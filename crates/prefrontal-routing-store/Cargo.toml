@@ -1,0 +1,16 @@
+[package]
+name = "prefrontal-routing-store"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "SQLite backend for the route-state store: implements prefrontal-routing-core's RouteStateStore domain trait over the shared cortexkit-store lib (single-writer lease + namespace-keyed migrations). The pure -core crate stays rusqlite-free; this is where the backend lives. A postgres sibling is a clean drop-in later."
+
+[dependencies]
+prefrontal-routing-core = { path = "../prefrontal-routing-core" }
+cortexkit-store = { workspace = true }
+cortexkit-store-types = { workspace = true }
+# Same rusqlite (bundled) cortexkit-store uses, so the Connection types match.
+# Naming params!/Row directly keeps the row mapping readable.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

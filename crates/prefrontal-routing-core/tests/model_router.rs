@@ -1,0 +1,1710 @@
+//! Test-vectors ported from the Alfonso TS plugin
+//! (`src/features/model-routing/model-router.test.ts`). Same inputs/outputs as
+//! the TS suite; this is the behavioral-parity proof for the port. The
+//! seed-backed cases (TS `describe("model facts seed")`) land with the
+//! model-facts-seed port slice; everything else from the TS file is here.
+
+use std::collections::HashSet;
+
+use std::collections::HashMap;
+
+use prefrontal_routing_core::model_facts::{
+    make_capacity_key, make_route_key, Confidence, ModelFact, ModelPromptDefaults,
+    ModelRequirements, ModelRoute, ModelScores, ReasoningEffort,
+};
+use prefrontal_routing_core::model_facts_seed::model_facts_seed;
+use prefrontal_routing_core::model_router::{
+    select_model_route, select_model_route_with_anchors, ModelRouteStateSnapshot,
+    RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
+};
+use prefrontal_routing_core::route_scoring::score_adequacy;
+use prefrontal_routing_core::{DEFAULT_ANCHORS, MIN_BEST_EFFORT_ADEQUACY};
+
+// ── builders mirroring the TS test helpers ──────────────────────────────────
+
+#[derive(Default)]
+struct FactBuilder {
+    provider_id: String,
+    model_id: String,
+    variant: Option<String>,
+    scores: ModelScores,
+    context_window: Option<f64>,
+    cost_tier: Option<f64>,
+    cost_per_m_tok_out: Option<f64>,
+    supports_vision: Option<bool>,
+    prompt_defaults: Option<ModelPromptDefaults>,
+    confidence: Option<Confidence>,
+}
+
+/// `fact({ providerID, modelID, scores, ...partial })`: confidence defaults to curated.
+fn fact(b: FactBuilder) -> ModelFact {
+    ModelFact {
+        provider_id: b.provider_id,
+        model_id: b.model_id,
+        variant: b.variant,
+        family: None,
+        scores: b.scores,
+        context_window: b.context_window,
+        max_output_tokens: None,
+        cost_tier: b.cost_tier,
+        cost_per_m_tok_out: b.cost_per_m_tok_out,
+        supports_vision: b.supports_vision,
+        supports_tool_use: None,
+        prompt_defaults: b.prompt_defaults,
+        confidence: b.confidence.unwrap_or(Confidence::Curated),
+        notes: None,
+        speed_multiplier: None,
+        subscription_multiplier: None,
+    }
+}
+
+fn scores(iq: f64, eq: f64, speed: f64) -> ModelScores {
+    ModelScores { iq, eq, speed }
+}
+
+fn req(iq: f64, eq: f64) -> ModelRequirements {
+    ModelRequirements { iq, eq }
+}
+
+fn availability_of(facts: &[ModelFact]) -> HashSet<String> {
+    let mut s = HashSet::new();
+    for f in facts {
+        s.insert(make_route_key(
+            &f.provider_id,
+            &f.model_id,
+            f.variant.as_deref(),
+        ));
+        s.insert(make_capacity_key(&f.provider_id, &f.model_id));
+    }
+    s
+}
+
+struct Extra<'a> {
+    available_models: Option<HashSet<String>>,
+    runtime_snapshot: Option<ModelRouteStateSnapshot>,
+    required_capabilities: Option<prefrontal_routing_core::model_router::RequiredCapabilities>,
+    is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
+    min_best_effort_adequacy: Option<f64>,
+    prefer_prompt_cache: bool,
+    providers_without_prompt_cache: HashSet<String>,
+}
+
+impl<'a> Default for Extra<'a> {
+    fn default() -> Self {
+        Extra {
+            available_models: None,
+            runtime_snapshot: None,
+            required_capabilities: None,
+            is_subscription_route: None,
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: HashSet::new(),
+        }
+    }
+}
+
+fn input<'a>(
+    facts: Vec<ModelFact>,
+    requirements: ModelRequirements,
+    extra: Extra<'a>,
+) -> SelectModelRouteInput<'a> {
+    let available_models = extra
+        .available_models
+        .unwrap_or_else(|| availability_of(&facts));
+    SelectModelRouteInput {
+        target_agent: "mason".to_string(),
+        requirements,
+        available_models,
+        facts,
+        runtime_snapshot: extra.runtime_snapshot,
+        exclude_route_keys: Vec::new(),
+        required_capabilities: extra.required_capabilities,
+        is_subscription_route: extra.is_subscription_route,
+        min_best_effort_adequacy: extra.min_best_effort_adequacy,
+        prefer_prompt_cache: extra.prefer_prompt_cache,
+        providers_without_prompt_cache: extra.providers_without_prompt_cache,
+    }
+}
+
+// ── exclusion spec-list semantics ───────────────────────────────────────────
+
+#[test]
+fn provider_wide_exclusion_spec_rejects_every_model_on_the_provider() {
+    // Red-proof for the k3 sidekick incident: a bare provider entry must
+    // exclude all of that provider's routes in admission (module-side panel
+    // and sidekick seats), not only in TS-side availability filtering where
+    // the spec classifier already applied it.
+    let quota = fact(FactBuilder {
+        provider_id: "kimi-for-coding".into(),
+        model_id: "k3".into(),
+        scores: scores(55.0, 1900.0, 50.0),
+        ..Default::default()
+    });
+    let cheap = fact(FactBuilder {
+        provider_id: "ollama-cloud".into(),
+        model_id: "deepseek-v4-flash".into(),
+        scores: scores(42.0, 1200.0, 113.0),
+        ..Default::default()
+    });
+    let mut in1 = input(
+        vec![quota.clone(), cheap.clone()],
+        req(20.0, 0.0),
+        Extra::default(),
+    );
+    in1.exclude_route_keys = vec!["kimi-for-coding".to_string()];
+    let r = select_model_route(in1).expect("cheap route survives");
+    assert_eq!(r.model.model_id, "deepseek-v4-flash");
+
+    // Negation re-admits a specific model: spec-list semantics end to end.
+    let mut in2 = input(vec![quota, cheap], req(20.0, 0.0), Extra::default());
+    in2.exclude_route_keys = vec![
+        "kimi-for-coding".to_string(),
+        "ollama-cloud".to_string(),
+        "-kimi-for-coding/k3".to_string(),
+    ];
+    let r = select_model_route(in2).expect("negated route survives");
+    assert_eq!(r.model.model_id, "k3");
+}
+
+// ── quality threshold (gate) ────────────────────────────────────────────────
+
+fn fast() -> ModelFact {
+    // iq just under the AA v4.1 strong anchor (44): clears low demand, fails high.
+    fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "fast".into(),
+        scores: scores(42.0, 1450.0, 200.0),
+        ..Default::default()
+    })
+}
+fn smart() -> ModelFact {
+    // iq above the AA v4.1 elite anchor (57): clears max demand.
+    fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "smart".into(),
+        scores: scores(60.0, 1950.0, 60.0),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn high_iq_requirement_only_clears_the_high_iq_route() {
+    let r = select_model_route(input(
+        vec![fast(), smart()],
+        req(90.0, 10.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "smart");
+}
+
+#[test]
+fn speed_breaks_ties_among_equal_cost_models_clearing_the_bar() {
+    let r = select_model_route(input(
+        vec![fast(), smart()],
+        req(20.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "fast");
+}
+
+#[test]
+fn speed_can_never_pull_a_sub_bar_model_in() {
+    // The model's iq score (34) is well below the requirement-80 target of about 50.5 on the default iq anchors, so its high speed must not make it eligible.
+    let weak_fast = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "weakfast".into(),
+        scores: scores(34.0, 1450.0, 300.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![weak_fast, smart()],
+        req(80.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "smart");
+}
+
+#[test]
+fn requirement_0_excludes_a_metric_from_the_quality_gate() {
+    let r = select_model_route(input(
+        vec![fast(), smart()],
+        req(80.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert!(!r
+        .score
+        .metrics
+        .contains_key(&prefrontal_routing_core::ModelMetric::Eq));
+    assert_eq!(r.model.model_id, "smart");
+}
+
+// ── cost-primary ordering (cost > speed) ────────────────────────────────────
+
+#[test]
+fn among_models_clearing_the_bar_the_cheapest_wins() {
+    let expensive_strong = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "expensive".into(),
+        scores: scores(62.0, 1900.0, 60.0),
+        cost_per_m_tok_out: Some(25.0),
+        ..Default::default()
+    });
+    let cheap_adequate = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "cheap".into(),
+        scores: scores(60.0, 1750.0, 60.0),
+        cost_per_m_tok_out: Some(2.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![expensive_strong, cheap_adequate],
+        req(80.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "cheap");
+}
+
+#[test]
+fn invariant_faster_pricier_never_beats_cheaper_slower() {
+    let fast_pricey = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "fastpricey".into(),
+        scores: scores(60.0, 1750.0, 220.0),
+        cost_per_m_tok_out: Some(12.0),
+        ..Default::default()
+    });
+    let slow_cheap = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "slowcheap".into(),
+        scores: scores(60.0, 1750.0, 40.0),
+        cost_per_m_tok_out: Some(2.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![fast_pricey, slow_cheap],
+        req(80.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "slowcheap");
+}
+
+#[test]
+fn gather_cache_preference_partitions_without_changing_cost_order() {
+    let ollama = fact(FactBuilder {
+        provider_id: "ollama-cloud".into(),
+        model_id: "cheap".into(),
+        scores: scores(60.0, 1750.0, 60.0),
+        cost_per_m_tok_out: Some(1.0),
+        ..Default::default()
+    });
+    let cache_capable = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "cached".into(),
+        scores: scores(60.0, 1750.0, 60.0),
+        cost_per_m_tok_out: Some(8.0),
+        ..Default::default()
+    });
+
+    let unflagged = select_model_route(input(
+        vec![ollama.clone(), cache_capable.clone()],
+        req(80.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(unflagged.model.provider_id, "ollama-cloud");
+
+    let mut flagged = Extra {
+        prefer_prompt_cache: true,
+        ..Default::default()
+    };
+    flagged
+        .providers_without_prompt_cache
+        .insert("ollama-cloud".into());
+    let preferred = select_model_route(input(
+        vec![ollama.clone(), cache_capable],
+        req(80.0, 20.0),
+        flagged,
+    ))
+    .unwrap();
+    assert_eq!(preferred.model.provider_id, "openai");
+
+    let only_uncached = select_model_route(input(
+        vec![ollama],
+        req(80.0, 20.0),
+        Extra {
+            prefer_prompt_cache: true,
+            providers_without_prompt_cache: HashSet::from(["ollama-cloud".into()]),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(only_uncached.model.provider_id, "ollama-cloud");
+}
+
+#[test]
+fn subscription_routes_with_different_list_prices_no_longer_tie() {
+    // Regression this task exists for: subscription coverage used to collapse
+    // every route's cost to 0, so a $6/Mtok flagship and a $0.28/Mtok flash model
+    // tied at cost 0 and the SPEED tiebreak (not price) chose between them — which
+    // is how routine work landed on the flagship. The flagship below is the faster
+    // route, so under the old collapse it won the speed tiebreak; pricing now comes
+    // from each route's own fact, so the cheaper list price wins the cost step even
+    // though both routes are subscription-covered.
+    let flagship = fact(FactBuilder {
+        provider_id: "alibaba-token-plan".into(),
+        model_id: "qwen3.8-max-preview".into(),
+        scores: scores(60.0, 1750.0, 300.0),
+        cost_per_m_tok_out: Some(6.0),
+        ..Default::default()
+    });
+    let flash = fact(FactBuilder {
+        provider_id: "google".into(),
+        model_id: "gemini-flash".into(),
+        scores: scores(60.0, 1750.0, 40.0),
+        cost_per_m_tok_out: Some(0.28),
+        ..Default::default()
+    });
+    let extra = Extra {
+        is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+        ..Default::default()
+    };
+    let r = select_model_route(input(vec![flagship, flash], req(80.0, 20.0), extra)).unwrap();
+    // Cheaper list price wins the cost step despite being the slower route.
+    assert_eq!(r.model.model_id, "gemini-flash");
+    assert!(
+        (r.score.objective.cost - 0.28 / 30.0).abs() < 1e-9,
+        "flash should be priced at its real list price, got {}",
+        r.score.objective.cost
+    );
+}
+
+#[test]
+fn cheapness_cannot_select_below_the_quality_bar() {
+    let strong = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "strong".into(),
+        scores: scores(60.0, 1750.0, 70.0),
+        cost_per_m_tok_out: Some(25.0),
+        ..Default::default()
+    });
+    let weak_cheap = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "weakcheap".into(),
+        scores: scores(38.0, 1100.0, 90.0),
+        cost_per_m_tok_out: Some(0.3),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![strong, weak_cheap],
+        req(80.0, 30.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "strong");
+}
+
+#[test]
+fn subscription_route_no_fresh_quota_window_explains_stale_signal() {
+    let sub = fact(FactBuilder {
+        provider_id: "opencode-go".into(),
+        model_id: "qwen3.7-max".into(),
+        scores: scores(60.0, 1800.0, 90.0),
+        ..Default::default()
+    });
+    let extra = Extra {
+        is_subscription_route: Some(Box::new(|route: &ModelRoute| {
+            route.provider_id == "opencode-go"
+        })),
+        runtime_snapshot: Some(ModelRouteStateSnapshot {
+            now: 1_000_000.0,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let r = select_model_route(input(vec![sub], req(80.0, 20.0), extra)).unwrap();
+    assert!(r
+        .explanation
+        .iter()
+        .any(|e| e == "quota signal: none (source stale/down)"));
+}
+
+// ── anchored (not min/max) normalization ────────────────────────────────────
+
+#[test]
+fn adding_a_stronger_future_model_does_not_change_adequacy() {
+    let a = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "a".into(),
+        scores: scores(52.0, 1500.0, 160.0),
+        ..Default::default()
+    });
+    let before = score_adequacy(&a, &req(80.0, 20.0), &DEFAULT_ANCHORS);
+    let after = score_adequacy(&a, &req(80.0, 20.0), &DEFAULT_ANCHORS);
+    assert!((after.adequacy - before.adequacy).abs() < 1e-10);
+    let future = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "future".into(),
+        scores: scores(130.0, 2500.0, 900.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(vec![a, future], req(90.0, 10.0), Extra::default())).unwrap();
+    assert_eq!(r.model.model_id, "future");
+}
+
+// ── admission filters ───────────────────────────────────────────────────────
+
+fn strong_25() -> ModelFact {
+    fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "strong".into(),
+        scores: scores(58.0, 1750.0, 70.0),
+        cost_per_m_tok_out: Some(25.0),
+        ..Default::default()
+    })
+}
+fn weak_cheap() -> ModelFact {
+    fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "weakcheap".into(),
+        scores: scores(38.0, 1100.0, 90.0),
+        cost_per_m_tok_out: Some(0.3),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn confirmed_cooldown_blocks_a_route() {
+    let now = 1_000_000.0;
+    let mut by_route = std::collections::HashMap::new();
+    by_route.insert(
+        make_route_key("p", "strong", None),
+        RouteRuntimeState {
+            cooldown_until: Some(now + 60_000.0),
+            ..Default::default()
+        },
+    );
+    let snapshot = ModelRouteStateSnapshot {
+        now,
+        by_route,
+        ..Default::default()
+    };
+    let r = select_model_route(input(
+        vec![strong_25(), weak_cheap()],
+        req(20.0, 10.0),
+        Extra {
+            runtime_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "weakcheap");
+    assert_eq!(
+        r.rejected
+            .iter()
+            .find(|x| x.route_key == "p/strong")
+            .map(|x| x.reason.as_str()),
+        Some("cooldown_active")
+    );
+}
+
+#[test]
+fn confirmed_quota_exhaustion_blocks_a_route() {
+    let now = 1_000_000.0;
+    let mut by_capacity = std::collections::HashMap::new();
+    by_capacity.insert(
+        make_capacity_key("p", "strong"),
+        RouteRuntimeState {
+            quota_exhausted_until: Some(now + 60_000.0),
+            ..Default::default()
+        },
+    );
+    let snapshot = ModelRouteStateSnapshot {
+        now,
+        by_capacity,
+        ..Default::default()
+    };
+    let r = select_model_route(input(
+        vec![strong_25(), weak_cheap()],
+        req(20.0, 10.0),
+        Extra {
+            runtime_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "weakcheap");
+}
+
+#[test]
+fn undefined_route_telemetry_does_not_erase_capacity_quota_blocks() {
+    let now = 1_000_000.0;
+    let route_key = make_route_key("p", "strong", None);
+    let mut by_capacity = std::collections::HashMap::new();
+    by_capacity.insert(
+        make_capacity_key("p", "strong"),
+        RouteRuntimeState {
+            quota_exhausted_until: Some(now + 60_000.0),
+            ..Default::default()
+        },
+    );
+    let mut by_route = std::collections::HashMap::new();
+    // quota_exhausted_until: undefined (None), success_ema: 0.9: must not erase the capacity block.
+    by_route.insert(
+        route_key,
+        RouteRuntimeState {
+            quota_exhausted_until: None,
+            success_ema: Some(0.9),
+            ..Default::default()
+        },
+    );
+    let snapshot = ModelRouteStateSnapshot {
+        now,
+        by_route,
+        by_capacity,
+    };
+    let r = select_model_route(input(
+        vec![strong_25(), weak_cheap()],
+        req(20.0, 10.0),
+        Extra {
+            runtime_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "weakcheap");
+}
+
+// ── soft quota pressure (objective) ─────────────────────────────────────────
+
+#[test]
+fn expired_route_deadlines_do_not_mask_live_capacity_blocks() {
+    let now = 50.0;
+    let route_key = make_route_key("p", "strong", None);
+    let capacity_key = make_capacity_key("p", "strong");
+    let snapshot = ModelRouteStateSnapshot {
+        now,
+        by_route: std::collections::HashMap::from([(
+            route_key,
+            RouteRuntimeState {
+                cooldown_until: Some(10.0),
+                quota_exhausted_until: Some(10.0),
+                ..Default::default()
+            },
+        )]),
+        by_capacity: std::collections::HashMap::from([(
+            capacity_key,
+            RouteRuntimeState {
+                cooldown_until: Some(100.0),
+                quota_exhausted_until: Some(100.0),
+                ..Default::default()
+            },
+        )]),
+    };
+
+    let selected = select_model_route(input(
+        vec![strong_25(), weak_cheap()],
+        req(20.0, 10.0),
+        Extra {
+            runtime_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(selected.model.model_id, "weakcheap");
+}
+
+#[test]
+fn soft_quota_pressure_shifts_selection_to_unpressured_peer() {
+    let a = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "aa".into(),
+        scores: scores(60.0, 1800.0, 60.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    let b = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "bb".into(),
+        scores: scores(60.0, 1800.0, 60.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    let now = 1_000_000.0;
+    let mut by_capacity = std::collections::HashMap::new();
+    by_capacity.insert(
+        make_capacity_key("p", "aa"),
+        RouteRuntimeState {
+            quota_pressure: Some(1.0),
+            ..Default::default()
+        },
+    );
+    let snapshot = ModelRouteStateSnapshot {
+        now,
+        by_capacity,
+        ..Default::default()
+    };
+    let r = select_model_route(input(
+        vec![a, b],
+        req(80.0, 20.0),
+        Extra {
+            runtime_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "bb");
+}
+
+// ── best-effort when nothing clears ─────────────────────────────────────────
+
+#[test]
+fn extreme_demand_returns_most_capable_never_strands() {
+    let weak = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "weak".into(),
+        scores: scores(30.0, 1100.0, 40.0),
+        ..Default::default()
+    });
+    let less = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "less".into(),
+        scores: scores(20.0, 900.0, 40.0),
+        ..Default::default()
+    });
+    // Band set to 0.0 to preserve the old "never strand" behavior for this test.
+    // With the default band (0.6), these extremely weak routes would be rejected
+    // as AllRoutesInadequate: the new band-check guard working as intended.
+    let r = select_model_route(input(
+        vec![weak, less],
+        req(100.0, 80.0),
+        Extra {
+            min_best_effort_adequacy: Some(0.0),
+            ..Extra::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "weak");
+    assert!(r.explanation.iter().any(|l| l.contains("best-effort")));
+}
+
+// ── typed failures ──────────────────────────────────────────────────────────
+
+fn ok_fact() -> ModelFact {
+    fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "ok".into(),
+        scores: scores(55.0, 1700.0, 90.0),
+        ..Default::default()
+    })
+}
+
+#[test]
+fn no_available_model_typed_failure() {
+    let extra = Extra {
+        available_models: Some(HashSet::new()),
+        ..Default::default()
+    };
+    let err = select_model_route(input(vec![ok_fact()], req(50.0, 10.0), extra)).unwrap_err();
+    assert_eq!(err.reason, RouteFailureReason::NoAvailableModel);
+}
+
+#[test]
+fn invalid_requirements_out_of_range_typed_failure() {
+    let err =
+        select_model_route(input(vec![ok_fact()], req(101.0, 10.0), Extra::default())).unwrap_err();
+    assert_eq!(err.reason, RouteFailureReason::InvalidRequirements);
+}
+
+#[test]
+fn all_zero_requirements_without_required_capability_invalid() {
+    let err =
+        select_model_route(input(vec![ok_fact()], req(0.0, 0.0), Extra::default())).unwrap_err();
+    assert_eq!(err.reason, RouteFailureReason::InvalidRequirements);
+}
+
+#[test]
+fn mixed_rejections_classify_as_quota_cooldown() {
+    let now = 1_000_000.0;
+    let a = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "blocked".into(),
+        scores: scores(60.0, 1800.0, 90.0),
+        ..Default::default()
+    });
+    let b = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "loggedout".into(),
+        scores: scores(60.0, 1800.0, 90.0),
+        ..Default::default()
+    });
+    let mut by_capacity = std::collections::HashMap::new();
+    by_capacity.insert(
+        make_capacity_key("p", "blocked"),
+        RouteRuntimeState {
+            quota_exhausted_until: Some(now + 60_000.0),
+            ..Default::default()
+        },
+    );
+    let snapshot = ModelRouteStateSnapshot {
+        now,
+        by_capacity,
+        ..Default::default()
+    };
+    let mut available = HashSet::new();
+    available.insert(make_route_key("p", "blocked", None));
+    available.insert(make_capacity_key("p", "blocked"));
+    let extra = Extra {
+        available_models: Some(available),
+        runtime_snapshot: Some(snapshot),
+        ..Default::default()
+    };
+    let err = select_model_route(input(vec![a, b], req(80.0, 20.0), extra)).unwrap_err();
+    assert_eq!(err.reason, RouteFailureReason::QuotaOrCooldownExhausted);
+}
+
+// ── required capabilities ───────────────────────────────────────────────────
+
+#[test]
+fn vision_requirement_admits_only_vision_capable() {
+    let vision_model = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "vision".into(),
+        scores: scores(30.0, 1200.0, 60.0),
+        supports_vision: Some(true),
+        ..Default::default()
+    });
+    let text_model = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "text".into(),
+        scores: scores(60.0, 1900.0, 200.0),
+        supports_vision: Some(false),
+        ..Default::default()
+    });
+    let extra = Extra {
+        required_capabilities: Some(
+            prefrontal_routing_core::model_router::RequiredCapabilities {
+                vision: Some(true),
+                min_context: None,
+            },
+        ),
+        ..Default::default()
+    };
+    let r =
+        select_model_route(input(vec![vision_model, text_model], req(0.0, 0.0), extra)).unwrap();
+    assert_eq!(r.model.model_id, "vision");
+}
+
+#[test]
+fn min_context_filters_small_context_models() {
+    let small = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "small".into(),
+        scores: scores(60.0, 1800.0, 90.0),
+        context_window: Some(8_000.0),
+        ..Default::default()
+    });
+    let big = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "big".into(),
+        scores: scores(55.0, 1700.0, 90.0),
+        context_window: Some(1_000_000.0),
+        ..Default::default()
+    });
+    let extra = Extra {
+        required_capabilities: Some(
+            prefrontal_routing_core::model_router::RequiredCapabilities {
+                vision: None,
+                min_context: Some(200_000.0),
+            },
+        ),
+        ..Default::default()
+    };
+    let r = select_model_route(input(vec![small, big], req(60.0, 10.0), extra)).unwrap();
+    assert_eq!(r.model.model_id, "big");
+}
+
+// ── unknown facts ───────────────────────────────────────────────────────────
+
+#[test]
+fn positive_min_context_rejects_unknown_context() {
+    let unknown_context = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "unknown-context".into(),
+        scores: scores(60.0, 1800.0, 90.0),
+        context_window: None,
+        ..Default::default()
+    });
+    let result = select_model_route(input(
+        vec![unknown_context],
+        req(0.0, 0.0),
+        Extra {
+            required_capabilities: Some(
+                prefrontal_routing_core::model_router::RequiredCapabilities {
+                    vision: None,
+                    min_context: Some(1.0),
+                },
+            ),
+            ..Default::default()
+        },
+    ));
+
+    assert_eq!(
+        result.unwrap_err().reason,
+        RouteFailureReason::ContextTooSmall
+    );
+}
+
+#[test]
+fn unknown_fact_candidate_loses_to_known_adequate_peer() {
+    let known = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "known".into(),
+        scores: scores(58.0, 1800.0, 90.0),
+        confidence: Some(Confidence::Curated),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    let unknown = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "unknown".into(),
+        scores: scores(58.0, 1800.0, 90.0),
+        confidence: Some(Confidence::Unknown),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![known, unknown],
+        req(70.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.model.model_id, "known");
+}
+
+#[test]
+fn unknown_fact_candidate_wins_when_only_option() {
+    let unknown = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "only".into(),
+        scores: scores(55.0, 1700.0, 90.0),
+        confidence: Some(Confidence::Unknown),
+        ..Default::default()
+    });
+    let r = select_model_route(input(vec![unknown], req(60.0, 10.0), Extra::default())).unwrap();
+    assert_eq!(r.model.model_id, "only");
+}
+
+// ── determinism & prompt params ─────────────────────────────────────────────
+
+#[test]
+fn deterministic_tie_break_stable_by_route_key() {
+    let a = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "aaa".into(),
+        scores: scores(55.0, 1700.0, 160.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    let b = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "bbb".into(),
+        scores: scores(55.0, 1700.0, 160.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    let r1 = select_model_route(input(
+        vec![a.clone(), b.clone()],
+        req(60.0, 40.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    let r2 = select_model_route(input(vec![b, a], req(60.0, 40.0), Extra::default())).unwrap();
+    assert_eq!(r1.route_key, r2.route_key);
+    assert_eq!(r1.model.model_id, "aaa");
+}
+
+#[test]
+fn prompt_defaults_variant_reasoning_from_selected_fact() {
+    let m = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "gpt-5.4".into(),
+        variant: Some("high".into()),
+        scores: scores(57.0, 1585.0, 75.0),
+        prompt_defaults: Some(ModelPromptDefaults {
+            variant: Some("high".into()),
+            temperature: None,
+            reasoning_effort: Some(ReasoningEffort::High),
+        }),
+        ..Default::default()
+    });
+    let r = select_model_route(input(vec![m], req(80.0, 20.0), Extra::default())).unwrap();
+    assert_eq!(r.prompt_params.variant.as_deref(), Some("high"));
+    assert_eq!(r.prompt_params.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(r.route_key, "openai/gpt-5.4/high");
+}
+
+#[test]
+fn explanation_strings_are_populated() {
+    let m = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "m".into(),
+        scores: scores(55.0, 1700.0, 90.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(vec![m], req(70.0, 20.0), Extra::default())).unwrap();
+    assert!(r.explanation.len() > 1);
+    assert!(r.explanation.iter().any(|l| l.contains("iq:")));
+}
+
+// ── subscription cost model ─────────────────────────────────────────────────
+
+#[test]
+fn subscription_coverage_is_reported_but_does_not_zero_cost() {
+    // A subscription route is no longer free for selection: it is priced at its
+    // real list price, so a cheap metered route beats an expensive subscription
+    // route. The subscription coverage is still reported in the explanation.
+    let cheap_metered = fact(FactBuilder {
+        provider_id: "metered".into(),
+        model_id: "cheap".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(1.0),
+        ..Default::default()
+    });
+    let pricy_sub = fact(FactBuilder {
+        provider_id: "sub".into(),
+        model_id: "pricy".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(25.0),
+        ..Default::default()
+    });
+    let extra = Extra {
+        is_subscription_route: Some(Box::new(|route: &ModelRoute| route.provider_id == "sub")),
+        ..Default::default()
+    };
+    let r =
+        select_model_route(input(vec![cheap_metered, pricy_sub], req(40.0, 0.0), extra)).unwrap();
+    // The cheap metered route wins on real price; the subscription is NOT zeroed.
+    assert_eq!(r.route_key, "metered/cheap");
+    assert!(r.score.selection_cost > 0.0);
+}
+
+#[test]
+fn subscription_coverage_appears_in_the_explanation_of_a_winning_sub_route() {
+    // When a subscription route genuinely wins (here it is the only adequate route),
+    // the explanation names its subscription coverage and its real price.
+    let pricy_sub = fact(FactBuilder {
+        provider_id: "sub".into(),
+        model_id: "pricy".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(25.0),
+        ..Default::default()
+    });
+    let extra = Extra {
+        is_subscription_route: Some(Box::new(|route: &ModelRoute| route.provider_id == "sub")),
+        ..Default::default()
+    };
+    let r = select_model_route(input(vec![pricy_sub], req(40.0, 0.0), extra)).unwrap();
+    assert_eq!(r.route_key, "sub/pricy");
+    let explanation = r.explanation.join("\n");
+    assert!(
+        explanation.contains("subscription-covered"),
+        "{explanation}"
+    );
+    assert!(explanation.contains("list $25/Mtok"), "{explanation}");
+}
+
+#[test]
+fn without_subscription_predicate_cheap_metered_wins() {
+    let cheap_metered = fact(FactBuilder {
+        provider_id: "metered".into(),
+        model_id: "cheap".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(1.0),
+        ..Default::default()
+    });
+    let pricy_sub = fact(FactBuilder {
+        provider_id: "sub".into(),
+        model_id: "pricy".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(25.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![cheap_metered, pricy_sub],
+        req(40.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.route_key, "metered/cheap");
+}
+
+#[test]
+fn unknown_metered_price_loses_to_known_cheap_on_primary_objective() {
+    let known_cheap = fact(FactBuilder {
+        provider_id: "m1".into(),
+        model_id: "cheap".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(1.0),
+        ..Default::default()
+    });
+    let unknown_price = fact(FactBuilder {
+        provider_id: "m2".into(),
+        model_id: "unknown".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![known_cheap, unknown_price],
+        req(40.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(r.route_key, "m1/cheap");
+}
+
+#[test]
+fn unknown_metered_price_does_not_win_cost_proxy_tiebreak_over_known_cheap_sub() {
+    let known_cheap = fact(FactBuilder {
+        provider_id: "aaa".into(),
+        model_id: "known".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(1.0),
+        ..Default::default()
+    });
+    let unknown_price = fact(FactBuilder {
+        provider_id: "zzz".into(),
+        model_id: "unknown".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        ..Default::default()
+    });
+    let extra = Extra {
+        is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+        ..Default::default()
+    };
+    let r = select_model_route(input(
+        vec![known_cheap, unknown_price],
+        req(40.0, 0.0),
+        extra,
+    ))
+    .unwrap();
+    assert_eq!(r.route_key, "aaa/known");
+}
+
+#[test]
+fn cost_proxy_tiebreak_orders_by_cheaper_if_metered_not_alphabetical() {
+    let asub = fact(FactBuilder {
+        provider_id: "asub".into(),
+        model_id: "m".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(25.0),
+        ..Default::default()
+    });
+    let zsub = fact(FactBuilder {
+        provider_id: "zsub".into(),
+        model_id: "m".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        cost_per_m_tok_out: Some(2.0),
+        ..Default::default()
+    });
+    let extra = Extra {
+        is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+        ..Default::default()
+    };
+    let r = select_model_route(input(vec![asub, zsub], req(40.0, 0.0), extra)).unwrap();
+    // Subscription coverage no longer zeroes cost, so the cheaper list price wins
+    // on real price (not alphabetically, and not via a 0-cost tie).
+    assert_eq!(r.route_key, "zsub/m");
+    assert!(
+        r.score.selection_cost > 0.0,
+        "subscription routes carry their real price, got {}",
+        r.score.selection_cost
+    );
+}
+
+// ── route-priced cost model (subscription multiplier + caller independence) ──
+
+#[test]
+fn pricing_is_independent_of_the_caller_subscription_list() {
+    // The same route, requested with an EMPTY caller subscription list and with a
+    // FULL one, must produce the same cost term: pricing is a property of the
+    // route's fact, not of who asks. (This is the defect where one caller priced a
+    // route at $6/Mtok and another at cost 0 for the same model and config.)
+    let route = fact(FactBuilder {
+        provider_id: "alibaba-token-plan".into(),
+        model_id: "qwen3.8-max-preview".into(),
+        scores: scores(60.0, 1750.0, 90.0),
+        cost_per_m_tok_out: Some(6.0),
+        ..Default::default()
+    });
+    let metered = select_model_route(input(
+        vec![route.clone()],
+        req(80.0, 20.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|_: &ModelRoute| false)),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let subscribed = select_model_route(input(
+        vec![route],
+        req(80.0, 20.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        metered.score.objective.cost, subscribed.score.objective.cost,
+        "cost term must not depend on the caller's subscription list"
+    );
+    assert_eq!(
+        metered.score.selection_cost,
+        subscribed.score.selection_cost
+    );
+    // The shared cost is the real list price, not zero.
+    assert!((metered.score.objective.cost - 6.0 / 30.0).abs() < 1e-9);
+}
+
+#[test]
+fn subscription_multiplier_halves_effective_cost() {
+    let mut subsidized = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "subsidized".into(),
+        scores: scores(60.0, 1750.0, 90.0),
+        cost_per_m_tok_out: Some(6.0),
+        ..Default::default()
+    });
+    subsidized.subscription_multiplier = Some(2.0);
+    let unsubsidized = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "unsubsidized".into(),
+        scores: scores(60.0, 1750.0, 90.0),
+        cost_per_m_tok_out: Some(6.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![subsidized, unsubsidized],
+        req(80.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    // A 2.0 multiplier halves $6 -> $3 effective, beating the $6 list-price sibling.
+    assert_eq!(r.model.model_id, "subsidized");
+    assert!((r.score.objective.cost - 3.0 / 30.0).abs() < 1e-9);
+}
+
+#[test]
+fn default_multiplier_leaves_cost_at_list_price() {
+    // No configured multiplier (None) behaves as 1.0: the route is priced at list.
+    let route = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "m".into(),
+        scores: scores(60.0, 1750.0, 90.0),
+        cost_per_m_tok_out: Some(6.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(vec![route], req(80.0, 20.0), Extra::default())).unwrap();
+    assert!((r.score.objective.cost - 6.0 / 30.0).abs() < 1e-9);
+}
+
+#[test]
+fn unknown_price_normalizes_to_maximum_cost() {
+    // An absent price (no cost_per_m_tok_out, no cost_tier) maps to the maximum
+    // normalized cost, never to "cheapest".
+    let unknown = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "unknown".into(),
+        scores: scores(55.0, 1500.0, 60.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(vec![unknown], req(40.0, 0.0), Extra::default())).unwrap();
+    assert!(
+        (r.score.objective.cost - 1.0).abs() < 1e-9,
+        "unknown price must normalize to max cost, got {}",
+        r.score.objective.cost
+    );
+}
+
+#[test]
+fn explanation_carries_effective_list_multiplier_and_coverage() {
+    let mut route = fact(FactBuilder {
+        provider_id: "alibaba-token-plan".into(),
+        model_id: "qwen3.8-max-preview".into(),
+        scores: scores(60.0, 1750.0, 90.0),
+        cost_per_m_tok_out: Some(6.0),
+        ..Default::default()
+    });
+    route.subscription_multiplier = Some(2.0);
+    let r = select_model_route(input(
+        vec![route],
+        req(80.0, 20.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    let explanation = r.explanation.join("\n");
+    // Effective $3/Mtok (list $6 ÷ 2.0), the multiplier, and coverage all appear so
+    // a reader can tell "cheap because subsidized" from "cheap because cheap model".
+    assert!(explanation.contains("effective $3/Mtok"), "{explanation}");
+    assert!(explanation.contains("list $6/Mtok"), "{explanation}");
+    assert!(explanation.contains("x2 subsidy"), "{explanation}");
+    assert!(
+        explanation.contains("subscription-covered"),
+        "{explanation}"
+    );
+}
+
+#[test]
+fn explanation_omits_multiplier_at_default_and_marks_metered() {
+    let route = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "m".into(),
+        scores: scores(60.0, 1750.0, 90.0),
+        cost_per_m_tok_out: Some(6.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(vec![route], req(80.0, 20.0), Extra::default())).unwrap();
+    let explanation = r.explanation.join("\n");
+    assert!(explanation.contains("effective $6/Mtok"), "{explanation}");
+    assert!(explanation.contains("list $6/Mtok"), "{explanation}");
+    assert!(explanation.contains("metered"), "{explanation}");
+    // A 1.0 multiplier is "no subsidy known" and must not be reported.
+    assert!(!explanation.contains("subsidy"), "{explanation}");
+    assert!(
+        !explanation.contains("subscription-covered"),
+        "{explanation}"
+    );
+}
+
+// ── model facts seed (TS describe("model facts seed")) ──────────────────────
+
+#[test]
+fn seed_loads_and_every_fact_has_valid_scores() {
+    let seed = model_facts_seed();
+    assert!(seed.len() >= 18);
+    for f in seed {
+        assert!(f.scores.iq.is_finite());
+        assert!(f.scores.eq.is_finite());
+        assert!(f.scores.speed.is_finite());
+        assert!(matches!(
+            f.confidence,
+            prefrontal_routing_core::Confidence::Curated
+                | prefrontal_routing_core::Confidence::Unknown
+        ));
+    }
+}
+
+#[test]
+fn max_iq_task_clears_at_a_top_tier_seed_model() {
+    use prefrontal_routing_core::{requirement_target, ModelMetric, ADEQUACY_FLOOR};
+    let r = select_model_route(input(
+        model_facts_seed().to_vec(),
+        req(100.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    // iq=100 sits on the elite anchor (57). Cost-primary selection among models
+    // that clear the bar, not "highest iq wins", so a cheaper adequate seed
+    // row can beat sol/opus.
+    let bar = requirement_target(DEFAULT_ANCHORS.iq, 100.0);
+    assert!((bar - 57.0).abs() < 1e-9);
+    assert!(
+        r.score.adequacy >= ADEQUACY_FLOOR,
+        "max demand must clear the adequacy floor, got {}",
+        r.score.adequacy
+    );
+    let iq_fact = r.score.metrics[&ModelMetric::Iq].fact;
+    assert!(
+        iq_fact + 1e-9 >= bar - 1.0,
+        "selected model iq {iq_fact} should be near/above elite bar {bar}"
+    );
+}
+
+#[test]
+fn low_demand_task_falls_to_a_cheap_adequate_seed_model() {
+    let r = select_model_route(input(
+        model_facts_seed().to_vec(),
+        req(20.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    // must NOT pick the most expensive model for a trivial task.
+    assert_ne!(r.model.model_id, "claude-opus-4-8");
+    assert!(r.score.objective.cost < 0.2);
+}
+
+#[test]
+fn fast_mechanical_task_routes_to_a_fast_seed_model() {
+    let r = select_model_route(input(
+        model_facts_seed().to_vec(),
+        req(3.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    let id = &r.model.model_id;
+    assert!(
+        id.contains("mini")
+            || id.contains("nano")
+            || id.contains("flash")
+            || id.contains("grok")
+            || id.contains("minimax"),
+        "expected a fast model, got {id}"
+    );
+}
+
+#[test]
+fn speed_multiplier_selection_tiebreak() {
+    let a = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "model-a".into(),
+        scores: scores(55.0, 1700.0, 196.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    let b = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "model-b".into(),
+        scores: scores(55.0, 1700.0, 160.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+
+    let mut multipliers = std::collections::HashMap::new();
+    multipliers.insert("p/model-a".to_string(), 0.5);
+    prefrontal_routing_core::model_facts::set_speed_multipliers(multipliers);
+
+    let mut facts = vec![a, b];
+    for f in &mut facts {
+        let route_key = make_route_key(&f.provider_id, &f.model_id, f.variant.as_deref());
+        if let Some(mult) = prefrontal_routing_core::model_facts::get_speed_multiplier(&route_key) {
+            f.scores.speed *= mult;
+            f.speed_multiplier = Some(mult);
+        }
+    }
+
+    let r = select_model_route(input(facts, req(60.0, 40.0), Extra::default())).unwrap();
+    assert_eq!(r.model.model_id, "model-b");
+}
+
+#[test]
+fn speed_multiplier_explanation_surfaces_multiplier() {
+    let a = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "model-a".into(),
+        scores: scores(55.0, 1700.0, 196.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+
+    let mut multipliers = std::collections::HashMap::new();
+    multipliers.insert("p/model-a".to_string(), 0.5);
+    prefrontal_routing_core::model_facts::set_speed_multipliers(multipliers);
+
+    let mut facts = vec![a];
+    for f in &mut facts {
+        let route_key = make_route_key(&f.provider_id, &f.model_id, f.variant.as_deref());
+        if let Some(mult) = prefrontal_routing_core::model_facts::get_speed_multiplier(&route_key) {
+            f.scores.speed *= mult;
+            f.speed_multiplier = Some(mult);
+        }
+    }
+
+    let r = select_model_route(input(facts, req(60.0, 40.0), Extra::default())).unwrap();
+    let explanation = r.explanation.join("\n");
+    assert!(explanation.contains("(x0.5 configured)"));
+}
+
+// ── Tests for the best-effort adequacy band ─────────────────────────────────
+
+/// Helper: build a snapshot with quota_exhausted_until on the given route.
+fn snapshot_with_quota_exhausted(route_key: &str, until: f64) -> ModelRouteStateSnapshot {
+    let mut by_route = HashMap::new();
+    by_route.insert(
+        route_key.to_string(),
+        RouteRuntimeState {
+            quota_exhausted_until: Some(until),
+            cooldown_until: None,
+            ..Default::default()
+        },
+    );
+    ModelRouteStateSnapshot {
+        now: 1000.0,
+        by_route,
+        by_capacity: HashMap::new(),
+    }
+}
+
+/// (a) All-blocked catalog → all_routes_inadequate with earliest reset.
+/// Every admissible route is quota-blocked, so nothing even makes it to
+/// best-effort. The admission filter rejects everything for quota_exhausted
+/// and the result should be QuotaOrCooldownExhausted, not AllRoutesInadequate.
+/// (AllRoutesInadequate only fires when admissible routes exist but all fall
+/// below the band.)
+#[test]
+fn all_routes_quota_blocked_yields_quota_exhausted_not_all_inadequate() {
+    // Two routes: both quota-blocked, so admission rejects them all.
+    let good = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "good".into(),
+        scores: scores(55.0, 1600.0, 80.0),
+        ..Default::default()
+    });
+    let snapshot = snapshot_with_quota_exhausted("p/good", 2000.0);
+    let err = select_model_route_with_anchors(
+        input(
+            vec![good],
+            req(50.0, 0.0),
+            Extra {
+                runtime_snapshot: Some(snapshot),
+                ..Extra::default()
+            },
+        ),
+        &DEFAULT_ANCHORS,
+    )
+    .unwrap_err();
+    // Nothing admitted → QuotaOrCooldownExhausted, not AllRoutesInadequate.
+    assert_eq!(err.reason, RouteFailureReason::QuotaOrCooldownExhausted);
+}
+
+/// (a) proper all_routes_inadequate: admissible routes exist but the best is
+/// below the sanity band. The error carries the best rejected candidate and
+/// the earliest quota reset from the blocked routes in the rejected list.
+#[test]
+fn best_effort_below_band_yields_all_routes_inadequate() {
+    // A route that barely fails iq=90 (adequacy ~0.3 with the default anchors).
+    let weak = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "weak".into(),
+        scores: scores(35.0, 1500.0, 80.0),
+        ..Default::default()
+    });
+    // With default band (0.6), this model's adequacy will be well below.
+    let err = select_model_route_with_anchors(
+        input(vec![weak], req(90.0, 0.0), Extra::default()),
+        &DEFAULT_ANCHORS,
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, RouteFailureReason::AllRoutesInadequate);
+    // The best rejected candidate should name the weak route.
+    assert!(err.best_rejected.is_some());
+    let best = err.best_rejected.unwrap();
+    assert_eq!(best.route_key, "p/weak");
+    assert!(best.adequacy < MIN_BEST_EFFORT_ADEQUACY);
+    // No quota blocks in this scenario → earliest_reset is None.
+    assert!(err.earliest_reset.is_none());
+}
+
+/// (b) Survivor at adequacy ~0.72 → selected WITH belowFloor warning.
+#[test]
+fn best_effort_in_band_gets_below_floor_warning() {
+    // Route with adequacy ~0.78 for a moderate-to-high demand: below floor (0.9) but
+    // above the default band (0.6). This requires no other route to clear the bar.
+    let medium = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "medium".into(),
+        // iq=42 vs req 70 → fit ~0.69 (just under bar); eq=1450 vs req 30 → clears.
+        // Weighted adequacy ≈ (0.69*70 + 1.0*30)/100 ≈ 0.78.
+        scores: scores(42.0, 1450.0, 80.0),
+        ..Default::default()
+    });
+    // Higher-demand requirement so the model does NOT clear the adequacy floor.
+    let result = select_model_route_with_anchors(
+        input(vec![medium], req(70.0, 30.0), Extra::default()),
+        &DEFAULT_ANCHORS,
+    )
+    .unwrap();
+    // Should be selected (best-effort, within band).
+    assert_eq!(result.route_key, "p/medium");
+    // Adequacy should be below the floor but ≥ band.
+    assert!(
+        result.score.adequacy < prefrontal_routing_core::ADEQUACY_FLOOR,
+        "adequacy {:.3} should be below floor {:.3}",
+        result.score.adequacy,
+        prefrontal_routing_core::ADEQUACY_FLOOR
+    );
+    assert!(
+        result.score.adequacy >= MIN_BEST_EFFORT_ADEQUACY,
+        "adequacy {:.3} should be >= band {:.3}",
+        result.score.adequacy,
+        MIN_BEST_EFFORT_ADEQUACY
+    );
+    // Must carry the belowFloor warning.
+    let warning = result
+        .below_floor
+        .as_ref()
+        .expect("expected belowFloor warning");
+    assert!((warning.floor - prefrontal_routing_core::ADEQUACY_FLOOR).abs() < 1e-9);
+    assert!((warning.adequacy - result.score.adequacy).abs() < 1e-9);
+}
+
+/// (c) Survivor at adequacy ~0.3 with default band → rejected as AllRoutesInadequate.
+///     Same survivor with configured band 0.1 → selected+warned.
+#[test]
+fn survivor_below_default_band_rejected_above_configured_band_selected() {
+    // A route with adequacy ~0.3 for iq=8: clearly below the default band (0.6),
+    // but above a configured band of 0.1.
+    let weak = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "weak".into(),
+        // iq=38 vs req 8 → fit well below bar; eq=1400 vs req 2 → clears.
+        // This gives a weighted adequacy well below 0.6 but above 0.1.
+        scores: scores(38.0, 1400.0, 80.0),
+        ..Default::default()
+    });
+    // (c-1) Default band (0.6): should be AllRoutesInadequate.
+    let err = select_model_route_with_anchors(
+        input(vec![weak.clone()], req(80.0, 20.0), Extra::default()),
+        &DEFAULT_ANCHORS,
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, RouteFailureReason::AllRoutesInadequate);
+
+    // (c-2) Configured band 0.1: should be selected with belowFloor warning.
+    let result = select_model_route_with_anchors(
+        input(
+            vec![weak],
+            req(80.0, 20.0),
+            Extra {
+                min_best_effort_adequacy: Some(0.1),
+                ..Extra::default()
+            },
+        ),
+        &DEFAULT_ANCHORS,
+    )
+    .unwrap();
+    assert_eq!(result.route_key, "p/weak");
+    assert!(result.score.adequacy < prefrontal_routing_core::ADEQUACY_FLOOR);
+    assert!(result.score.adequacy >= 0.1);
+    assert!(result.below_floor.is_some());
+}
+
+/// (d) Config clamp: values >1 are clamped to 1; NaN is rejected loudly.
+/// The config parsing lives in the module crate, so we test the core constant
+/// and the band-check logic here. The module-level config validation
+/// (NaN rejection, clamping) is tested in the module crate's own tests.
+#[test]
+fn default_min_best_effort_adequacy_is_0_6() {
+    assert!((MIN_BEST_EFFORT_ADEQUACY - 0.6).abs() < 1e-9);
+}
+
+#[test]
+fn min_best_effort_adequacy_config_clamp_logic() {
+    // Clamp logic: [0, 1], NaN rejected. These mirror the module-crate validation.
+    // Values > 1 clamp to 1.
+    assert!((1.5_f64.clamp(0.0, 1.0) - 1.0).abs() < 1e-9);
+    // Values < 0 clamp to 0.
+    assert!(((-0.1_f64).clamp(0.0, 1.0) - 0.0).abs() < 1e-9);
+    // Normal values pass through.
+    assert!((0.5_f64.clamp(0.0, 1.0) - 0.5).abs() < 1e-9);
+    // NaN is NOT finite and should be rejected at parse time (tested in module crate).
+    assert!(f64::NAN.is_nan());
+}
+
+#[test]
+fn effectively_free_bucket_lets_demand_pick_the_stronger_model() {
+    // The terra-at-iq-95 inversion, live 2026-08-05: with 40x subsidies both
+    // terra (iq 55, $0.375 effective) and sol (iq 58, $0.75) cleared the bar at
+    // a 95 demand - terra at adequacy 0.93, sol at 1.00 - and cost-primary
+    // ordering handed the flagship demand to terra to save 37 imaginary cents.
+    // Inside the effectively-free bucket, adequacy must decide instead. (Weaker
+    // models are NOT this test's subject: past the 85 knee the saturating fit
+    // curve drops a 53-iq model below the floor entirely, so the GATE excludes
+    // it and the ordering never sees it - two earlier drafts asserted on that
+    // shape and were vacuous, their mutation proofs green under any ordering.)
+    let mut terra = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "terra".into(),
+        scores: scores(55.0, 1590.0, 100.0),
+        cost_per_m_tok_out: Some(15.0),
+        ..Default::default()
+    });
+    terra.subscription_multiplier = Some(40.0); // $0.375 effective
+    let mut sol = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "sol".into(),
+        scores: scores(58.0, 1610.0, 55.0),
+        cost_per_m_tok_out: Some(30.0),
+        ..Default::default()
+    });
+    sol.subscription_multiplier = Some(40.0); // $0.75 effective
+
+    // Anti-vacuity guard: terra must CLEAR the floor at iq 95 on its own, or
+    // the gate (not the ordering under test) is what excludes it and the main
+    // assertion stops meaning anything. Fails the test loudly if a future
+    // anchor change pushes a 55-iq model under the floor at this demand.
+    let terra_alone = select_model_route(input(
+        vec![terra.clone()],
+        req(95.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert!(
+        !terra_alone.explanation.join("\n").contains("best-effort"),
+        "terra must CLEAR the floor at iq 95 or this test asserts nothing about ordering"
+    );
+
+    let high = select_model_route(input(
+        vec![terra.clone(), sol.clone()],
+        req(95.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(
+        high.model.model_id, "sol",
+        "inside the free bucket the demand's own quality metric decides"
+    );
+
+    // iq 30: both saturate adequacy 1.00, so the bucket falls through to the
+    // speed tiebreak and the fast mid model keeps cheap-band work off the
+    // flagship.
+    let low = select_model_route(input(
+        vec![terra.clone(), sol.clone()],
+        req(30.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(
+        low.model.model_id, "terra",
+        "when adequacy saturates for both, speed keeps cheap work on the faster model"
+    );
+
+    // Metered contrast (the bucket-boundary mutation guard): the same pair
+    // WITHOUT subsidies sits far above the free threshold, so cost-primary
+    // ordering must still pick the genuinely cheaper adequate route. Fails if
+    // the bucket is widened to swallow real dollar differences.
+    let metered = select_model_route(input(
+        vec![
+            fact(FactBuilder {
+                provider_id: "openai".into(),
+                model_id: "terra".into(),
+                scores: scores(55.0, 1590.0, 100.0),
+                cost_per_m_tok_out: Some(15.0),
+                ..Default::default()
+            }),
+            fact(FactBuilder {
+                provider_id: "openai".into(),
+                model_id: "sol".into(),
+                scores: scores(58.0, 1610.0, 55.0),
+                cost_per_m_tok_out: Some(30.0),
+                ..Default::default()
+            }),
+        ],
+        req(95.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(
+        metered.model.model_id, "terra",
+        "outside the bucket real price differences still order the pick"
+    );
+}

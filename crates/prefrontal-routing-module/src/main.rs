@@ -1,0 +1,2660 @@
+#![forbid(unsafe_code)]
+
+//! The prefrontal-routing subc module.
+//!
+//! Lifecycle (mirrors the canonical module handshake, same shape as quota-module):
+//!   1. read `--subc <connection-file>`, HMAC-authenticate as a client to subc;
+//!   2. send `HELLO { manifest }` registering the routing operations, await
+//!      `HELLO_ACK`;
+//!   3. serve channel-0 control (`route.bind` → ack, `PING` → `PONG`) and
+//!      route-channel data requests (`route.select` → `SelectedModelRoute`).
+//!
+//! The module OWNS the model catalog (currently the curated seed; the route-state
+//! SQLite store + module-to-module quota consumption land in later slices). The
+//! caller passes the task's requirements + the set of available routes; the
+//! module runs the pure `prefrontal-routing-core` scorer and returns the selection.
+
+mod config_overrides;
+mod quota_consumer;
+
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    ffi::OsString,
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use cortexkit_store_types::StorageDescriptor;
+use prefrontal_routing_core::model_router::{
+    select_model_route, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
+    RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
+};
+use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
+use prefrontal_routing_core::route_anchors::{ANCHOR_VERSION, DEFAULT_ANCHORS};
+use prefrontal_routing_core::{
+    derive_provider_key, fact_to_route, maybe_upgrade_to_fast_variant, relax_earliest_reset,
+    select_panel, validate_panel_spec, BreakGlassCandidate, DecisionInput, FastVariantUpgradeInput,
+    ModelFact, ModelRequirements, ModelRoute, PanelRosterEntry, PanelSelection, PanelSpec,
+    RouteOutcome, RouteStateStore, SelectPanelInput, SelectedPanel,
+};
+use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+use quota_consumer::QuotaConsumer;
+use serde::{Deserialize, Deserializer};
+use serde_json::json;
+use subc_protocol::{
+    manifest::{
+        Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+    },
+    session::{
+        HealthReport, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
+    },
+    ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
+    PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
+};
+use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
+    net::TcpStream,
+    sync::mpsc,
+};
+
+const DEFAULT_MODULE_ID: &str = "prefrontal-routing";
+const ROUTE_SELECT_OP: &str = "route.select";
+const ROUTE_SELECT_PANEL_OP: &str = "route.select_panel";
+/// Set a recorded decision's terminal outcome (idempotent UPDATE by id).
+const ROUTE_SET_DECISION_OUTCOME_OP: &str = "route.set_decision_outcome";
+/// Record one observed-TPS usage sample (idempotent by message id).
+const ROUTE_RECORD_USAGE_OP: &str = "route.record_usage";
+/// Record a route cooldown / quota-error increment (best-effort soft state).
+const ROUTE_RECORD_COOLDOWN_OP: &str = "route.record_cooldown";
+/// Query only cooldown state for a frozen route without re-running admission.
+const ROUTE_COOLDOWN_STATUS_OP: &str = "route.cooldown_status";
+/// Observability op: reports whether the outbound quota-consumer connection is
+/// live and how fresh its windows are. Lets a consumer (and the e2e) confirm the
+/// module->module quota path actually round-tripped, not just that it didn't hang.
+const QUOTA_STATUS_OP: &str = "route.quota_status";
+const HELLO_CORR: u64 = 1;
+const EGRESS_BUFFER: usize = 64;
+/// How often the background task refreshes quota windows from ai-provider-quota.
+/// Windows change slowly, so a cached snapshot refreshed off the selection hot
+/// path keeps `route.select` from ever blocking on a live cross-module call.
+const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Backoff between quota-connect attempts when ai-provider-quota is absent/down.
+/// The module degrades gracefully (seed-only selection) until quota appears. Kept
+/// short so a sibling module that registers slightly later is picked up promptly.
+const QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+/// Decision audit rows are retained for one month before the existing refresh
+/// cycle deletes them.
+const DECISION_RETENTION_MS: u64 = 30 * 24 * 60 * 60_000;
+/// How recently a provider must have supplied a live quota entry for its
+/// low-pressure reading to permit an optimistic fast-variant upgrade. Retained
+/// windows still constrain normal selection but never authorize an upgrade.
+const QUOTA_FRESH_FOR_UPGRADE_MS: u64 = 3 * 60_000;
+
+/// Latest quota snapshot, shared between the background refresh task (writer) and
+/// `route.select` handlers (readers). The lock is NEVER held across an `.await`:
+/// the refresh task fetches outside the lock then takes it briefly to merge; a
+/// selection takes it only to clone the snapshot out.
+#[derive(Default)]
+struct QuotaCache {
+    windows: Vec<ProviderUsage>,
+    refreshed_at_ms: u64,
+    /// Observation time for providers that supplied a live entry in the latest
+    /// successful poll. Replacing this map makes absent and degraded providers stale.
+    provider_observed_at_ms: HashMap<String, u64>,
+    available: bool,
+    /// Last connect/fetch error (observability: surfaced via route.quota_status).
+    last_error: Option<String>,
+    /// Provider/account keys whose most recent refresh degraded while a healthy window is retained.
+    retained_degraded_keys: HashSet<String>,
+}
+
+type SharedQuotaCache = Arc<Mutex<QuotaCache>>;
+
+/// The route-state store, shared by the select handler (reader). Single-writer:
+/// this module holds the store's lease for its lifetime.
+type SharedStore = Arc<SqliteRouteStateStore>;
+/// Shared read of `min_best_effort_adequacy` from config. Written once at boot;
+/// read on every `route.select`.
+type SharedMinBand = Arc<std::sync::Mutex<Option<f64>>>;
+type RouteEpochs = HashMap<u16, u32>;
+
+fn clear_route_epoch(route_epochs: &mut RouteEpochs, channel: u16, epoch: u32) {
+    if route_epochs.get(&channel) == Some(&epoch) {
+        route_epochs.remove(&channel);
+    }
+}
+
+fn quota_cache_key(window: &ProviderUsage) -> String {
+    format!(
+        "{}\0{}",
+        window.provider,
+        window.account.as_deref().unwrap_or("")
+    )
+}
+
+fn merge_quota_windows(
+    existing: &mut Vec<ProviderUsage>,
+    fresh: Vec<ProviderUsage>,
+    retained_degraded_keys: &mut HashSet<String>,
+) {
+    let mut fresh_by_key: std::collections::HashMap<String, ProviderUsage> = fresh
+        .into_iter()
+        .map(|window| (quota_cache_key(&window), window))
+        .collect();
+    let mut merged = Vec::with_capacity(existing.len() + fresh_by_key.len());
+    for window in existing.drain(..) {
+        let key = quota_cache_key(&window);
+        if let Some(replacement) = fresh_by_key.remove(&key) {
+            if window.is_healthy() && !replacement.is_healthy() {
+                if retained_degraded_keys.insert(key.clone()) {
+                    let reason = replacement
+                        .error
+                        .as_deref()
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or("no usable quota windows");
+                    let provider = match replacement
+                        .account
+                        .as_deref()
+                        .filter(|account| !account.is_empty())
+                    {
+                        Some(account) => format!("{} account {}", replacement.provider, account),
+                        None => replacement.provider.clone(),
+                    };
+                    eprintln!(
+                        "[prefrontal-routing] retaining last healthy quota window for {provider} after degraded refresh: {reason}"
+                    );
+                }
+                merged.push(window);
+            } else {
+                if replacement.is_healthy() {
+                    retained_degraded_keys.remove(&key);
+                }
+                merged.push(replacement);
+            }
+        } else {
+            merged.push(window);
+        }
+    }
+    for (key, window) in fresh_by_key {
+        if window.is_healthy() {
+            retained_degraded_keys.remove(&key);
+        }
+        merged.push(window);
+    }
+    *existing = merged;
+}
+
+fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observed_at_ms: u64) {
+    // Freshness keys on the same resolved id the overlay keys on: the published
+    // canonical slug first, wire name as fallback. Keying this map on the wire
+    // name alone while the overlay resolves via apiProvider would mark a
+    // provider's windows live under one name and stale under the other.
+    cache.provider_observed_at_ms = fresh
+        .iter()
+        .filter(|entry| entry.is_healthy())
+        .map(|entry| {
+            let key = entry
+                .api_provider
+                .clone()
+                .filter(|slug| !slug.is_empty())
+                .unwrap_or_else(|| entry.provider.clone());
+            (key, observed_at_ms)
+        })
+        .collect();
+    merge_quota_windows(&mut cache.windows, fresh, &mut cache.retained_degraded_keys);
+    cache.refreshed_at_ms = observed_at_ms;
+    cache.available = true;
+    cache.last_error = None;
+}
+
+fn record_quota_refresh_failure(cache: &mut QuotaCache, phase: &str, error: impl fmt::Display) {
+    cache.available = false;
+    cache.provider_observed_at_ms.clear();
+    cache.last_error = Some(format!("{phase}: {error}"));
+}
+
+fn record_cooldown_update(
+    store: &impl RouteStateStore,
+    params: &RecordCooldownParams,
+) -> prefrontal_routing_core::RouteStateResult<()> {
+    let update = prefrontal_routing_core::RouteStateUpdate {
+        cooldown_until: params.cooldown_until,
+        quota_exhausted_until: params.quota_exhausted_until,
+        quota_pressure: params.quota_pressure,
+        last_error: params.last_error.clone(),
+        increment_quota_error: params.increment_quota_error,
+        increment_failure: params.increment_failure,
+        ..Default::default()
+    };
+    if params.provider_wide {
+        let provider_key = derive_provider_key(&params.route_key)
+            .or_else(|| derive_provider_key(&params.capacity_key))
+            .ok_or_else(|| {
+                prefrontal_routing_core::RouteStateStoreError(
+                    "provider-wide cooldown has no canonical provider key".into(),
+                )
+            })?;
+        return store.record_provider_cooldown(
+            provider_key,
+            &params.route_key,
+            &params.capacity_key,
+            &update,
+        );
+    }
+    store.update_route_state(&params.route_key, &params.capacity_key, &update)
+}
+
+fn prune_expired_decisions(store: &impl RouteStateStore, now: u64) {
+    let cutoff = now.saturating_sub(DECISION_RETENTION_MS) as i64;
+    if let Err(error) = store.delete_decisions_older_than(cutoff) {
+        tracing::debug!(error = %error, "decision retention cycle failed");
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Resolve the storage descriptor, preferring the daemon-delivered one from
+/// `HELLO_ACK.storage` and falling back to a local dev descriptor when storage is
+/// not centrally configured. The ONLY descriptor-acquisition site: the
+/// dev↔delivered choice lives here alone.
+fn resolve_storage_descriptor(
+    ack_storage: &Option<serde_json::Value>,
+    module_id: &str,
+) -> Result<StorageDescriptor, ModuleError> {
+    if let Some(value) = ack_storage {
+        return serde_json::from_value(value.clone()).map_err(ModuleError::Json);
+    }
+    // No managed storage configured by the daemon → dev fallback: a per-module
+    // sqlite db under the OS temp dir, so a standalone/dev run still has a store.
+    let path = std::env::temp_dir()
+        .join("cortexkit")
+        .join(module_id)
+        .join("store.db")
+        .to_string_lossy()
+        .into_owned();
+    Ok(dev_descriptor(module_id, path))
+}
+
+/// Open the route-state store from the resolved descriptor (applies migrations:
+/// DDL + the 33-fact seed, run-once). The lib derives the single-writer lease
+/// location from the descriptor's db path (one lease per database, by
+/// construction), so there is nothing to pass or get wrong here.
+fn open_route_state_store(descriptor: &StorageDescriptor) -> Result<SharedStore, ModuleError> {
+    let store = SqliteRouteStateStore::open(descriptor)
+        .map_err(|e| ModuleError::Message(format!("open route-state store: {e}")))?;
+    Ok(Arc::new(store))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), ModuleError> {
+    let config = ModuleConfig::from_env()?;
+    run(config).await
+}
+
+struct ModuleConfig {
+    connection_file_path: PathBuf,
+    module_id: String,
+}
+
+impl ModuleConfig {
+    fn from_env() -> Result<Self, ModuleError> {
+        let connection_file_path = parse_subc_arg(std::env::args_os().skip(1))?;
+        let module_id = std::env::var(SUBC_MODULE_ID_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string());
+        Ok(Self {
+            connection_file_path,
+            module_id,
+        })
+    }
+}
+
+async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
+    let stream = connect_to_subc(&config.connection_file_path).await?;
+    let (mut read_half, write_half) = tokio::io::split(stream);
+    let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
+    let writer = tokio::spawn(drain_writer(write_half, rx));
+
+    // The quota cache is fed by SEPARATE short-lived outbound consumer connections
+    // to ai-provider-quota (the second, independent connection while a cycle runs).
+    // It refreshes off the selection hot path; route.select reads the cached snapshot,
+    // never blocking on a live cross-module call. Quota being absent is non-fatal
+    // (seed-only routing).
+    let quota_cache: SharedQuotaCache = Arc::new(Mutex::new(QuotaCache::default()));
+
+    let loop_result = module_loop(&mut read_half, tx.clone(), &config, quota_cache).await;
+    drop(tx);
+
+    let writer_result = writer
+        .await
+        .map_err(|e| ModuleError::Message(e.to_string()));
+    match (loop_result, writer_result) {
+        (Err(loop_err), _) => Err(loop_err),
+        (Ok(()), Ok(Ok(()))) => Ok(()),
+        (Ok(()), Ok(Err(writer_err))) => Err(ModuleError::Message(writer_err.to_string())),
+        (Ok(()), Err(join_err)) => Err(join_err),
+    }
+}
+
+/// Background task refreshing quota windows on an interval. Each cycle owns its
+/// outbound connection; the connection is never held across the refresh sleep. The
+/// fetch `.await` happens with NO lock held; the cache lock is taken only to merge
+/// the fresh poll, so a slow/blocked quota call can never stall `route.select`.
+/// The same cadence also prunes expired decision audit rows, avoiding another timer.
+async fn quota_refresh_loop(
+    connection_file_path: PathBuf,
+    cache: SharedQuotaCache,
+    store: SharedStore,
+) {
+    // The quota module is machine-global (ignores project_root), but route.open
+    // needs a valid identity. A stable per-process temp dir suffices.
+    let project_root = std::env::temp_dir().join("prefrontal-routing-quota-consumer");
+    let _ = std::fs::create_dir_all(&project_root);
+
+    loop {
+        prune_expired_decisions(store.as_ref(), now_ms());
+        let mut consumer = match QuotaConsumer::connect(&connection_file_path, &project_root).await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // Quota module not up yet (or route.open failed). Degrade to
+                // seed-only routing and retry; do not crash the module. Record the
+                // error so route.quota_status can surface why quota is unavailable.
+                tracing::debug!(error = %e, "quota refresh cycle failed");
+                if let Ok(mut guard) = cache.lock() {
+                    record_quota_refresh_failure(&mut guard, "connect", &e);
+                }
+                tokio::time::sleep(QUOTA_RETRY_INTERVAL).await;
+                continue;
+            }
+        };
+
+        match consumer.usage_get().await {
+            Ok(windows) => {
+                // Replace healthy providers we just heard from, but retain providers absent
+                // from this poll and healthy windows whose fresh replacement degraded.
+                if let Ok(mut guard) = cache.lock() {
+                    apply_quota_refresh(&mut guard, windows, now_ms());
+                }
+                // `usage_get` sends GOODBYE and shuts down the stream on success;
+                // drop it before beginning the long idle interval as well.
+                drop(consumer);
+                tokio::time::sleep(QUOTA_REFRESH_INTERVAL).await;
+            }
+            Err(e) => {
+                // A failed cycle is expected during transient daemon restarts. Keep
+                // the last healthy windows, mark the live observation unavailable,
+                // and reconnect from scratch on the retry interval.
+                tracing::debug!(error = %e, "quota refresh cycle failed");
+                if let Ok(mut guard) = cache.lock() {
+                    record_quota_refresh_failure(&mut guard, "usage.get", &e);
+                }
+                drop(consumer);
+                tokio::time::sleep(QUOTA_RETRY_INTERVAL).await;
+            }
+        }
+    }
+}
+
+async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, ModuleError> {
+    let conn = connection_file::read(connection_file_path)
+        .map_err(|e| ModuleError::Message(format!("reading connection file: {e}")))?;
+    let endpoint = conn
+        .endpoints
+        .first()
+        .ok_or_else(|| ModuleError::Message("connection file has no endpoints".into()))?;
+    let addr = format!("{}:{}", endpoint.host, endpoint.port);
+    let mut stream = TcpStream::connect(&addr)
+        .await
+        .map_err(|e| ModuleError::Message(format!("connect {addr}: {e}")))?;
+    authenticate_client(&mut stream, &conn, std::time::Duration::from_secs(2))
+        .await
+        .map_err(|e| ModuleError::Message(format!("authenticate: {e}")))?;
+    Ok(stream)
+}
+
+async fn module_loop<R>(
+    read_half: &mut R,
+    writer: mpsc::Sender<Frame>,
+    config: &ModuleConfig,
+    quota_cache: SharedQuotaCache,
+) -> Result<(), ModuleError>
+where
+    R: AsyncRead + Unpin,
+{
+    send_hello(&writer, config).await?;
+    let ack = expect_hello_ack(read_half).await?;
+
+    // Open the route-state store from the daemon-delivered descriptor (or the dev
+    // fallback). Opening acquires the single-writer lease and runs migrations (the
+    // 33-fact seed, once). The store backs route.select's facts + runtime snapshot.
+    let descriptor = resolve_storage_descriptor(&ack.storage, &config.module_id)?;
+    let store = open_route_state_store(&descriptor)?;
+    tokio::spawn(quota_refresh_loop(
+        config.connection_file_path.clone(),
+        Arc::clone(&quota_cache),
+        Arc::clone(&store),
+    ));
+
+    // Merge the user's model-fact overrides (model_routing.models) from the module's
+    // OWN config-home file onto the migration-applied seed. The module owns its
+    // catalog incl overrides (NOT subc-mediated config, which is unwired). A missing
+    // file is a no-op; a parse error is logged but never aborts boot (routing
+    // degrades to the seed catalog).
+    let override_path = config_overrides::config_path();
+    match config_overrides::apply_overrides_from_config(store.as_ref(), &override_path) {
+        Ok(outcome) => {
+            if outcome.applied > 0 || outcome.reverted > 0 || !outcome.skipped.is_empty() {
+                eprintln!(
+                    "[prefrontal-routing] model-fact overrides: applied {}, reverted {}, skipped {:?}",
+                    outcome.applied, outcome.reverted, outcome.skipped
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("[prefrontal-routing] model-fact override read failed (using seed): {e}")
+        }
+    }
+
+    // Read `min_best_effort_adequacy` from the same config file. Clamp to [0,1];
+    // reject NaN loudly. Absent means use the module default (0.6).
+    let min_band: SharedMinBand = Arc::new(std::sync::Mutex::new(
+        match config_overrides::read_min_best_effort_adequacy(&override_path) {
+            Ok(Some(val)) => {
+                eprintln!("[prefrontal-routing] min_best_effort_adequacy: {val}");
+                Some(val)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!(
+                    "[prefrontal-routing] min_best_effort_adequacy config error (using default): {e}"
+                );
+                None
+            }
+        },
+    ));
+
+    let mut route_epochs = RouteEpochs::new();
+    loop {
+        let Some(frame) = read_frame(read_half)
+            .await
+            .map_err(|e| ModuleError::Message(e.to_string()))?
+        else {
+            return Ok(()); // clean EOF: subc closed the connection.
+        };
+        if !handle_frame(
+            frame,
+            &writer,
+            &quota_cache,
+            &store,
+            &mut route_epochs,
+            &min_band,
+            &override_path,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+}
+
+async fn drain_writer<W>(write_half: W, mut rx: mpsc::Receiver<Frame>) -> Result<(), ModuleError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut writer = BufWriter::new(write_half);
+    while let Some(frame) = rx.recv().await {
+        write_frame(&mut writer, &frame)
+            .await
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+        while let Ok(frame) = rx.try_recv() {
+            write_frame(&mut writer, &frame)
+                .await
+                .map_err(|e| ModuleError::Message(e.to_string()))?;
+        }
+        writer
+            .flush()
+            .await
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+    Ok(())
+}
+
+async fn send_hello(
+    writer: &mpsc::Sender<Frame>,
+    config: &ModuleConfig,
+) -> Result<(), ModuleError> {
+    let body = serde_json::to_vec(&ModuleHelloBody {
+        manifest: manifest(&config.module_id),
+        protocol_ver: PROTOCOL_VERSION,
+        // Advertise health.check: the daemon's prober is capability-gated and only probes
+        // modules that DECLARE the op: answering it (handle_control_request) is not enough.
+        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+        launch_nonce: std::env::var("SUBC_LAUNCH_NONCE").ok(),
+    })
+    .map_err(ModuleError::Json)?;
+    let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
+}
+
+async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, ModuleError>
+where
+    R: AsyncRead + Unpin,
+{
+    let frame = read_frame(reader)
+        .await
+        .map_err(|e| ModuleError::Message(e.to_string()))?
+        .ok_or_else(|| ModuleError::Message("connection closed before HELLO_ACK".into()))?;
+    match frame.header.ty {
+        FrameType::HelloAck => serde_json::from_slice(&frame.body).map_err(ModuleError::Json),
+        FrameType::Error => {
+            let body =
+                serde_json::from_slice::<ErrorBody>(&frame.body).map_err(ModuleError::Json)?;
+            Err(ModuleError::Message(format!(
+                "subc rejected HELLO: {}: {}",
+                body.code, body.message
+            )))
+        }
+        ty => Err(ModuleError::Message(format!(
+            "unexpected frame {ty:?} awaiting HELLO_ACK"
+        ))),
+    }
+}
+
+/// Returns `Ok(false)` to stop the loop (graceful goodbye / EOF).
+async fn handle_frame(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    quota_cache: &SharedQuotaCache,
+    store: &SharedStore,
+    route_epochs: &mut RouteEpochs,
+    min_band: &SharedMinBand,
+    routing_config_path: &Path,
+) -> Result<bool, ModuleError> {
+    match frame.header.ty {
+        FrameType::Ping if frame.header.channel == 0 => {
+            let pong = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Pong,
+                frame.header.flags,
+                0,
+                0,
+                frame.header.corr,
+                Vec::new(),
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+            send(writer, pong).await?;
+            Ok(true)
+        }
+        FrameType::Goodbye if frame.header.channel == 0 => Ok(false),
+        FrameType::Goodbye => {
+            clear_route_epoch(route_epochs, frame.header.channel, frame.header.epoch);
+            Ok(true)
+        }
+        FrameType::Request if frame.header.channel == 0 => {
+            handle_control_request(frame, writer, route_epochs).await?;
+            Ok(true)
+        }
+        FrameType::Request => {
+            let Some(&route_epoch) = route_epochs.get(&frame.header.channel) else {
+                return Ok(true);
+            };
+            if frame.header.epoch != route_epoch {
+                return Ok(true);
+            }
+            // Data-plane request on a route channel. Spawn so a slow selection
+            // never head-of-line-blocks another route.
+            let writer = writer.clone();
+            let quota_cache = Arc::clone(quota_cache);
+            let store = Arc::clone(store);
+            let min_band = Arc::clone(min_band);
+            let routing_config_path = routing_config_path.to_path_buf();
+            tokio::spawn(async move {
+                let _ = handle_select_request(
+                    frame,
+                    route_epoch,
+                    &writer,
+                    &quota_cache,
+                    &store,
+                    &min_band,
+                    &routing_config_path,
+                )
+                .await;
+            });
+            Ok(true)
+        }
+        _ => Ok(true),
+    }
+}
+
+async fn handle_control_request(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    route_epochs: &mut RouteEpochs,
+) -> Result<(), ModuleError> {
+    let request =
+        serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
+    match request {
+        ModuleControlRequest::RouteBind {
+            route_channel,
+            epoch,
+            ..
+        } => {
+            // The catalog is machine-global, but the wire identity is binding-specific.
+            // Install it only after the accepted bind ACK is queued.
+            let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
+                .map_err(ModuleError::Json)?;
+            let response = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                frame.header.corr,
+                body,
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+            send(writer, response).await?;
+            route_epochs.insert(route_channel, epoch);
+            Ok(())
+        }
+        ModuleControlRequest::HealthCheck {} => {
+            // Routing is stateless: the catalog is machine-global and selection depends
+            // only on the request body, so there is no domain state that can wedge: a
+            // reply on this real dispatch path is itself the liveness proof the prober wants.
+            let body = serde_json::to_vec(&ModuleControlResponse::from(HealthReport::ok()))
+                .map_err(ModuleError::Json)?;
+            let response = Frame::build_with_version(
+                frame.header.ver,
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                frame.header.corr,
+                body,
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+            send(writer, response).await
+        }
+    }
+}
+
+/// The method envelope, decoded first so an unknown method reports `unknown_method`
+/// regardless of whether the (method-specific) params are present/valid. Only once
+/// the method is confirmed do we decode the typed `SelectParams`.
+#[derive(Debug, Deserialize)]
+struct MethodEnvelope {
+    method: String,
+}
+
+/// The full `route.select` body, decoded only after the method is confirmed.
+#[derive(Debug, Deserialize)]
+struct SelectBody {
+    params: SelectParams,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectParams {
+    #[serde(default = "default_target_agent")]
+    target_agent: String,
+    #[serde(deserialize_with = "deserialize_wire_requirements")]
+    requirements: ModelRequirements,
+    /// The routeKeys/capacityKeys the caller is logged into. Required: an empty
+    /// set yields a typed `no_available_model` failure (the honest result).
+    #[serde(default)]
+    available_models: Vec<String>,
+    #[serde(default)]
+    exclude_route_keys: Vec<String>,
+    #[serde(default)]
+    required_capabilities: Option<RequiredCapabilities>,
+    /// The subset of `available_models` that are flat-rate SUBSCRIPTION routes
+    /// (effective metered cost 0). The plugin resolves this (it reads the harness's
+    /// auth model + the curated/config subscription specs); the module stays
+    /// harness-agnostic and just applies the cost model to the supplied set.
+    #[serde(default)]
+    subscription_keys: Vec<String>,
+    /// Raw `model_routing.prefer_fast_when_relaxed` spec entries; the module runs
+    /// the post-selection fast-variant upgrade against them.
+    #[serde(default)]
+    prefer_fast_specs: Vec<String>,
+    /// Gather seats can request cache-capable providers without changing the
+    /// normal quality and cost ordering for other route selections.
+    #[serde(default)]
+    prefer_prompt_cache: bool,
+    /// Audit context for the recorded decision (route.select is now a mutate that
+    /// records the decision server-side and returns its id).
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default, alias = "parentSessionID")]
+    parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectPanelBody {
+    params: SelectPanelParams,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectPanelParams {
+    #[serde(deserialize_with = "deserialize_wire_panel_spec")]
+    panel_spec: PanelSpec,
+    #[serde(default)]
+    selection: PanelSelection,
+    #[serde(default)]
+    roster: Vec<PanelRosterEntry>,
+    #[serde(default)]
+    package_tokens_estimate: Option<u32>,
+    #[serde(default)]
+    pro_member_max_package_tokens: Option<u32>,
+    #[serde(default)]
+    available_models: Vec<String>,
+    #[serde(default)]
+    exclude_route_keys: Vec<String>,
+    #[serde(default)]
+    required_capabilities: Option<RequiredCapabilities>,
+    #[serde(default)]
+    subscription_keys: Vec<String>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default)]
+    parent_session_id: Option<String>,
+}
+
+fn default_target_agent() -> String {
+    "unknown".to_string()
+}
+
+/// Normalize demand values at the routing wire boundary. Values in (0, 10]
+/// are legacy 0-10 demands and are multiplied by 10; values above 10 already
+/// use the 0-100 scale and pass through. A genuine 0-100 demand of <=10 would
+/// target below the weak anchor, which no caller legitimately asks for, so the
+/// detection is unambiguous. Keep this compatibility shim at the wire boundary
+/// so old plugins and classify plans using the legacy scale remain safe without
+/// duplicating conversion logic in the scoring core.
+fn normalize_wire_demand(value: f64) -> f64 {
+    if value > 0.0 && value <= 10.0 {
+        value * 10.0
+    } else {
+        value
+    }
+}
+
+fn deserialize_wire_requirements<'de, D>(deserializer: D) -> Result<ModelRequirements, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut requirements = ModelRequirements::deserialize(deserializer)?;
+    requirements.iq = normalize_wire_demand(requirements.iq);
+    requirements.eq = normalize_wire_demand(requirements.eq);
+    Ok(requirements)
+}
+
+fn deserialize_wire_panel_spec<'de, D>(deserializer: D) -> Result<PanelSpec, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut panel_spec = PanelSpec::deserialize(deserializer)?;
+    panel_spec.iq_floor = normalize_wire_demand(panel_spec.iq_floor);
+    Ok(panel_spec)
+}
+
+/// subc-wire-name → routing providerID reconciliation. The quota module's wire
+/// provider names ("codex", "claude", "antigravity", ...) differ from our
+/// providerIDs ("openai", "anthropic", "google", ...). This mirrors the plugin's
+/// live CODEXBAR_PROVIDER_MAP exactly (the 6 providers the plugin currently routes
+/// quota for). An unmapped wire name contributes no pressure (degrades safely); the
+/// `antigravity → google` entry pairs with the per-model extractor so the Geminis'
+/// own windows pressure their capacities (not the misleading aggregate).
+fn quota_name_map() -> &'static std::collections::HashMap<String, String> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        [
+            ("codex", "openai"),
+            ("grok", "xai"),
+            ("antigravity", "google"),
+            ("opencodego", "opencode-go"),
+            ("ollama", "ollama-cloud"),
+            ("claude", "anthropic"),
+        ]
+        .into_iter()
+        .map(|(wire, pid)| (wire.to_string(), pid.to_string()))
+        .collect()
+    })
+}
+
+struct PreparedSelectionInputs {
+    now: f64,
+    facts: Vec<ModelFact>,
+    snapshot: ModelRouteStateSnapshot,
+    fresh_quota_provider_ids: HashSet<String>,
+}
+
+/// Read one consistent store/cache view for every selection operation. Quota
+/// windows are cloned before merging so no handler holds the cache lock while
+/// recording or writing its response.
+fn prepare_selection_inputs(
+    quota_cache: &SharedQuotaCache,
+    store: &SharedStore,
+) -> Result<PreparedSelectionInputs, String> {
+    let now = now_ms() as f64;
+    let facts = store
+        .get_facts_with_observed_speed(now)
+        .map_err(|e| format!("reading facts from route-state store: {e}"))?;
+    let mut snapshot = store
+        .build_snapshot(now)
+        .map_err(|e| format!("building route-state snapshot: {e}"))?;
+    // Retain cached windows even while the quota source is unavailable. Dropping
+    // last-known pressure would make a transient outage look optimistically free.
+    let (quota_windows, provider_observed_at_ms) = match quota_cache.lock() {
+        Ok(guard) if !guard.windows.is_empty() => (
+            Some(guard.windows.clone()),
+            guard.provider_observed_at_ms.clone(),
+        ),
+        _ => (None, HashMap::new()),
+    };
+    if let Some(windows) = &quota_windows {
+        merge_quota_overlay(&mut snapshot, windows, &facts, quota_name_map());
+    }
+    let current_ms = now_ms();
+    let fresh_quota_provider_ids = provider_observed_at_ms
+        .into_iter()
+        .filter(|(_, observed_at_ms)| {
+            *observed_at_ms != 0
+                && current_ms.saturating_sub(*observed_at_ms) <= QUOTA_FRESH_FOR_UPGRADE_MS
+        })
+        .filter_map(|(key, _)| {
+            // The freshness map's key is the published canonical slug when QTA
+            // serves one (already a routing providerID), else the wire name that
+            // still needs the local map. Try the map first so legacy wire names
+            // resolve; a miss means the key is already canonical.
+            quota_name_map().get(&key).cloned().or(Some(key))
+        })
+        .collect();
+    Ok(PreparedSelectionInputs {
+        now,
+        facts,
+        snapshot,
+        fresh_quota_provider_ids,
+    })
+}
+
+async fn handle_select_request(
+    mut frame: Frame,
+    route_epoch: u32,
+    writer: &mpsc::Sender<Frame>,
+    quota_cache: &SharedQuotaCache,
+    store: &SharedStore,
+    min_band: &SharedMinBand,
+    routing_config_path: &Path,
+) -> Result<(), ModuleError> {
+    let channel = frame.header.channel;
+    frame.header.epoch = route_epoch;
+    let epoch = route_epoch;
+    let corr = frame.header.corr;
+    let ver = frame.header.ver;
+
+    // Decode the method first: an unknown method must report `unknown_method` even
+    // when params are absent/malformed (the params are method-specific).
+    let envelope: MethodEnvelope = match serde_json::from_slice(&frame.body) {
+        Ok(e) => e,
+        Err(e) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &format!("route request body has no decodable method: {e}"),
+            )
+            .await;
+        }
+    };
+
+    if envelope.method == QUOTA_STATUS_OP {
+        let (available, refreshed_at_ms, providers, healthy, last_error) = match quota_cache.lock()
+        {
+            Ok(g) => (
+                g.available,
+                g.refreshed_at_ms,
+                g.windows.len(),
+                g.windows.iter().filter(|w| w.is_healthy()).count(),
+                g.last_error.clone(),
+            ),
+            Err(_) => (false, 0, 0, 0, Some("cache poisoned".to_string())),
+        };
+        let body = serde_json::to_vec(&json!({ "result": {
+            "available": available,
+            "refreshedAtMs": refreshed_at_ms,
+            "providerCount": providers,
+            "healthyCount": healthy,
+            "lastError": last_error,
+        }}))
+        .map_err(ModuleError::Json)?;
+        let response = Frame::build_with_version(
+            ver,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            body,
+        )
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+        return send(writer, response).await;
+    }
+
+    if envelope.method == ROUTE_SET_DECISION_OUTCOME_OP {
+        return handle_set_decision_outcome(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_RECORD_USAGE_OP {
+        return handle_record_usage(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_RECORD_COOLDOWN_OP {
+        return handle_record_cooldown(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_COOLDOWN_STATUS_OP {
+        return handle_cooldown_status(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_SELECT_PANEL_OP {
+        return handle_select_panel(frame, writer, quota_cache, store).await;
+    }
+
+    if envelope.method != ROUTE_SELECT_OP {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "unknown_method",
+            &format!("unknown method '{}'", envelope.method),
+        )
+        .await;
+    }
+
+    let params: SelectParams = match serde_json::from_slice::<SelectBody>(&frame.body) {
+        Ok(b) => b.params,
+        Err(e) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &format!("route.select params not decodable: {e}"),
+            )
+            .await;
+        }
+    };
+    let providers_without_prompt_cache = match config_overrides::read_providers_without_prompt_cache(
+        routing_config_path,
+    ) {
+        Ok(providers) => providers,
+        Err(error) => {
+            eprintln!(
+                    "[prefrontal-routing] prompt-cache provider config reload failed (using default): {error}"
+                );
+            config_overrides::default_providers_without_prompt_cache()
+        }
+    };
+    let PreparedSelectionInputs {
+        now,
+        facts,
+        snapshot,
+        fresh_quota_provider_ids,
+    } = match prepare_selection_inputs(quota_cache, store) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
+        }
+    };
+    // The subscription set the plugin resolved (which available routes are flat-rate
+    // 0-cost). The module stays harness-agnostic: it applies the cost model to the
+    // supplied set rather than reading any harness's auth model itself.
+    let subscription_keys: std::collections::HashSet<String> =
+        params.subscription_keys.iter().cloned().collect();
+    let available: std::collections::HashSet<String> =
+        params.available_models.iter().cloned().collect();
+    let exclude = params.exclude_route_keys.clone();
+    let prefer_fast = params.prefer_fast_specs.clone();
+    let requirements = params.requirements;
+    let required_capabilities = params.required_capabilities;
+    let target_agent = params.target_agent.clone();
+    let prefer_prompt_cache = params.prefer_prompt_cache;
+
+    let min_best_effort_adequacy = min_band.lock().ok().and_then(|g| *g);
+
+    let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
+        let sub = subscription_keys.clone();
+        select_model_route(SelectModelRouteInput {
+            target_agent: target_agent.clone(),
+            requirements,
+            available_models: available.clone(),
+            facts: facts.clone(),
+            runtime_snapshot: Some(snap),
+            exclude_route_keys: exclude.clone(),
+            required_capabilities,
+            is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
+                sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
+            })),
+            min_best_effort_adequacy,
+            prefer_prompt_cache,
+            providers_without_prompt_cache: providers_without_prompt_cache
+                .iter()
+                .cloned()
+                .collect(),
+        })
+    };
+
+    // First attempt against the live snapshot.
+    let selection = match attempt(snapshot.clone()) {
+        Ok(mut selected) => {
+            // Post-selection fast-variant upgrade (no-op if not opted in / not relaxed).
+            if !prefer_fast.is_empty() {
+                let is_subscription_route = |route: &ModelRoute| {
+                    subscription_keys.contains(&route.route_key)
+                        || subscription_keys.contains(&route.capacity_key)
+                };
+                if let Some(upgraded) = maybe_upgrade_to_fast_variant(
+                    &FastVariantUpgradeInput {
+                        selected: &selected,
+                        facts: &facts,
+                        snapshot: &snapshot,
+                        requirements: &requirements,
+                        required_capabilities,
+                        available_models: &available,
+                        prefer_fast_specs: &prefer_fast,
+                        exclude_route_keys: &exclude,
+                        is_subscription_route: Some(&is_subscription_route),
+                        now,
+                        quota_signal_fresh: fresh_quota_provider_ids
+                            .contains(&selected.model.provider_id),
+                    },
+                    &DEFAULT_ANCHORS,
+                ) {
+                    selected = upgraded;
+                }
+            }
+            Ok(selected)
+        }
+        Err(no_route) if no_route.reason == RouteFailureReason::QuotaOrCooldownExhausted => {
+            // Break-glass: in a subscription environment "all routes exhausted" is a
+            // common steady state and stalls the orchestrator. Retry ONCE against a
+            // snapshot that clears the single earliest-reset route.
+            let hard_rejected_keys: HashSet<&str> = no_route
+                .rejected
+                .iter()
+                .filter(|rejected| {
+                    matches!(
+                        rejected.reason.as_str(),
+                        "quota_exhausted" | "cooldown_active"
+                    )
+                })
+                .map(|rejected| rejected.route_key.as_str())
+                .collect();
+            let rejected_candidates: Vec<BreakGlassCandidate> = facts
+                .iter()
+                .map(fact_to_route)
+                .filter(|route| hard_rejected_keys.contains(route.route_key.as_str()))
+                .map(|route| BreakGlassCandidate {
+                    route_key: route.route_key,
+                    capacity_key: route.capacity_key,
+                })
+                .collect();
+            match relax_earliest_reset(&snapshot, &rejected_candidates) {
+                Some(relaxed) => match attempt(relaxed.snapshot) {
+                    Ok(mut selected) => {
+                        let reset_label = relaxed.resets_at.map_or_else(
+                            || "unknown".to_string(),
+                            |resets_at| (resets_at as i64).to_string(),
+                        );
+                        selected.explanation.insert(
+                            0,
+                            format!(
+                                "break-glass: all routes quota-exhausted; relaxed earliest-reset route {} (resets {})",
+                                relaxed.route_key, reset_label
+                            ),
+                        );
+                        Ok(selected)
+                    }
+                    Err(_) => Err(no_route),
+                },
+                None => Err(no_route),
+            }
+        }
+        Err(no_route) => Err(no_route),
+    };
+
+    // Record the decision, then respond. The decisionID is returned ONLY after
+    // record_decision commits (it is a single store txn that either commits or
+    // errors), so a returned id always maps to a committed row; never an id whose
+    // write then failed (the contract requirement). A failed selection records a
+    // no-selection row and surfaces the typed routing failure.
+    match selection {
+        Ok(selected) => {
+            let decision =
+                decision_input_for(&target_agent, &requirements, Some(&selected), &params);
+            match store.record_decision(&decision) {
+                Ok(decision_id) => {
+                    let body = serde_json::to_vec(
+                        &json!({ "result": { "selected": selected, "decisionID": decision_id } }),
+                    )
+                    .map_err(ModuleError::Json)?;
+                    let response = Frame::build_with_version(
+                        ver,
+                        FrameType::Response,
+                        Flags::new(false, Priority::Interactive, false),
+                        channel,
+                        epoch,
+                        corr,
+                        body,
+                    )
+                    .map_err(|e| ModuleError::Message(e.to_string()))?;
+                    send(writer, response).await
+                }
+                Err(e) => {
+                    send_route_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "store_error",
+                        &format!("recording decision: {e}"),
+                    )
+                    .await
+                }
+            }
+        }
+        Err(no_route) => {
+            // Best-effort failed-decision audit row (ignore a store error here: the
+            // routing failure is the real result to surface).
+            let decision = decision_input_for(&target_agent, &requirements, None, &params);
+            let _ = store.record_decision(&decision);
+            send_no_route(writer, ver, channel, epoch, corr, &no_route).await
+        }
+    }
+}
+
+async fn handle_select_panel(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    quota_cache: &SharedQuotaCache,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let channel = frame.header.channel;
+    let epoch = frame.header.epoch;
+    let corr = frame.header.corr;
+    let ver = frame.header.ver;
+    let params = match serde_json::from_slice::<SelectPanelBody>(&frame.body) {
+        Ok(body) => body.params,
+        Err(e) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &format!("route.select_panel params not decodable: {e}"),
+            )
+            .await;
+        }
+    };
+    if let Err(e) = validate_panel_spec(&params.panel_spec) {
+        return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &e.0).await;
+    }
+    if params.selection == PanelSelection::NPick {
+        if params.package_tokens_estimate.is_none() {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                "packageTokensEstimate is required when selection is n_pick",
+            )
+            .await;
+        }
+        if params.pro_member_max_package_tokens.is_none() {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                "proMemberMaxPackageTokens is required when selection is n_pick",
+            )
+            .await;
+        }
+    }
+    let prepared = match prepare_selection_inputs(quota_cache, store) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
+        }
+    };
+    let subscription_keys: HashSet<String> = params.subscription_keys.iter().cloned().collect();
+    let available_models = params.available_models.iter().cloned().collect();
+    let panel = match select_panel(SelectPanelInput {
+        panel_spec: params.panel_spec.clone(),
+        selection: params.selection,
+        roster: params.roster.clone(),
+        package_tokens_estimate: params.package_tokens_estimate,
+        pro_member_max_package_tokens: params.pro_member_max_package_tokens,
+        facts: prepared.facts,
+        runtime_snapshot: Some(prepared.snapshot),
+        exclude_route_keys: params.exclude_route_keys.clone(),
+        required_capabilities: params.required_capabilities,
+        available_models,
+        is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
+            subscription_keys.contains(&route.route_key)
+                || subscription_keys.contains(&route.capacity_key)
+        })),
+    }) {
+        Ok(panel) => panel,
+        Err(e) => {
+            return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &e.0)
+                .await;
+        }
+    };
+    let decision = panel_decision_input(&params, &panel);
+    let decision_id = match store.record_decision(&decision) {
+        Ok(id) => id,
+        Err(e) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("recording panel decision: {e}"),
+            )
+            .await;
+        }
+    };
+    let mut result = json!({
+        "members": &panel.members,
+        "runnerUp": &panel.runner_up,
+        "decisionID": decision_id,
+    });
+    if let Some(shortfall) = &panel.shortfall {
+        result
+            .as_object_mut()
+            .expect("panel result is an object")
+            .insert("shortfall".into(), json!(shortfall));
+    }
+    if let Some(policy) = &panel.policy {
+        result
+            .as_object_mut()
+            .expect("panel result is an object")
+            .insert("policy".into(), json!(policy));
+    }
+    let body = serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, response).await
+}
+
+fn panel_decision_input(params: &SelectPanelParams, panel: &SelectedPanel) -> DecisionInput {
+    let causes = panel
+        .shortfall
+        .as_ref()
+        .map(|shortfall| shortfall.causes.as_slice())
+        .unwrap_or(&[]);
+    let member_route_keys: Vec<&str> = panel
+        .members
+        .iter()
+        .map(|member| member.route_key.as_str())
+        .collect();
+    let explanation = if params.selection == PanelSelection::NPick {
+        json!({
+            "members": member_route_keys,
+            "causes": causes,
+            "selection": "n_pick",
+            "policy": panel.policy,
+        })
+    } else {
+        json!({
+            "members": member_route_keys,
+            "causes": causes,
+        })
+    };
+    DecisionInput {
+        decision_id: None,
+        decision_kind: "panel".into(),
+        task_id: params.task_id.clone(),
+        parent_session_id: params.parent_session_id.clone(),
+        target_agent: "athena-panel".into(),
+        requirements_json: serde_json::to_string(&params.panel_spec)
+            .unwrap_or_else(|_| "null".into()),
+        selected_route_key: None,
+        selected_provider_id: None,
+        selected_model_id: None,
+        selected_variant: None,
+        score_json: "null".into(),
+        rejected_json: serde_json::to_string(causes).unwrap_or_else(|_| "[]".into()),
+        explanation_json: Some(serde_json::to_string(&explanation).unwrap_or_else(|_| "{}".into())),
+        anchor_version: ANCHOR_VERSION,
+    }
+}
+
+/// Build the decision audit row from a selection (or a no-selection failure).
+fn decision_input_for(
+    target_agent: &str,
+    requirements: &ModelRequirements,
+    selected: Option<&SelectedModelRoute>,
+    params: &SelectParams,
+) -> DecisionInput {
+    let requirements_json = serde_json::to_string(requirements).unwrap_or_else(|_| "null".into());
+    match selected {
+        Some(sel) => DecisionInput {
+            decision_id: None,
+            decision_kind: "single".into(),
+            task_id: params.task_id.clone(),
+            parent_session_id: params.parent_session_id.clone(),
+            target_agent: target_agent.to_string(),
+            requirements_json,
+            selected_route_key: Some(sel.route_key.clone()),
+            selected_provider_id: Some(sel.model.provider_id.clone()),
+            selected_model_id: Some(sel.model.model_id.clone()),
+            selected_variant: sel.model.variant.clone(),
+            score_json: serde_json::to_string(&sel.score).unwrap_or_else(|_| "null".into()),
+            rejected_json: serde_json::to_string(&sel.rejected).unwrap_or_else(|_| "[]".into()),
+            explanation_json: Some(
+                serde_json::to_string(&sel.explanation).unwrap_or_else(|_| "[]".into()),
+            ),
+            anchor_version: ANCHOR_VERSION,
+        },
+        None => DecisionInput {
+            decision_id: None,
+            decision_kind: "single".into(),
+            task_id: params.task_id.clone(),
+            parent_session_id: params.parent_session_id.clone(),
+            target_agent: target_agent.to_string(),
+            requirements_json,
+            selected_route_key: None,
+            selected_provider_id: None,
+            selected_model_id: None,
+            selected_variant: None,
+            score_json: "null".into(),
+            rejected_json: "[]".into(),
+            explanation_json: None,
+            anchor_version: ANCHOR_VERSION,
+        },
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MethodParamsBody<P> {
+    params: P,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetDecisionOutcomeParams {
+    // The wire field is `decisionID` (capital ID) to match what route.select RETURNS
+    // (json!{ "decisionID": ... }) and what every TS caller sends: camelCase alone
+    // would expect `decisionId`, the lone casing drift that broke the round-trip.
+    #[serde(rename = "decisionID")]
+    decision_id: String,
+    /// completed | error | cancelled | interrupted | launch_failed
+    outcome: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordUsageParams {
+    /// The message id: the idempotency key.
+    id: String,
+    route_key: String,
+    capacity_key: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    output_tokens: f64,
+    duration_ms: f64,
+    observed_at: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CooldownStatusParams {
+    route_key: String,
+    capacity_key: String,
+    now: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordCooldownParams {
+    route_key: String,
+    capacity_key: String,
+    #[serde(default)]
+    cooldown_until: Option<f64>,
+    #[serde(default)]
+    quota_exhausted_until: Option<f64>,
+    #[serde(default)]
+    quota_pressure: Option<f64>,
+    #[serde(default)]
+    provider_wide: bool,
+    #[serde(default)]
+    increment_quota_error: bool,
+    #[serde(default)]
+    increment_failure: bool,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+fn parse_outcome(s: &str) -> Option<RouteOutcome> {
+    match s {
+        "completed" => Some(RouteOutcome::Completed),
+        "error" => Some(RouteOutcome::Error),
+        "cancelled" => Some(RouteOutcome::Cancelled),
+        "interrupted" => Some(RouteOutcome::Interrupted),
+        "launch_failed" => Some(RouteOutcome::LaunchFailed),
+        _ => None,
+    }
+}
+
+/// Send a `{ result: { ok: true } }` ack for a successful write op.
+async fn send_ok(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+) -> Result<(), ModuleError> {
+    let body =
+        serde_json::to_vec(&json!({ "result": { "ok": true } })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, response).await
+}
+
+async fn handle_set_decision_outcome(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: SetDecisionOutcomeParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(b) => b.params,
+            Err(e) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("set_decision_outcome params not decodable: {e}"),
+                )
+                .await;
+            }
+        };
+    let Some(outcome) = parse_outcome(&params.outcome) else {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            &format!("unknown outcome '{}'", params.outcome),
+        )
+        .await;
+    };
+    match store.set_decision_outcome(&params.decision_id, outcome) {
+        Ok(()) => send_ok(writer, ver, channel, epoch, corr).await,
+        Err(e) => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("set_decision_outcome: {e}"),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_record_usage(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: RecordUsageParams = match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body)
+    {
+        Ok(b) => b.params,
+        Err(e) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &format!("record_usage params not decodable: {e}"),
+            )
+            .await;
+        }
+    };
+    let obs = prefrontal_routing_core::UsageObservation {
+        id: params.id,
+        route_key: params.route_key,
+        capacity_key: params.capacity_key,
+        provider_id: params.provider_id,
+        output_tokens: params.output_tokens,
+        duration_ms: params.duration_ms,
+        observed_at: params.observed_at,
+    };
+    match store.record_usage_observation(&obs) {
+        // `recorded` reports whether a NEW row was inserted (false = gated out or a
+        // duplicate); either way the op succeeded, so the consumer never retries it.
+        Ok(recorded) => {
+            let body = serde_json::to_vec(&json!({ "result": { "recorded": recorded } }))
+                .map_err(ModuleError::Json)?;
+            let response = Frame::build_with_version(
+                ver,
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                corr,
+                body,
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+            send(writer, response).await
+        }
+        Err(e) => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("record_usage: {e}"),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_cooldown_status(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: CooldownStatusParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(body) => body.params,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("cooldown_status params not decodable: {error}"),
+                )
+                .await;
+            }
+        };
+    let provider_state = if let Some(provider_key) =
+        derive_provider_key(&params.route_key).or_else(|| derive_provider_key(&params.capacity_key))
+    {
+        match store.get_provider_cooldown(provider_key) {
+            Ok(state) => state,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &format!("cooldown_status provider lookup: {error}"),
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
+    let snapshot = match store.build_snapshot(params.now as f64) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("cooldown_status: {error}"),
+            )
+            .await;
+        }
+    };
+    let provider_cooled = provider_state.as_ref().is_some_and(|state| {
+        state
+            .cooldown_until
+            .is_some_and(|until| until > params.now as f64)
+            || state
+                .quota_exhausted_until
+                .is_some_and(|until| until > params.now as f64)
+    });
+    let cooled = provider_cooled
+        || snapshot
+            .by_route
+            .get(&params.route_key)
+            .into_iter()
+            .chain(snapshot.by_capacity.get(&params.capacity_key))
+            .any(|state| {
+                state
+                    .cooldown_until
+                    .is_some_and(|until| until > params.now as f64)
+                    || state
+                        .quota_exhausted_until
+                        .is_some_and(|until| until > params.now as f64)
+            });
+    let body =
+        serde_json::to_vec(&json!({"result": {"cooled": cooled}})).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
+async fn handle_record_cooldown(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: RecordCooldownParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(b) => b.params,
+            Err(e) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("record_cooldown params not decodable: {e}"),
+                )
+                .await;
+            }
+        };
+    match record_cooldown_update(store.as_ref(), &params) {
+        Ok(()) => send_ok(writer, ver, channel, epoch, corr).await,
+        Err(e) => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("record_cooldown: {e}"),
+            )
+            .await
+        }
+    }
+}
+
+/// Map a typed `NoRouteError` to an Error frame, preserving the reason code so a
+/// consumer can branch (e.g. break-glass on quota/cooldown) the same way the TS
+/// caller does on the typed error. For `AllRoutesInadequate`, the error body also
+/// carries the best rejected candidate and earliest reset timestamp.
+async fn send_no_route(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    err: &NoRouteError,
+) -> Result<(), ModuleError> {
+    let code = err.reason.as_str();
+    let message = if err.reason == RouteFailureReason::AllRoutesInadequate {
+        let best_part = match &err.best_rejected {
+            Some(b) => format!(
+                " Best candidate: {} (adequacy {:.2}).",
+                b.route_key, b.adequacy
+            ),
+            None => String::new(),
+        };
+        let reset_part = match err.earliest_reset {
+            Some(ts) => format!(" Earliest quota reset: {:.0}.", ts),
+            None => String::new(),
+        };
+        format!("{}{}{}", err.message, best_part, reset_part)
+    } else {
+        err.message.clone()
+    };
+    // Build the error body. For AllRoutesInadequate, include structured fields
+    // alongside the standard code/message so future clients can parse them.
+    let body_value = if err.reason == RouteFailureReason::AllRoutesInadequate {
+        let mut obj = serde_json::Map::new();
+        obj.insert("code".into(), json!(code));
+        obj.insert("message".into(), json!(message));
+        if let Some(ref best) = err.best_rejected {
+            obj.insert(
+                "bestRejected".into(),
+                json!({ "routeKey": best.route_key, "adequacy": best.adequacy }),
+            );
+        }
+        if let Some(earliest) = err.earliest_reset {
+            obj.insert("earliestReset".into(), json!(earliest));
+        }
+        serde_json::Value::Object(obj)
+    } else {
+        json!({ "code": code, "message": message })
+    };
+    let body = serde_json::to_vec(&body_value).map_err(ModuleError::Json)?;
+    let frame = Frame::build_with_version(
+        ver,
+        FrameType::Error,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
+}
+
+async fn send_route_error(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    code: &str,
+    message: &str,
+) -> Result<(), ModuleError> {
+    let body = serde_json::to_vec(&ErrorBody {
+        code: code.to_string(),
+        message: message.to_string(),
+    })
+    .map_err(ModuleError::Json)?;
+    let frame = Frame::build_with_version(
+        ver,
+        FrameType::Error,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
+}
+
+async fn send(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), ModuleError> {
+    writer
+        .send(frame)
+        .await
+        .map_err(|_| ModuleError::Message("egress channel closed".into()))
+}
+
+fn control_flags() -> Flags {
+    Flags::new(false, Priority::Passive, false)
+}
+
+/// The module's capability manifest: a ManagementSurface exposing routing operations.
+///
+/// The catalog and route-state tables are machine-global, so `identity_scope` is
+/// empty and the identity binding requires nothing. The routing module owns this
+/// schema and is the sole writer for its provider and route cooldown state.
+fn manifest(module_id: &str) -> ModuleManifest {
+    ModuleManifest {
+        module_id: module_id.to_string(),
+        module_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_ver: PROTOCOL_VERSION,
+        trust_tier: TrustTier::FirstParty,
+        provides: vec![ProviderRole::ManagementSurface {
+            operations: vec![
+                // route.select is now a MUTATE: it records the decision it returns.
+                ManagementOperation {
+                    name: ROUTE_SELECT_OP.to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                },
+                ManagementOperation {
+                    name: ROUTE_SELECT_PANEL_OP.to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                },
+                ManagementOperation {
+                    name: ROUTE_SET_DECISION_OUTCOME_OP.to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                },
+                ManagementOperation {
+                    name: ROUTE_RECORD_USAGE_OP.to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                },
+                ManagementOperation {
+                    name: ROUTE_RECORD_COOLDOWN_OP.to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                },
+                ManagementOperation {
+                    name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
+                },
+                ManagementOperation {
+                    name: QUOTA_STATUS_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
+                },
+            ],
+            config_schema: json!({ "type": "object" }),
+            observability: Vec::new(),
+            identity_scope: Vec::new(),
+        }],
+        consumes: Vec::new(),
+        scheduled_tasks: Vec::new(),
+        bindings: Bindings {
+            storage: StorageBinding {
+                kind: StorageKind::Sqlite,
+                scope: StorageScope::Project,
+                owns_schema: true,
+            },
+            vault_grants: Vec::new(),
+            identity: IdentityBinding {
+                requires: Vec::new(),
+                optional: Vec::new(),
+            },
+        },
+    }
+}
+
+fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, ModuleError> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--subc" {
+            let value = args
+                .next()
+                .ok_or_else(|| ModuleError::Message("--subc requires a value".into()))?;
+            return Ok(PathBuf::from(value));
+        }
+        if let Some(raw) = arg.to_str().and_then(|a| a.strip_prefix("--subc=")) {
+            if raw.is_empty() {
+                return Err(ModuleError::Message("--subc= requires a value".into()));
+            }
+            return Ok(PathBuf::from(raw));
+        }
+    }
+    Err(ModuleError::Message(
+        "missing required --subc <connection-file> argument".into(),
+    ))
+}
+
+#[derive(Debug)]
+enum ModuleError {
+    Message(String),
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for ModuleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(m) => write!(f, "{m}"),
+            Self::Json(e) => write!(f, "json: {e}"),
+        }
+    }
+}
+
+impl Error for ModuleError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores};
+    use prefrontal_routing_core::FactSource;
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Rig {
+        dir: PathBuf,
+    }
+
+    impl Rig {
+        fn new(label: &str) -> Self {
+            let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "prefrontal-routing-module-{label}-{}-{n}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn open_store(&self) -> SqliteRouteStateStore {
+            let descriptor = dev_descriptor(
+                DEFAULT_MODULE_ID,
+                self.dir.join("store.db").to_string_lossy().into_owned(),
+            );
+            SqliteRouteStateStore::open(&descriptor).expect("open test store")
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fact(provider: &str, model: &str) -> ModelFact {
+        ModelFact {
+            provider_id: provider.into(),
+            model_id: model.into(),
+            variant: None,
+            family: None,
+            scores: ModelScores {
+                iq: 55.0,
+                eq: 1700.0,
+                speed: 90.0,
+            },
+            context_window: Some(200_000.0),
+            max_output_tokens: None,
+            cost_tier: Some(2.0),
+            cost_per_m_tok_out: Some(4.5),
+            supports_vision: Some(true),
+            supports_tool_use: Some(true),
+            prompt_defaults: None,
+            confidence: Confidence::Curated,
+            notes: None,
+            speed_multiplier: None,
+            subscription_multiplier: None,
+        }
+    }
+
+    fn usage(v: serde_json::Value) -> ProviderUsage {
+        serde_json::from_value(v).expect("provider usage")
+    }
+
+    #[tokio::test]
+    async fn route_bind_replaces_the_epoch_for_a_reused_channel() {
+        let (writer, mut replies) = mpsc::channel(2);
+        let mut route_epochs = RouteEpochs::new();
+
+        for (corr, epoch) in [(1, 41), (2, 42)] {
+            let body = serde_json::to_vec(&json!({
+                "op": "route.bind",
+                "route_channel": 7,
+                "epoch": epoch,
+                "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
+                "identity": {
+                    "project_root": std::env::temp_dir(),
+                    "harness": "epoch-rebind-test",
+                    "session": "session-1"
+                }
+            }))
+            .unwrap();
+            let frame =
+                Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap();
+
+            handle_control_request(frame, &writer, &mut route_epochs)
+                .await
+                .unwrap();
+            let ack = replies.recv().await.unwrap();
+            assert_eq!(ack.header.channel, 0);
+            assert_eq!(ack.header.epoch, 0);
+            assert_eq!(route_epochs.get(&7), Some(&epoch));
+        }
+
+        clear_route_epoch(&mut route_epochs, 7, 41);
+        assert_eq!(route_epochs.get(&7), Some(&42));
+        clear_route_epoch(&mut route_epochs, 7, 42);
+        assert!(!route_epochs.contains_key(&7));
+    }
+
+    fn select_panel_wire_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../../../test-vectors/select-panel-wire.json"))
+            .expect("select_panel wire vectors")
+    }
+
+    async fn run_select_panel_wire_request(
+        label: &str,
+        request: &str,
+    ) -> (Frame, Rig, SharedStore) {
+        let rig = Rig::new(label);
+        let store = Arc::new(rig.open_store());
+        let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            request.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &quota_cache,
+            &store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+        )
+        .await
+        .unwrap();
+        (rx.recv().await.unwrap(), rig, store)
+    }
+
+    #[test]
+    fn provider_wide_cooldown_cools_all_capacity_keys_for_provider_and_only_that_provider() {
+        let rig = Rig::new("provider-wide-cooldown");
+        let store = rig.open_store();
+        store
+            .upsert_fact(&fact("p", "a"), FactSource::Override)
+            .unwrap();
+        store
+            .upsert_fact(&fact("p", "b"), FactSource::Override)
+            .unwrap();
+        store
+            .upsert_fact(&fact("q", "c"), FactSource::Override)
+            .unwrap();
+
+        let params = RecordCooldownParams {
+            route_key: "p/a/high".into(),
+            capacity_key: "p/a".into(),
+            cooldown_until: Some(7_000.0),
+            quota_exhausted_until: Some(9_000.0),
+            quota_pressure: None,
+            provider_wide: true,
+            increment_quota_error: true,
+            increment_failure: true,
+            last_error: Some("quota exhausted".into()),
+        };
+        record_cooldown_update(&store, &params).unwrap();
+
+        let snap = store.build_snapshot(1_000.0).unwrap();
+        for capacity_key in ["p/a", "p/b"] {
+            let state = snap
+                .by_capacity
+                .get(capacity_key)
+                .expect("provider capacity cooled");
+            assert_eq!(state.cooldown_until, Some(7_000.0));
+            assert_eq!(state.quota_exhausted_until, Some(9_000.0));
+        }
+        assert_eq!(
+            snap.by_capacity
+                .get("q/c")
+                .and_then(|state| state.cooldown_until),
+            None,
+            "other providers must stay untouched"
+        );
+    }
+
+    #[test]
+    fn absent_provider_window_is_retained_until_a_new_window_arrives() {
+        let mut cached = vec![
+            usage(serde_json::json!({
+                "provider": "codex",
+                "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+            })),
+            usage(serde_json::json!({
+                "provider": "grok",
+                "usage": { "primary": { "usedPercent": 10.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+            })),
+        ];
+        let fresh = vec![usage(serde_json::json!({
+            "provider": "grok",
+            "usage": { "primary": { "usedPercent": 40.0, "resetsAt": "2031-01-01T00:00:00Z" } }
+        }))];
+
+        let mut retained_degraded_keys = HashSet::new();
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+
+        let codex = cached
+            .iter()
+            .find(|window| window.provider == "codex")
+            .expect("missing provider should be retained");
+        assert_eq!(
+            codex
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(100.0)
+        );
+        let grok = cached
+            .iter()
+            .find(|window| window.provider == "grok")
+            .expect("present provider should be replaced");
+        assert_eq!(
+            grok.usage
+                .as_ref()
+                .and_then(|usage| usage.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(40.0)
+        );
+    }
+
+    #[test]
+    fn degraded_refresh_does_not_replace_a_healthy_cached_window() {
+        let mut cached = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 97.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }))];
+        let fresh = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "error": "quota source timeout"
+        }))];
+        let mut retained_degraded_keys = HashSet::new();
+
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].provider, "codex");
+        assert!(
+            cached[0].error.is_none(),
+            "healthy cached entry is retained"
+        );
+        assert_eq!(
+            cached[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(97.0)
+        );
+        assert!(retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+    }
+
+    #[test]
+    fn empty_usage_refresh_does_not_replace_a_healthy_cached_window() {
+        let mut cached = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 88.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }))];
+        let fresh = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "usage": {}
+        }))];
+        let mut retained_degraded_keys = HashSet::new();
+
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+
+        assert_eq!(
+            cached[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(88.0)
+        );
+        assert!(retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+    }
+
+    #[test]
+    fn failed_quota_refresh_retains_last_healthy_windows() {
+        let mut cache = QuotaCache::default();
+        let healthy = usage(serde_json::json!({
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 24.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }));
+        apply_quota_refresh(&mut cache, vec![healthy], 10);
+        let retained = cache.windows.clone();
+        cache.provider_observed_at_ms.insert("codex".into(), 10);
+
+        record_quota_refresh_failure(&mut cache, "usage.get", "daemon restarted");
+
+        assert_eq!(cache.windows, retained);
+        assert!(!cache.available);
+        assert!(cache.provider_observed_at_ms.is_empty());
+        assert_eq!(
+            cache.last_error.as_deref(),
+            Some("usage.get: daemon restarted")
+        );
+    }
+
+    #[test]
+    fn select_params_accepts_parent_session_id_acronym_alias() {
+        let body: SelectBody = serde_json::from_value(json!({
+            "params": {
+                "requirements": { "iq": 90, "eq": 0 },
+                "parentSessionID": "parent-session"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            body.params.parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+        assert_eq!(body.params.requirements.iq, 90.0);
+    }
+
+    #[tokio::test]
+    async fn wire_demand_normalization_preserves_legacy_scale_and_top_band_boundary() {
+        async fn select(demand: f64) -> (Frame, Rig) {
+            let rig = Rig::new(&format!("wire-demand-{demand}"));
+            let store = Arc::new(rig.open_store());
+            let mut route = fact("p", "fact-53");
+            route.scores.iq = 53.0;
+            store.upsert_fact(&route, FactSource::Override).unwrap();
+            let request = json!({
+                "method": ROUTE_SELECT_OP,
+                "params": {
+                    "targetAgent": "mason",
+                    "requirements": { "iq": demand, "eq": 0 },
+                    "availableModels": ["p/fact-53"]
+                }
+            });
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+            let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
+            let min_band = Arc::new(Mutex::new(Some(0.9)));
+            let (tx, mut rx) = mpsc::channel(1);
+            handle_select_request(
+                frame,
+                1,
+                &tx,
+                &quota_cache,
+                &store,
+                &min_band,
+                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            )
+            .await
+            .unwrap();
+            (rx.recv().await.unwrap(), rig)
+        }
+
+        let (legacy, _legacy_rig) = select(8.0).await;
+        let (current, _current_rig) = select(80.0).await;
+        assert_eq!(legacy.header.ty, FrameType::Response);
+        assert_eq!(current.header.ty, FrameType::Response);
+        let legacy_body: serde_json::Value = serde_json::from_slice(&legacy.body).unwrap();
+        let current_body: serde_json::Value = serde_json::from_slice(&current.body).unwrap();
+        assert_eq!(legacy_body["result"]["selected"]["routeKey"], "p/fact-53");
+        assert_eq!(
+            legacy_body["result"]["selected"]["routeKey"],
+            current_body["result"]["selected"]["routeKey"]
+        );
+        assert!(legacy_body["result"]["selected"]["explanation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("need 80/100")));
+
+        // The top knee prices the 53-class mid band out from demand 84 up
+        // (bar 54.61 at 84), well before the pre-knee boundary of 92.
+        let (top_band, _top_band_rig) = select(84.0).await;
+        assert_eq!(top_band.header.ty, FrameType::Error);
+        let error: ErrorBody = serde_json::from_slice(&top_band.body).unwrap();
+        assert_eq!(error.code, "all_routes_inadequate");
+    }
+
+    #[tokio::test]
+    async fn empty_refresh_retains_pressure_but_revokes_fast_upgrade_freshness() {
+        let rig = Rig::new("empty-refresh-fast-freshness");
+        let store = Arc::new(rig.open_store());
+        let base = fact("openai", "freshness-base");
+        let mut fast = fact("openai", "freshness-base-fast");
+        fast.cost_per_m_tok_out = Some(30.0);
+        store.upsert_fact(&base, FactSource::Override).unwrap();
+        store.upsert_fact(&fast, FactSource::Override).unwrap();
+
+        let observed_at_ms = now_ms();
+        let mut cache = QuotaCache::default();
+        apply_quota_refresh(
+            &mut cache,
+            vec![usage(json!({
+                "provider": "codex",
+                "usage": {
+                    "primary": {
+                        "usedPercent": 1.0,
+                        "resetsAt": "2099-01-01T00:00:00Z"
+                    }
+                }
+            }))],
+            observed_at_ms,
+        );
+        apply_quota_refresh(&mut cache, Vec::new(), observed_at_ms.saturating_add(1));
+        assert_eq!(
+            cache.windows.len(),
+            1,
+            "the low-pressure window is retained"
+        );
+        assert!(cache.provider_observed_at_ms.is_empty());
+        let quota_cache = Arc::new(Mutex::new(cache));
+        let prepared = prepare_selection_inputs(&quota_cache, &store).unwrap();
+        assert!(
+            prepared.snapshot.by_capacity["openai/freshness-base-fast"]
+                .quota_pressure
+                .is_some_and(
+                    |pressure| pressure <= prefrontal_routing_core::FAST_UPGRADE_MAX_PRESSURE
+                )
+        );
+        assert!(!prepared.fresh_quota_provider_ids.contains("openai"));
+
+        let request = json!({
+            "method": ROUTE_SELECT_OP,
+            "params": {
+                "targetAgent": "mason",
+                "requirements": { "iq": 50, "eq": 0 },
+                "availableModels": [
+                    "openai/freshness-base",
+                    "openai/freshness-base-fast"
+                ],
+                "subscriptionKeys": ["openai/freshness-base"],
+                "preferFastSpecs": ["openai/freshness-base"],
+                "taskId": "empty-refresh-fast-freshness"
+            }
+        });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &quota_cache,
+            &store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+        )
+        .await
+        .unwrap();
+        let response = rx.recv().await.unwrap();
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["result"]["selected"]["model"]["modelID"],
+            "freshness-base"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_roster_wire_is_byte_identical_to_fixture() {
+        let vectors = select_panel_wire_vectors();
+        let request = vectors["legacyRoster"]["request"].as_str().unwrap();
+        let request_value: serde_json::Value = serde_json::from_str(request).unwrap();
+        assert!(request_value["params"].get("selection").is_none());
+        assert!(request_value["params"]
+            .get("packageTokensEstimate")
+            .is_none());
+        assert!(request_value["params"]
+            .get("proMemberMaxPackageTokens")
+            .is_none());
+
+        let (response, _rig, _store) = run_select_panel_wire_request("legacy-wire", request).await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let response_value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(response_value["result"].get("policy").is_none());
+        let decision_id = response_value["result"]["decisionID"].as_str().unwrap();
+        let expected = vectors["legacyRoster"]["reply"]
+            .as_str()
+            .unwrap()
+            .replace("$decisionID", decision_id);
+        assert_eq!(response.body, expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn n_pick_wire_matches_policy_fixture_and_decision_explanation() {
+        let vectors = select_panel_wire_vectors();
+        let request = vectors["nPick"]["request"].as_str().unwrap();
+        let (response, _rig, store) = run_select_panel_wire_request("n-pick-wire", request).await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let response_value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let decision_id = response_value["result"]["decisionID"].as_str().unwrap();
+        let expected = vectors["nPick"]["reply"]
+            .as_str()
+            .unwrap()
+            .replace("$decisionID", decision_id);
+        assert_eq!(response.body, expected.as_bytes());
+
+        let decisions = store.get_decisions_for_task("panel-wire-n-pick").unwrap();
+        assert_eq!(decisions.len(), 1);
+    }
+
+    #[test]
+    fn n_pick_decision_explanation_includes_selection_and_policy() {
+        let vectors = select_panel_wire_vectors();
+        let request = vectors["nPick"]["request"].as_str().unwrap();
+        let params = serde_json::from_str::<SelectPanelBody>(request)
+            .unwrap()
+            .params;
+        let policy = prefrontal_routing_core::PanelPolicy {
+            selection: prefrontal_routing_core::PanelSelectionPolicy::TopIq,
+            seated_variants: vec![prefrontal_routing_core::SeatedVariant {
+                slot: 0,
+                route_key: "openai/gpt-5.6-sol-pro".into(),
+                variant: prefrontal_routing_core::SeatedSiblingVariant::Pro,
+            }],
+            pro_downgraded_for_size: false,
+            sibling_collapses: Vec::new(),
+        };
+        let panel = SelectedPanel {
+            members: Vec::new(),
+            runner_up: Vec::new(),
+            shortfall: None,
+            policy: Some(policy),
+        };
+        let decision = panel_decision_input(&params, &panel);
+        let explanation: serde_json::Value =
+            serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
+        assert_eq!(explanation["selection"], "n_pick");
+        assert_eq!(explanation["policy"]["selection"], "top_iq");
+    }
+
+    #[tokio::test]
+    async fn n_pick_missing_gate_fields_are_typed_fixture_errors() {
+        let vectors = select_panel_wire_vectors();
+        for invalid in vectors["invalidNPick"].as_array().unwrap() {
+            let missing_field = invalid["missingField"].as_str().unwrap();
+            let request = invalid["request"].as_str().unwrap();
+            let (response, _rig, _store) =
+                run_select_panel_wire_request(&format!("invalid-n-pick-{missing_field}"), request)
+                    .await;
+            assert_eq!(response.header.ty, FrameType::Error);
+            assert_eq!(response.body, invalid["reply"].as_str().unwrap().as_bytes());
+            let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(error.code, "invalid_request");
+            assert!(error.message.contains(missing_field));
+        }
+    }
+
+    #[tokio::test]
+    async fn select_panel_serves_full_contract_shape() {
+        let advertised = manifest(DEFAULT_MODULE_ID)
+            .provides
+            .into_iter()
+            .find_map(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => Some(operations),
+                _ => None,
+            })
+            .unwrap();
+        assert!(advertised
+            .iter()
+            .any(|operation| operation.name == ROUTE_SELECT_PANEL_OP));
+
+        let rig = Rig::new("select-panel-contract");
+        let store = Arc::new(rig.open_store());
+        let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
+        let request = json!({
+            "method": ROUTE_SELECT_PANEL_OP,
+            "params": {
+                "panelSpec": {
+                    "size": 1,
+                    "iqFloor": 0,
+                    "diversity": "none",
+                    "class": "AUDIT",
+                    "temperatureSpread": [0.2]
+                },
+                "roster": [
+                    {"model": "openai/gpt-5.6-sol", "promptParams": {"variant": "xhigh"}},
+                    {"model": "openai/gpt-5.5", "promptParams": {"variant": "high"}}
+                ],
+                "availableModels": ["openai/gpt-5.6-sol", "openai/gpt-5.5"],
+                "subscriptionKeys": ["openai/gpt-5.6-sol", "openai/gpt-5.5"],
+                "taskId": "panel-contract-task"
+            }
+        });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &quota_cache,
+            &store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+        )
+        .await
+        .unwrap();
+        let response = rx.recv().await.unwrap();
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let result = &body["result"];
+        assert_eq!(result["members"].as_array().unwrap().len(), 1);
+        assert_eq!(result["runnerUp"].as_array().unwrap().len(), 1);
+        assert!(
+            result.get("runner_up").is_none(),
+            "wire keys stay camelCase"
+        );
+        assert_eq!(result["members"][0]["temperature"], 0.2);
+        assert!(result["runnerUp"][0].get("temperature").is_none());
+        assert_eq!(result["members"][0]["promptParams"]["variant"], "xhigh");
+        assert!(result["decisionID"].as_str().is_some());
+        assert!(result.get("shortfall").is_none());
+
+        let decisions = store.get_decisions_for_task("panel-contract-task").unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].decision_kind, "panel");
+        assert_eq!(decisions[0].selected_route_key, None);
+    }
+
+    #[test]
+    fn healthy_refresh_replaces_a_degraded_cached_window_and_clears_retention() {
+        let mut cached = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "error": "previous timeout"
+        }))];
+        let fresh = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 12.0, "resetsAt": "2031-01-01T00:00:00Z" } }
+        }))];
+        let mut retained_degraded_keys = HashSet::from([quota_cache_key(&cached[0])]);
+
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+
+        assert_eq!(cached.len(), 1);
+        assert!(cached[0].error.is_none());
+        assert_eq!(
+            cached[0]
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(12.0)
+        );
+        assert!(!retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+    }
+}

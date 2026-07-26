@@ -1,0 +1,10 @@
+[package]
+name = "prefrontal-routing-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Pure model-routing core for Alfonso: the saturating-adequacy quality gate + cost-primary objective scorer, the route-state types, and (next slice) the SQLite route-state store. Wire-agnostic: knows nothing about subc."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

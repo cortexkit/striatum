@@ -1,0 +1,839 @@
+//! Boot-time model-fact overrides from the module's OWN config-home file.
+//!
+//! Ported from the TS `applyModelFactOverrides` + the subscription-classifier's
+//! config-read pattern. Per the locked contract with the daemon owner, routing
+//! config does NOT flow over subc-mediated config (that path is unwired); instead
+//! the module reads `~/.config/cortexkit/prefrontal-routing.jsonc` itself at boot and
+//! merges the `model_routing.models` overrides onto the migration-applied seed.
+//!
+//! Overrides are upserted with source `override`; an override row that disappears
+//! from config is reverted to the seed fact (or deleted if the model is not in the
+//! seed). This is the user-GLOBAL tier (iq/eq/cost are not per-project); the
+//! project tier (read at route.bind) is deferred.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
+
+use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores};
+use prefrontal_routing_core::{make_route_key, model_facts_seed, FactSource, RouteStateStore};
+use serde::{Deserialize, Deserializer};
+use subc_jsonc::jsonc_to_json;
+
+const CONFIG_RELATIVE_PATH: &str = "cortexkit/prefrontal-routing.jsonc";
+
+#[derive(Debug, Clone)]
+struct PromptCacheProvidersCache {
+    modified_at: Option<SystemTime>,
+    providers: Vec<String>,
+}
+
+fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCacheProvidersCache>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, PromptCacheProvidersCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn default_providers_without_prompt_cache() -> Vec<String> {
+    vec!["ollama-cloud".to_string()]
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RoutingConfigFile {
+    #[serde(default)]
+    model_routing: ModelRoutingSection,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ModelRoutingSection {
+    /// Keyed by "provider/model" or "provider/model/variant".
+    #[serde(default)]
+    models: HashMap<String, ModelFactOverride>,
+    /// Minimum adequacy for best-effort selection (sanity band). Default 0.6.
+    /// Clamped to [0, 1]; NaN is rejected loudly at parse time.
+    #[serde(default)]
+    min_best_effort_adequacy: Option<f64>,
+    /// Providers that do not expose prompt-cache reads or writes. Gather seats
+    /// avoid these providers when a cache-capable adequate route exists.
+    #[serde(
+        default = "default_providers_without_prompt_cache",
+        alias = "providersWithoutPromptCache"
+    )]
+    providers_without_prompt_cache: Vec<String>,
+}
+
+/// One per-model override. Every field optional: a present field overrides the
+/// base fact, an absent one preserves it. Mirrors the TS `ModelFactOverride`.
+#[derive(Debug, Deserialize, Default, Clone)]
+struct ModelFactOverride {
+    /// Outer None means absent; Some(None) means an explicit JSON null clears it.
+    #[serde(default, deserialize_with = "deserialize_family_override")]
+    family: Option<Option<String>>,
+    iq: Option<f64>,
+    eq: Option<f64>,
+    speed: Option<f64>,
+    cost_per_mtok_out: Option<f64>,
+    context_window: Option<f64>,
+    vision: Option<bool>,
+    speed_multiplier: Option<f64>,
+    /// Subscription subsidy multiplier: divides the route's list price to yield its
+    /// effective price. 1.0 (or absent) means "no subsidy known"; larger values make
+    /// the route proportionally cheaper than list. Validated at load (must be finite
+    /// and > 0); an invalid value is rejected and logged, not applied.
+    subscription_multiplier: Option<f64>,
+}
+
+/// The config-home path for this module's own config file. Honors
+/// XDG_CONFIG_HOME, else `$HOME/.config`, matching the daemon's own resolution.
+pub fn config_path() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join(CONFIG_RELATIVE_PATH);
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home)
+            .join(".config")
+            .join(CONFIG_RELATIVE_PATH);
+    }
+    PathBuf::from(".config").join(CONFIG_RELATIVE_PATH)
+}
+
+/// Parse `provider/model` or `provider/model/variant`.
+fn parse_model_key(key: &str) -> Option<(String, String, Option<String>)> {
+    let parts: Vec<&str> = key.trim().split('/').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let provider = parts[0].trim();
+    let model = parts[1].trim();
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    let variant = parts
+        .get(2)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    Some((provider.to_string(), model.to_string(), variant))
+}
+
+fn deserialize_family_override<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
+    let mut fact = base.clone();
+    if let Some(family) = &ov.family {
+        fact.family = family.clone();
+    }
+    fact.scores = ModelScores {
+        iq: ov.iq.unwrap_or(base.scores.iq),
+        eq: ov.eq.unwrap_or(base.scores.eq),
+        speed: ov.speed.unwrap_or(base.scores.speed),
+    };
+    if ov.cost_per_mtok_out.is_some() {
+        fact.cost_per_m_tok_out = ov.cost_per_mtok_out;
+    }
+    if ov.context_window.is_some() {
+        fact.context_window = ov.context_window;
+    }
+    if ov.vision.is_some() {
+        fact.supports_vision = ov.vision;
+    }
+    fact.confidence = Confidence::Curated;
+    fact
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OverrideOutcome {
+    pub applied: usize,
+    pub reverted: usize,
+    pub skipped: Vec<String>,
+}
+
+/// Validate the supplied value and clamp finite values to [0, 1]. NaN is rejected
+/// with an error. The caller handles an absent configuration field by using the
+/// module default.
+pub fn validate_min_best_effort_adequacy(raw: f64) -> Result<f64, String> {
+    if raw.is_nan() {
+        return Err(format!(
+            "model_routing.min_best_effort_adequacy must be a number, got NaN"
+        ));
+    }
+    Ok(raw.clamp(0.0, 1.0))
+}
+
+/// Read the config file (if present) and reconcile model-fact overrides against the
+/// store. Missing file = a clean no-op. A parse error is returned so the caller can
+/// log it without aborting boot (routing degrades to the seed). Pure-ish: all
+/// effects go through the `RouteStateStore` trait, so it is testable with any store.
+pub fn apply_overrides_from_config<S: RouteStateStore>(
+    store: &S,
+    path: &std::path::Path,
+) -> Result<OverrideOutcome, String> {
+    let doc = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OverrideOutcome::default()),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    let json =
+        jsonc_to_json(&doc).map_err(|m| format!("invalid jsonc in {}: {m}", path.display()))?;
+    let config: RoutingConfigFile = serde_json::from_str(&json)
+        .map_err(|e| format!("invalid config in {}: {e}", path.display()))?;
+    apply_overrides(store, &config.model_routing.models)
+}
+
+/// Read `min_best_effort_adequacy` from the routing config file, validating and
+/// clamping the value. Returns `None` when absent or the file is missing.
+pub fn read_min_best_effort_adequacy(path: &std::path::Path) -> Result<Option<f64>, String> {
+    let doc = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+    };
+    let json =
+        jsonc_to_json(&doc).map_err(|m| format!("invalid jsonc in {}: {m}", path.display()))?;
+    let config: RoutingConfigFile = serde_json::from_str(&json)
+        .map_err(|e| format!("invalid config in {}: {e}", path.display()))?;
+    match config.model_routing.min_best_effort_adequacy {
+        None => Ok(None),
+        Some(raw) => validate_min_best_effort_adequacy(raw).map(Some),
+    }
+}
+
+/// Read the cache capability deny-list for the gather-seat preference. The file
+/// is checked at selection time so changing this operational policy does not need a
+/// routing-module restart, but the JSONC is reparsed only after its mtime changes.
+/// A missing file or missing field uses the safe default.
+pub fn read_providers_without_prompt_cache(path: &Path) -> Result<Vec<String>, String> {
+    read_providers_without_prompt_cache_with_reader(path, |path| {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("reading {}: {error}", path.display()))
+    })
+}
+
+fn read_providers_without_prompt_cache_with_reader<F>(
+    path: &Path,
+    read_file: F,
+) -> Result<Vec<String>, String>
+where
+    F: FnOnce(&Path) -> Result<String, String>,
+{
+    let modified_at = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.modified().map(Some).map_err(|error| {
+            format!("reading modification time for {}: {error}", path.display())
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("reading metadata for {}: {error}", path.display())),
+    };
+    let mut cache = prompt_cache_providers_cache()
+        .lock()
+        .map_err(|_| "prompt-cache provider cache lock poisoned".to_string())?;
+    if let Some(cached) = cache.get(path) {
+        if cached.modified_at == modified_at {
+            return Ok(cached.providers.clone());
+        }
+    }
+
+    let providers = match modified_at {
+        None => Ok(default_providers_without_prompt_cache()),
+        Some(_) => read_file(path).and_then(|doc| {
+            let json = jsonc_to_json(&doc)
+                .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
+            let config: RoutingConfigFile = serde_json::from_str(&json)
+                .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
+            let mut providers = config
+                .model_routing
+                .providers_without_prompt_cache
+                .into_iter()
+                .map(|provider| provider.trim().to_string())
+                .filter(|provider| !provider.is_empty())
+                .collect::<Vec<_>>();
+            providers.sort();
+            providers.dedup();
+            Ok(providers)
+        }),
+    };
+
+    match providers {
+        Ok(providers) => {
+            cache.insert(
+                path.to_path_buf(),
+                PromptCacheProvidersCache {
+                    modified_at,
+                    providers: providers.clone(),
+                },
+            );
+            Ok(providers)
+        }
+        Err(error) => {
+            // A malformed live edit must not leave a previously parsed policy in
+            // the cache: the caller falls back to the default until it is repaired.
+            cache.remove(path);
+            Err(error)
+        }
+    }
+}
+
+fn apply_overrides<S: RouteStateStore>(
+    store: &S,
+    overrides: &HashMap<String, ModelFactOverride>,
+) -> Result<OverrideOutcome, String> {
+    // The current seed is the stable base for an override (so a seed-value change
+    // flows through), falling back to the live row, else a fresh skeleton so config
+    // can introduce a brand-new model.
+    let seed_by_key: HashMap<String, ModelFact> = model_facts_seed()
+        .iter()
+        .map(|f| {
+            (
+                make_route_key(&f.provider_id, &f.model_id, f.variant.as_deref()),
+                f.clone(),
+            )
+        })
+        .collect();
+
+    let mut outcome = OverrideOutcome::default();
+    let mut next_override_keys: HashSet<String> = HashSet::new();
+    let mut speed_multipliers = HashMap::new();
+    let mut subscription_multipliers = HashMap::new();
+
+    for (key, ov) in overrides {
+        let Some((provider_id, model_id, variant)) = parse_model_key(key) else {
+            outcome.skipped.push(key.clone());
+            continue;
+        };
+        let route_key = make_route_key(&provider_id, &model_id, variant.as_deref());
+        if let Some(val) = ov.speed_multiplier {
+            if val.is_finite() && val > 0.0 && val <= 2.0 {
+                speed_multipliers.insert(route_key.clone(), val);
+            } else {
+                eprintln!(
+                    "[prefrontal-routing] invalid speed_multiplier for route {}: {}, skipping multiplier",
+                    route_key, val
+                );
+            }
+        }
+        if let Some(val) = ov.subscription_multiplier {
+            // A subsidy multiplier divides list price, so it must be finite and
+            // strictly positive; zero or negative would divide by zero or flip the
+            // price negative. There is deliberately no upper cap here (unlike
+            // speed_multiplier): a measured API-to-subscription ratio may exceed 1.0.
+            if val.is_finite() && val > 0.0 {
+                subscription_multipliers.insert(route_key.clone(), val);
+            } else {
+                eprintln!(
+                    "[prefrontal-routing] invalid subscription_multiplier for route {}: {}, skipping multiplier",
+                    route_key, val
+                );
+            }
+        }
+        let existing_fact = store.get_fact_by_route_key(&route_key).ok().flatten();
+        let mut base = seed_by_key
+            .get(&route_key)
+            .cloned()
+            .or_else(|| existing_fact.clone())
+            .unwrap_or_else(|| ModelFact {
+                provider_id,
+                model_id,
+                variant,
+                family: None,
+                scores: ModelScores::default(),
+                context_window: None,
+                max_output_tokens: None,
+                cost_tier: None,
+                cost_per_m_tok_out: None,
+                supports_vision: None,
+                supports_tool_use: None,
+                prompt_defaults: None,
+                confidence: Confidence::Curated,
+                notes: None,
+                speed_multiplier: None,
+                subscription_multiplier: None,
+            });
+        if base.max_output_tokens.is_none() {
+            base.max_output_tokens = existing_fact.and_then(|fact| fact.max_output_tokens);
+        }
+        store
+            .upsert_fact(&merge_override(&base, ov), FactSource::Override)
+            .map_err(|e| format!("upsert override {route_key}: {e}"))?;
+        next_override_keys.insert(route_key);
+        outcome.applied += 1;
+    }
+
+    // Revert override rows no longer present in config: back to the seed fact, or
+    // delete if the model is not in the seed.
+    let existing = store
+        .list_override_route_keys()
+        .map_err(|e| format!("listing override keys: {e}"))?;
+    for route_key in existing {
+        if next_override_keys.contains(&route_key) {
+            continue;
+        }
+        match seed_by_key.get(&route_key) {
+            Some(seed_fact) => {
+                let mut restored = seed_fact.clone();
+                if restored.max_output_tokens.is_none() {
+                    restored.max_output_tokens = store
+                        .get_fact_by_route_key(&route_key)
+                        .ok()
+                        .flatten()
+                        .and_then(|fact| fact.max_output_tokens);
+                }
+                store
+                    .upsert_fact(&restored, FactSource::Seed)
+                    .map_err(|e| format!("reverting {route_key} to seed: {e}"))?
+            }
+            None => store
+                .delete_fact(&route_key)
+                .map_err(|e| format!("deleting stale override {route_key}: {e}"))?,
+        }
+        outcome.reverted += 1;
+    }
+
+    prefrontal_routing_core::model_facts::set_speed_multipliers(speed_multipliers);
+    prefrontal_routing_core::model_facts::set_subscription_multipliers(subscription_multipliers);
+
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_provider_model_and_variant_keys() {
+        assert_eq!(
+            parse_model_key("openai/gpt-5.5"),
+            Some(("openai".into(), "gpt-5.5".into(), None))
+        );
+        assert_eq!(
+            parse_model_key("anthropic/claude/high"),
+            Some(("anthropic".into(), "claude".into(), Some("high".into())))
+        );
+        assert_eq!(parse_model_key("bare"), None);
+        assert_eq!(parse_model_key("a/b/c/d"), None);
+        assert_eq!(parse_model_key("/m"), None);
+    }
+
+    #[test]
+    fn family_override_distinguishes_absent_null_and_value() {
+        let base = ModelFact {
+            provider_id: "p".into(),
+            model_id: "m".into(),
+            variant: None,
+            family: Some("original".into()),
+            scores: ModelScores {
+                iq: 50.0,
+                eq: 1700.0,
+                speed: 90.0,
+            },
+            context_window: Some(100.0),
+            max_output_tokens: None,
+            cost_tier: Some(2.0),
+            cost_per_m_tok_out: Some(4.0),
+            supports_vision: Some(false),
+            supports_tool_use: Some(true),
+            prompt_defaults: None,
+            confidence: Confidence::Unknown,
+            notes: None,
+            speed_multiplier: None,
+            subscription_multiplier: None,
+        };
+        let ov = ModelFactOverride {
+            iq: Some(60.0),
+            vision: Some(true),
+            ..Default::default()
+        };
+        let merged = merge_override(&base, &ov);
+        assert_eq!(merged.family.as_deref(), Some("original"));
+        assert_eq!(merged.scores.iq, 60.0);
+        assert_eq!(merged.scores.eq, 1700.0); // preserved
+        assert_eq!(merged.scores.speed, 90.0); // preserved
+        assert_eq!(merged.supports_vision, Some(true)); // overridden
+        assert_eq!(merged.cost_per_m_tok_out, Some(4.0)); // preserved (not in override)
+        assert_eq!(merged.confidence, Confidence::Curated); // override forces curated
+
+        let absent: ModelFactOverride = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            merge_override(&base, &absent).family.as_deref(),
+            Some("original")
+        );
+        let cleared: ModelFactOverride = serde_json::from_str(r#"{"family":null}"#).unwrap();
+        assert_eq!(merge_override(&base, &cleared).family, None);
+        let set: ModelFactOverride = serde_json::from_str(r#"{"family":"new-lineage"}"#).unwrap();
+        assert_eq!(
+            merge_override(&base, &set).family.as_deref(),
+            Some("new-lineage")
+        );
+    }
+
+    #[test]
+    fn validates_speed_multiplier_at_load() {
+        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-overrides-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("store.db");
+        let descriptor =
+            dev_descriptor("prefrontal-routing", db_path.to_string_lossy().into_owned());
+        let store = SqliteRouteStateStore::open(&descriptor).expect("open test store");
+
+        let config_content = r#"{
+            "model_routing": {
+                "models": {
+                    "openai/gpt-5.5": {
+                        "iq": 60.0,
+                        "speed_multiplier": 0.5
+                    },
+                    "openai/gpt-5.4": {
+                        "iq": 50.0,
+                        "speed_multiplier": 0.0
+                    },
+                    "openai/gpt-5.4-mini": {
+                        "iq": 40.0,
+                        "speed_multiplier": -1.0
+                    },
+                    "openai/gpt-5.4-fast": {
+                        "iq": 50.0,
+                        "speed_multiplier": 2.5
+                    },
+                    "openai/gpt-5.4-mini-fast": {
+                        "iq": 40.0,
+                        "speed_multiplier": null
+                    }
+                }
+            }
+        }"#;
+        let config_path = dir.join("prefrontal-routing.jsonc");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let outcome = apply_overrides_from_config(&store, &config_path).unwrap();
+        assert_eq!(outcome.applied, 5);
+
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.5"),
+            Some(0.5)
+        );
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.4"),
+            None
+        );
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.4-mini"),
+            None
+        );
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.4-fast"),
+            None
+        );
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.4-mini-fast"),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_nan_speed_multiplier() {
+        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-overrides-nan-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("store.db");
+        let descriptor =
+            dev_descriptor("prefrontal-routing", db_path.to_string_lossy().into_owned());
+        let store = SqliteRouteStateStore::open(&descriptor).expect("open test store");
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "openai/gpt-5.5".to_string(),
+            ModelFactOverride {
+                family: None,
+                iq: Some(60.0),
+                eq: None,
+                speed: None,
+                cost_per_mtok_out: None,
+                context_window: None,
+                vision: None,
+                speed_multiplier: Some(f64::NAN),
+                subscription_multiplier: None,
+            },
+        );
+
+        let outcome = apply_overrides(&store, &overrides).unwrap();
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.5"),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_subscription_multiplier_at_load() {
+        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-sub-multiplier-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("store.db");
+        let descriptor =
+            dev_descriptor("prefrontal-routing", db_path.to_string_lossy().into_owned());
+        let store = SqliteRouteStateStore::open(&descriptor).expect("open test store");
+
+        // 2.0 is a valid subsidy (halves effective price) and must be accepted; 0.0
+        // and -1.0 would divide by zero / flip the price negative and are rejected
+        // and logged rather than applied.
+        let config_content = r#"{
+            "model_routing": {
+                "models": {
+                    "openai/gpt-5.5": {
+                        "iq": 60.0,
+                        "subscription_multiplier": 2.0
+                    },
+                    "openai/gpt-5.4": {
+                        "iq": 50.0,
+                        "subscription_multiplier": 0.0
+                    },
+                    "openai/gpt-5.4-mini": {
+                        "iq": 40.0,
+                        "subscription_multiplier": -1.0
+                    }
+                }
+            }
+        }"#;
+        let config_path = dir.join("prefrontal-routing.jsonc");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let outcome = apply_overrides_from_config(&store, &config_path).unwrap();
+        assert_eq!(outcome.applied, 3);
+
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.5"),
+            Some(2.0)
+        );
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.4"),
+            None
+        );
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier(
+                "openai/gpt-5.4-mini"
+            ),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_min_best_effort_adequacy_clamp_and_nan() {
+        // Valid values pass through.
+        assert!((super::validate_min_best_effort_adequacy(0.5).unwrap() - 0.5).abs() < 1e-9);
+        // Values > 1 clamp to 1.
+        assert!((super::validate_min_best_effort_adequacy(1.5).unwrap() - 1.0).abs() < 1e-9);
+        // Values < 0 clamp to 0.
+        assert!((super::validate_min_best_effort_adequacy(-0.1).unwrap() - 0.0).abs() < 1e-9);
+        // NaN is rejected loudly.
+        let err = super::validate_min_best_effort_adequacy(f64::NAN).unwrap_err();
+        assert!(err.contains("NaN"), "expected NaN rejection, got: {err}");
+        // Edge values: 0 and 1 pass through.
+        assert!((super::validate_min_best_effort_adequacy(0.0).unwrap() - 0.0).abs() < 1e-9);
+        assert!((super::validate_min_best_effort_adequacy(1.0).unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn read_min_best_effort_adequacy_from_config() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-min-band-read-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing file → None.
+        let missing_path = dir.join("nonexistent.jsonc");
+        assert_eq!(
+            super::read_min_best_effort_adequacy(&missing_path).unwrap(),
+            None
+        );
+
+        // File with the key → returns clamped value.
+        let config_path = dir.join("prefrontal-routing.jsonc");
+        std::fs::write(
+            &config_path,
+            r#"{ "model_routing": { "min_best_effort_adequacy": 0.35 } }"#,
+        )
+        .unwrap();
+        let val = super::read_min_best_effort_adequacy(&config_path).unwrap();
+        assert_eq!(val, Some(0.35));
+
+        // File without the key → None.
+        let config_path2 = dir.join("prefrontal-routing-empty.jsonc");
+        std::fs::write(&config_path2, r#"{ "model_routing": { "models": {} } }"#).unwrap();
+        assert_eq!(
+            super::read_min_best_effort_adequacy(&config_path2).unwrap(),
+            None
+        );
+
+        // File with NaN key → error.
+        let config_path3 = dir.join("prefrontal-routing-nan.jsonc");
+        std::fs::write(
+            &config_path3,
+            r#"{ "model_routing": { "min_best_effort_adequacy": NaN } }"#,
+        )
+        .unwrap();
+        assert!(super::read_min_best_effort_adequacy(&config_path3).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_cache_provider_policy_defaults_and_reloads() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-cache-policy-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.jsonc");
+        assert_eq!(
+            read_providers_without_prompt_cache(&missing).unwrap(),
+            vec!["ollama-cloud"]
+        );
+
+        let path = dir.join("prefrontal-routing.jsonc");
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"providers_without_prompt_cache":["ollama-cloud"," custom ","ollama-cloud"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_providers_without_prompt_cache(&path).unwrap(),
+            vec!["custom", "ollama-cloud"]
+        );
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"providers_without_prompt_cache":["cacheless-two"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_providers_without_prompt_cache(&path).unwrap(),
+            vec!["cacheless-two"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prompt_cache_provider_policy_caches_by_mtime_and_drops_bad_live_edits() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-cache-policy-mtime-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prefrontal-routing.jsonc");
+        let set_mtime = |seconds| {
+            let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)),
+            )
+            .unwrap();
+        };
+        let reads = AtomicUsize::new(0);
+        let read_file = |path: &std::path::Path| {
+            reads.fetch_add(1, Ordering::Relaxed);
+            std::fs::read_to_string(path).map_err(|error| error.to_string())
+        };
+
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"providers_without_prompt_cache":["first"]}}"#,
+        )
+        .unwrap();
+        set_mtime(1_700_000_000);
+        assert_eq!(
+            read_providers_without_prompt_cache_with_reader(&path, read_file).unwrap(),
+            vec!["first"]
+        );
+        assert_eq!(
+            read_providers_without_prompt_cache_with_reader(&path, read_file).unwrap(),
+            vec!["first"]
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "unchanged mtime reused cache"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"providers_without_prompt_cache":["second"]}}"#,
+        )
+        .unwrap();
+        set_mtime(1_700_000_001);
+        assert_eq!(
+            read_providers_without_prompt_cache_with_reader(&path, read_file).unwrap(),
+            vec!["second"]
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            2,
+            "changed mtime reparsed config"
+        );
+
+        std::fs::write(&path, "{ not jsonc").unwrap();
+        set_mtime(1_700_000_002);
+        assert!(read_providers_without_prompt_cache_with_reader(&path, read_file).is_err());
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
+
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"providers_without_prompt_cache":["repaired"]}}"#,
+        )
+        .unwrap();
+        set_mtime(1_700_000_003);
+        assert_eq!(
+            read_providers_without_prompt_cache_with_reader(&path, read_file).unwrap(),
+            vec!["repaired"]
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            4,
+            "parse failure did not serve stale policy"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
