@@ -21,7 +21,7 @@ use prefrontal_routing_core::{make_route_key, model_facts_seed, FactSource, Rout
 use serde::{Deserialize, Deserializer};
 use subc_jsonc::jsonc_to_json;
 
-const CONFIG_RELATIVE_PATH: &str = "cortexkit/prefrontal-routing.jsonc";
+const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
 
 #[derive(Debug, Clone)]
 struct PromptCacheProvidersCache {
