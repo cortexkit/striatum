@@ -576,7 +576,11 @@ mod tests {
         // prefix in the capacity key is what keeps the products apart in the
         // title matcher; this vector pins that separation so a key rename or
         // matcher loosening cannot silently let one product's exhaustion wall
-        // the other's.
+        // the other's. THE TWO FENCES ARE NOT REDUNDANT (QTA): their
+        // (provider, id) keying prevents the collision ON THE WIRE, this
+        // vendor segment prevents it IN EXTRACTION - either alone leaves the
+        // other side able to fuse two products, so seeing one fence must not
+        // be read as the hazard being handled.
         let entry = ProviderUsage {
             api_provider: Some("google".into()),
             provider: "gemini".into(),
