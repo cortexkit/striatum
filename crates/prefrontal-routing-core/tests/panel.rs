@@ -124,7 +124,15 @@ fn iq_floor_is_anchored_demand_scale() {
         fact("just-below", target - 0.01, Some("b")),
         fact("adequacy-near-miss", target * 0.95, Some("c")),
     ];
-    let selected = select_panel(panel_input(facts, spec(3, 70.0, PanelDiversity::None))).unwrap();
+    // The floor is an n_pick admission gate (pinned rosters bypass it), so the
+    // demand-scale contract is asserted through n_pick inputs.
+    let selected = select_panel(n_pick_input(
+        facts,
+        spec(3, 70.0, PanelDiversity::None),
+        1_000,
+        8_000,
+    ))
+    .unwrap();
     assert_eq!(selected.members.len(), 1);
     assert_eq!(selected.members[0].route_key, "p/at-boundary");
     assert_eq!(
@@ -133,9 +141,11 @@ fn iq_floor_is_anchored_demand_scale() {
     );
 
     // iq_floor 100 sits on elite (57); a model just under elite cannot seat.
-    let selected = select_panel(panel_input(
+    let selected = select_panel(n_pick_input(
         vec![fact("too-low", 56.9, Some("a"))],
         spec(1, 100.0, PanelDiversity::None),
+        1_000,
+        8_000,
     ))
     .unwrap();
     assert!(selected.members.is_empty());
@@ -417,9 +427,11 @@ fn shortfall_precedence_and_empty_success() {
         "zero admission outranks iq and diversity"
     );
 
-    let below = select_panel(panel_input(
+    let below = select_panel(n_pick_input(
         vec![fact("below", 40.0, None)],
         spec(2, 100.0, PanelDiversity::Family),
+        1_000,
+        8_000,
     ))
     .unwrap();
     assert_eq!(
@@ -820,6 +832,31 @@ fn roster_mode_is_never_inferred_from_roster_contents() {
     assert_eq!(
         selected.shortfall.unwrap().code,
         PanelShortfallCode::SizeReduced
+    );
+}
+
+#[test]
+fn roster_mode_seats_pins_below_the_iq_floor() {
+    // The floor governs n_pick admission only. A pinned roster is the operator's
+    // statement of who sits: the live incident (2026-08-06, MC audit consult
+    // ct_...3ab81b4661a0) had a pinned 4-seat audit silently halved to sol+opus
+    // because the floor bar (85 -> ~55.05) sat above kimi/qwen's 55.0 facts.
+    let facts = vec![
+        fact("strong-a", 75.0, Some("fam-a")),
+        fact("strong-b", 74.0, Some("fam-b")),
+        fact("pinned-low-c", 40.0, Some("fam-c")),
+        fact("pinned-low-d", 39.0, Some("fam-d")),
+    ];
+    let output = select_panel(panel_input(facts, spec(4, 99.0, PanelDiversity::Family))).unwrap();
+    assert_eq!(
+        output.members.len(),
+        4,
+        "a pinned roster seats every pin regardless of the iq floor: {:?}",
+        output.shortfall
+    );
+    assert!(
+        output.shortfall.is_none(),
+        "full seating means no shortfall record (a floor-rejection would surface here)"
     );
 }
 

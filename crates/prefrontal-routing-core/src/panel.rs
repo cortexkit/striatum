@@ -284,8 +284,14 @@ pub fn select_panel_with_anchors(
         },
     }));
 
-    // Zero means no IQ requirement, matching singular route selection.
-    let iq_bar = (input.panel_spec.iq_floor > 0.0)
+    // Zero means no IQ requirement, matching singular route selection. The floor
+    // governs AUTOMATIC (n_pick) admission only: an explicit roster is the
+    // operator's statement of who sits, and every generic filter that has been
+    // allowed to override a pin has produced a silent-downgrade incident
+    // (exclusion dropped pinned Kimi 2026-07-21, family diversity dropped Opus
+    // beside Fable 2026-07-16, and the floor halved a pinned 4-seat audit to
+    // sol+opus 2026-08-06). Pins bypass the floor exactly as they bypass both.
+    let iq_bar = (input.selection == PanelSelection::NPick && input.panel_spec.iq_floor > 0.0)
         .then(|| requirement_target(anchors.iq, input.panel_spec.iq_floor));
     let mut candidates = Vec::new();
     for admitted in admission.admitted {
