@@ -499,11 +499,21 @@ mod tests {
         // QTA's headless antigravity lane (2026-08-06) serves POOLED windows:
         // "Claude and GPT models" is a genuinely separate meter for models we
         // route through OTHER providers, so a 100%-exhausted external pool must
-        // not pressure or wall any google/antigravity-* capacity. The pool
-        // titles are QTA-OWNED values (they fold the cloud response's flat
-        // per-model buckets into pools themselves), not upstream strings - so
-        // the exact text pinned here is stable because QTA controls it, and
-        // QTA has committed to flagging any change before it ships. Today the
+        // not pressure or wall any google/antigravity-* capacity. String
+        // ownership is SPLIT BY LANE (QTA's correction, same day): the CLOUD
+        // lane's pool ids ("Gemini Models", "Claude and GPT models", "Other
+        // models") are QTA-owned and QTA flags changes before they ship; the
+        // LOCAL lane republishes UPSTREAM strings (bucket ids like "3p-5h",
+        // titles like "Claude and GPT models Five Hour Limit") that QTA can
+        // only observe, not promise. The same account switches lanes with an
+        // unrelated editor process's lifecycle, so BOTH shapes are live inputs
+        // and the vectors below cover both. The protection's real polarity is
+        // POSITIVE matching - only windows matching a routed capacity key
+        // contribute - which is why the dangerous local form ("3p-5h", sharing
+        // no token with claude, gpt, OR gemini) drops correctly: never widen
+        // this matcher to sweep unmatched windows in by prefix or pool them by
+        // heuristic; "g-*" native and "3p-*" external are one such heuristic
+        // away from merging. Today the
         // title-token matcher skips it because no capacity key matches - this
         // pins that behavior so a future matcher extension (e.g. loosening the
         // contiguous-subsequence rule) cannot silently convert a walled
@@ -545,6 +555,58 @@ mod tests {
             (out[0].utilization - 0.4).abs() < 1e-9,
             "the surviving window is the gemini pool, not the walled external one"
         );
+    }
+
+    #[test]
+    fn antigravity_local_lane_external_forms_also_never_reach_capacities() {
+        // The LOCAL lane's shapes for the same walled external pool: upstream
+        // bucket ids ("3p-5h") and composed titles ("Claude and GPT models
+        // Five Hour Limit"). "3p-5h" is the dangerous form: it shares no token
+        // with claude, gpt, or gemini, so nothing name-shaped can skip it - it
+        // drops only because POSITIVE matching finds no routed capacity for
+        // it. This vector red-flags any matcher widening that sweeps unmatched
+        // windows in. Cloud and local shapes are pinned in separate vectors
+        // because the serving lane flips with an editor process's lifecycle:
+        // both are live on the same host in the same week.
+        let entry = ProviderUsage {
+            api_provider: None,
+            provider: "antigravity".into(),
+            account: None,
+            source: None,
+            usage: Some(Usage {
+                primary: None,
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: Some(vec![
+                    ExtraWindow {
+                        title: Some("Claude and GPT models Five Hour Limit".into()),
+                        id: Some("3p-5h".into()),
+                        window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                    },
+                    ExtraWindow {
+                        title: Some("Claude and GPT models Weekly Limit".into()),
+                        id: Some("3p-weekly".into()),
+                        window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                    },
+                    // The local lane's per-model native window still matches:
+                    // the skip must stay selective on this lane too.
+                    ExtraWindow {
+                        title: Some("Gemini 3.6 Flash (High)".into()),
+                        id: Some("g-5h".into()),
+                        window: Some(win(25.0, "2026-01-01T00:00:00Z", None)),
+                    },
+                ]),
+            }),
+            error: None,
+        };
+        let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
+        let out = extract_windows(&entry, "google", "antigravity", &caps);
+        assert_eq!(out.len(), 1, "both external forms skipped, native kept");
+        assert_eq!(
+            out[0].applies_key.as_deref(),
+            Some("google/antigravity-gemini-3.6-flash")
+        );
+        assert!((out[0].utilization - 0.25).abs() < 1e-9);
     }
 
     #[test]
