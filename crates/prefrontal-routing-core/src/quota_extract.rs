@@ -495,6 +495,59 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_walled_external_pool_never_reads_as_provider_exhaustion() {
+        // QTA's headless antigravity lane (2026-08-06) serves POOLED windows:
+        // "Claude and GPT models" is a genuinely separate meter for models we
+        // route through OTHER providers, so a 100%-exhausted external pool must
+        // not pressure or wall any google/antigravity-* capacity. The pool
+        // titles are QTA-OWNED values (they fold the cloud response's flat
+        // per-model buckets into pools themselves), not upstream strings - so
+        // the exact text pinned here is stable because QTA controls it, and
+        // QTA has committed to flagging any change before it ships. Today the
+        // title-token matcher skips it because no capacity key matches - this
+        // pins that behavior so a future matcher extension (e.g. loosening the
+        // contiguous-subsequence rule) cannot silently convert a walled
+        // external pool into a provider-wide exhaustion signal. The Gemini
+        // pool alongside it must still extract, proving the skip is selective
+        // rather than the whole entry being dropped.
+        let entry = ProviderUsage {
+            api_provider: None,
+            provider: "antigravity".into(),
+            account: None,
+            source: None,
+            usage: Some(Usage {
+                primary: None,
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: Some(vec![
+                    ExtraWindow {
+                        title: Some("Claude and GPT models".into()),
+                        id: None,
+                        window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                    },
+                    ExtraWindow {
+                        title: Some("Gemini 3.6 Flash".into()),
+                        id: Some("gemini-flash".into()),
+                        window: Some(win(40.0, "2026-01-01T00:00:00Z", None)),
+                    },
+                ]),
+            }),
+            error: None,
+        };
+        let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
+        let out = extract_windows(&entry, "google", "antigravity", &caps);
+        assert_eq!(out.len(), 1, "external pool skipped, gemini pool kept");
+        assert_eq!(
+            out[0].applies_key.as_deref(),
+            Some("google/antigravity-gemini-3.6-flash")
+        );
+        assert!(
+            (out[0].utilization - 0.4).abs() < 1e-9,
+            "the surviving window is the gemini pool, not the walled external one"
+        );
+    }
+
+    #[test]
     fn antigravity_with_no_extras_emits_nothing() {
         let entry = ProviderUsage {
             api_provider: None,
