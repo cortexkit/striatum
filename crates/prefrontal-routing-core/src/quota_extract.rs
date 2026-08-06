@@ -588,11 +588,19 @@ mod tests {
                         id: Some("3p-weekly".into()),
                         window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
                     },
-                    // The local lane's per-model native window still matches:
-                    // the skip must stay selective on this lane too.
+                    // OBSERVED local-lane native pool (QTA has seen this pair
+                    // on the live agy wire; the earlier draft paired an
+                    // invented "g-5h" id with a per-model title the local lane
+                    // CANNOT compose - every local title is <group> <bucket>,
+                    // never a model name, so that vector asserted an
+                    // unreachable shape). The pooled title shares tokens with
+                    // no single-model capacity key, so on this lane even the
+                    // NATIVE pool drops: the local lane currently contributes
+                    // zero per-model signal, and this vector documents that
+                    // honestly instead of inventing a match.
                     ExtraWindow {
-                        title: Some("Gemini 3.6 Flash (High)".into()),
-                        id: Some("g-5h".into()),
+                        title: Some("Gemini Models Five Hour Limit".into()),
+                        id: Some("gemini-5h".into()),
                         window: Some(win(25.0, "2026-01-01T00:00:00Z", None)),
                     },
                 ]),
@@ -601,12 +609,19 @@ mod tests {
         };
         let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
         let out = extract_windows(&entry, "google", "antigravity", &caps);
-        assert_eq!(out.len(), 1, "both external forms skipped, native kept");
+        // The local lane's POOLED titles match no per-model capacity, so the
+        // whole lane extracts nothing - external pools AND the native pool
+        // alike. That is the honest current state (pooled windows cannot
+        // pressure per-model capacities through a title matcher) and the
+        // correct-by-polarity outcome for the external forms. If antigravity
+        // signal is ever wanted from the local lane, it needs a pool-level
+        // extractor, not a looser matcher: loosening is exactly the widening
+        // the comment above forbids.
         assert_eq!(
-            out[0].applies_key.as_deref(),
-            Some("google/antigravity-gemini-3.6-flash")
+            out.len(),
+            0,
+            "pooled local-lane windows match no per-model capacity; nothing extracts"
         );
-        assert!((out[0].utilization - 0.25).abs() < 1e-9);
     }
 
     #[test]
