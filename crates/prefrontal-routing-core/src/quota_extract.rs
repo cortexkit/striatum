@@ -502,10 +502,13 @@ mod tests {
         // not pressure or wall any google/antigravity-* capacity. String
         // ownership is SPLIT BY LANE (QTA's correction, same day): the CLOUD
         // lane's pool ids ("Gemini Models", "Claude and GPT models", "Other
-        // models") are QTA-owned and QTA flags changes before they ship; the
-        // LOCAL lane republishes UPSTREAM strings (bucket ids like "3p-5h",
-        // titles like "Claude and GPT models Five Hour Limit") that QTA can
-        // only observe, not promise. The same account switches lanes with an
+        // models") are QTA-owned and QTA flags changes before they ship - but
+        // even there match on ID, never title: cloud titles carry a moving
+        // model count ("Gemini Models (17 models)"). The LOCAL lane
+        // republishes UPSTREAM strings (bucket ids like "3p-5h", titles like
+        // "Claude and GPT models Five Hour Limit") that QTA can only observe;
+        // newly observed bucket ids get reported to us on a channel, not just
+        // logged. The same account switches lanes with an
         // unrelated editor process's lifecycle, so BOTH shapes are live inputs
         // and the vectors below cover both. The protection's real polarity is
         // POSITIVE matching - only windows matching a routed capacity key
@@ -593,11 +596,18 @@ mod tests {
                     // invented "g-5h" id with a per-model title the local lane
                     // CANNOT compose - every local title is <group> <bucket>,
                     // never a model name, so that vector asserted an
-                    // unreachable shape). The pooled title shares tokens with
-                    // no single-model capacity key, so on this lane even the
-                    // NATIVE pool drops: the local lane currently contributes
-                    // zero per-model signal, and this vector documents that
-                    // honestly instead of inventing a match.
+                    // unreachable shape). CAUSAL RECORD, corrected by QTA from
+                    // their lane's first commit: antigravity has published
+                    // pooled windows on BOTH lanes since the day it shipped -
+                    // the per-model extractor below has never extracted
+                    // anything from an antigravity entry, and zero extractions
+                    // read exactly like a provider with nothing to report. The
+                    // per-model shape this extractor fits lives on the GEMINI
+                    // wire provider (ids like "gemini-2.5-pro"), which resolves
+                    // to the same "google" providerID: two products, one API.
+                    // So antigravity signal, if ever wanted, needs a
+                    // POOL-LEVEL extractor - there was never a lane change to
+                    // hunt for, and this test pins the state that always held.
                     ExtraWindow {
                         title: Some("Gemini Models Five Hour Limit".into()),
                         id: Some("gemini-5h".into()),
