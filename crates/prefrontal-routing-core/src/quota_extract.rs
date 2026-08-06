@@ -561,6 +561,60 @@ mod tests {
     }
 
     #[test]
+    fn gemini_wire_entries_never_pressure_antigravity_capacities() {
+        // QTA's cross-product hazard, measured from their deployed wire
+        // (2026-08-06): gemini-the-product publishes per-model ids that are
+        // BYTE-IDENTICAL to antigravity's upstream model ids (both are Google
+        // Code Assist, shared catalogue) - four collisions live today, kept
+        // off the wire only because antigravity pools before publishing. Both
+        // products resolve to the "google" providerID under apiProvider
+        // keying, so gemini entries now REACH this extractor (they never did
+        // under the wire-name map). They must still extract nothing against
+        // our capacities: every routed google capacity is an ANTIGRAVITY
+        // product (antigravity-gemini-*), and gemini-product quota describes a
+        // DIFFERENT pool under different credentials. The vendor-segment
+        // prefix in the capacity key is what keeps the products apart in the
+        // title matcher; this vector pins that separation so a key rename or
+        // matcher loosening cannot silently let one product's exhaustion wall
+        // the other's.
+        let entry = ProviderUsage {
+            api_provider: Some("google".into()),
+            provider: "gemini".into(),
+            account: None,
+            source: None,
+            usage: Some(Usage {
+                primary: None,
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: Some(vec![
+                    ExtraWindow {
+                        title: Some("gemini-2.5-flash".into()),
+                        id: Some("gemini-2.5-flash".into()),
+                        window: Some(win(100.0, "2026-01-01T00:00:00Z", Some(1440))),
+                    },
+                    ExtraWindow {
+                        title: Some("gemini-3.1-flash-lite".into()),
+                        id: Some("gemini-3.1-flash-lite".into()),
+                        window: Some(win(100.0, "2026-01-01T00:00:00Z", Some(1440))),
+                    },
+                ]),
+            }),
+            error: None,
+        };
+        let caps = vec![
+            "google/antigravity-gemini-3.1-pro".to_string(),
+            "google/antigravity-gemini-3.5-flash".to_string(),
+            "google/antigravity-gemini-3.6-flash".to_string(),
+        ];
+        let out = extract_windows(&entry, "google", "gemini", &caps);
+        assert_eq!(
+            out.len(),
+            0,
+            "gemini-product windows must not pressure antigravity-product capacities"
+        );
+    }
+
+    #[test]
     fn antigravity_local_lane_external_forms_also_never_reach_capacities() {
         // The LOCAL lane's shapes for the same walled external pool: upstream
         // bucket ids ("3p-5h") and composed titles ("Claude and GPT models
