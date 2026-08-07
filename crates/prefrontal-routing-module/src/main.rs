@@ -150,7 +150,17 @@ fn merge_quota_windows(
     for window in existing.drain(..) {
         let key = quota_cache_key(&window);
         if let Some(replacement) = fresh_by_key.remove(&key) {
-            if window.is_healthy() && !replacement.is_healthy() {
+            // credential_absent will not self-recover: nobody configured the
+            // credential on this host, so a retained "last healthy" window is a
+            // fiction that can only mislead (the entry is not in trouble, it does
+            // not exist here). Drop retention for that class and take the degraded
+            // entry as the truth. Every other class keeps retention: decode_failed
+            // self-recovers, upstream/rejected age out via the freshness map.
+            let absent_credential = replacement
+                .error_class
+                .as_deref()
+                .is_some_and(|class| class == "credential_absent");
+            if window.is_healthy() && !replacement.is_healthy() && !absent_credential {
                 if retained_degraded_keys.insert(key.clone()) {
                     let reason = replacement
                         .error
@@ -2242,6 +2252,62 @@ mod tests {
             Some(97.0)
         );
         assert!(retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+    }
+
+    #[test]
+    fn credential_absent_class_drops_retention_and_takes_the_degraded_entry() {
+        // credential_absent is steady state (nobody configured the credential),
+        // not trouble: retaining a last-healthy window for it manufactures a
+        // provider that does not exist on this host. Classless degraded entries
+        // (older QTA) and every other class keep the retention path above.
+        let mut cached = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 97.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }))];
+        let fresh = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "error": "no credential configured",
+            "errorClass": "credential_absent"
+        }))];
+        let mut retained_degraded_keys = HashSet::new();
+
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+
+        assert_eq!(cached.len(), 1);
+        assert!(
+            cached[0].error.is_some(),
+            "degraded credential_absent entry replaces the stale healthy window"
+        );
+        assert_eq!(cached[0].error_class.as_deref(), Some("credential_absent"));
+        assert!(
+            retained_degraded_keys.is_empty(),
+            "no retention record for a provider that does not exist here"
+        );
+    }
+
+    #[test]
+    fn unknown_error_class_still_retains_like_any_degraded_entry() {
+        // The class list grows producer-side (String by contract, not enum): an
+        // unrecognized class must behave exactly like a classless degraded entry,
+        // never disappear and never join a known bucket.
+        let mut cached = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 55.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }))];
+        let fresh = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "error": "novel failure",
+            "errorClass": "some_future_class"
+        }))];
+        let mut retained_degraded_keys = HashSet::new();
+
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+
+        assert_eq!(cached.len(), 1);
+        assert!(
+            cached[0].error.is_none(),
+            "unknown class keeps the last-healthy retention path"
+        );
     }
 
     #[test]

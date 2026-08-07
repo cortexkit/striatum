@@ -366,6 +366,7 @@ mod tests {
                 extra_rate_windows: None,
             }),
             error: None,
+            error_class: None,
         };
         let out = extract_windows(&entry, "openai", "codex", &[]);
         assert_eq!(out.len(), 2);
@@ -396,6 +397,7 @@ mod tests {
                 extra_rate_windows: None,
             }),
             error: None,
+            error_class: None,
         };
 
         let out = extract_windows(&entry, "ollama", "ollama", &[]);
@@ -423,6 +425,7 @@ mod tests {
                 extra_rate_windows: None,
             }),
             error: None,
+            error_class: None,
         };
 
         assert!(extract_windows(&entry, "ollama", "ollama", &[]).is_empty());
@@ -442,6 +445,7 @@ mod tests {
                 extra_rate_windows: None,
             }),
             error: None,
+            error_class: None,
         };
 
         let out = extract_windows(&entry, "ollama", "ollama", &[]);
@@ -478,6 +482,7 @@ mod tests {
                 ]),
             }),
             error: None,
+            error_class: None,
         };
         let caps = vec![
             "google/antigravity-gemini-3.5-flash".to_string(),
@@ -546,6 +551,7 @@ mod tests {
                 ]),
             }),
             error: None,
+            error_class: None,
         };
         let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
         let out = extract_windows(&entry, "google", "antigravity", &caps);
@@ -604,6 +610,7 @@ mod tests {
                 ]),
             }),
             error: None,
+            error_class: None,
         };
         let caps = vec![
             "google/antigravity-gemini-3.1-pro".to_string(),
@@ -674,6 +681,7 @@ mod tests {
                 ]),
             }),
             error: None,
+            error_class: None,
         };
         let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
         let out = extract_windows(&entry, "google", "antigravity", &caps);
@@ -706,6 +714,7 @@ mod tests {
                 extra_rate_windows: None,
             }),
             error: None,
+            error_class: None,
         };
         let caps = vec!["google/antigravity-gemini-3.5-flash".to_string()];
         assert!(extract_windows(&entry, "google", "antigravity", &caps).is_empty());

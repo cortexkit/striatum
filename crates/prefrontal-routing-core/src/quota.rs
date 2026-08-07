@@ -81,6 +81,14 @@ pub struct ProviderUsage {
     /// Present only on a degraded entry. The consumer skips any entry with `error`.
     #[serde(default)]
     pub error: Option<String>,
+    /// Stable machine class beside `error` on degraded entries (QTA, additive):
+    /// credential_absent, credential_rejected, upstream_failed, decode_failed,
+    /// no_quota_reported. Deliberately a String, not an enum: the producer's list
+    /// grows, and an unknown value must stay a readable degraded entry, never a
+    /// parse failure or a fold into a known bucket. Branch on `error` for health;
+    /// this field only says WHY.
+    #[serde(default)]
+    pub error_class: Option<String>,
 }
 
 impl Usage {
