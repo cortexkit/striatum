@@ -14,7 +14,7 @@
 //!       identically to an external consumer;
 //!   (c) no deadlock when the serve loop's selection path consults quota.
 //!
-//! `#[ignore]` by default: builds subc-core AND ai-provider-quota from sibling
+//! `#[ignore]` by default: builds subc-core AND insula (the quota module) from sibling
 //! repos and binds real loopback ports. Run:
 //!   cargo test -p prefrontal-routing-module --test both_modules_e2e -- --ignored --nocapture
 
@@ -34,7 +34,7 @@ use common::{
 };
 
 const SUBCONSCIOUS_REL: &str = "../../../subconscious";
-const QUOTA_REPO_REL: &str = "../../../ai-provider-quota";
+const QUOTA_REPO_REL: &str = "../../../insula";
 const QUOTA_MODULE_ID: &str = "ai-provider-quota";
 
 struct RealDaemon {
@@ -93,7 +93,7 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
 /// Stand up a real subc-core daemon supervising BOTH modules from one subc.jsonc.
 async fn start_both_modules_daemon() -> RealDaemon {
     let subc_core = build_bin(&sibling(SUBCONSCIOUS_REL), "ck-subc");
-    let quota_module = build_bin(&sibling(QUOTA_REPO_REL), "ck-quota");
+    let quota_module = build_bin(&sibling(QUOTA_REPO_REL), "ck-insula");
     let routing_module = PathBuf::from(env!("CARGO_BIN_EXE_ck-prefrontal-routing"));
     assert!(routing_module.exists());
 
@@ -155,7 +155,7 @@ async fn start_both_modules_daemon() -> RealDaemon {
 /// only do if its inbound provider connection is healthy concurrently with its
 /// outbound quota connection running in the background refresh task).
 #[tokio::test]
-#[ignore = "builds subc-core + ai-provider-quota in sibling repos and binds loopback ports"]
+#[ignore = "builds subc-core + insula in sibling repos and binds loopback ports"]
 async fn routing_consumes_quota_module_to_module_while_serving() {
     let daemon = start_both_modules_daemon().await;
     let mut consumer = connect_consumer(&daemon.connection_file).await;
