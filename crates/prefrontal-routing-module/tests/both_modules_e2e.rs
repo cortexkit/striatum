@@ -1,16 +1,16 @@
 #![forbid(unsafe_code)]
 
 //! The module-to-module quota-consumption proof: a real subc-core daemon
-//! supervises BOTH ai-provider-quota AND prefrontal-routing, and prefrontal-routing
+//! supervises BOTH insula AND prefrontal-routing, and prefrontal-routing
 //! holds TWO independent authenticated connections to the daemon at once: its
 //! INBOUND provider connection (serving route.select) and its OUTBOUND consumer
-//! connection (calling ai-provider-quota's usage.get): without the daemon
+//! connection (calling insula's usage.get): without the daemon
 //! conflating or rejecting either.
 //!
 //! This exercises the three concerns flagged before the wire path was built:
 //!   (a) a second outbound consumer connection from a process that is also a
 //!       provider: independent, not a self-reference the daemon rejects;
-//!   (b) module->module route.open (prefrontal-routing -> ai-provider-quota) works
+//!   (b) module->module route.open (prefrontal-routing -> insula) works
 //!       identically to an external consumer;
 //!   (c) no deadlock when the serve loop's selection path consults quota.
 //!
@@ -35,7 +35,7 @@ use common::{
 
 const SUBCONSCIOUS_REL: &str = "../../../subconscious";
 const QUOTA_REPO_REL: &str = "../../../insula";
-const QUOTA_MODULE_ID: &str = "ai-provider-quota";
+const QUOTA_MODULE_ID: &str = "insula";
 
 struct RealDaemon {
     #[allow(dead_code)]
@@ -177,8 +177,8 @@ async fn routing_consumes_quota_module_to_module_while_serving() {
 
     // THE DISTINGUISHING ASSERTION (a)+(b): poll route.quota_status until routing's
     // OUTBOUND consumer connection has actually round-tripped a usage.get against
-    // ai-provider-quota. `available: true` means: the second outbound connection
-    // authenticated, route.open(ai-provider-quota) succeeded, and usage.get
+    // insula. `available: true` means: the second outbound connection
+    // authenticated, route.open(insula) succeeded, and usage.get
     // returned a ProviderUsage[]: module->module consumption proven on the wire,
     // not merely "didn't hang". (In a credless shell every provider silent-degrades,
     // so healthyCount may be 0, but availability + providerCount>0 prove the round
@@ -201,7 +201,7 @@ async fn routing_consumes_quota_module_to_module_while_serving() {
     }
     assert!(
         quota_live,
-        "routing's outbound quota-consumer connection must round-trip usage.get against ai-provider-quota; last status: {}",
+        "routing's outbound quota-consumer connection must round-trip usage.get against insula; last status: {}",
         serde_json::to_string(&last_status).unwrap()
     );
 

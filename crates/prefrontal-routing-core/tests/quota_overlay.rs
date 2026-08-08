@@ -1,4 +1,4 @@
-//! Tests for the quota overlay: mapping `ai-provider-quota`'s `ProviderUsage[]`
+//! Tests for the quota overlay: mapping `insula (formerly ai-provider-quota)`'s `ProviderUsage[]`
 //! through per-provider extraction + pace projection + hard exhaustion into a
 //! routing runtime snapshot. Exercises the FULL parity pipeline (the flat
 //! worst-utilization proxy was replaced).

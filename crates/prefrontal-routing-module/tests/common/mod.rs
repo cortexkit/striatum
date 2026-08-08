@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 //! Shared consumer-side wire driver for the prefrontal-routing-module e2e tests.
 //!
-//! Mirrors ai-provider-quota's `common/mod.rs` (the proven harness): authenticate
+//! Mirrors insula (formerly ai-provider-quota)'s `common/mod.rs` (the proven harness): authenticate
 //! as a client, `catalog.list`, `route.open` the ManagementSurface, then
 //! `route.select` on the route channel. Adapted only in the module id and the
 //! data-plane op (`route.select` vs `usage.get`).

@@ -1,6 +1,6 @@
 //! Module-to-module quota consumption: a SECOND, outbound connection from this
-//! module to the daemon, acting as an ordinary consumer of `ai-provider-quota`'s
-//! `usage.get`. This is independent of the module's inbound provider connection
+//! module to the daemon, acting as an ordinary consumer of `insula`'s (the quota
+//! module, formerly `ai-provider-quota`) `usage.get`. This is independent of the module's inbound provider connection
 //! (the one that serves `route.select`): the daemon keys connections by the
 //! socket/handshake, so one process holds two authenticated connections without
 //! conflation.
@@ -18,7 +18,7 @@ use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
-const QUOTA_MODULE_ID: &str = "ai-provider-quota";
+const QUOTA_MODULE_ID: &str = "insula";
 const USAGE_GET_OP: &str = "usage.get";
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -125,7 +125,7 @@ impl QuotaConsumer {
         let reply = self.read_reply(0, 0, corr).await?;
         if reply.header.ty == FrameType::Error {
             return Err(msg(format!(
-                "route.open(ai-provider-quota) failed: {}",
+                "route.open(insula) failed: {}",
                 String::from_utf8_lossy(&reply.body)
             )));
         }
@@ -333,5 +333,16 @@ mod tests {
             "dead-port setup took longer than {SETUP_TIMEOUT:?}: {error}"
         );
         let _ = std::fs::remove_file(connection_file);
+    }
+
+    #[test]
+    fn quota_dial_targets_insula() {
+        // The rename class this fences: a caller whose compiled dial lags a module-id
+        // rename compiles fine, registers nothing, and fails only at runtime with
+        // unknown_module (the daemon refuses; the module never sees the call and reads
+        // healthy throughout). SUBC's CLI walked exactly that window today. The wire id
+        // is pinned here so a regression to the old name reddens a test by name instead
+        // of surfacing as a silent quota-signal outage.
+        assert_eq!(QUOTA_MODULE_ID, "insula");
     }
 }

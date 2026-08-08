@@ -1,4 +1,4 @@
-//! Quota usage wire types: the decode contract for `ai-provider-quota`'s
+//! Quota usage wire types: the decode contract for `insula` (formerly `ai-provider-quota`)'s
 //! `usage.get` response, mirrored from `quota-core/src/model.rs`.
 //!
 //! These are DESERIALIZE-side mirrors: prefrontal-routing consumes quota windows

@@ -9,7 +9,7 @@
 //!
 //! Ported from the Alfonso TS plugin's `ModelRouteStore`
 //! (`src/features/model-routing/route-state-store.ts`), scoped to the route-owned
-//! domain. Quota windows are NOT here; they live in `ai-provider-quota` and are
+//! domain. Quota windows are NOT here; they live in `insula` (formerly `ai-provider-quota`) and are
 //! consumed module-to-module (see `crate::quota`).
 
 use crate::model_facts::ModelFact;
@@ -257,7 +257,7 @@ pub trait RouteStateStore {
     // ── Snapshot ────────────────────────────────────────────
     /// Build the ROUTE-STATE-ONLY runtime snapshot the scorer consumes: per-route
     /// telemetry plus capacity-shared cooldown/quota signals. The quota
-    /// overlay is NOT applied here (quota is `ai-provider-quota`'s domain, consumed
+    /// overlay is NOT applied here (quota is `insula` (formerly `ai-provider-quota`)'s domain, consumed
     /// module-to-module and merged on top at the module via `crate::quota`).
     fn build_snapshot(&self, now: f64) -> RouteStateResult<ModelRouteStateSnapshot>;
 }

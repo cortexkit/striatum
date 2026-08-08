@@ -79,11 +79,11 @@ const ROUTE_COOLDOWN_STATUS_OP: &str = "route.cooldown_status";
 const QUOTA_STATUS_OP: &str = "route.quota_status";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
-/// How often the background task refreshes quota windows from ai-provider-quota.
+/// How often the background task refreshes quota windows from insula.
 /// Windows change slowly, so a cached snapshot refreshed off the selection hot
 /// path keeps `route.select` from ever blocking on a live cross-module call.
 const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-/// Backoff between quota-connect attempts when ai-provider-quota is absent/down.
+/// Backoff between quota-connect attempts when insula is absent/down.
 /// The module degrades gracefully (seed-only selection) until quota appears. Kept
 /// short so a sibling module that registers slightly later is picked up promptly.
 const QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(3);
@@ -337,7 +337,7 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
     // The quota cache is fed by SEPARATE short-lived outbound consumer connections
-    // to ai-provider-quota (the second, independent connection while a cycle runs).
+    // to insula (the second, independent connection while a cycle runs).
     // It refreshes off the selection hot path; route.select reads the cached snapshot,
     // never blocking on a live cross-module call. Quota being absent is non-fatal
     // (seed-only routing).

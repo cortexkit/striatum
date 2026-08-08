@@ -1,7 +1,7 @@
 //! Per-provider quota window EXTRACTION. Ported VERBATIM from the TS
 //! `quota/codexbar-window-extractors.ts`.
 //!
-//! `ai-provider-quota` returns a uniform `ProviderUsage` shape, but providers
+//! `insula` (formerly `ai-provider-quota`) returns a uniform `ProviderUsage` shape, but providers
 //! expose quota with DIFFERENT topologies. Most (codex/grok/opencode-go/ollama)
 //! report one account-wide pool in primary/secondary/tertiary → one account-scoped
 //! window each. Antigravity (Google AI Ultra) bundles MULTIPLE independent pools
