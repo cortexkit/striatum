@@ -28,7 +28,13 @@ const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
 
 #[derive(Debug, Clone)]
 struct PromptCacheProvidersCache {
+    /// Freshness key is (mtime, byte length), not mtime alone: two writes can
+    /// land inside one filesystem clock tick (Linux coarse clocks tick ~4ms;
+    /// the CI runner hit it deterministically), and a same-tick same-length
+    /// rewrite is the only shape this still misses. See memory rule: a check
+    /// whose resolution limit coincides with its use is worse than absent.
     modified_at: Option<SystemTime>,
+    byte_len: Option<u64>,
     providers: Vec<String>,
 }
 
@@ -368,18 +374,21 @@ fn read_providers_without_prompt_cache_with_reader<F>(
 where
     F: FnOnce(&Path) -> Result<String, String>,
 {
-    let modified_at = match std::fs::metadata(path) {
-        Ok(metadata) => metadata.modified().map(Some).map_err(|error| {
-            format!("reading modification time for {}: {error}", path.display())
-        })?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let (modified_at, byte_len) = match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let modified = metadata.modified().map(Some).map_err(|error| {
+                format!("reading modification time for {}: {error}", path.display())
+            })?;
+            (modified, Some(metadata.len()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
         Err(error) => return Err(format!("reading metadata for {}: {error}", path.display())),
     };
     let mut cache = prompt_cache_providers_cache()
         .lock()
         .map_err(|_| "prompt-cache provider cache lock poisoned".to_string())?;
     if let Some(cached) = cache.get(path) {
-        if cached.modified_at == modified_at {
+        if cached.modified_at == modified_at && cached.byte_len == byte_len {
             return Ok(cached.providers.clone());
         }
     }
@@ -410,6 +419,7 @@ where
                 path.to_path_buf(),
                 PromptCacheProvidersCache {
                     modified_at,
+                    byte_len,
                     providers: providers.clone(),
                 },
             );
