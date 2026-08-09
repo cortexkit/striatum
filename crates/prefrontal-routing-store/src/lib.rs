@@ -87,11 +87,12 @@ const MIGRATION_019: &str = include_str!("../migrations/019_anthropic_real_price
 /// Migration 20: make age-based decision retention an indexed delete.
 const MIGRATION_020: &str = include_str!("../migrations/020_decision_retention_index.sql");
 const MIGRATION_021: &str = include_str!("../migrations/021_new_sibling_models.sql");
+const MIGRATION_022: &str = include_str!("../migrations/022_elo_rescore.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 21] {
+fn route_state_migrations() -> [Migration; 22] {
     [
         Migration {
             version: 1,
@@ -176,6 +177,10 @@ fn route_state_migrations() -> [Migration; 21] {
         Migration {
             version: 21,
             statements: MIGRATION_021,
+        },
+        Migration {
+            version: 22,
+            statements: MIGRATION_022,
         },
     ]
 }
@@ -322,7 +327,7 @@ impl SqliteRouteStateStore {
 fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
     let scores_json: String = row.get("scores_json")?;
     let scores: ModelScores = serde_json::from_str(&scores_json).unwrap_or(ModelScores {
-        iq: 0.0,
+        elo: 0.0,
         eq: 0.0,
         speed: 0.0,
     });

@@ -11,7 +11,7 @@ use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, ModelRouteStateSnapshot,
     RequiredCapabilities,
 };
-use crate::route_anchors::{requirement_target, Anchors, DEFAULT_ANCHORS};
+use crate::routing_config::{demand_bar, RoutingConfig, DEFAULT_ROUTING_CONFIG};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -234,12 +234,12 @@ fn validate_selection(input: &SelectPanelInput<'_>) -> Result<(), InvalidPanelRe
 }
 
 pub fn select_panel(input: SelectPanelInput<'_>) -> Result<SelectedPanel, InvalidPanelRequest> {
-    select_panel_with_anchors(input, &DEFAULT_ANCHORS)
+    select_panel_with_config(input, &DEFAULT_ROUTING_CONFIG)
 }
 
-pub fn select_panel_with_anchors(
+pub fn select_panel_with_config(
     input: SelectPanelInput<'_>,
-    anchors: &Anchors,
+    config: &RoutingConfig,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
     validate_panel_spec(&input.panel_spec)?;
     validate_selection(&input)?;
@@ -271,9 +271,10 @@ pub fn select_panel_with_anchors(
         input.required_capabilities,
         &input.available_models,
         &ModelRequirements { iq: 0.0, eq: 0.0 },
-        anchors,
+        config,
     );
     let admitted_count = admission.admitted.len();
+    let top_routable_elo = admission.top_routable.elo;
     causes.extend(admission.rejected.into_iter().map(|rejected| PanelCause {
         model: rejected.route_key,
         reason: match rejected.reason.as_str() {
@@ -292,11 +293,17 @@ pub fn select_panel_with_anchors(
     // beside Fable 2026-07-16, and the floor halved a pinned 4-seat audit to
     // sol+opus 2026-08-06). Pins bypass the floor exactly as they bypass both.
     let iq_bar = (input.selection == PanelSelection::NPick && input.panel_spec.iq_floor > 0.0)
-        .then(|| requirement_target(anchors.iq, input.panel_spec.iq_floor));
+        .then(|| {
+            demand_bar(
+                top_routable_elo,
+                input.panel_spec.iq_floor,
+                config.demand_exponent,
+            )
+        });
     let mut candidates = Vec::new();
     for admitted in admission.admitted {
         let model = admitted.route.capacity_key.clone();
-        if iq_bar.is_some_and(|bar| admitted.route.fact.scores.iq < bar) {
+        if iq_bar.is_some_and(|bar| admitted.route.fact.scores.elo < bar) {
             causes.push(PanelCause {
                 model,
                 reason: PanelCauseReason::BelowIqFloor,
@@ -315,8 +322,7 @@ pub fn select_panel_with_anchors(
             .as_ref()
             .map(|predicate| predicate(&admitted.route))
             .unwrap_or(false);
-        let (objective, _) =
-            compute_objective(&admitted.route, &admitted.runtime, anchors, is_subscription);
+        let (objective, _) = compute_objective(&admitted.route, &admitted.runtime, is_subscription);
         candidates.push(Candidate {
             metered_cost: normalized_metered_cost(&admitted.route.fact),
             route: admitted.route,
@@ -611,8 +617,8 @@ fn iq_cost_order(a: &Candidate, b: &Candidate) -> Ordering {
     b.route
         .fact
         .scores
-        .iq
-        .total_cmp(&a.route.fact.scores.iq)
+        .elo
+        .total_cmp(&a.route.fact.scores.elo)
         .then_with(|| a.selection_cost.total_cmp(&b.selection_cost))
         .then_with(|| b.speed_score.total_cmp(&a.speed_score))
         .then_with(|| a.metered_cost.total_cmp(&b.metered_cost))
@@ -623,8 +629,8 @@ fn iq_lineage_order(a: &Candidate, b: &Candidate) -> Ordering {
     b.route
         .fact
         .scores
-        .iq
-        .total_cmp(&a.route.fact.scores.iq)
+        .elo
+        .total_cmp(&a.route.fact.scores.elo)
         .then_with(|| a.selection_cost.total_cmp(&b.selection_cost))
         .then_with(|| b.speed_score.total_cmp(&a.speed_score))
         .then_with(|| a.metered_cost.total_cmp(&b.metered_cost))

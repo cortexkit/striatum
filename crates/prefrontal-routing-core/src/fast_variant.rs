@@ -13,12 +13,13 @@
 
 use crate::model_facts::{fact_to_route, ModelFact, ModelRequirements, ModelRoute};
 use crate::model_router::{
-    capability_rejection_reason, compute_objective, latest_deadline, ModelRouteStateSnapshot,
-    PromptParams, RequiredCapabilities, RouteRuntimeState, SelectedModel, SelectedModelRoute,
+    admit_routes, capability_rejection_reason, compute_objective, latest_deadline,
+    ModelRouteStateSnapshot, PromptParams, RequiredCapabilities, RouteRuntimeState, SelectedModel,
+    SelectedModelRoute,
 };
 use crate::provider_model_spec::{parse_spec_list, resolve_spec, ParsedSpec};
-use crate::route_anchors::{Anchors, ADEQUACY_FLOOR};
 use crate::route_scoring::score_adequacy;
+use crate::routing_config::RoutingConfig;
 
 /// Pressure at or below which a quota projection counts as "relaxed" (built-in, no
 /// config knob): the projected lockout cost is trivial.
@@ -87,7 +88,7 @@ pub struct FastVariantUpgradeInput<'a> {
 /// `SelectedModelRoute` when the upgrade applies, else `None` (mutates nothing).
 pub fn maybe_upgrade_to_fast_variant(
     input: &FastVariantUpgradeInput,
-    anchors: &Anchors,
+    config: &RoutingConfig,
 ) -> Option<SelectedModelRoute> {
     let specs: Vec<ParsedSpec> = parse_spec_list(input.prefer_fast_specs);
     if specs.is_empty() {
@@ -171,16 +172,27 @@ pub fn maybe_upgrade_to_fast_variant(
         return None;
     }
 
-    // The fast sibling must still clear the quality bar for THIS task.
-    let adequacy = score_adequacy(fast_fact, input.requirements, anchors);
-    if !adequacy.capability_only && adequacy.adequacy < ADEQUACY_FLOOR {
+    // Recompute the static request frontier without quota state. A transient
+    // quota signal may permit the upgrade, but it must never redefine the bar.
+    let top_routable = admit_routes(
+        input.facts,
+        None,
+        input.exclude_route_keys,
+        input.required_capabilities,
+        input.available_models,
+        input.requirements,
+        config,
+    )
+    .top_routable;
+    let adequacy = score_adequacy(fast_fact, input.requirements, top_routable, config);
+    if !adequacy.clears_adequacy_floor() {
         return None;
     }
 
     let is_subscription = input
         .is_subscription_route
         .is_some_and(|predicate| predicate(&fast_route));
-    let (objective, _) = compute_objective(&fast_route, &fast_runtime, anchors, is_subscription);
+    let (objective, _) = compute_objective(&fast_route, &fast_runtime, is_subscription);
 
     let mut upgraded = input.selected.clone();
     upgraded.model = SelectedModel {
@@ -228,17 +240,17 @@ mod tests {
         make_capacity_key, make_route_key, Confidence, ModelPromptDefaults, ModelScores,
     };
     use crate::model_router::{ObjectiveBreakdown, SelectedRouteScore};
-    use crate::route_anchors::DEFAULT_ANCHORS;
+    use crate::routing_config::DEFAULT_ROUTING_CONFIG;
     use std::collections::{BTreeMap, HashMap, HashSet};
 
-    fn fact(provider: &str, model: &str, iq: f64) -> ModelFact {
+    fn fact(provider: &str, model: &str, elo: f64) -> ModelFact {
         ModelFact {
             provider_id: provider.into(),
             model_id: model.into(),
             variant: None,
             family: None,
             scores: ModelScores {
-                iq,
+                elo,
                 eq: 1700.0,
                 speed: 100.0,
             },
@@ -347,7 +359,7 @@ mod tests {
                 now: 1000.0,
                 quota_signal_fresh: true,
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         );
         assert!(out.is_none());
     }
@@ -375,7 +387,7 @@ mod tests {
                 now: 1000.0,
                 quota_signal_fresh: true,
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         )
         .expect("should upgrade");
         assert_eq!(out.route_key, "openai/gpt-5.5-fast");
@@ -422,7 +434,7 @@ mod tests {
                 now: 1_000.0,
                 quota_signal_fresh: true,
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         );
 
         assert!(out.is_none());
@@ -456,13 +468,13 @@ mod tests {
                 now: 1_000.0,
                 quota_signal_fresh: true,
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         )
         .expect("should upgrade");
         let fast_route = fact_to_route(&facts[1]);
         let fast_runtime =
             effective_runtime(&snap, &fast_route.route_key, &fast_route.capacity_key);
-        let (expected, _) = compute_objective(&fast_route, &fast_runtime, &DEFAULT_ANCHORS, false);
+        let (expected, _) = compute_objective(&fast_route, &fast_runtime, false);
 
         assert_eq!(out.score.objective, expected);
         assert_eq!(out.score.selection_cost, expected.selection_cost);
@@ -493,7 +505,7 @@ mod tests {
                 now: 1000.0,
                 quota_signal_fresh: false, // ...but the signal is STALE
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         );
         assert!(
             out.is_none(),
@@ -529,7 +541,7 @@ mod tests {
                 now: 1000.0,
                 quota_signal_fresh: true, // fresh cache, but no window for this route
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         );
         assert!(
             out.is_none(),
@@ -562,7 +574,7 @@ mod tests {
                 now: 1000.0,
                 quota_signal_fresh: true,
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         );
         assert!(
             out.is_none(),
@@ -595,7 +607,7 @@ mod tests {
                 now: 1_000.0,
                 quota_signal_fresh: true,
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         );
 
         assert!(out.is_none());
@@ -636,7 +648,7 @@ mod tests {
                 now: 1000.0,
                 quota_signal_fresh: true,
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         );
         assert!(out.is_none(), "high pressure must block the upgrade");
     }
@@ -668,7 +680,7 @@ mod tests {
                 now: 1000.0,
                 quota_signal_fresh: true,
             },
-            &DEFAULT_ANCHORS,
+            &DEFAULT_ROUTING_CONFIG,
         );
         assert!(out.is_none());
     }

@@ -29,20 +29,20 @@ use std::{
 
 use cortexkit_store_types::StorageDescriptor;
 use prefrontal_routing_core::model_router::{
-    select_model_route, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
+    select_model_route_with_config, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
     RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
-use prefrontal_routing_core::route_anchors::{ANCHOR_VERSION, DEFAULT_ANCHORS};
+use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, maybe_upgrade_to_fast_variant, relax_earliest_reset,
-    select_panel, validate_panel_spec, BreakGlassCandidate, DecisionInput, FastVariantUpgradeInput,
-    ModelFact, ModelRequirements, ModelRoute, PanelRosterEntry, PanelSelection, PanelSpec,
-    RouteOutcome, RouteStateStore, SelectPanelInput, SelectedPanel,
+    select_panel_with_config, validate_panel_spec, BreakGlassCandidate, DecisionInput,
+    FastVariantUpgradeInput, ModelFact, ModelRequirements, ModelRoute, PanelRosterEntry,
+    PanelSelection, PanelSpec, RouteOutcome, RouteStateStore, SelectPanelInput, SelectedPanel,
 };
 use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::json;
 use subc_protocol::{
     manifest::{
@@ -724,7 +724,6 @@ struct SelectBody {
 struct SelectParams {
     #[serde(default = "default_target_agent")]
     target_agent: String,
-    #[serde(deserialize_with = "deserialize_wire_requirements")]
     requirements: ModelRequirements,
     /// The routeKeys/capacityKeys the caller is logged into. Required: an empty
     /// set yields a typed `no_available_model` failure (the honest result).
@@ -764,7 +763,6 @@ struct SelectPanelBody {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SelectPanelParams {
-    #[serde(deserialize_with = "deserialize_wire_panel_spec")]
     panel_spec: PanelSpec,
     #[serde(default)]
     selection: PanelSelection,
@@ -790,40 +788,6 @@ struct SelectPanelParams {
 
 fn default_target_agent() -> String {
     "unknown".to_string()
-}
-
-/// Normalize demand values at the routing wire boundary. Values in (0, 10]
-/// are legacy 0-10 demands and are multiplied by 10; values above 10 already
-/// use the 0-100 scale and pass through. A genuine 0-100 demand of <=10 would
-/// target below the weak anchor, which no caller legitimately asks for, so the
-/// detection is unambiguous. Keep this compatibility shim at the wire boundary
-/// so old plugins and classify plans using the legacy scale remain safe without
-/// duplicating conversion logic in the scoring core.
-fn normalize_wire_demand(value: f64) -> f64 {
-    if value > 0.0 && value <= 10.0 {
-        value * 10.0
-    } else {
-        value
-    }
-}
-
-fn deserialize_wire_requirements<'de, D>(deserializer: D) -> Result<ModelRequirements, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let mut requirements = ModelRequirements::deserialize(deserializer)?;
-    requirements.iq = normalize_wire_demand(requirements.iq);
-    requirements.eq = normalize_wire_demand(requirements.eq);
-    Ok(requirements)
-}
-
-fn deserialize_wire_panel_spec<'de, D>(deserializer: D) -> Result<PanelSpec, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let mut panel_spec = PanelSpec::deserialize(deserializer)?;
-    panel_spec.iq_floor = normalize_wire_demand(panel_spec.iq_floor);
-    Ok(panel_spec)
 }
 
 /// subc-wire-name → routing providerID reconciliation. The quota module's wire
@@ -986,7 +950,7 @@ async fn handle_select_request(
         return handle_cooldown_status(frame, writer, store).await;
     }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
-        return handle_select_panel(frame, writer, quota_cache, store).await;
+        return handle_select_panel(frame, writer, quota_cache, store, routing_config_path).await;
     }
 
     if envelope.method != ROUTE_SELECT_OP {
@@ -1028,9 +992,14 @@ async fn handle_select_request(
             config_overrides::default_providers_without_prompt_cache()
         }
     };
+    if let Err(error) = config_overrides::reload_live_multipliers(routing_config_path) {
+        eprintln!(
+            "[prefrontal-routing] live route multiplier reload failed (using no multipliers): {error}"
+        );
+    }
     let PreparedSelectionInputs {
         now,
-        facts,
+        mut facts,
         snapshot,
         fresh_quota_provider_ids,
     } = match prepare_selection_inputs(quota_cache, store) {
@@ -1039,6 +1008,19 @@ async fn handle_select_request(
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
         }
     };
+    let routing_config = match config_overrides::apply_live_selection_config(
+        routing_config_path,
+        &mut facts,
+    ) {
+        Ok(outcome) => outcome.routing_config,
+        Err(error) => {
+            eprintln!(
+                "[prefrontal-routing] live Elo routing config reload failed (using defaults): {error}"
+            );
+            DEFAULT_ROUTING_CONFIG
+        }
+    };
+
     // The subscription set the plugin resolved (which available routes are flat-rate
     // 0-cost). The module stays harness-agnostic: it applies the cost model to the
     // supplied set rather than reading any harness's auth model itself.
@@ -1057,24 +1039,27 @@ async fn handle_select_request(
 
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
         let sub = subscription_keys.clone();
-        select_model_route(SelectModelRouteInput {
-            target_agent: target_agent.clone(),
-            requirements,
-            available_models: available.clone(),
-            facts: facts.clone(),
-            runtime_snapshot: Some(snap),
-            exclude_route_keys: exclude.clone(),
-            required_capabilities,
-            is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
-            })),
-            min_best_effort_adequacy,
-            prefer_prompt_cache,
-            providers_without_prompt_cache: providers_without_prompt_cache
-                .iter()
-                .cloned()
-                .collect(),
-        })
+        select_model_route_with_config(
+            SelectModelRouteInput {
+                target_agent: target_agent.clone(),
+                requirements,
+                available_models: available.clone(),
+                facts: facts.clone(),
+                runtime_snapshot: Some(snap),
+                exclude_route_keys: exclude.clone(),
+                required_capabilities,
+                is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
+                    sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
+                })),
+                min_best_effort_adequacy,
+                prefer_prompt_cache,
+                providers_without_prompt_cache: providers_without_prompt_cache
+                    .iter()
+                    .cloned()
+                    .collect(),
+            },
+            &routing_config,
+        )
     };
 
     // First attempt against the live snapshot.
@@ -1101,7 +1086,7 @@ async fn handle_select_request(
                         quota_signal_fresh: fresh_quota_provider_ids
                             .contains(&selected.model.provider_id),
                     },
-                    &DEFAULT_ANCHORS,
+                    &routing_config,
                 ) {
                     selected = upgraded;
                 }
@@ -1212,6 +1197,7 @@ async fn handle_select_panel(
     writer: &mpsc::Sender<Frame>,
     quota_cache: &SharedQuotaCache,
     store: &SharedStore,
+    routing_config_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -1261,30 +1247,50 @@ async fn handle_select_panel(
             .await;
         }
     }
-    let prepared = match prepare_selection_inputs(quota_cache, store) {
+    if let Err(error) = config_overrides::reload_live_multipliers(routing_config_path) {
+        eprintln!(
+            "[prefrontal-routing] live route multiplier reload failed (using no multipliers): {error}"
+        );
+    }
+    let mut prepared = match prepare_selection_inputs(quota_cache, store) {
         Ok(prepared) => prepared,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
         }
     };
+    let routing_config = match config_overrides::apply_live_selection_config(
+        routing_config_path,
+        &mut prepared.facts,
+    ) {
+        Ok(outcome) => outcome.routing_config,
+        Err(error) => {
+            eprintln!(
+                "[prefrontal-routing] live Elo routing config reload failed (using defaults): {error}"
+            );
+            DEFAULT_ROUTING_CONFIG
+        }
+    };
     let subscription_keys: HashSet<String> = params.subscription_keys.iter().cloned().collect();
     let available_models = params.available_models.iter().cloned().collect();
-    let panel = match select_panel(SelectPanelInput {
-        panel_spec: params.panel_spec.clone(),
-        selection: params.selection,
-        roster: params.roster.clone(),
-        package_tokens_estimate: params.package_tokens_estimate,
-        pro_member_max_package_tokens: params.pro_member_max_package_tokens,
-        facts: prepared.facts,
-        runtime_snapshot: Some(prepared.snapshot),
-        exclude_route_keys: params.exclude_route_keys.clone(),
-        required_capabilities: params.required_capabilities,
-        available_models,
-        is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-            subscription_keys.contains(&route.route_key)
-                || subscription_keys.contains(&route.capacity_key)
-        })),
-    }) {
+    let panel = match select_panel_with_config(
+        SelectPanelInput {
+            panel_spec: params.panel_spec.clone(),
+            selection: params.selection,
+            roster: params.roster.clone(),
+            package_tokens_estimate: params.package_tokens_estimate,
+            pro_member_max_package_tokens: params.pro_member_max_package_tokens,
+            facts: prepared.facts,
+            runtime_snapshot: Some(prepared.snapshot),
+            exclude_route_keys: params.exclude_route_keys.clone(),
+            required_capabilities: params.required_capabilities,
+            available_models,
+            is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
+                subscription_keys.contains(&route.route_key)
+                    || subscription_keys.contains(&route.capacity_key)
+            })),
+        },
+        &routing_config,
+    ) {
         Ok(panel) => panel,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &e.0)
@@ -2039,7 +2045,7 @@ mod tests {
             variant: None,
             family: None,
             scores: ModelScores {
-                iq: 55.0,
+                elo: 55.0,
                 eq: 1700.0,
                 speed: 90.0,
             },
@@ -2375,12 +2381,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wire_demand_normalization_preserves_legacy_scale_and_top_band_boundary() {
+    async fn wire_demand_uses_the_caller_0_to_100_scale_without_rescaling() {
         async fn select(demand: f64) -> (Frame, Rig) {
             let rig = Rig::new(&format!("wire-demand-{demand}"));
             let store = Arc::new(rig.open_store());
             let mut route = fact("p", "fact-53");
-            route.scores.iq = 53.0;
+            route.scores.elo = 53.0;
             store.upsert_fact(&route, FactSource::Override).unwrap();
             let request = json!({
                 "method": ROUTE_SELECT_OP,
@@ -2416,29 +2422,22 @@ mod tests {
             (rx.recv().await.unwrap(), rig)
         }
 
-        let (legacy, _legacy_rig) = select(8.0).await;
-        let (current, _current_rig) = select(80.0).await;
-        assert_eq!(legacy.header.ty, FrameType::Response);
-        assert_eq!(current.header.ty, FrameType::Response);
-        let legacy_body: serde_json::Value = serde_json::from_slice(&legacy.body).unwrap();
-        let current_body: serde_json::Value = serde_json::from_slice(&current.body).unwrap();
-        assert_eq!(legacy_body["result"]["selected"]["routeKey"], "p/fact-53");
-        assert_eq!(
-            legacy_body["result"]["selected"]["routeKey"],
-            current_body["result"]["selected"]["routeKey"]
-        );
-        assert!(legacy_body["result"]["selected"]["explanation"]
+        let (low, _low_rig) = select(8.0).await;
+        let (high, _high_rig) = select(80.0).await;
+        assert_eq!(low.header.ty, FrameType::Response);
+        assert_eq!(high.header.ty, FrameType::Response);
+        let low_body: serde_json::Value = serde_json::from_slice(&low.body).unwrap();
+        let high_body: serde_json::Value = serde_json::from_slice(&high.body).unwrap();
+        assert!(low_body["result"]["selected"]["explanation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("need 8/100")));
+        assert!(high_body["result"]["selected"]["explanation"]
             .as_array()
             .unwrap()
             .iter()
             .any(|line| line.as_str().unwrap().contains("need 80/100")));
-
-        // The top knee prices the 53-class mid band out from demand 84 up
-        // (bar 54.61 at 84), well before the pre-knee boundary of 92.
-        let (top_band, _top_band_rig) = select(84.0).await;
-        assert_eq!(top_band.header.ty, FrameType::Error);
-        let error: ErrorBody = serde_json::from_slice(&top_band.body).unwrap();
-        assert_eq!(error.code, "all_routes_inadequate");
     }
 
     #[tokio::test]
@@ -2695,6 +2694,74 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].decision_kind, "panel");
         assert_eq!(decisions[0].selected_route_key, None);
+    }
+
+    #[tokio::test]
+    async fn next_selection_observes_a_live_elo_override_edit() {
+        async fn select(
+            store: &SharedStore,
+            quota_cache: &SharedQuotaCache,
+            config_path: &Path,
+        ) -> String {
+            let request = json!({
+                "method": ROUTE_SELECT_OP,
+                "params": {
+                    "targetAgent": "mason",
+                    "requirements": { "iq": 100, "eq": 0 },
+                    "availableModels": ["p/weak", "p/strong"]
+                }
+            });
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            handle_select_request(
+                frame,
+                1,
+                &tx,
+                quota_cache,
+                store,
+                &Arc::new(Mutex::new(None)),
+                config_path,
+            )
+            .await
+            .unwrap();
+            let response = rx.recv().await.unwrap();
+            assert_eq!(response.header.ty, FrameType::Response);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            body["result"]["selected"]["routeKey"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        let rig = Rig::new("live-elo-override");
+        let store = Arc::new(rig.open_store());
+        let mut weak = fact("p", "weak");
+        weak.scores.elo = 1_000.0;
+        weak.cost_per_m_tok_out = Some(0.0);
+        let mut strong = fact("p", "strong");
+        strong.scores.elo = 1_800.0;
+        strong.cost_per_m_tok_out = Some(30.0);
+        store.upsert_fact(&weak, FactSource::Override).unwrap();
+        store.upsert_fact(&strong, FactSource::Override).unwrap();
+        let config_path = rig.dir.join("alfonso-routing.jsonc");
+        std::fs::write(&config_path, r#"{"model_routing":{}}"#).unwrap();
+        let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
+
+        assert_eq!(select(&store, &quota_cache, &config_path).await, "p/strong");
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"elo_overrides":{"p/weak":1900}}}"#,
+        )
+        .unwrap();
+        assert_eq!(select(&store, &quota_cache, &config_path).await, "p/weak");
     }
 
     #[test]

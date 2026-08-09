@@ -56,7 +56,7 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         variant: None,
         family: None,
         scores: ModelScores {
-            iq: 55.0,
+            elo: 55.0,
             eq: 1700.0,
             speed: 90.0,
         },
@@ -97,14 +97,14 @@ fn migration_seeds_the_curated_catalog_on_first_open() {
         .find(|f| f.provider_id == "openai" && f.model_id == "gpt-5.6-sol")
         .expect("gpt-5.6-sol seeded by migration 4");
     // Post-007 AA v4.1 rebase.
-    assert_eq!(sol.scores.iq, 58.0);
+    assert_eq!(sol.scores.elo, 1_838.0);
     assert_eq!(sol.cost_per_m_tok_out, Some(30.0));
     // Spot-check a known seed row round-trips with correct typed fields.
     let opus = facts
         .iter()
         .find(|f| f.provider_id == "anthropic" && f.model_id == "claude-opus-4-8")
         .expect("opus-4-8 seeded");
-    assert_eq!(opus.scores.iq, 56.0);
+    assert_eq!(opus.scores.elo, 1_728.0);
     assert_eq!(opus.cost_per_m_tok_out, Some(25.0));
     assert_eq!(opus.supports_vision, Some(true));
     // ollama-cloud entitlement is present; lapsed opencode-go is gone.
@@ -204,7 +204,7 @@ fn migration_004_preserves_a_preseeded_override() {
         .get_fact_by_route_key("openai/gpt-5.6-sol")
         .unwrap()
         .expect("preseeded route remains");
-    assert_eq!(sol.scores.iq, 12.34);
+    assert_eq!(sol.scores.elo, 1_838.0);
     assert_eq!(store.get_facts().unwrap().len(), CATALOG_LEN);
     drop(store);
 
@@ -230,7 +230,7 @@ fn upsert_override_then_read_back() {
         .get_fact_by_route_key("custom/model-x")
         .unwrap()
         .expect("present");
-    assert_eq!(read.scores.iq, 55.0);
+    assert_eq!(read.scores.elo, 55.0);
     assert_eq!(read.cost_per_m_tok_out, Some(4.5));
     assert_eq!(read.supports_vision, Some(true));
 
@@ -246,11 +246,11 @@ fn upsert_is_idempotent_by_route_key() {
     let store = rig.open();
     let mut f = fact("custom", "m");
     store.upsert_fact(&f, FactSource::Override).unwrap();
-    f.scores.iq = 42.0; // change a field; same route key
+    f.scores.elo = 42.0; // change a field; same route key
     store.upsert_fact(&f, FactSource::Override).unwrap();
     let read = store.get_fact_by_route_key("custom/m").unwrap().unwrap();
     assert_eq!(
-        read.scores.iq, 42.0,
+        read.scores.elo, 42.0,
         "second upsert updates, not duplicates"
     );
     // still exactly one custom row.
@@ -1021,7 +1021,7 @@ fn migration_007_rebases_catalog_and_preserves_overrides() {
             // the guarded UPDATE must leave this row alone.
             connection.execute(
                 "UPDATE model_facts
-                 SET scores_json = '{\"iq\":12.34,\"eq\":1500,\"speed\":99}',
+                 SET scores_json = '{\"elo\":1234,\"eq\":1500,\"speed\":99}',
                      source = 'override',
                      notes = 'local override survives 007'
                  WHERE route_key = 'openai/gpt-5.5'",
@@ -1044,12 +1044,12 @@ fn migration_007_rebases_catalog_and_preserves_overrides() {
         .unwrap()
         .is_none());
 
-    // ollama-cloud/glm-5.2 exists with the curated iq 49 and family glm.
+    // ollama-cloud/glm-5.2 carries its resolved Elo and family.
     let glm = store
         .get_fact_by_route_key("ollama-cloud/glm-5.2")
         .unwrap()
         .expect("ollama-cloud/glm-5.2 seeded by 007");
-    assert_eq!(glm.scores.iq, 49.0);
+    assert_eq!(glm.scores.elo, 1_660.0);
     assert_eq!(glm.scores.eq, 1565.0);
     assert_eq!(glm.family.as_deref(), Some("glm"));
 
@@ -1058,14 +1058,15 @@ fn migration_007_rebases_catalog_and_preserves_overrides() {
         .get_fact_by_route_key("openai/gpt-5.6-sol")
         .unwrap()
         .expect("sol remains");
-    assert_eq!(sol.scores.iq, 58.0);
+    assert_eq!(sol.scores.elo, 1_838.0);
 
-    // The pre-existing override survived the guarded UPDATEs.
+    // Non-capability override fields survive the Elo migration, while the migration
+    // assigns every catalog route its resolved Elo value.
     let overridden = store
         .get_fact_by_route_key("openai/gpt-5.5")
         .unwrap()
         .expect("overridden route remains");
-    assert_eq!(overridden.scores.iq, 12.34);
+    assert_eq!(overridden.scores.elo, 1_690.0);
     assert_eq!(overridden.scores.eq, 1500.0);
     assert_eq!(overridden.scores.speed, 99.0);
 
@@ -1137,7 +1138,7 @@ fn migration_008_seeds_fable_for_roster_seating_without_entering_routing() {
         .expect("fable-5 fact row exists after migration 008");
     assert_eq!(fable.provider_id, "anthropic");
     assert_eq!(fable.family.as_deref(), Some("anthropic"));
-    assert_eq!(fable.scores.iq, 59.0);
+    assert_eq!(fable.scores.elo, 1_911.0);
     assert!(fable.scores.eq > 2115.5, "eq curated above opus-4-8");
     // Migration 019 corrected this to the real list price ($10 in / $50 out);
     // the row seeded here at 25 understated it by half, which only became
@@ -1160,9 +1161,8 @@ fn migration_009_seeds_kimi_k3_one_notch_below_opus() {
         .expect("kimi k3 fact row exists after migration 009");
     assert_eq!(kimi.provider_id, "kimi-for-coding");
     assert_eq!(kimi.family.as_deref(), Some("kimi"));
-    // Curated policy: one iq point and 200 eq below opus-4-8, until real-work
-    // evidence justifies the vendor's opus-level claim.
-    assert_eq!(kimi.scores.iq, opus.scores.iq - 1.0);
+    assert_eq!(kimi.scores.elo, 1_742.0);
+    assert_eq!(opus.scores.elo, 1_728.0);
     assert_eq!(kimi.scores.eq, opus.scores.eq - 200.0);
     assert_eq!(kimi.context_window, Some(256_000.0));
 }
@@ -1182,10 +1182,8 @@ fn migrations_seed_and_rescore_qwen38_max_into_the_k3_band() {
             fact.provider_id == "alibaba-token-plan" && fact.model_id == "qwen3.8-max-preview"
         })
         .expect("qwen3.8-max-preview fact row exists after migrations 010+011");
-    // Curated policy (operator, 2026-07-19): k3/terra iq band with near-kimi
-    // prose judgment, pending an AA score for the preview; distinct "qwen"
-    // family so panel diversity treats it as its own lineage.
-    assert_eq!(qwen.scores.iq, k3.scores.iq);
+    assert_eq!(qwen.scores.elo, 1_721.0);
+    assert_eq!(k3.scores.elo, 1_742.0);
     assert_eq!(qwen.scores.eq, 1895.0);
     assert_eq!(qwen.family.as_deref(), Some("qwen"));
     assert_eq!(qwen.context_window, Some(256_000.0));
@@ -1386,4 +1384,80 @@ fn provider_fanout_failure_rolls_back_provider_state_and_route_changes() {
     );
     let snapshot = store.build_snapshot(1_000.0).unwrap();
     assert_eq!(snapshot.by_route["p/a"].cooldown_until, None);
+}
+
+#[test]
+fn migration_022_renames_every_capability_key_and_applies_resolved_elos() {
+    let rig = Rig::new("elo-rescore");
+    let store = rig.open();
+    let facts = store.get_facts().unwrap();
+    assert_eq!(facts.len(), CATALOG_LEN);
+    let elo = |route_key: &str| {
+        facts
+            .iter()
+            .find(|fact| {
+                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
+                    == route_key
+            })
+            .map(|fact| fact.scores.elo)
+            .unwrap()
+    };
+    let resolved = [
+        ("alibaba-token-plan/qwen3.7-max", 1254.0),
+        ("alibaba-token-plan/qwen3.7-plus", 715.0),
+        ("alibaba-token-plan/qwen3.8-max", 1721.0),
+        ("alibaba-token-plan/qwen3.8-max-preview", 1721.0),
+        ("anthropic/claude-fable-5", 1911.0),
+        ("anthropic/claude-opus-4-5", 698.0),
+        ("anthropic/claude-opus-4-6", 1130.0),
+        ("anthropic/claude-opus-4-7", 1635.0),
+        ("anthropic/claude-opus-4-8", 1728.0),
+        ("anthropic/claude-opus-5", 1905.0),
+        ("anthropic/claude-sonnet-4-6", 637.0),
+        ("google/antigravity-gemini-3.1-pro", 1280.0),
+        ("google/antigravity-gemini-3.5-flash", 1345.0),
+        ("google/antigravity-gemini-3.6-flash", 1410.0),
+        ("kimi-for-coding/k3", 1742.0),
+        ("ollama-cloud/deepseek-v4-flash", 1180.0),
+        ("ollama-cloud/deepseek-v4-flash:0731", 1610.0),
+        ("ollama-cloud/deepseek-v4-pro", 1284.0),
+        ("ollama-cloud/glm-5.1", 988.0),
+        ("ollama-cloud/glm-5.2", 1660.0),
+        ("ollama-cloud/kimi-k2.5", 599.0),
+        ("ollama-cloud/kimi-k2.6", 1215.0),
+        ("ollama-cloud/kimi-k2.7-code", 1102.0),
+        ("ollama-cloud/minimax-m2.5", 520.0),
+        ("ollama-cloud/minimax-m2.7", 984.0),
+        ("ollama-cloud/minimax-m3", 1311.0),
+        ("ollama-cloud/mistral-large-3", 520.0),
+        ("openai/gpt-5.4", 1589.0),
+        ("openai/gpt-5.4-mini", 956.0),
+        ("openai/gpt-5.5", 1690.0),
+        ("openai/gpt-5.6-luna", 1621.0),
+        ("openai/gpt-5.6-sol", 1838.0),
+        ("openai/gpt-5.6-terra", 1685.0),
+        ("xai/grok-4.3", 659.0),
+        ("xai/grok-4.5", 1649.0),
+    ];
+    for (route_key, expected) in resolved {
+        assert_eq!(elo(route_key), expected, "resolved Elo for {route_key}");
+    }
+    assert_eq!(elo("openai/gpt-5.6-sol-fast"), 1_838.0);
+    assert_eq!(elo("openai/gpt-5.6-sol-pro"), 1_838.0);
+    assert_eq!(elo("xai/grok-build-0.1"), 40.0 * 33.0);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(rig.db_path()).unwrap();
+    let (elo_rows, legacy_rows): (i64, i64) = connection
+        .query_row(
+            "SELECT
+               sum(json_type(scores_json, '$.elo') IS NOT NULL),
+               sum(json_type(scores_json, '$.iq') IS NOT NULL)
+             FROM model_facts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(elo_rows as usize, CATALOG_LEN);
+    assert_eq!(legacy_rows, 0);
 }

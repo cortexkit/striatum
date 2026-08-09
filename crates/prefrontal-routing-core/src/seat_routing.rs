@@ -29,7 +29,7 @@ use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, AdmittedRoute,
     ModelRouteStateSnapshot, ObjectiveBreakdown, RequiredCapabilities, SelectedModel,
 };
-use crate::route_anchors::{Anchors, ADEQUACY_FLOOR, DEFAULT_ANCHORS};
+use crate::routing_config::{RoutingConfig, ADEQUACY_FLOOR, DEFAULT_ROUTING_CONFIG};
 
 /// Ordered persona model recommendations, already normalized to the canonical
 /// lowercase ids exported by model facts. Entry order is preference order.
@@ -205,9 +205,9 @@ pub fn incumbent_grand_families(
     families
 }
 
-/// Select the seat route with default anchors. See [`select_seat_route_with_anchors`].
+/// Select a seat route with the default demand curve.
 pub fn select_seat_route(input: SeatRouteInput<'_>) -> Result<SeatRouteSelection, SeatRouteError> {
-    select_seat_route_with_anchors(input, &DEFAULT_ANCHORS)
+    select_seat_route_with_config(input, &DEFAULT_ROUTING_CONFIG)
 }
 
 /// Candidate wrapper carrying the precomputed objective for deterministic
@@ -218,9 +218,9 @@ struct SeatCandidate {
     metered_cost: f64,
 }
 
-pub fn select_seat_route_with_anchors(
+pub fn select_seat_route_with_config(
     input: SeatRouteInput<'_>,
-    anchors: &Anchors,
+    config: &RoutingConfig,
 ) -> Result<SeatRouteSelection, SeatRouteError> {
     for value in [input.requirements.iq, input.requirements.eq] {
         if value.is_nan() || !(0.0..=100.0).contains(&value) {
@@ -237,7 +237,7 @@ pub fn select_seat_route_with_anchors(
         input.required_capabilities,
         &input.available_models,
         &input.requirements,
-        anchors,
+        config,
     );
 
     // Adequacy gate: seats have no best-effort band. A route is adequate only
@@ -245,7 +245,7 @@ pub fn select_seat_route_with_anchors(
     let (adequate, inadequate): (Vec<AdmittedRoute>, Vec<AdmittedRoute>) = admission
         .admitted
         .into_iter()
-        .partition(|route| route.adequacy.adequacy >= ADEQUACY_FLOOR);
+        .partition(|route| route.adequacy.clears_adequacy_floor());
 
     if let Some(pin) = &input.model_pin {
         return select_pinned(
@@ -254,7 +254,7 @@ pub fn select_seat_route_with_anchors(
             adequate,
             inadequate,
             &admission.rejected,
-            anchors,
+            config,
         );
     }
 
@@ -266,7 +266,7 @@ pub fn select_seat_route_with_anchors(
             )
         } else {
             format!(
-                "{} available route(s), none clears the adequacy gate {ADEQUACY_FLOOR:.2}",
+                "{} available route(s), none clears the adequacy floor",
                 inadequate.len()
             )
         };
@@ -283,7 +283,7 @@ pub fn select_seat_route_with_anchors(
         ));
     }
 
-    let ordered = order_candidates(pool, &input, anchors);
+    let ordered = order_candidates(pool, &input);
 
     // Diversity preference: first candidate (in deterministic tie-break order)
     // whose KNOWN grand family is absent from every known incumbent family.
@@ -325,7 +325,7 @@ fn select_pinned(
     adequate: Vec<AdmittedRoute>,
     inadequate: Vec<AdmittedRoute>,
     rejected: &[crate::model_router::RejectedRoute],
-    anchors: &Anchors,
+    _config: &RoutingConfig,
 ) -> Result<SeatRouteSelection, SeatRouteError> {
     let pin_key = pin.trim().to_ascii_lowercase();
     if pin_key.split('/').filter(|part| !part.is_empty()).count() != 2 {
@@ -366,7 +366,7 @@ fn select_pinned(
         });
     }
 
-    let ordered = order_candidates(pinned_adequate, input, anchors);
+    let ordered = order_candidates(pinned_adequate, input);
     let winner = &ordered[0];
     Ok(build_selection(
         winner,
@@ -430,11 +430,7 @@ fn apply_recommendations(
 /// Deterministic cost-primary ordering, identical to the existing router
 /// tie-break chain: lowest economic selection cost, then fastest, then
 /// cheapest metered proxy, then highest adequacy, then route key.
-fn order_candidates(
-    pool: Vec<AdmittedRoute>,
-    input: &SeatRouteInput<'_>,
-    anchors: &Anchors,
-) -> Vec<SeatCandidate> {
+fn order_candidates(pool: Vec<AdmittedRoute>, input: &SeatRouteInput<'_>) -> Vec<SeatCandidate> {
     let mut candidates: Vec<SeatCandidate> = pool
         .into_iter()
         .map(|admitted| {
@@ -444,7 +440,7 @@ fn order_candidates(
                 .map(|predicate| predicate(&admitted.route))
                 .unwrap_or(false);
             let (objective, _) =
-                compute_objective(&admitted.route, &admitted.runtime, anchors, is_subscription);
+                compute_objective(&admitted.route, &admitted.runtime, is_subscription);
             SeatCandidate {
                 metered_cost: normalized_metered_cost(&admitted.route.fact),
                 admitted,

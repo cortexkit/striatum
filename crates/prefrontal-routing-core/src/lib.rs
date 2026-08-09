@@ -20,9 +20,9 @@ pub mod provider_model_spec;
 pub mod quota;
 pub mod quota_extract;
 pub mod quota_pace;
-pub mod route_anchors;
 pub mod route_scoring;
 pub mod route_state_store;
+pub mod routing_config;
 pub mod seat_routing;
 
 pub use break_glass::{relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot};
@@ -36,14 +36,14 @@ pub use model_facts::{
 };
 pub use model_facts_seed::model_facts_seed;
 pub use model_router::{
-    admit_routes, select_model_route, select_model_route_with_anchors, AdmissionResult,
+    admit_routes, select_model_route, select_model_route_with_config, AdmissionResult,
     AdmittedRoute, BelowFloorWarning, GoverningWindow, ModelRouteStateSnapshot, NoRouteError,
     ObjectiveBreakdown, PromptParams, RejectedCandidate, RejectedRoute, RequiredCapabilities,
     RouteFailureReason, RouteRuntimeState, SelectModelRouteInput, SelectedModel,
     SelectedModelRoute, SelectedRouteScore,
 };
 pub use panel::{
-    select_panel, select_panel_with_anchors, validate_panel_spec, InvalidPanelRequest, PanelCause,
+    select_panel, select_panel_with_config, validate_panel_spec, InvalidPanelRequest, PanelCause,
     PanelCauseReason, PanelClass, PanelDiversity, PanelMember, PanelPolicy, PanelRosterEntry,
     PanelRunnerUp, PanelSelection, PanelSelectionPolicy, PanelShortfall, PanelShortfallCode,
     PanelSpec, SeatedSiblingVariant, SeatedVariant, SelectPanelInput, SelectedPanel,
@@ -63,21 +63,21 @@ pub use quota_pace::{
     clamp01, project_quota_pressure, smoothstep, PaceConfig, PaceInput, PaceReason, PaceResult,
     DEFAULT_PACE_CONFIG,
 };
-pub use route_anchors::{
-    lerp, metric_spread, requirement_target, sigmoid, Anchors, MetricAnchor, ADEQUACY_FLOOR,
-    ANCHOR_VERSION, COST_REFERENCE_PER_MTOK, DEFAULT_ANCHORS, MIN_BEST_EFFORT_ADEQUACY,
-    OBJECTIVE_WEIGHT_QUOTA, QUALITY_METRICS, RELATIVE_SHORTLIST_DELTA,
-    UNKNOWN_FACT_CONFIDENCE_PENALTY, UNKNOWN_MODEL_SCORES,
-};
-pub use route_scoring::{saturating_fit, score_adequacy, AdequacyScore, MetricFit};
+pub use route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 pub use route_state_store::{
     DecisionInput, DecisionRow, FactSource, ProviderCooldownState, RouteOutcome, RouteStateResult,
     RouteStateStore, RouteStateStoreError, RouteStateUpdate, UsageObservation,
     OBSERVED_SPEED_MIN_OUTPUT_TOKENS, OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT,
     OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
 };
+pub use routing_config::{
+    demand_bar, fit_ratio, RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, ANCHOR_VERSION,
+    COST_REFERENCE_PER_MTOK, DEFAULT_DEMAND_EXPONENT, DEFAULT_ROUTING_CONFIG,
+    MIN_BEST_EFFORT_ADEQUACY, OBJECTIVE_WEIGHT_QUOTA, RELATIVE_SHORTLIST_DELTA,
+    UNKNOWN_FACT_CONFIDENCE_PENALTY, UNKNOWN_MODEL_SCORES,
+};
 pub use seat_routing::{
-    incumbent_grand_families, select_seat_route, select_seat_route_with_anchors,
+    incumbent_grand_families, select_seat_route, select_seat_route_with_config,
     SeatRecommendationMatch, SeatRecommendationTier, SeatRecommendations, SeatRouteError,
     SeatRouteInput, SeatRouteSelection,
 };

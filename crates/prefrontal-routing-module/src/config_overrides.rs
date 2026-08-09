@@ -8,7 +8,7 @@
 //!
 //! Overrides are upserted with source `override`; an override row that disappears
 //! from config is reverted to the seed fact (or deleted if the model is not in the
-//! seed). This is the user-GLOBAL tier (iq/eq/cost are not per-project); the
+//! seed). This is the user-GLOBAL tier (elo/eq/cost are not per-project); the
 //! project tier (read at route.bind) is deferred.
 
 use std::collections::{HashMap, HashSet};
@@ -17,7 +17,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores};
-use prefrontal_routing_core::{make_route_key, model_facts_seed, FactSource, RouteStateStore};
+use prefrontal_routing_core::{
+    make_route_key, model_facts_seed, FactSource, RouteStateStore, RoutingConfig,
+    DEFAULT_DEMAND_EXPONENT,
+};
 use serde::{Deserialize, Deserializer};
 use subc_jsonc::jsonc_to_json;
 
@@ -49,6 +52,13 @@ struct ModelRoutingSection {
     /// Keyed by "provider/model" or "provider/model/variant".
     #[serde(default)]
     models: HashMap<String, ModelFactOverride>,
+    /// Request-time capability overrides. Unknown keys are ignored and surfaced
+    /// to the caller for warning logs.
+    #[serde(default)]
+    elo_overrides: HashMap<String, f64>,
+    /// Power-curve exponent mapping caller IQ demand to the request frontier.
+    #[serde(default)]
+    demand_exponent: Option<f64>,
     /// Minimum adequacy for best-effort selection (sanity band). Default 0.6.
     /// Clamped to [0, 1]; NaN is rejected loudly at parse time.
     #[serde(default)]
@@ -65,11 +75,11 @@ struct ModelRoutingSection {
 /// One per-model override. Every field optional: a present field overrides the
 /// base fact, an absent one preserves it. Mirrors the TS `ModelFactOverride`.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 struct ModelFactOverride {
     /// Outer None means absent; Some(None) means an explicit JSON null clears it.
     #[serde(default, deserialize_with = "deserialize_family_override")]
     family: Option<Option<String>>,
-    iq: Option<f64>,
     eq: Option<f64>,
     speed: Option<f64>,
     cost_per_mtok_out: Option<f64>,
@@ -129,7 +139,7 @@ fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
         fact.family = family.clone();
     }
     fact.scores = ModelScores {
-        iq: ov.iq.unwrap_or(base.scores.iq),
+        elo: base.scores.elo,
         eq: ov.eq.unwrap_or(base.scores.eq),
         speed: ov.speed.unwrap_or(base.scores.speed),
     };
@@ -201,6 +211,143 @@ pub fn read_min_best_effort_adequacy(path: &std::path::Path) -> Result<Option<f6
         None => Ok(None),
         Some(raw) => validate_min_best_effort_adequacy(raw).map(Some),
     }
+}
+
+/// Refresh route multipliers before facts are loaded for a selection. Removing
+/// the config file or a multiplier clears its previous value on the next request.
+pub fn reload_live_multipliers(path: &Path) -> Result<(), String> {
+    let document = match std::fs::read_to_string(path) {
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            prefrontal_routing_core::model_facts::set_speed_multipliers(HashMap::new());
+            prefrontal_routing_core::model_facts::set_subscription_multipliers(HashMap::new());
+            return Ok(());
+        }
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let parsed = jsonc_to_json(&document)
+        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))
+        .and_then(|json| {
+            serde_json::from_str::<RoutingConfigFile>(&json)
+                .map_err(|error| format!("invalid config in {}: {error}", path.display()))
+        });
+    let config = match parsed {
+        Ok(config) => config,
+        Err(error) => {
+            prefrontal_routing_core::model_facts::set_speed_multipliers(HashMap::new());
+            prefrontal_routing_core::model_facts::set_subscription_multipliers(HashMap::new());
+            return Err(error);
+        }
+    };
+
+    let mut speed_multipliers = HashMap::new();
+    let mut subscription_multipliers = HashMap::new();
+    for (key, model) in config.model_routing.models {
+        let Some((provider, model_id, variant)) = parse_model_key(&key) else {
+            continue;
+        };
+        let route_key = make_route_key(&provider, &model_id, variant.as_deref());
+        if let Some(value) = model.speed_multiplier {
+            if value.is_finite() && value > 0.0 && value <= 2.0 {
+                speed_multipliers.insert(route_key.clone(), value);
+            } else {
+                eprintln!(
+                    "[prefrontal-routing] invalid speed_multiplier for route {route_key}: {value}; ignoring"
+                );
+            }
+        }
+        if let Some(value) = model.subscription_multiplier {
+            if value.is_finite() && value > 0.0 {
+                subscription_multipliers.insert(route_key, value);
+            } else {
+                eprintln!(
+                    "[prefrontal-routing] invalid subscription_multiplier for route {route_key}: {value}; ignoring"
+                );
+            }
+        }
+    }
+    prefrontal_routing_core::model_facts::set_speed_multipliers(speed_multipliers);
+    prefrontal_routing_core::model_facts::set_subscription_multipliers(subscription_multipliers);
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectionOverrideOutcome {
+    pub routing_config: RoutingConfig,
+    pub applied: usize,
+    pub unknown_keys: Vec<String>,
+}
+
+/// Re-read request-time Elo settings and apply known route overrides to this
+/// selection's fact snapshot. Nothing is persisted, so removing an override
+/// restores the catalog Elo value on the next request.
+pub fn apply_live_selection_config(
+    path: &Path,
+    facts: &mut [ModelFact],
+) -> Result<SelectionOverrideOutcome, String> {
+    let doc = match std::fs::read_to_string(path) {
+        Ok(doc) => doc,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SelectionOverrideOutcome {
+                routing_config: RoutingConfig::default(),
+                applied: 0,
+                unknown_keys: Vec::new(),
+            });
+        }
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let json = jsonc_to_json(&doc)
+        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
+    let config: RoutingConfigFile = serde_json::from_str(&json)
+        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
+    let exponent = config
+        .model_routing
+        .demand_exponent
+        .unwrap_or(DEFAULT_DEMAND_EXPONENT);
+    if !exponent.is_finite() || exponent <= 0.0 {
+        return Err(format!(
+            "model_routing.demand_exponent must be finite and positive, got {exponent}"
+        ));
+    }
+
+    let mut fact_indices = facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| {
+            (
+                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()),
+                index,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut applied = 0;
+    let mut unknown_keys = Vec::new();
+    for (route_key, elo) in config.model_routing.elo_overrides {
+        let Some(index) = fact_indices.remove(&route_key) else {
+            eprintln!(
+                "[prefrontal-routing] unknown elo_overrides route key `{route_key}`; ignoring"
+            );
+            unknown_keys.push(route_key);
+            continue;
+        };
+        if !elo.is_finite() || elo <= 0.0 {
+            eprintln!(
+                "[prefrontal-routing] invalid Elo override for route `{route_key}`: {elo}; ignoring"
+            );
+            continue;
+        }
+        facts[index].scores.elo = elo;
+        applied += 1;
+    }
+    unknown_keys.sort();
+
+    Ok(SelectionOverrideOutcome {
+        routing_config: RoutingConfig {
+            demand_exponent: exponent,
+        },
+        applied,
+        unknown_keys,
+    })
 }
 
 /// Read the cache capability deny-list for the gather-seat preference. The file
@@ -425,7 +572,7 @@ mod tests {
             variant: None,
             family: Some("original".into()),
             scores: ModelScores {
-                iq: 50.0,
+                elo: 50.0,
                 eq: 1700.0,
                 speed: 90.0,
             },
@@ -442,13 +589,12 @@ mod tests {
             subscription_multiplier: None,
         };
         let ov = ModelFactOverride {
-            iq: Some(60.0),
             vision: Some(true),
             ..Default::default()
         };
         let merged = merge_override(&base, &ov);
         assert_eq!(merged.family.as_deref(), Some("original"));
-        assert_eq!(merged.scores.iq, 60.0);
+        assert_eq!(merged.scores.elo, 50.0);
         assert_eq!(merged.scores.eq, 1700.0); // preserved
         assert_eq!(merged.scores.speed, 90.0); // preserved
         assert_eq!(merged.supports_vision, Some(true)); // overridden
@@ -490,23 +636,18 @@ mod tests {
             "model_routing": {
                 "models": {
                     "openai/gpt-5.5": {
-                        "iq": 60.0,
                         "speed_multiplier": 0.5
                     },
                     "openai/gpt-5.4": {
-                        "iq": 50.0,
                         "speed_multiplier": 0.0
                     },
                     "openai/gpt-5.4-mini": {
-                        "iq": 40.0,
                         "speed_multiplier": -1.0
                     },
                     "openai/gpt-5.4-fast": {
-                        "iq": 50.0,
                         "speed_multiplier": 2.5
                     },
                     "openai/gpt-5.4-mini-fast": {
-                        "iq": 40.0,
                         "speed_multiplier": null
                     }
                 }
@@ -564,7 +705,6 @@ mod tests {
             "openai/gpt-5.5".to_string(),
             ModelFactOverride {
                 family: None,
-                iq: Some(60.0),
                 eq: None,
                 speed: None,
                 cost_per_mtok_out: None,
@@ -609,15 +749,12 @@ mod tests {
             "model_routing": {
                 "models": {
                     "openai/gpt-5.5": {
-                        "iq": 60.0,
                         "subscription_multiplier": 2.0
                     },
                     "openai/gpt-5.4": {
-                        "iq": 50.0,
                         "subscription_multiplier": 0.0
                     },
                     "openai/gpt-5.4-mini": {
-                        "iq": 40.0,
                         "subscription_multiplier": -1.0
                     }
                 }
@@ -833,6 +970,54 @@ mod tests {
             4,
             "parse failure did not serve stale policy"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elo_overrides_and_demand_exponent_live_reload_and_warn_on_unknown_keys() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-elo-live-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alfonso-routing.jsonc");
+        let mut facts = model_facts_seed().to_vec();
+        let sol = |facts: &[ModelFact]| {
+            facts
+                .iter()
+                .find(|fact| fact.provider_id == "openai" && fact.model_id == "gpt-5.6-sol")
+                .unwrap()
+                .scores
+                .elo
+        };
+
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"demand_exponent":0.4,"elo_overrides":{"openai/gpt-5.6-sol":1800,"typo/missing":9999}}}"#,
+        )
+        .unwrap();
+        let first = apply_live_selection_config(&path, &mut facts).unwrap();
+        assert_eq!(first.routing_config.demand_exponent, 0.4);
+        assert_eq!(first.applied, 1);
+        assert_eq!(first.unknown_keys, vec!["typo/missing"]);
+        assert_eq!(sol(&facts), 1_800.0);
+
+        facts = model_facts_seed().to_vec();
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"demand_exponent":0.25,"elo_overrides":{"openai/gpt-5.6-sol":1750}}}"#,
+        )
+        .unwrap();
+        let second = apply_live_selection_config(&path, &mut facts).unwrap();
+        assert_eq!(second.routing_config.demand_exponent, 0.25);
+        assert_eq!(second.applied, 1);
+        assert!(second.unknown_keys.is_empty());
+        assert_eq!(sol(&facts), 1_750.0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

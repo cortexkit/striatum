@@ -7,7 +7,7 @@
 //! so the JSON round-trips without remapping.
 //!
 //! Provenance (all real sources, no fabrication):
-//!   - `iq`   : Artificial Analysis intelligence index, max-effort reasoning variant.
+//!   - `elo`  : operator-resolved open capability Elo placement.
 //!   - `eq`   : EQ-Bench 3 elo_norm (absolute) + curated values on the same scale.
 //!   - `speed`: AA median output tokens/sec (max-effort variant).
 //!   - context/cost/vision: models.dev catalog.

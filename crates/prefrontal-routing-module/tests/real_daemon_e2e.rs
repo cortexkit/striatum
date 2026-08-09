@@ -183,13 +183,14 @@ async fn real_subc_core_supervises_routing_module_and_routes_select() {
     std::fs::create_dir_all(&project_root).unwrap();
     let route_channel = route_open(&mut consumer, &project_root, 1).await;
 
-    // A high-IQ selection can use the entire configured model pool, so an iq:100
-    // task must be satisfied by at least one top-tier model.
+    // A maximum-demand request may still choose a cheaper near-frontier route,
+    // but its request-relative fit must clear the normal adequacy floor.
     let available: Vec<&str> = vec![
         "anthropic/claude-opus-4-8",
         "openai/gpt-5.5",
         "xai/grok-4.3",
         "ollama-cloud/minimax-m2.5",
+        "ollama-cloud/deepseek-v4-flash:0731",
     ];
     let params = serde_json::json!({
         "targetAgent": "mason",
@@ -203,9 +204,12 @@ async fn real_subc_core_supervises_routing_module_and_routes_select() {
         .as_str()
         .expect("result.selected.model.modelID");
     eprintln!("[real-daemon] route.select(iq:100) -> {model_id}");
+    let adequacy = selected["score"]["adequacy"]
+        .as_f64()
+        .expect("result.selected.score.adequacy");
     assert!(
-        ["claude-opus-4-8", "gpt-5.5"].contains(&model_id),
-        "iq:100 must clear a top-tier model, got {model_id}"
+        adequacy >= 0.9,
+        "iq:100 must clear the adequacy floor, got {model_id} at {adequacy}"
     );
     assert!(
         response["result"]["decisionID"]
@@ -224,7 +228,7 @@ async fn real_subc_core_supervises_routing_module_and_routes_select() {
     let low_id = low["result"]["selected"]["model"]["modelID"]
         .as_str()
         .unwrap();
-    eprintln!("[real-daemon] route.select(iq:2) -> {low_id}");
+    eprintln!("[real-daemon] route.select(iq:20) -> {low_id}");
     assert_ne!(
         low_id, "claude-opus-4-8",
         "trivial task must not pick the priciest model"

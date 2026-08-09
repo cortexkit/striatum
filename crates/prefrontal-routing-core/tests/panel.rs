@@ -1,23 +1,23 @@
 use std::collections::{HashMap, HashSet};
 
 use prefrontal_routing_core::{
-    make_capacity_key, make_route_key, model_facts_seed, requirement_target, select_model_route,
+    demand_bar, make_capacity_key, make_route_key, model_facts_seed, select_model_route,
     select_panel, Confidence, InvalidPanelRequest, ModelFact, ModelPromptDefaults,
     ModelRequirements, ModelRouteStateSnapshot, ModelScores, PanelCauseReason, PanelClass,
     PanelDiversity, PanelRosterEntry, PanelSelection, PanelSelectionPolicy, PanelShortfallCode,
     PanelSpec, RequiredCapabilities, RouteRuntimeState, SeatedSiblingVariant,
-    SelectModelRouteInput, SelectPanelInput, DEFAULT_ANCHORS,
+    SelectModelRouteInput, SelectPanelInput, DEFAULT_DEMAND_EXPONENT,
 };
 use serde_json::{json, Map};
 
-fn fact(model: &str, iq: f64, family: Option<&str>) -> ModelFact {
+fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
     ModelFact {
         provider_id: "p".into(),
         model_id: model.into(),
         variant: None,
         family: family.map(str::to_string),
         scores: ModelScores {
-            iq,
+            elo,
             eq: 1_600.0,
             speed: 100.0,
         },
@@ -99,8 +99,8 @@ fn n_pick_input(
     }
 }
 
-fn openai_sibling(model: &str, iq: f64) -> ModelFact {
-    let mut fact = fact(model, iq, Some("openai-gpt"));
+fn openai_sibling(model: &str, elo: f64) -> ModelFact {
+    let mut fact = fact(model, elo, Some("openai-gpt"));
     fact.provider_id = "openai".into();
     fact.prompt_defaults = Some(ModelPromptDefaults {
         variant: Some("xhigh".into()),
@@ -111,21 +111,14 @@ fn openai_sibling(model: &str, iq: f64) -> ModelFact {
 }
 
 #[test]
-fn iq_floor_is_anchored_demand_scale() {
-    let target = requirement_target(DEFAULT_ANCHORS.iq, 70.0);
-    // AA v4.1 with the top knee (85% of the strong→elite climb by demand 85):
-    // strong 44 + (elite 57 − strong 44) * 0.85 * (70−60)/25 = 48.42
-    assert_eq!(
-        target, 48.42,
-        "the demand-to-raw-score boundary is contractual"
-    );
+fn iq_floor_uses_the_request_elo_frontier() {
+    let top = 1_838.0;
+    let target = demand_bar(top, 70.0, DEFAULT_DEMAND_EXPONENT);
     let facts = vec![
+        fact("frontier", top, Some("frontier")),
         fact("at-boundary", target, Some("a")),
         fact("just-below", target - 0.01, Some("b")),
-        fact("adequacy-near-miss", target * 0.95, Some("c")),
     ];
-    // The floor is an n_pick admission gate (pinned rosters bypass it), so the
-    // demand-scale contract is asserted through n_pick inputs.
     let selected = select_panel(n_pick_input(
         facts,
         spec(3, 70.0, PanelDiversity::None),
@@ -133,33 +126,36 @@ fn iq_floor_is_anchored_demand_scale() {
         8_000,
     ))
     .unwrap();
-    assert_eq!(selected.members.len(), 1);
-    assert_eq!(selected.members[0].route_key, "p/at-boundary");
+    let routes: HashSet<_> = selected
+        .members
+        .iter()
+        .map(|member| member.route_key.as_str())
+        .collect();
+    assert_eq!(routes, HashSet::from(["p/frontier", "p/at-boundary"]));
     assert_eq!(
         selected.shortfall.unwrap().code,
         PanelShortfallCode::SizeReduced
     );
 
-    // iq_floor 100 sits on elite (57); a model just under elite cannot seat.
     let selected = select_panel(n_pick_input(
-        vec![fact("too-low", 56.9, Some("a"))],
-        spec(1, 100.0, PanelDiversity::None),
+        vec![
+            fact("frontier", top, Some("a")),
+            fact("too-low", top - 0.1, Some("b")),
+        ],
+        spec(2, 100.0, PanelDiversity::None),
         1_000,
         8_000,
     ))
     .unwrap();
-    assert!(selected.members.is_empty());
-    assert_eq!(
-        selected.shortfall.unwrap().code,
-        PanelShortfallCode::IqFloorUnmeetable
-    );
+    assert_eq!(selected.members.len(), 1);
+    assert_eq!(selected.members[0].route_key, "p/frontier");
 
     let no_floor = select_panel(panel_input(
-        vec![fact("below-weak-anchor", 1.0, Some("a"))],
+        vec![fact("low-elo", 15.0, Some("a"))],
         spec(1, 0.0, PanelDiversity::None),
     ))
     .unwrap();
-    assert_eq!(no_floor.members[0].route_key, "p/below-weak-anchor");
+    assert_eq!(no_floor.members[0].route_key, "p/low-elo");
     assert!(no_floor.shortfall.is_none());
 }
 
@@ -427,13 +423,24 @@ fn shortfall_precedence_and_empty_success() {
         "zero admission outranks iq and diversity"
     );
 
-    let below = select_panel(n_pick_input(
-        vec![fact("below", 40.0, None)],
+    let mut below_input = n_pick_input(
+        vec![fact("top", 100.0, Some("top")), fact("below", 40.0, None)],
         spec(2, 100.0, PanelDiversity::Family),
         1_000,
         8_000,
-    ))
-    .unwrap();
+    );
+    below_input.runtime_snapshot = Some(ModelRouteStateSnapshot {
+        now: 1_000.0,
+        by_route: HashMap::from([(
+            "p/top".to_string(),
+            RouteRuntimeState {
+                quota_exhausted_until: Some(2_000.0),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    });
+    let below = select_panel(below_input).unwrap();
     assert_eq!(
         below.shortfall.unwrap().code,
         PanelShortfallCode::IqFloorUnmeetable,
@@ -494,8 +501,9 @@ fn shortfall_precedence_and_empty_success() {
 }
 
 #[test]
-fn n_pick_reuses_anchored_floor_and_fact_prompt_defaults() {
-    let target = requirement_target(DEFAULT_ANCHORS.iq, 70.0);
+fn n_pick_reuses_elo_floor_and_fact_prompt_defaults() {
+    let top = 1_838.0;
+    let target = demand_bar(top, 70.0, DEFAULT_DEMAND_EXPONENT);
     let mut at_boundary = fact("at-boundary", target, Some("a"));
     at_boundary.prompt_defaults = Some(ModelPromptDefaults {
         variant: Some("high".into()),
@@ -503,17 +511,25 @@ fn n_pick_reuses_anchored_floor_and_fact_prompt_defaults() {
         reasoning_effort: None,
     });
     let selected = select_panel(n_pick_input(
-        vec![at_boundary, fact("below", target - 0.01, Some("b"))],
-        spec(2, 70.0, PanelDiversity::None),
+        vec![
+            fact("frontier", top, Some("frontier")),
+            at_boundary,
+            fact("below", target - 0.01, Some("b")),
+        ],
+        spec(3, 70.0, PanelDiversity::None),
         0,
         8_000,
     ))
     .unwrap();
 
-    assert_eq!(selected.members.len(), 1);
-    assert_eq!(selected.members[0].route_key, "p/at-boundary");
-    assert_eq!(selected.members[0].prompt_params["variant"], "high");
-    assert_eq!(selected.members[0].prompt_params["temperature"], 0.4);
+    assert_eq!(selected.members.len(), 2);
+    let boundary = selected
+        .members
+        .iter()
+        .find(|member| member.route_key == "p/at-boundary")
+        .unwrap();
+    assert_eq!(boundary.prompt_params["variant"], "high");
+    assert_eq!(boundary.prompt_params["temperature"], 0.4);
     assert_eq!(
         selected.shortfall.unwrap().code,
         PanelShortfallCode::SizeReduced

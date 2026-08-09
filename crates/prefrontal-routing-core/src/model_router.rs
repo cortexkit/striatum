@@ -21,12 +21,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model_facts::{fact_to_route, ModelFact, ModelMetric, ModelRequirements, ModelRoute};
 use crate::provider_model_spec::{parse_spec_list, resolve_spec};
-use crate::route_anchors::{
-    Anchors, ADEQUACY_FLOOR, COST_REFERENCE_PER_MTOK, DEFAULT_ANCHORS,
-    EFFECTIVELY_FREE_SELECTION_COST, MIN_BEST_EFFORT_ADEQUACY, OBJECTIVE_WEIGHT_QUOTA,
-    RELATIVE_SHORTLIST_DELTA,
-};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
+use crate::routing_config::{
+    RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, COST_REFERENCE_PER_MTOK,
+    DEFAULT_ROUTING_CONFIG, EFFECTIVELY_FREE_SELECTION_COST, MIN_BEST_EFFORT_ADEQUACY,
+    OBJECTIVE_WEIGHT_QUOTA, RELATIVE_SHORTLIST_DELTA, SPEED_CEILING_TPS, SPEED_FLOOR_TPS,
+};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GoverningWindow {
@@ -362,11 +362,12 @@ pub struct AdmittedRoute {
 pub struct AdmissionResult {
     pub admitted: Vec<AdmittedRoute>,
     pub rejected: Vec<RejectedRoute>,
+    pub top_routable: TopRoutableScores,
 }
 
-/// Apply the shared hard-admission boundary used by singular and panel routing.
-/// Policy after admission, including adequacy fallback and break-glass, remains
-/// with the caller so a panel can never silently relax an exhausted route.
+/// Apply the shared hard-admission boundary used by singular, panel, and seat routing.
+/// The request frontier is computed after static exclusions, availability, and
+/// capability requirements, but before quota or cooldown state.
 pub fn admit_routes(
     facts: &[ModelFact],
     runtime_snapshot: Option<&ModelRouteStateSnapshot>,
@@ -374,16 +375,12 @@ pub fn admit_routes(
     required_capabilities: Option<RequiredCapabilities>,
     available_models: &HashSet<String>,
     requirements: &ModelRequirements,
-    anchors: &Anchors,
+    config: &RoutingConfig,
 ) -> AdmissionResult {
     let now = runtime_snapshot.map(|s| s.now).unwrap_or_else(now_millis);
-    // Exclusions are a spec list, not exact keys: a bare provider entry
-    // ("kimi-for-coding") excludes every model on the provider, and negations
-    // re-admit ("-openai/gpt-5.5"). Exact-key matching here silently ignored
-    // provider-wide entries for module-side callers (panel seats, consult
-    // sidekicks) while TS-side callers honored them.
     let exclusion_specs = parse_spec_list(exclude_route_keys);
-    let mut admitted = Vec::new();
+    let mut static_candidates = Vec::new();
+    let mut top_routable = TopRoutableScores::default();
     let mut rejected = Vec::new();
 
     for fact in facts {
@@ -409,6 +406,12 @@ pub fn admit_routes(
             });
             continue;
         }
+        top_routable.include(fact.scores);
+        static_candidates.push((fact, route));
+    }
+
+    let mut admitted = Vec::new();
+    for (fact, route) in static_candidates {
         let runtime = merged_runtime_state(&route, runtime_snapshot);
         if runtime.cooldown_until.is_some_and(|until| until > now) {
             rejected.push(RejectedRoute {
@@ -429,18 +432,21 @@ pub fn admit_routes(
         }
         admitted.push(AdmittedRoute {
             route,
-            adequacy: score_adequacy(fact, requirements, anchors),
+            adequacy: score_adequacy(fact, requirements, top_routable, config),
             runtime,
         });
     }
 
-    AdmissionResult { admitted, rejected }
+    AdmissionResult {
+        admitted,
+        rejected,
+        top_routable,
+    }
 }
 
-/// Normalized speed 0..1 over the speed anchor band (weak..elite).
-fn normalized_speed(speed: f64, anchors: &Anchors) -> f64 {
-    let a = anchors.speed;
-    ((speed - a.weak) / (a.elite - a.weak)).clamp(0.0, 1.0)
+/// Normalized speed 0..1 over the fixed tie-break range.
+fn normalized_speed(speed: f64) -> f64 {
+    ((speed - SPEED_FLOOR_TPS) / (SPEED_CEILING_TPS - SPEED_FLOOR_TPS)).clamp(0.0, 1.0)
 }
 
 /// Selection cost among models that already clear the quality bar. Lower wins.
@@ -458,7 +464,6 @@ fn normalized_speed(speed: f64, anchors: &Anchors) -> f64 {
 pub(crate) fn compute_objective(
     route: &ModelRoute,
     runtime: &RouteRuntimeState,
-    anchors: &Anchors,
     is_subscription: bool,
 ) -> (ObjectiveBreakdown, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
@@ -500,7 +505,7 @@ pub(crate) fn compute_objective(
         notes.push(format!("quota +{:.2}", quota));
     }
 
-    let speed_score = normalized_speed(route.fact.scores.speed, anchors);
+    let speed_score = normalized_speed(route.fact.scores.speed);
 
     let selection_cost = cost + quota;
     let speed_note = if let Some(mult) = route.fact.speed_multiplier {
@@ -541,16 +546,19 @@ fn now_millis() -> f64 {
 pub fn select_model_route(
     input: SelectModelRouteInput<'_>,
 ) -> Result<SelectedModelRoute, NoRouteError> {
-    select_model_route_with_anchors(input, &DEFAULT_ANCHORS)
+    select_model_route_with_config(input, &DEFAULT_ROUTING_CONFIG)
 }
 
-pub fn select_model_route_with_anchors(
+pub fn select_model_route_with_config(
     input: SelectModelRouteInput<'_>,
-    anchors: &Anchors,
+    config: &RoutingConfig,
 ) -> Result<SelectedModelRoute, NoRouteError> {
     let requirements = input.requirements;
 
-    if !requirements_are_valid(&requirements) {
+    if !requirements_are_valid(&requirements)
+        || !config.demand_exponent.is_finite()
+        || config.demand_exponent <= 0.0
+    {
         return Err(NoRouteError {
             reason: RouteFailureReason::InvalidRequirements,
             message: "model_requirements must be numbers in 0..100".to_string(),
@@ -580,6 +588,7 @@ pub fn select_model_route_with_anchors(
     let AdmissionResult {
         admitted: admissible,
         rejected,
+        ..
     } = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),
@@ -587,7 +596,7 @@ pub fn select_model_route_with_anchors(
         caps,
         &input.available_models,
         &requirements,
-        anchors,
+        config,
     );
 
     if admissible.is_empty() {
@@ -609,7 +618,7 @@ pub fn select_model_route_with_anchors(
         .fold(f64::NEG_INFINITY, f64::max);
     let cleared_count = admissible
         .iter()
-        .filter(|a| a.adequacy.adequacy >= ADEQUACY_FLOOR)
+        .filter(|a| a.adequacy.clears_adequacy_floor())
         .count();
     let best_effort = cleared_count == 0;
 
@@ -680,7 +689,7 @@ pub fn select_model_route_with_anchors(
             if best_effort {
                 a.adequacy.adequacy >= max_adequacy - RELATIVE_SHORTLIST_DELTA
             } else {
-                a.adequacy.adequacy >= ADEQUACY_FLOOR
+                a.adequacy.clears_adequacy_floor()
             }
         })
         .map(|(i, _)| i)
@@ -701,7 +710,7 @@ pub fn select_model_route_with_anchors(
                 .as_ref()
                 .map(|pred| pred(&a.route))
                 .unwrap_or(false);
-            let (breakdown, notes) = compute_objective(&a.route, &a.runtime, anchors, is_sub);
+            let (breakdown, notes) = compute_objective(&a.route, &a.runtime, is_sub);
             Scored {
                 idx,
                 objective: breakdown,
@@ -832,16 +841,11 @@ pub fn select_model_route_with_anchors(
         },
         rejected,
         explanation,
-        below_floor: if best_effort {
-            // best_effort implies adequacy < ADEQUACY_FLOOR; the band check
-            // above guarantees adequacy >= min_band, so this is within the band.
-            Some(BelowFloorWarning {
+        below_floor: (best_effort && winner_admissible.adequacy.adequacy < ADEQUACY_FLOOR)
+            .then_some(BelowFloorWarning {
                 adequacy: winner_admissible.adequacy.adequacy,
                 floor: ADEQUACY_FLOOR,
-            })
-        } else {
-            None
-        },
+            }),
     })
 }
 

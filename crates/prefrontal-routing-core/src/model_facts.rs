@@ -4,15 +4,14 @@
 //!
 //! Capability facts use open-ended ABSOLUTE scores, never normalized to the 0..100 demand scale.
 //! Caller requirements are 0..100 task-demand weights. The router converts
-//! absolute facts into per-task fit via stable anchors (see [`crate::route_anchors`]).
+//! absolute facts into per-task fit against the request's routable Elo frontier.
 //!
-//! Scales (v1):
-//!   - `iq`   : Artificial Analysis intelligence index (absolute, ~0..70+).
-//!   - `eq`   : curated interpersonal/prose/judgment score (absolute, ~0..110).
-//!   - `speed`: AA median output tokens/sec (absolute, ~0..960+).
+//! Scales:
+//!   - `elo`  : open model-capability Elo scale (unbounded above).
+//!   - `eq`   : curated interpersonal/prose/judgment Elo-like score.
+//!   - `speed`: Artificial Analysis median output tokens per second.
 //!
-//! Adding a stronger future model (e.g. iq 75) must NOT rewrite existing scores:
-//! anchors are fixed, not derived from the live min/max distribution.
+//! Elo placements are curated facts; routing never derives them from live min/max values.
 //!
 //! Numeric fields the TS source typed as `number` are kept as `f64` here to
 //! preserve exact arithmetic parity with the port source (a faithful-first port;
@@ -61,7 +60,7 @@ pub fn get_subscription_multiplier(route_key: &str) -> Option<f64> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct ModelScores {
-    pub iq: f64,
+    pub elo: f64,
     pub eq: f64,
     pub speed: f64,
 }
@@ -69,7 +68,7 @@ pub struct ModelScores {
 impl ModelScores {
     pub fn get(&self, metric: ModelMetric) -> f64 {
         match metric {
-            ModelMetric::Iq => self.iq,
+            ModelMetric::Elo => self.elo,
             ModelMetric::Eq => self.eq,
             ModelMetric::Speed => self.speed,
         }
@@ -90,7 +89,7 @@ impl ModelRequirements {
     /// Demand for a metric. Speed has no demand axis (cost-primary), so it reads 0.
     pub fn get(&self, metric: ModelMetric) -> f64 {
         match metric {
-            ModelMetric::Iq => self.iq,
+            ModelMetric::Elo => self.iq,
             ModelMetric::Eq => self.eq,
             ModelMetric::Speed => 0.0,
         }
@@ -100,7 +99,7 @@ impl ModelRequirements {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelMetric {
-    Iq,
+    Elo,
     Eq,
     Speed,
 }
@@ -108,14 +107,14 @@ pub enum ModelMetric {
 impl ModelMetric {
     pub fn as_str(&self) -> &'static str {
         match self {
-            ModelMetric::Iq => "iq",
+            ModelMetric::Elo => "elo",
             ModelMetric::Eq => "eq",
             ModelMetric::Speed => "speed",
         }
     }
 }
 
-pub const MODEL_METRICS: [ModelMetric; 3] = [ModelMetric::Iq, ModelMetric::Eq, ModelMetric::Speed];
+pub const MODEL_METRICS: [ModelMetric; 3] = [ModelMetric::Elo, ModelMetric::Eq, ModelMetric::Speed];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

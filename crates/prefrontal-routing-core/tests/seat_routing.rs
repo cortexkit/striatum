@@ -11,7 +11,7 @@
 //! paths yield a typed error and no selection, which is the only channel
 //! through which an effect could be requested.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use prefrontal_routing_core::model_facts::{
     is_valid_grand_family_id, make_capacity_key, make_route_key, Confidence, ModelFact, ModelScores,
@@ -29,14 +29,14 @@ use prefrontal_routing_core::ModelRequirements;
 /// A curated fact with an explicit optional grand family. Families are always
 /// set HERE, as data; never derived from the provider or model name (several
 /// fixtures deliberately contradict the name to prove no inference happens).
-fn fact(provider: &str, model: &str, family: Option<&str>, iq: f64, cost: f64) -> ModelFact {
+fn fact(provider: &str, model: &str, family: Option<&str>, elo: f64, cost: f64) -> ModelFact {
     ModelFact {
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         variant: None,
         family: family.map(str::to_string),
         scores: ModelScores {
-            iq,
+            elo,
             eq: 1600.0,
             speed: 100.0,
         },
@@ -519,10 +519,22 @@ fn no_adequate_route_fails_with_no_selection() {
     // Available routes exist but none clears the gate → typed refusal, no
     // best-effort fallback, and therefore no invitation or session effect.
     let facts = vec![
+        fact("prov-top", "top", Some("fam-top"), 100.0, 3.0),
         fact("prov-a", "weak-a", Some("fam-a"), 30.0, 1.0),
         fact("prov-b", "weak-b", Some("fam-b"), 30.0, 2.0),
     ];
-    let err = select_seat_route(InputBuilder::new(facts).build())
+    let snapshot = ModelRouteStateSnapshot {
+        now: 1_000.0,
+        by_route: HashMap::from([(
+            "prov-top/top".to_string(),
+            RouteRuntimeState {
+                quota_exhausted_until: Some(2_000.0),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let err = select_seat_route(InputBuilder::new(facts).snapshot(snapshot).build())
         .expect_err("inadequate pool must refuse");
     assert!(matches!(err, SeatRouteError::NoAdequateRoute { .. }));
     assert_eq!(err.code(), "no_adequate_route");

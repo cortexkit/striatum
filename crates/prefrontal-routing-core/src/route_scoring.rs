@@ -1,24 +1,18 @@
-//! Quality adequacy scoring (threshold model).
+//! Quality adequacy scoring for open Elo facts.
 //!
-//! Ported from the Alfonso TS plugin (`src/features/model-routing/route-scoring.ts`).
-//!
-//! Converts absolute iq/eq facts + 0..100 requirements into a SATURATING "clears
-//! the bar" adequacy score: meeting the requirement target scores ~1.0, and
-//! exceeding it yields NO additional bonus. This is the core of the routing
-//! model: it stops "more is always better", so the router can pick the cheapest
-//! adequate model instead of always the highest-capability (most expensive) one.
-//!
-//! Speed is NOT scored here. It is an OBJECTIVE handled by the router among the
-//! models that already clear the quality bar, never a gate that could pull a
-//! sub-bar model in.
+//! Caller demand remains 0..100. Each quality axis is mapped to an absolute bar
+//! against the strongest statically routable fact for the request, then scored as
+//! a capped score-to-bar ratio. Exceeding a bar gives no bonus.
 
 use std::collections::BTreeMap;
 
 use crate::model_facts::{Confidence, ModelFact, ModelMetric, ModelRequirements};
-use crate::route_anchors::{
-    metric_spread, requirement_target, sigmoid, Anchors, QUALITY_METRICS,
+use crate::routing_config::{
+    demand_bar, fit_ratio, RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR,
     UNKNOWN_FACT_CONFIDENCE_PENALTY,
 };
+
+const QUALITY_METRICS: [ModelMetric; 2] = [ModelMetric::Elo, ModelMetric::Eq];
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct MetricFit {
@@ -30,33 +24,31 @@ pub struct MetricFit {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdequacyScore {
-    /// Weighted saturating adequacy over quality metrics, after unknown penalty.
+    /// Weighted capped fit over quality metrics, after unknown-fact penalty.
     pub adequacy: f64,
-    /// Raw adequacy before the unknown-fact penalty (tie-break / audit).
+    /// Raw adequacy before the unknown-fact penalty.
     pub raw_adequacy: f64,
     /// Per-quality-metric audit; excludes metrics with requirement 0.
     pub metrics: BTreeMap<ModelMetric, MetricFit>,
-    /// True when no quality metric had a non-zero requirement (capability-only).
+    /// True when no quality metric had a non-zero requirement.
     pub capability_only: bool,
     pub explanation: Vec<String>,
 }
 
-/// Saturating fit: 1.0 at-or-above the target (exceeding gives NO bonus), ramps
-/// down below the target. `2·sigmoid(0) = 1`, so fit == 1 exactly at the target.
-pub fn saturating_fit(fact_score: f64, target: f64, spread: f64) -> f64 {
-    (2.0 * sigmoid((fact_score - target) / spread)).min(1.0)
+impl AdequacyScore {
+    /// Whether the route clears the normal adequacy gate. Fit remains a ratio,
+    /// so a route may clear while slightly below one component's exact bar.
+    pub fn clears_adequacy_floor(&self) -> bool {
+        self.capability_only || self.adequacy >= ADEQUACY_FLOOR
+    }
 }
 
-/// Score how well a fact clears the task's quality bar (iq/eq thresholds).
-///
-/// Requirement 0 means "ignore this metric". All-zero quality requirements yield
-/// `capability_only = true` with adequacy 1 (the caller must have admitted via a
-/// required capability such as vision; the router differentiates such routes by
-/// the cost/speed objective alone).
+/// Score how well a fact clears this request's quality bars.
 pub fn score_adequacy(
     fact: &ModelFact,
     requirements: &ModelRequirements,
-    anchors: &Anchors,
+    top_routable: TopRoutableScores,
+    config: &RoutingConfig,
 ) -> AdequacyScore {
     let mut metrics: BTreeMap<ModelMetric, MetricFit> = BTreeMap::new();
     let mut explanation: Vec<String> = Vec::new();
@@ -68,11 +60,14 @@ pub fn score_adequacy(
         if requirement == 0.0 {
             continue;
         }
-        let anchor = anchors.get(metric);
         let fact_score = fact.scores.get(metric);
-        let target = requirement_target(anchor, requirement);
-        let spread = metric_spread(anchor);
-        let fit = saturating_fit(fact_score, target, spread);
+        let top_score = match metric {
+            ModelMetric::Elo => top_routable.elo,
+            ModelMetric::Eq => top_routable.eq,
+            ModelMetric::Speed => unreachable!("speed is not a quality gate"),
+        };
+        let target = demand_bar(top_score, requirement, config.demand_exponent);
+        let fit = fit_ratio(fact_score, target);
         numerator += fit * requirement;
         denominator += requirement;
         metrics.insert(
@@ -131,9 +126,6 @@ pub fn score_adequacy(
     }
 }
 
-/// Format a requirement like JS `${n}`: integers without a decimal point, others
-/// with their natural representation. Keeps explanation strings byte-identical to
-/// the TS port source for whole-number demands (the common case).
 fn fmt_num(n: f64) -> String {
     if n.fract() == 0.0 && n.is_finite() {
         format!("{}", n as i64)

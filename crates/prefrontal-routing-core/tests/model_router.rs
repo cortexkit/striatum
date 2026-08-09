@@ -14,11 +14,10 @@ use prefrontal_routing_core::model_facts::{
 };
 use prefrontal_routing_core::model_facts_seed::model_facts_seed;
 use prefrontal_routing_core::model_router::{
-    select_model_route, select_model_route_with_anchors, ModelRouteStateSnapshot,
+    admit_routes, select_model_route, select_model_route_with_config, ModelRouteStateSnapshot,
     RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
 };
-use prefrontal_routing_core::route_scoring::score_adequacy;
-use prefrontal_routing_core::{DEFAULT_ANCHORS, MIN_BEST_EFFORT_ADEQUACY};
+use prefrontal_routing_core::{DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY};
 
 // ── builders mirroring the TS test helpers ──────────────────────────────────
 
@@ -58,8 +57,8 @@ fn fact(b: FactBuilder) -> ModelFact {
     }
 }
 
-fn scores(iq: f64, eq: f64, speed: f64) -> ModelScores {
-    ModelScores { iq, eq, speed }
+fn scores(elo: f64, eq: f64, speed: f64) -> ModelScores {
+    ModelScores { elo, eq, speed }
 }
 
 fn req(iq: f64, eq: f64) -> ModelRequirements {
@@ -169,7 +168,7 @@ fn provider_wide_exclusion_spec_rejects_every_model_on_the_provider() {
 // ── quality threshold (gate) ────────────────────────────────────────────────
 
 fn fast() -> ModelFact {
-    // iq just under the AA v4.1 strong anchor (44): clears low demand, fails high.
+    // Lower-Elo fast route: clears low demand but fails the high request bar.
     fact(FactBuilder {
         provider_id: "p".into(),
         model_id: "fast".into(),
@@ -178,7 +177,7 @@ fn fast() -> ModelFact {
     })
 }
 fn smart() -> ModelFact {
-    // iq above the AA v4.1 elite anchor (57): clears max demand.
+    // Higher-Elo route clears the high request bar.
     fact(FactBuilder {
         provider_id: "p".into(),
         model_id: "smart".into(),
@@ -437,24 +436,55 @@ fn subscription_route_no_fresh_quota_window_explains_stale_signal() {
 // ── anchored (not min/max) normalization ────────────────────────────────────
 
 #[test]
-fn adding_a_stronger_future_model_does_not_change_adequacy() {
-    let a = fact(FactBuilder {
+fn quota_exhaustion_does_not_change_the_request_frontier() {
+    let top = fact(FactBuilder {
         provider_id: "p".into(),
-        model_id: "a".into(),
-        scores: scores(52.0, 1500.0, 160.0),
+        model_id: "top".into(),
+        scores: scores(1_838.0, 2_100.0, 60.0),
         ..Default::default()
     });
-    let before = score_adequacy(&a, &req(80.0, 20.0), &DEFAULT_ANCHORS);
-    let after = score_adequacy(&a, &req(80.0, 20.0), &DEFAULT_ANCHORS);
-    assert!((after.adequacy - before.adequacy).abs() < 1e-10);
-    let future = fact(FactBuilder {
+    let luna = fact(FactBuilder {
         provider_id: "p".into(),
-        model_id: "future".into(),
-        scores: scores(130.0, 2500.0, 900.0),
+        model_id: "luna".into(),
+        scores: scores(1_621.0, 1_900.0, 160.0),
         ..Default::default()
     });
-    let r = select_model_route(input(vec![a, future], req(90.0, 10.0), Extra::default())).unwrap();
-    assert_eq!(r.model.model_id, "future");
+    let facts = vec![top, luna];
+    let available = availability_of(&facts);
+    let requirements = req(70.0, 0.0);
+    let baseline = admit_routes(
+        &facts,
+        None,
+        &[],
+        None,
+        &available,
+        &requirements,
+        &DEFAULT_ROUTING_CONFIG,
+    );
+    let quota = snapshot_with_quota_exhausted("p/top", 5_000.0);
+    let pressured = admit_routes(
+        &facts,
+        Some(&quota),
+        &[],
+        None,
+        &available,
+        &requirements,
+        &DEFAULT_ROUTING_CONFIG,
+    );
+
+    assert_eq!(baseline.top_routable.elo, 1_838.0);
+    assert_eq!(pressured.top_routable.elo, 1_838.0);
+    let baseline_luna = baseline
+        .admitted
+        .iter()
+        .find(|route| route.route.route_key == "p/luna")
+        .unwrap();
+    let pressured_luna = pressured
+        .admitted
+        .iter()
+        .find(|route| route.route.route_key == "p/luna")
+        .unwrap();
+    assert_eq!(baseline_luna.adequacy, pressured_luna.adequacy);
 }
 
 // ── admission filters ───────────────────────────────────────────────────────
@@ -666,6 +696,12 @@ fn soft_quota_pressure_shifts_selection_to_unpressured_peer() {
 
 #[test]
 fn extreme_demand_returns_most_capable_never_strands() {
+    let top = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "top".into(),
+        scores: scores(100.0, 2_000.0, 40.0),
+        ..Default::default()
+    });
     let weak = fact(FactBuilder {
         provider_id: "p".into(),
         model_id: "weak".into(),
@@ -678,20 +714,21 @@ fn extreme_demand_returns_most_capable_never_strands() {
         scores: scores(20.0, 900.0, 40.0),
         ..Default::default()
     });
-    // Band set to 0.0 to preserve the old "never strand" behavior for this test.
-    // With the default band (0.6), these extremely weak routes would be rejected
-    // as AllRoutesInadequate: the new band-check guard working as intended.
     let r = select_model_route(input(
-        vec![weak, less],
+        vec![top, weak, less],
         req(100.0, 80.0),
         Extra {
             min_best_effort_adequacy: Some(0.0),
+            runtime_snapshot: Some(snapshot_with_quota_exhausted("p/top", 2_000.0)),
             ..Extra::default()
         },
     ))
     .unwrap();
     assert_eq!(r.model.model_id, "weak");
-    assert!(r.explanation.iter().any(|l| l.contains("best-effort")));
+    assert!(r
+        .explanation
+        .iter()
+        .any(|line| line.contains("best-effort")));
 }
 
 // ── typed failures ──────────────────────────────────────────────────────────
@@ -960,7 +997,7 @@ fn explanation_strings_are_populated() {
     });
     let r = select_model_route(input(vec![m], req(70.0, 20.0), Extra::default())).unwrap();
     assert!(r.explanation.len() > 1);
-    assert!(r.explanation.iter().any(|l| l.contains("iq:")));
+    assert!(r.explanation.iter().any(|l| l.contains("elo:")));
 }
 
 // ── subscription cost model ─────────────────────────────────────────────────
@@ -1293,7 +1330,7 @@ fn seed_loads_and_every_fact_has_valid_scores() {
     let seed = model_facts_seed();
     assert!(seed.len() >= 18);
     for f in seed {
-        assert!(f.scores.iq.is_finite());
+        assert!(f.scores.elo.is_finite());
         assert!(f.scores.eq.is_finite());
         assert!(f.scores.speed.is_finite());
         assert!(matches!(
@@ -1305,29 +1342,20 @@ fn seed_loads_and_every_fact_has_valid_scores() {
 }
 
 #[test]
-fn max_iq_task_clears_at_a_top_tier_seed_model() {
-    use prefrontal_routing_core::{requirement_target, ModelMetric, ADEQUACY_FLOOR};
-    let r = select_model_route(input(
-        model_facts_seed().to_vec(),
-        req(100.0, 20.0),
-        Extra::default(),
-    ))
-    .unwrap();
-    // iq=100 sits on the elite anchor (57). Cost-primary selection among models
-    // that clear the bar, not "highest iq wins", so a cheaper adequate seed
-    // row can beat sol/opus.
-    let bar = requirement_target(DEFAULT_ANCHORS.iq, 100.0);
-    assert!((bar - 57.0).abs() < 1e-9);
-    assert!(
-        r.score.adequacy >= ADEQUACY_FLOOR,
-        "max demand must clear the adequacy floor, got {}",
-        r.score.adequacy
-    );
-    let iq_fact = r.score.metrics[&ModelMetric::Iq].fact;
-    assert!(
-        iq_fact + 1e-9 >= bar - 1.0,
-        "selected model iq {iq_fact} should be near/above elite bar {bar}"
-    );
+fn iq_100_seed_selection_respects_the_adequacy_floor() {
+    use prefrontal_routing_core::{ModelMetric, ADEQUACY_FLOOR};
+
+    let seed = model_facts_seed();
+    let top_elo = seed
+        .iter()
+        .map(|fact| fact.scores.elo)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let selected =
+        select_model_route(input(seed.to_vec(), req(100.0, 0.0), Extra::default())).unwrap();
+    let selected_elo = selected.score.metrics[&ModelMetric::Elo].fact;
+
+    assert!(selected_elo >= top_elo * ADEQUACY_FLOOR);
+    assert!(selected.score.adequacy >= ADEQUACY_FLOOR);
 }
 
 #[test]
@@ -1460,7 +1488,7 @@ fn all_routes_quota_blocked_yields_quota_exhausted_not_all_inadequate() {
         ..Default::default()
     });
     let snapshot = snapshot_with_quota_exhausted("p/good", 2000.0);
-    let err = select_model_route_with_anchors(
+    let err = select_model_route_with_config(
         input(
             vec![good],
             req(50.0, 0.0),
@@ -1469,117 +1497,126 @@ fn all_routes_quota_blocked_yields_quota_exhausted_not_all_inadequate() {
                 ..Extra::default()
             },
         ),
-        &DEFAULT_ANCHORS,
+        &DEFAULT_ROUTING_CONFIG,
     )
     .unwrap_err();
     // Nothing admitted → QuotaOrCooldownExhausted, not AllRoutesInadequate.
     assert_eq!(err.reason, RouteFailureReason::QuotaOrCooldownExhausted);
 }
 
-/// (a) proper all_routes_inadequate: admissible routes exist but the best is
-/// below the sanity band. The error carries the best rejected candidate and
-/// the earliest quota reset from the blocked routes in the rejected list.
+/// An admissible survivor below the sanity band is rejected. The blocked top
+/// route still defines the request frontier and contributes reset diagnostics.
 #[test]
 fn best_effort_below_band_yields_all_routes_inadequate() {
-    // A route that barely fails iq=90 (adequacy ~0.3 with the default anchors).
+    let top = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "top".into(),
+        scores: scores(1_000.0, 1500.0, 80.0),
+        ..Default::default()
+    });
     let weak = fact(FactBuilder {
         provider_id: "p".into(),
         model_id: "weak".into(),
-        scores: scores(35.0, 1500.0, 80.0),
+        scores: scores(300.0, 1500.0, 80.0),
         ..Default::default()
     });
-    // With default band (0.6), this model's adequacy will be well below.
-    let err = select_model_route_with_anchors(
-        input(vec![weak], req(90.0, 0.0), Extra::default()),
-        &DEFAULT_ANCHORS,
+    let err = select_model_route_with_config(
+        input(
+            vec![top, weak],
+            req(90.0, 0.0),
+            Extra {
+                runtime_snapshot: Some(snapshot_with_quota_exhausted("p/top", 2_000.0)),
+                ..Extra::default()
+            },
+        ),
+        &DEFAULT_ROUTING_CONFIG,
     )
     .unwrap_err();
     assert_eq!(err.reason, RouteFailureReason::AllRoutesInadequate);
-    // The best rejected candidate should name the weak route.
-    assert!(err.best_rejected.is_some());
-    let best = err.best_rejected.unwrap();
+    let best = err
+        .best_rejected
+        .expect("weak route is the closest survivor");
     assert_eq!(best.route_key, "p/weak");
     assert!(best.adequacy < MIN_BEST_EFFORT_ADEQUACY);
-    // No quota blocks in this scenario → earliest_reset is None.
-    assert!(err.earliest_reset.is_none());
+    assert_eq!(err.earliest_reset, Some(2_000.0));
 }
 
-/// (b) Survivor at adequacy ~0.72 → selected WITH belowFloor warning.
+/// A survivor between the floor and sanity band is returned with a warning.
 #[test]
 fn best_effort_in_band_gets_below_floor_warning() {
-    // Route with adequacy ~0.78 for a moderate-to-high demand: below floor (0.9) but
-    // above the default band (0.6). This requires no other route to clear the bar.
+    let top = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "top".into(),
+        scores: scores(1_000.0, 2_000.0, 80.0),
+        ..Default::default()
+    });
     let medium = fact(FactBuilder {
         provider_id: "p".into(),
         model_id: "medium".into(),
-        // iq=42 vs req 70 → fit ~0.69 (just under bar); eq=1450 vs req 30 → clears.
-        // Weighted adequacy ≈ (0.69*70 + 1.0*30)/100 ≈ 0.78.
-        scores: scores(42.0, 1450.0, 80.0),
+        scores: scores(700.0, 1450.0, 80.0),
         ..Default::default()
     });
-    // Higher-demand requirement so the model does NOT clear the adequacy floor.
-    let result = select_model_route_with_anchors(
-        input(vec![medium], req(70.0, 30.0), Extra::default()),
-        &DEFAULT_ANCHORS,
+    let result = select_model_route_with_config(
+        input(
+            vec![top, medium],
+            req(70.0, 30.0),
+            Extra {
+                runtime_snapshot: Some(snapshot_with_quota_exhausted("p/top", 2_000.0)),
+                ..Extra::default()
+            },
+        ),
+        &DEFAULT_ROUTING_CONFIG,
     )
     .unwrap();
-    // Should be selected (best-effort, within band).
     assert_eq!(result.route_key, "p/medium");
-    // Adequacy should be below the floor but ≥ band.
-    assert!(
-        result.score.adequacy < prefrontal_routing_core::ADEQUACY_FLOOR,
-        "adequacy {:.3} should be below floor {:.3}",
-        result.score.adequacy,
-        prefrontal_routing_core::ADEQUACY_FLOOR
-    );
-    assert!(
-        result.score.adequacy >= MIN_BEST_EFFORT_ADEQUACY,
-        "adequacy {:.3} should be >= band {:.3}",
-        result.score.adequacy,
-        MIN_BEST_EFFORT_ADEQUACY
-    );
-    // Must carry the belowFloor warning.
-    let warning = result
-        .below_floor
-        .as_ref()
-        .expect("expected belowFloor warning");
+    assert!(result.score.adequacy < prefrontal_routing_core::ADEQUACY_FLOOR);
+    assert!(result.score.adequacy >= MIN_BEST_EFFORT_ADEQUACY);
+    let warning = result.below_floor.as_ref().expect("below-floor warning");
     assert!((warning.floor - prefrontal_routing_core::ADEQUACY_FLOOR).abs() < 1e-9);
     assert!((warning.adequacy - result.score.adequacy).abs() < 1e-9);
 }
 
-/// (c) Survivor at adequacy ~0.3 with default band → rejected as AllRoutesInadequate.
-///     Same survivor with configured band 0.1 → selected+warned.
+/// Lowering the sanity band changes refusal into an explicit best-effort pick.
 #[test]
 fn survivor_below_default_band_rejected_above_configured_band_selected() {
-    // A route with adequacy ~0.3 for iq=8: clearly below the default band (0.6),
-    // but above a configured band of 0.1.
+    let top = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "top".into(),
+        scores: scores(1_000.0, 2_000.0, 80.0),
+        ..Default::default()
+    });
     let weak = fact(FactBuilder {
         provider_id: "p".into(),
         model_id: "weak".into(),
-        // iq=38 vs req 8 → fit well below bar; eq=1400 vs req 2 → clears.
-        // This gives a weighted adequacy well below 0.6 but above 0.1.
-        scores: scores(38.0, 1400.0, 80.0),
+        scores: scores(400.0, 1400.0, 80.0),
         ..Default::default()
     });
-    // (c-1) Default band (0.6): should be AllRoutesInadequate.
-    let err = select_model_route_with_anchors(
-        input(vec![weak.clone()], req(80.0, 20.0), Extra::default()),
-        &DEFAULT_ANCHORS,
+    let snapshot = snapshot_with_quota_exhausted("p/top", 2_000.0);
+    let err = select_model_route_with_config(
+        input(
+            vec![top.clone(), weak.clone()],
+            req(80.0, 20.0),
+            Extra {
+                runtime_snapshot: Some(snapshot.clone()),
+                ..Extra::default()
+            },
+        ),
+        &DEFAULT_ROUTING_CONFIG,
     )
     .unwrap_err();
     assert_eq!(err.reason, RouteFailureReason::AllRoutesInadequate);
 
-    // (c-2) Configured band 0.1: should be selected with belowFloor warning.
-    let result = select_model_route_with_anchors(
+    let result = select_model_route_with_config(
         input(
-            vec![weak],
+            vec![top, weak],
             req(80.0, 20.0),
             Extra {
                 min_best_effort_adequacy: Some(0.1),
+                runtime_snapshot: Some(snapshot),
                 ..Extra::default()
             },
         ),
-        &DEFAULT_ANCHORS,
+        &DEFAULT_ROUTING_CONFIG,
     )
     .unwrap();
     assert_eq!(result.route_key, "p/weak");
@@ -1624,7 +1661,7 @@ fn effectively_free_bucket_lets_demand_pick_the_stronger_model() {
     let mut terra = fact(FactBuilder {
         provider_id: "openai".into(),
         model_id: "terra".into(),
-        scores: scores(55.0, 1590.0, 100.0),
+        scores: scores(1_685.0, 1590.0, 100.0),
         cost_per_m_tok_out: Some(15.0),
         ..Default::default()
     });
@@ -1632,30 +1669,30 @@ fn effectively_free_bucket_lets_demand_pick_the_stronger_model() {
     let mut sol = fact(FactBuilder {
         provider_id: "openai".into(),
         model_id: "sol".into(),
-        scores: scores(58.0, 1610.0, 55.0),
+        scores: scores(1_838.0, 1610.0, 55.0),
         cost_per_m_tok_out: Some(30.0),
         ..Default::default()
     });
     sol.subscription_multiplier = Some(40.0); // $0.75 effective
 
-    // Anti-vacuity guard: terra must CLEAR the floor at iq 95 on its own, or
+    // Anti-vacuity guard: terra must CLEAR the floor at iq 90 on its own, or
     // the gate (not the ordering under test) is what excludes it and the main
     // assertion stops meaning anything. Fails the test loudly if a future
     // anchor change pushes a 55-iq model under the floor at this demand.
     let terra_alone = select_model_route(input(
         vec![terra.clone()],
-        req(95.0, 20.0),
+        req(90.0, 20.0),
         Extra::default(),
     ))
     .unwrap();
     assert!(
         !terra_alone.explanation.join("\n").contains("best-effort"),
-        "terra must CLEAR the floor at iq 95 or this test asserts nothing about ordering"
+        "terra must CLEAR the floor at iq 90 or this test asserts nothing about ordering"
     );
 
     let high = select_model_route(input(
         vec![terra.clone(), sol.clone()],
-        req(95.0, 20.0),
+        req(90.0, 20.0),
         Extra::default(),
     ))
     .unwrap();
@@ -1687,19 +1724,19 @@ fn effectively_free_bucket_lets_demand_pick_the_stronger_model() {
             fact(FactBuilder {
                 provider_id: "openai".into(),
                 model_id: "terra".into(),
-                scores: scores(55.0, 1590.0, 100.0),
+                scores: scores(1_685.0, 1590.0, 100.0),
                 cost_per_m_tok_out: Some(15.0),
                 ..Default::default()
             }),
             fact(FactBuilder {
                 provider_id: "openai".into(),
                 model_id: "sol".into(),
-                scores: scores(58.0, 1610.0, 55.0),
+                scores: scores(1_838.0, 1610.0, 55.0),
                 cost_per_m_tok_out: Some(30.0),
                 ..Default::default()
             }),
         ],
-        req(95.0, 20.0),
+        req(90.0, 20.0),
         Extra::default(),
     ))
     .unwrap();
@@ -1723,7 +1760,7 @@ fn all_routes_inadequate_reset_is_scoped_to_the_requests_own_rejections() {
     let blocked = fact(FactBuilder {
         provider_id: "p".into(),
         model_id: "blocked".into(),
-        scores: scores(55.0, 1600.0, 80.0),
+        scores: scores(100.0, 1600.0, 80.0),
         ..Default::default()
     });
     let weak = fact(FactBuilder {
@@ -1735,7 +1772,7 @@ fn all_routes_inadequate_reset_is_scoped_to_the_requests_own_rejections() {
     let outsider = fact(FactBuilder {
         provider_id: "q".into(),
         model_id: "outsider".into(),
-        scores: scores(55.0, 1600.0, 80.0),
+        scores: scores(200.0, 1600.0, 80.0),
         ..Default::default()
     });
     let mut snapshot = snapshot_with_quota_exhausted("p/blocked", 5000.0);
@@ -1756,11 +1793,100 @@ fn all_routes_inadequate_reset_is_scoped_to_the_requests_own_rejections() {
         },
     );
     request.exclude_route_keys = vec!["q/outsider".to_string()];
-    let err = select_model_route_with_anchors(request, &DEFAULT_ANCHORS).unwrap_err();
+    let err = select_model_route_with_config(request, &DEFAULT_ROUTING_CONFIG).unwrap_err();
     assert_eq!(err.reason, RouteFailureReason::AllRoutesInadequate);
     assert_eq!(
         err.earliest_reset,
         Some(5000.0),
         "the diagnostic must name the candidate's reset, not the excluded outsider's earlier one"
     );
+}
+
+#[test]
+fn top_routable_excludes_config_excluded_fable() {
+    let fable = fact(FactBuilder {
+        provider_id: "anthropic".into(),
+        model_id: "claude-fable-5".into(),
+        scores: scores(1_911.0, 2_200.0, 60.0),
+        ..Default::default()
+    });
+    let sol = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "gpt-5.6-sol".into(),
+        scores: scores(1_838.0, 1_900.0, 60.0),
+        ..Default::default()
+    });
+    let facts = vec![fable, sol];
+    let available = availability_of(&facts);
+    let excluded = admit_routes(
+        &facts,
+        None,
+        &["anthropic/claude-fable-5".into()],
+        None,
+        &available,
+        &req(70.0, 0.0),
+        &DEFAULT_ROUTING_CONFIG,
+    );
+    assert_eq!(excluded.top_routable.elo, 1_838.0);
+
+    let admitted = admit_routes(
+        &facts,
+        None,
+        &[],
+        None,
+        &available,
+        &req(70.0, 0.0),
+        &DEFAULT_ROUTING_CONFIG,
+    );
+    assert_eq!(admitted.top_routable.elo, 1_911.0);
+}
+
+#[test]
+fn iq_endpoints_admit_all_at_zero_and_clear_only_the_top_at_100() {
+    let facts = vec![
+        fact(FactBuilder {
+            provider_id: "p".into(),
+            model_id: "top".into(),
+            scores: scores(1_838.0, 2_000.0, 60.0),
+            ..Default::default()
+        }),
+        fact(FactBuilder {
+            provider_id: "p".into(),
+            model_id: "lower".into(),
+            scores: scores(1_600.0, 1_900.0, 80.0),
+            ..Default::default()
+        }),
+    ];
+    let available = availability_of(&facts);
+    let zero = admit_routes(
+        &facts,
+        None,
+        &[],
+        None,
+        &available,
+        &req(0.0, 0.0),
+        &DEFAULT_ROUTING_CONFIG,
+    );
+    assert_eq!(zero.admitted.len(), 2);
+    assert!(zero
+        .admitted
+        .iter()
+        .all(|route| route.adequacy.clears_adequacy_floor()));
+
+    let max = admit_routes(
+        &facts,
+        None,
+        &[],
+        None,
+        &available,
+        &req(100.0, 0.0),
+        &DEFAULT_ROUTING_CONFIG,
+    );
+    let cleared: Vec<_> = max
+        .admitted
+        .iter()
+        .filter(|route| route.adequacy.clears_adequacy_floor())
+        .map(|route| route.route.route_key.as_str())
+        .collect();
+    assert_eq!(cleared, vec!["p/top"]);
 }

@@ -25,7 +25,7 @@ fn fact(provider: &str, model: &str, cost: f64) -> ModelFact {
         variant: None,
         family: None,
         scores: ModelScores {
-            iq: 60.0,
+            elo: 60.0,
             eq: 1800.0,
             speed: 60.0,
         },
