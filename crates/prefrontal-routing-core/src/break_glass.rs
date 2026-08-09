@@ -30,6 +30,36 @@ fn earliest_future_reset(state: &RouteRuntimeState, now: f64) -> Option<f64> {
         .min_by(f64::total_cmp)
 }
 
+/// The candidate's own earliest future reset across both state scopes.
+fn candidate_earliest_reset(
+    snapshot: &ModelRouteStateSnapshot,
+    candidate: &BreakGlassCandidate,
+) -> Option<f64> {
+    [
+        snapshot.by_route.get(&candidate.route_key),
+        snapshot.by_capacity.get(&candidate.capacity_key),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|state| earliest_future_reset(state, snapshot.now))
+    .min_by(f64::total_cmp)
+}
+
+/// Earliest future reset across the GIVEN candidates only. This is the single
+/// producer for "when could a blocked route recover": diagnostics must scope
+/// the answer to the request's own rejected candidates, because a reset read
+/// from an unrelated route (excluded, capability-rejected, or belonging to a
+/// different request's pool) promises a recovery this caller can never use.
+pub fn earliest_reset_among_candidates(
+    snapshot: &ModelRouteStateSnapshot,
+    candidates: &[BreakGlassCandidate],
+) -> Option<f64> {
+    candidates
+        .iter()
+        .filter_map(|candidate| candidate_earliest_reset(snapshot, candidate))
+        .min_by(f64::total_cmp)
+}
+
 /// Clear both state scopes for the rejected candidate whose next reset is earliest.
 /// Candidates with no stated future reset are eligible last: they provide the least
 /// evidence of recovery, so they are least preferred for the one-time probe. They are
@@ -42,14 +72,7 @@ pub fn relax_earliest_reset(
     let mut earliest: Option<(&BreakGlassCandidate, Option<f64>)> = None;
 
     for candidate in candidates {
-        let resets_at = [
-            snapshot.by_route.get(&candidate.route_key),
-            snapshot.by_capacity.get(&candidate.capacity_key),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|state| earliest_future_reset(state, snapshot.now))
-        .min_by(f64::total_cmp);
+        let resets_at = candidate_earliest_reset(snapshot, candidate);
         let should_replace = earliest.as_ref().is_none_or(|(current, current_reset)| {
             match (resets_at, *current_reset) {
                 // A stated reset is stronger recovery evidence than an unknown one.

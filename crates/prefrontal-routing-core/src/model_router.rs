@@ -632,29 +632,31 @@ pub fn select_model_route_with_anchors(
             route_key: a.route.route_key.clone(),
             adequacy: a.adequacy.adequacy,
         });
-        // Earliest quota/cooldown reset across all rejected candidates (reuses
-        // the same logic as break-glass).
-        let now = input
-            .runtime_snapshot
-            .as_ref()
-            .map(|s| s.now)
-            .unwrap_or_else(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0)
-            });
+        // Earliest quota/cooldown reset among THIS REQUEST'S quota/cooldown
+        // rejections, through the same helper break-glass acts on. An earlier
+        // inline scan here read every state in the snapshot, so the diagnostic
+        // could name a reset belonging to a route that was never a candidate
+        // (excluded or capability-rejected), promising a recovery this caller
+        // could not have.
+        let reset_candidates: Vec<crate::break_glass::BreakGlassCandidate> = {
+            let quota_rejected: std::collections::HashSet<&str> = rejected
+                .iter()
+                .filter(|r| matches!(r.reason.as_str(), "quota_exhausted" | "cooldown_active"))
+                .map(|r| r.route_key.as_str())
+                .collect();
+            input
+                .facts
+                .iter()
+                .map(fact_to_route)
+                .filter(|route| quota_rejected.contains(route.route_key.as_str()))
+                .map(|route| crate::break_glass::BreakGlassCandidate {
+                    route_key: route.route_key,
+                    capacity_key: route.capacity_key,
+                })
+                .collect()
+        };
         let earliest_reset = input.runtime_snapshot.as_ref().and_then(|snap| {
-            let mut resets: Vec<f64> = Vec::new();
-            for state in snap.by_route.values().chain(snap.by_capacity.values()) {
-                if let Some(until) = state.quota_exhausted_until.filter(|&t| t > now) {
-                    resets.push(until);
-                }
-                if let Some(until) = state.cooldown_until.filter(|&t| t > now) {
-                    resets.push(until);
-                }
-            }
-            resets.into_iter().min_by(f64::total_cmp)
+            crate::break_glass::earliest_reset_among_candidates(snap, &reset_candidates)
         });
 
         return Err(NoRouteError {

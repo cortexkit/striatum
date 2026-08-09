@@ -1708,3 +1708,59 @@ fn effectively_free_bucket_lets_demand_pick_the_stronger_model() {
         "outside the bucket real price differences still order the pick"
     );
 }
+
+/// The AllRoutesInadequate diagnostic must report a reset the CALLER could
+/// actually wait for: the earliest reset among this request's own
+/// quota/cooldown rejections. A route outside the request (excluded here)
+/// with an EARLIER reset must not leak into the diagnostic - a caller that
+/// schedules a retry at a never-candidate's reset retries into the same
+/// refusal.
+#[test]
+fn all_routes_inadequate_reset_is_scoped_to_the_requests_own_rejections() {
+    // blocked: quota-rejected candidate (reset 5000). weak: admissible but
+    // below the band, forcing AllRoutesInadequate. outsider: EXCLUDED from the
+    // request entirely, carrying an earlier reset (2000) that must not win.
+    let blocked = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "blocked".into(),
+        scores: scores(55.0, 1600.0, 80.0),
+        ..Default::default()
+    });
+    let weak = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "weak".into(),
+        scores: scores(35.0, 1500.0, 80.0),
+        ..Default::default()
+    });
+    let outsider = fact(FactBuilder {
+        provider_id: "q".into(),
+        model_id: "outsider".into(),
+        scores: scores(55.0, 1600.0, 80.0),
+        ..Default::default()
+    });
+    let mut snapshot = snapshot_with_quota_exhausted("p/blocked", 5000.0);
+    snapshot.by_route.insert(
+        "q/outsider".to_string(),
+        RouteRuntimeState {
+            quota_exhausted_until: Some(2000.0),
+            cooldown_until: None,
+            ..Default::default()
+        },
+    );
+    let mut request = input(
+        vec![blocked, weak, outsider],
+        req(90.0, 0.0),
+        Extra {
+            runtime_snapshot: Some(snapshot),
+            ..Extra::default()
+        },
+    );
+    request.exclude_route_keys = vec!["q/outsider".to_string()];
+    let err = select_model_route_with_anchors(request, &DEFAULT_ANCHORS).unwrap_err();
+    assert_eq!(err.reason, RouteFailureReason::AllRoutesInadequate);
+    assert_eq!(
+        err.earliest_reset,
+        Some(5000.0),
+        "the diagnostic must name the candidate's reset, not the excluded outsider's earlier one"
+    );
+}
