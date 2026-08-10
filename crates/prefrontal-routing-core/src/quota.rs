@@ -200,8 +200,14 @@ pub fn merge_quota_overlay_with(
             .push(make_capacity_key(&fact.provider_id, &fact.model_id));
     }
 
-    // capacity_key -> accumulated signal across every matching window.
-    let mut signals: HashMap<String, CapacitySignal> = HashMap::new();
+    // (account, capacity_key) -> signal. Accounts accumulate SEPARATELY and
+    // fold at the end: QTA's multi-account contract makes the entry atomic per
+    // (provider, account), serving pressure selects the BEST account, and a
+    // wall is per-account. Merging worst-wins across accounts inverted that:
+    // one exhausted account (of anthropic's four) walled the whole provider
+    // while its siblings sat at 5% (live 2026-08-10: opus-5 rejected
+    // quota_exhausted off one 99% weekly account beside three nearly-free).
+    let mut signals: HashMap<(String, String), HashMap<String, CapacitySignal>> = HashMap::new();
 
     for entry in windows {
         if !entry.is_healthy() {
@@ -250,8 +256,18 @@ pub fn merge_quota_overlay_with(
                     win.applies_key.clone().into_iter().collect()
                 }
             };
+            let account_key = (
+                provider_id.clone(),
+                entry.account.clone().unwrap_or_default(),
+            );
             for cap in targets {
-                let sig = signals.entry(cap).or_default();
+                let sig = signals
+                    .entry(account_key.clone())
+                    .or_default()
+                    .entry(cap)
+                    .or_default();
+                // WITHIN one account, worst window wins (an account is as
+                // constrained as its tightest live window).
                 sig.pressure = Some(match sig.pressure {
                     Some(p) => p.max(pace.pressure),
                     None => pace.pressure,
@@ -269,17 +285,48 @@ pub fn merge_quota_overlay_with(
         }
     }
 
-    // Merge onto the snapshot, worst/latest-wins against any existing state.
-    for (cap, sig) in signals {
+    // Fold ACROSS accounts per capacity: best account serves. Pressure takes the
+    // MINIMUM (the account the send will actually use), and a capacity is
+    // exhausted only when EVERY account holding a signal for it is exhausted,
+    // recovering at the EARLIEST reset (the first account to free unblocks the
+    // provider). One account's wall must never silence its siblings.
+    let mut folded: HashMap<String, (Option<f64>, Option<f64>, bool)> = HashMap::new();
+    for ((_, _account), caps) in &signals {
+        for (cap, sig) in caps {
+            let entry = folded.entry(cap.clone()).or_insert((None, None, true));
+            if let Some(p) = sig.pressure {
+                entry.0 = Some(match entry.0 {
+                    Some(existing) => existing.min(p),
+                    None => p,
+                });
+            }
+            match sig.exhausted_until {
+                Some(e) => {
+                    entry.1 = Some(match entry.1 {
+                        Some(existing) => existing.min(e),
+                        None => e,
+                    });
+                }
+                None => entry.2 = false, // an unwalled account exists
+            }
+        }
+    }
+
+    // Merge onto the snapshot. Fresh pressure replaces stored pressure; a hard
+    // wall lands only when all accounts walled, and keeps the worst/latest
+    // horizon against any existing stored state.
+    for (cap, (pressure, earliest_wall, all_walled)) in folded {
         let state = snapshot.by_capacity.entry(cap).or_default();
-        if let Some(p) = sig.pressure {
+        if let Some(p) = pressure {
             state.quota_pressure = Some(p);
         }
-        if let Some(e) = sig.exhausted_until {
-            state.quota_exhausted_until = Some(match state.quota_exhausted_until {
-                Some(existing) => existing.max(e),
-                None => e,
-            });
+        if all_walled {
+            if let Some(e) = earliest_wall {
+                state.quota_exhausted_until = Some(match state.quota_exhausted_until {
+                    Some(existing) => existing.max(e),
+                    None => e,
+                });
+            }
         }
     }
 }

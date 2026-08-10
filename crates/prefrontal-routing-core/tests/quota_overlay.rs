@@ -404,3 +404,78 @@ fn published_api_provider_slug_reaches_routes_the_local_map_never_heard_of() {
         "a healthy window must contribute pressure through the slug path"
     );
 }
+
+#[test]
+fn one_exhausted_account_beside_a_free_sibling_does_not_wall_the_provider() {
+    // QTA's multi-account contract: entries are atomic per (provider, account),
+    // serving picks the best account, and a wall is per-account. Live incident
+    // 2026-08-10: one anthropic account at 99-100% weekly walled opus-5 for the
+    // whole provider while three sibling accounts sat at 5-8%.
+    let facts = vec![fact("anthropic", "claude-opus-5", 25.0)];
+    let windows = vec![
+        usage_from_json(serde_json::json!({
+            "provider": "claude", "apiProvider": "anthropic", "account": "acct-walled",
+            "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z", "windowMinutes": 10080 } }
+        })),
+        usage_from_json(serde_json::json!({
+            "provider": "claude", "apiProvider": "anthropic", "account": "acct-free",
+            "usage": { "primary": { "usedPercent": 5.0, "resetsAt": "2030-01-01T00:00:00Z", "windowMinutes": 10080 } }
+        })),
+    ];
+    let snap = overlay(&windows, &facts, &HashMap::new());
+    let state = snap
+        .by_capacity
+        .get(&make_capacity_key("anthropic", "claude-opus-5"))
+        .expect("capacity signal present");
+    assert!(
+        state.quota_exhausted_until.is_none(),
+        "a free sibling account must keep the capacity unwalled, got {:?}",
+        state.quota_exhausted_until
+    );
+}
+
+#[test]
+fn all_accounts_exhausted_walls_at_the_earliest_reset() {
+    // When EVERY account is walled the capacity is genuinely exhausted, and it
+    // recovers at the EARLIEST reset: the first account to free unblocks the
+    // provider.
+    let facts = vec![fact("anthropic", "claude-opus-5", 25.0)];
+    let windows = vec![
+        usage_from_json(serde_json::json!({
+            "provider": "claude", "apiProvider": "anthropic", "account": "acct-a",
+            "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-06-01T00:00:00Z", "windowMinutes": 10080 } }
+        })),
+        usage_from_json(serde_json::json!({
+            "provider": "claude", "apiProvider": "anthropic", "account": "acct-b",
+            "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z", "windowMinutes": 10080 } }
+        })),
+    ];
+    let snap = overlay(&windows, &facts, &HashMap::new());
+    let state = snap
+        .by_capacity
+        .get(&make_capacity_key("anthropic", "claude-opus-5"))
+        .expect("capacity signal present");
+    let expected_earliest = wall_ms_for("2030-01-01T00:00:00Z");
+    assert_eq!(
+        state.quota_exhausted_until,
+        Some(expected_earliest),
+        "all accounts walled -> the earliest reset unblocks"
+    );
+}
+
+fn wall_ms_for(rfc3339: &str) -> f64 {
+    // Reuse the same parse path the overlay uses via a decoded window round-trip:
+    // build an entry whose resets_at is the target stamp and read the extracted
+    // value back through the public snapshot (avoids depending on a datetime
+    // crate in the test).
+    let facts = vec![fact("zzz-probe", "probe-model", 1.0)];
+    let windows = vec![usage_from_json(serde_json::json!({
+        "provider": "zzz", "apiProvider": "zzz-probe", "account": "only",
+        "usage": { "primary": { "usedPercent": 100.0, "resetsAt": rfc3339, "windowMinutes": 60 } }
+    }))];
+    let snap = overlay(&windows, &facts, &HashMap::new());
+    snap.by_capacity
+        .get(&make_capacity_key("zzz-probe", "probe-model"))
+        .and_then(|s| s.quota_exhausted_until)
+        .expect("probe wall present")
+}
