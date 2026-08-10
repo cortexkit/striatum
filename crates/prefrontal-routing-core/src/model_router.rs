@@ -62,7 +62,7 @@ pub struct ModelRouteStateSnapshot {
     pub by_capacity: HashMap<String, RouteRuntimeState>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequiredCapabilities {
     #[serde(default)]
