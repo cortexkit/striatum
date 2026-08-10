@@ -88,11 +88,14 @@ const MIGRATION_019: &str = include_str!("../migrations/019_anthropic_real_price
 const MIGRATION_020: &str = include_str!("../migrations/020_decision_retention_index.sql");
 const MIGRATION_021: &str = include_str!("../migrations/021_new_sibling_models.sql");
 const MIGRATION_022: &str = include_str!("../migrations/022_elo_rescore.sql");
+/// Migration 23: ollama-cloud began serving Kimi K3; an unseeded route made the
+/// operator's roster seat silently unseatable.
+const MIGRATION_023: &str = include_str!("../migrations/023_ollama_kimi_k3.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 22] {
+fn route_state_migrations() -> [Migration; 23] {
     [
         Migration {
             version: 1,
@@ -181,6 +184,10 @@ fn route_state_migrations() -> [Migration; 22] {
         Migration {
             version: 22,
             statements: MIGRATION_022,
+        },
+        Migration {
+            version: 23,
+            statements: MIGRATION_023,
         },
     ]
 }

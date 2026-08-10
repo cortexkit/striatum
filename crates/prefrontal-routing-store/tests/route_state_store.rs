@@ -80,7 +80,9 @@ fn fact(provider: &str, model: &str) -> ModelFact {
 // + 14 alibaba-token-plan text models (013) - 11 pruned to the real
 // entitlement (014: the token plan serves the qwen family only)
 // + gemini 3.6 flash (017) + opus-5 and its -fast sibling (018).
-const CATALOG_LEN: usize = 54;
+// 54 seeded + migration 023's ollama-cloud/kimi-k3 (K3 became servable on
+// ollama-cloud; an unseeded route made a roster seat silently unseatable).
+const CATALOG_LEN: usize = 55;
 
 #[test]
 fn migration_seeds_the_curated_catalog_on_first_open() {
