@@ -37,11 +37,14 @@ pub fn get_speed_multiplier(route_key: &str) -> Option<f64> {
         .and_then(|m| m.lock().unwrap().get(route_key).copied())
 }
 
-/// Per-route subscription subsidy multipliers, keyed by route key. Populated by
-/// the routing module from the `model_routing.models` config override block at
-/// boot, mirroring [`SPEED_MULTIPLIERS`]. A multiplier divides the route's list
-/// price to yield its effective (subscription-adjusted) price: 1.0 means "no
-/// subsidy known", larger values make the route proportionally cheaper than list.
+/// Subscription subsidy multipliers. Keyed by bare provider ("openai") or by
+/// full route key ("openai/gpt-5.6-sol"); a route-key entry overrides its
+/// provider's. Provider keying is the primary shape: the subsidy is a property
+/// of the ACCOUNT serving the provider, not of any one model - per-model
+/// repetition was the drift that let a new model ship unpriced. A multiplier
+/// divides the route's list price to yield its effective (subscription-
+/// adjusted) price: 1.0 means "no subsidy known", larger values make the route
+/// proportionally cheaper than list.
 static SUBSCRIPTION_MULTIPLIERS: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
 
 pub fn set_subscription_multipliers(multipliers: HashMap<String, f64>) {
@@ -53,9 +56,16 @@ pub fn set_subscription_multipliers(multipliers: HashMap<String, f64>) {
 }
 
 pub fn get_subscription_multiplier(route_key: &str) -> Option<f64> {
-    SUBSCRIPTION_MULTIPLIERS
-        .get()
-        .and_then(|m| m.lock().unwrap().get(route_key).copied())
+    SUBSCRIPTION_MULTIPLIERS.get().and_then(|m| {
+        let map = m.lock().unwrap();
+        if let Some(value) = map.get(route_key) {
+            return Some(*value);
+        }
+        let provider = route_key
+            .split_once('/')
+            .map_or(route_key, |(provider, _)| provider);
+        map.get(provider).copied()
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]

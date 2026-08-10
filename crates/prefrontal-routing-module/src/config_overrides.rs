@@ -76,6 +76,12 @@ struct ModelRoutingSection {
         alias = "providersWithoutPromptCache"
     )]
     providers_without_prompt_cache: Vec<String>,
+    /// Provider-keyed subscription subsidy multipliers ("openai": 40). The
+    /// subsidy is a property of the account serving the provider, so this is
+    /// the primary shape; a per-model `subscription_multiplier` in `models`
+    /// overrides its provider's value for that route only.
+    #[serde(default)]
+    subscription_multipliers: HashMap<String, f64>,
 }
 
 /// One per-model override. Every field optional: a present field overrides the
@@ -248,6 +254,19 @@ pub fn reload_live_multipliers(path: &Path) -> Result<(), String> {
 
     let mut speed_multipliers = HashMap::new();
     let mut subscription_multipliers = HashMap::new();
+    for (provider, value) in config.model_routing.subscription_multipliers {
+        let provider = provider.trim().to_string();
+        if provider.is_empty() {
+            continue;
+        }
+        if value.is_finite() && value > 0.0 {
+            subscription_multipliers.insert(provider, value);
+        } else {
+            eprintln!(
+                "[prefrontal-routing] invalid subscription_multiplier for provider {provider}: {value}; ignoring"
+            );
+        }
+    }
     for (key, model) in config.model_routing.models {
         let Some((provider, model_id, variant)) = parse_model_key(&key) else {
             continue;
@@ -791,6 +810,59 @@ mod tests {
             None
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_level_subscription_multipliers_apply_with_route_override() {
+        // The subsidy is a property of the account serving the provider, so the
+        // provider key is the primary shape: every model inherits it, including
+        // ones that did not exist when the config was written (the per-model
+        // repetition let a new model ship unpriced). A per-route entry still
+        // overrides its provider's value.
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-provider-mult-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("routing.jsonc");
+        std::fs::write(
+            &config_path,
+            r##"{
+                "model_routing": {
+                    "subscription_multipliers": { "openai": 40.0, "bogus": -1.0 },
+                    "models": {
+                        "openai/special-route": { "subscription_multiplier": 5.0 }
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+
+        super::reload_live_multipliers(&config_path).unwrap();
+        // Any model on the provider inherits, including never-listed ones.
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier(
+                "openai/brand-new-model"
+            ),
+            Some(40.0)
+        );
+        // A per-route entry overrides its provider's value.
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier(
+                "openai/special-route"
+            ),
+            Some(5.0)
+        );
+        // Invalid provider values are rejected, not applied.
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier("bogus/anything"),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
