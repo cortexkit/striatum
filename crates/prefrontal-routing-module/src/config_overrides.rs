@@ -620,6 +620,16 @@ fn apply_overrides<S: RouteStateStore>(
 mod tests {
     use super::*;
 
+    /// SUBSCRIPTION_MULTIPLIERS in model_facts is one process-global map that
+    /// set_subscription_multipliers REPLACES wholesale. Tests that load a config
+    /// and then read the map race each other under the parallel test runner:
+    /// another test's load lands between this test's load and its asserts, and
+    /// the assert reads the other test's config. Serialize every such test.
+    fn multiplier_map_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn parses_provider_model_and_variant_keys() {
         assert_eq!(
@@ -688,6 +698,7 @@ mod tests {
 
     #[test]
     fn validates_speed_multiplier_at_load() {
+        let _guard = multiplier_map_guard();
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -756,6 +767,7 @@ mod tests {
 
     #[test]
     fn validates_nan_speed_multiplier() {
+        let _guard = multiplier_map_guard();
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -798,6 +810,7 @@ mod tests {
 
     #[test]
     fn validates_subscription_multiplier_at_load() {
+        let _guard = multiplier_map_guard();
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -857,6 +870,7 @@ mod tests {
 
     #[test]
     fn removing_an_override_demotes_the_row_and_never_deletes_it() {
+        let _guard = multiplier_map_guard();
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
         // A migration-seeded fact (absent from the compiled JSON seed) whose
         // config override disappears must SURVIVE as source='seed'. The delete
@@ -909,6 +923,7 @@ mod tests {
 
     #[test]
     fn provider_level_subscription_multipliers_apply_with_route_override() {
+        let _guard = multiplier_map_guard();
         // The subsidy is a property of the account serving the provider, so the
         // provider key is the primary shape: every model inherits it, including
         // ones that did not exist when the config was written (the per-model
