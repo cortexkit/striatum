@@ -25,6 +25,7 @@ use serde::{Deserialize, Deserializer};
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
+const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
 
 #[derive(Debug, Clone)]
 struct PromptCacheProvidersCache {
@@ -111,6 +112,39 @@ pub fn config_path() -> PathBuf {
             .join(CONFIG_RELATIVE_PATH);
     }
     PathBuf::from(".config").join(CONFIG_RELATIVE_PATH)
+}
+
+pub fn auth_json_path() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join(OPENCODE_AUTH_RELATIVE_PATH);
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join(OPENCODE_AUTH_RELATIVE_PATH);
+    }
+    PathBuf::from(".local")
+        .join("share")
+        .join(OPENCODE_AUTH_RELATIVE_PATH)
+}
+
+/// Read only the provider auth kind needed by subscription policy. Token values
+/// remain owned by OpenCode and never enter the routing request or decision log.
+pub fn read_provider_auth_types(path: &Path) -> Result<HashMap<String, String>, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("reading {}: {error}", path.display()))?;
+    let parsed: HashMap<String, serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|error| format!("parsing {}: {error}", path.display()))?;
+    Ok(parsed
+        .into_iter()
+        .filter_map(|(provider, value)| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|kind| (provider, kind.to_string()))
+        })
+        .collect())
 }
 
 /// Parse `provider/model` or `provider/model/variant`.

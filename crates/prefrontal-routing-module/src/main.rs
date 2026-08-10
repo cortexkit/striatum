@@ -36,9 +36,11 @@ use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
 use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, maybe_upgrade_to_fast_variant, relax_earliest_reset,
-    select_panel_with_config, validate_panel_spec, BreakGlassCandidate, DecisionInput,
-    FastVariantUpgradeInput, ModelFact, ModelRequirements, ModelRoute, PanelRosterEntry,
-    PanelSelection, PanelSpec, RouteOutcome, RouteStateStore, SelectPanelInput, SelectedPanel,
+    resolve_launch_requirements, resolve_routing_policy, select_panel_with_config,
+    validate_panel_spec, BreakGlassCandidate, DecisionInput, FastVariantUpgradeInput, ModelFact,
+    ModelRequirements, ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection,
+    PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
+    SelectPanelInput, SelectedPanel,
 };
 use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
@@ -64,6 +66,7 @@ use tokio::{
 
 const DEFAULT_MODULE_ID: &str = "prefrontal-routing";
 const ROUTE_SELECT_OP: &str = "route.select";
+const ROUTE_RESOLVE_POLICY_OP: &str = "route.resolve_policy";
 const ROUTE_SELECT_PANEL_OP: &str = "route.select_panel";
 /// Set a recorded decision's terminal outcome (idempotent UPDATE by id).
 const ROUTE_SET_DECISION_OUTCOME_OP: &str = "route.set_decision_outcome";
@@ -724,25 +727,33 @@ struct SelectBody {
 struct SelectParams {
     #[serde(default = "default_target_agent")]
     target_agent: String,
-    requirements: ModelRequirements,
-    /// The routeKeys/capacityKeys the caller is logged into. Required: an empty
-    /// set yields a typed `no_available_model` failure (the honest result).
+    /// Existing module callers may provide an already-resolved demand vector.
+    #[serde(default)]
+    requirements: Option<ModelRequirements>,
+    /// Launch callers provide raw optional requirements so the module applies
+    /// clamping, specialist defaults, and Mason's required non-zero demand.
+    #[serde(default)]
+    requested_requirements: Option<RequestedModelRequirements>,
+    /// Raw routeKeys/capacityKeys reported by the harness.
     #[serde(default)]
     available_models: Vec<String>,
+    /// Per-attempt exclusions such as a route that just failed.
     #[serde(default)]
     exclude_route_keys: Vec<String>,
     #[serde(default)]
     required_capabilities: Option<RequiredCapabilities>,
-    /// The subset of `available_models` that are flat-rate SUBSCRIPTION routes
-    /// (effective metered cost 0). The plugin resolves this (it reads the harness's
-    /// auth model + the curated/config subscription specs); the module stays
-    /// harness-agnostic and just applies the cost model to the supplied set.
+    /// Legacy callers carry raw subscription specs in this field. The module
+    /// resolves them together with OAuth and curated provider facts.
     #[serde(default)]
     subscription_keys: Vec<String>,
-    /// Raw `model_routing.prefer_fast_when_relaxed` spec entries; the module runs
-    /// the post-selection fast-variant upgrade against them.
     #[serde(default)]
     prefer_fast_specs: Vec<String>,
+    #[serde(default)]
+    routing_policy: ModelRoutingPolicyInput,
+    #[serde(default)]
+    provider_auth_types: Option<HashMap<String, String>>,
+    #[serde(default)]
+    suppress_fast_variant: bool,
     /// Gather seats can request cache-capable providers without changing the
     /// normal quality and cost ordering for other route selections.
     #[serde(default)]
@@ -753,6 +764,24 @@ struct SelectParams {
     task_id: Option<String>,
     #[serde(default, alias = "parentSessionID")]
     parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolvePolicyBody {
+    params: ResolvePolicyParams,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolvePolicyParams {
+    #[serde(default)]
+    available_models: Vec<String>,
+    #[serde(default)]
+    routing_policy: ModelRoutingPolicyInput,
+    #[serde(default)]
+    provider_auth_types: Option<HashMap<String, String>>,
+    #[serde(default)]
+    suppress_fast_variant: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -788,6 +817,146 @@ struct SelectPanelParams {
 
 fn default_target_agent() -> String {
     "unknown".to_string()
+}
+
+struct ResolvedSelectRequest {
+    requirements: ModelRequirements,
+    required_capabilities: Option<RequiredCapabilities>,
+    policy: ResolvedRoutingPolicy,
+}
+
+fn provider_auth_types(raw: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+    if let Some(raw) = raw {
+        return raw.clone();
+    }
+    let path = config_overrides::auth_json_path();
+    match config_overrides::read_provider_auth_types(&path) {
+        Ok(types) => types,
+        Err(error) => {
+            eprintln!(
+                "[prefrontal-routing] provider auth read failed (treating non-curated providers as metered): {error}"
+            );
+            HashMap::new()
+        }
+    }
+}
+
+fn no_route_error(
+    reason: RouteFailureReason,
+    message: String,
+    requirements: ModelRequirements,
+) -> NoRouteError {
+    NoRouteError {
+        reason,
+        message,
+        rejected: Vec::new(),
+        requirements: Some(requirements),
+        best_rejected: None,
+        earliest_reset: None,
+    }
+}
+
+fn resolve_select_request(params: &SelectParams) -> Result<ResolvedSelectRequest, NoRouteError> {
+    let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
+        (requirements, params.required_capabilities)
+    } else {
+        match resolve_launch_requirements(
+            &params.target_agent,
+            params.requested_requirements.as_ref(),
+        ) {
+            Ok(resolved) => (resolved.requirements, resolved.required_capabilities),
+            Err(error) => {
+                return Err(no_route_error(
+                    RouteFailureReason::InvalidRequirements,
+                    error.message,
+                    ModelRequirements { iq: 0.0, eq: 0.0 },
+                ));
+            }
+        }
+    };
+
+    let mut routing_policy = params.routing_policy.clone();
+    routing_policy
+        .subscription
+        .extend(params.subscription_keys.iter().cloned());
+    routing_policy
+        .prefer_fast_when_relaxed
+        .extend(params.prefer_fast_specs.iter().cloned());
+    let policy = resolve_routing_policy(
+        params.available_models.iter().cloned(),
+        &routing_policy,
+        &provider_auth_types(params.provider_auth_types.as_ref()),
+        params.suppress_fast_variant,
+    );
+    if policy.connected_model_count == 0 {
+        return Err(no_route_error(
+            RouteFailureReason::NoAvailableModel,
+            format!(
+                "No models available to route {} (no connected providers detected).",
+                params.target_agent
+            ),
+            requirements,
+        ));
+    }
+    if policy.available_models.is_empty() {
+        return Err(no_route_error(
+            RouteFailureReason::NoAvailableModel,
+            format!(
+                "No models available to route {}: all {} connected models are excluded by model_routing.exclude. Loosen the exclude list.",
+                params.target_agent, policy.connected_model_count
+            ),
+            requirements,
+        ));
+    }
+
+    Ok(ResolvedSelectRequest {
+        requirements,
+        required_capabilities,
+        policy,
+    })
+}
+
+async fn handle_resolve_policy(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+) -> Result<(), ModuleError> {
+    let channel = frame.header.channel;
+    let epoch = frame.header.epoch;
+    let corr = frame.header.corr;
+    let ver = frame.header.ver;
+    let params = match serde_json::from_slice::<ResolvePolicyBody>(&frame.body) {
+        Ok(body) => body.params,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &format!("route.resolve_policy params not decodable: {error}"),
+            )
+            .await;
+        }
+    };
+    let resolved = resolve_routing_policy(
+        params.available_models,
+        &params.routing_policy,
+        &provider_auth_types(params.provider_auth_types.as_ref()),
+        params.suppress_fast_variant,
+    );
+    let body = serde_json::to_vec(&json!({ "result": resolved })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
 }
 
 /// subc-wire-name → routing providerID reconciliation. The quota module's wire
@@ -949,6 +1118,9 @@ async fn handle_select_request(
     if envelope.method == ROUTE_COOLDOWN_STATUS_OP {
         return handle_cooldown_status(frame, writer, store).await;
     }
+    if envelope.method == ROUTE_RESOLVE_POLICY_OP {
+        return handle_resolve_policy(frame, writer).await;
+    }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(frame, writer, quota_cache, store, routing_config_path).await;
     }
@@ -979,6 +1151,17 @@ async fn handle_select_request(
                 &format!("route.select params not decodable: {e}"),
             )
             .await;
+        }
+    };
+    let resolved_request = match resolve_select_request(&params) {
+        Ok(resolved) => resolved,
+        Err(no_route) => {
+            let requirements = no_route
+                .requirements
+                .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
+            let decision = decision_input_for(&params.target_agent, &requirements, None, &params);
+            let _ = store.record_decision(&decision);
+            return send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
         }
     };
     let providers_without_prompt_cache = match config_overrides::read_providers_without_prompt_cache(
@@ -1021,17 +1204,22 @@ async fn handle_select_request(
         }
     };
 
-    // The subscription set the plugin resolved (which available routes are flat-rate
-    // 0-cost). The module stays harness-agnostic: it applies the cost model to the
-    // supplied set rather than reading any harness's auth model itself.
-    let subscription_keys: std::collections::HashSet<String> =
-        params.subscription_keys.iter().cloned().collect();
-    let available: std::collections::HashSet<String> =
-        params.available_models.iter().cloned().collect();
+    let subscription_keys: HashSet<String> = resolved_request
+        .policy
+        .subscription_keys
+        .iter()
+        .cloned()
+        .collect();
+    let available: HashSet<String> = resolved_request
+        .policy
+        .available_models
+        .iter()
+        .cloned()
+        .collect();
     let exclude = params.exclude_route_keys.clone();
-    let prefer_fast = params.prefer_fast_specs.clone();
-    let requirements = params.requirements;
-    let required_capabilities = params.required_capabilities;
+    let prefer_fast = resolved_request.policy.prefer_fast_specs.clone();
+    let requirements = resolved_request.requirements;
+    let required_capabilities = resolved_request.required_capabilities;
     let target_agent = params.target_agent.clone();
     let prefer_prompt_cache = params.prefer_prompt_cache;
 
@@ -1152,9 +1340,20 @@ async fn handle_select_request(
                 decision_input_for(&target_agent, &requirements, Some(&selected), &params);
             match store.record_decision(&decision) {
                 Ok(decision_id) => {
-                    let body = serde_json::to_vec(
-                        &json!({ "result": { "selected": selected, "decisionID": decision_id } }),
-                    )
+                    let mut resolved_input = json!({
+                        "requirements": requirements,
+                        "availableModels": &resolved_request.policy.available_models,
+                        "subscriptionKeys": &resolved_request.policy.subscription_keys,
+                        "preferFastSpecs": &resolved_request.policy.prefer_fast_specs,
+                    });
+                    if let Some(required_capabilities) = required_capabilities {
+                        resolved_input["requiredCapabilities"] = json!(required_capabilities);
+                    }
+                    let body = serde_json::to_vec(&json!({ "result": {
+                        "selected": selected,
+                        "decisionID": decision_id,
+                        "resolvedInput": resolved_input,
+                    }}))
                     .map_err(ModuleError::Json)?;
                     let response = Frame::build_with_version(
                         ver,
@@ -1270,8 +1469,18 @@ async fn handle_select_panel(
             DEFAULT_ROUTING_CONFIG
         }
     };
-    let subscription_keys: HashSet<String> = params.subscription_keys.iter().cloned().collect();
-    let available_models = params.available_models.iter().cloned().collect();
+    let resolved_policy = resolve_routing_policy(
+        params.available_models.iter().cloned(),
+        &ModelRoutingPolicyInput {
+            subscription: params.subscription_keys.clone(),
+            ..ModelRoutingPolicyInput::default()
+        },
+        &provider_auth_types(None),
+        false,
+    );
+    let subscription_keys: HashSet<String> =
+        resolved_policy.subscription_keys.into_iter().collect();
+    let available_models = resolved_policy.available_models.into_iter().collect();
     let panel = match select_panel_with_config(
         SelectPanelInput {
             panel_spec: params.panel_spec.clone(),
@@ -1809,7 +2018,7 @@ async fn send_no_route(
     err: &NoRouteError,
 ) -> Result<(), ModuleError> {
     let code = err.reason.as_str();
-    let message = if err.reason == RouteFailureReason::AllRoutesInadequate {
+    let mut message = if err.reason == RouteFailureReason::AllRoutesInadequate {
         let best_part = match &err.best_rejected {
             Some(b) => format!(
                 " Best candidate: {} (adequacy {:.2}).",
@@ -1825,6 +2034,16 @@ async fn send_no_route(
     } else {
         err.message.clone()
     };
+    if !message.starts_with("No models available")
+        && !message.contains("requires explicit model_requirements")
+    {
+        if let Some(requirements) = err.requirements {
+            message.push_str(&format!(
+                " Requirements iq={} eq={}.",
+                requirements.iq, requirements.eq
+            ));
+        }
+    }
     // Build the error body. For AllRoutesInadequate, include structured fields
     // alongside the standard code/message so future clients can parse them.
     let body_value = if err.reason == RouteFailureReason::AllRoutesInadequate {
@@ -1913,6 +2132,10 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 ManagementOperation {
                     name: ROUTE_SELECT_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
+                },
+                ManagementOperation {
+                    name: ROUTE_RESOLVE_POLICY_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
                 },
                 ManagementOperation {
                     name: ROUTE_SELECT_PANEL_OP.to_string(),
@@ -2377,7 +2600,221 @@ mod tests {
             body.params.parent_session_id.as_deref(),
             Some("parent-session")
         );
-        assert_eq!(body.params.requirements.iq, 90.0);
+        assert_eq!(body.params.requirements.unwrap().iq, 90.0);
+    }
+
+    async fn run_select_wire_request(
+        label: &str,
+        params: serde_json::Value,
+        facts: &[ModelFact],
+    ) -> (Frame, Rig) {
+        let rig = Rig::new(label);
+        let store = Arc::new(rig.open_store());
+        for fact in facts {
+            store.upsert_fact(fact, FactSource::Override).unwrap();
+        }
+        let request = json!({ "method": ROUTE_SELECT_OP, "params": params });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &quota_cache,
+            &store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+        )
+        .await
+        .unwrap();
+        (rx.recv().await.unwrap(), rig)
+    }
+
+    #[tokio::test]
+    async fn route_select_reports_empty_and_policy_excluded_availability() {
+        let (empty, _empty_rig) = run_select_wire_request(
+            "empty-launch-availability",
+            json!({
+                "targetAgent": "explore",
+                "availableModels": [],
+                "providerAuthTypes": {}
+            }),
+            &[],
+        )
+        .await;
+        assert_eq!(empty.header.ty, FrameType::Error);
+        let empty_body: serde_json::Value = serde_json::from_slice(&empty.body).unwrap();
+        assert_eq!(empty_body["code"], "no_available_model");
+        assert!(empty_body["message"]
+            .as_str()
+            .unwrap()
+            .contains("no connected providers detected"));
+
+        let route = fact("openai", "gpt-5.5");
+        let (excluded, _excluded_rig) = run_select_wire_request(
+            "policy-excluded-launch-availability",
+            json!({
+                "targetAgent": "explore",
+                "availableModels": ["openai/gpt-5.5"],
+                "routingPolicy": { "exclude": ["openai"] },
+                "providerAuthTypes": {}
+            }),
+            &[route],
+        )
+        .await;
+        assert_eq!(excluded.header.ty, FrameType::Error);
+        let excluded_body: serde_json::Value = serde_json::from_slice(&excluded.body).unwrap();
+        assert_eq!(excluded_body["code"], "no_available_model");
+        assert!(excluded_body["message"]
+            .as_str()
+            .unwrap()
+            .contains("all 1 connected models are excluded"));
+    }
+
+    #[tokio::test]
+    async fn route_select_resolves_raw_launch_policy_before_shared_selection() {
+        let routes = [
+            fact("openai", "gpt-5.5"),
+            fact("opencode-go", "deepseek-v4-flash"),
+            fact("opencode-go", "minimax-m2.5"),
+        ];
+        let (response, _rig) = run_select_wire_request(
+            "raw-launch-policy",
+            json!({
+                "targetAgent": "mason",
+                "requestedRequirements": {
+                    "iq": 80,
+                    "eq": 30,
+                    "caps": { "vision": true, "minContext": 200_000 }
+                },
+                "availableModels": [
+                    "openai/gpt-5.5",
+                    "opencode-go/minimax-m2.5",
+                    "opencode-go/deepseek-v4-flash"
+                ],
+                "excludeRouteKeys": [],
+                "routingPolicy": {
+                    "exclude": ["openai/gpt-5.5"],
+                    "subscription": ["opencode-go", "-opencode-go/deepseek-v4-flash"],
+                    "preferFastWhenRelaxed": ["openai", "opencode-go/minimax-m2.5"]
+                },
+                "providerAuthTypes": { "openai": "oauth", "opencode-go": "api" }
+            }),
+            &routes,
+        )
+        .await;
+
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["result"]["resolvedInput"],
+            json!({
+                "requirements": { "iq": 80.0, "eq": 30.0 },
+                "requiredCapabilities": { "vision": true, "minContext": 200_000.0 },
+                "availableModels": [
+                    "opencode-go/deepseek-v4-flash",
+                    "opencode-go/minimax-m2.5"
+                ],
+                "subscriptionKeys": ["opencode-go/minimax-m2.5"],
+                "preferFastSpecs": ["openai", "opencode-go/minimax-m2.5"]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn route_select_applies_specialist_default_and_rejects_implicit_mason_demand() {
+        let route = fact("p", "default-vector");
+        let (explore, _explore_rig) = run_select_wire_request(
+            "explore-default-vector",
+            json!({
+                "targetAgent": "explore",
+                "availableModels": ["p/default-vector"],
+                "providerAuthTypes": {}
+            }),
+            std::slice::from_ref(&route),
+        )
+        .await;
+        assert_eq!(explore.header.ty, FrameType::Response);
+        let explore_body: serde_json::Value = serde_json::from_slice(&explore.body).unwrap();
+        assert_eq!(
+            explore_body["result"]["resolvedInput"]["requirements"],
+            json!({ "iq": 30.0, "eq": 0.0 })
+        );
+
+        let (mason, _mason_rig) = run_select_wire_request(
+            "mason-explicit-required",
+            json!({
+                "targetAgent": "mason",
+                "availableModels": ["p/default-vector"],
+                "providerAuthTypes": {}
+            }),
+            &[route],
+        )
+        .await;
+        assert_eq!(mason.header.ty, FrameType::Error);
+        let mason_body: serde_json::Value = serde_json::from_slice(&mason.body).unwrap();
+        assert_eq!(mason_body["code"], "invalid_requirements");
+        assert!(mason_body["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires explicit model_requirements"));
+    }
+
+    #[tokio::test]
+    async fn route_resolve_policy_dispatches_as_a_read_only_wire_query() {
+        let request = json!({
+            "method": ROUTE_RESOLVE_POLICY_OP,
+            "params": {
+                "availableModels": ["openai/gpt-5.5", "opencode-go/minimax-m2.5"],
+                "routingPolicy": {
+                    "exclude": ["openai"],
+                    "subscription": ["opencode-go"],
+                    "preferFastWhenRelaxed": []
+                },
+                "providerAuthTypes": { "openai": "oauth", "opencode-go": "api" }
+            }
+        });
+        let (response, _rig, _store) = run_select_panel_wire_request(
+            "resolve-policy-wire",
+            &serde_json::to_string(&request).unwrap(),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["result"],
+            json!({
+                "availableModels": ["opencode-go/minimax-m2.5"],
+                "subscriptionKeys": ["opencode-go/minimax-m2.5"],
+                "preferFastSpecs": [],
+                "connectedModelCount": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn manifest_exposes_policy_query_alongside_selection() {
+        let manifest = manifest(DEFAULT_MODULE_ID);
+        let operations = manifest
+            .provides
+            .iter()
+            .find_map(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => Some(operations),
+                _ => None,
+            })
+            .unwrap();
+        assert!(operations
+            .iter()
+            .any(|operation| operation.name == ROUTE_RESOLVE_POLICY_OP));
     }
 
     #[tokio::test]
