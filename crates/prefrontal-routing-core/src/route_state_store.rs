@@ -175,6 +175,9 @@ pub trait RouteStateStore {
 
     /// Remove a fact by route key.
     fn delete_fact(&self, route_key: &str) -> RouteStateResult<()>;
+    /// Withdraw an override without deleting the row: the fact stays in the
+    /// catalog under source 'seed'. Rows leave the catalog by migration only.
+    fn demote_fact_source_to_seed(&self, route_key: &str) -> RouteStateResult<()>;
 
     /// Distinct capacity keys (`provider/model`) known for a provider.
     fn get_capacity_keys_for_provider(&self, provider_id: &str) -> RouteStateResult<Vec<String>>;

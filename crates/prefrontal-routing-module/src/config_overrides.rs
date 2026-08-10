@@ -595,9 +595,17 @@ fn apply_overrides<S: RouteStateStore>(
                     .upsert_fact(&restored, FactSource::Seed)
                     .map_err(|e| format!("reverting {route_key} to seed: {e}"))?
             }
+            // Not in the JSON seed: DEMOTE the source stamp, never delete the
+            // row. The catalog holds migration-seeded facts the JSON seed does
+            // not know (fable-5, opus-5, provider onboarding rows); deleting
+            // here erased three of them when their stale config overrides were
+            // cleaned up (2026-08-10) and the loss surfaced two layers away as
+            // a roster seat failing missing_fact. An override row's removal
+            // withdraws the OVERRIDE, not the model's existence; rows that
+            // should leave the catalog leave by migration.
             None => store
-                .delete_fact(&route_key)
-                .map_err(|e| format!("deleting stale override {route_key}: {e}"))?,
+                .demote_fact_source_to_seed(&route_key)
+                .map_err(|e| format!("demoting stale override {route_key}: {e}"))?,
         }
         outcome.reverted += 1;
     }
@@ -844,6 +852,58 @@ mod tests {
             None
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_an_override_demotes_the_row_and_never_deletes_it() {
+        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        // A migration-seeded fact (absent from the compiled JSON seed) whose
+        // config override disappears must SURVIVE as source='seed'. The delete
+        // arm erased fable-5/opus-5/opus-5-fast on 2026-08-10 when their stale
+        // pre-Elo overrides were cleaned from the live config, and the loss
+        // surfaced two layers away as a roster seat failing missing_fact.
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-demote-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("store.db");
+        let descriptor =
+            dev_descriptor("prefrontal-routing", db_path.to_string_lossy().into_owned());
+        let store = SqliteRouteStateStore::open(&descriptor).expect("open test store");
+
+        // Round 1: config carries an override for a MIGRATION-ONLY model
+        // (opus-5 is in the store via migration 018/024, not the JSON seed).
+        let config_path = dir.join("routing.jsonc");
+        std::fs::write(
+            &config_path,
+            r##"{ "model_routing": { "models": {
+                "anthropic/claude-opus-5": { "speed_multiplier": 0.9 }
+            } } }"##,
+        )
+        .unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+
+        // Round 2: the override is removed from config entirely.
+        std::fs::write(&config_path, r#"{ "model_routing": { "models": {} } }"#).unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+
+        // The fact must still exist, demoted to seed, not deleted.
+        let fact =
+            prefrontal_routing_core::route_state_store::RouteStateStore::get_fact_by_route_key(
+                &store,
+                "anthropic/claude-opus-5",
+            )
+            .unwrap();
+        assert!(
+            fact.is_some(),
+            "removing an override must never delete a migration-seeded fact"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

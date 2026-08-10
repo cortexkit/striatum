@@ -91,11 +91,14 @@ const MIGRATION_022: &str = include_str!("../migrations/022_elo_rescore.sql");
 /// Migration 23: ollama-cloud began serving Kimi K3; an unseeded route made the
 /// operator's roster seat silently unseatable.
 const MIGRATION_023: &str = include_str!("../migrations/023_ollama_kimi_k3.sql");
+/// Migration 24: restore fable-5/opus-5/opus-5-fast after the config
+/// override-revert deleted migration-seeded rows absent from the JSON seed.
+const MIGRATION_024: &str = include_str!("../migrations/024_restore_override_reverted_facts.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 23] {
+fn route_state_migrations() -> [Migration; 24] {
     [
         Migration {
             version: 1,
@@ -188,6 +191,10 @@ fn route_state_migrations() -> [Migration; 23] {
         Migration {
             version: 23,
             statements: MIGRATION_023,
+        },
+        Migration {
+            version: 24,
+            statements: MIGRATION_024,
         },
     ]
 }
@@ -498,6 +505,21 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 c.execute("DELETE FROM model_facts WHERE route_key = ?1", [route_key])?;
+                Ok(())
+            })
+            .map_err(err)
+    }
+
+    /// Withdraw an override without deleting the row: the fact stays in the
+    /// catalog under source 'seed' so migration-seeded models survive their
+    /// config override's removal. Rows leave the catalog by migration only.
+    fn demote_fact_source_to_seed(&self, route_key: &str) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "UPDATE model_facts SET source = 'seed' WHERE route_key = ?1",
+                    [route_key],
+                )?;
                 Ok(())
             })
             .map_err(err)
