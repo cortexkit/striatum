@@ -94,11 +94,13 @@ const MIGRATION_023: &str = include_str!("../migrations/023_ollama_kimi_k3.sql")
 /// Migration 24: restore fable-5/opus-5/opus-5-fast after the config
 /// override-revert deleted migration-seeded rows absent from the JSON seed.
 const MIGRATION_024: &str = include_str!("../migrations/024_restore_override_reverted_facts.sql");
+/// Migration 25: explicit image capability facts for known vision model families.
+const MIGRATION_025: &str = include_str!("../migrations/025_known_vision_capabilities.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 24] {
+fn route_state_migrations() -> [Migration; 25] {
     [
         Migration {
             version: 1,
@@ -195,6 +197,10 @@ fn route_state_migrations() -> [Migration; 24] {
         Migration {
             version: 24,
             statements: MIGRATION_024,
+        },
+        Migration {
+            version: 25,
+            statements: MIGRATION_025,
         },
     ]
 }

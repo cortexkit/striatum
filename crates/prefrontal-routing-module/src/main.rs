@@ -35,12 +35,12 @@ use prefrontal_routing_core::model_router::{
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
 use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
 use prefrontal_routing_core::{
-    derive_provider_key, fact_to_route, maybe_upgrade_to_fast_variant, relax_earliest_reset,
-    resolve_launch_requirements, resolve_routing_policy, select_panel_with_config,
-    validate_panel_spec, BreakGlassCandidate, DecisionInput, FastVariantUpgradeInput, ModelFact,
-    ModelRequirements, ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection,
-    PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
-    SelectPanelInput, SelectedPanel,
+    derive_provider_key, fact_to_route, make_route_key, maybe_upgrade_to_fast_variant,
+    relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
+    select_panel_with_config, validate_panel_spec, BreakGlassCandidate, DecisionInput,
+    FastVariantUpgradeInput, ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput,
+    PanelRosterEntry, PanelSelection, PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy,
+    RouteOutcome, RouteStateStore, SelectPanelInput, SelectedPanel,
 };
 use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
@@ -68,6 +68,8 @@ const DEFAULT_MODULE_ID: &str = "prefrontal-routing";
 const ROUTE_SELECT_OP: &str = "route.select";
 const ROUTE_RESOLVE_POLICY_OP: &str = "route.resolve_policy";
 const ROUTE_SELECT_PANEL_OP: &str = "route.select_panel";
+/// Read one model capability fact from the live route-state catalog.
+const ROUTE_MODEL_FACT_OP: &str = "route.model_fact";
 /// Set a recorded decision's terminal outcome (idempotent UPDATE by id).
 const ROUTE_SET_DECISION_OUTCOME_OP: &str = "route.set_decision_outcome";
 /// Record one observed-TPS usage sample (idempotent by message id).
@@ -772,6 +774,20 @@ struct ResolvePolicyBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct ModelFactBody {
+    params: ModelFactParams,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelFactParams {
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(rename = "modelID")]
+    model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResolvePolicyParams {
     #[serde(default)]
@@ -914,6 +930,85 @@ fn resolve_select_request(params: &SelectParams) -> Result<ResolvedSelectRequest
         required_capabilities,
         policy,
     })
+}
+
+async fn handle_model_fact(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: ModelFactParams = match serde_json::from_slice::<ModelFactBody>(&frame.body) {
+        Ok(body)
+            if !body.params.provider_id.trim().is_empty()
+                && !body.params.model_id.trim().is_empty() =>
+        {
+            body.params
+        }
+        Ok(_) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                "model_fact requires non-empty providerID and modelID",
+            )
+            .await;
+        }
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &format!("model_fact params not decodable: {error}"),
+            )
+            .await;
+        }
+    };
+    let route_key = make_route_key(&params.provider_id, &params.model_id, None);
+    let result = match store.get_fact_by_route_key(&route_key) {
+        Ok(Some(fact)) => json!({
+            "known": true,
+            // Capability reads preserve an absent flag as cannot-verify. Routing admission
+            // remains conservative in its own path and may treat the same absence as no.
+            "supportsVision": fact.supports_vision,
+        }),
+        Ok(None) => json!({ "known": false, "supportsVision": null }),
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("model_fact: {error}"),
+            )
+            .await;
+        }
+    };
+    let body = serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
 }
 
 async fn handle_resolve_policy(
@@ -1120,6 +1215,9 @@ async fn handle_select_request(
     }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
         return handle_resolve_policy(frame, writer).await;
+    }
+    if envelope.method == ROUTE_MODEL_FACT_OP {
+        return handle_model_fact(frame, writer, store).await;
     }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(frame, writer, quota_cache, store, routing_config_path).await;
@@ -2138,6 +2236,10 @@ fn manifest(module_id: &str) -> ModuleManifest {
                     kind: ManagementOperationKind::Query,
                 },
                 ManagementOperation {
+                    name: ROUTE_MODEL_FACT_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
+                },
+                ManagementOperation {
                     name: ROUTE_SELECT_PANEL_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
                 },
@@ -2360,6 +2462,32 @@ mod tests {
         .await
         .unwrap();
         (rx.recv().await.unwrap(), rig, store)
+    }
+
+    #[tokio::test]
+    async fn route_model_fact_reads_a_seed_absent_anthropic_fact_from_the_live_store() {
+        let request = json!({
+            "method": ROUTE_MODEL_FACT_OP,
+            "params": { "providerID": "anthropic", "modelID": "claude-opus-5" }
+        });
+        assert!(
+            prefrontal_routing_core::model_facts_seed()
+                .iter()
+                .all(|fact| !(fact.provider_id == "anthropic" && fact.model_id == "claude-opus-5")),
+            "NON-VACUITY BREAK: claude-opus-5 must remain absent from the frozen seed so this test proves the live store is authoritative"
+        );
+
+        let (response, _rig, _store) = run_select_panel_wire_request(
+            "live-model-fact-anthropic",
+            &serde_json::to_string(&request).unwrap(),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["result"],
+            json!({ "known": true, "supportsVision": true })
+        );
     }
 
     #[test]
@@ -2815,6 +2943,9 @@ mod tests {
         assert!(operations
             .iter()
             .any(|operation| operation.name == ROUTE_RESOLVE_POLICY_OP));
+        assert!(operations
+            .iter()
+            .any(|operation| operation.name == ROUTE_MODEL_FACT_OP));
     }
 
     #[tokio::test]

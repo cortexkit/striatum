@@ -117,6 +117,24 @@ fn migration_seeds_the_curated_catalog_on_first_open() {
 }
 
 #[test]
+fn migration_025_marks_known_vision_families_and_leaves_qwen_unverified() {
+    let rig = Rig::new("known-vision-capabilities");
+    let facts = rig.open().get_facts().unwrap();
+    let vision = |provider: &str, model: &str| {
+        facts
+            .iter()
+            .find(|fact| fact.provider_id == provider && fact.model_id == model)
+            .and_then(|fact| fact.supports_vision)
+    };
+
+    assert_eq!(vision("anthropic", "claude-fable-5"), Some(true));
+    assert_eq!(vision("anthropic", "claude-opus-5"), Some(true));
+    assert_eq!(vision("openai", "gpt-5.6-sol"), Some(true));
+    assert_eq!(vision("xai", "grok-4.5"), Some(true));
+    assert_eq!(vision("alibaba-token-plan", "qwen3.8-max"), None);
+}
+
+#[test]
 fn migration_012_seeds_output_caps_and_leaves_unknown_routes_uncapped() {
     let rig = Rig::new("max-output-tokens");
     let facts = rig.open().get_facts().unwrap();
