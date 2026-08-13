@@ -1333,6 +1333,7 @@ async fn handle_select_request(
                 facts: facts.clone(),
                 runtime_snapshot: Some(snap),
                 exclude_route_keys: exclude.clone(),
+                prefer_fast_specs: prefer_fast.clone(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                     sub.contains(&route.route_key) || sub.contains(&route.capacity_key)

@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::model_facts::{make_capacity_key, ModelFact, ModelRequirements, ModelRoute};
+use crate::model_facts::{
+    make_capacity_key, ModelFact, ModelRequirements, ModelRoute, FAST_SUFFIX,
+};
 use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, ModelRouteStateSnapshot,
     RequiredCapabilities,
@@ -262,12 +264,22 @@ pub fn select_panel_with_config(
         PanelSelection::Roster => &no_exclusions,
         PanelSelection::NPick => &input.exclude_route_keys,
     };
+    let exact_model_pins: Vec<String> = match input.selection {
+        PanelSelection::Roster => input
+            .roster
+            .iter()
+            .map(|entry| entry.model.clone())
+            .collect(),
+        PanelSelection::NPick => Vec::new(),
+    };
     // Panel selection has no adequacy fallback. The zero requirements are only an
     // unused scoring input to the shared hard-admission implementation.
     let admission = admit_routes(
         &considered_facts,
         input.runtime_snapshot.as_ref(),
         effective_exclusions,
+        &[],
+        &exact_model_pins,
         input.required_capabilities,
         &input.available_models,
         &ModelRequirements { iq: 0.0, eq: 0.0 },
@@ -647,7 +659,7 @@ fn cost_primary_order(a: &Candidate, b: &Candidate) -> Ordering {
 }
 
 fn sibling_group_key(route: &ModelRoute, capacity_keys: &HashSet<String>) -> String {
-    for suffix in ["-fast", "-pro"] {
+    for suffix in [FAST_SUFFIX, "-pro"] {
         if let Some(base_model) = route.model_id.strip_suffix(suffix) {
             let base_key = make_capacity_key(&route.provider_id, base_model);
             if capacity_keys.contains(&base_key) {

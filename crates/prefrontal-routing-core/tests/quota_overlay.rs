@@ -362,6 +362,7 @@ fn exhausted_provider_loses_selection_to_unpressured_peer_end_to_end() {
         facts: facts.clone(),
         runtime_snapshot: Some(snap),
         exclude_route_keys: Vec::new(),
+        prefer_fast_specs: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
         min_best_effort_adequacy: None,

@@ -230,10 +230,13 @@ pub fn select_seat_route_with_config(
         }
     }
 
+    let exact_model_pins: Vec<String> = input.model_pin.iter().cloned().collect();
     let admission = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         &input.exclude_route_keys,
+        &[],
+        &exact_model_pins,
         input.required_capabilities,
         &input.available_models,
         &input.requirements,

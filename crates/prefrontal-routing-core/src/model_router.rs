@@ -19,7 +19,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model_facts::{fact_to_route, ModelFact, ModelMetric, ModelRequirements, ModelRoute};
+use crate::model_facts::{
+    fact_to_route, make_capacity_key, ModelFact, ModelMetric, ModelRequirements, ModelRoute,
+    FAST_SUFFIX,
+};
 use crate::provider_model_spec::{parse_spec_list, resolve_spec};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 use crate::routing_config::{
@@ -103,6 +106,8 @@ pub struct SelectModelRouteInput<'a> {
     pub facts: Vec<ModelFact>,
     pub runtime_snapshot: Option<ModelRouteStateSnapshot>,
     pub exclude_route_keys: Vec<String>,
+    /// Base-model specs that deliberately admit matching priority-tier siblings.
+    pub prefer_fast_specs: Vec<String>,
     pub required_capabilities: Option<RequiredCapabilities>,
     pub is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
     /// Sanity band for best-effort selection. When no route clears the adequacy
@@ -372,6 +377,8 @@ pub fn admit_routes(
     facts: &[ModelFact],
     runtime_snapshot: Option<&ModelRouteStateSnapshot>,
     exclude_route_keys: &[String],
+    prefer_fast_specs: &[String],
+    exact_model_pins: &[String],
     required_capabilities: Option<RequiredCapabilities>,
     available_models: &HashSet<String>,
     requirements: &ModelRequirements,
@@ -379,6 +386,7 @@ pub fn admit_routes(
 ) -> AdmissionResult {
     let now = runtime_snapshot.map(|s| s.now).unwrap_or_else(now_millis);
     let exclusion_specs = parse_spec_list(exclude_route_keys);
+    let prefer_fast_specs = parse_spec_list(prefer_fast_specs);
     let mut static_candidates = Vec::new();
     let mut top_routable = TopRoutableScores::default();
     let mut rejected = Vec::new();
@@ -405,6 +413,26 @@ pub fn admit_routes(
                 reason: reason.to_string(),
             });
             continue;
+        }
+        if let Some(base_model_id) = fact.model_id.strip_suffix(FAST_SUFFIX) {
+            let base_exists = facts.iter().any(|candidate| {
+                candidate.provider_id == fact.provider_id && candidate.model_id == base_model_id
+            });
+            let base_key = make_capacity_key(&fact.provider_id, base_model_id);
+            let is_exact_pin = exact_model_pins.iter().any(|pin| {
+                let pin = pin.trim();
+                pin.eq_ignore_ascii_case(&route.capacity_key)
+                    || pin.eq_ignore_ascii_case(&route.route_key)
+            });
+            let opted_in = resolve_spec(&prefer_fast_specs, &base_key, false)
+                && resolve_spec(&prefer_fast_specs, &route.capacity_key, true);
+            if base_exists && !is_exact_pin && !opted_in {
+                rejected.push(RejectedRoute {
+                    route_key: route.route_key,
+                    reason: "fast_variant_not_opted_in".to_string(),
+                });
+                continue;
+            }
         }
         top_routable.include(fact.scores);
         static_candidates.push((fact, route));
@@ -593,6 +621,8 @@ pub fn select_model_route_with_config(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         &input.exclude_route_keys,
+        &input.prefer_fast_specs,
+        &[],
         caps,
         &input.available_models,
         &requirements,

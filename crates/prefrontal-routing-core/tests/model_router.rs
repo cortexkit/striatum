@@ -81,6 +81,7 @@ fn availability_of(facts: &[ModelFact]) -> HashSet<String> {
 struct Extra<'a> {
     available_models: Option<HashSet<String>>,
     runtime_snapshot: Option<ModelRouteStateSnapshot>,
+    prefer_fast_specs: Vec<String>,
     required_capabilities: Option<prefrontal_routing_core::model_router::RequiredCapabilities>,
     is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
     min_best_effort_adequacy: Option<f64>,
@@ -93,6 +94,7 @@ impl<'a> Default for Extra<'a> {
         Extra {
             available_models: None,
             runtime_snapshot: None,
+            prefer_fast_specs: Vec::new(),
             required_capabilities: None,
             is_subscription_route: None,
             min_best_effort_adequacy: None,
@@ -117,6 +119,7 @@ fn input<'a>(
         facts,
         runtime_snapshot: extra.runtime_snapshot,
         exclude_route_keys: Vec::new(),
+        prefer_fast_specs: extra.prefer_fast_specs,
         required_capabilities: extra.required_capabilities,
         is_subscription_route: extra.is_subscription_route,
         min_best_effort_adequacy: extra.min_best_effort_adequacy,
@@ -456,6 +459,8 @@ fn quota_exhaustion_does_not_change_the_request_frontier() {
         &facts,
         None,
         &[],
+        &[],
+        &[],
         None,
         &available,
         &requirements,
@@ -465,6 +470,8 @@ fn quota_exhaustion_does_not_change_the_request_frontier() {
     let pressured = admit_routes(
         &facts,
         Some(&quota),
+        &[],
+        &[],
         &[],
         None,
         &available,
@@ -1822,6 +1829,8 @@ fn top_routable_excludes_config_excluded_fable() {
         &facts,
         None,
         &["anthropic/claude-fable-5".into()],
+        &[],
+        &[],
         None,
         &available,
         &req(70.0, 0.0),
@@ -1832,6 +1841,8 @@ fn top_routable_excludes_config_excluded_fable() {
     let admitted = admit_routes(
         &facts,
         None,
+        &[],
+        &[],
         &[],
         None,
         &available,
@@ -1862,6 +1873,8 @@ fn iq_endpoints_admit_all_at_zero_and_clear_only_the_top_at_100() {
         &facts,
         None,
         &[],
+        &[],
+        &[],
         None,
         &available,
         &req(0.0, 0.0),
@@ -1877,6 +1890,8 @@ fn iq_endpoints_admit_all_at_zero_and_clear_only_the_top_at_100() {
         &facts,
         None,
         &[],
+        &[],
+        &[],
         None,
         &available,
         &req(100.0, 0.0),
@@ -1889,4 +1904,84 @@ fn iq_endpoints_admit_all_at_zero_and_clear_only_the_top_at_100() {
         .map(|route| route.route.route_key.as_str())
         .collect();
     assert_eq!(cleared, vec!["p/top"]);
+}
+
+#[test]
+fn fast_variant_without_opt_in_cannot_win_effectively_free_speed_tiebreak() {
+    let mut base = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "gpt-5.6-sol".into(),
+        scores: scores(1_838.0, 1_610.0, 55.0),
+        cost_per_m_tok_out: Some(30.0),
+        ..Default::default()
+    });
+    base.subscription_multiplier = Some(40.0);
+    let mut fast = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "gpt-5.6-sol-fast".into(),
+        scores: scores(1_838.0, 1_610.0, 200.0),
+        cost_per_m_tok_out: Some(60.0),
+        ..Default::default()
+    });
+    fast.subscription_multiplier = Some(40.0);
+
+    let selected =
+        select_model_route(input(vec![base, fast], req(30.0, 20.0), Extra::default())).unwrap();
+
+    assert_eq!(selected.model.model_id, "gpt-5.6-sol");
+    assert!(selected.rejected.iter().any(|rejected| {
+        rejected.route_key == "openai/gpt-5.6-sol-fast"
+            && rejected.reason == "fast_variant_not_opted_in"
+    }));
+}
+
+#[test]
+fn fast_spelling_without_a_catalogued_base_stays_admissible() {
+    let fast = fact(FactBuilder {
+        provider_id: "provider".into(),
+        model_id: "only-model-fast".into(),
+        scores: scores(1_700.0, 1_600.0, 150.0),
+        cost_per_m_tok_out: Some(10.0),
+        ..Default::default()
+    });
+
+    let selected =
+        select_model_route(input(vec![fast], req(30.0, 20.0), Extra::default())).unwrap();
+
+    assert_eq!(selected.model.model_id, "only-model-fast");
+    assert!(selected.rejected.is_empty());
+}
+
+#[test]
+fn base_preference_spec_re_admits_the_fast_variant() {
+    let base = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "gpt-5.6-sol".into(),
+        scores: scores(1_838.0, 1_610.0, 55.0),
+        cost_per_m_tok_out: Some(30.0),
+        ..Default::default()
+    });
+    let fast = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "gpt-5.6-sol-fast".into(),
+        scores: scores(1_838.0, 1_610.0, 200.0),
+        cost_per_m_tok_out: Some(30.0),
+        ..Default::default()
+    });
+
+    let selected = select_model_route(input(
+        vec![base, fast],
+        req(30.0, 20.0),
+        Extra {
+            prefer_fast_specs: vec!["openai/gpt-5.6-sol".into()],
+            ..Extra::default()
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(selected.model.model_id, "gpt-5.6-sol-fast");
+    assert!(!selected
+        .rejected
+        .iter()
+        .any(|rejected| rejected.reason == "fast_variant_not_opted_in"));
 }
