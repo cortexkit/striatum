@@ -82,7 +82,7 @@ fn fact(provider: &str, model: &str) -> ModelFact {
 // + gemini 3.6 flash (017) + opus-5 and its -fast sibling (018).
 // 54 seeded + migration 023's ollama-cloud/kimi-k3 (K3 became servable on
 // ollama-cloud; an unseeded route made a roster seat silently unseatable).
-const CATALOG_LEN: usize = 55;
+const CATALOG_LEN: usize = 56;
 
 #[test]
 fn migration_seeds_the_curated_catalog_on_first_open() {
