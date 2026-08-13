@@ -212,6 +212,15 @@ fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observ
     cache.provider_observed_at_ms = fresh
         .iter()
         .filter(|entry| entry.is_healthy())
+        // A preserved reading (stale disclosure present) carries usage and no
+        // error, so it passes is_healthy - but it is a reading QTA has been
+        // UNABLE to refresh, not a fresh success. The fast-variant upgrade
+        // demands positive fresh evidence, and before the disclosure existed a
+        // preserved entry was wire-identical to a fresh one and silently
+        // qualified. Overlay pressure still uses the preserved windows
+        // (correct: last-known beats nothing); only upgrade freshness excludes
+        // them.
+        .filter(|entry| entry.stale.is_none())
         .map(|entry| {
             let key = entry
                 .api_provider
@@ -3093,6 +3102,43 @@ mod tests {
         assert_eq!(
             body["result"]["selected"]["model"]["modelID"],
             "freshness-base"
+        );
+    }
+
+    /// A preserved reading (QTA's `stale` disclosure) carries usage and no
+    /// error, so it is wire-identical to a fresh success everywhere EXCEPT the
+    /// disclosure - and the fast-upgrade freshness map must treat it as
+    /// not-fresh: the upgrade demands positive evidence of a relaxed window,
+    /// and a reading the producer has been unable to refresh is not that.
+    /// Overlay pressure keeps using the preserved windows.
+    #[test]
+    fn preserved_stale_reading_keeps_windows_but_is_not_upgrade_fresh() {
+        let observed_at_ms = now_ms();
+        let mut cache = QuotaCache::default();
+        apply_quota_refresh(
+            &mut cache,
+            vec![
+                usage(json!({
+                    "provider": "codex",
+                    "usage": { "primary": { "usedPercent": 1.0 } },
+                    "fetchedAt": "2026-08-13T16:03:50Z",
+                    "stale": { "since": "2026-08-13T16:04:50Z", "class": "upstream_failed" }
+                })),
+                usage(json!({
+                    "provider": "gemini",
+                    "usage": { "primary": { "usedPercent": 2.0 } }
+                })),
+            ],
+            observed_at_ms,
+        );
+        assert_eq!(cache.windows.len(), 2, "preserved windows still serve");
+        assert!(
+            !cache.provider_observed_at_ms.contains_key("codex"),
+            "a preserved reading must not qualify its provider as upgrade-fresh"
+        );
+        assert!(
+            cache.provider_observed_at_ms.contains_key("gemini"),
+            "a fresh reading (no disclosure) stays upgrade-fresh"
         );
     }
 

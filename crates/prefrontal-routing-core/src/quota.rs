@@ -89,6 +89,27 @@ pub struct ProviderUsage {
     /// this field only says WHY.
     #[serde(default)]
     pub error_class: Option<String>,
+    /// Present exactly when this entry is a PRESERVED reading served through an
+    /// ongoing refresh failure (QTA, additive 2026-08-13). The entry still
+    /// carries usage and no error - on the wire it would otherwise be
+    /// indistinguishable from a fresh read. Not a fault signal: preserving a
+    /// reading through a transient failure is correct producer behavior; this
+    /// discloses that it is happening so consumers can price the aging.
+    #[serde(default)]
+    pub stale: Option<StaleDisclosure>,
+}
+
+/// Why a preserved reading is aging: `since` stamps the first failed refresh
+/// after the served reading was obtained, `class` reuses the errorClass
+/// vocabulary and is optional (a producer that cannot classify still
+/// discloses the state).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleDisclosure {
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub class: Option<String>,
 }
 
 impl Usage {
