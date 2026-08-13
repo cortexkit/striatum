@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+/// Suffix used for provider models that are priority-tier siblings of a base model.
+pub const FAST_SUFFIX: &str = "-fast";
+
 static SPEED_MULTIPLIERS: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
 
 pub fn set_speed_multipliers(multipliers: HashMap<String, f64>) {

@@ -11,7 +11,7 @@
 //! projection tightens, pressure rises past the threshold, and selection quietly
 //! returns to the normal sibling.
 
-use crate::model_facts::{fact_to_route, ModelFact, ModelRequirements, ModelRoute};
+use crate::model_facts::{fact_to_route, ModelFact, ModelRequirements, ModelRoute, FAST_SUFFIX};
 use crate::model_router::{
     admit_routes, capability_rejection_reason, compute_objective, latest_deadline,
     ModelRouteStateSnapshot, PromptParams, RequiredCapabilities, RouteRuntimeState, SelectedModel,
@@ -24,8 +24,6 @@ use crate::routing_config::RoutingConfig;
 /// Pressure at or below which a quota projection counts as "relaxed" (built-in, no
 /// config knob): the projected lockout cost is trivial.
 pub const FAST_UPGRADE_MAX_PRESSURE: f64 = 0.25;
-
-const FAST_SUFFIX: &str = "-fast";
 
 /// Merge capacity-shared and route-specific runtime state.
 fn effective_runtime(
@@ -178,6 +176,8 @@ pub fn maybe_upgrade_to_fast_variant(
         input.facts,
         None,
         input.exclude_route_keys,
+        input.prefer_fast_specs,
+        &[],
         input.required_capabilities,
         input.available_models,
         input.requirements,

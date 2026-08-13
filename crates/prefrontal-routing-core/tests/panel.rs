@@ -195,6 +195,7 @@ fn admission_is_shared_not_reimplemented() {
         facts: facts.clone(),
         runtime_snapshot: Some(snapshot.clone()),
         exclude_route_keys: vec!["p/excluded".into()],
+        prefer_fast_specs: Vec::new(),
         required_capabilities: capabilities,
         is_subscription_route: None,
         min_best_effort_adequacy: None,
@@ -537,7 +538,7 @@ fn n_pick_reuses_elo_floor_and_fact_prompt_defaults() {
 }
 
 #[test]
-fn inferred_sibling_groups_collapse_variants_and_never_seat_known_fast_routes() {
+fn n_pick_never_seats_fast_variants_with_known_base_siblings() {
     let mut facts = Vec::new();
     for model in ["sol", "terra", "luna"] {
         facts.push(openai_sibling(&format!("gpt-5.6-{model}"), 60.0));
@@ -567,25 +568,23 @@ fn inferred_sibling_groups_collapse_variants_and_never_seat_known_fast_routes() 
     }
     let policy = selected.policy.unwrap();
     assert_eq!(policy.sibling_collapses.len(), 3);
-    assert!(policy.sibling_collapses.iter().all(|collapse| collapse
-        .collapsed_route_keys
-        .iter()
-        .any(|route_key| route_key.ends_with("-fast"))));
+    assert!(policy.sibling_collapses.iter().all(|collapse| {
+        collapse.collapsed_route_keys.len() == 1
+            && collapse.collapsed_route_keys[0].ends_with("-pro")
+    }));
 }
 
 #[test]
-fn sibling_collapse_retains_an_admitted_variant_when_the_base_is_unavailable() {
-    let base = openai_sibling("gpt-5.6-sol", 60.0);
+fn n_pick_keeps_a_fast_spelling_when_the_base_is_absent_from_the_catalog() {
     let fast = openai_sibling("gpt-5.6-sol-fast", 61.0);
-    let facts = vec![base.clone(), fast.clone()];
-    let mut input = n_pick_input(facts, spec(1, 0.0, PanelDiversity::None), 100, 8_000);
-    input.available_models = HashSet::from([make_route_key(
-        &fast.provider_id,
-        &fast.model_id,
-        fast.variant.as_deref(),
-    )]);
 
-    let selected = select_panel(input).unwrap();
+    let selected = select_panel(n_pick_input(
+        vec![fast],
+        spec(1, 0.0, PanelDiversity::None),
+        100,
+        8_000,
+    ))
+    .unwrap();
 
     assert_eq!(selected.members.len(), 1);
     assert_eq!(selected.members[0].route_key, "openai/gpt-5.6-sol-fast");
@@ -607,7 +606,7 @@ fn routes_with_the_same_capacity_key_collapse_without_static_metadata() {
 }
 
 #[test]
-fn every_seed_base_fast_pair_collapses() {
+fn every_seed_base_fast_pair_is_contained_before_sibling_collapse() {
     let seed = model_facts_seed();
     let pairs: Vec<_> = seed
         .iter()
@@ -627,7 +626,6 @@ fn every_seed_base_fast_pair_collapses() {
 
     for (base, fast) in pairs {
         let base_route_key = make_route_key(&base.provider_id, &base.model_id, None);
-        let fast_route_key = make_route_key(&fast.provider_id, &fast.model_id, None);
         let mut panel_spec = spec(2, 0.0, PanelDiversity::None);
         panel_spec.class = PanelClass::Diagnose;
         let selected =
@@ -641,11 +639,12 @@ fn every_seed_base_fast_pair_collapses() {
                 .collect::<Vec<_>>(),
             [base_route_key.as_str()]
         );
-        let collapses = &selected.policy.as_ref().unwrap().sibling_collapses;
-        assert!(collapses.iter().any(|collapse| {
-            collapse.retained_route_key == base_route_key
-                && collapse.collapsed_route_keys.contains(&fast_route_key)
-        }));
+        assert!(selected
+            .policy
+            .as_ref()
+            .unwrap()
+            .sibling_collapses
+            .is_empty());
     }
 }
 
@@ -895,4 +894,43 @@ fn roster_mode_seats_same_family_pins_without_diversity_ejection() {
         output.shortfall.is_none(),
         "no diversity shortfall for pins"
     );
+}
+
+#[test]
+fn n_pick_contains_fast_variant_before_sibling_collapse() {
+    let base = openai_sibling("gpt-5.6-sol", 60.0);
+    let mut fast = openai_sibling("gpt-5.6-sol-fast", 60.0);
+    fast.scores.speed = 200.0;
+
+    let selected = select_panel(n_pick_input(
+        vec![base, fast],
+        spec(1, 0.0, PanelDiversity::None),
+        100,
+        8_000,
+    ))
+    .unwrap();
+
+    assert_eq!(selected.members[0].route_key, "openai/gpt-5.6-sol");
+    assert!(selected.policy.unwrap().sibling_collapses.is_empty());
+}
+
+#[test]
+fn roster_pins_can_seat_both_base_and_fast_sibling() {
+    let base = openai_sibling("gpt-5.6-sol", 60.0);
+    let fast = openai_sibling("gpt-5.6-sol-fast", 60.0);
+
+    let selected = select_panel(panel_input(
+        vec![base, fast],
+        spec(2, 0.0, PanelDiversity::None),
+    ))
+    .unwrap();
+    let routes: HashSet<_> = selected
+        .members
+        .iter()
+        .map(|member| member.route_key.as_str())
+        .collect();
+
+    assert_eq!(routes.len(), 2);
+    assert!(routes.contains("openai/gpt-5.6-sol"));
+    assert!(routes.contains("openai/gpt-5.6-sol-fast"));
 }
