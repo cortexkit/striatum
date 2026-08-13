@@ -87,6 +87,15 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
     assert!(status.success(), "building {bin} failed");
     let path = repo.join(format!("target/debug/{bin}"));
     assert!(path.exists(), "{bin} binary missing at {}", path.display());
+    // A freshly built binary stalls in macOS Gatekeeper/syspolicyd assessment
+    // on first exec (measured 14-33s under load), which lands inside this
+    // test's supervisor setup deadline and reads as a module that never came
+    // up. One warm exec eats the assessment before the daemon spawns it.
+    let _ = std::process::Command::new(&path)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     path
 }
 
