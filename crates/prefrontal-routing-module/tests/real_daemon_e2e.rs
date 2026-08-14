@@ -69,13 +69,20 @@ fn subconscious_root() -> PathBuf {
 
 fn build_subc_core() -> PathBuf {
     let root = subconscious_root();
+    // Build into a prefrontal-owned target dir: building in the sibling's own
+    // target/debug contends with that repo owner's live cargo lock (measured:
+    // a concurrent insula build held both_modules_e2e past its 720s cap).
+    let sibling_target =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sibling-target/subconscious");
+    std::fs::create_dir_all(&sibling_target).unwrap();
     let status = std::process::Command::new(env!("CARGO"))
         .current_dir(&root)
         .args(["build", "--bin", "ck-subc"])
+        .env("CARGO_TARGET_DIR", &sibling_target)
         .status()
         .expect("run cargo build for subc-core");
     assert!(status.success(), "building ck-subc failed");
-    let bin = root.join("target/debug/ck-subc");
+    let bin = sibling_target.join("debug/ck-subc");
     assert!(
         bin.exists(),
         "subc-core binary missing at {}",

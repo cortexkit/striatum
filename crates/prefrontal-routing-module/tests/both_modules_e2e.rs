@@ -79,13 +79,23 @@ fn sibling(rel: &str) -> PathBuf {
 }
 
 fn build_bin(repo: &Path, bin: &str) -> PathBuf {
+    // Build into a prefrontal-owned target dir: building in the sibling's own
+    // target/debug contends with that repo owner's live cargo lock (measured:
+    // a concurrent insula build held this test past its 720s terminate cap
+    // while cargo silently waited on the sibling's file lock).
+    let repo_name = repo.file_name().expect("sibling repo has a name");
+    let sibling_target = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/sibling-target")
+        .join(repo_name);
+    std::fs::create_dir_all(&sibling_target).unwrap();
     let status = std::process::Command::new(env!("CARGO"))
         .current_dir(repo)
+        .env("CARGO_TARGET_DIR", &sibling_target)
         .args(["build", "--bin", bin])
         .status()
         .unwrap_or_else(|_| panic!("run cargo build --bin {bin} in {}", repo.display()));
     assert!(status.success(), "building {bin} failed");
-    let path = repo.join(format!("target/debug/{bin}"));
+    let path = sibling_target.join(format!("debug/{bin}"));
     assert!(path.exists(), "{bin} binary missing at {}", path.display());
     // A freshly built binary stalls in macOS Gatekeeper/syspolicyd assessment
     // on first exec (measured 14-33s under load), which lands inside this
