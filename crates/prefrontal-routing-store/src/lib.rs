@@ -98,11 +98,12 @@ const MIGRATION_024: &str = include_str!("../migrations/024_restore_override_rev
 const MIGRATION_025: &str = include_str!("../migrations/025_known_vision_capabilities.sql");
 /// Migration 26: Grok 4.6 catalog fact (Ufuk curation, elo 1798, xhigh default).
 const MIGRATION_026: &str = include_str!("../migrations/026_grok_46.sql");
+const MIGRATION_027: &str = include_str!("../migrations/027_gemini_37_flash.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 26] {
+fn route_state_migrations() -> [Migration; 27] {
     [
         Migration {
             version: 1,
@@ -207,6 +208,10 @@ fn route_state_migrations() -> [Migration; 26] {
         Migration {
             version: 26,
             statements: MIGRATION_026,
+        },
+        Migration {
+            version: 27,
+            statements: MIGRATION_027,
         },
     ]
 }

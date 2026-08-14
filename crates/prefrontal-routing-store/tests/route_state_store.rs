@@ -81,8 +81,10 @@ fn fact(provider: &str, model: &str) -> ModelFact {
 // entitlement (014: the token plan serves the qwen family only)
 // + gemini 3.6 flash (017) + opus-5 and its -fast sibling (018).
 // 54 seeded + migration 023's ollama-cloud/kimi-k3 (K3 became servable on
-// ollama-cloud; an unseeded route made a roster seat silently unseatable).
-const CATALOG_LEN: usize = 56;
+// ollama-cloud; an unseeded route made a roster seat silently unseatable)
+// + grok-4.6 (026) + gemini 3.7 flash (027, succession seed carrying
+// 3.6-flash scores; 3.6 retires via the config exclude, not the store).
+const CATALOG_LEN: usize = 57;
 
 #[test]
 fn migration_seeds_the_curated_catalog_on_first_open() {
