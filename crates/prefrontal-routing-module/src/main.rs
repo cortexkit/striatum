@@ -28,11 +28,13 @@ use std::{
 };
 
 use cortexkit_store_types::StorageDescriptor;
+use prefrontal_routing_core::model_facts::{Confidence, ModelScores};
 use prefrontal_routing_core::model_router::{
     select_model_route_with_config, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
     RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
+use prefrontal_routing_core::route_state_store::FactSource;
 use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, make_route_key, maybe_upgrade_to_fast_variant,
@@ -70,6 +72,10 @@ const ROUTE_RESOLVE_POLICY_OP: &str = "route.resolve_policy";
 const ROUTE_SELECT_PANEL_OP: &str = "route.select_panel";
 /// Read one model capability fact from the live route-state catalog.
 const ROUTE_MODEL_FACT_OP: &str = "route.model_fact";
+/// Live catalog write: add a model or adjust its scores/metadata without a
+/// store migration or module deploy. Merge semantics against the stored fact;
+/// writes land as FactSource::Override so a re-seed never reverts them.
+const ROUTE_MODEL_UPSERT_OP: &str = "route.model_upsert";
 /// Set a recorded decision's terminal outcome (idempotent UPDATE by id).
 const ROUTE_SET_DECISION_OUTCOME_OP: &str = "route.set_decision_outcome";
 /// Record one observed-TPS usage sample (idempotent by message id).
@@ -797,6 +803,46 @@ struct ModelFactParams {
 }
 
 #[derive(Debug, Deserialize)]
+struct ModelUpsertBody {
+    params: ModelUpsertParams,
+}
+
+/// Partial fact: absent fields keep the stored value on merge, and a NEW model
+/// requires elo + eq (the two judgment axes nothing can default honestly).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelUpsertParams {
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(rename = "modelID")]
+    model_id: String,
+    #[serde(default)]
+    variant: Option<String>,
+    #[serde(default)]
+    family: Option<String>,
+    #[serde(default)]
+    elo: Option<f64>,
+    #[serde(default)]
+    eq: Option<f64>,
+    #[serde(default)]
+    speed: Option<f64>,
+    #[serde(default)]
+    context_window: Option<f64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    cost_per_m_tok_out: Option<f64>,
+    #[serde(default)]
+    supports_vision: Option<bool>,
+    #[serde(default)]
+    supports_tool_use: Option<bool>,
+    #[serde(default)]
+    default_variant: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ResolvePolicyParams {
     #[serde(default)]
@@ -939,6 +985,221 @@ fn resolve_select_request(params: &SelectParams) -> Result<ResolvedSelectRequest
         required_capabilities,
         policy,
     })
+}
+
+/// Merge partial upsert params over the stored fact. A NEW route requires elo
+/// and eq: defaulting either would place a model in the ladder silently, the
+/// quiet-wrongness class the seed migrations never had. Absent fields keep the
+/// stored value; a new route's speed defaults to 100 (mid-catalog neutral)
+/// until observed samples replace it.
+fn merge_model_upsert(
+    existing: Option<ModelFact>,
+    params: &ModelUpsertParams,
+) -> Result<ModelFact, String> {
+    let mut fact = match existing {
+        Some(fact) => fact,
+        None => {
+            let (Some(elo), Some(eq)) = (params.elo, params.eq) else {
+                return Err(format!(
+                    "model_upsert: route {}/{} is new; elo and eq are required to place it",
+                    params.provider_id, params.model_id
+                ));
+            };
+            ModelFact {
+                provider_id: params.provider_id.clone(),
+                model_id: params.model_id.clone(),
+                variant: params.variant.clone(),
+                family: None,
+                scores: ModelScores {
+                    elo,
+                    eq,
+                    speed: params.speed.unwrap_or(100.0),
+                },
+                context_window: None,
+                max_output_tokens: None,
+                cost_tier: None,
+                cost_per_m_tok_out: None,
+                supports_vision: None,
+                supports_tool_use: None,
+                prompt_defaults: None,
+                confidence: Confidence::Curated,
+                notes: None,
+                speed_multiplier: None,
+                subscription_multiplier: None,
+            }
+        }
+    };
+    if let Some(elo) = params.elo {
+        fact.scores.elo = elo;
+    }
+    if let Some(eq) = params.eq {
+        fact.scores.eq = eq;
+    }
+    if let Some(speed) = params.speed {
+        fact.scores.speed = speed;
+    }
+    if params.family.is_some() {
+        fact.family = params.family.clone();
+    }
+    if params.context_window.is_some() {
+        fact.context_window = params.context_window;
+    }
+    if params.max_output_tokens.is_some() {
+        fact.max_output_tokens = params.max_output_tokens;
+    }
+    if params.cost_per_m_tok_out.is_some() {
+        fact.cost_per_m_tok_out = params.cost_per_m_tok_out;
+    }
+    if params.supports_vision.is_some() {
+        fact.supports_vision = params.supports_vision;
+    }
+    if params.supports_tool_use.is_some() {
+        fact.supports_tool_use = params.supports_tool_use;
+    }
+    if let Some(default_variant) = params.default_variant.clone() {
+        let mut defaults = fact.prompt_defaults.clone().unwrap_or_default();
+        defaults.variant = Some(default_variant);
+        fact.prompt_defaults = Some(defaults);
+    }
+    if params.notes.is_some() {
+        fact.notes = params.notes.clone();
+    }
+    Ok(fact)
+}
+
+/// route.model_upsert: live catalog write. Merges the partial params over the
+/// stored fact when the route exists; a new route requires elo and eq (the
+/// operator-judgment axes). Writes land as FactSource::Override so re-seeds
+/// never revert them. This op retires the add-a-model migration path.
+async fn handle_model_upsert(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: ModelUpsertParams = match serde_json::from_slice::<ModelUpsertBody>(&frame.body) {
+        Ok(body)
+            if !body.params.provider_id.trim().is_empty()
+                && !body.params.model_id.trim().is_empty() =>
+        {
+            body.params
+        }
+        Ok(_) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                "model_upsert requires non-empty providerID and modelID",
+            )
+            .await;
+        }
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &format!("model_upsert params not decodable: {error}"),
+            )
+            .await;
+        }
+    };
+    for (label, value) in [
+        ("elo", params.elo),
+        ("eq", params.eq),
+        ("speed", params.speed),
+    ] {
+        if let Some(score) = value {
+            if !score.is_finite() || score <= 0.0 {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("model_upsert {label} must be a positive finite number, got {score}"),
+                )
+                .await;
+            }
+        }
+    }
+    let route_key = make_route_key(
+        &params.provider_id,
+        &params.model_id,
+        params.variant.as_deref(),
+    );
+    let existing = match store.get_fact_by_route_key(&route_key) {
+        Ok(existing) => existing,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("model_upsert read: {error}"),
+            )
+            .await;
+        }
+    };
+    let created = existing.is_none();
+    let fact = match merge_model_upsert(existing, &params) {
+        Ok(fact) => fact,
+        Err(message) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &message,
+            )
+            .await;
+        }
+    };
+    if let Err(error) = store.upsert_fact(&fact, FactSource::Override) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "store_error",
+            &format!("model_upsert write: {error}"),
+        )
+        .await;
+    }
+    let result = json!({
+        "routeKey": route_key,
+        "created": created,
+        "scores": fact.scores,
+        "source": "override",
+    });
+    let body = serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
 }
 
 async fn handle_model_fact(
@@ -1227,6 +1488,9 @@ async fn handle_select_request(
     }
     if envelope.method == ROUTE_MODEL_FACT_OP {
         return handle_model_fact(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_MODEL_UPSERT_OP {
+        return handle_model_upsert(frame, writer, store).await;
     }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(frame, writer, quota_cache, store, routing_config_path).await;
@@ -2250,6 +2514,10 @@ fn manifest(module_id: &str) -> ModuleManifest {
                     kind: ManagementOperationKind::Query,
                 },
                 ManagementOperation {
+                    name: ROUTE_MODEL_UPSERT_OP.to_string(),
+                    kind: ManagementOperationKind::Mutate,
+                },
+                ManagementOperation {
                     name: ROUTE_SELECT_PANEL_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
                 },
@@ -2371,6 +2639,96 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    fn upsert_params(provider: &str, model: &str) -> ModelUpsertParams {
+        ModelUpsertParams {
+            provider_id: provider.into(),
+            model_id: model.into(),
+            variant: None,
+            family: None,
+            elo: None,
+            eq: None,
+            speed: None,
+            context_window: None,
+            max_output_tokens: None,
+            cost_per_m_tok_out: None,
+            supports_vision: None,
+            supports_tool_use: None,
+            default_variant: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn model_upsert_new_route_requires_both_judgment_scores() {
+        // elo without eq (and vice versa) must refuse: a defaulted judgment
+        // score places a model in the ladder silently.
+        let mut params = upsert_params("newco", "shiny-1");
+        params.elo = Some(1500.0);
+        assert!(merge_model_upsert(None, &params).is_err());
+        params.elo = None;
+        params.eq = Some(1700.0);
+        assert!(merge_model_upsert(None, &params).is_err());
+        params.elo = Some(1500.0);
+        let fact = merge_model_upsert(None, &params).expect("both scores create");
+        assert_eq!(fact.scores.elo, 1500.0);
+        assert_eq!(fact.scores.eq, 1700.0);
+        assert_eq!(fact.scores.speed, 100.0, "new route speed defaults neutral");
+        assert_eq!(fact.confidence, Confidence::Curated);
+    }
+
+    #[test]
+    fn model_upsert_merge_touches_only_supplied_fields() {
+        let stored = fact("openai", "gpt-x");
+        let mut params = upsert_params("openai", "gpt-x");
+        params.elo = Some(1615.0);
+        let merged = merge_model_upsert(Some(stored.clone()), &params).unwrap();
+        assert_eq!(merged.scores.elo, 1615.0);
+        // Every untouched field survives the merge byte-for-byte.
+        assert_eq!(merged.scores.eq, stored.scores.eq);
+        assert_eq!(merged.scores.speed, stored.scores.speed);
+        assert_eq!(merged.context_window, stored.context_window);
+        assert_eq!(merged.cost_per_m_tok_out, stored.cost_per_m_tok_out);
+        assert_eq!(merged.supports_vision, stored.supports_vision);
+        assert_eq!(merged.family, stored.family);
+    }
+
+    #[test]
+    fn model_upsert_default_variant_lands_in_prompt_defaults() {
+        let stored = fact("xai", "grok-z");
+        let mut params = upsert_params("xai", "grok-z");
+        params.default_variant = Some("xhigh".into());
+        let merged = merge_model_upsert(Some(stored), &params).unwrap();
+        assert_eq!(
+            merged
+                .prompt_defaults
+                .as_ref()
+                .and_then(|d| d.variant.as_deref()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn model_upsert_written_as_override_survives_reseed() {
+        // The store contract the op leans on: an Override row is never
+        // reverted by the seed pass (seed fills absent rows only).
+        let rig = Rig::new("upsert-override");
+        let store = rig.open_store();
+        let mut params = upsert_params("newco", "shiny-2");
+        params.elo = Some(1400.0);
+        params.eq = Some(1600.0);
+        let fact = merge_model_upsert(None, &params).unwrap();
+        store.upsert_fact(&fact, FactSource::Override).unwrap();
+        let read = store
+            .get_fact_by_route_key("newco/shiny-2")
+            .unwrap()
+            .expect("written route reads back");
+        assert_eq!(read.scores.elo, 1400.0);
+        assert!(store
+            .list_override_route_keys()
+            .unwrap()
+            .contains(&"newco/shiny-2".to_string()));
     }
 
     fn fact(provider: &str, model: &str) -> ModelFact {
