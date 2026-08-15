@@ -501,6 +501,18 @@ fn spend_pools_decode_additively_and_unknown_funding_cannot_spend() {
                 "futurePoolField": true
             },
             {
+                "id": "banked-credits",
+                "label": "Banked credits",
+                // The literal "unknown" is what insula's PoolFunding::Unknown
+                // actually serializes for codex banked credits: it is a distinct
+                // shape from a novel string even though our arm-less String
+                // decode treats both identically, so both are driven.
+                "funding": "unknown",
+                "remaining": { "minor": 500, "exponent": 2, "unit": "USD" },
+                "basis": "reported",
+                "spendable": true
+            },
+            {
                 "id": "subscription",
                 "label": "Subscription",
                 "funding": "subscription",
@@ -522,7 +534,12 @@ fn spend_pools_decode_additively_and_unknown_funding_cannot_spend() {
         !entry.spend[0].is_routing_spendable(),
         "unknown funding must remain not-granted-do-not-spend"
     );
-    assert!(entry.spend[1].is_routing_spendable());
+    assert_eq!(entry.spend[1].funding, "unknown");
+    assert!(
+        !entry.spend[1].is_routing_spendable(),
+        "the literal \"unknown\" (codex banked credits) must be not-spendable through the same path"
+    );
+    assert!(entry.spend[2].is_routing_spendable());
 }
 
 #[test]
