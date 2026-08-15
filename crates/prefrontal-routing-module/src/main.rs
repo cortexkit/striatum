@@ -222,6 +222,34 @@ fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
             "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {unknown:?}"
         );
     }
+    // A provider whose spendable pools are all empty walls even when other
+    // pools hold funds (producer fact: deepseek carries 0 granted beside a
+    // positive purchased balance). Rendered undistinguished, that wall reads
+    // as a quota bug to anyone who can see the account balance, so name the
+    // withheld funds explicitly whenever the wall-with-funds shape occurs.
+    for entry in fresh {
+        if entry.spend.is_empty() {
+            continue;
+        }
+        let all_spendable_empty = entry
+            .spend
+            .iter()
+            .filter(|pool| pool.has_supported_funding())
+            .all(|pool| pool.remaining.is_non_positive());
+        let withheld: Vec<String> = entry
+            .spend
+            .iter()
+            .filter(|pool| !pool.has_supported_funding() && !pool.remaining.is_non_positive())
+            .map(|pool| format!("{} ({})", pool.remaining.render(), pool.funding))
+            .collect();
+        if all_spendable_empty && !withheld.is_empty() {
+            eprintln!(
+                "[prefrontal-routing] provider {} walled on empty spendable pools while non-spendable pools hold {} - policy, not a quota bug (only granted/subscription funding may spend)",
+                entry.provider,
+                withheld.join(", ")
+            );
+        }
+    }
 }
 
 fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observed_at_ms: u64) {

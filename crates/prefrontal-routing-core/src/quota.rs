@@ -63,8 +63,15 @@ pub struct SpendBalance {
 }
 
 impl SpendBalance {
-    fn is_non_positive(&self) -> bool {
+    pub fn is_non_positive(&self) -> bool {
         self.minor <= 0
+    }
+
+    /// Human-readable amount for log lines, e.g. "24.01 CNY". Diagnostic only:
+    /// policy math stays on the fixed-precision minor units.
+    pub fn render(&self) -> String {
+        let amount = self.minor as f64 * 10_f64.powi(-self.exponent);
+        format!("{amount:.2} {}", self.unit)
     }
 
     fn ratio_of(&self, total: &Self) -> Option<f64> {
