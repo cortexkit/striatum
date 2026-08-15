@@ -366,6 +366,7 @@ mod tests {
                 tertiary: None,
                 extra_rate_windows: None,
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };
@@ -398,6 +399,7 @@ mod tests {
                 tertiary: None,
                 extra_rate_windows: None,
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };
@@ -427,6 +429,7 @@ mod tests {
                 tertiary: None,
                 extra_rate_windows: None,
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };
@@ -448,6 +451,7 @@ mod tests {
                 tertiary: None,
                 extra_rate_windows: None,
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };
@@ -486,6 +490,7 @@ mod tests {
                     },
                 ]),
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };
@@ -556,6 +561,7 @@ mod tests {
                     },
                 ]),
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };
@@ -616,6 +622,7 @@ mod tests {
                     },
                 ]),
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };
@@ -688,6 +695,7 @@ mod tests {
                     },
                 ]),
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };
@@ -722,6 +730,7 @@ mod tests {
                 tertiary: None,
                 extra_rate_windows: None,
             }),
+            spend: Vec::new(),
             error: None,
             error_class: None,
         };

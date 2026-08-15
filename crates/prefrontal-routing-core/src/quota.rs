@@ -52,6 +52,76 @@ pub struct Usage {
     pub extra_rate_windows: Option<Vec<ExtraWindow>>,
 }
 
+/// A fixed-precision balance used by a spend pool. `minor` carries the signed
+/// amount in `10^-exponent` units; the sign alone is enough for exhaustion.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpendBalance {
+    pub minor: i64,
+    pub exponent: i32,
+    pub unit: String,
+}
+
+impl SpendBalance {
+    fn is_non_positive(&self) -> bool {
+        self.minor <= 0
+    }
+
+    fn ratio_of(&self, total: &Self) -> Option<f64> {
+        if self.unit != total.unit || total.minor <= 0 {
+            return None;
+        }
+        let remaining = self.minor as f64 * 10_f64.powi(-self.exponent);
+        let total = total.minor as f64 * 10_f64.powi(-total.exponent);
+        (total.is_finite() && total > 0.0).then_some((remaining / total).clamp(0.0, 1.0))
+    }
+}
+
+/// One provider-scoped spend pool. `funding` and `basis` remain Strings because
+/// insula extends both vocabularies additively; unsupported funding is deliberately
+/// retained and treated as not granted rather than rejecting the whole entry.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpendPool {
+    pub id: String,
+    pub label: String,
+    pub funding: String,
+    pub remaining: SpendBalance,
+    #[serde(default)]
+    pub total: Option<SpendBalance>,
+    pub basis: String,
+    pub spendable: bool,
+}
+
+impl SpendPool {
+    /// Only these producer funding classes may authorize routing spend.
+    pub fn has_supported_funding(&self) -> bool {
+        matches!(self.funding.as_str(), "granted" | "subscription")
+    }
+
+    /// A pool can serve routing only when its producer flag, supported funding,
+    /// and reported remaining balance all agree. This must not be used to suppress
+    /// an exhausted-pool wall: an empty allowed pool is intentionally unspendable.
+    pub fn is_routing_spendable(&self) -> bool {
+        self.spendable && self.has_supported_funding() && !self.remaining.is_non_positive()
+    }
+
+    fn can_inform_pacing(&self) -> bool {
+        self.spendable && self.has_supported_funding()
+    }
+
+    fn utilization(&self) -> f64 {
+        if self.remaining.is_non_positive() {
+            return 1.0;
+        }
+        self.total
+            .as_ref()
+            .and_then(|total| self.remaining.ratio_of(total))
+            .map(|remaining_ratio| 1.0 - remaining_ratio)
+            .unwrap_or(0.0)
+    }
+}
+
 /// One provider/account's usage entry. The `usage.get` result is an array of
 /// these. A fetch failure becomes an entry carrying `error` (silent-degrade),
 /// never a failure of the whole array: the consumer skips any entry with a
@@ -78,6 +148,10 @@ pub struct ProviderUsage {
     pub source: Option<String>,
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// Provider-scoped spend pools. Pool draw order is not published, so routing
+    /// never assigns a request to an individual pool.
+    #[serde(default)]
+    pub spend: Vec<SpendPool>,
     /// Present only on a degraded entry. The consumer skips any entry with `error`.
     #[serde(default)]
     pub error: Option<String>,
@@ -125,10 +199,12 @@ impl Usage {
 }
 
 impl ProviderUsage {
-    /// True when this entry carries real quota windows (not a silent-degrade error
-    /// or an otherwise empty usage payload).
+    /// True when this entry carries a usable quota signal (rate windows or reported
+    /// spend pools), not a silent-degrade error or an otherwise empty payload.
     pub fn is_healthy(&self) -> bool {
-        self.error.is_none() && self.usage.as_ref().is_some_and(Usage::has_usable_windows)
+        self.error.is_none()
+            && (self.usage.as_ref().is_some_and(Usage::has_usable_windows)
+                || !self.spend.is_empty())
     }
 }
 
@@ -156,8 +232,38 @@ struct CapacitySignal {
     exhausted_until: Option<f64>,
 }
 
-/// Merge quota windows onto an EXISTING (store-built) route-state snapshot, with
-/// FULL plugin parity (replacing the flat worst-utilization proxy):
+type AccountSignals = HashMap<(String, String), HashMap<String, CapacitySignal>>;
+
+fn record_capacity_signal(
+    signals: &mut AccountSignals,
+    account_key: &(String, String),
+    targets: &[String],
+    pressure: f64,
+    exhausted_until: Option<f64>,
+) {
+    for cap in targets {
+        let sig = signals
+            .entry(account_key.clone())
+            .or_default()
+            .entry(cap.clone())
+            .or_default();
+        // Within one account, the tightest signal governs every capacity it covers.
+        sig.pressure = Some(match sig.pressure {
+            Some(existing) => existing.max(pressure),
+            None => pressure,
+        });
+        if let Some(exhausted_until) = exhausted_until {
+            sig.exhausted_until = Some(match sig.exhausted_until {
+                Some(existing) => existing.max(exhausted_until),
+                None => exhausted_until,
+            });
+        }
+    }
+}
+
+/// Merge quota windows and provider-scoped spend pools onto an existing store-built
+/// route-state snapshot using the provider mapping, capacity extraction, reset
+/// handling, pressure projection, and exhaustion rules below:
 ///   - the wire name is mapped to a routing providerID via `name_map`;
 ///   - each provider's windows are EXTRACTED per its topology (account-wide pools
 ///     vs antigravity's per-model `extra_rate_windows` → capacity scope);
@@ -166,7 +272,11 @@ struct CapacitySignal {
 ///   - a window with `limit_reached` or utilization >= the hard-block threshold
 ///     sets `quota_exhausted_until` to its reset, or to a local re-probe horizon
 ///     when no reset was reported, on its matching capacity (a hard block until
-///     that local retry point), worst/latest-wins across windows.
+///     that local retry point), worst/latest-wins across windows;
+///   - granted/subscription spend pools apply only provider-wide: the producer does
+///     not document pool draw order, so routing never targets an individual pool;
+///     a non-derived empty balance walls through the same no-reset re-probe path,
+///     while a `derived` balance contributes pacing only.
 /// Fresh soft pressure REPLACES any older stored pressure on `by_capacity`, so a
 /// recovered provider can become cheaper again as soon as a new window is fetched.
 /// Hard exhaustion still keeps the WORST/LATEST reset, because a confirmed future
@@ -228,7 +338,7 @@ pub fn merge_quota_overlay_with(
     // one exhausted account (of anthropic's four) walled the whole provider
     // while its siblings sat at 5% (live 2026-08-10: opus-5 rejected
     // quota_exhausted off one 99% weekly account beside three nearly-free).
-    let mut signals: HashMap<(String, String), HashMap<String, CapacitySignal>> = HashMap::new();
+    let mut signals: AccountSignals = HashMap::new();
 
     for entry in windows {
         if !entry.is_healthy() {
@@ -253,6 +363,10 @@ pub fn merge_quota_overlay_with(
         let provider_caps = caps_by_provider.get(provider_id).unwrap_or(&empty);
         let extracted = extract_windows(entry, provider_id, &entry.provider, provider_caps);
 
+        let account_key = (
+            provider_id.clone(),
+            entry.account.clone().unwrap_or_default(),
+        );
         for win in extracted {
             if win.resets_at.is_some_and(|resets_at| resets_at <= now_ms) {
                 continue; // an explicitly past reset is no longer in force
@@ -277,32 +391,52 @@ pub fn merge_quota_overlay_with(
                     win.applies_key.clone().into_iter().collect()
                 }
             };
-            let account_key = (
-                provider_id.clone(),
-                entry.account.clone().unwrap_or_default(),
+            record_capacity_signal(
+                &mut signals,
+                &account_key,
+                &targets,
+                pace.pressure,
+                blocked.then(|| {
+                    win.resets_at
+                        .unwrap_or(now_ms + NO_RESET_REPROBE_HORIZON_MS)
+                }),
             );
-            for cap in targets {
-                let sig = signals
-                    .entry(account_key.clone())
-                    .or_default()
-                    .entry(cap)
-                    .or_default();
-                // WITHIN one account, worst window wins (an account is as
-                // constrained as its tightest live window).
-                sig.pressure = Some(match sig.pressure {
-                    Some(p) => p.max(pace.pressure),
-                    None => pace.pressure,
-                });
-                if blocked {
-                    let exhausted_until = win
-                        .resets_at
-                        .unwrap_or(now_ms + NO_RESET_REPROBE_HORIZON_MS);
-                    sig.exhausted_until = Some(match sig.exhausted_until {
-                        Some(e) => e.max(exhausted_until),
-                        None => exhausted_until,
-                    });
-                }
+        }
+
+        for pool in &entry.spend {
+            if !pool.has_supported_funding() {
+                continue;
             }
+            // A derived remainder is a ceiling rather than an authoritative account
+            // balance. It can raise soft pressure, but must never manufacture a wall.
+            let exhausted_until = (pool.remaining.is_non_positive() && pool.basis != "derived")
+                .then_some(now_ms + NO_RESET_REPROBE_HORIZON_MS);
+            if !pool.can_inform_pacing() && exhausted_until.is_none() {
+                continue;
+            }
+            let pressure = if pool.can_inform_pacing() {
+                project_quota_pressure(
+                    PaceInput {
+                        utilization: pool.utilization(),
+                        resets_at: None,
+                        window_ms: None,
+                        observed_at: now_ms,
+                    },
+                    pace_config,
+                )
+                .pressure
+            } else {
+                0.0
+            };
+            // The provider chooses its own draw order, so every pool remains scoped
+            // to the provider's capacities rather than a pool-selected model route.
+            record_capacity_signal(
+                &mut signals,
+                &account_key,
+                provider_caps,
+                pressure,
+                exhausted_until,
+            );
         }
     }
 

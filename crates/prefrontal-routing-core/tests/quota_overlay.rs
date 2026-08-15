@@ -14,7 +14,9 @@ use prefrontal_routing_core::quota::{
     NO_RESET_REPROBE_HORIZON_MS,
 };
 use prefrontal_routing_core::quota_pace::DEFAULT_PACE_CONFIG;
-use prefrontal_routing_core::{make_capacity_key, make_route_key, ModelRequirements};
+use prefrontal_routing_core::{
+    extract_windows, make_capacity_key, make_route_key, ModelRequirements,
+};
 
 const NOW: f64 = 1_000_000.0;
 
@@ -479,4 +481,164 @@ fn wall_ms_for(rfc3339: &str) -> f64 {
         .get(&make_capacity_key("zzz-probe", "probe-model"))
         .and_then(|s| s.quota_exhausted_until)
         .expect("probe wall present")
+}
+
+#[test]
+fn spend_pools_decode_additively_and_unknown_funding_cannot_spend() {
+    let entry = usage_from_json(serde_json::json!({
+        "provider": "balance-provider",
+        "futureProviderField": { "kept": "opaque" },
+        "usage": {},
+        "spend": [
+            {
+                "id": "future-fund",
+                "label": "Future fund",
+                "funding": "issuer_credit_v2",
+                "remaining": { "minor": 100, "exponent": 2, "unit": "USD" },
+                "total": { "minor": 100, "exponent": 2, "unit": "USD" },
+                "basis": "reported",
+                "spendable": true,
+                "futurePoolField": true
+            },
+            {
+                "id": "subscription",
+                "label": "Subscription",
+                "funding": "subscription",
+                "remaining": { "minor": 100, "exponent": 2, "unit": "USD" },
+                "total": { "minor": 100, "exponent": 2, "unit": "USD" },
+                "basis": "reported",
+                "spendable": true
+            }
+        ]
+    }));
+
+    assert!(
+        entry.is_healthy(),
+        "reported pools are a valid quota response"
+    );
+    assert_eq!(entry.spend[0].funding, "issuer_credit_v2");
+    assert_eq!(entry.spend[0].basis, "reported");
+    assert!(
+        !entry.spend[0].is_routing_spendable(),
+        "unknown funding must remain not-granted-do-not-spend"
+    );
+    assert!(entry.spend[1].is_routing_spendable());
+}
+
+#[test]
+fn windowless_usage_with_empty_balance_pool_walls_without_reset() {
+    let facts = vec![fact("balance-provider", "budget-model", 1.0)];
+    let entry = usage_from_json(serde_json::json!({
+        "provider": "balance-wire",
+        "apiProvider": "balance-provider",
+        "usage": {},
+        "spend": [{
+            "id": "subscription",
+            "label": "Subscription balance",
+            "funding": "subscription",
+            "remaining": { "minor": 0, "exponent": 2, "unit": "USD" },
+            "total": { "minor": 100, "exponent": 2, "unit": "USD" },
+            "basis": "reported",
+            "spendable": true
+        }]
+    }));
+
+    assert!(
+        extract_windows(&entry, "balance-provider", "balance-wire", &[]).is_empty(),
+        "usage={{}} stays no-signal for the rate-window arm even when spend is present"
+    );
+    let snap = overlay(&[entry], &facts, &HashMap::new());
+    let state = snap
+        .by_capacity
+        .get(&make_capacity_key("balance-provider", "budget-model"))
+        .expect("the spend-pool arm contributes a provider-scoped signal");
+    assert_eq!(
+        state.quota_exhausted_until,
+        Some(NOW + NO_RESET_REPROBE_HORIZON_MS),
+        "an actual empty balance has no provider reset and must wall through the no-reset path"
+    );
+    assert!(
+        state.quota_pressure.is_some(),
+        "the same pool contributes soft pacing alongside its wall"
+    );
+}
+
+#[test]
+fn balance_only_positive_pool_keeps_provider_servable() {
+    let facts = vec![fact("balance-provider", "budget-model", 1.0)];
+    let entry = usage_from_json(serde_json::json!({
+        "provider": "balance-wire",
+        "apiProvider": "balance-provider",
+        "usage": {},
+        "spend": [{
+            "id": "grant",
+            "label": "Grant balance",
+            "funding": "granted",
+            "remaining": { "minor": 10, "exponent": 2, "unit": "USD" },
+            "total": { "minor": 100, "exponent": 2, "unit": "USD" },
+            "basis": "reported",
+            "spendable": true
+        }]
+    }));
+    let snap = overlay(&[entry], &facts, &HashMap::new());
+    let cap = make_capacity_key("balance-provider", "budget-model");
+    assert!(
+        snap.by_capacity[&cap].quota_exhausted_until.is_none(),
+        "a positive balance must not be walled"
+    );
+    assert!(
+        snap.by_capacity[&cap].quota_pressure.is_some(),
+        "the remaining-to-total ratio supplies a best-effort pacing signal"
+    );
+
+    let available = std::collections::HashSet::from([
+        make_route_key("balance-provider", "budget-model", None),
+        cap,
+    ]);
+    let selected = select_model_route(SelectModelRouteInput {
+        target_agent: "mason".into(),
+        requirements: ModelRequirements { iq: 80.0, eq: 20.0 },
+        available_models: available,
+        facts,
+        runtime_snapshot: Some(snap),
+        exclude_route_keys: Vec::new(),
+        prefer_fast_specs: Vec::new(),
+        required_capabilities: None,
+        is_subscription_route: None,
+        min_best_effort_adequacy: None,
+        prefer_prompt_cache: false,
+        providers_without_prompt_cache: std::collections::HashSet::new(),
+    })
+    .expect("a positive balance-only provider remains selectable");
+    assert_eq!(selected.model.provider_id, "balance-provider");
+}
+
+#[test]
+fn derived_pool_remainder_can_pace_but_never_walls() {
+    let facts = vec![fact("balance-provider", "budget-model", 1.0)];
+    let entry = usage_from_json(serde_json::json!({
+        "provider": "balance-wire",
+        "apiProvider": "balance-provider",
+        "usage": {},
+        "spend": [{
+            "id": "derived-ceiling",
+            "label": "Derived ceiling",
+            "funding": "subscription",
+            "remaining": { "minor": 0, "exponent": 2, "unit": "USD" },
+            "total": { "minor": 100, "exponent": 2, "unit": "USD" },
+            "basis": "derived",
+            "spendable": true
+        }]
+    }));
+    let snap = overlay(&[entry], &facts, &HashMap::new());
+    let state = &snap.by_capacity[&make_capacity_key("balance-provider", "budget-model")];
+
+    assert!(
+        state.quota_pressure.is_some_and(|pressure| pressure > 0.0),
+        "the derived ceiling may still inform pacing"
+    );
+    assert!(
+        state.quota_exhausted_until.is_none(),
+        "derived balance data must never create a hard exhaustion wall"
+    );
 }

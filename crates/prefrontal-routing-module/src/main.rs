@@ -18,7 +18,7 @@ mod config_overrides;
 mod quota_consumer;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     error::Error,
     ffi::OsString,
     fmt,
@@ -210,7 +210,24 @@ fn merge_quota_windows(
     *existing = merged;
 }
 
+fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
+    let unknown: BTreeSet<&str> = fresh
+        .iter()
+        .flat_map(|entry| entry.spend.iter())
+        .filter(|pool| !pool.has_supported_funding())
+        .map(|pool| pool.funding.as_str())
+        .collect();
+    if !unknown.is_empty() {
+        eprintln!(
+            "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {unknown:?}"
+        );
+    }
+}
+
 fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observed_at_ms: u64) {
+    // Insula extends funding additively. Report unsupported values once per poll,
+    // while the core policy treats each corresponding pool as not granted.
+    log_unknown_spend_funding(&fresh);
     // Freshness keys on the same resolved id the overlay keys on: the published
     // canonical slug first, wire name as fallback. Keying this map on the wire
     // name alone while the overlay resolves via apiProvider would mark a
@@ -3058,6 +3075,35 @@ mod tests {
             Some(88.0)
         );
         assert!(retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+    }
+
+    #[test]
+    fn pool_only_refresh_is_retained_as_a_live_quota_signal() {
+        let mut cache = QuotaCache::default();
+        let pool_only = usage(serde_json::json!({
+            "provider": "balance-wire",
+            "apiProvider": "balance-provider",
+            "usage": {},
+            "spend": [{
+                "id": "subscription",
+                "label": "Subscription balance",
+                "funding": "subscription",
+                "remaining": { "minor": 20, "exponent": 2, "unit": "USD" },
+                "total": { "minor": 100, "exponent": 2, "unit": "USD" },
+                "basis": "reported",
+                "spendable": true
+            }]
+        }));
+
+        apply_quota_refresh(&mut cache, vec![pool_only], 10);
+
+        assert_eq!(cache.windows.len(), 1);
+        assert_eq!(cache.windows[0].provider, "balance-wire");
+        assert_eq!(
+            cache.provider_observed_at_ms.get("balance-provider"),
+            Some(&10),
+            "pool-only entries are successful quota observations, not degraded usage={{}}"
+        );
     }
 
     #[test]
