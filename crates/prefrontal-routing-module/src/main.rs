@@ -161,17 +161,20 @@ fn merge_quota_windows(
     for window in existing.drain(..) {
         let key = quota_cache_key(&window);
         if let Some(replacement) = fresh_by_key.remove(&key) {
-            // credential_absent will not self-recover: nobody configured the
-            // credential on this host, so a retained "last healthy" window is a
-            // fiction that can only mislead (the entry is not in trouble, it does
-            // not exist here). Drop retention for that class and take the degraded
-            // entry as the truth. Every other class keeps retention: decode_failed
+            // Two classes will not self-recover, so a retained "last healthy"
+            // window is a fiction that can only mislead: credential_absent
+            // (nobody configured the credential on this host) and
+            // credential_unusable (QTA 2026-08-15: a revoked OAuth grant -
+            // Google answers invalid_grant, permanent under RFC 6749, only a
+            // re-authorisation recovers it; before QTA's classifier fix this
+            // state stale-served forever and looked like a live provider with
+            // old data). Drop retention for both and take the degraded entry
+            // as the truth. Every other class keeps retention: decode_failed
             // self-recovers, upstream/rejected age out via the freshness map.
-            let absent_credential = replacement
-                .error_class
-                .as_deref()
-                .is_some_and(|class| class == "credential_absent");
-            if window.is_healthy() && !replacement.is_healthy() && !absent_credential {
+            let dead_credential = replacement.error_class.as_deref().is_some_and(|class| {
+                class == "credential_absent" || class == "credential_unusable"
+            });
+            if window.is_healthy() && !replacement.is_healthy() && !dead_credential {
                 if retained_degraded_keys.insert(key.clone()) {
                     let reason = replacement
                         .error
@@ -3022,6 +3025,40 @@ mod tests {
             Some(97.0)
         );
         assert!(retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+    }
+
+    #[test]
+    fn credential_unusable_class_drops_retention_like_absent() {
+        // A revoked OAuth grant (QTA maps Google's invalid_grant here, RFC 6749
+        // permanent) never self-recovers; retaining the last healthy window
+        // would keep routing to a dead account. Mutation: remove the class from
+        // the dead-credential set and this reddens by name.
+        let mut cached = vec![usage(serde_json::json!({
+            "provider": "gemini",
+            "usage": { "primary": { "usedPercent": 12.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }))];
+        let fresh = vec![usage(serde_json::json!({
+            "provider": "gemini",
+            "error": "invalid_grant: token revoked",
+            "errorClass": "credential_unusable"
+        }))];
+        let mut retained_degraded_keys = HashSet::new();
+
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+
+        assert_eq!(cached.len(), 1);
+        assert!(
+            cached[0].error.is_some(),
+            "degraded credential_unusable entry replaces the stale healthy window"
+        );
+        assert_eq!(
+            cached[0].error_class.as_deref(),
+            Some("credential_unusable")
+        );
+        assert!(
+            retained_degraded_keys.is_empty(),
+            "no retention record for a revoked account"
+        );
     }
 
     #[test]
