@@ -48,6 +48,7 @@ use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
 use serde::Deserialize;
 use serde_json::json;
+use subc_protocol::manifest::Concurrency;
 use subc_protocol::{
     manifest::{
         Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
@@ -2509,6 +2510,7 @@ async fn send_route_error(
     let body = serde_json::to_vec(&ErrorBody {
         code: code.to_string(),
         message: message.to_string(),
+        detail: None,
     })
     .map_err(ModuleError::Json)?;
     let frame = Frame::build_with_version(
@@ -2547,6 +2549,10 @@ fn manifest(module_id: &str) -> ModuleManifest {
         protocol_ver: PROTOCOL_VERSION,
         trust_tier: TrustTier::FirstParty,
         provides: vec![ProviderRole::ManagementSurface {
+            // Deliberate lane, not a default: routing serves concurrent
+            // selection reads; Serial would put every route decision in
+            // one queue.
+            concurrency: Concurrency::ModuleManaged,
             operations: vec![
                 // route.select is now a MUTATE: it records the decision it returns.
                 ManagementOperation {
