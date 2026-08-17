@@ -830,6 +830,10 @@ struct SelectParams {
     task_id: Option<String>,
     #[serde(default, alias = "parentSessionID")]
     parent_session_id: Option<String>,
+    /// The caller may provide a launch attempt id before selection; otherwise it
+    /// remains null because the router never invents a send correlation.
+    #[serde(default, rename = "sendID")]
+    send_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -933,6 +937,8 @@ struct SelectPanelParams {
     task_id: Option<String>,
     #[serde(default)]
     parent_session_id: Option<String>,
+    #[serde(default, rename = "sendID")]
+    send_id: Option<String>,
 }
 
 fn default_target_agent() -> String {
@@ -1403,6 +1409,75 @@ struct PreparedSelectionInputs {
     facts: Vec<ModelFact>,
     snapshot: ModelRouteStateSnapshot,
     fresh_quota_provider_ids: HashSet<String>,
+    quota_signal_json: String,
+}
+
+#[derive(Clone)]
+struct DecisionProvenance {
+    quota_signal_json: String,
+    policy_revision: String,
+}
+
+/// Summarize the cached overlay that the scorer consumed without serializing the
+/// full quota response. A no-signal marker is explicit so it cannot be confused
+/// with old rows written before the provenance columns existed.
+fn quota_signal_json(
+    snapshot: &ModelRouteStateSnapshot,
+    windows: &[ProviderUsage],
+    available: bool,
+    refreshed_at_ms: u64,
+    retained_degraded_count: usize,
+    last_error: Option<&str>,
+) -> String {
+    let mut signals: Vec<serde_json::Value> = snapshot
+        .by_capacity
+        .iter()
+        .filter(|(_, state)| {
+            state.quota_pressure.is_some() || state.quota_exhausted_until.is_some()
+        })
+        .map(|(capacity_key, state)| {
+            json!({
+                "capacityKey": capacity_key,
+                "pressure": state.quota_pressure,
+                "exhaustedUntil": state.quota_exhausted_until,
+            })
+        })
+        .collect();
+    signals.sort_by(|left, right| {
+        left["capacityKey"]
+            .as_str()
+            .cmp(&right["capacityKey"].as_str())
+    });
+
+    let healthy_provider_count = windows.iter().filter(|window| window.is_healthy()).count();
+    let summary = if healthy_provider_count == 0 {
+        let reason = if windows.is_empty() {
+            "quota signal: none (no cached readings)"
+        } else if last_error.is_some() {
+            "quota signal: none (refresh unavailable)"
+        } else {
+            "quota signal: none (no usable readings)"
+        };
+        json!({
+            "state": "none",
+            "reason": reason,
+            "available": available,
+            "refreshedAtMs": refreshed_at_ms,
+            "lastError": last_error,
+        })
+    } else {
+        json!({
+            "state": "present",
+            "available": available,
+            "refreshedAtMs": refreshed_at_ms,
+            "healthyProviderCount": healthy_provider_count,
+            "retainedDegradedCount": retained_degraded_count,
+            "signals": signals,
+        })
+    };
+    serde_json::to_string(&summary).unwrap_or_else(|_| {
+        r#"{"state":"none","reason":"quota signal: serialization failed"}"#.to_string()
+    })
 }
 
 /// Read one consistent store/cache view for every selection operation. Quota
@@ -1421,12 +1496,30 @@ fn prepare_selection_inputs(
         .map_err(|e| format!("building route-state snapshot: {e}"))?;
     // Retain cached windows even while the quota source is unavailable. Dropping
     // last-known pressure would make a transient outage look optimistically free.
-    let (quota_windows, provider_observed_at_ms) = match quota_cache.lock() {
-        Ok(guard) if !guard.windows.is_empty() => (
-            Some(guard.windows.clone()),
+    let (
+        quota_windows,
+        provider_observed_at_ms,
+        quota_available,
+        quota_refreshed_at_ms,
+        retained_degraded_count,
+        quota_last_error,
+    ) = match quota_cache.lock() {
+        Ok(guard) => (
+            (!guard.windows.is_empty()).then(|| guard.windows.clone()),
             guard.provider_observed_at_ms.clone(),
+            guard.available,
+            guard.refreshed_at_ms,
+            guard.retained_degraded_keys.len(),
+            guard.last_error.clone(),
         ),
-        _ => (None, HashMap::new()),
+        Err(_) => (
+            None,
+            HashMap::new(),
+            false,
+            0,
+            0,
+            Some("cache poisoned".into()),
+        ),
     };
     if let Some(windows) = &quota_windows {
         merge_quota_overlay(&mut snapshot, windows, &facts, quota_name_map());
@@ -1446,11 +1539,20 @@ fn prepare_selection_inputs(
             quota_name_map().get(&key).cloned().or(Some(key))
         })
         .collect();
+    let quota_signal_json = quota_signal_json(
+        &snapshot,
+        quota_windows.as_deref().unwrap_or_default(),
+        quota_available,
+        quota_refreshed_at_ms,
+        retained_degraded_count,
+        quota_last_error.as_deref(),
+    );
     Ok(PreparedSelectionInputs {
         now,
         facts,
         snapshot,
         fresh_quota_provider_ids,
+        quota_signal_json,
     })
 }
 
@@ -1579,7 +1681,14 @@ async fn handle_select_request(
             let requirements = no_route
                 .requirements
                 .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
-            let decision = decision_input_for(&params.target_agent, &requirements, None, &params);
+            let decision = decision_input_for(
+                &params.target_agent,
+                &requirements,
+                None,
+                Some(&no_route),
+                &params,
+                None,
+            );
             let _ = store.record_decision(&decision);
             return send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
         }
@@ -1605,23 +1714,31 @@ async fn handle_select_request(
         mut facts,
         snapshot,
         fresh_quota_provider_ids,
+        quota_signal_json,
     } = match prepare_selection_inputs(quota_cache, store) {
         Ok(prepared) => prepared,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
         }
     };
-    let routing_config = match config_overrides::apply_live_selection_config(
+    let (routing_config, policy_revision) = match config_overrides::apply_live_selection_config(
         routing_config_path,
         &mut facts,
     ) {
-        Ok(outcome) => outcome.routing_config,
+        Ok(outcome) => (outcome.routing_config, outcome.policy_revision),
         Err(error) => {
             eprintln!(
                 "[prefrontal-routing] live Elo routing config reload failed (using defaults): {error}"
             );
-            DEFAULT_ROUTING_CONFIG
+            (
+                DEFAULT_ROUTING_CONFIG,
+                config_overrides::default_policy_revision(),
+            )
         }
+    };
+    let provenance = DecisionProvenance {
+        quota_signal_json,
+        policy_revision,
     };
 
     let subscription_keys: HashSet<String> = resolved_request
@@ -1757,8 +1874,14 @@ async fn handle_select_request(
     // no-selection row and surfaces the typed routing failure.
     match selection {
         Ok(selected) => {
-            let decision =
-                decision_input_for(&target_agent, &requirements, Some(&selected), &params);
+            let decision = decision_input_for(
+                &target_agent,
+                &requirements,
+                Some(&selected),
+                None,
+                &params,
+                Some(&provenance),
+            );
             match store.record_decision(&decision) {
                 Ok(decision_id) => {
                     let mut resolved_input = json!({
@@ -1805,7 +1928,14 @@ async fn handle_select_request(
         Err(no_route) => {
             // Best-effort failed-decision audit row (ignore a store error here: the
             // routing failure is the real result to surface).
-            let decision = decision_input_for(&target_agent, &requirements, None, &params);
+            let decision = decision_input_for(
+                &target_agent,
+                &requirements,
+                None,
+                Some(&no_route),
+                &params,
+                Some(&provenance),
+            );
             let _ = store.record_decision(&decision);
             send_no_route(writer, ver, channel, epoch, corr, &no_route).await
         }
@@ -1878,17 +2008,24 @@ async fn handle_select_panel(
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
         }
     };
-    let routing_config = match config_overrides::apply_live_selection_config(
+    let (routing_config, policy_revision) = match config_overrides::apply_live_selection_config(
         routing_config_path,
         &mut prepared.facts,
     ) {
-        Ok(outcome) => outcome.routing_config,
+        Ok(outcome) => (outcome.routing_config, outcome.policy_revision),
         Err(error) => {
             eprintln!(
                 "[prefrontal-routing] live Elo routing config reload failed (using defaults): {error}"
             );
-            DEFAULT_ROUTING_CONFIG
+            (
+                DEFAULT_ROUTING_CONFIG,
+                config_overrides::default_policy_revision(),
+            )
         }
+    };
+    let provenance = DecisionProvenance {
+        quota_signal_json: prepared.quota_signal_json.clone(),
+        policy_revision,
     };
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
@@ -1927,7 +2064,7 @@ async fn handle_select_panel(
                 .await;
         }
     };
-    let decision = panel_decision_input(&params, &panel);
+    let decision = panel_decision_input(&params, &panel, &provenance);
     let decision_id = match store.record_decision(&decision) {
         Ok(id) => id,
         Err(e) => {
@@ -1974,7 +2111,11 @@ async fn handle_select_panel(
     send(writer, response).await
 }
 
-fn panel_decision_input(params: &SelectPanelParams, panel: &SelectedPanel) -> DecisionInput {
+fn panel_decision_input(
+    params: &SelectPanelParams,
+    panel: &SelectedPanel,
+    provenance: &DecisionProvenance,
+) -> DecisionInput {
     let causes = panel
         .shortfall
         .as_ref()
@@ -2003,6 +2144,7 @@ fn panel_decision_input(params: &SelectPanelParams, panel: &SelectedPanel) -> De
         decision_kind: "panel".into(),
         task_id: params.task_id.clone(),
         parent_session_id: params.parent_session_id.clone(),
+        send_id: params.send_id.clone(),
         target_agent: "athena-panel".into(),
         requirements_json: serde_json::to_string(&params.panel_spec)
             .unwrap_or_else(|_| "null".into()),
@@ -2013,24 +2155,31 @@ fn panel_decision_input(params: &SelectPanelParams, panel: &SelectedPanel) -> De
         score_json: "null".into(),
         rejected_json: serde_json::to_string(causes).unwrap_or_else(|_| "[]".into()),
         explanation_json: Some(serde_json::to_string(&explanation).unwrap_or_else(|_| "{}".into())),
+        quota_signal_json: Some(provenance.quota_signal_json.clone()),
+        policy_revision: Some(provenance.policy_revision.clone()),
         anchor_version: ANCHOR_VERSION,
     }
 }
 
-/// Build the decision audit row from a selection (or a no-selection failure).
+/// Build the decision audit row from a selection or the refusal that prevented one.
 fn decision_input_for(
     target_agent: &str,
     requirements: &ModelRequirements,
     selected: Option<&SelectedModelRoute>,
+    no_route: Option<&NoRouteError>,
     params: &SelectParams,
+    provenance: Option<&DecisionProvenance>,
 ) -> DecisionInput {
     let requirements_json = serde_json::to_string(requirements).unwrap_or_else(|_| "null".into());
+    let quota_signal_json = provenance.map(|value| value.quota_signal_json.clone());
+    let policy_revision = provenance.map(|value| value.policy_revision.clone());
     match selected {
         Some(sel) => DecisionInput {
             decision_id: None,
             decision_kind: "single".into(),
             task_id: params.task_id.clone(),
             parent_session_id: params.parent_session_id.clone(),
+            send_id: params.send_id.clone(),
             target_agent: target_agent.to_string(),
             requirements_json,
             selected_route_key: Some(sel.route_key.clone()),
@@ -2042,24 +2191,41 @@ fn decision_input_for(
             explanation_json: Some(
                 serde_json::to_string(&sel.explanation).unwrap_or_else(|_| "[]".into()),
             ),
+            quota_signal_json,
+            policy_revision,
             anchor_version: ANCHOR_VERSION,
         },
-        None => DecisionInput {
-            decision_id: None,
-            decision_kind: "single".into(),
-            task_id: params.task_id.clone(),
-            parent_session_id: params.parent_session_id.clone(),
-            target_agent: target_agent.to_string(),
-            requirements_json,
-            selected_route_key: None,
-            selected_provider_id: None,
-            selected_model_id: None,
-            selected_variant: None,
-            score_json: "null".into(),
-            rejected_json: "[]".into(),
-            explanation_json: None,
-            anchor_version: ANCHOR_VERSION,
-        },
+        None => {
+            let failure = no_route.expect("a refusal decision must preserve its routing failure");
+            DecisionInput {
+                decision_id: None,
+                decision_kind: "single".into(),
+                task_id: params.task_id.clone(),
+                parent_session_id: params.parent_session_id.clone(),
+                send_id: params.send_id.clone(),
+                target_agent: target_agent.to_string(),
+                requirements_json,
+                selected_route_key: None,
+                selected_provider_id: None,
+                selected_model_id: None,
+                selected_variant: None,
+                score_json: "null".into(),
+                rejected_json: serde_json::to_string(&failure.rejected)
+                    .unwrap_or_else(|_| "[]".into()),
+                explanation_json: Some(
+                    serde_json::to_string(&json!({
+                        "failureReason": failure.reason.as_str(),
+                        "message": &failure.message,
+                        "bestRejected": failure.best_rejected.as_ref(),
+                        "earliestReset": failure.earliest_reset,
+                    }))
+                    .unwrap_or_else(|_| "{}".into()),
+                ),
+                quota_signal_json,
+                policy_revision,
+                anchor_version: ANCHOR_VERSION,
+            }
+        }
     }
 }
 
@@ -2895,7 +3061,7 @@ mod tests {
             prefrontal_routing_core::model_facts_seed()
                 .iter()
                 .all(|fact| !(fact.provider_id == "anthropic" && fact.model_id == "claude-opus-5")),
-            "NON-VACUITY BREAK: claude-opus-5 must remain absent from the frozen seed so this test proves the live store is authoritative"
+            "claude-opus-5 must remain absent from the frozen seed so this test proves the live store is authoritative"
         );
 
         let (response, _rig, _store) = run_select_panel_wire_request(
@@ -3249,6 +3415,206 @@ mod tests {
         .await
         .unwrap();
         (rx.recv().await.unwrap(), rig)
+    }
+
+    #[tokio::test]
+    async fn refusal_decision_row_carries_per_candidate_rejections() {
+        let rig = Rig::new("refusal-decision-evidence");
+        let store = Arc::new(rig.open_store());
+        let mut rejected = fact("p", "missing-vision");
+        rejected.supports_vision = Some(false);
+        store.upsert_fact(&rejected, FactSource::Override).unwrap();
+        let request = json!({
+            "method": ROUTE_SELECT_OP,
+            "params": {
+                "targetAgent": "mason",
+                "requirements": { "iq": 30, "eq": 0 },
+                "requiredCapabilities": { "vision": true },
+                "availableModels": ["p/missing-vision"],
+                "taskId": "refusal-evidence"
+            }
+        });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &Arc::new(Mutex::new(QuotaCache::default())),
+            &store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Error);
+
+        let decisions = store.get_decisions_for_task("refusal-evidence").unwrap();
+        assert_eq!(decisions.len(), 1);
+        let rejections: serde_json::Value =
+            serde_json::from_str(&decisions[0].rejected_json).unwrap();
+        let candidates = rejections
+            .as_array()
+            .expect("refusal rejections serialize as an array");
+        assert!(
+            !candidates.is_empty(),
+            "refusal preserves every candidate rejection"
+        );
+        let detailed = candidates
+            .iter()
+            .filter(|entry| entry["routeKey"].as_str().is_some())
+            .collect::<Vec<_>>();
+        assert!(!detailed.is_empty());
+        assert!(detailed
+            .iter()
+            .all(|entry| entry["reason"].as_str().is_some()));
+        let explanation: serde_json::Value =
+            serde_json::from_str(decisions[0].explanation_json.as_deref().unwrap()).unwrap();
+        assert!(explanation["failureReason"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn send_id_round_trips_launch_to_decision_row_or_stays_null_without_one() {
+        let route = fact("p", "send-id-route");
+        let (with_send, with_send_rig) = run_select_wire_request(
+            "send-id-present",
+            json!({
+                "targetAgent": "explore",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["p/send-id-route"],
+                "taskId": "send-id-present",
+                "sendID": "send-attempt-42"
+            }),
+            std::slice::from_ref(&route),
+        )
+        .await;
+        assert_eq!(with_send.header.ty, FrameType::Response);
+        assert_eq!(
+            with_send_rig
+                .open_store()
+                .get_decisions_for_task("send-id-present")
+                .unwrap()[0]
+                .send_id
+                .as_deref(),
+            Some("send-attempt-42")
+        );
+
+        let (without_send, without_send_rig) = run_select_wire_request(
+            "send-id-absent",
+            json!({
+                "targetAgent": "explore",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["p/send-id-route"],
+                "taskId": "send-id-absent"
+            }),
+            &[route],
+        )
+        .await;
+        assert_eq!(without_send.header.ty, FrameType::Response);
+        assert_eq!(
+            without_send_rig
+                .open_store()
+                .get_decisions_for_task("send-id-absent")
+                .unwrap()[0]
+                .send_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_rows_record_quota_signal_state_and_policy_revision() {
+        let route = fact("p", "quota-none");
+        let (none_response, none_rig) = run_select_wire_request(
+            "quota-none-provenance",
+            json!({
+                "targetAgent": "explore",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["p/quota-none"],
+                "taskId": "quota-none-provenance"
+            }),
+            std::slice::from_ref(&route),
+        )
+        .await;
+        assert_eq!(none_response.header.ty, FrameType::Response);
+        let none_row = none_rig
+            .open_store()
+            .get_decisions_for_task("quota-none-provenance")
+            .unwrap()
+            .remove(0);
+        let none_signal: serde_json::Value =
+            serde_json::from_str(none_row.quota_signal_json.as_deref().unwrap()).unwrap();
+        assert_eq!(none_signal["state"], "none");
+        assert!(none_signal["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("quota signal: none")));
+        assert!(none_row
+            .policy_revision
+            .as_deref()
+            .is_some_and(|revision| revision.starts_with("sha256:")));
+
+        let rig = Rig::new("quota-present-provenance");
+        let store = Arc::new(rig.open_store());
+        let quota_route = fact("openai", "quota-present");
+        store
+            .upsert_fact(&quota_route, FactSource::Override)
+            .unwrap();
+        let mut quota_cache = QuotaCache::default();
+        apply_quota_refresh(
+            &mut quota_cache,
+            vec![usage(json!({
+                "provider": "codex",
+                "usage": { "primary": { "usedPercent": 75.0, "resetsAt": "2099-01-01T00:00:00Z", "windowMinutes": 60 } }
+            }))],
+            now_ms(),
+        );
+        let request = json!({
+            "method": ROUTE_SELECT_OP,
+            "params": {
+                "targetAgent": "explore",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["openai/quota-present"],
+                "taskId": "quota-present-provenance"
+            }
+        });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &Arc::new(Mutex::new(quota_cache)),
+            &store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+        let present_row = store
+            .get_decisions_for_task("quota-present-provenance")
+            .unwrap()
+            .remove(0);
+        let present_signal: serde_json::Value =
+            serde_json::from_str(present_row.quota_signal_json.as_deref().unwrap()).unwrap();
+        assert_eq!(present_signal["state"], "present");
+        assert_eq!(present_signal["healthyProviderCount"], 1);
+        assert!(present_row.policy_revision.is_some());
     }
 
     #[tokio::test]
@@ -3682,7 +4048,11 @@ mod tests {
             shortfall: None,
             policy: Some(policy),
         };
-        let decision = panel_decision_input(&params, &panel);
+        let provenance = DecisionProvenance {
+            quota_signal_json: r#"{"state":"none","reason":"quota signal: none"}"#.into(),
+            policy_revision: "test-policy".into(),
+        };
+        let decision = panel_decision_input(&params, &panel, &provenance);
         let explanation: serde_json::Value =
             serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
         assert_eq!(explanation["selection"], "n_pick");

@@ -22,6 +22,7 @@ use prefrontal_routing_core::{
     DEFAULT_DEMAND_EXPONENT,
 };
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
@@ -335,6 +336,20 @@ pub struct SelectionOverrideOutcome {
     pub routing_config: RoutingConfig,
     pub applied: usize,
     pub unknown_keys: Vec<String>,
+    /// SHA-256 of the live policy document whose selection settings were applied.
+    pub policy_revision: String,
+}
+
+/// The reproducible identifier for selection that intentionally used built-in defaults.
+pub fn default_policy_revision() -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("model-routing-default:{DEFAULT_DEMAND_EXPONENT}").as_bytes())
+    )
+}
+
+fn policy_revision(document: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(document.as_bytes()))
 }
 
 /// Re-read request-time Elo settings and apply known route overrides to this
@@ -351,6 +366,7 @@ pub fn apply_live_selection_config(
                 routing_config: RoutingConfig::default(),
                 applied: 0,
                 unknown_keys: Vec::new(),
+                policy_revision: default_policy_revision(),
             });
         }
         Err(error) => return Err(format!("reading {}: {error}", path.display())),
@@ -406,6 +422,7 @@ pub fn apply_live_selection_config(
         },
         applied,
         unknown_keys,
+        policy_revision: policy_revision(&doc),
     })
 }
 

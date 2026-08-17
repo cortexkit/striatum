@@ -99,11 +99,13 @@ const MIGRATION_025: &str = include_str!("../migrations/025_known_vision_capabil
 /// Migration 26: Grok 4.6 catalog fact (Ufuk curation, elo 1798, xhigh default).
 const MIGRATION_026: &str = include_str!("../migrations/026_grok_46.sql");
 const MIGRATION_027: &str = include_str!("../migrations/027_gemini_37_flash.sql");
+/// Migration 28: persist decision-to-send correlation and selection provenance.
+const MIGRATION_028: &str = include_str!("../migrations/028_decision_ledger_provenance.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 27] {
+fn route_state_migrations() -> [Migration; 28] {
     [
         Migration {
             version: 1,
@@ -212,6 +214,10 @@ fn route_state_migrations() -> [Migration; 27] {
         Migration {
             version: 27,
             statements: MIGRATION_027,
+        },
+        Migration {
+            version: 28,
+            statements: MIGRATION_028,
         },
     ]
 }
@@ -852,15 +858,17 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 c.execute(
                     "INSERT INTO model_route_decisions (
-                       id, decision_kind, task_id, parent_session_id, target_agent, requirements_json,
-                       selected_route_key, selected_provider_id, selected_model_id, selected_variant,
-                       score_json, rejected_json, explanation_json, anchor_version, created_at
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                       id, decision_kind, task_id, parent_session_id, send_id, target_agent,
+                       requirements_json, selected_route_key, selected_provider_id, selected_model_id,
+                       selected_variant, score_json, rejected_json, explanation_json,
+                       quota_signal_json, policy_revision, anchor_version, created_at
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
                         input.task_id,
                         input.parent_session_id,
+                        input.send_id,
                         input.target_agent,
                         input.requirements_json,
                         input.selected_route_key,
@@ -870,6 +878,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                         input.score_json,
                         rejected_json,
                         input.explanation_json,
+                        input.quota_signal_json,
+                        input.policy_revision,
                         input.anchor_version,
                         now_ms(),
                     ],
@@ -900,18 +910,25 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let mut stmt = c.prepare(
-                    "SELECT id, decision_kind, task_id, target_agent, selected_route_key, outcome, created_at
-                     FROM model_route_decisions WHERE task_id=?1 ORDER BY created_at",
+                    "SELECT id, decision_kind, task_id, send_id, target_agent, selected_route_key,
+                             rejected_json, explanation_json, quota_signal_json, policy_revision,
+                             outcome, created_at
+                      FROM model_route_decisions WHERE task_id=?1 ORDER BY created_at",
                 )?;
                 let rows = stmt.query_map([task_id], |r| {
                     Ok(DecisionRow {
                         id: r.get(0)?,
                         decision_kind: r.get(1)?,
                         task_id: r.get(2)?,
-                        target_agent: r.get(3)?,
-                        selected_route_key: r.get(4)?,
-                        outcome: r.get(5)?,
-                        created_at: r.get(6)?,
+                        send_id: r.get(3)?,
+                        target_agent: r.get(4)?,
+                        selected_route_key: r.get(5)?,
+                        rejected_json: r.get(6)?,
+                        explanation_json: r.get(7)?,
+                        quota_signal_json: r.get(8)?,
+                        policy_revision: r.get(9)?,
+                        outcome: r.get(10)?,
+                        created_at: r.get(11)?,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()

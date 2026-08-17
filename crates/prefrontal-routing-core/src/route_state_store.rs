@@ -107,6 +107,8 @@ pub struct DecisionInput {
     pub decision_kind: String,
     pub task_id: Option<String>,
     pub parent_session_id: Option<String>,
+    /// Caller-provided launch attempt id. A decision without an execution keeps this null.
+    pub send_id: Option<String>,
     pub target_agent: String,
     pub requirements_json: String,
     pub selected_route_key: Option<String>,
@@ -116,6 +118,10 @@ pub struct DecisionInput {
     pub score_json: String,
     pub rejected_json: String,
     pub explanation_json: Option<String>,
+    /// Compact summary of the quota overlay consumed during selection.
+    pub quota_signal_json: Option<String>,
+    /// Digest or named fallback revision of the selection configuration actually applied.
+    pub policy_revision: Option<String>,
     pub anchor_version: u32,
 }
 
@@ -125,8 +131,13 @@ pub struct DecisionRow {
     pub id: String,
     pub decision_kind: String,
     pub task_id: Option<String>,
+    pub send_id: Option<String>,
     pub target_agent: String,
     pub selected_route_key: Option<String>,
+    pub rejected_json: String,
+    pub explanation_json: Option<String>,
+    pub quota_signal_json: Option<String>,
+    pub policy_revision: Option<String>,
     pub outcome: Option<String>,
     pub created_at: f64,
 }
