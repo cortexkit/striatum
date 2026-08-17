@@ -9,6 +9,8 @@
 
 use serde::Deserialize;
 
+use crate::quota_pace::ProviderWindowModel;
+
 /// One rate-limit window: how much of a quota pool is spent and when it resets.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +25,10 @@ pub struct RateWindow {
     /// Window length in minutes. Omitted when the provider does not report one.
     #[serde(default)]
     pub window_minutes: Option<i64>,
+    /// Explicit provider semantics. A rolling value is rejected by pace projection
+    /// until routing has a model that can account for a moving recovery horizon.
+    #[serde(default, alias = "windowType")]
+    pub window_model: Option<ProviderWindowModel>,
 }
 
 /// A per-model window bundled under one account (e.g. Antigravity's Geminis).
@@ -220,7 +226,9 @@ use std::collections::HashMap;
 use crate::model_facts::{make_capacity_key, ModelFact};
 use crate::model_router::ModelRouteStateSnapshot;
 use crate::quota_extract::{extract_windows, WindowScopeKind};
-use crate::quota_pace::{project_quota_pressure, PaceConfig, PaceInput, DEFAULT_PACE_CONFIG};
+use crate::quota_pace::{
+    project_quota_pressure, PaceConfig, PaceError, PaceInput, PaceWindowModel, DEFAULT_PACE_CONFIG,
+};
 
 /// Hard-block threshold (utilization at/above which a window blocks routes until
 /// reset). Matches the plugin's `DEFAULT_HARD_BLOCK_THRESHOLD`.
@@ -236,6 +244,7 @@ pub const NO_RESET_REPROBE_HORIZON_MS: f64 = 6.0 * 60.0 * 60.0 * 1000.0;
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct CapacitySignal {
     pressure: Option<f64>,
+    window_model: Option<PaceWindowModel>,
     exhausted_until: Option<f64>,
 }
 
@@ -246,6 +255,7 @@ fn record_capacity_signal(
     account_key: &(String, String),
     targets: &[String],
     pressure: f64,
+    window_model: PaceWindowModel,
     exhausted_until: Option<f64>,
 ) {
     for cap in targets {
@@ -255,10 +265,10 @@ fn record_capacity_signal(
             .entry(cap.clone())
             .or_default();
         // Within one account, the tightest signal governs every capacity it covers.
-        sig.pressure = Some(match sig.pressure {
-            Some(existing) => existing.max(pressure),
-            None => pressure,
-        });
+        if sig.pressure.is_none_or(|existing| pressure > existing) {
+            sig.pressure = Some(pressure);
+            sig.window_model = Some(window_model);
+        }
         if let Some(exhausted_until) = exhausted_until {
             sig.exhausted_until = Some(match sig.exhausted_until {
                 Some(existing) => existing.max(exhausted_until),
@@ -378,15 +388,21 @@ pub fn merge_quota_overlay_with(
             if win.resets_at.is_some_and(|resets_at| resets_at <= now_ms) {
                 continue; // an explicitly past reset is no longer in force
             }
-            let pace = project_quota_pressure(
+            let pace = match project_quota_pressure(
                 PaceInput {
                     utilization: win.utilization,
                     resets_at: win.resets_at,
                     window_ms: win.window_ms,
                     observed_at: now_ms,
+                    provider_window_model: win.window_model,
                 },
                 pace_config,
-            );
+            ) {
+                Ok(pace) => pace,
+                // A producer has made the fixed-window premise explicitly false.
+                // Do not turn its rolling reset horizon into a confident projection.
+                Err(PaceError::RollingWindow) => continue,
+            };
             let blocked = win.limit_reached || win.utilization >= hard_block_threshold;
 
             // The capacities this window applies to.
@@ -403,6 +419,7 @@ pub fn merge_quota_overlay_with(
                 &account_key,
                 &targets,
                 pace.pressure,
+                pace.window_model,
                 blocked.then(|| {
                     win.resets_at
                         .unwrap_or(now_ms + NO_RESET_REPROBE_HORIZON_MS)
@@ -421,19 +438,21 @@ pub fn merge_quota_overlay_with(
             if !pool.can_inform_pacing() && exhausted_until.is_none() {
                 continue;
             }
-            let pressure = if pool.can_inform_pacing() {
-                project_quota_pressure(
+            let (pressure, window_model) = if pool.can_inform_pacing() {
+                let pace = project_quota_pressure(
                     PaceInput {
                         utilization: pool.utilization(),
                         resets_at: None,
                         window_ms: None,
                         observed_at: now_ms,
+                        provider_window_model: None,
                     },
                     pace_config,
                 )
-                .pressure
+                .expect("spend pools have utilization-only pacing semantics");
+                (pace.pressure, pace.window_model)
             } else {
-                0.0
+                (0.0, PaceWindowModel::UtilizationFallback)
             };
             // The provider chooses its own draw order, so every pool remains scoped
             // to the provider's capacities rather than a pool-selected model route.
@@ -442,6 +461,7 @@ pub fn merge_quota_overlay_with(
                 &account_key,
                 provider_caps,
                 pressure,
+                window_model,
                 exhausted_until,
             );
         }
@@ -452,15 +472,19 @@ pub fn merge_quota_overlay_with(
     // exhausted only when EVERY account holding a signal for it is exhausted,
     // recovering at the EARLIEST reset (the first account to free unblocks the
     // provider). One account's wall must never silence its siblings.
-    let mut folded: HashMap<String, (Option<f64>, Option<f64>, bool)> = HashMap::new();
+    let mut folded: HashMap<String, (Option<(f64, PaceWindowModel)>, Option<f64>, bool)> =
+        HashMap::new();
     for ((_, _account), caps) in &signals {
         for (cap, sig) in caps {
             let entry = folded.entry(cap.clone()).or_insert((None, None, true));
-            if let Some(p) = sig.pressure {
-                entry.0 = Some(match entry.0 {
-                    Some(existing) => existing.min(p),
-                    None => p,
-                });
+            if let Some(pressure) = sig.pressure {
+                if entry.0.is_none_or(|(existing, _)| pressure < existing) {
+                    entry.0 = Some((
+                        pressure,
+                        sig.window_model
+                            .unwrap_or(PaceWindowModel::UtilizationFallback),
+                    ));
+                }
             }
             match sig.exhausted_until {
                 Some(e) => {
@@ -479,8 +503,9 @@ pub fn merge_quota_overlay_with(
     // horizon against any existing stored state.
     for (cap, (pressure, earliest_wall, all_walled)) in folded {
         let state = snapshot.by_capacity.entry(cap).or_default();
-        if let Some(p) = pressure {
-            state.quota_pressure = Some(p);
+        if let Some((pressure, window_model)) = pressure {
+            state.quota_pressure = Some(pressure);
+            state.quota_window_model = Some(window_model);
         }
         if all_walled {
             if let Some(e) = earliest_wall {

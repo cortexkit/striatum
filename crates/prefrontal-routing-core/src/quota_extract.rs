@@ -11,6 +11,7 @@
 //! the per-model windows mapped to specific capacity keys instead.
 
 use crate::quota::{ProviderUsage, RateWindow};
+use crate::quota_pace::ProviderWindowModel;
 
 /// The routing scope a window applies to. `account` pressures every route of the
 /// provider; `capacity_key` pressures exactly one provider/model. (`model_family`
@@ -37,6 +38,8 @@ pub struct ExtractedWindow {
     pub resets_at: Option<f64>,
     /// `None` when the provider does not report a window length.
     pub window_ms: Option<f64>,
+    /// Explicit provider semantics, if the producer has started reporting them.
+    pub window_model: Option<ProviderWindowModel>,
     pub limit_reached: bool,
 }
 
@@ -85,6 +88,7 @@ fn rate_window_to_extracted(
         utilization,
         resets_at,
         window_ms: w.window_minutes.map(|m| m as f64 * 60_000.0),
+        window_model: w.window_model,
         limit_reached: false,
     })
 }
@@ -335,6 +339,7 @@ mod tests {
             used_percent: used,
             resets_at: Some(resets_at.into()),
             window_minutes: mins,
+            window_model: None,
         }
     }
 
@@ -394,6 +399,7 @@ mod tests {
                     used_percent: 100.0,
                     resets_at: None,
                     window_minutes: Some(10_080),
+                    window_model: None,
                 }),
                 secondary: None,
                 tertiary: None,
@@ -424,6 +430,7 @@ mod tests {
                     used_percent: 0.0,
                     resets_at: None,
                     window_minutes: Some(10_080),
+                    window_model: None,
                 }),
                 secondary: None,
                 tertiary: None,

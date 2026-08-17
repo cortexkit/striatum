@@ -9,6 +9,33 @@
 //! cached window ages). Output is a soft pressure 0..1 feeding the router's capped
 //! quota penalty; a 429 (Tier B) bypasses this and writes a hard cooldown.
 
+use serde::{Deserialize, Serialize};
+
+/// The pacing model recorded with a quota projection. `Fixed` means the projection
+/// used a reported reset and window length; `UtilizationFallback` names the path
+/// that deliberately avoids inventing a burn-rate horizon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaceWindowModel {
+    Fixed,
+    UtilizationFallback,
+}
+
+/// A provider's explicit window semantics. Providers currently omit this field;
+/// a rolling window must be refused until its different pacing math is modeled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderWindowModel {
+    Fixed,
+    Rolling,
+}
+
+/// A quota projection refused because its provider semantics are unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaceError {
+    RollingWindow,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaceInput {
     /// Window utilization 0..1 (parsers normalize provider %/100 to this).
@@ -21,6 +48,9 @@ pub struct PaceInput {
     pub window_ms: Option<f64>,
     /// When this sample was observed, ms epoch. Pace is measured from here.
     pub observed_at: f64,
+    /// An explicit provider discriminator. `Rolling` is rejected rather than
+    /// treating moving recovery time as a fixed-window reset horizon.
+    pub provider_window_model: Option<ProviderWindowModel>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -64,6 +94,8 @@ pub struct PaceResult {
     pub time_until_reset_ms: f64,
     /// true if projected to last until reset (or insufficient data).
     pub will_last_to_reset: bool,
+    /// Which pacing model produced this result; persisted with decision provenance.
+    pub window_model: PaceWindowModel,
     pub reason: PaceReason,
 }
 
@@ -92,28 +124,43 @@ pub fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
 
 /// Project quota pressure for a single window. Pure; every guard-table row is a
 /// required test case (mirrors quota-pace.test.ts).
-pub fn project_quota_pressure(input: PaceInput, config: &PaceConfig) -> PaceResult {
+pub fn project_quota_pressure(
+    input: PaceInput,
+    config: &PaceConfig,
+) -> Result<PaceResult, PaceError> {
     let PaceInput {
         utilization,
         resets_at,
         window_ms,
         observed_at,
+        provider_window_model,
     } = input;
+    if provider_window_model == Some(ProviderWindowModel::Rolling) {
+        return Err(PaceError::RollingWindow);
+    }
+
     let time_until_reset_ms = resets_at.map_or(f64::INFINITY, |reset| reset - observed_at);
     let actual = clamp01(utilization);
+    let has_window = resets_at.is_some() && matches!(window_ms, Some(w) if w > 0.0);
+    let window_model = if has_window {
+        PaceWindowModel::Fixed
+    } else {
+        PaceWindowModel::UtilizationFallback
+    };
 
     // Near-limit utilization floor (independent of pace).
     let floor = smoothstep(config.floor_start, config.hard_block_threshold, actual);
 
     // Guard: window expired or clock skew → almost certainly reset to ~0.
     if time_until_reset_ms <= config.skew_ms {
-        return PaceResult {
+        return Ok(PaceResult {
             pressure: 0.0,
             eta_ms: f64::INFINITY,
             time_until_reset_ms,
             will_last_to_reset: true,
+            window_model,
             reason: PaceReason::ExpiredOrSkew,
-        };
+        });
     }
 
     let remaining = (1.0 - actual).max(0.0);
@@ -121,7 +168,6 @@ pub fn project_quota_pressure(input: PaceInput, config: &PaceConfig) -> PaceResu
     // A missing reset gives us no recovery horizon, even when a nominal window
     // length is present. As with an unknown window length, use utilization only:
     // inventing a reset would turn an absent provider signal into false precision.
-    let has_window = resets_at.is_some() && matches!(window_ms, Some(w) if w > 0.0);
     if !has_window {
         let ramp = smoothstep(
             config.util_fallback_start,
@@ -129,35 +175,40 @@ pub fn project_quota_pressure(input: PaceInput, config: &PaceConfig) -> PaceResu
             actual,
         ) * config.util_fallback_max;
         let pressure = clamp01(ramp.max(floor));
-        return PaceResult {
+        return Ok(PaceResult {
             pressure,
             eta_ms: f64::INFINITY,
             time_until_reset_ms,
             will_last_to_reset: true,
+            window_model,
             reason: if pressure > 0.0 {
                 PaceReason::ProjectedShortfall
             } else {
                 PaceReason::InsufficientData
             },
-        };
+        });
     }
 
     let duration_ms = window_ms.unwrap();
+    // This derives elapsed time from a fixed start and fixed reset. A rolling or
+    // regenerating pool has no such elapsed span, so an explicit rolling signal
+    // was rejected above rather than producing a confident but invalid burn rate.
     let elapsed_ms = (duration_ms - time_until_reset_ms).clamp(0.0, duration_ms);
 
     // Guard: warmup / insufficient elapsed → don't trust rate yet. Floor still applies.
     if elapsed_ms <= config.min_elapsed_fraction * duration_ms {
-        return PaceResult {
+        return Ok(PaceResult {
             pressure: floor,
             eta_ms: f64::INFINITY,
             time_until_reset_ms,
             will_last_to_reset: true,
+            window_model,
             reason: if floor > 0.0 {
                 PaceReason::ProjectedShortfall
             } else {
                 PaceReason::InsufficientData
             },
-        };
+        });
     }
 
     let rate = actual / elapsed_ms; // utilization per ms
@@ -166,25 +217,27 @@ pub fn project_quota_pressure(input: PaceInput, config: &PaceConfig) -> PaceResu
     // Guard: not burning.
     if rate <= EPS {
         if remaining <= 0.0 {
-            return PaceResult {
+            return Ok(PaceResult {
                 pressure: 1.0,
                 eta_ms: 0.0,
                 time_until_reset_ms,
                 will_last_to_reset: false,
+                window_model,
                 reason: PaceReason::Exhausted,
-            };
+            });
         }
-        return PaceResult {
+        return Ok(PaceResult {
             pressure: floor,
             eta_ms: f64::INFINITY,
             time_until_reset_ms,
             will_last_to_reset: true,
+            window_model,
             reason: if floor > 0.0 {
                 PaceReason::ProjectedShortfall
             } else {
                 PaceReason::NotBurning
             },
-        };
+        });
     }
 
     let eta_ms = remaining / rate;
@@ -192,17 +245,18 @@ pub fn project_quota_pressure(input: PaceInput, config: &PaceConfig) -> PaceResu
 
     // On or ahead of pace → will last to reset → no pace pressure (floor may apply).
     if will_last_to_reset {
-        return PaceResult {
+        return Ok(PaceResult {
             pressure: floor,
             eta_ms,
             time_until_reset_ms,
             will_last_to_reset,
+            window_model,
             reason: if floor > 0.0 {
                 PaceReason::ProjectedShortfall
             } else {
                 PaceReason::OnTrackDeadband
             },
-        };
+        });
     }
 
     // Projected to deplete BEFORE reset. Pressure = lockout cost (reset − runout)
@@ -211,13 +265,14 @@ pub fn project_quota_pressure(input: PaceInput, config: &PaceConfig) -> PaceResu
     let lockout_pressure = clamp01(lockout_ms / config.pain_horizon_ms);
     let pressure = clamp01(lockout_pressure.max(floor));
 
-    PaceResult {
+    Ok(PaceResult {
         pressure,
         eta_ms,
         time_until_reset_ms,
         will_last_to_reset,
+        window_model,
         reason: PaceReason::ProjectedShortfall,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -244,9 +299,11 @@ mod tests {
                 resets_at: Some(1000.0),
                 window_ms: Some(18_000_000.0),
                 observed_at: 1000.0,
+                provider_window_model: None,
             },
             &C,
-        );
+        )
+        .expect("fixed and fallback pacing inputs are supported");
         assert_eq!(r.pressure, 0.0);
         assert_eq!(r.reason, PaceReason::ExpiredOrSkew);
     }
@@ -260,10 +317,13 @@ mod tests {
                 resets_at: Some(1_000_000.0),
                 window_ms: None,
                 observed_at: 0.0,
+                provider_window_model: None,
             },
             &C,
-        );
+        )
+        .expect("fixed and fallback pacing inputs are supported");
         assert_eq!(low.pressure, 0.0);
+        assert_eq!(low.window_model, PaceWindowModel::UtilizationFallback);
         // High utilization (past hard block) → ramp + floor near 1.
         let high = project_quota_pressure(
             PaceInput {
@@ -271,9 +331,11 @@ mod tests {
                 resets_at: Some(1_000_000.0),
                 window_ms: None,
                 observed_at: 0.0,
+                provider_window_model: None,
             },
             &C,
-        );
+        )
+        .expect("fixed and fallback pacing inputs are supported");
         assert!(high.pressure > 0.8, "got {}", high.pressure);
     }
 
@@ -285,9 +347,11 @@ mod tests {
                 resets_at: None,
                 window_ms: Some(7.0 * 24.0 * 60.0 * 60_000.0),
                 observed_at: 0.0,
+                provider_window_model: None,
             },
             &C,
-        );
+        )
+        .expect("fixed and fallback pacing inputs are supported");
 
         assert!(r.time_until_reset_ms.is_infinite());
         assert!(r.pressure > 0.8, "got {}", r.pressure);
@@ -307,10 +371,13 @@ mod tests {
                 resets_at: Some(resets_at),
                 window_ms: Some(seven_day),
                 observed_at: observed,
+                provider_window_model: None,
             },
             &C,
-        );
+        )
+        .expect("fixed and fallback pacing inputs are supported");
         assert!(!r.will_last_to_reset, "should project shortfall");
+        assert_eq!(r.window_model, PaceWindowModel::Fixed);
         assert!(
             r.pressure > 0.5,
             "long-window early depletion → high pressure, got {}",
@@ -331,9 +398,11 @@ mod tests {
                 resets_at: Some(resets_at),
                 window_ms: Some(five_hour),
                 observed_at: observed,
+                provider_window_model: None,
             },
             &C,
-        );
+        )
+        .expect("fixed and fallback pacing inputs are supported");
         // lockout is at most a few hours << 24h pain horizon → low pace pressure
         // (the near-limit floor at 0.9 may add a little, but well below a long window).
         assert!(
@@ -354,10 +423,28 @@ mod tests {
                 resets_at: Some(resets_at),
                 window_ms: Some(five_hour),
                 observed_at: 0.0,
+                provider_window_model: None,
+            },
+            &C,
+        )
+        .expect("fixed and fallback pacing inputs are supported");
+        assert_eq!(r.pressure, 0.0);
+        assert_eq!(r.reason, PaceReason::InsufficientData);
+    }
+
+    #[test]
+    fn rolling_window_semantics_are_rejected() {
+        let result = project_quota_pressure(
+            PaceInput {
+                utilization: 0.5,
+                resets_at: Some(1_000_000.0),
+                window_ms: Some(300_000.0),
+                observed_at: 0.0,
+                provider_window_model: Some(ProviderWindowModel::Rolling),
             },
             &C,
         );
-        assert_eq!(r.pressure, 0.0);
-        assert_eq!(r.reason, PaceReason::InsufficientData);
+
+        assert_eq!(result, Err(PaceError::RollingWindow));
     }
 }

@@ -51,6 +51,9 @@ fn effective_runtime(
         ),
         success_ema: by_route.success_ema.or(by_capacity.success_ema),
         quota_pressure: by_route.quota_pressure.or(by_capacity.quota_pressure),
+        quota_window_model: by_route
+            .quota_window_model
+            .or(by_capacity.quota_window_model),
         latency_ema_ms: by_route.latency_ema_ms.or(by_capacity.latency_ema_ms),
         governing_window: by_route.governing_window.or(by_capacity.governing_window),
     }

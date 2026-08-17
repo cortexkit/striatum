@@ -122,6 +122,8 @@ pub struct DecisionInput {
     pub quota_signal_json: Option<String>,
     /// Digest or named fallback revision of the selection configuration actually applied.
     pub policy_revision: Option<String>,
+    /// The live catalog fingerprint is stamped by the durable store at write time.
+    /// Callers do not supply it, so a decision cannot claim a stale fact generation.
     pub anchor_version: u32,
 }
 
@@ -138,6 +140,8 @@ pub struct DecisionRow {
     pub explanation_json: Option<String>,
     pub quota_signal_json: Option<String>,
     pub policy_revision: Option<String>,
+    /// NULL for decisions written before the catalog-generation migration.
+    pub catalog_fingerprint: Option<String>,
     pub outcome: Option<String>,
     pub created_at: f64,
 }

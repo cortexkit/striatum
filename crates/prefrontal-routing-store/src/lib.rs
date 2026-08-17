@@ -23,6 +23,7 @@ use prefrontal_routing_core::{
     USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -101,11 +102,13 @@ const MIGRATION_026: &str = include_str!("../migrations/026_grok_46.sql");
 const MIGRATION_027: &str = include_str!("../migrations/027_gemini_37_flash.sql");
 /// Migration 28: persist decision-to-send correlation and selection provenance.
 const MIGRATION_028: &str = include_str!("../migrations/028_decision_ledger_provenance.sql");
+/// Migration 29: catalog generation fingerprints stamped on new decision rows.
+const MIGRATION_029: &str = include_str!("../migrations/029_catalog_fingerprint.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 28] {
+fn route_state_migrations() -> [Migration; 29] {
     [
         Migration {
             version: 1,
@@ -219,6 +222,10 @@ fn route_state_migrations() -> [Migration; 28] {
             version: 28,
             statements: MIGRATION_028,
         },
+        Migration {
+            version: 29,
+            statements: MIGRATION_029,
+        },
     ]
 }
 
@@ -231,6 +238,53 @@ fn now_ms() -> i64 {
 
 fn err(e: impl std::fmt::Display) -> RouteStateStoreError {
     RouteStateStoreError(e.to_string())
+}
+
+#[derive(Serialize)]
+struct CatalogFingerprintRow {
+    route_key: String,
+    elo: f64,
+    eq: f64,
+    speed_multiplier: Option<f64>,
+    excluded: bool,
+}
+
+/// BLAKE3 over canonical catalog facts. Query ordering—not insertion ordering—is
+/// the generation contract, so a no-op reseed or shuffled input cannot mint a
+/// different fingerprint for the same scored catalog.
+fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<String> {
+    let mut statement = connection.prepare(
+        "SELECT route_key,
+                json_extract(scores_json, '$.elo') AS elo,
+                json_extract(scores_json, '$.eq') AS eq,
+                speed_multiplier,
+                excluded
+         FROM model_facts
+         ORDER BY route_key",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(CatalogFingerprintRow {
+            route_key: row.get(0)?,
+            elo: row.get(1)?,
+            eq: row.get(2)?,
+            speed_multiplier: row.get(3)?,
+            excluded: row.get::<_, i64>(4)? != 0,
+        })
+    })?;
+    let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let bytes = serde_json::to_vec(&rows)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let hex = blake3::hash(&bytes).to_hex().to_string();
+    Ok(hex[..16].to_string())
+}
+
+fn record_catalog_generation(connection: &Connection) -> rusqlite::Result<String> {
+    let fingerprint = calculate_catalog_fingerprint(connection)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO catalog_generation (fingerprint, created_at) VALUES (?1, ?2)",
+        params![fingerprint, now_ms()],
+    )?;
+    Ok(fingerprint)
 }
 
 /// Retain detailed rejected routes for the common case, then append one summary
@@ -290,13 +344,28 @@ impl SqliteRouteStateStore {
         store
             .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations())
             .map_err(err)?;
-        Ok(Self { store })
+        let route_store = Self { store };
+        route_store.refresh_catalog_generation()?;
+        Ok(route_store)
     }
 
     /// The single-writer fence epoch for this open (for diagnostics / future
     /// cloud-backend CAS).
     pub fn epoch(&self) -> u64 {
         self.store.epoch()
+    }
+
+    /// The fingerprint for the catalog currently available to routing decisions.
+    pub fn catalog_fingerprint(&self) -> RouteStateResult<String> {
+        self.store
+            .with_conn(|connection: &Connection| calculate_catalog_fingerprint(connection))
+            .map_err(err)
+    }
+
+    fn refresh_catalog_generation(&self) -> RouteStateResult<String> {
+        self.store
+            .with_conn(|connection: &Connection| record_catalog_generation(connection))
+            .map_err(err)
     }
 
     /// Aggregate each route's most-recent eligible usage samples in one query.
@@ -394,7 +463,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         prompt_defaults,
         confidence,
         notes: row.get::<_, Option<String>>("notes")?,
-        speed_multiplier: None,
+        speed_multiplier: row.get::<_, Option<f64>>("speed_multiplier")?,
         subscription_multiplier: None,
     })
 }
@@ -425,9 +494,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                     "INSERT INTO model_facts (
                        route_key, capacity_key, provider_id, model_id, variant, family,
                        scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
-                       supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, source,
-                       updated_at
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
+                        supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
+                        source, updated_at
+                      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
                      ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,
@@ -436,7 +505,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                        cost_per_mtok_out=excluded.cost_per_mtok_out,
                        supports_vision=excluded.supports_vision, supports_tool_use=excluded.supports_tool_use,
                        prompt_defaults_json=excluded.prompt_defaults_json, confidence=excluded.confidence,
-                       notes=excluded.notes, source=excluded.source, updated_at=excluded.updated_at",
+                        notes=excluded.notes, speed_multiplier=excluded.speed_multiplier,
+                        source=excluded.source, updated_at=excluded.updated_at",
                     params![
                         route.route_key,
                         route.capacity_key,
@@ -454,6 +524,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         prompt_defaults_json,
                         confidence_str(fact.confidence),
                         fact.notes,
+                        fact.speed_multiplier,
                         source.as_str(),
                         now_ms(),
                     ],
@@ -485,6 +556,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         now_ms(),
                     ],
                 )?;
+                record_catalog_generation(&tx)?;
                 tx.commit()
             })
             .map_err(err)
@@ -527,8 +599,10 @@ impl RouteStateStore for SqliteRouteStateStore {
     fn delete_fact(&self, route_key: &str) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
-                c.execute("DELETE FROM model_facts WHERE route_key = ?1", [route_key])?;
-                Ok(())
+                let tx = c.unchecked_transaction()?;
+                tx.execute("DELETE FROM model_facts WHERE route_key = ?1", [route_key])?;
+                record_catalog_generation(&tx)?;
+                tx.commit()
             })
             .map_err(err)
     }
@@ -539,11 +613,13 @@ impl RouteStateStore for SqliteRouteStateStore {
     fn demote_fact_source_to_seed(&self, route_key: &str) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
-                c.execute(
+                let tx = c.unchecked_transaction()?;
+                tx.execute(
                     "UPDATE model_facts SET source = 'seed' WHERE route_key = ?1",
                     [route_key],
                 )?;
-                Ok(())
+                record_catalog_generation(&tx)?;
+                tx.commit()
             })
             .map_err(err)
     }
@@ -856,13 +932,14 @@ impl RouteStateStore for SqliteRouteStateStore {
         let rejected_json = bound_rejected_json(&input.rejected_json);
         self.store
             .with_conn(|c: &Connection| {
+                let catalog_fingerprint = record_catalog_generation(c)?;
                 c.execute(
                     "INSERT INTO model_route_decisions (
-                       id, decision_kind, task_id, parent_session_id, send_id, target_agent,
-                       requirements_json, selected_route_key, selected_provider_id, selected_model_id,
-                       selected_variant, score_json, rejected_json, explanation_json,
-                       quota_signal_json, policy_revision, anchor_version, created_at
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                        id, decision_kind, task_id, parent_session_id, send_id, target_agent,
+                        requirements_json, selected_route_key, selected_provider_id, selected_model_id,
+                        selected_variant, score_json, rejected_json, explanation_json,
+                        quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at
+                      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
@@ -881,6 +958,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         input.quota_signal_json,
                         input.policy_revision,
                         input.anchor_version,
+                        catalog_fingerprint,
                         now_ms(),
                     ],
                 )?;
@@ -911,8 +989,8 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 let mut stmt = c.prepare(
                     "SELECT id, decision_kind, task_id, send_id, target_agent, selected_route_key,
-                             rejected_json, explanation_json, quota_signal_json, policy_revision,
-                             outcome, created_at
+                              rejected_json, explanation_json, quota_signal_json, policy_revision,
+                              catalog_fingerprint, outcome, created_at
                       FROM model_route_decisions WHERE task_id=?1 ORDER BY created_at",
                 )?;
                 let rows = stmt.query_map([task_id], |r| {
@@ -927,8 +1005,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                         explanation_json: r.get(7)?,
                         quota_signal_json: r.get(8)?,
                         policy_revision: r.get(9)?,
-                        outcome: r.get(10)?,
-                        created_at: r.get(11)?,
+                        catalog_fingerprint: r.get(10)?,
+                        outcome: r.get(11)?,
+                        created_at: r.get(12)?,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
