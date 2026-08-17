@@ -119,6 +119,133 @@ fn migration_seeds_the_curated_catalog_on_first_open() {
 }
 
 #[test]
+fn catalog_fingerprint_changes_for_every_scored_fact_field() {
+    use rusqlite::Connection;
+
+    let rig = Rig::new("catalog-fingerprint-fields");
+    let store = rig.open();
+    let baseline = store.catalog_fingerprint().unwrap();
+
+    let mut override_fact = fact("custom", "catalog-probe");
+    store
+        .upsert_fact(&override_fact, FactSource::Override)
+        .unwrap();
+    let after_route_key = store.catalog_fingerprint().unwrap();
+    assert_ne!(
+        baseline, after_route_key,
+        "route identity must affect the fingerprint"
+    );
+
+    override_fact.scores.elo = 56.0;
+    store
+        .upsert_fact(&override_fact, FactSource::Override)
+        .unwrap();
+    let after_elo = store.catalog_fingerprint().unwrap();
+    assert_ne!(
+        after_route_key, after_elo,
+        "Elo must affect the fingerprint"
+    );
+
+    override_fact.scores.eq = 1701.0;
+    store
+        .upsert_fact(&override_fact, FactSource::Override)
+        .unwrap();
+    let after_eq = store.catalog_fingerprint().unwrap();
+    assert_ne!(after_elo, after_eq, "EQ must affect the fingerprint");
+
+    override_fact.speed_multiplier = Some(0.5);
+    store
+        .upsert_fact(&override_fact, FactSource::Override)
+        .unwrap();
+    let after_multiplier = store.catalog_fingerprint().unwrap();
+    assert_ne!(
+        after_eq, after_multiplier,
+        "speed multiplier must affect the fingerprint"
+    );
+
+    let connection = Connection::open(rig.db_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE model_facts SET excluded = 1 WHERE route_key = 'custom/catalog-probe'",
+            [],
+        )
+        .unwrap();
+    let after_exclusion = store.catalog_fingerprint().unwrap();
+    assert_ne!(
+        after_multiplier, after_exclusion,
+        "exclusion must affect the fingerprint"
+    );
+}
+
+#[test]
+fn catalog_fingerprint_is_stable_across_a_shuffled_no_op_reseed() {
+    use rusqlite::Connection;
+
+    let rig = Rig::new("catalog-fingerprint-reseed");
+    let store = rig.open();
+    let fingerprint = store.catalog_fingerprint().unwrap();
+    let mut facts = store.get_facts().unwrap();
+    for fact in &facts {
+        let route_key = make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
+        store.delete_fact(&route_key).unwrap();
+    }
+    facts.reverse();
+    for fact in facts {
+        store.upsert_fact(&fact, FactSource::Seed).unwrap();
+    }
+
+    assert_eq!(store.catalog_fingerprint().unwrap(), fingerprint);
+    let connection = Connection::open(rig.db_path()).unwrap();
+    let generations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM catalog_generation WHERE fingerprint = ?1",
+            [&fingerprint],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(generations, 1, "a no-op reseed must reuse its generation");
+}
+
+#[test]
+fn decision_rows_carry_the_live_catalog_fingerprint() {
+    use rusqlite::Connection;
+
+    let rig = Rig::new("catalog-fingerprint-decision");
+    let store = rig.open();
+    let fingerprint = store.catalog_fingerprint().unwrap();
+    let id = store
+        .record_decision(&DecisionInput {
+            task_id: Some("catalog-task".into()),
+            target_agent: "mason".into(),
+            requirements_json: "{}".into(),
+            score_json: "{}".into(),
+            rejected_json: "[]".into(),
+            anchor_version: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let decision = store
+        .get_decisions_for_task("catalog-task")
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        decision.catalog_fingerprint.as_deref(),
+        Some(fingerprint.as_str())
+    );
+    let connection = Connection::open(rig.db_path()).unwrap();
+    let persisted: Option<String> = connection
+        .query_row(
+            "SELECT catalog_fingerprint FROM model_route_decisions WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted.as_deref(), Some(fingerprint.as_str()));
+}
+
+#[test]
 fn migration_025_marks_known_vision_families_and_leaves_qwen_unverified() {
     let rig = Rig::new("known-vision-capabilities");
     let facts = rig.open().get_facts().unwrap();
@@ -945,6 +1072,10 @@ fn panel_decision_kind_and_migration() {
     assert_eq!(
         legacy[0].selected_route_key.as_deref(),
         Some("openai/gpt-5.5")
+    );
+    assert_eq!(
+        legacy[0].catalog_fingerprint, None,
+        "migration must not fabricate catalog provenance for historical decisions"
     );
 
     let panel_id = store

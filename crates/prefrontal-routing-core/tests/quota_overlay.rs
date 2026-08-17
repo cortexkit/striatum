@@ -13,7 +13,9 @@ use prefrontal_routing_core::quota::{
     merge_quota_overlay_with, ProviderUsage, DEFAULT_HARD_BLOCK_THRESHOLD,
     NO_RESET_REPROBE_HORIZON_MS,
 };
-use prefrontal_routing_core::quota_pace::DEFAULT_PACE_CONFIG;
+use prefrontal_routing_core::quota_pace::{
+    project_quota_pressure, PaceError, PaceInput, DEFAULT_PACE_CONFIG,
+};
 use prefrontal_routing_core::{
     extract_windows, make_capacity_key, make_route_key, ModelRequirements,
 };
@@ -121,6 +123,37 @@ fn high_utilization_no_window_pressures_mapped_capacity() {
     assert!(!snap
         .by_capacity
         .contains_key(&make_capacity_key("anthropic", "claude-opus-4-8")));
+}
+
+#[test]
+fn rolling_window_discriminator_is_typed_as_an_unsupported_pacing_model() {
+    let entry = usage_from_json(serde_json::json!({
+        "provider": "codex",
+        "usage": {
+            "primary": {
+                "usedPercent": 50.0,
+                "resetsAt": "2030-01-01T00:00:00Z",
+                "windowMinutes": 300,
+                "windowModel": "rolling"
+            }
+        }
+    }));
+    let extracted = extract_windows(&entry, "openai", "codex", &[])
+        .pop()
+        .expect("rolling provider window is still decoded for typed refusal");
+
+    let result = project_quota_pressure(
+        PaceInput {
+            utilization: extracted.utilization,
+            resets_at: extracted.resets_at,
+            window_ms: extracted.window_ms,
+            observed_at: NOW,
+            provider_window_model: extracted.window_model,
+        },
+        &DEFAULT_PACE_CONFIG,
+    );
+
+    assert_eq!(result, Err(PaceError::RollingWindow));
 }
 
 #[test]

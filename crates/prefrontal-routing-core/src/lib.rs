@@ -66,8 +66,8 @@ pub use quota_extract::{
     extract_windows, match_capacity_key_by_title, ExtractedWindow, WindowScopeKind,
 };
 pub use quota_pace::{
-    clamp01, project_quota_pressure, smoothstep, PaceConfig, PaceInput, PaceReason, PaceResult,
-    DEFAULT_PACE_CONFIG,
+    clamp01, project_quota_pressure, smoothstep, PaceConfig, PaceError, PaceInput, PaceReason,
+    PaceResult, PaceWindowModel, ProviderWindowModel, DEFAULT_PACE_CONFIG,
 };
 pub use route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 pub use route_state_store::{

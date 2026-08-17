@@ -50,6 +50,8 @@ pub struct RouteRuntimeState {
     pub success_ema: Option<f64>,
     /// Soft quota pressure 0..1 (e.g. pace projection). None = unknown.
     pub quota_pressure: Option<f64>,
+    /// The pace model that produced `quota_pressure`, retained for decision audit.
+    pub quota_window_model: Option<crate::quota_pace::PaceWindowModel>,
     pub latency_ema_ms: Option<f64>,
     /// Provenance for the window that drove quota signals (audit + break-glass).
     /// The pure scorer IGNORES this; only the integration seam reads it.
@@ -345,6 +347,7 @@ fn merged_runtime_state(
         }
         if route_state.quota_pressure.is_some() {
             merged.quota_pressure = route_state.quota_pressure;
+            merged.quota_window_model = route_state.quota_window_model;
         }
         if route_state.latency_ema_ms.is_some() {
             merged.latency_ema_ms = route_state.latency_ema_ms;

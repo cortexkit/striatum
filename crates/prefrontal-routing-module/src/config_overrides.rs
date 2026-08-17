@@ -199,6 +199,9 @@ fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
     if ov.vision.is_some() {
         fact.supports_vision = ov.vision;
     }
+    if ov.speed_multiplier.is_some() {
+        fact.speed_multiplier = ov.speed_multiplier;
+    }
     fact.confidence = Confidence::Curated;
     fact
 }

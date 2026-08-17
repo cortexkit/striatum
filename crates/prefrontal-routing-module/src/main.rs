@@ -1439,6 +1439,7 @@ fn quota_signal_json(
             json!({
                 "capacityKey": capacity_key,
                 "pressure": state.quota_pressure,
+                "windowModel": state.quota_window_model,
                 "exhaustedUntil": state.quota_exhausted_until,
             })
         })
@@ -2829,6 +2830,38 @@ mod tests {
     use prefrontal_routing_core::FactSource;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn quota_provenance_records_the_pacing_window_model() {
+        let snapshot = ModelRouteStateSnapshot {
+            now: 0.0,
+            by_route: HashMap::new(),
+            by_capacity: HashMap::from([(
+                "openai/gpt-5.6-sol".to_string(),
+                prefrontal_routing_core::RouteRuntimeState {
+                    quota_pressure: Some(0.7),
+                    quota_window_model: Some(
+                        prefrontal_routing_core::PaceWindowModel::UtilizationFallback,
+                    ),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let windows: Vec<ProviderUsage> = serde_json::from_value(json!([{
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 70.0 } }
+        }]))
+        .unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&quota_signal_json(&snapshot, &windows, true, 1, 0, None))
+                .unwrap();
+
+        assert_eq!(
+            value["signals"][0]["windowModel"],
+            serde_json::Value::String("utilization_fallback".to_string())
+        );
+    }
 
     struct Rig {
         dir: PathBuf,
