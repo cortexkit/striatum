@@ -21,8 +21,12 @@ pub enum PaceWindowModel {
     UtilizationFallback,
 }
 
-/// A provider's explicit window semantics. Providers currently omit this field;
-/// a rolling window must be refused until its different pacing math is modeled.
+/// A provider's explicit window semantics.
+///
+/// An absent marker defaults to `Fixed` only when both a reset time and a
+/// positive window length are present, because those signals are consistent
+/// with fixed-boundary windows. Without them, the window mechanism is unknown,
+/// so a rolling window must be refused until its pacing math is modeled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderWindowModel {
@@ -142,6 +146,7 @@ pub fn project_quota_pressure(
     let time_until_reset_ms = resets_at.map_or(f64::INFINITY, |reset| reset - observed_at);
     let actual = clamp01(utilization);
     let has_window = resets_at.is_some() && matches!(window_ms, Some(w) if w > 0.0);
+    let no_window_signals = resets_at.is_none() && window_ms.is_none();
     let window_model = if has_window {
         PaceWindowModel::Fixed
     } else {
@@ -175,16 +180,19 @@ pub fn project_quota_pressure(
             actual,
         ) * config.util_fallback_max;
         let pressure = clamp01(ramp.max(floor));
+        // With neither window signal, utilization is a safety signal rather
+        // than evidence for a particular depletion horizon. Keep the pressure
+        // ramp but report its mechanism honestly instead of projecting shortfall.
         return Ok(PaceResult {
             pressure,
             eta_ms: f64::INFINITY,
             time_until_reset_ms,
             will_last_to_reset: true,
             window_model,
-            reason: if pressure > 0.0 {
-                PaceReason::ProjectedShortfall
-            } else {
+            reason: if no_window_signals || pressure == 0.0 {
                 PaceReason::InsufficientData
+            } else {
+                PaceReason::ProjectedShortfall
             },
         });
     }
@@ -356,6 +364,45 @@ mod tests {
         assert!(r.time_until_reset_ms.is_infinite());
         assert!(r.pressure > 0.8, "got {}", r.pressure);
         assert_eq!(r.reason, PaceReason::ProjectedShortfall);
+    }
+
+    #[test]
+    fn no_window_signals_high_utilization_returns_insufficient_data() {
+        let r = project_quota_pressure(
+            PaceInput {
+                utilization: 0.97,
+                resets_at: None,
+                window_ms: None,
+                observed_at: 0.0,
+                provider_window_model: None,
+            },
+            &C,
+        )
+        .expect("fixed and fallback pacing inputs are supported");
+
+        assert!(r.pressure > 0.8, "got {}", r.pressure);
+        assert_eq!(r.window_model, PaceWindowModel::UtilizationFallback);
+        assert_eq!(r.reason, PaceReason::InsufficientData);
+    }
+
+    #[test]
+    fn absent_window_model_with_window_signals_defaults_to_fixed() {
+        let five_hour = 5.0 * 60.0 * 60_000.0;
+        let r = project_quota_pressure(
+            PaceInput {
+                utilization: 0.9,
+                resets_at: Some(five_hour / 2.0),
+                window_ms: Some(five_hour),
+                observed_at: 0.0,
+                provider_window_model: None,
+            },
+            &C,
+        )
+        .expect("window signals select fixed pacing when the marker is absent");
+
+        assert_eq!(r.window_model, PaceWindowModel::Fixed);
+        assert_eq!(r.reason, PaceReason::ProjectedShortfall);
+        assert!(!r.will_last_to_reset);
     }
 
     #[test]
