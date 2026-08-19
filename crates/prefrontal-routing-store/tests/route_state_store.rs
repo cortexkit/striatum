@@ -178,6 +178,28 @@ fn catalog_fingerprint_changes_for_every_scored_fact_field() {
 }
 
 #[test]
+fn catalog_fingerprint_changes_when_only_price_changes() {
+    let rig = Rig::new("catalog-fingerprint-price");
+    let store = rig.open();
+    let mut override_fact = fact("custom", "catalog-price-probe");
+    store
+        .upsert_fact(&override_fact, FactSource::Override)
+        .unwrap();
+    let before_price_change = store.catalog_fingerprint().unwrap();
+
+    override_fact.cost_per_m_tok_out = Some(5.5);
+    store
+        .upsert_fact(&override_fact, FactSource::Override)
+        .unwrap();
+
+    assert_ne!(
+        before_price_change,
+        store.catalog_fingerprint().unwrap(),
+        "a price-only change must affect the catalog fingerprint"
+    );
+}
+
+#[test]
 fn catalog_fingerprint_is_stable_across_a_shuffled_no_op_reseed() {
     use rusqlite::Connection;
 

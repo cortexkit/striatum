@@ -243,32 +243,70 @@ fn err(e: impl std::fmt::Display) -> RouteStateStoreError {
 #[derive(Serialize)]
 struct CatalogFingerprintRow {
     route_key: String,
+    capacity_key: String,
+    provider_id: String,
+    model_id: String,
+    variant: Option<String>,
+    family: Option<String>,
     elo: f64,
     eq: f64,
+    speed: f64,
+    context_window: Option<f64>,
+    max_output_tokens: Option<u64>,
+    cost_tier: Option<f64>,
+    cost_per_mtok_out: Option<f64>,
+    supports_vision: Option<bool>,
+    supports_tool_use: Option<bool>,
+    prompt_defaults_json: Option<String>,
+    confidence: String,
     speed_multiplier: Option<f64>,
     excluded: bool,
 }
 
-/// BLAKE3 over canonical catalog facts. Query ordering—not insertion ordering—is
-/// the generation contract, so a no-op reseed or shuffled input cannot mint a
-/// different fingerprint for the same scored catalog.
+/// BLAKE3 over every routing-read `model_facts` column: route/capacity identity,
+/// provider/model/variant, family, Elo/EQ/speed, context and output limits, price
+/// data, vision/tool capability flags, prompt defaults, confidence, speed multiplier,
+/// and exclusion. Adding a routing-read column without extending this row is the
+/// defect this hash exists to catch. Query ordering—not insertion ordering—is the
+/// generation contract, so a no-op reseed or shuffled input cannot mint a different
+/// fingerprint for the same catalog.
+///
+/// Widening this row is intentionally migration-free even though it changes every
+/// fingerprint: comparisons only have meaning within a catalog generation, and a
+/// historical NULL fingerprint was never comparable to a live catalog value.
 fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<String> {
     let mut statement = connection.prepare(
-        "SELECT route_key,
+        "SELECT route_key, capacity_key, provider_id, model_id, variant, family,
                 json_extract(scores_json, '$.elo') AS elo,
                 json_extract(scores_json, '$.eq') AS eq,
-                speed_multiplier,
-                excluded
+                json_extract(scores_json, '$.speed') AS speed,
+                context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
+                supports_vision, supports_tool_use, prompt_defaults_json, confidence,
+                speed_multiplier, excluded
          FROM model_facts
          ORDER BY route_key",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(CatalogFingerprintRow {
             route_key: row.get(0)?,
-            elo: row.get(1)?,
-            eq: row.get(2)?,
-            speed_multiplier: row.get(3)?,
-            excluded: row.get::<_, i64>(4)? != 0,
+            capacity_key: row.get(1)?,
+            provider_id: row.get(2)?,
+            model_id: row.get(3)?,
+            variant: row.get(4)?,
+            family: row.get(5)?,
+            elo: row.get(6)?,
+            eq: row.get(7)?,
+            speed: row.get(8)?,
+            context_window: row.get(9)?,
+            max_output_tokens: row.get(10)?,
+            cost_tier: row.get(11)?,
+            cost_per_mtok_out: row.get(12)?,
+            supports_vision: row.get::<_, Option<i64>>(13)?.map(|value| value != 0),
+            supports_tool_use: row.get::<_, Option<i64>>(14)?.map(|value| value != 0),
+            prompt_defaults_json: row.get(15)?,
+            confidence: row.get(16)?,
+            speed_multiplier: row.get(17)?,
+            excluded: row.get::<_, i64>(18)? != 0,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
