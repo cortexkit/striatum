@@ -103,7 +103,12 @@ pub struct SpendPool {
     #[serde(default)]
     pub total: Option<SpendBalance>,
     pub basis: String,
-    pub spendable: bool,
+    /// Producer contract (cortexkit-provider-usage 0.6, skip_serializing_if):
+    /// ABSENT means the provider does not say - only a literal `false` is a
+    /// closed-pool wall. Requiring this field made the decoder refuse every
+    /// reply carrying a pool without the flag (deepseek with sufficient
+    /// balance, openrouter always), taking the WHOLE usage.get down.
+    pub spendable: Option<bool>,
 }
 
 impl SpendPool {
@@ -112,15 +117,24 @@ impl SpendPool {
         matches!(self.funding.as_str(), "granted" | "subscription")
     }
 
+    /// The producer's flag with the contract's absence rule applied: absent is
+    /// "the provider does not say", which must not close a pool - only a
+    /// literal `false` walls it.
+    fn producer_allows_spend(&self) -> bool {
+        self.spendable != Some(false)
+    }
+
     /// A pool can serve routing only when its producer flag, supported funding,
     /// and reported remaining balance all agree. This must not be used to suppress
     /// an exhausted-pool wall: an empty allowed pool is intentionally unspendable.
     pub fn is_routing_spendable(&self) -> bool {
-        self.spendable && self.has_supported_funding() && !self.remaining.is_non_positive()
+        self.producer_allows_spend()
+            && self.has_supported_funding()
+            && !self.remaining.is_non_positive()
     }
 
     fn can_inform_pacing(&self) -> bool {
-        self.spendable && self.has_supported_funding()
+        self.producer_allows_spend() && self.has_supported_funding()
     }
 
     fn utilization(&self) -> f64 {

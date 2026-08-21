@@ -614,6 +614,39 @@ fn windowless_usage_with_empty_balance_pool_walls_without_reset() {
 }
 
 #[test]
+fn pool_without_spendable_flag_decodes_and_serves() {
+    // Producer contract (cortexkit-provider-usage 0.6): `spendable` is
+    // skip_serializing_if - ABSENT means the provider does not say, and only a
+    // literal false closes a pool. Requiring the field refused the whole
+    // usage.get reply (caught live by both_modules_e2e against real insula:
+    // deepseek omits the flag when balance is sufficient, openrouter always).
+    let facts = vec![fact("absent-provider", "budget-model", 1.0)];
+    let entry = usage_from_json(serde_json::json!({
+        "provider": "absent-wire",
+        "apiProvider": "absent-provider",
+        "usage": {},
+        "spend": [{
+            "id": "grant",
+            "label": "Grant balance",
+            "funding": "granted",
+            "remaining": { "minor": 10, "exponent": 2, "unit": "USD" },
+            "total": { "minor": 100, "exponent": 2, "unit": "USD" },
+            "basis": "reported"
+        }]
+    }));
+    let snap = overlay(&[entry], &facts, &HashMap::new());
+    let cap = make_capacity_key("absent-provider", "budget-model");
+    assert!(
+        snap.by_capacity[&cap].quota_exhausted_until.is_none(),
+        "an absent spendable flag must not wall the pool: absent is 'does not say', not 'closed'"
+    );
+    assert!(
+        snap.by_capacity[&cap].quota_pressure.is_some(),
+        "an absent-flag pool still informs pacing"
+    );
+}
+
+#[test]
 fn balance_only_positive_pool_keeps_provider_servable() {
     let facts = vec![fact("balance-provider", "budget-model", 1.0)];
     let entry = usage_from_json(serde_json::json!({
