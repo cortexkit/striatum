@@ -553,6 +553,158 @@ fn record_decision_and_set_outcome() {
 }
 
 #[test]
+fn project_root_population_round_trips_through_decision_write_path() {
+    use rusqlite::Connection;
+
+    let rig = Rig::new("decision-join-identity");
+    let store = rig.open();
+    let with_identity = store
+        .record_decision(&DecisionInput {
+            task_id: Some("run-with-identity".into()),
+            parent_session_id: Some("ses-reused".into()),
+            harness: Some("broca".into()),
+            project_root: Some("/repos/one".into()),
+            target_agent: "mason".into(),
+            requirements_json: "{}".into(),
+            score_json: "{}".into(),
+            rejected_json: "[]".into(),
+            anchor_version: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    let without_identity = store
+        .record_decision(&DecisionInput {
+            task_id: Some("run-without-identity".into()),
+            target_agent: "mason".into(),
+            requirements_json: "{}".into(),
+            score_json: "{}".into(),
+            rejected_json: "[]".into(),
+            anchor_version: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let connection = Connection::open(rig.db_path()).unwrap();
+    let stored_identity: (Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT harness, project_root FROM model_route_decisions WHERE id=?1",
+            [&with_identity],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let absent_identity: (Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT harness, project_root FROM model_route_decisions WHERE id=?1",
+            [&without_identity],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        stored_identity,
+        (Some("broca".into()), Some("/repos/one".into()))
+    );
+    assert_eq!(absent_identity, (None, None));
+}
+
+#[test]
+fn migration_030_preserves_real_028_era_decision_rows_without_join_identity() {
+    use cortexkit_store::{open_sqlite, Migration};
+    use rusqlite::Connection;
+
+    macro_rules! migration {
+        ($version:literal, $file:literal) => {
+            Migration {
+                version: $version,
+                statements: include_str!(concat!("../migrations/", $file)),
+            }
+        };
+    }
+
+    let rig = Rig::new("migration-030-028-era-row");
+    let descriptor = dev_descriptor("prefrontal-routing", rig.db_path());
+    let migrations = [
+        migration!(1, "001_route_state.sql"),
+        migration!(2, "002_usage.sql"),
+        migration!(3, "003_drop_reservations.sql"),
+        migration!(4, "004_gpt56_family.sql"),
+        migration!(5, "005_panel_selection.sql"),
+        migration!(6, "006_grok_45.sql"),
+        migration!(7, "007_aa_v41_rebase.sql"),
+        migration!(8, "008_fable_5.sql"),
+        migration!(9, "009_kimi_k3.sql"),
+        migration!(10, "010_qwen38_max.sql"),
+        migration!(11, "011_qwen38_rescore.sql"),
+        migration!(12, "012_max_output_tokens.sql"),
+        migration!(13, "013_alibaba_token_plan_expansion.sql"),
+        migration!(14, "014_alibaba_entitlement_prune.sql"),
+        migration!(15, "015_provider_cooldown_inheritance.sql"),
+        migration!(16, "016_opus_default_variant_xhigh.sql"),
+        migration!(17, "017_gemini_36_flash.sql"),
+        migration!(18, "018_opus_5.sql"),
+        migration!(19, "019_anthropic_real_prices.sql"),
+        migration!(20, "020_decision_retention_index.sql"),
+        migration!(21, "021_new_sibling_models.sql"),
+        migration!(22, "022_elo_rescore.sql"),
+        migration!(23, "023_ollama_kimi_k3.sql"),
+        migration!(24, "024_restore_override_reverted_facts.sql"),
+        migration!(25, "025_known_vision_capabilities.sql"),
+        migration!(26, "026_grok_46.sql"),
+        migration!(27, "027_gemini_37_flash.sql"),
+        migration!(28, "028_decision_ledger_provenance.sql"),
+    ];
+    let v28 = open_sqlite(&descriptor).unwrap();
+    v28.migrate("route_state", &migrations).unwrap();
+    v28.with_conn(|connection: &Connection| {
+        connection.execute(
+            "INSERT INTO model_route_decisions (
+                id, decision_kind, task_id, parent_session_id, send_id, target_agent,
+                requirements_json, selected_route_key, selected_provider_id, selected_model_id,
+                selected_variant, score_json, rejected_json, explanation_json,
+                quota_signal_json, policy_revision, anchor_version, created_at
+              ) VALUES (
+                'decision-v28', 'single', 'run-42', 'ses-reused', 'send-42', 'mason',
+                '{}', 'openai/gpt-5.6', 'openai', 'gpt-5.6', NULL, '{}', '[]', '{}',
+                '{\"state\":\"none\"}', 'revision-1', 2, 42
+              )",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    drop(v28);
+
+    let _current = SqliteRouteStateStore::open(&descriptor).unwrap();
+    let connection = Connection::open(rig.db_path()).unwrap();
+    let stored: (String, String, String, Option<String>, Option<String>) = connection
+        .query_row(
+            "SELECT task_id, parent_session_id, send_id, harness, project_root
+             FROM model_route_decisions WHERE id='decision-v28'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        stored,
+        (
+            "run-42".into(),
+            "ses-reused".into(),
+            "send-42".into(),
+            None,
+            None,
+        )
+    );
+}
+
+#[test]
 fn decision_retention_deletes_old_rows_and_keeps_young_rows() {
     use rusqlite::{params, Connection};
 

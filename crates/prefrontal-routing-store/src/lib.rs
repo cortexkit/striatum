@@ -104,11 +104,13 @@ const MIGRATION_027: &str = include_str!("../migrations/027_gemini_37_flash.sql"
 const MIGRATION_028: &str = include_str!("../migrations/028_decision_ledger_provenance.sql");
 /// Migration 29: catalog generation fingerprints stamped on new decision rows.
 const MIGRATION_029: &str = include_str!("../migrations/029_catalog_fingerprint.sql");
+/// Migration 30: decision join identity for safe spend attribution.
+const MIGRATION_030: &str = include_str!("../migrations/030_decision_ledger_join_identity.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 29] {
+fn route_state_migrations() -> [Migration; 30] {
     [
         Migration {
             version: 1,
@@ -225,6 +227,10 @@ fn route_state_migrations() -> [Migration; 29] {
         Migration {
             version: 29,
             statements: MIGRATION_029,
+        },
+        Migration {
+            version: 30,
+            statements: MIGRATION_030,
         },
     ]
 }
@@ -972,17 +978,19 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 let catalog_fingerprint = record_catalog_generation(c)?;
                 c.execute(
-                    "INSERT INTO model_route_decisions (
-                        id, decision_kind, task_id, parent_session_id, send_id, target_agent,
-                        requirements_json, selected_route_key, selected_provider_id, selected_model_id,
-                        selected_variant, score_json, rejected_json, explanation_json,
-                        quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at
-                      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                     "INSERT INTO model_route_decisions (
+                         id, decision_kind, task_id, parent_session_id, harness, project_root, send_id,
+                         target_agent, requirements_json, selected_route_key, selected_provider_id,
+                         selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
+                         quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
                         input.task_id,
                         input.parent_session_id,
+                        input.harness,
+                        input.project_root,
                         input.send_id,
                         input.target_agent,
                         input.requirements_json,
