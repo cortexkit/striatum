@@ -830,6 +830,12 @@ struct SelectParams {
     task_id: Option<String>,
     #[serde(default, alias = "parentSessionID")]
     parent_session_id: Option<String>,
+    /// The caller's harness, used to match the decision with recorded spend facts when provided.
+    #[serde(default)]
+    harness: Option<String>,
+    /// The caller's project directory, used to match the decision with recorded spend facts.
+    #[serde(default)]
+    project_root: Option<String>,
     /// The caller may provide a launch attempt id before selection; otherwise it
     /// remains null because the router never invents a send correlation.
     #[serde(default, rename = "sendID")]
@@ -937,6 +943,10 @@ struct SelectPanelParams {
     task_id: Option<String>,
     #[serde(default)]
     parent_session_id: Option<String>,
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    project_root: Option<String>,
     #[serde(default, rename = "sendID")]
     send_id: Option<String>,
 }
@@ -2145,6 +2155,16 @@ fn panel_decision_input(
         decision_kind: "panel".into(),
         task_id: params.task_id.clone(),
         parent_session_id: params.parent_session_id.clone(),
+        harness: params
+            .harness
+            .as_deref()
+            .filter(|value| matches!(*value, "opencode" | "broca"))
+            .map(str::to_owned),
+        project_root: params
+            .project_root
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned),
         send_id: params.send_id.clone(),
         target_agent: "athena-panel".into(),
         requirements_json: serde_json::to_string(&params.panel_spec)
@@ -2180,6 +2200,16 @@ fn decision_input_for(
             decision_kind: "single".into(),
             task_id: params.task_id.clone(),
             parent_session_id: params.parent_session_id.clone(),
+            harness: params
+                .harness
+                .as_deref()
+                .filter(|value| matches!(*value, "opencode" | "broca"))
+                .map(str::to_owned),
+            project_root: params
+                .project_root
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned),
             send_id: params.send_id.clone(),
             target_agent: target_agent.to_string(),
             requirements_json,
@@ -2203,6 +2233,16 @@ fn decision_input_for(
                 decision_kind: "single".into(),
                 task_id: params.task_id.clone(),
                 parent_session_id: params.parent_session_id.clone(),
+                harness: params
+                    .harness
+                    .as_deref()
+                    .filter(|value| matches!(*value, "opencode" | "broca"))
+                    .map(str::to_owned),
+                project_root: params
+                    .project_root
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned),
                 send_id: params.send_id.clone(),
                 target_agent: target_agent.to_string(),
                 requirements_json,
@@ -3560,6 +3600,62 @@ mod tests {
                 .send_id,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn project_root_population_round_trips_through_route_select_write_path() {
+        let route = fact("p", "join-identity-route");
+        let (with_identity, with_identity_rig) = run_select_wire_request(
+            "join-identity-present",
+            json!({
+                "targetAgent": "explore",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["p/join-identity-route"],
+                "taskId": "run-with-identity",
+                "parentSessionID": "ses-reused",
+                "harness": "broca",
+                "projectRoot": "/repos/one"
+            }),
+            std::slice::from_ref(&route),
+        )
+        .await;
+        assert_eq!(with_identity.header.ty, FrameType::Response);
+        let connection =
+            rusqlite::Connection::open(with_identity_rig.dir.join("store.db")).unwrap();
+        let stored_identity: (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT harness, project_root FROM model_route_decisions WHERE task_id='run-with-identity'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_identity,
+            (Some("broca".into()), Some("/repos/one".into()))
+        );
+
+        let (without_identity, without_identity_rig) = run_select_wire_request(
+            "join-identity-absent",
+            json!({
+                "targetAgent": "explore",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["p/join-identity-route"],
+                "taskId": "run-without-identity"
+            }),
+            &[route],
+        )
+        .await;
+        assert_eq!(without_identity.header.ty, FrameType::Response);
+        let connection =
+            rusqlite::Connection::open(without_identity_rig.dir.join("store.db")).unwrap();
+        let absent_identity: (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT harness, project_root FROM model_route_decisions WHERE task_id='run-without-identity'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(absent_identity, (None, None));
     }
 
     #[tokio::test]

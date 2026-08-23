@@ -107,6 +107,10 @@ pub struct DecisionInput {
     pub decision_kind: String,
     pub task_id: Option<String>,
     pub parent_session_id: Option<String>,
+    /// The caller's harness, copied from the selection input when one was provided.
+    pub harness: Option<String>,
+    /// The caller's project directory, used to match the decision with recorded spend facts.
+    pub project_root: Option<String>,
     /// Caller-provided launch attempt id. A decision without an execution keeps this null.
     pub send_id: Option<String>,
     pub target_agent: String,
