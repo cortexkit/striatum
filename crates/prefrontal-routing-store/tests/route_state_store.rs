@@ -201,8 +201,6 @@ fn catalog_fingerprint_changes_when_only_price_changes() {
 
 #[test]
 fn catalog_fingerprint_is_stable_across_a_shuffled_no_op_reseed() {
-    use rusqlite::Connection;
-
     let rig = Rig::new("catalog-fingerprint-reseed");
     let store = rig.open();
     let fingerprint = store.catalog_fingerprint().unwrap();
@@ -217,15 +215,6 @@ fn catalog_fingerprint_is_stable_across_a_shuffled_no_op_reseed() {
     }
 
     assert_eq!(store.catalog_fingerprint().unwrap(), fingerprint);
-    let connection = Connection::open(rig.db_path()).unwrap();
-    let generations: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM catalog_generation WHERE fingerprint = ?1",
-            [&fingerprint],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(generations, 1, "a no-op reseed must reuse its generation");
 }
 
 #[test]

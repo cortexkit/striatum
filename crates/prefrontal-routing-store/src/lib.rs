@@ -102,15 +102,17 @@ const MIGRATION_026: &str = include_str!("../migrations/026_grok_46.sql");
 const MIGRATION_027: &str = include_str!("../migrations/027_gemini_37_flash.sql");
 /// Migration 28: persist decision-to-send correlation and selection provenance.
 const MIGRATION_028: &str = include_str!("../migrations/028_decision_ledger_provenance.sql");
-/// Migration 29: catalog generation fingerprints stamped on new decision rows.
+/// Migration 29: catalog fingerprints stamped on new decision rows.
 const MIGRATION_029: &str = include_str!("../migrations/029_catalog_fingerprint.sql");
 /// Migration 30: decision join identity for safe spend attribution.
 const MIGRATION_030: &str = include_str!("../migrations/030_decision_ledger_join_identity.sql");
+/// Migration 31: retire the never-read catalog generation history.
+const MIGRATION_031: &str = include_str!("../migrations/031_drop_catalog_generation.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 30] {
+fn route_state_migrations() -> [Migration; 31] {
     [
         Migration {
             version: 1,
@@ -232,6 +234,10 @@ fn route_state_migrations() -> [Migration; 30] {
             version: 30,
             statements: MIGRATION_030,
         },
+        Migration {
+            version: 31,
+            statements: MIGRATION_031,
+        },
     ]
 }
 
@@ -322,15 +328,6 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
     Ok(hex[..16].to_string())
 }
 
-fn record_catalog_generation(connection: &Connection) -> rusqlite::Result<String> {
-    let fingerprint = calculate_catalog_fingerprint(connection)?;
-    connection.execute(
-        "INSERT OR IGNORE INTO catalog_generation (fingerprint, created_at) VALUES (?1, ?2)",
-        params![fingerprint, now_ms()],
-    )?;
-    Ok(fingerprint)
-}
-
 /// Retain detailed rejected routes for the common case, then append one summary
 /// for the omitted tail. The stored value remains a JSON array for audit readers.
 fn bound_rejected_json(raw: &str) -> String {
@@ -388,9 +385,7 @@ impl SqliteRouteStateStore {
         store
             .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations())
             .map_err(err)?;
-        let route_store = Self { store };
-        route_store.refresh_catalog_generation()?;
-        Ok(route_store)
+        Ok(Self { store })
     }
 
     /// The single-writer fence epoch for this open (for diagnostics / future
@@ -403,12 +398,6 @@ impl SqliteRouteStateStore {
     pub fn catalog_fingerprint(&self) -> RouteStateResult<String> {
         self.store
             .with_conn(|connection: &Connection| calculate_catalog_fingerprint(connection))
-            .map_err(err)
-    }
-
-    fn refresh_catalog_generation(&self) -> RouteStateResult<String> {
-        self.store
-            .with_conn(|connection: &Connection| record_catalog_generation(connection))
             .map_err(err)
     }
 
@@ -600,7 +589,6 @@ impl RouteStateStore for SqliteRouteStateStore {
                         now_ms(),
                     ],
                 )?;
-                record_catalog_generation(&tx)?;
                 tx.commit()
             })
             .map_err(err)
@@ -645,7 +633,6 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 let tx = c.unchecked_transaction()?;
                 tx.execute("DELETE FROM model_facts WHERE route_key = ?1", [route_key])?;
-                record_catalog_generation(&tx)?;
                 tx.commit()
             })
             .map_err(err)
@@ -662,7 +649,6 @@ impl RouteStateStore for SqliteRouteStateStore {
                     "UPDATE model_facts SET source = 'seed' WHERE route_key = ?1",
                     [route_key],
                 )?;
-                record_catalog_generation(&tx)?;
                 tx.commit()
             })
             .map_err(err)
@@ -976,7 +962,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         let rejected_json = bound_rejected_json(&input.rejected_json);
         self.store
             .with_conn(|c: &Connection| {
-                let catalog_fingerprint = record_catalog_generation(c)?;
+                let catalog_fingerprint = calculate_catalog_fingerprint(c)?;
                 c.execute(
                      "INSERT INTO model_route_decisions (
                          id, decision_kind, task_id, parent_session_id, harness, project_root, send_id,
@@ -1352,5 +1338,63 @@ fn confidence_str(c: Confidence) -> &'static str {
     match c {
         Confidence::Curated => "curated",
         Confidence::Unknown => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_031_drops_a_populated_catalog_generation_table_through_the_store_runner() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "prefrontal-routing-catalog-generation-migration-{}-{timestamp}.sqlite",
+            std::process::id()
+        ));
+        let descriptor = dev_descriptor(
+            "prefrontal-routing-catalog-generation-migration",
+            path.to_string_lossy(),
+        );
+
+        let legacy = open_sqlite(&descriptor).unwrap();
+        let migrations = route_state_migrations();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &migrations[..30])
+            .unwrap();
+        legacy
+            .with_conn(|connection| {
+                connection.execute(
+                    "INSERT INTO catalog_generation(fingerprint,created_at) VALUES ('legacy',1)",
+                    [],
+                )
+            })
+            .unwrap();
+        drop(legacy);
+
+        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let table_exists: bool = migrated
+            .store
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM sqlite_schema
+                       WHERE type='table' AND name='catalog_generation'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(!table_exists);
+        drop(migrated);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
     }
 }
