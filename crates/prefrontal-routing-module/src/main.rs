@@ -45,7 +45,7 @@ use prefrontal_routing_core::{
     PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
     SelectPanelInput, SelectedPanel,
 };
-use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
 use serde::Deserialize;
 use serde_json::json;
@@ -72,6 +72,10 @@ const DEFAULT_MODULE_ID: &str = "prefrontal-routing";
 const ROUTE_SELECT_OP: &str = "route.select";
 const ROUTE_RESOLVE_POLICY_OP: &str = "route.resolve_policy";
 const ROUTE_SELECT_PANEL_OP: &str = "route.select_panel";
+/// Render one retained routing decision without requiring local SQLite access.
+const ROUTE_EXPLAIN_OP: &str = "route.explain";
+/// List recent routing decisions using only compact diagnostic fields.
+const ROUTE_DECISIONS_LIST_OP: &str = "route.decisions_list";
 /// Read one model capability fact from the live route-state catalog.
 const ROUTE_MODEL_FACT_OP: &str = "route.model_fact";
 /// Live catalog write: add a model or adjust its scores/metadata without a
@@ -1651,6 +1655,12 @@ async fn handle_select_request(
     if envelope.method == ROUTE_COOLDOWN_STATUS_OP {
         return handle_cooldown_status(frame, writer, store).await;
     }
+    if envelope.method == ROUTE_EXPLAIN_OP {
+        return handle_route_explain(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_DECISIONS_LIST_OP {
+        return handle_route_decisions_list(frame, writer, store).await;
+    }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
         return handle_resolve_policy(frame, writer).await;
     }
@@ -2318,6 +2328,36 @@ struct CooldownStatusParams {
     now: i64,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RouteExplainParams {
+    #[serde(
+        default,
+        rename = "decisionID",
+        alias = "decisionId",
+        alias = "decision_id"
+    )]
+    decision_id: Option<String>,
+    #[serde(default, rename = "sendID", alias = "sendId", alias = "send_id")]
+    send_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouteDecisionsListParams {
+    #[serde(default, rename = "sendID", alias = "sendId", alias = "send_id")]
+    send_id: Option<String>,
+    #[serde(default, alias = "target_agent")]
+    target_agent: Option<String>,
+    #[serde(default, alias = "route_key")]
+    route_key: Option<String>,
+    #[serde(default, alias = "since_ms")]
+    since_ms: Option<i64>,
+    #[serde(default, alias = "until_ms")]
+    until_ms: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RecordCooldownParams {
@@ -2349,6 +2389,16 @@ fn parse_outcome(s: &str) -> Option<RouteOutcome> {
         "launch_failed" => Some(RouteOutcome::LaunchFailed),
         _ => None,
     }
+}
+
+/// Decode persisted evidence without supplying a current-day fallback. If a legacy
+/// row contains malformed JSON, return its exact text rather than inventing a value.
+fn recorded_json(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| json!(raw))
+}
+
+fn recorded_optional_json(raw: Option<&str>) -> serde_json::Value {
+    raw.map(recorded_json).unwrap_or(serde_json::Value::Null)
 }
 
 /// Send a `{ result: { ok: true } }` ack for a successful write op.
@@ -2616,6 +2666,243 @@ async fn handle_cooldown_status(
     send(writer, response).await
 }
 
+async fn handle_route_explain(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: RouteExplainParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(body) => body.params,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("route.explain params not decodable: {error}"),
+                )
+                .await;
+            }
+        };
+    let decision_id = params.decision_id.filter(|value| !value.trim().is_empty());
+    let send_id = params.send_id.filter(|value| !value.trim().is_empty());
+    let (key_name, key, lookup) = match (decision_id.as_deref(), send_id.as_deref()) {
+        (Some(decision_id), None) => (
+            "decisionID",
+            decision_id,
+            store.get_decision_by_id(decision_id),
+        ),
+        (None, Some(send_id)) => ("sendID", send_id, store.get_decision_by_send_id(send_id)),
+        _ => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                "route.explain requires exactly one of decisionID or sendID",
+            )
+            .await;
+        }
+    };
+    let decision = match lookup {
+        Ok(Some(decision)) => decision,
+        Ok(None) => {
+            let retention_days = DECISION_RETENTION_MS / (24 * 60 * 60_000);
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "not_found",
+                &format!(
+                    "{key_name} '{key}' not found or pruned; retention is {retention_days} days"
+                ),
+            )
+            .await;
+        }
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("route.explain {key_name} lookup: {error}"),
+            )
+            .await;
+        }
+    };
+    let outcome = decision.outcome.as_ref().map(|state| {
+        json!({
+            "state": state,
+            "recordedAtMs": decision.outcome_at,
+            "error": decision.outcome_error,
+        })
+    });
+    let result = json!({
+        "decisionID": decision.id,
+        "createdAtMs": decision.created_at,
+        "decisionKind": decision.decision_kind,
+        "selectedRoute": {
+            "routeKey": decision.selected_route_key,
+            "providerID": decision.selected_provider_id,
+            "modelID": decision.selected_model_id,
+            "variant": decision.selected_variant,
+        },
+        "why": {
+            "requirements": recorded_json(&decision.requirements_json),
+            "score": recorded_json(&decision.score_json),
+            "explanation": recorded_optional_json(decision.explanation_json.as_deref()),
+            // This is the persisted rejection payload, not a new scoring pass.
+            "rejections": recorded_json(&decision.rejected_json),
+        },
+        "quotaSignalSnapshot": recorded_optional_json(decision.quota_signal_json.as_deref()),
+        "catalogFingerprint": decision.catalog_fingerprint,
+        "policyRevision": decision.policy_revision,
+        "anchorVersion": decision.anchor_version,
+        "provenance": {
+            "sendID": decision.send_id,
+            "taskID": decision.task_id,
+            "parentSessionID": decision.parent_session_id,
+            "targetAgent": decision.target_agent,
+            "harness": decision.harness,
+            "projectRoot": decision.project_root,
+        },
+        "outcome": outcome,
+    });
+    let body = serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
+async fn handle_route_decisions_list(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: RouteDecisionsListParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(body) => body.params,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("route.decisions_list params not decodable: {error}"),
+                )
+                .await;
+            }
+        };
+    let limit = params.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "route.decisions_list limit must be between 1 and 100",
+        )
+        .await;
+    }
+    if params
+        .since_ms
+        .zip(params.until_ms)
+        .is_some_and(|(since_ms, until_ms)| since_ms > until_ms)
+    {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "route.decisions_list sinceMs must not be after untilMs",
+        )
+        .await;
+    }
+    let decisions = match store.list_decisions(&DecisionListFilter {
+        send_id: params.send_id.filter(|value| !value.trim().is_empty()),
+        target_agent: params.target_agent.filter(|value| !value.trim().is_empty()),
+        route_key: params.route_key.filter(|value| !value.trim().is_empty()),
+        since_ms: params.since_ms,
+        until_ms: params.until_ms,
+        limit,
+    }) {
+        Ok(decisions) => decisions,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("route.decisions_list: {error}"),
+            )
+            .await;
+        }
+    };
+    let rows: Vec<serde_json::Value> = decisions
+        .into_iter()
+        .map(|decision| {
+            json!({
+                "decisionID": decision.id,
+                "createdAtMs": decision.created_at,
+                "selectedRouteKey": decision.selected_route_key,
+                "decisionKind": decision.decision_kind,
+                "topRejectionReason": decision.top_rejection_reason,
+                "topRejectionCount": decision.top_rejection_count,
+            })
+        })
+        .collect();
+    let body = serde_json::to_vec(&json!({ "result": { "decisions": rows } }))
+        .map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
 async fn handle_record_cooldown(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -2831,6 +3118,16 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 },
                 ManagementOperation {
                     name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: None,
+                },
+                ManagementOperation {
+                    name: ROUTE_EXPLAIN_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: None,
+                },
+                ManagementOperation {
+                    name: ROUTE_DECISIONS_LIST_OP.to_string(),
                     kind: ManagementOperationKind::Query,
                     description: None,
                 },
@@ -3138,35 +3435,44 @@ mod tests {
             .expect("select_panel wire vectors")
     }
 
-    async fn run_select_panel_wire_request(
-        label: &str,
-        request: &str,
-    ) -> (Frame, Rig, SharedStore) {
-        let rig = Rig::new(label);
-        let store = Arc::new(rig.open_store());
-        let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
+    async fn run_route_wire_request(store: &SharedStore, request: serde_json::Value) -> Frame {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             7,
             1,
             99,
-            request.as_bytes().to_vec(),
+            serde_json::to_vec(&request).unwrap(),
         )
         .unwrap();
+        let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
         let (tx, mut rx) = mpsc::channel(1);
         handle_select_request(
             frame,
             1,
             &tx,
             &quota_cache,
-            &store,
+            store,
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/prefrontal-routing.jsonc"),
         )
         .await
         .unwrap();
-        (rx.recv().await.unwrap(), rig, store)
+        rx.recv().await.unwrap()
+    }
+
+    async fn run_select_panel_wire_request(
+        label: &str,
+        request: &str,
+    ) -> (Frame, Rig, SharedStore) {
+        let rig = Rig::new(label);
+        let store = Arc::new(rig.open_store());
+        let response = run_route_wire_request(
+            &store,
+            serde_json::from_str(request).expect("select-panel request JSON"),
+        )
+        .await;
+        (response, rig, store)
     }
 
     #[tokio::test]
@@ -4040,6 +4346,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_explain_by_send_id_returns_recorded_rejections_verbatim() {
+        let rig = Rig::new("route-explain-send-id");
+        let store = Arc::new(rig.open_store());
+        let rejections = json!([
+            { "routeKey": "p/too-slow", "reason": "too_slow", "detail": "recorded" },
+            { "routeKey": "p/too-costly", "reason": "too_expensive" },
+        ]);
+        let score = json!({
+            "adequacy": 0.97,
+            "selectionCost": 12.5,
+            "metrics": { "speed": { "actual": 73.0 } },
+        });
+        store
+            .record_decision(&DecisionInput {
+                decision_id: Some("dec-explain-send".into()),
+                decision_kind: "single".into(),
+                task_id: Some("task-explain".into()),
+                parent_session_id: Some("ses-explain".into()),
+                send_id: Some("send-explain".into()),
+                target_agent: "mason".into(),
+                requirements_json: r#"{"iq":80,"eq":20}"#.into(),
+                selected_route_key: Some("p/selected".into()),
+                selected_provider_id: Some("p".into()),
+                selected_model_id: Some("selected".into()),
+                score_json: serde_json::to_string(&score).unwrap(),
+                rejected_json: serde_json::to_string(&rejections).unwrap(),
+                explanation_json: Some(r#"["cost-primary"]"#.into()),
+                quota_signal_json: Some(r#"{"state":"present","signals":[]}"#.into()),
+                policy_revision: Some("policy-explain".into()),
+                anchor_version: ANCHOR_VERSION,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_EXPLAIN_OP,
+                "params": { "sendID": "send-explain" },
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["decisionID"], "dec-explain-send");
+        assert_eq!(body["result"]["why"]["rejections"], rejections);
+        assert_eq!(body["result"]["why"]["score"], score);
+        assert_eq!(body["result"]["provenance"]["sendID"], "send-explain");
+        assert_eq!(body["result"]["provenance"]["taskID"], "task-explain");
+        assert_eq!(
+            body["result"]["provenance"]["parentSessionID"],
+            "ses-explain"
+        );
+        assert_eq!(body["result"]["provenance"]["targetAgent"], "mason");
+    }
+
+    #[tokio::test]
+    async fn route_decisions_list_composes_target_agent_and_since_filters() {
+        let rig = Rig::new("route-decisions-list-filters");
+        let store = Arc::new(rig.open_store());
+        for (id, target_agent, route_key) in [
+            ("dec-old-mason", "mason", "p/old"),
+            ("dec-new-mason", "mason", "p/new"),
+            ("dec-new-explore", "explore", "p/other"),
+        ] {
+            store
+                .record_decision(&DecisionInput {
+                    decision_id: Some(id.into()),
+                    target_agent: target_agent.into(),
+                    requirements_json: "{}".into(),
+                    selected_route_key: Some(route_key.into()),
+                    score_json: "null".into(),
+                    rejected_json: "[]".into(),
+                    anchor_version: ANCHOR_VERSION,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        for (id, created_at) in [
+            ("dec-old-mason", 1_000_i64),
+            ("dec-new-mason", 6_000_i64),
+            ("dec-new-explore", 7_000_i64),
+        ] {
+            connection
+                .execute(
+                    "UPDATE model_route_decisions SET created_at=?1 WHERE id=?2",
+                    rusqlite::params![created_at, id],
+                )
+                .unwrap();
+        }
+
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_DECISIONS_LIST_OP,
+                "params": { "target_agent": "mason", "since_ms": 5_000 },
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["result"]["decisions"],
+            json!([{
+                "decisionID": "dec-new-mason",
+                "createdAtMs": 6_000,
+                "selectedRouteKey": "p/new",
+                "decisionKind": "single",
+                "topRejectionReason": null,
+                "topRejectionCount": 0,
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn route_explain_unknown_id_names_key_and_retention() {
+        let rig = Rig::new("route-explain-missing");
+        let store = Arc::new(rig.open_store());
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_EXPLAIN_OP,
+                "params": { "decisionID": "dec-pruned" },
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Error);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let message = body["message"].as_str().unwrap();
+        let retention_days = DECISION_RETENTION_MS / (24 * 60 * 60_000);
+        assert_eq!(body["code"], "not_found");
+        assert!(message.contains("decisionID 'dec-pruned'"));
+        assert!(message.contains(&format!(
+            "not found or pruned; retention is {retention_days} days"
+        )));
+    }
+
+    #[tokio::test]
+    async fn route_explain_exactly_one_key_validation_does_not_mutate_decisions() {
+        let rig = Rig::new("route-explain-one-key");
+        let store = Arc::new(rig.open_store());
+        for params in [json!({}), json!({ "decisionID": "dec", "sendID": "send" })] {
+            let response = run_route_wire_request(
+                &store,
+                json!({ "method": ROUTE_EXPLAIN_OP, "params": params }),
+            )
+            .await;
+            assert_eq!(response.header.ty, FrameType::Error);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["code"], "invalid_request");
+            assert!(body["message"]
+                .as_str()
+                .unwrap()
+                .contains("exactly one of decisionID or sendID"));
+        }
+        assert!(store
+            .list_decisions(&DecisionListFilter {
+                limit: 20,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn route_resolve_policy_dispatches_as_a_read_only_wire_query() {
         let request = json!({
             "method": ROUTE_RESOLVE_POLICY_OP,
@@ -4088,6 +4560,11 @@ mod tests {
         assert!(operations
             .iter()
             .any(|operation| operation.name == ROUTE_MODEL_FACT_OP));
+        for operation_name in [ROUTE_EXPLAIN_OP, ROUTE_DECISIONS_LIST_OP] {
+            assert!(operations.iter().any(|operation| {
+                operation.name == operation_name && operation.kind == ManagementOperationKind::Query
+            }));
+        }
     }
 
     #[tokio::test]
