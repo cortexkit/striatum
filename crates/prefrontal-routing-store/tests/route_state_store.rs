@@ -27,8 +27,13 @@ struct Rig {
 impl Rig {
     fn new(label: &str) -> Self {
         let n = N.fetch_add(1, Ordering::Relaxed);
+        // nanos: cross-run uniqueness under pid reuse
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "prefrontal-routing-store-{label}-{}-{n}",
+            "prefrontal-routing-store-{label}-{}-{nanos}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
