@@ -49,6 +49,8 @@ fn effective_runtime(
             by_route.quota_exhausted_until,
             by_capacity.quota_exhausted_until,
         ),
+        failure_backoff_until: by_route.failure_backoff_until,
+        failure_backoff_reason: by_route.failure_backoff_reason,
         success_ema: by_route.success_ema.or(by_capacity.success_ema),
         quota_pressure: by_route.quota_pressure.or(by_capacity.quota_pressure),
         quota_window_model: by_route
@@ -60,7 +62,9 @@ fn effective_runtime(
 }
 
 fn is_blocked(state: &RouteRuntimeState, now: f64) -> bool {
-    if state.cooldown_until.is_some_and(|v| v > now) {
+    if state.cooldown_until.is_some_and(|v| v > now)
+        || state.failure_backoff_until.is_some_and(|until| until > now)
+    {
         return true;
     }
     if state.quota_exhausted_until.is_some_and(|v| v > now) {

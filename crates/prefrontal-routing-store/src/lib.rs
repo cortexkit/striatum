@@ -16,8 +16,9 @@ use prefrontal_routing_core::model_facts::{
 };
 use prefrontal_routing_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
 use prefrontal_routing_core::{
-    derive_provider_key, fact_to_route, DecisionInput, DecisionRow, FactSource,
-    ProviderCooldownState, RouteOutcome, RouteStateResult, RouteStateStore, RouteStateStoreError,
+    derive_provider_key, fact_to_route, failure_backoff_transition, DecisionInput,
+    DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffTransition,
+    ProviderCooldownState, RouteStateResult, RouteStateStore, RouteStateStoreError,
     RouteStateUpdate, UsageObservation, OBSERVED_SPEED_MIN_OUTPUT_TOKENS,
     OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT, OBSERVED_SPEED_WINDOW_MS,
     USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
@@ -108,11 +109,13 @@ const MIGRATION_029: &str = include_str!("../migrations/029_catalog_fingerprint.
 const MIGRATION_030: &str = include_str!("../migrations/030_decision_ledger_join_identity.sql");
 /// Migration 31: retire the never-read catalog generation history.
 const MIGRATION_031: &str = include_str!("../migrations/031_drop_catalog_generation.sql");
+/// Migration 32: consecutive terminal-send-failure counter and short backoff.
+const MIGRATION_032: &str = include_str!("../migrations/032_consecutive_failure_backoff.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 31] {
+fn route_state_migrations() -> [Migration; 32] {
     [
         Migration {
             version: 1,
@@ -238,6 +241,10 @@ fn route_state_migrations() -> [Migration; 31] {
             version: 31,
             statements: MIGRATION_031,
         },
+        Migration {
+            version: 32,
+            statements: MIGRATION_032,
+        },
     ]
 }
 
@@ -328,8 +335,8 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
     Ok(hex[..16].to_string())
 }
 
-/// Retain detailed rejected routes for the common case, then append one summary
-/// for the omitted tail. The stored value remains a JSON array for audit readers.
+/// Retain actionable rejection detail within the ledger's fixed-size bound,
+/// then append one reason-count summary for the omitted tail.
 fn bound_rejected_json(raw: &str) -> String {
     let Ok(serde_json::Value::Array(rejected)) = serde_json::from_str(raw) else {
         return raw.to_string();
@@ -338,16 +345,29 @@ fn bound_rejected_json(raw: &str) -> String {
         return raw.to_string();
     }
 
+    // Backoff is an operator-actionable answer to "why not this route", so keep
+    // it inline even when an alphabetically earlier catalog tail fills the bound.
+    let mut prioritized = Vec::with_capacity(rejected.len());
+    prioritized.extend(rejected.iter().filter(|entry| {
+        entry.get("reason").and_then(serde_json::Value::as_str) == Some("backoff_active")
+    }));
+    prioritized.extend(rejected.iter().filter(|entry| {
+        entry.get("reason").and_then(serde_json::Value::as_str) != Some("backoff_active")
+    }));
+
     let mut reasons = BTreeMap::<String, usize>::new();
-    for entry in &rejected[MAX_STORED_REJECTIONS..] {
+    for entry in &prioritized[MAX_STORED_REJECTIONS..] {
         let reason = entry
             .get("reason")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown");
         *reasons.entry(reason.to_string()).or_default() += 1;
     }
-    let truncated = rejected.len() - MAX_STORED_REJECTIONS;
-    let mut bounded = rejected[..MAX_STORED_REJECTIONS].to_vec();
+    let truncated = prioritized.len() - MAX_STORED_REJECTIONS;
+    let mut bounded = prioritized[..MAX_STORED_REJECTIONS]
+        .iter()
+        .map(|entry| (*entry).clone())
+        .collect::<Vec<_>>();
     bounded.push(serde_json::json!({
         "truncated": truncated,
         "reasons": reasons,
@@ -1003,15 +1023,133 @@ impl RouteStateStore for SqliteRouteStateStore {
     fn set_decision_outcome(
         &self,
         decision_id: &str,
-        outcome: RouteOutcome,
+        update: &DecisionOutcomeUpdate,
     ) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
-                c.execute(
-                    "UPDATE model_route_decisions SET outcome=?1, outcome_at=?2 WHERE id=?3",
-                    params![outcome.as_str(), now_ms(), decision_id],
+                let tx = c.unchecked_transaction()?;
+                let (route_key, selected_provider_id, selected_model_id, prior_outcome): (
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ) = tx.query_row(
+                    "SELECT selected_route_key, selected_provider_id, selected_model_id, outcome
+                     FROM model_route_decisions WHERE id=?1",
+                    [decision_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )?;
-                Ok(())
+
+                // Outcome delivery is soft and may be retried after a lost ack. The first
+                // terminal write owns the counter transition; a replay must not count twice.
+                if prior_outcome.is_some() {
+                    tx.commit()?;
+                    return Ok(());
+                }
+
+                tx.execute(
+                    "UPDATE model_route_decisions
+                     SET outcome=?1, outcome_at=?2, outcome_error=?3
+                     WHERE id=?4 AND outcome IS NULL",
+                    params![
+                        update.outcome.as_str(),
+                        update.observed_at_ms,
+                        update.last_error,
+                        decision_id
+                    ],
+                )?;
+
+                let Some(route_key) = route_key else {
+                    tx.commit()?;
+                    return Ok(());
+                };
+                let (parsed_provider_id, parsed_model_id, variant) = split_route_key(&route_key);
+                let provider_id = selected_provider_id.unwrap_or(parsed_provider_id);
+                let model_id = selected_model_id.unwrap_or(parsed_model_id);
+                let capacity_key = format!("{provider_id}/{model_id}");
+                let existing: Option<(i64, Option<f64>, Option<String>)> = tx
+                    .query_row(
+                        "SELECT consecutive_terminal_failures, failure_backoff_until,
+                                failure_backoff_reason
+                         FROM model_route_state WHERE route_key=?1",
+                        [&route_key],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                let previous_failures = existing
+                    .as_ref()
+                    .map(|state| state.0.max(0) as u32)
+                    .unwrap_or(0);
+
+                match failure_backoff_transition(
+                    previous_failures,
+                    update.outcome,
+                    update.last_error.as_deref(),
+                    update.observed_at_ms,
+                    update.failure_backoff,
+                ) {
+                    FailureBackoffTransition::Unchanged => {}
+                    FailureBackoffTransition::Reset => {
+                        tx.execute(
+                            "UPDATE model_route_state
+                             SET consecutive_terminal_failures=0,
+                                 failure_backoff_until=NULL,
+                                 failure_backoff_reason=NULL,
+                                 updated_at=?1
+                             WHERE route_key=?2",
+                            params![update.observed_at_ms, route_key],
+                        )?;
+                    }
+                    FailureBackoffTransition::Failure {
+                        consecutive_failures,
+                        cooldown_until,
+                        reason,
+                    } => {
+                        let previous_until = existing.as_ref().and_then(|state| state.1);
+                        let previous_reason = existing.as_ref().and_then(|state| state.2.clone());
+                        let failure_backoff_until =
+                            max_defined(previous_until, cooldown_until.map(|value| value as f64));
+                        let failure_backoff_reason = reason.or(previous_reason);
+                        let surfaced_error = update
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| update.outcome.as_str().to_string());
+                        tx.execute(
+                            "INSERT INTO model_route_state (
+                               route_key, capacity_key, provider_id, model_id, variant,
+                               failure_count, last_error, last_error_at, updated_at,
+                               consecutive_terminal_failures, failure_backoff_until,
+                               failure_backoff_reason
+                             ) VALUES (?1,?2,?3,?4,?5,1,?6,?7,?7,?8,?9,?10)
+                             ON CONFLICT(route_key) DO UPDATE SET
+                               capacity_key=excluded.capacity_key,
+                               provider_id=excluded.provider_id,
+                               model_id=excluded.model_id,
+                               variant=excluded.variant,
+                               failure_count=model_route_state.failure_count + 1,
+                               last_error=excluded.last_error,
+                               last_error_at=excluded.last_error_at,
+                               updated_at=excluded.updated_at,
+                               consecutive_terminal_failures=excluded.consecutive_terminal_failures,
+                               failure_backoff_until=excluded.failure_backoff_until,
+                               failure_backoff_reason=excluded.failure_backoff_reason",
+                            params![
+                                route_key,
+                                capacity_key,
+                                provider_id,
+                                model_id,
+                                variant,
+                                surfaced_error,
+                                update.observed_at_ms,
+                                consecutive_failures,
+                                failure_backoff_until,
+                                failure_backoff_reason,
+                            ],
+                        )?;
+                    }
+                }
+
+                tx.commit()
             })
             .map_err(err)
     }
@@ -1212,7 +1350,8 @@ impl RouteStateStore for SqliteRouteStateStore {
 
                 let mut stmt = c.prepare(
                     "SELECT route_key, capacity_key, cooldown_until, quota_exhausted_until,
-                            quota_pressure, latency_ema_ms, success_ema
+                            quota_pressure, latency_ema_ms, success_ema,
+                            failure_backoff_until, failure_backoff_reason
                      FROM model_route_state",
                 )?;
                 let rows = stmt.query_map([], |r| {
@@ -1224,6 +1363,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                         quota_pressure: r.get(4)?,
                         latency_ema_ms: r.get(5)?,
                         success_ema: r.get(6)?,
+                        failure_backoff_until: r.get(7)?,
+                        failure_backoff_reason: r.get(8)?,
                     })
                 })?;
                 for row in rows {
@@ -1233,6 +1374,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                         quota_exhausted_until: row.quota_exhausted_until,
                         latency_ema_ms: row.latency_ema_ms,
                         success_ema: row.success_ema,
+                        failure_backoff_until: row.failure_backoff_until,
+                        failure_backoff_reason: row.failure_backoff_reason,
                         ..Default::default()
                     };
                     // Capacity-shared signals propagate across variants of the same
@@ -1292,6 +1435,8 @@ struct StateRow {
     quota_pressure: Option<f64>,
     latency_ema_ms: Option<f64>,
     success_ema: Option<f64>,
+    failure_backoff_until: Option<f64>,
+    failure_backoff_reason: Option<String>,
 }
 
 /// `max` over two optional times, treating `None` as "no value" (the defined one

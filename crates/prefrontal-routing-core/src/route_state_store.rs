@@ -79,6 +79,7 @@ pub struct ProviderCooldownState {
 pub enum RouteOutcome {
     Completed,
     Error,
+    SessionError,
     Cancelled,
     Interrupted,
     LaunchFailed,
@@ -89,11 +90,20 @@ impl RouteOutcome {
         match self {
             RouteOutcome::Completed => "completed",
             RouteOutcome::Error => "error",
+            RouteOutcome::SessionError => "session_error",
             RouteOutcome::Cancelled => "cancelled",
             RouteOutcome::Interrupted => "interrupted",
             RouteOutcome::LaunchFailed => "launch_failed",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionOutcomeUpdate {
+    pub outcome: RouteOutcome,
+    pub last_error: Option<String>,
+    pub observed_at_ms: i64,
+    pub failure_backoff: crate::failure_backoff::FailureBackoffConfig,
 }
 
 /// What `record_decision` persists: the selection (or none) + its audit context.
@@ -240,11 +250,12 @@ pub trait RouteStateStore {
     /// Record a route decision. Returns the decision id.
     fn record_decision(&self, input: &DecisionInput) -> RouteStateResult<String>;
 
-    /// Set a decision's terminal outcome.
+    /// Set a decision's terminal outcome and atomically update the selected
+    /// route's consecutive-terminal-failure backoff state.
     fn set_decision_outcome(
         &self,
         decision_id: &str,
-        outcome: RouteOutcome,
+        update: &DecisionOutcomeUpdate,
     ) -> RouteStateResult<()>;
 
     /// Decisions for a task, oldest first.

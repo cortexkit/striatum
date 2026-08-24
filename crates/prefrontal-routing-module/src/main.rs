@@ -40,9 +40,10 @@ use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, make_route_key, maybe_upgrade_to_fast_variant,
     relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
     select_panel_with_config, validate_panel_spec, BreakGlassCandidate, DecisionInput,
-    FastVariantUpgradeInput, ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput,
-    PanelRosterEntry, PanelSelection, PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy,
-    RouteOutcome, RouteStateStore, SelectPanelInput, SelectedPanel,
+    DecisionOutcomeUpdate, FailureBackoffConfig, FastVariantUpgradeInput, ModelFact,
+    ModelRequirements, ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection,
+    PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
+    SelectPanelInput, SelectedPanel,
 };
 use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
@@ -1634,7 +1635,7 @@ async fn handle_select_request(
     }
 
     if envelope.method == ROUTE_SET_DECISION_OUTCOME_OP {
-        return handle_set_decision_outcome(frame, writer, store).await;
+        return handle_set_decision_outcome(frame, writer, store, routing_config_path).await;
     }
     if envelope.method == ROUTE_RECORD_USAGE_OP {
         return handle_record_usage(frame, writer, store).await;
@@ -2283,8 +2284,11 @@ struct SetDecisionOutcomeParams {
     // would expect `decisionId`, the lone casing drift that broke the round-trip.
     #[serde(rename = "decisionID")]
     decision_id: String,
-    /// completed | error | cancelled | interrupted | launch_failed
+    /// completed | error | session_error | cancelled | interrupted | launch_failed
     outcome: String,
+    /// Exact terminal send error surfaced by the harness, when one was available.
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2334,6 +2338,7 @@ fn parse_outcome(s: &str) -> Option<RouteOutcome> {
     match s {
         "completed" => Some(RouteOutcome::Completed),
         "error" => Some(RouteOutcome::Error),
+        "session_error" => Some(RouteOutcome::SessionError),
         "cancelled" => Some(RouteOutcome::Cancelled),
         "interrupted" => Some(RouteOutcome::Interrupted),
         "launch_failed" => Some(RouteOutcome::LaunchFailed),
@@ -2368,6 +2373,7 @@ async fn handle_set_decision_outcome(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
+    routing_config_path: &Path,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -2403,7 +2409,20 @@ async fn handle_set_decision_outcome(
         )
         .await;
     };
-    match store.set_decision_outcome(&params.decision_id, outcome) {
+    let failure_backoff = match config_overrides::read_failure_backoff_config(routing_config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("[prefrontal-routing] failure backoff config error (using default): {error}");
+            FailureBackoffConfig::default()
+        }
+    };
+    let update = DecisionOutcomeUpdate {
+        outcome,
+        last_error: params.last_error,
+        observed_at_ms: now_ms() as i64,
+        failure_backoff,
+    };
+    match store.set_decision_outcome(&params.decision_id, &update) {
         Ok(()) => send_ok(writer, ver, channel, epoch, corr).await,
         Err(e) => {
             send_route_error(
@@ -2572,6 +2591,9 @@ async fn handle_cooldown_status(
                     .is_some_and(|until| until > params.now as f64)
                     || state
                         .quota_exhausted_until
+                        .is_some_and(|until| until > params.now as f64)
+                    || state
+                        .failure_backoff_until
                         .is_some_and(|until| until > params.now as f64)
             });
     let body =
@@ -3560,6 +3582,92 @@ mod tests {
         let explanation: serde_json::Value =
             serde_json::from_str(decisions[0].explanation_json.as_deref().unwrap()).unwrap();
         assert!(explanation["failureReason"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn third_session_error_writes_backoff_active_into_refusal_decision_ledger() {
+        const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
+        const LAST_ERROR: &str =
+            "Access to model denied. Please make sure you are eligible for using the model.";
+        let rig = Rig::new("backoff-decision-evidence");
+        let store = Arc::new(rig.open_store());
+        for failure in 1..=3 {
+            let decision_id = store
+                .record_decision(&DecisionInput {
+                    decision_id: Some(format!("dec-session-error-{failure}")),
+                    task_id: Some(format!("failed-task-{failure}")),
+                    target_agent: "mason".into(),
+                    requirements_json: "{\"iq\":80,\"eq\":20}".into(),
+                    selected_route_key: Some(ROUTE.into()),
+                    selected_provider_id: Some("alibaba-token-plan".into()),
+                    selected_model_id: Some("qwen3.8-max-preview".into()),
+                    score_json: "{}".into(),
+                    rejected_json: "[]".into(),
+                    anchor_version: ANCHOR_VERSION,
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .set_decision_outcome(
+                    &decision_id,
+                    &DecisionOutcomeUpdate {
+                        outcome: RouteOutcome::SessionError,
+                        last_error: Some(LAST_ERROR.into()),
+                        observed_at_ms: now_ms() as i64,
+                        failure_backoff: FailureBackoffConfig::default(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let request = json!({
+            "method": ROUTE_SELECT_OP,
+            "params": {
+                "targetAgent": "mason",
+                "requirements": { "iq": 80, "eq": 20 },
+                "availableModels": [ROUTE],
+                "taskId": "backoff-refusal-ledger"
+            }
+        });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &Arc::new(Mutex::new(QuotaCache::default())),
+            &store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Error);
+
+        let decisions = store
+            .get_decisions_for_task("backoff-refusal-ledger")
+            .unwrap();
+        let rejections: serde_json::Value =
+            serde_json::from_str(&decisions[0].rejected_json).unwrap();
+        let qwen = rejections
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rejection| rejection["routeKey"] == ROUTE)
+            .expect("qwen rejection is visible inline");
+        assert_eq!(qwen["reason"], "backoff_active");
+        assert!(qwen["detail"].as_str().unwrap().contains(LAST_ERROR));
+        let explanation: serde_json::Value =
+            serde_json::from_str(decisions[0].explanation_json.as_deref().unwrap()).unwrap();
+        assert!(explanation["earliestReset"].as_f64().is_some());
     }
 
     #[tokio::test]

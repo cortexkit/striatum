@@ -1,0 +1,179 @@
+//! Class-independent route backoff after repeated terminal send failures.
+//!
+//! Provider-specific quota and refusal classifiers remain authoritative. This
+//! policy is the shorter safety net underneath them when a terminal send error
+//! reaches the router without a recognized class.
+
+use crate::RouteOutcome;
+
+pub const DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD: u32 = 3;
+pub const FAILURE_BACKOFF_INITIAL_MS: i64 = 10 * 60 * 1_000;
+pub const FAILURE_BACKOFF_MAX_MS: i64 = 6 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailureBackoffConfig {
+    pub consecutive_terminal_failure_threshold: u32,
+}
+
+impl Default for FailureBackoffConfig {
+    fn default() -> Self {
+        Self {
+            consecutive_terminal_failure_threshold: DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailureBackoffTransition {
+    Unchanged,
+    Reset,
+    Failure {
+        consecutive_failures: u32,
+        cooldown_until: Option<i64>,
+        reason: Option<String>,
+    },
+}
+
+/// Only outcomes that prove the selected route could not complete its send count.
+/// `error`, `session_error`, and `launch_failed` count. `cancelled` is a user abort,
+/// while `interrupted` is a harness cancellation; neither says the route failed.
+pub fn is_terminal_send_failure(outcome: RouteOutcome) -> bool {
+    matches!(
+        outcome,
+        RouteOutcome::Error | RouteOutcome::SessionError | RouteOutcome::LaunchFailed
+    )
+}
+
+pub fn failure_backoff_transition(
+    previous_consecutive_failures: u32,
+    outcome: RouteOutcome,
+    last_error: Option<&str>,
+    now_ms: i64,
+    config: FailureBackoffConfig,
+) -> FailureBackoffTransition {
+    if outcome == RouteOutcome::Completed {
+        return FailureBackoffTransition::Reset;
+    }
+    if !is_terminal_send_failure(outcome) {
+        return FailureBackoffTransition::Unchanged;
+    }
+
+    let consecutive_failures = previous_consecutive_failures.saturating_add(1);
+    let threshold = config.consecutive_terminal_failure_threshold.max(1);
+    if consecutive_failures < threshold {
+        return FailureBackoffTransition::Failure {
+            consecutive_failures,
+            cooldown_until: None,
+            reason: None,
+        };
+    }
+
+    let exponent = consecutive_failures.saturating_sub(threshold).min(31);
+    let duration = FAILURE_BACKOFF_INITIAL_MS
+        .saturating_mul(1_i64 << exponent)
+        .min(FAILURE_BACKOFF_MAX_MS);
+    let error = last_error
+        .filter(|error| !error.is_empty())
+        .unwrap_or_else(|| outcome.as_str());
+    FailureBackoffTransition::Failure {
+        consecutive_failures,
+        cooldown_until: Some(now_ms.saturating_add(duration)),
+        reason: Some(format!(
+            "consecutive terminal send failures: {consecutive_failures}; last error: {error}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPECIMEN_ERROR: &str =
+        "Access to model denied. Please make sure you are eligible for using the model.";
+
+    #[test]
+    fn third_consecutive_session_error_starts_ten_minute_backoff_with_verbatim_reason() {
+        let transition = failure_backoff_transition(
+            2,
+            RouteOutcome::SessionError,
+            Some(SPECIMEN_ERROR),
+            1_000,
+            FailureBackoffConfig::default(),
+        );
+        assert_eq!(
+            transition,
+            FailureBackoffTransition::Failure {
+                consecutive_failures: 3,
+                cooldown_until: Some(1_000 + FAILURE_BACKOFF_INITIAL_MS),
+                reason: Some(format!(
+                    "consecutive terminal send failures: 3; last error: {SPECIMEN_ERROR}"
+                )),
+            }
+        );
+    }
+
+    #[test]
+    fn success_at_two_resets_the_consecutive_failure_counter() {
+        assert_eq!(
+            failure_backoff_transition(
+                2,
+                RouteOutcome::Completed,
+                None,
+                1_000,
+                FailureBackoffConfig::default(),
+            ),
+            FailureBackoffTransition::Reset
+        );
+    }
+
+    #[test]
+    fn user_abort_cancelled_is_excluded_from_the_terminal_send_failure_outcome_filter() {
+        assert!(!is_terminal_send_failure(RouteOutcome::Cancelled));
+        assert_eq!(
+            failure_backoff_transition(
+                2,
+                RouteOutcome::Cancelled,
+                Some("user aborted"),
+                1_000,
+                FailureBackoffConfig::default(),
+            ),
+            FailureBackoffTransition::Unchanged
+        );
+    }
+
+    #[test]
+    fn harness_interruption_is_excluded_from_the_terminal_send_failure_outcome_filter() {
+        assert!(!is_terminal_send_failure(RouteOutcome::Interrupted));
+        assert_eq!(
+            failure_backoff_transition(
+                2,
+                RouteOutcome::Interrupted,
+                Some("harness stopped"),
+                1_000,
+                FailureBackoffConfig::default(),
+            ),
+            FailureBackoffTransition::Unchanged
+        );
+    }
+
+    #[test]
+    fn consecutive_failures_double_backoff_to_the_six_hour_cap() {
+        let config = FailureBackoffConfig::default();
+        let deadline = |previous| match failure_backoff_transition(
+            previous,
+            RouteOutcome::Error,
+            Some("send failed"),
+            0,
+            config,
+        ) {
+            FailureBackoffTransition::Failure {
+                cooldown_until: Some(until),
+                ..
+            } => until,
+            other => panic!("expected active backoff, got {other:?}"),
+        };
+        assert_eq!(deadline(2), FAILURE_BACKOFF_INITIAL_MS);
+        assert_eq!(deadline(3), 2 * FAILURE_BACKOFF_INITIAL_MS);
+        assert_eq!(deadline(30), FAILURE_BACKOFF_MAX_MS);
+    }
+}
