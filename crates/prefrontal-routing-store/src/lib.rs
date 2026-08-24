@@ -396,6 +396,60 @@ pub struct SqliteRouteStateStore {
     store: SqliteStore,
 }
 
+/// One durable routing decision rendered for a diagnostic reader. JSON fields stay
+/// serialized here so the wire layer can return exactly the evidence that was
+/// recorded rather than reconstructing an explanation from today's catalog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionExplainRow {
+    pub id: String,
+    pub decision_kind: String,
+    pub task_id: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub harness: Option<String>,
+    pub project_root: Option<String>,
+    pub send_id: Option<String>,
+    pub target_agent: String,
+    pub requirements_json: String,
+    pub selected_route_key: Option<String>,
+    pub selected_provider_id: Option<String>,
+    pub selected_model_id: Option<String>,
+    pub selected_variant: Option<String>,
+    pub score_json: String,
+    pub rejected_json: String,
+    pub explanation_json: Option<String>,
+    pub quota_signal_json: Option<String>,
+    pub policy_revision: Option<String>,
+    pub anchor_version: i64,
+    pub catalog_fingerprint: Option<String>,
+    pub created_at: i64,
+    pub outcome: Option<String>,
+    pub outcome_at: Option<i64>,
+    pub outcome_error: Option<String>,
+}
+
+/// Optional predicates for the compact decision-ledger list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DecisionListFilter {
+    pub send_id: Option<String>,
+    pub target_agent: Option<String>,
+    pub route_key: Option<String>,
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+    pub limit: usize,
+}
+
+/// One compact decision-ledger list row. The top rejection is derived in SQLite,
+/// so callers do not need the persisted rejection payload to render a recent list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionListRow {
+    pub id: String,
+    pub created_at: i64,
+    pub selected_route_key: Option<String>,
+    pub decision_kind: String,
+    pub top_rejection_reason: Option<String>,
+    pub top_rejection_count: usize,
+}
+
 impl SqliteRouteStateStore {
     /// Open from a resolved descriptor, applying migrations. The single-writer
     /// lease location is derived by the lib from the descriptor's db path (one
@@ -418,6 +472,138 @@ impl SqliteRouteStateStore {
     pub fn catalog_fingerprint(&self) -> RouteStateResult<String> {
         self.store
             .with_conn(|connection: &Connection| calculate_catalog_fingerprint(connection))
+            .map_err(err)
+    }
+
+    /// Look up one decision by its durable id for a diagnostic explanation.
+    pub fn get_decision_by_id(
+        &self,
+        decision_id: &str,
+    ) -> RouteStateResult<Option<DecisionExplainRow>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                connection
+                    .query_row(
+                        "SELECT id, decision_kind, task_id, parent_session_id, harness, project_root,
+                                send_id, target_agent, requirements_json, selected_route_key,
+                                selected_provider_id, selected_model_id, selected_variant, score_json,
+                                rejected_json, explanation_json, quota_signal_json, policy_revision,
+                                anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
+                                outcome_error
+                         FROM model_route_decisions
+                         WHERE id=?1",
+                        [decision_id],
+                        decision_explain_row,
+                    )
+                    .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Look up the most recent decision correlated to one launch attempt.
+    pub fn get_decision_by_send_id(
+        &self,
+        send_id: &str,
+    ) -> RouteStateResult<Option<DecisionExplainRow>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                connection
+                    .query_row(
+                        "SELECT id, decision_kind, task_id, parent_session_id, harness, project_root,
+                                send_id, target_agent, requirements_json, selected_route_key,
+                                selected_provider_id, selected_model_id, selected_variant, score_json,
+                                rejected_json, explanation_json, quota_signal_json, policy_revision,
+                                anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
+                                outcome_error
+                         FROM model_route_decisions
+                         WHERE send_id=?1
+                         ORDER BY created_at DESC, id DESC
+                         LIMIT 1",
+                        [send_id],
+                        decision_explain_row,
+                    )
+                    .optional()
+            })
+            .map_err(err)
+    }
+
+    /// List recent decisions without returning their full audit payloads.
+    pub fn list_decisions(
+        &self,
+        filter: &DecisionListFilter,
+    ) -> RouteStateResult<Vec<DecisionListRow>> {
+        let limit = filter.limit.min(100) as i64;
+        self.store
+            .with_conn(|connection: &Connection| {
+                // Observability queries that pulled send-payload-scale JSON caused measured disk
+                // churn. Keep this list to compact scalars and derive rejection counts in SQLite;
+                // requirements, scores, explanations, and quota snapshots stay on explain only.
+                let mut statement = connection.prepare(
+                    "WITH filtered AS (
+                         SELECT id, created_at, selected_route_key, decision_kind, rejected_json
+                         FROM model_route_decisions
+                         WHERE (?1 IS NULL OR send_id=?1)
+                           AND (?2 IS NULL OR target_agent=?2)
+                           AND (?3 IS NULL OR selected_route_key=?3)
+                           AND (?4 IS NULL OR created_at>=?4)
+                           AND (?5 IS NULL OR created_at<=?5)
+                         ORDER BY created_at DESC, id DESC
+                         LIMIT ?6
+                     ), rejection_counts AS (
+                         SELECT filtered.id,
+                                json_extract(
+                                    CASE WHEN rejection.type='object' THEN rejection.value ELSE '{}' END,
+                                    '$.reason'
+                                ) AS reason,
+                                COUNT(*) AS count
+                         FROM filtered
+                         JOIN json_each(
+                             CASE WHEN json_valid(filtered.rejected_json)
+                                  THEN filtered.rejected_json ELSE '[]' END
+                         ) AS rejection
+                         WHERE json_type(
+                             CASE WHEN rejection.type='object' THEN rejection.value ELSE '{}' END,
+                             '$.reason'
+                         )='text'
+                         GROUP BY filtered.id, reason
+                     ), top_rejections AS (
+                         SELECT id, reason, count,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY id ORDER BY count DESC, reason ASC
+                                ) AS rank
+                         FROM rejection_counts
+                     )
+                     SELECT filtered.id, filtered.created_at, filtered.selected_route_key,
+                            filtered.decision_kind, top_rejections.reason,
+                            COALESCE(top_rejections.count, 0)
+                     FROM filtered
+                     LEFT JOIN top_rejections
+                       ON top_rejections.id=filtered.id AND top_rejections.rank=1
+                     ORDER BY filtered.created_at DESC, filtered.id DESC",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        filter.send_id.as_deref(),
+                        filter.target_agent.as_deref(),
+                        filter.route_key.as_deref(),
+                        filter.since_ms,
+                        filter.until_ms,
+                        limit,
+                    ],
+                    |row| {
+                        let top_rejection_count = row.get::<_, i64>(5)?;
+                        Ok(DecisionListRow {
+                            id: row.get(0)?,
+                            created_at: row.get(1)?,
+                            selected_route_key: row.get(2)?,
+                            decision_kind: row.get(3)?,
+                            top_rejection_reason: row.get(4)?,
+                            top_rejection_count: top_rejection_count.max(0) as usize,
+                        })
+                    },
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
             .map_err(err)
     }
 
@@ -481,6 +667,35 @@ impl SqliteRouteStateStore {
             })
             .map_err(err)
     }
+}
+
+fn decision_explain_row(row: &Row<'_>) -> rusqlite::Result<DecisionExplainRow> {
+    Ok(DecisionExplainRow {
+        id: row.get(0)?,
+        decision_kind: row.get(1)?,
+        task_id: row.get(2)?,
+        parent_session_id: row.get(3)?,
+        harness: row.get(4)?,
+        project_root: row.get(5)?,
+        send_id: row.get(6)?,
+        target_agent: row.get(7)?,
+        requirements_json: row.get(8)?,
+        selected_route_key: row.get(9)?,
+        selected_provider_id: row.get(10)?,
+        selected_model_id: row.get(11)?,
+        selected_variant: row.get(12)?,
+        score_json: row.get(13)?,
+        rejected_json: row.get(14)?,
+        explanation_json: row.get(15)?,
+        quota_signal_json: row.get(16)?,
+        policy_revision: row.get(17)?,
+        anchor_version: row.get(18)?,
+        catalog_fingerprint: row.get(19)?,
+        created_at: row.get(20)?,
+        outcome: row.get(21)?,
+        outcome_at: row.get(22)?,
+        outcome_error: row.get(23)?,
+    })
 }
 
 fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {

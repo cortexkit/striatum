@@ -15,7 +15,7 @@ use prefrontal_routing_core::{
     RouteStateUpdate, RoutingConfig, SelectModelRouteInput, UsageObservation,
     FAILURE_BACKOFF_INITIAL_MS,
 };
-use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
 
 static N: AtomicU64 = AtomicU64::new(0);
 
@@ -872,6 +872,72 @@ fn migration_030_preserves_real_028_era_decision_rows_without_join_identity() {
             None,
         )
     );
+}
+
+#[test]
+fn decision_read_queries_render_full_explanations_and_compact_lists() {
+    let rig = Rig::new("decision-read-queries");
+    let store = rig.open();
+    let rejections = serde_json::json!([
+        { "routeKey": "p/slow", "reason": "too_slow" },
+        { "routeKey": "p/expensive", "reason": "too_expensive" },
+        { "routeKey": "p/also-slow", "reason": "too_slow" },
+    ]);
+    store
+        .record_decision(&DecisionInput {
+            decision_id: Some("dec-read".into()),
+            decision_kind: "single".into(),
+            task_id: Some("task-read".into()),
+            parent_session_id: Some("ses-read".into()),
+            harness: Some("broca".into()),
+            project_root: Some("/repos/read".into()),
+            send_id: Some("send-read".into()),
+            target_agent: "mason".into(),
+            requirements_json: r#"{"iq":80,"eq":20}"#.into(),
+            selected_route_key: Some("p/selected".into()),
+            selected_provider_id: Some("p".into()),
+            selected_model_id: Some("selected".into()),
+            score_json: r#"{"adequacy":0.98,"selectionCost":2,"metrics":{"speed":7}}"#.into(),
+            rejected_json: serde_json::to_string(&rejections).unwrap(),
+            explanation_json: Some(r#"["cost-primary"]"#.into()),
+            quota_signal_json: Some(r#"{"state":"present"}"#.into()),
+            policy_revision: Some("policy-read".into()),
+            anchor_version: 9,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let explanation = store
+        .get_decision_by_send_id("send-read")
+        .unwrap()
+        .expect("send id resolves its decision");
+    assert_eq!(explanation.id, "dec-read");
+    assert_eq!(explanation.parent_session_id.as_deref(), Some("ses-read"));
+    assert_eq!(
+        explanation.rejected_json,
+        serde_json::to_string(&rejections).unwrap()
+    );
+    assert_eq!(
+        store
+            .get_decision_by_id("dec-read")
+            .unwrap()
+            .unwrap()
+            .score_json,
+        r#"{"adequacy":0.98,"selectionCost":2,"metrics":{"speed":7}}"#
+    );
+
+    let rows = store
+        .list_decisions(&DecisionListFilter {
+            target_agent: Some("mason".into()),
+            limit: 20,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "dec-read");
+    assert_eq!(rows[0].selected_route_key.as_deref(), Some("p/selected"));
+    assert_eq!(rows[0].top_rejection_reason.as_deref(), Some("too_slow"));
+    assert_eq!(rows[0].top_rejection_count, 2);
 }
 
 #[test]
