@@ -2792,42 +2792,52 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 ManagementOperation {
                     name: ROUTE_SELECT_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
+                    description: None,
                 },
                 ManagementOperation {
                     name: ROUTE_RESOLVE_POLICY_OP.to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 },
                 ManagementOperation {
                     name: ROUTE_MODEL_FACT_OP.to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 },
                 ManagementOperation {
                     name: ROUTE_MODEL_UPSERT_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
+                    description: None,
                 },
                 ManagementOperation {
                     name: ROUTE_SELECT_PANEL_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
+                    description: None,
                 },
                 ManagementOperation {
                     name: ROUTE_SET_DECISION_OUTCOME_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
+                    description: None,
                 },
                 ManagementOperation {
                     name: ROUTE_RECORD_USAGE_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
+                    description: None,
                 },
                 ManagementOperation {
                     name: ROUTE_RECORD_COOLDOWN_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
+                    description: None,
                 },
                 ManagementOperation {
                     name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 },
                 ManagementOperation {
                     name: QUOTA_STATUS_OP.to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 },
             ],
             config_schema: json!({ "type": "object" }),
