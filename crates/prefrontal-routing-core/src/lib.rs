@@ -11,6 +11,7 @@
 //! port's behavioral parity is provable, not assumed.
 
 pub mod break_glass;
+pub mod failure_backoff;
 pub mod fast_variant;
 pub mod launch_policy;
 pub mod model_facts;
@@ -27,6 +28,11 @@ pub mod routing_config;
 pub mod seat_routing;
 
 pub use break_glass::{relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot};
+pub use failure_backoff::{
+    failure_backoff_transition, is_terminal_send_failure, FailureBackoffConfig,
+    FailureBackoffTransition, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD,
+    FAILURE_BACKOFF_INITIAL_MS, FAILURE_BACKOFF_MAX_MS,
+};
 pub use fast_variant::{
     maybe_upgrade_to_fast_variant, FastVariantUpgradeInput, FAST_UPGRADE_MAX_PRESSURE,
 };
@@ -71,10 +77,11 @@ pub use quota_pace::{
 };
 pub use route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 pub use route_state_store::{
-    DecisionInput, DecisionRow, FactSource, ProviderCooldownState, RouteOutcome, RouteStateResult,
-    RouteStateStore, RouteStateStoreError, RouteStateUpdate, UsageObservation,
-    OBSERVED_SPEED_MIN_OUTPUT_TOKENS, OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT,
-    OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
+    DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource, ProviderCooldownState,
+    RouteOutcome, RouteStateResult, RouteStateStore, RouteStateStoreError, RouteStateUpdate,
+    UsageObservation, OBSERVED_SPEED_MIN_OUTPUT_TOKENS, OBSERVED_SPEED_MIN_SAMPLES,
+    OBSERVED_SPEED_SAMPLE_LIMIT, OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS,
+    USAGE_MIN_OUTPUT_TOKENS,
 };
 pub use routing_config::{
     demand_bar, fit_ratio, RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, ANCHOR_VERSION,

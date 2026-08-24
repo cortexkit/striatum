@@ -46,6 +46,10 @@ pub struct RouteRuntimeState {
     pub cooldown_until: Option<f64>,
     /// Confirmed quota exhaustion until this time (ms epoch).
     pub quota_exhausted_until: Option<f64>,
+    /// Route-local short backoff after repeated unclassified terminal send failures.
+    pub failure_backoff_until: Option<f64>,
+    /// Operator-facing reason containing the consecutive count and last send error.
+    pub failure_backoff_reason: Option<String>,
     /// 0..1, lower = worse recent reliability. None = unknown (neutral).
     pub success_ema: Option<f64>,
     /// Soft quota pressure 0..1 (e.g. pace projection). None = unknown.
@@ -144,6 +148,8 @@ pub struct ObjectiveBreakdown {
 pub struct RejectedRoute {
     pub route_key: String,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -341,6 +347,8 @@ fn merged_runtime_state(
             merged.quota_exhausted_until,
             route_state.quota_exhausted_until,
         );
+        merged.failure_backoff_until = route_state.failure_backoff_until;
+        merged.failure_backoff_reason = route_state.failure_backoff_reason.clone();
         // Soft telemetry remains route-specific when present.
         if route_state.success_ema.is_some() {
             merged.success_ema = route_state.success_ema;
@@ -400,6 +408,7 @@ pub fn admit_routes(
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "excluded".to_string(),
+                detail: None,
             });
             continue;
         }
@@ -407,6 +416,7 @@ pub fn admit_routes(
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "not_available".to_string(),
+                detail: None,
             });
             continue;
         }
@@ -414,6 +424,7 @@ pub fn admit_routes(
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: reason.to_string(),
+                detail: None,
             });
             continue;
         }
@@ -433,6 +444,7 @@ pub fn admit_routes(
                 rejected.push(RejectedRoute {
                     route_key: route.route_key,
                     reason: "fast_variant_not_opted_in".to_string(),
+                    detail: None,
                 });
                 continue;
             }
@@ -448,6 +460,7 @@ pub fn admit_routes(
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "cooldown_active".to_string(),
+                detail: None,
             });
             continue;
         }
@@ -458,6 +471,18 @@ pub fn admit_routes(
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "quota_exhausted".to_string(),
+                detail: None,
+            });
+            continue;
+        }
+        if runtime
+            .failure_backoff_until
+            .is_some_and(|until| until > now)
+        {
+            rejected.push(RejectedRoute {
+                route_key: route.route_key,
+                reason: "backoff_active".to_string(),
+                detail: runtime.failure_backoff_reason.clone(),
             });
             continue;
         }
@@ -633,13 +658,15 @@ pub fn select_model_route_with_config(
     );
 
     if admissible.is_empty() {
+        let earliest_reset =
+            earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
         return Err(NoRouteError {
             reason: classify_empty_admission(&rejected),
             message: "no admissible model route for requirements".to_string(),
             rejected,
             requirements: Some(requirements),
             best_rejected: None,
-            earliest_reset: None,
+            earliest_reset,
         });
     }
 
@@ -674,32 +701,8 @@ pub fn select_model_route_with_config(
             route_key: a.route.route_key.clone(),
             adequacy: a.adequacy.adequacy,
         });
-        // Earliest quota/cooldown reset among THIS REQUEST'S quota/cooldown
-        // rejections, through the same helper break-glass acts on. An earlier
-        // inline scan here read every state in the snapshot, so the diagnostic
-        // could name a reset belonging to a route that was never a candidate
-        // (excluded or capability-rejected), promising a recovery this caller
-        // could not have.
-        let reset_candidates: Vec<crate::break_glass::BreakGlassCandidate> = {
-            let quota_rejected: std::collections::HashSet<&str> = rejected
-                .iter()
-                .filter(|r| matches!(r.reason.as_str(), "quota_exhausted" | "cooldown_active"))
-                .map(|r| r.route_key.as_str())
-                .collect();
-            input
-                .facts
-                .iter()
-                .map(fact_to_route)
-                .filter(|route| quota_rejected.contains(route.route_key.as_str()))
-                .map(|route| crate::break_glass::BreakGlassCandidate {
-                    route_key: route.route_key,
-                    capacity_key: route.capacity_key,
-                })
-                .collect()
-        };
-        let earliest_reset = input.runtime_snapshot.as_ref().and_then(|snap| {
-            crate::break_glass::earliest_reset_among_candidates(snap, &reset_candidates)
-        });
+        let earliest_reset =
+            earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
 
         return Err(NoRouteError {
             reason: RouteFailureReason::AllRoutesInadequate,
@@ -837,6 +840,19 @@ pub fn select_model_route_with_config(
         winner.objective.selection_cost,
     ));
     explanation.extend(winner.objective_notes.iter().cloned());
+    explanation.extend(rejected.iter().filter_map(|route| {
+        (route.reason == "backoff_active").then(|| {
+            format!(
+                "route {} rejected: backoff_active{}",
+                route.route_key,
+                route
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!(" ({detail})"))
+                    .unwrap_or_default()
+            )
+        })
+    }));
 
     let prompt_variant = fact
         .prompt_defaults
@@ -882,13 +898,45 @@ pub fn select_model_route_with_config(
     })
 }
 
+fn earliest_reset_for_rejections(
+    facts: &[ModelFact],
+    snapshot: Option<&ModelRouteStateSnapshot>,
+    rejected: &[RejectedRoute],
+) -> Option<f64> {
+    let blocked: HashSet<&str> = rejected
+        .iter()
+        .filter(|rejection| {
+            matches!(
+                rejection.reason.as_str(),
+                "quota_exhausted" | "cooldown_active" | "backoff_active"
+            )
+        })
+        .map(|rejection| rejection.route_key.as_str())
+        .collect();
+    let candidates = facts
+        .iter()
+        .map(fact_to_route)
+        .filter(|route| blocked.contains(route.route_key.as_str()))
+        .map(|route| crate::break_glass::BreakGlassCandidate {
+            route_key: route.route_key,
+            capacity_key: route.capacity_key,
+        })
+        .collect::<Vec<_>>();
+    snapshot.and_then(|snapshot| {
+        crate::break_glass::earliest_reset_among_candidates(snapshot, &candidates)
+    })
+}
+
 fn classify_empty_admission(rejected: &[RejectedRoute]) -> RouteFailureReason {
     let reasons: HashSet<&str> = rejected.iter().map(|r| r.reason.as_str()).collect();
     // Prioritize the most RECOVERABLE/actionable signal, even when reasons are
     // mixed. A quota/cooldown-blocked route passed the capability gates, so its
     // presence means a capable route merely needs to reset: break-glass can
     // relax it. This must win over "not_available" peers.
-    if reasons.contains("quota_exhausted") || reasons.contains("cooldown_active") {
+    if reasons.contains("quota_exhausted")
+        || reasons.contains("cooldown_active")
+        || reasons.contains("backoff_active")
+    {
         return RouteFailureReason::QuotaOrCooldownExhausted;
     }
     if reasons.contains("missing_vision") {

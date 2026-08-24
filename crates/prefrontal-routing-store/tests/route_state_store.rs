@@ -9,10 +9,11 @@ use prefrontal_routing_core::model_facts::{
     Confidence, ModelFact, ModelPromptDefaults, ModelScores,
 };
 use prefrontal_routing_core::{
-    derive_provider_key, make_capacity_key, make_route_key, relax_earliest_reset,
-    select_model_route, BreakGlassCandidate, DecisionInput, FactSource, ModelRequirements,
-    RouteFailureReason, RouteOutcome, RouteStateStore, RouteStateUpdate, SelectModelRouteInput,
-    UsageObservation,
+    admit_routes, derive_provider_key, make_capacity_key, make_route_key, relax_earliest_reset,
+    select_model_route, BreakGlassCandidate, DecisionInput, DecisionOutcomeUpdate, FactSource,
+    FailureBackoffConfig, ModelRequirements, RouteFailureReason, RouteOutcome, RouteStateStore,
+    RouteStateUpdate, RoutingConfig, SelectModelRouteInput, UsageObservation,
+    FAILURE_BACKOFF_INITIAL_MS,
 };
 use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
 
@@ -533,7 +534,15 @@ fn record_decision_and_set_outcome() {
         })
         .unwrap();
     store
-        .set_decision_outcome(&id, RouteOutcome::Completed)
+        .set_decision_outcome(
+            &id,
+            &DecisionOutcomeUpdate {
+                outcome: RouteOutcome::Completed,
+                last_error: None,
+                observed_at_ms: 1_000,
+                failure_backoff: FailureBackoffConfig::default(),
+            },
+        )
         .unwrap();
 
     let decisions = store.get_decisions_for_task("t1").unwrap();
@@ -544,6 +553,173 @@ fn record_decision_and_set_outcome() {
         Some("anthropic/claude-opus-4-8")
     );
     assert_eq!(decisions[0].outcome.as_deref(), Some("completed"));
+}
+
+fn selected_decision(store: &impl RouteStateStore, id: &str, route_key: &str) -> String {
+    let (provider_id, model_id) = route_key.split_once('/').unwrap();
+    store
+        .record_decision(&DecisionInput {
+            decision_id: Some(id.to_string()),
+            task_id: Some(id.to_string()),
+            target_agent: "mason".into(),
+            requirements_json: "{\"iq\":80,\"eq\":20}".into(),
+            selected_route_key: Some(route_key.into()),
+            selected_provider_id: Some(provider_id.into()),
+            selected_model_id: Some(model_id.into()),
+            score_json: "{}".into(),
+            rejected_json: "[]".into(),
+            anchor_version: 5,
+            ..Default::default()
+        })
+        .unwrap()
+}
+
+fn set_outcome(
+    store: &impl RouteStateStore,
+    decision_id: &str,
+    outcome: RouteOutcome,
+    last_error: Option<&str>,
+    observed_at_ms: i64,
+) {
+    store
+        .set_decision_outcome(
+            decision_id,
+            &DecisionOutcomeUpdate {
+                outcome,
+                last_error: last_error.map(str::to_owned),
+                observed_at_ms,
+                failure_backoff: FailureBackoffConfig::default(),
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn three_consecutive_session_failures_cool_qwen_by_name_and_preserve_quota_wall() {
+    const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
+    const ERROR: &str =
+        "Access to model denied. Please make sure you are eligible for using the model.";
+    let rig = Rig::new("consecutive-failure-backoff");
+    let store = rig.open();
+    store
+        .update_route_state(
+            ROUTE,
+            ROUTE,
+            &RouteStateUpdate {
+                quota_exhausted_until: Some(9_000_000.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    for failure in 1..=3 {
+        let id = selected_decision(&store, &format!("dec-qwen-{failure}"), ROUTE);
+        set_outcome(
+            &store,
+            &id,
+            RouteOutcome::SessionError,
+            Some(ERROR),
+            1_000 + failure,
+        );
+    }
+
+    let snapshot = store.build_snapshot(2_000.0).unwrap();
+    let state = snapshot.by_route.get(ROUTE).expect("qwen state");
+    assert_eq!(
+        state.failure_backoff_until,
+        Some((1_003 + FAILURE_BACKOFF_INITIAL_MS) as f64)
+    );
+    assert_eq!(state.quota_exhausted_until, Some(9_000_000.0));
+    assert_eq!(
+        state.failure_backoff_reason.as_deref(),
+        Some(
+            "consecutive terminal send failures: 3; last error: Access to model denied. Please make sure you are eligible for using the model."
+        )
+    );
+
+    let fact = store
+        .get_fact_by_route_key(ROUTE)
+        .unwrap()
+        .expect("qwen fact");
+    let quota_admission = admit_routes(
+        std::slice::from_ref(&fact),
+        Some(&snapshot),
+        &[],
+        &[],
+        &[],
+        None,
+        &[ROUTE.to_string()].into_iter().collect(),
+        &ModelRequirements { iq: 80.0, eq: 20.0 },
+        &RoutingConfig::default(),
+    );
+    assert_eq!(quota_admission.rejected.len(), 1);
+    assert_eq!(quota_admission.rejected[0].route_key, ROUTE);
+    assert_eq!(
+        quota_admission.rejected[0].reason, "quota_exhausted",
+        "the existing longer quota wall remains authoritative over the shorter safety net"
+    );
+
+    let mut backoff_only = snapshot;
+    backoff_only
+        .by_route
+        .get_mut(ROUTE)
+        .unwrap()
+        .quota_exhausted_until = None;
+    backoff_only
+        .by_capacity
+        .get_mut(ROUTE)
+        .unwrap()
+        .quota_exhausted_until = None;
+    let backoff_admission = admit_routes(
+        &[fact],
+        Some(&backoff_only),
+        &[],
+        &[],
+        &[],
+        None,
+        &[ROUTE.to_string()].into_iter().collect(),
+        &ModelRequirements { iq: 80.0, eq: 20.0 },
+        &RoutingConfig::default(),
+    );
+    assert_eq!(backoff_admission.rejected[0].route_key, ROUTE);
+    assert_eq!(backoff_admission.rejected[0].reason, "backoff_active");
+    assert!(backoff_admission.rejected[0]
+        .detail
+        .as_deref()
+        .unwrap()
+        .contains(ERROR));
+}
+
+#[test]
+fn success_after_two_terminal_failures_resets_before_the_third_failure() {
+    const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
+    let rig = Rig::new("consecutive-failure-reset");
+    let store = rig.open();
+    for failure in 1..=2 {
+        let id = selected_decision(&store, &format!("dec-failure-{failure}"), ROUTE);
+        set_outcome(
+            &store,
+            &id,
+            RouteOutcome::SessionError,
+            Some("send failed"),
+            failure,
+        );
+    }
+    let success = selected_decision(&store, "dec-success", ROUTE);
+    set_outcome(&store, &success, RouteOutcome::Completed, None, 3);
+    let failure = selected_decision(&store, "dec-after-success", ROUTE);
+    set_outcome(
+        &store,
+        &failure,
+        RouteOutcome::SessionError,
+        Some("send failed again"),
+        4,
+    );
+
+    let snapshot = store.build_snapshot(5.0).unwrap();
+    let state = snapshot.by_route.get(ROUTE).expect("qwen state");
+    assert_eq!(state.failure_backoff_until, None);
+    assert_eq!(state.failure_backoff_reason, None);
 }
 
 #[test]

@@ -105,6 +105,7 @@ pub enum PanelCauseReason {
     Excluded,
     Unavailable,
     QuotaExhausted,
+    BackoffActive,
     Capability,
     BelowIqFloor,
     MissingFact,
@@ -116,6 +117,8 @@ pub enum PanelCauseReason {
 pub struct PanelCause {
     pub model: String,
     pub reason: PanelCauseReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -292,9 +295,11 @@ pub fn select_panel_with_config(
         reason: match rejected.reason.as_str() {
             "excluded" => PanelCauseReason::Excluded,
             "quota_exhausted" | "cooldown_active" => PanelCauseReason::QuotaExhausted,
+            "backoff_active" => PanelCauseReason::BackoffActive,
             "missing_vision" | "context_too_small" => PanelCauseReason::Capability,
             _ => PanelCauseReason::Unavailable,
         },
+        detail: rejected.detail,
     }));
 
     // Zero means no IQ requirement, matching singular route selection. The floor
@@ -319,6 +324,7 @@ pub fn select_panel_with_config(
             causes.push(PanelCause {
                 model,
                 reason: PanelCauseReason::BelowIqFloor,
+                detail: None,
             });
             continue;
         }
@@ -383,6 +389,7 @@ pub fn select_panel_with_config(
                 causes.push(PanelCause {
                     model: candidate.route.capacity_key.clone(),
                     reason: PanelCauseReason::FamilyUnlabeled,
+                    detail: None,
                 });
                 false
             }
@@ -408,6 +415,7 @@ pub fn select_panel_with_config(
                 causes.push(PanelCause {
                     model: candidate.route.capacity_key.clone(),
                     reason: PanelCauseReason::FamilyDuplicate,
+                    detail: None,
                 });
             }
         }
@@ -456,6 +464,7 @@ pub fn select_panel_with_config(
             causes.push(PanelCause {
                 model: "<unfilled-slot>".into(),
                 reason: PanelCauseReason::Unavailable,
+                detail: None,
             });
         }
         let detail = match code {
@@ -531,6 +540,7 @@ fn roster_facts(
             None => causes.push(PanelCause {
                 model: entry.model.clone(),
                 reason: PanelCauseReason::MissingFact,
+                detail: None,
             }),
         }
     }

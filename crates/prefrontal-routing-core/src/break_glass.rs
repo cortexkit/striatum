@@ -23,11 +23,15 @@ pub struct RelaxedSnapshot {
 }
 
 fn earliest_future_reset(state: &RouteRuntimeState, now: f64) -> Option<f64> {
-    [state.quota_exhausted_until, state.cooldown_until]
-        .into_iter()
-        .flatten()
-        .filter(|reset| *reset > now)
-        .min_by(f64::total_cmp)
+    [
+        state.quota_exhausted_until,
+        state.cooldown_until,
+        state.failure_backoff_until,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|reset| *reset > now)
+    .min_by(f64::total_cmp)
 }
 
 /// The candidate's own earliest future reset across both state scopes.

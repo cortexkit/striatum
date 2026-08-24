@@ -18,8 +18,8 @@ use std::time::SystemTime;
 
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores};
 use prefrontal_routing_core::{
-    make_route_key, model_facts_seed, FactSource, RouteStateStore, RoutingConfig,
-    DEFAULT_DEMAND_EXPONENT,
+    make_route_key, model_facts_seed, FactSource, FailureBackoffConfig, RouteStateStore,
+    RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
 };
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
@@ -71,6 +71,9 @@ struct ModelRoutingSection {
     /// Clamped to [0, 1]; NaN is rejected loudly at parse time.
     #[serde(default)]
     min_best_effort_adequacy: Option<f64>,
+    /// Terminal send failures required before the route-local safety backoff starts.
+    #[serde(default, alias = "consecutiveTerminalFailureThreshold")]
+    consecutive_terminal_failure_threshold: Option<u32>,
     /// Providers that do not expose prompt-cache reads or writes. Gather seats
     /// avoid these providers when a cache-capable adequate route exists.
     #[serde(
@@ -247,6 +250,32 @@ pub fn apply_overrides_from_config<S: RouteStateStore>(
 
 /// Read `min_best_effort_adequacy` from the routing config file, validating and
 /// clamping the value. Returns `None` when absent or the file is missing.
+pub fn read_failure_backoff_config(path: &Path) -> Result<FailureBackoffConfig, String> {
+    let doc = match std::fs::read_to_string(path) {
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FailureBackoffConfig::default());
+        }
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let json = jsonc_to_json(&doc)
+        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
+    let config: RoutingConfigFile = serde_json::from_str(&json)
+        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
+    let threshold = config
+        .model_routing
+        .consecutive_terminal_failure_threshold
+        .unwrap_or(DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD);
+    if threshold == 0 {
+        return Err(
+            "model_routing.consecutive_terminal_failure_threshold must be at least 1".to_string(),
+        );
+    }
+    Ok(FailureBackoffConfig {
+        consecutive_terminal_failure_threshold: threshold,
+    })
+}
+
 pub fn read_min_best_effort_adequacy(path: &std::path::Path) -> Result<Option<f64>, String> {
     let doc = match std::fs::read_to_string(path) {
         Ok(d) => d,
@@ -1009,6 +1038,35 @@ mod tests {
         // Edge values: 0 and 1 pass through.
         assert!((super::validate_min_best_effort_adequacy(0.0).unwrap() - 0.0).abs() < 1e-9);
         assert!((super::validate_min_best_effort_adequacy(1.0).unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn consecutive_terminal_failure_threshold_is_configurable_and_rejects_zero() {
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-failure-threshold-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("routing.jsonc");
+        std::fs::write(
+            &config_path,
+            r#"{ "model_routing": { "consecutive_terminal_failure_threshold": 5 } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::read_failure_backoff_config(&config_path)
+                .unwrap()
+                .consecutive_terminal_failure_threshold,
+            5
+        );
+
+        std::fs::write(
+            &config_path,
+            r#"{ "model_routing": { "consecutive_terminal_failure_threshold": 0 } }"#,
+        )
+        .unwrap();
+        assert!(super::read_failure_backoff_config(&config_path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
