@@ -2913,8 +2913,13 @@ mod tests {
     impl Rig {
         fn new(label: &str) -> Self {
             let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            // nanos: cross-run uniqueness under pid reuse
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos();
             let dir = std::env::temp_dir().join(format!(
-                "prefrontal-routing-module-{label}-{}-{n}",
+                "prefrontal-routing-module-{label}-{}-{nanos}-{n}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&dir).unwrap();

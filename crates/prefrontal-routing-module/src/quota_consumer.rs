@@ -234,8 +234,13 @@ mod tests {
 
     fn connection_file_path(port: u16) -> std::path::PathBuf {
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // nanos: cross-run uniqueness under pid reuse
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
         let path = std::env::temp_dir().join(format!(
-            "prefrontal-routing-quota-consumer-{pid}-{n}.json",
+            "prefrontal-routing-quota-consumer-{pid}-{nanos}-{n}.json",
             pid = std::process::id()
         ));
         std::fs::write(
