@@ -162,18 +162,23 @@ fn merge_quota_windows(
     for window in existing.drain(..) {
         let key = quota_cache_key(&window);
         if let Some(replacement) = fresh_by_key.remove(&key) {
-            // Two classes will not self-recover, so a retained "last healthy"
+            // Three classes will not self-recover, so a retained "last healthy"
             // window is a fiction that can only mislead: credential_absent
-            // (nobody configured the credential on this host) and
-            // credential_unusable (QTA 2026-08-15: a revoked OAuth grant -
-            // Google answers invalid_grant, permanent under RFC 6749, only a
-            // re-authorisation recovers it; before QTA's classifier fix this
-            // state stale-served forever and looked like a live provider with
-            // old data). Drop retention for both and take the degraded entry
-            // as the truth. Every other class keeps retention: decode_failed
-            // self-recovers, upstream/rejected age out via the freshness map.
+            // (nobody configured the credential on this host), credential_unusable
+            // (QTA 2026-08-15: a revoked OAuth grant - Google answers
+            // invalid_grant, permanent under RFC 6749, only a re-authorisation
+            // recovers it), and no_quota_reported (QTA 2026-08-24, qwen
+            // subscription-end incident: valid credential, gateway affirms
+            // success and reports NO plan block - the plan is gone; the retained
+            // healthy window routed workers to a dead subscription for a day
+            // before this arm learned the class). Drop retention for all three
+            // and take the degraded entry as the truth. Every other class keeps
+            // retention: decode_failed self-recovers, upstream/rejected age out
+            // via the freshness map.
             let dead_credential = replacement.error_class.as_deref().is_some_and(|class| {
-                class == "credential_absent" || class == "credential_unusable"
+                class == "credential_absent"
+                    || class == "credential_unusable"
+                    || class == "no_quota_reported"
             });
             if window.is_healthy() && !replacement.is_healthy() && !dead_credential {
                 if retained_degraded_keys.insert(key.clone()) {
@@ -3310,6 +3315,38 @@ mod tests {
         assert!(
             retained_degraded_keys.is_empty(),
             "no retention record for a revoked account"
+        );
+    }
+
+    #[test]
+    fn no_quota_reported_class_drops_retention_and_takes_the_degraded_entry() {
+        // no_quota_reported is an ended plan (gateway affirms success, no plan
+        // block) - QTA 4f6d048; the same truth-not-degradation family,
+        // not trouble: retaining a last-healthy window for it manufactures a
+        // provider that does not exist on this host. Classless degraded entries
+        // (older QTA) and every other class keep the retention path above.
+        let mut cached = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 97.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }))];
+        let fresh = vec![usage(serde_json::json!({
+            "provider": "codex",
+            "error": "qwen-cloud: the account has no token plan (gateway affirmed success and reported no plan block)",
+            "errorClass": "no_quota_reported"
+        }))];
+        let mut retained_degraded_keys = HashSet::new();
+
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+
+        assert_eq!(cached.len(), 1);
+        assert!(
+            cached[0].error.is_some(),
+            "degraded no_quota_reported entry replaces the stale healthy window"
+        );
+        assert_eq!(cached[0].error_class.as_deref(), Some("no_quota_reported"));
+        assert!(
+            retained_degraded_keys.is_empty(),
+            "no retention record for a provider that does not exist here"
         );
     }
 
