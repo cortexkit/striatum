@@ -2820,6 +2820,9 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 optional: Vec::new(),
             },
         },
+        // None until this module declares versioned capabilities; the wire
+        // field is optional and absent-means-none.
+        capabilities: None,
     }
 }
 
