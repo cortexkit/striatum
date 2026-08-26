@@ -3157,6 +3157,9 @@ fn manifest(module_id: &str) -> ModuleManifest {
         // None until this module declares versioned capabilities; the wire
         // field is optional and absent-means-none.
         capabilities: None,
+        // Wire-optional, construct-required since subc-protocol 0.13 (PR#59):
+        // None until the deploy script injects CK_BUILD_* provenance facts.
+        provenance: None,
     }
 }
 
