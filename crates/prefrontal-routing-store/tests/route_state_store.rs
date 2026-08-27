@@ -1659,19 +1659,24 @@ fn migration_007_rebases_catalog_and_preserves_overrides() {
 fn speed_multiplier_applies_after_observed_speed_overlay() {
     let rig = Rig::new("speed-multiplier-overlay");
     let store = rig.open();
+    // set_speed_multipliers replaces a PROCESS-GLOBAL map with no restore, and
+    // tests share the process: keying this test on the fixture-standard "p/m"
+    // halved every later reader's p/m speed (90 -> 45) whenever the scheduler
+    // ran this test first - green locally, red on CI's core count. A route key
+    // no other test reads removes the collision domain instead of racing it.
     store
-        .upsert_fact(&fact("p", "m"), FactSource::Override)
+        .upsert_fact(&fact("pmult", "mmult"), FactSource::Override)
         .unwrap();
 
     let mut multipliers = std::collections::HashMap::new();
-    multipliers.insert("p/m".to_string(), 0.5);
+    multipliers.insert("pmult/mmult".to_string(), 0.5);
     prefrontal_routing_core::model_facts::set_speed_multipliers(multipliers);
 
     for i in 0..5 {
         store
             .record_usage_observation(&obs(
                 &format!("s{i}"),
-                "p/m",
+                "pmult/mmult",
                 2000.0,
                 1000.0,
                 1000.0 + i as f64,
@@ -1682,7 +1687,7 @@ fn speed_multiplier_applies_after_observed_speed_overlay() {
     let after = store.get_facts_with_observed_speed(10_000.0).unwrap();
     let pm_after = after
         .iter()
-        .find(|f| f.provider_id == "p" && f.model_id == "m")
+        .find(|f| f.provider_id == "pmult" && f.model_id == "mmult")
         .unwrap();
     assert!(
         (pm_after.scores.speed - 1000.0).abs() < 1e-9,
