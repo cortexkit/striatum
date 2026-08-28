@@ -2174,7 +2174,7 @@ fn panel_decision_input(
         harness: params
             .harness
             .as_deref()
-            .filter(|value| matches!(*value, "opencode" | "broca"))
+            .filter(|value| matches!(*value, "opencode" | "broca" | "pi"))
             .map(str::to_owned),
         project_root: params
             .project_root
@@ -2219,7 +2219,7 @@ fn decision_input_for(
             harness: params
                 .harness
                 .as_deref()
-                .filter(|value| matches!(*value, "opencode" | "broca"))
+                .filter(|value| matches!(*value, "opencode" | "broca" | "pi"))
                 .map(str::to_owned),
             project_root: params
                 .project_root
@@ -2252,7 +2252,7 @@ fn decision_input_for(
                 harness: params
                     .harness
                     .as_deref()
-                    .filter(|value| matches!(*value, "opencode" | "broca"))
+                    .filter(|value| matches!(*value, "opencode" | "broca" | "pi"))
                     .map(str::to_owned),
                 project_root: params
                     .project_root
@@ -4085,7 +4085,7 @@ mod tests {
                 "availableModels": ["p/join-identity-route"],
                 "taskId": "run-with-identity",
                 "parentSessionID": "ses-reused",
-                "harness": "broca",
+                "harness": "pi",
                 "projectRoot": "/repos/one"
             }),
             std::slice::from_ref(&route),
@@ -4103,7 +4103,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             stored_identity,
-            (Some("broca".into()), Some("/repos/one".into()))
+            (Some("pi".into()), Some("/repos/one".into()))
         );
 
         let (without_identity, without_identity_rig) = run_select_wire_request(
