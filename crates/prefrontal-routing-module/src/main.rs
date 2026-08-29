@@ -3065,6 +3065,7 @@ fn control_flags() -> Flags {
 /// schema and is the sole writer for its provider and route cooldown state.
 fn manifest(module_id: &str) -> ModuleManifest {
     ModuleManifest {
+        self_signals: None,
         module_id: module_id.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_ver: PROTOCOL_VERSION,
