@@ -78,6 +78,8 @@ const ROUTE_EXPLAIN_OP: &str = "route.explain";
 const ROUTE_DECISIONS_LIST_OP: &str = "route.decisions_list";
 /// Read one model capability fact from the live route-state catalog.
 const ROUTE_MODEL_FACT_OP: &str = "route.model_fact";
+/// Read the complete durable model catalog for display and observation consumers.
+const ROUTE_MODEL_FACTS_OP: &str = "route.model_facts";
 /// Live catalog write: add a model or adjust its scores/metadata without a
 /// store migration or module deploy. Merge semantics against the stored fact;
 /// writes land as FactSource::Override so a re-seed never reverts them.
@@ -1277,6 +1279,51 @@ async fn handle_model_upsert(
     send(writer, response).await
 }
 
+/// route.model_facts: serve the durable catalog without reconstructing facts in
+/// the plugin. Inventory consumers receive every stored capability field and the
+/// explicit exclusion bit, so an absent capability remains unknown rather than
+/// being fabricated from a local fallback.
+async fn handle_model_facts(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let facts = match store.get_catalog_facts() {
+        Ok(facts) => facts,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("model_facts: {error}"),
+            )
+            .await;
+        }
+    };
+    let body =
+        serde_json::to_vec(&json!({ "result": { "facts": facts } })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
 async fn handle_model_fact(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -1666,6 +1713,9 @@ async fn handle_select_request(
     }
     if envelope.method == ROUTE_MODEL_FACT_OP {
         return handle_model_fact(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_MODEL_FACTS_OP {
+        return handle_model_facts(frame, writer, store).await;
     }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         return handle_model_upsert(frame, writer, store).await;
@@ -3092,6 +3142,11 @@ fn manifest(module_id: &str) -> ModuleManifest {
                     description: None,
                 },
                 ManagementOperation {
+                    name: ROUTE_MODEL_FACTS_OP.to_string(),
+                    kind: ManagementOperationKind::Query,
+                    description: None,
+                },
+                ManagementOperation {
                     name: ROUTE_MODEL_UPSERT_OP.to_string(),
                     kind: ManagementOperationKind::Mutate,
                     description: None,
@@ -3502,6 +3557,57 @@ mod tests {
             body["result"],
             json!({ "known": true, "supportsVision": true })
         );
+    }
+
+    #[tokio::test]
+    async fn route_model_facts_reads_a_live_store_row_with_catalog_fields() {
+        let rig = Rig::new("live-model-facts");
+        let store = Arc::new(rig.open_store());
+        let mut live_fact = fact("fixture", "wire-only");
+        live_fact.scores = ModelScores {
+            elo: 1_701.0,
+            eq: 1_801.5,
+            speed: 91.0,
+        };
+        live_fact.cost_per_m_tok_out = Some(7.25);
+        live_fact.supports_vision = Some(false);
+        live_fact.supports_tool_use = Some(true);
+        store
+            .upsert_fact(&live_fact, FactSource::Override)
+            .expect("write fixture directly to the routing store");
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .expect("open fixture database")
+            .execute(
+                "UPDATE model_facts SET excluded = 1 WHERE route_key = 'fixture/wire-only'",
+                [],
+            )
+            .expect("mark the fixture route excluded");
+
+        let response = run_route_wire_request(
+            &store,
+            json!({ "method": ROUTE_MODEL_FACTS_OP, "params": {} }),
+        )
+        .await;
+
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let facts = body["result"]["facts"]
+            .as_array()
+            .expect("model_facts returns a facts array");
+        let fact = facts
+            .iter()
+            .find(|candidate| {
+                candidate["providerID"] == "fixture" && candidate["modelID"] == "wire-only"
+            })
+            .expect("the wire response includes the store-only fixture row");
+        assert_eq!(
+            fact["scores"],
+            json!({ "elo": 1701.0, "eq": 1801.5, "speed": 91.0 })
+        );
+        assert_eq!(fact["costPerMTokOut"], 7.25);
+        assert_eq!(fact["supportsVision"], false);
+        assert_eq!(fact["supportsToolUse"], true);
+        assert_eq!(fact["excluded"], true);
     }
 
     #[test]

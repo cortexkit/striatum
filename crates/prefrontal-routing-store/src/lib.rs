@@ -259,6 +259,17 @@ fn err(e: impl std::fmt::Display) -> RouteStateStoreError {
     RouteStateStoreError(e.to_string())
 }
 
+/// One catalog row served to read-only consumers. `excluded` stays separate from
+/// the model fact because it describes routing policy state rather than a model
+/// capability, but catalog readers need both to render an honest inventory.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogFact {
+    #[serde(flatten)]
+    pub fact: ModelFact,
+    pub excluded: bool,
+}
+
 #[derive(Serialize)]
 struct CatalogFingerprintRow {
     route_key: String,
@@ -472,6 +483,27 @@ impl SqliteRouteStateStore {
     pub fn catalog_fingerprint(&self) -> RouteStateResult<String> {
         self.store
             .with_conn(|connection: &Connection| calculate_catalog_fingerprint(connection))
+            .map_err(err)
+    }
+
+    /// All durable catalog rows, including each row's routing-exclusion state.
+    ///
+    /// This is intentionally separate from `RouteStateStore::get_facts`: selection
+    /// only needs capabilities, while read-only inventory consumers must not infer
+    /// policy state from a missing capability or a filtered result.
+    pub fn get_catalog_facts(&self) -> RouteStateResult<Vec<CatalogFact>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                let mut statement =
+                    connection.prepare("SELECT * FROM model_facts ORDER BY route_key")?;
+                let rows = statement.query_map([], |row| {
+                    Ok(CatalogFact {
+                        fact: row_to_fact(row)?,
+                        excluded: row.get::<_, i64>("excluded")? != 0,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
             .map_err(err)
     }
 

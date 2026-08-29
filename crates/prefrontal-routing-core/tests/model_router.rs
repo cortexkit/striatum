@@ -2,7 +2,8 @@
 //! (`src/features/model-routing/model-router.test.ts`). Same inputs/outputs as
 //! the TS suite; this is the behavioral-parity proof for the port. The
 //! seed-backed cases (TS `describe("model facts seed")`) land with the
-//! model-facts-seed port slice; everything else from the TS file is here.
+//! The seed-backed catalog test cases are a fixed subset; all other TypeScript
+//! suite cases are included below.
 
 use std::collections::HashSet;
 
