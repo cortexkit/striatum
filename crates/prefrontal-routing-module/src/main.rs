@@ -3064,86 +3064,15 @@ fn control_flags() -> Flags {
 /// empty and the identity binding requires nothing. The routing module owns this
 /// schema and is the sole writer for its provider and route cooldown state.
 fn manifest(module_id: &str) -> ModuleManifest {
-    ModuleManifest {
-        self_signals: None,
-        module_id: module_id.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![ProviderRole::ManagementSurface {
-            // Deliberate lane, not a default: routing serves concurrent
-            // selection reads; Serial would put every route decision in
-            // one queue.
-            concurrency: Concurrency::ModuleManaged,
-            operations: vec![
-                // route.select is now a MUTATE: it records the decision it returns.
-                ManagementOperation {
-                    name: ROUTE_SELECT_OP.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_RESOLVE_POLICY_OP.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_MODEL_FACT_OP.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_MODEL_UPSERT_OP.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_SELECT_PANEL_OP.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_SET_DECISION_OUTCOME_OP.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_RECORD_USAGE_OP.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_RECORD_COOLDOWN_OP.to_string(),
-                    kind: ManagementOperationKind::Mutate,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_EXPLAIN_OP.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: ROUTE_DECISIONS_LIST_OP.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: None,
-                },
-                ManagementOperation {
-                    name: QUOTA_STATUS_OP.to_string(),
-                    kind: ManagementOperationKind::Query,
-                    description: None,
-                },
-            ],
-            config_schema: json!({ "type": "object" }),
-            observability: Vec::new(),
-            identity_scope: Vec::new(),
-        }],
-        consumes: Vec::new(),
-        bindings: Bindings {
+    // ModuleManifest went #[non_exhaustive] with a mandatory builder in
+    // subc-protocol (sibling commit 9f3e6faa); optional declarations stay at
+    // their absent defaults: no capabilities, no self-signals, and no
+    // provenance until the deploy script injects CK_BUILD_* facts.
+    ModuleManifest::builder(
+        module_id,
+        env!("CARGO_PKG_VERSION"),
+        TrustTier::FirstParty,
+        Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -3155,13 +3084,81 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 optional: Vec::new(),
             },
         },
-        // None until this module declares versioned capabilities; the wire
-        // field is optional and absent-means-none.
-        capabilities: None,
-        // Wire-optional, construct-required since subc-protocol 0.13 (PR#59):
-        // None until the deploy script injects CK_BUILD_* provenance facts.
-        provenance: None,
-    }
+    )
+    .protocol_ver(PROTOCOL_VERSION)
+    .provides(vec![ProviderRole::ManagementSurface {
+        // Deliberate lane, not a default: routing serves concurrent
+        // selection reads; Serial would put every route decision in
+        // one queue.
+        concurrency: Concurrency::ModuleManaged,
+        operations: vec![
+            // route.select is now a MUTATE: it records the decision it returns.
+            ManagementOperation {
+                name: ROUTE_SELECT_OP.to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_RESOLVE_POLICY_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_MODEL_FACT_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_MODEL_UPSERT_OP.to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_SELECT_PANEL_OP.to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_SET_DECISION_OUTCOME_OP.to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_RECORD_USAGE_OP.to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_RECORD_COOLDOWN_OP.to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_EXPLAIN_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_DECISIONS_LIST_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: QUOTA_STATUS_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+        ],
+        config_schema: json!({ "type": "object" }),
+        observability: Vec::new(),
+        identity_scope: Vec::new(),
+    }])
+    .build()
 }
 
 fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, ModuleError> {
