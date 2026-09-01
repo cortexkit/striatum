@@ -624,8 +624,7 @@ fn diversity_first_order(candidates: &mut [Candidate], preserve_top_slot: bool) 
     }
 
     let mut old_positions: Vec<usize> = (0..candidates.len()).collect();
-    for new_position in 0..candidates.len() {
-        let wanted_old_position = ordered_indices[new_position];
+    for (new_position, &wanted_old_position) in ordered_indices.iter().enumerate() {
         let current_position = old_positions
             .iter()
             .position(|position| *position == wanted_old_position)

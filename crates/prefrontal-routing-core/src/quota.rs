@@ -308,6 +308,7 @@ fn record_capacity_signal(
 ///     not document pool draw order, so routing never targets an individual pool;
 ///     a non-derived empty balance walls through the same no-reset re-probe path,
 ///     while a `derived` balance contributes pacing only.
+///
 /// Fresh soft pressure REPLACES any older stored pressure on `by_capacity`, so a
 /// recovered provider can become cheaper again as soon as a new window is fetched.
 /// Hard exhaustion still keeps the WORST/LATEST reset, because a confirmed future

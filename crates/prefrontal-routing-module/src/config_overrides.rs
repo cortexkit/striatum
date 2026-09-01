@@ -221,9 +221,7 @@ pub struct OverrideOutcome {
 /// module default.
 pub fn validate_min_best_effort_adequacy(raw: f64) -> Result<f64, String> {
     if raw.is_nan() {
-        return Err(format!(
-            "model_routing.min_best_effort_adequacy must be a number, got NaN"
-        ));
+        return Err("model_routing.min_best_effort_adequacy must be a number, got NaN".to_string());
     }
     Ok(raw.clamp(0.0, 1.0))
 }

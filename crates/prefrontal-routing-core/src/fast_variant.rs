@@ -166,9 +166,7 @@ pub fn maybe_upgrade_to_fast_variant(
     if !input.quota_signal_fresh {
         return None;
     }
-    let Some(pressure) = fast_runtime.quota_pressure else {
-        return None;
-    };
+    let pressure = fast_runtime.quota_pressure?;
     if pressure > FAST_UPGRADE_MAX_PRESSURE {
         return None;
     }
