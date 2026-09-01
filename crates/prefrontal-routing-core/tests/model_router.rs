@@ -79,6 +79,7 @@ fn availability_of(facts: &[ModelFact]) -> HashSet<String> {
     s
 }
 
+#[derive(Default)]
 struct Extra<'a> {
     available_models: Option<HashSet<String>>,
     runtime_snapshot: Option<ModelRouteStateSnapshot>,
@@ -88,21 +89,6 @@ struct Extra<'a> {
     min_best_effort_adequacy: Option<f64>,
     prefer_prompt_cache: bool,
     providers_without_prompt_cache: HashSet<String>,
-}
-
-impl<'a> Default for Extra<'a> {
-    fn default() -> Self {
-        Extra {
-            available_models: None,
-            runtime_snapshot: None,
-            prefer_fast_specs: Vec::new(),
-            required_capabilities: None,
-            is_subscription_route: None,
-            min_best_effort_adequacy: None,
-            prefer_prompt_cache: false,
-            providers_without_prompt_cache: HashSet::new(),
-        }
-    }
 }
 
 fn input<'a>(

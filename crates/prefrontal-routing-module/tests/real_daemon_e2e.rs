@@ -170,11 +170,11 @@ async fn real_subc_core_supervises_routing_module_and_routes_select() {
         "[real-daemon] catalog entry: {}",
         serde_json::to_string(&entry).unwrap()
     );
-    let exposes_select = entry["roles"].as_array().map_or(false, |roles| {
+    let exposes_select = entry["roles"].as_array().is_some_and(|roles| {
         roles.iter().any(|role| {
-            role["operations"].as_array().map_or(false, |ops| {
-                ops.iter().any(|op| op["name"] == "route.select")
-            })
+            role["operations"]
+                .as_array()
+                .is_some_and(|ops| ops.iter().any(|op| op["name"] == "route.select"))
         })
     });
     assert!(

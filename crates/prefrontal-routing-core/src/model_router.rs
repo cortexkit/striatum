@@ -840,19 +840,22 @@ pub fn select_model_route_with_config(
         winner.objective.selection_cost,
     ));
     explanation.extend(winner.objective_notes.iter().cloned());
-    explanation.extend(rejected.iter().filter_map(|route| {
-        (route.reason == "backoff_active").then(|| {
-            format!(
-                "route {} rejected: backoff_active{}",
-                route.route_key,
-                route
-                    .detail
-                    .as_deref()
-                    .map(|detail| format!(" ({detail})"))
-                    .unwrap_or_default()
-            )
-        })
-    }));
+    explanation.extend(
+        rejected
+            .iter()
+            .filter(|route| route.reason == "backoff_active")
+            .map(|route| {
+                format!(
+                    "route {} rejected: backoff_active{}",
+                    route.route_key,
+                    route
+                        .detail
+                        .as_deref()
+                        .map(|detail| format!(" ({detail})"))
+                        .unwrap_or_default()
+                )
+            }),
+    );
 
     let prompt_variant = fact
         .prompt_defaults

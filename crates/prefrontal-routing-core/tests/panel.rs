@@ -498,7 +498,10 @@ fn shortfall_precedence_and_empty_success() {
     )
     .unwrap();
     assert_eq!(serialized["members"], json!([]));
-    assert!(serialized["shortfall"]["causes"].as_array().unwrap().len() >= 1);
+    assert!(!serialized["shortfall"]["causes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
