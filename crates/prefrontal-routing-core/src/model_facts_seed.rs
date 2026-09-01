@@ -1,10 +1,10 @@
-//! Curated model facts: the live resolved catalog, ported from the Alfonso TS
-//! plugin (`src/features/model-routing/model-facts-seed.ts`).
+//! Curated model facts kept unchanged as seed data for bootstrapping and testing migrations.
 //!
-//! The seed is DATA, not logic: the generated TS catalog is exported to
-//! `model_facts_seed.json` and parsed here. `ModelFact`'s serde field names match
-//! that generated shape (`providerID`, `modelID`, `family`, `costPerMTokOut`, ...),
-//! so the JSON round-trips without remapping.
+//! The seed is DATA, not logic: `model_facts_seed.json` preserves the historical
+//! catalog used by migration fixtures and is parsed here. Live catalog reads belong
+//! to the routing store. `ModelFact`'s serde field names match the stored wire
+//! shape (`providerID`, `modelID`, `family`, `costPerMTokOut`, ...), so the JSON
+//! round-trips without remapping.
 //!
 //! Provenance (all real sources, no fabrication):
 //!   - `elo`  : operator-resolved open capability Elo placement.
