@@ -15,12 +15,15 @@
 use crate::model_facts::ModelFact;
 use crate::model_router::ModelRouteStateSnapshot;
 
-/// Provenance of a stored fact: the curated seed, or a user/config override.
-/// Overrides survive a re-seed; the seed only fills absent rows.
+/// Provenance of a stored fact. The closed vocabulary the router and listing ops
+/// speak is `curated` / `override` / `aa_inferred` (plus `unscored` as a catalog
+/// state, not a score). Existing rows keep `source='seed'`; that stamp is curated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactSource {
     Seed,
     Override,
+    AaInferred,
+    Unscored,
 }
 
 impl FactSource {
@@ -28,7 +31,33 @@ impl FactSource {
         match self {
             FactSource::Seed => "seed",
             FactSource::Override => "override",
+            FactSource::AaInferred => "aa_inferred",
+            FactSource::Unscored => "unscored",
         }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "override" => FactSource::Override,
+            "aa_inferred" => FactSource::AaInferred,
+            "unscored" => FactSource::Unscored,
+            // `curated` is the closed vocabulary; `seed` is the historical stamp.
+            _ => FactSource::Seed,
+        }
+    }
+
+    pub fn provenance(&self) -> crate::model_facts::ScoreProvenance {
+        match self {
+            FactSource::Seed => crate::model_facts::ScoreProvenance::Curated,
+            FactSource::Override => crate::model_facts::ScoreProvenance::Override,
+            FactSource::AaInferred => crate::model_facts::ScoreProvenance::AaInferred,
+            FactSource::Unscored => crate::model_facts::ScoreProvenance::Unscored,
+        }
+    }
+
+    /// `aa_inferred` never overwrites these stamps; `override` always wins over it.
+    pub fn blocks_aa_inferred(&self) -> bool {
+        matches!(self, FactSource::Seed | FactSource::Override)
     }
 }
 

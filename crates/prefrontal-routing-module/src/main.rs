@@ -14,6 +14,7 @@
 //! caller passes the task's requirements + the set of available routes; the
 //! module runs the pure `prefrontal-routing-core` scorer and returns the selection.
 
+mod aa_ingest;
 mod config_overrides;
 mod quota_consumer;
 
@@ -28,7 +29,7 @@ use std::{
 };
 
 use cortexkit_store_types::StorageDescriptor;
-use prefrontal_routing_core::model_facts::{Confidence, ModelScores};
+use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::model_router::{
     select_model_route_with_config, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
     RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
@@ -96,6 +97,10 @@ const ROUTE_COOLDOWN_STATUS_OP: &str = "route.cooldown_status";
 /// live and how fresh its windows are. Lets a consumer (and the e2e) confirm the
 /// module->module quota path actually round-tripped, not just that it didn't hang.
 const QUOTA_STATUS_OP: &str = "route.quota_status";
+/// Seed a provisional AA-inferred score for one router key (management, primary-only).
+const ROUTE_MODEL_SEED_AA_OP: &str = "route.model_seed_aa";
+/// Operator worklist: every `aa_inferred` row plus unscored catalog rows.
+const ROUTE_LIST_INFERRED_OP: &str = "route.list_inferred";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 /// How often the background task refreshes quota windows from insula.
@@ -537,6 +542,10 @@ where
         Arc::clone(&quota_cache),
         Arc::clone(&store),
     ));
+    tokio::spawn(aa_ingest::aa_ingest_loop(
+        Arc::clone(&store),
+        config_overrides::config_path(),
+    ));
 
     // Merge the user's model-fact overrides (model_routing.models) from the module's
     // OWN config-home file onto the migration-applied seed. The module owns its
@@ -878,6 +887,11 @@ struct ModelUpsertBody {
     params: ModelUpsertParams,
 }
 
+#[derive(Debug, Deserialize)]
+struct SeedAaBody {
+    params: aa_ingest::SeedAaParams,
+}
+
 /// Partial fact: absent fields keep the stored value on merge, and a NEW model
 /// requires elo + eq (the two judgment axes nothing can default honestly).
 #[derive(Debug, Deserialize)]
@@ -1103,6 +1117,10 @@ fn merge_model_upsert(
                 notes: None,
                 speed_multiplier: None,
                 subscription_multiplier: None,
+                score_provenance: ScoreProvenance::Curated,
+                aa_index: None,
+                review_by_ms: None,
+                eq_source: None,
             }
         }
     };
@@ -1277,6 +1295,139 @@ async fn handle_model_upsert(
     )
     .map_err(|error| ModuleError::Message(error.to_string()))?;
     send(writer, response).await
+}
+
+async fn handle_model_seed_aa(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+    routing_config_path: &Path,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params = match serde_json::from_slice::<SeedAaBody>(&frame.body) {
+        Ok(body)
+            if !body.params.provider_id.trim().is_empty()
+                && !body.params.model_id.trim().is_empty() =>
+        {
+            body.params
+        }
+        Ok(_) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                "model_seed_aa requires non-empty providerID and modelID",
+            )
+            .await;
+        }
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "invalid_request",
+                &format!("model_seed_aa params not decodable: {error}"),
+            )
+            .await;
+        }
+    };
+    let aa_config = match config_overrides::read_aa_config(routing_config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &error)
+                .await;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    match aa_ingest::seed_aa(store, &params, &aa_config, now) {
+        Ok(ok) => {
+            let body =
+                serde_json::to_vec(&json!({ "result": aa_ingest::seed_aa_result_json(&ok) }))
+                    .map_err(ModuleError::Json)?;
+            let response = Frame::build_with_version(
+                ver,
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                corr,
+                body,
+            )
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
+            send(writer, response).await
+        }
+        Err(refusal) => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                refusal.as_str(),
+                refusal.message(),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_list_inferred(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    match aa_ingest::list_inferred_json(store, now) {
+        Ok(result) => {
+            let body =
+                serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
+            let response = Frame::build_with_version(
+                ver,
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                corr,
+                body,
+            )
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
+            send(writer, response).await
+        }
+        Err(error) => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("list_inferred: {error}"),
+            )
+            .await
+        }
+    }
 }
 
 /// route.model_facts: serve the durable catalog without reconstructing facts in
@@ -1657,6 +1808,19 @@ async fn handle_select_request(
         }
     };
 
+    if !handles(&envelope.method) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "unknown_method",
+            &format!("unknown method '{}'", envelope.method),
+        )
+        .await;
+    }
+
     if envelope.method == QUOTA_STATUS_OP {
         let (available, refreshed_at_ms, providers, healthy, last_error) = match quota_cache.lock()
         {
@@ -1719,6 +1883,12 @@ async fn handle_select_request(
     }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         return handle_model_upsert(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_MODEL_SEED_AA_OP {
+        return handle_model_seed_aa(frame, writer, store, routing_config_path).await;
+    }
+    if envelope.method == ROUTE_LIST_INFERRED_OP {
+        return handle_list_inferred(frame, writer, store).await;
     }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(frame, writer, quota_cache, store, routing_config_path).await;
@@ -3108,6 +3278,27 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
+fn handles(method: &str) -> bool {
+    matches!(
+        method,
+        ROUTE_SELECT_OP
+            | ROUTE_RESOLVE_POLICY_OP
+            | ROUTE_MODEL_FACT_OP
+            | ROUTE_MODEL_FACTS_OP
+            | ROUTE_MODEL_UPSERT_OP
+            | ROUTE_MODEL_SEED_AA_OP
+            | ROUTE_LIST_INFERRED_OP
+            | ROUTE_SELECT_PANEL_OP
+            | ROUTE_SET_DECISION_OUTCOME_OP
+            | ROUTE_RECORD_USAGE_OP
+            | ROUTE_RECORD_COOLDOWN_OP
+            | ROUTE_COOLDOWN_STATUS_OP
+            | ROUTE_EXPLAIN_OP
+            | ROUTE_DECISIONS_LIST_OP
+            | QUOTA_STATUS_OP
+    )
+}
+
 /// The module's capability manifest: a ManagementSurface exposing routing operations.
 ///
 /// The catalog and route-state tables are machine-global, so `identity_scope` is
@@ -3167,6 +3358,21 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 name: ROUTE_MODEL_UPSERT_OP.to_string(),
                 kind: ManagementOperationKind::Mutate,
                 description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_MODEL_SEED_AA_OP.to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: Some(
+                    "Seed a provisional AA-inferred score for one router key (primary-only)"
+                        .to_string(),
+                ),
+            },
+            ManagementOperation {
+                name: ROUTE_LIST_INFERRED_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: Some(
+                    "List aa_inferred scores and unscored catalog rows for hand review".to_string(),
+                ),
             },
             ManagementOperation {
                 name: ROUTE_SELECT_PANEL_OP.to_string(),
@@ -3443,6 +3649,10 @@ mod tests {
             notes: None,
             speed_multiplier: None,
             subscription_multiplier: None,
+            score_provenance: ScoreProvenance::Curated,
+            aa_index: None,
+            review_by_ms: None,
+            eq_source: None,
         }
     }
 
@@ -5124,5 +5334,159 @@ mod tests {
             Some(12.0)
         );
         assert!(!retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+    }
+
+    #[test]
+    fn handles_covers_every_manifest_operation() {
+        let operations = manifest(DEFAULT_MODULE_ID)
+            .provides
+            .iter()
+            .find_map(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => Some(operations.clone()),
+                _ => None,
+            })
+            .expect("routing module must expose a management surface");
+        for operation in &operations {
+            assert!(
+                handles(&operation.name),
+                "manifest op {} missing from handles allowlist",
+                operation.name
+            );
+        }
+        assert!(handles(ROUTE_MODEL_SEED_AA_OP));
+        assert!(handles(ROUTE_LIST_INFERRED_OP));
+        assert!(!handles("route.unknown"));
+    }
+
+    #[tokio::test]
+    async fn route_model_seed_aa_and_list_inferred_wire() {
+        let rig = Rig::new("seed-aa-wire");
+        let store = Arc::new(rig.open_store());
+        store
+            .replace_aa_index_table(&[("new-slug".into(), 60.0)], 1)
+            .unwrap();
+        let config_path = rig.dir.join("alfonso-routing.jsonc");
+        std::fs::write(
+            &config_path,
+            r#"{ "aa": { "model_map": { "custom/wire-inferred": "new-slug" } } }"#,
+        )
+        .unwrap();
+
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({
+                "method": ROUTE_MODEL_SEED_AA_OP,
+                "params": { "providerID": "custom", "modelID": "wire-inferred" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &Arc::new(Mutex::new(QuotaCache::default())),
+            &store,
+            &Arc::new(Mutex::new(None)),
+            &config_path,
+        )
+        .await
+        .unwrap();
+        let response = rx.recv().await.unwrap();
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["provenance"], "aa_inferred");
+
+        let listed = run_route_wire_request(
+            &store,
+            json!({ "method": ROUTE_LIST_INFERRED_OP, "params": {} }),
+        )
+        .await;
+        assert_eq!(listed.header.ty, FrameType::Response);
+        let listed_body: serde_json::Value = serde_json::from_slice(&listed.body).unwrap();
+        assert_eq!(
+            listed_body["result"]["inferred"][0]["routeKey"],
+            "custom/wire-inferred"
+        );
+        assert!(listed_body["result"]["unscored"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn aa_inferred_is_admitted_and_unscored_is_not_replayable() {
+        let rig = Rig::new("aa-inferred-admit");
+        let store = Arc::new(rig.open_store());
+        let mut inferred = fact("custom", "aa-live");
+        inferred.scores.elo = 1_800.0;
+        inferred.score_provenance = ScoreProvenance::AaInferred;
+        inferred.aa_index = Some(55.0);
+        store
+            .upsert_fact(&inferred, FactSource::AaInferred)
+            .unwrap();
+        let mut unscored = fact("custom", "no-score");
+        unscored.scores.elo = 2_000.0;
+        unscored.score_provenance = ScoreProvenance::Unscored;
+        store.upsert_fact(&unscored, FactSource::Unscored).unwrap();
+
+        let request = json!({
+            "method": ROUTE_SELECT_OP,
+            "params": {
+                "targetAgent": "mason",
+                "requirements": { "iq": 20, "eq": 0 },
+                "availableModels": ["custom/aa-live", "custom/no-score"],
+                "taskId": "aa-inferred-admit"
+            }
+        });
+        let response = run_route_wire_request(&store, request).await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["selected"]["model"]["modelID"], "aa-live");
+        let explanation = body["result"]["selected"]["explanation"]
+            .as_array()
+            .unwrap();
+        assert!(
+            explanation
+                .iter()
+                .any(|line| line == "provenance=aa_inferred"),
+            "decision must attribute an AA-inferred pick: {explanation:?}"
+        );
+        let decision_id = body["result"]["decisionID"].as_str().unwrap();
+        let explain = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_EXPLAIN_OP,
+                "params": { "decisionID": decision_id }
+            }),
+        )
+        .await;
+        assert_eq!(explain.header.ty, FrameType::Response);
+        let explain_body: serde_json::Value = serde_json::from_slice(&explain.body).unwrap();
+        let replayed = explain_body["result"]["why"]["explanation"].to_string();
+        assert!(
+            replayed.contains("provenance=aa_inferred"),
+            "replayed decision must keep AA provenance: {replayed}"
+        );
+
+        let unscored_only = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_SELECT_OP,
+                "params": {
+                    "targetAgent": "mason",
+                    "requirements": { "iq": 20, "eq": 0 },
+                    "availableModels": ["custom/no-score"],
+                    "taskId": "unscored-excluded"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(unscored_only.header.ty, FrameType::Error);
     }
 }

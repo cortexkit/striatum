@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prefrontal_routing_core::model_facts::{
-    Confidence, ModelFact, ModelPromptDefaults, ModelScores,
+    Confidence, ModelFact, ModelPromptDefaults, ModelScores, ScoreProvenance,
 };
 use prefrontal_routing_core::{
     admit_routes, derive_provider_key, make_capacity_key, make_route_key, relax_earliest_reset,
@@ -77,6 +77,10 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         notes: None,
         speed_multiplier: None,
         subscription_multiplier: None,
+        score_provenance: ScoreProvenance::Curated,
+        aa_index: None,
+        review_by_ms: None,
+        eq_source: None,
     }
 }
 
@@ -2030,4 +2034,149 @@ fn migration_022_renames_every_capability_key_and_applies_resolved_elos() {
         .unwrap();
     assert_eq!(elo_rows as usize, CATALOG_LEN);
     assert_eq!(legacy_rows, 0);
+}
+
+#[test]
+fn aa_inferred_does_not_overwrite_override_and_override_wins() {
+    let rig = Rig::new("aa-inferred-precedence");
+    let store = rig.open();
+    let mut override_fact = fact("custom", "override-probe");
+    override_fact.scores.elo = 1_500.0;
+    store
+        .upsert_fact(&override_fact, FactSource::Override)
+        .unwrap();
+
+    let mut inferred = override_fact.clone();
+    inferred.scores.elo = 900.0;
+    inferred.score_provenance = ScoreProvenance::AaInferred;
+    inferred.aa_index = Some(40.0);
+    inferred.review_by_ms = Some(1);
+    let err = store
+        .upsert_fact(&inferred, FactSource::AaInferred)
+        .expect_err("aa_inferred must refuse to clobber an override");
+    assert!(
+        err.0.contains("aa_inferred does not overwrite"),
+        "got {err:?}"
+    );
+    let kept = store
+        .get_fact_by_route_key("custom/override-probe")
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.scores.elo, 1_500.0);
+    assert_eq!(kept.score_provenance, ScoreProvenance::Override);
+    assert_eq!(kept.aa_index, None);
+
+    // Other direction: an aa_inferred row is replaced by an override.
+    let mut inferred_only = fact("custom", "inferred-probe");
+    inferred_only.scores.elo = 800.0;
+    inferred_only.score_provenance = ScoreProvenance::AaInferred;
+    inferred_only.aa_index = Some(30.0);
+    inferred_only.review_by_ms = Some(2);
+    store
+        .upsert_fact(&inferred_only, FactSource::AaInferred)
+        .unwrap();
+    let mut as_override = inferred_only.clone();
+    as_override.scores.elo = 1_600.0;
+    as_override.score_provenance = ScoreProvenance::Override;
+    store
+        .upsert_fact(&as_override, FactSource::Override)
+        .unwrap();
+    let won = store
+        .get_fact_by_route_key("custom/inferred-probe")
+        .unwrap()
+        .unwrap();
+    assert_eq!(won.scores.elo, 1_600.0);
+    assert_eq!(won.score_provenance, ScoreProvenance::Override);
+    assert_eq!(won.aa_index, None);
+}
+
+#[test]
+fn aa_inferred_does_not_overwrite_curated_seed() {
+    let rig = Rig::new("aa-inferred-seed-precedence");
+    let store = rig.open();
+    let mut inferred = store
+        .get_fact_by_route_key("openai/gpt-5.6-sol")
+        .unwrap()
+        .unwrap();
+    let original_elo = inferred.scores.elo;
+    inferred.scores.elo = 12.0;
+    inferred.score_provenance = ScoreProvenance::AaInferred;
+    inferred.aa_index = Some(1.0);
+    store
+        .upsert_fact(&inferred, FactSource::AaInferred)
+        .expect_err("aa_inferred must refuse to clobber a curated seed row");
+    let kept = store
+        .get_fact_by_route_key("openai/gpt-5.6-sol")
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.scores.elo, original_elo);
+    assert_eq!(kept.score_provenance, ScoreProvenance::Curated);
+}
+
+#[test]
+fn list_inferred_flags_a_row_past_review_by() {
+    let rig = Rig::new("aa-inferred-review-by");
+    let store = rig.open();
+    let mut inferred = fact("custom", "stale-inferred");
+    inferred.scores.elo = 400.0;
+    inferred.score_provenance = ScoreProvenance::AaInferred;
+    inferred.aa_index = Some(20.0);
+    inferred.review_by_ms = Some(1_000);
+    store
+        .upsert_fact(&inferred, FactSource::AaInferred)
+        .unwrap();
+    let rows = store.list_inferred_rows(2_000).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.route_key == "custom/stale-inferred")
+        .expect("inferred row listed");
+    assert_eq!(row.aa_index, Some(20.0));
+    assert!((row.elo - 400.0).abs() < 1e-9);
+    assert_eq!(row.review_by_ms, Some(1_000));
+    assert!(row.review_by_passed, "deadline 1000 is past now=2000");
+
+    let fresh = store.list_inferred_rows(500).unwrap();
+    let fresh_row = fresh
+        .iter()
+        .find(|row| row.route_key == "custom/stale-inferred")
+        .unwrap();
+    assert!(!fresh_row.review_by_passed);
+}
+
+#[test]
+fn unscored_rows_are_hidden_from_selection_facts() {
+    let rig = Rig::new("unscored-hidden");
+    let store = rig.open();
+    let mut unscored = fact("custom", "unscored-probe");
+    unscored.score_provenance = ScoreProvenance::Unscored;
+    store.upsert_fact(&unscored, FactSource::Unscored).unwrap();
+    assert!(store
+        .get_facts()
+        .unwrap()
+        .iter()
+        .all(|fact| fact.provider_id != "custom" || fact.model_id != "unscored-probe"));
+    assert_eq!(
+        store.list_unscored_rows().unwrap()[0].route_key,
+        "custom/unscored-probe"
+    );
+    let by_key = store
+        .get_fact_by_route_key("custom/unscored-probe")
+        .unwrap()
+        .unwrap();
+    assert_eq!(by_key.score_provenance, ScoreProvenance::Unscored);
+}
+
+#[test]
+fn aa_index_cache_replace_is_wholesale() {
+    let rig = Rig::new("aa-index-cache");
+    let store = rig.open();
+    store
+        .replace_aa_index_table(&[("slug-a".into(), 40.0), ("slug-b".into(), 50.0)], 10)
+        .unwrap();
+    assert_eq!(store.get_aa_index("slug-a").unwrap(), Some((40.0, 10)));
+    store
+        .replace_aa_index_table(&[("slug-c".into(), 12.0)], 20)
+        .unwrap();
+    assert_eq!(store.get_aa_index("slug-a").unwrap(), None);
+    assert_eq!(store.get_aa_index("slug-c").unwrap(), Some((12.0, 20)));
 }

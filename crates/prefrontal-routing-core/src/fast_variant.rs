@@ -274,6 +274,10 @@ mod tests {
             notes: None,
             speed_multiplier: None,
             subscription_multiplier: None,
+            score_provenance: crate::model_facts::ScoreProvenance::Curated,
+            aa_index: None,
+            review_by_ms: None,
+            eq_source: None,
         }
     }
 

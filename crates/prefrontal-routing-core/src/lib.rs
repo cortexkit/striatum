@@ -10,6 +10,7 @@
 //! TS unit tests are preserved as Rust test-vectors (same inputs/outputs) so the
 //! port's behavioral parity is provable, not assumed.
 
+pub mod aa_infer;
 pub mod break_glass;
 pub mod failure_backoff;
 pub mod fast_variant;
@@ -27,6 +28,11 @@ pub mod route_state_store;
 pub mod routing_config;
 pub mod seat_routing;
 
+pub use aa_infer::{
+    aa_elo_curve, elo_floor, infer_elo_from_aa, infer_elo_from_aa_static, inferred_scores,
+    inherit_eq_from_curated_neighbors, interpolate_elo, EqSource, AA_INFERRED_DEFAULT_SPEED,
+    AA_INFERRED_PENALTY,
+};
 pub use break_glass::{relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot};
 pub use failure_backoff::{
     failure_backoff_transition, is_terminal_send_failure, FailureBackoffConfig,
@@ -44,7 +50,7 @@ pub use launch_policy::{
 pub use model_facts::{
     derive_provider_key, fact_to_route, is_valid_grand_family_id, make_capacity_key,
     make_route_key, Confidence, ModelFact, ModelMetric, ModelPromptDefaults, ModelRequirements,
-    ModelRoute, ModelScores, ReasoningEffort, MODEL_METRICS,
+    ModelRoute, ModelScores, ReasoningEffort, ScoreProvenance, MODEL_METRICS,
 };
 pub use model_facts_seed::model_facts_seed;
 pub use model_router::{

@@ -51,6 +51,10 @@ fn fact(provider: &str, model: &str, family: Option<&str>, elo: f64, cost: f64) 
         notes: None,
         speed_multiplier: None,
         subscription_multiplier: None,
+        score_provenance: prefrontal_routing_core::ScoreProvenance::Curated,
+        aa_index: None,
+        review_by_ms: None,
+        eq_source: None,
     }
 }
 
