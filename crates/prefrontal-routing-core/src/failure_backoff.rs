@@ -107,6 +107,12 @@ pub fn classify_failure_attribution(
     }
 }
 
+/// Advance route-local failure backoff only for provider-attributable terminal evidence.
+///
+/// The allow-list includes provider 5xx responses, non-quota provider 4xx responses,
+/// model refusals, stream errors after the first token, and timeouts after dispatch.
+/// Local network failures and pre-dispatch launch failures preserve the existing streak
+/// and backoff because they do not establish that this provider route was reached.
 pub fn failure_backoff_transition(
     previous_consecutive_failures: u32,
     outcome: RouteOutcome,
