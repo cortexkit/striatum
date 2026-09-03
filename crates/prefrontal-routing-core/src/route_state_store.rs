@@ -135,6 +135,14 @@ pub struct DecisionOutcomeUpdate {
     pub failure_backoff: crate::failure_backoff::FailureBackoffConfig,
 }
 
+/// The route-local failure-backoff fields before an operator clears them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FailureBackoffState {
+    pub consecutive_terminal_failures: u32,
+    pub failure_backoff_until: Option<f64>,
+    pub failure_backoff_reason: Option<String>,
+}
+
 /// What `record_decision` persists: the selection (or none) + its audit context.
 /// `score_json`/`rejected_json`/`explanation_json` are pre-serialized by the
 /// caller (the module serializes the scorer's `SelectedModelRoute`), keeping this
@@ -286,6 +294,17 @@ pub trait RouteStateStore {
         decision_id: &str,
         update: &DecisionOutcomeUpdate,
     ) -> RouteStateResult<()>;
+
+    /// Clear only the route-local terminal-failure streak and backoff fields. The
+    /// returned state is the durable value before the clear; provider cooldown and
+    /// quota state remain outside this operator recovery action. Lightweight stores
+    /// may not keep this optional state and return `None`.
+    fn clear_failure_backoff(
+        &self,
+        _route_key: &str,
+    ) -> RouteStateResult<Option<FailureBackoffState>> {
+        Ok(None)
+    }
 
     /// Decisions for a task, oldest first.
     fn get_decisions_for_task(&self, task_id: &str) -> RouteStateResult<Vec<DecisionRow>>;

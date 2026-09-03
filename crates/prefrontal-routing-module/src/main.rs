@@ -93,6 +93,9 @@ const ROUTE_RECORD_USAGE_OP: &str = "route.record_usage";
 const ROUTE_RECORD_COOLDOWN_OP: &str = "route.record_cooldown";
 /// Query only cooldown state for a frozen route without re-running admission.
 const ROUTE_COOLDOWN_STATUS_OP: &str = "route.cooldown_status";
+/// Clear an operator-identified route-local terminal-failure backoff without changing
+/// provider cooldown or quota state.
+const ROUTE_CLEAR_FAILURE_BACKOFF_OP: &str = "route.clear_failure_backoff";
 /// Observability op: reports whether the outbound quota-consumer connection is
 /// live and how fresh its windows are. Lets a consumer (and the e2e) confirm the
 /// module->module quota path actually round-tripped, not just that it didn't hang.
@@ -1863,6 +1866,9 @@ async fn handle_select_request(
     if envelope.method == ROUTE_RECORD_COOLDOWN_OP {
         return handle_record_cooldown(frame, writer, store).await;
     }
+    if envelope.method == ROUTE_CLEAR_FAILURE_BACKOFF_OP {
+        return handle_clear_failure_backoff(frame, writer, store).await;
+    }
     if envelope.method == ROUTE_COOLDOWN_STATUS_OP {
         return handle_cooldown_status(frame, writer, store).await;
     }
@@ -2580,6 +2586,12 @@ struct RouteDecisionsListParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ClearFailureBackoffParams {
+    route_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RecordCooldownParams {
     route_key: String,
     capacity_key: String,
@@ -3123,6 +3135,82 @@ async fn handle_route_decisions_list(
     send(writer, response).await
 }
 
+async fn handle_clear_failure_backoff(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: ClearFailureBackoffParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(body) => body.params,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("route.clear_failure_backoff params not decodable: {error}"),
+                )
+                .await;
+            }
+        };
+    if params.route_key.trim().is_empty() {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "route.clear_failure_backoff routeKey must not be empty",
+        )
+        .await;
+    }
+    let prior = match store.clear_failure_backoff(&params.route_key) {
+        Ok(prior) => prior,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("route.clear_failure_backoff: {error}"),
+            )
+            .await;
+        }
+    };
+    let prior = prior.map(|state| {
+        json!({
+            "consecutiveTerminalFailures": state.consecutive_terminal_failures,
+            "failureBackoffUntil": state.failure_backoff_until,
+            "failureBackoffReason": state.failure_backoff_reason,
+        })
+    });
+    let body =
+        serde_json::to_vec(&json!({ "result": { "prior": prior } })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
 async fn handle_record_cooldown(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -3292,6 +3380,7 @@ fn handles(method: &str) -> bool {
             | ROUTE_SET_DECISION_OUTCOME_OP
             | ROUTE_RECORD_USAGE_OP
             | ROUTE_RECORD_COOLDOWN_OP
+            | ROUTE_CLEAR_FAILURE_BACKOFF_OP
             | ROUTE_COOLDOWN_STATUS_OP
             | ROUTE_EXPLAIN_OP
             | ROUTE_DECISIONS_LIST_OP
@@ -3393,6 +3482,14 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 name: ROUTE_RECORD_COOLDOWN_OP.to_string(),
                 kind: ManagementOperationKind::Mutate,
                 description: None,
+            },
+            ManagementOperation {
+                name: ROUTE_CLEAR_FAILURE_BACKOFF_OP.to_string(),
+                kind: ManagementOperationKind::Mutate,
+                description: Some(
+                    "Clear one route's terminal-failure backoff without changing cooldown or quota state"
+                        .to_string(),
+                ),
             },
             ManagementOperation {
                 name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
@@ -4338,6 +4435,76 @@ mod tests {
         let explanation: serde_json::Value =
             serde_json::from_str(decisions[0].explanation_json.as_deref().unwrap()).unwrap();
         assert!(explanation["earliestReset"].as_f64().is_some());
+    }
+
+    #[tokio::test]
+    async fn route_clear_failure_backoff_returns_prior_state_and_readmits_route() {
+        const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
+        const LAST_ERROR: &str = "provider returned HTTP 503 after dispatch";
+        let rig = Rig::new("clear-failure-backoff");
+        let store = Arc::new(rig.open_store());
+        for failure in 1..=3 {
+            let decision_id = store
+                .record_decision(&DecisionInput {
+                    decision_id: Some(format!("dec-provider-error-{failure}")),
+                    task_id: Some(format!("failed-task-{failure}")),
+                    target_agent: "mason".into(),
+                    requirements_json: "{\"iq\":80,\"eq\":20}".into(),
+                    selected_route_key: Some(ROUTE.into()),
+                    selected_provider_id: Some("alibaba-token-plan".into()),
+                    selected_model_id: Some("qwen3.8-max-preview".into()),
+                    score_json: "{}".into(),
+                    rejected_json: "[]".into(),
+                    anchor_version: ANCHOR_VERSION,
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .set_decision_outcome(
+                    &decision_id,
+                    &DecisionOutcomeUpdate {
+                        outcome: RouteOutcome::Error,
+                        last_error: Some(LAST_ERROR.into()),
+                        observed_at_ms: now_ms() as i64,
+                        failure_backoff: FailureBackoffConfig::default(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_CLEAR_FAILURE_BACKOFF_OP,
+                "params": { "routeKey": ROUTE },
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let prior = &body["result"]["prior"];
+        assert_eq!(prior["consecutiveTerminalFailures"], 3);
+        assert!(prior["failureBackoffUntil"].as_f64().is_some());
+        assert!(prior["failureBackoffReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(LAST_ERROR)));
+
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_SELECT_OP,
+                "params": {
+                    "targetAgent": "mason",
+                    "requirements": { "iq": 80, "eq": 20 },
+                    "availableModels": [ROUTE],
+                    "taskId": "backoff-cleared-route-selection",
+                },
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["selected"]["routeKey"], ROUTE);
     }
 
     #[tokio::test]
