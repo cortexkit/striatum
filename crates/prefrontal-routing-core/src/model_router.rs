@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model_facts::{
     fact_to_route, make_capacity_key, ModelFact, ModelMetric, ModelRequirements, ModelRoute,
-    FAST_SUFFIX,
+    ScoreProvenance, FAST_SUFFIX,
 };
 use crate::provider_model_spec::{parse_spec_list, resolve_spec};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
@@ -404,6 +404,14 @@ pub fn admit_routes(
 
     for fact in facts {
         let route = fact_to_route(fact);
+        if fact.score_provenance == ScoreProvenance::Unscored {
+            rejected.push(RejectedRoute {
+                route_key: route.route_key,
+                reason: "unscored".to_string(),
+                detail: None,
+            });
+            continue;
+        }
         if resolve_spec(&exclusion_specs, &route.route_key, false) {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
@@ -828,6 +836,9 @@ pub fn select_model_route_with_config(
         "route {} for agent {}",
         winner_admissible.route.route_key, input.target_agent
     ));
+    if fact.score_provenance == ScoreProvenance::AaInferred {
+        explanation.push("provenance=aa_inferred".to_string());
+    }
     explanation.extend(winner_admissible.adequacy.explanation.iter().cloned());
     explanation.push(format!(
         "{}: adequacy {:.2}, selection cost {:.2}",

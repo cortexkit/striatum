@@ -111,11 +111,13 @@ const MIGRATION_030: &str = include_str!("../migrations/030_decision_ledger_join
 const MIGRATION_031: &str = include_str!("../migrations/031_drop_catalog_generation.sql");
 /// Migration 32: consecutive terminal-send-failure counter and short backoff.
 const MIGRATION_032: &str = include_str!("../migrations/032_consecutive_failure_backoff.sql");
+/// Migration 33: AA-inferred provenance columns and the AA index cache.
+const MIGRATION_033: &str = include_str!("../migrations/033_aa_inferred_provenance.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 32] {
+fn route_state_migrations() -> [Migration; 33] {
     [
         Migration {
             version: 1,
@@ -244,6 +246,10 @@ fn route_state_migrations() -> [Migration; 32] {
         Migration {
             version: 32,
             statements: MIGRATION_032,
+        },
+        Migration {
+            version: 33,
+            statements: MIGRATION_033,
         },
     ]
 }
@@ -461,6 +467,24 @@ pub struct DecisionListRow {
     pub top_rejection_count: usize,
 }
 
+/// One `aa_inferred` catalog row for the operator's hand-placement worklist.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferredScoreRow {
+    pub route_key: String,
+    pub aa_index: Option<f64>,
+    pub elo: f64,
+    pub review_by_ms: Option<i64>,
+    pub review_by_passed: bool,
+}
+
+/// A catalog row with no score, waiting for Fusiform or a hand placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnscoredRow {
+    pub route_key: String,
+}
+
 impl SqliteRouteStateStore {
     /// Open from a resolved descriptor, applying migrations. The single-writer
     /// lease location is derived by the lib from the descriptor's db path (one
@@ -500,6 +524,89 @@ impl SqliteRouteStateStore {
                     Ok(CatalogFact {
                         fact: row_to_fact(row)?,
                         excluded: row.get::<_, i64>("excluded")? != 0,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)
+    }
+
+    /// Replace the AA index cache in one transaction. A failed fetch must not
+    /// call this, so the previous table survives (fail-open).
+    pub fn replace_aa_index_table(
+        &self,
+        rows: &[(String, f64)],
+        fetched_at: i64,
+    ) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let tx = c.unchecked_transaction()?;
+                tx.execute("DELETE FROM aa_index_cache", [])?;
+                for (slug, index) in rows {
+                    tx.execute(
+                        "INSERT INTO aa_index_cache (aa_slug, aa_index, fetched_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![slug, index, fetched_at],
+                    )?;
+                }
+                tx.commit()
+            })
+            .map_err(err)
+    }
+
+    /// Latest cached AA intelligence index for an AA slug, plus when it was fetched.
+    pub fn get_aa_index(&self, slug: &str) -> RouteStateResult<Option<(f64, i64)>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT aa_index, fetched_at FROM aa_index_cache WHERE aa_slug = ?1",
+                    [slug],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Every `aa_inferred` row with review-by status relative to `now_ms`.
+    pub fn list_inferred_rows(&self, now_ms: i64) -> RouteStateResult<Vec<InferredScoreRow>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(
+                    "SELECT route_key, aa_index,
+                            json_extract(scores_json, '$.elo') AS elo,
+                            review_by_ms
+                     FROM model_facts
+                     WHERE source = 'aa_inferred'
+                     ORDER BY route_key",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    let review_by_ms: Option<i64> = row.get(3)?;
+                    Ok(InferredScoreRow {
+                        route_key: row.get(0)?,
+                        aa_index: row.get(1)?,
+                        elo: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                        review_by_ms,
+                        review_by_passed: review_by_ms.is_some_and(|deadline| deadline <= now_ms),
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)
+    }
+
+    /// Catalog rows that exist without a score (Fusiform's later target).
+    pub fn list_unscored_rows(&self) -> RouteStateResult<Vec<UnscoredRow>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(
+                    "SELECT route_key FROM model_facts
+                     WHERE source = 'unscored'
+                     ORDER BY route_key",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(UnscoredRow {
+                        route_key: row.get(0)?,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -744,6 +851,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         "unknown" => Confidence::Unknown,
         _ => Confidence::Curated,
     };
+    let source = FactSource::parse(&row.get::<_, String>("source")?);
     Ok(ModelFact {
         provider_id: row.get("provider_id")?,
         model_id: row.get("model_id")?,
@@ -765,6 +873,10 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         notes: row.get::<_, Option<String>>("notes")?,
         speed_multiplier: row.get::<_, Option<f64>>("speed_multiplier")?,
         subscription_multiplier: None,
+        score_provenance: source.provenance(),
+        aa_index: row.get::<_, Option<f64>>("aa_index")?,
+        review_by_ms: row.get::<_, Option<i64>>("review_by_ms")?,
+        eq_source: row.get::<_, Option<String>>("eq_source")?,
     })
 }
 
@@ -784,19 +896,42 @@ impl RouteStateStore for SqliteRouteStateStore {
             .map(serde_json::to_string)
             .transpose()
             .map_err(err)?;
+        let (aa_index, review_by_ms, eq_source) = if source == FactSource::AaInferred {
+            (fact.aa_index, fact.review_by_ms, fact.eq_source.clone())
+        } else {
+            (None, None, None)
+        };
         self.store
             .with_conn(|c: &Connection| {
                 // Fact replacement and route-state insertion share one transaction.
                 // The store connection mutex serializes this with provider fanout,
                 // so a new route resolves either before fanout or after inheritance.
                 let tx = c.unchecked_transaction()?;
+                if source == FactSource::AaInferred {
+                    let existing: Option<String> = tx
+                        .query_row(
+                            "SELECT source FROM model_facts WHERE route_key = ?1",
+                            [&route.route_key],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if let Some(existing) = existing {
+                        if FactSource::parse(&existing).blocks_aa_inferred() {
+                            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                std::io::Error::other(
+                                    "aa_inferred does not overwrite curated or override rows",
+                                ),
+                            )));
+                        }
+                    }
+                }
                 tx.execute(
                     "INSERT INTO model_facts (
                        route_key, capacity_key, provider_id, model_id, variant, family,
                        scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                         supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
-                        source, updated_at
-                      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+                        source, updated_at, aa_index, review_by_ms, eq_source
+                      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
                      ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,
@@ -806,7 +941,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                        supports_vision=excluded.supports_vision, supports_tool_use=excluded.supports_tool_use,
                        prompt_defaults_json=excluded.prompt_defaults_json, confidence=excluded.confidence,
                         notes=excluded.notes, speed_multiplier=excluded.speed_multiplier,
-                        source=excluded.source, updated_at=excluded.updated_at",
+                        source=excluded.source, updated_at=excluded.updated_at,
+                        aa_index=excluded.aa_index, review_by_ms=excluded.review_by_ms,
+                        eq_source=excluded.eq_source",
                     params![
                         route.route_key,
                         route.capacity_key,
@@ -827,6 +964,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                         fact.speed_multiplier,
                         source.as_str(),
                         now_ms(),
+                        aa_index,
+                        review_by_ms,
+                        eq_source,
                     ],
                 )?;
                 // The migration trigger covers fresh INSERTs. This idempotent
@@ -864,7 +1004,7 @@ impl RouteStateStore for SqliteRouteStateStore {
     fn get_facts(&self) -> RouteStateResult<Vec<ModelFact>> {
         self.store
             .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare("SELECT * FROM model_facts")?;
+                let mut stmt = c.prepare("SELECT * FROM model_facts WHERE source != 'unscored'")?;
                 let rows = stmt.query_map([], row_to_fact)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
@@ -1736,6 +1876,7 @@ fn confidence_str(c: Confidence) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prefrontal_routing_core::ScoreProvenance;
 
     #[test]
     fn migration_031_drops_a_populated_catalog_generation_table_through_the_store_runner() {
@@ -1782,6 +1923,67 @@ mod tests {
             })
             .unwrap();
         assert!(!table_exists);
+        drop(migrated);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+    }
+
+    #[test]
+    fn migration_033_adds_aa_columns_without_rewriting_existing_scores() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "prefrontal-routing-aa-inferred-migration-{}-{timestamp}.sqlite",
+            std::process::id()
+        ));
+        let descriptor = dev_descriptor(
+            "prefrontal-routing-aa-inferred-migration",
+            path.to_string_lossy(),
+        );
+
+        let legacy = open_sqlite(&descriptor).unwrap();
+        let migrations = route_state_migrations();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &migrations[..32])
+            .unwrap();
+        let (elo, source): (f64, String) = legacy
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT json_extract(scores_json, '$.elo'), source
+                     FROM model_facts WHERE route_key = 'openai/gpt-5.6-sol'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(elo, 1_838.0);
+        assert_eq!(source, "seed");
+        drop(legacy);
+
+        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let sol = migrated
+            .get_fact_by_route_key("openai/gpt-5.6-sol")
+            .unwrap()
+            .unwrap();
+        assert_eq!(sol.scores.elo, 1_838.0);
+        assert_eq!(sol.score_provenance, ScoreProvenance::Curated);
+        assert_eq!(sol.aa_index, None);
+        let columns: bool = migrated
+            .store
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('model_facts') WHERE name = 'aa_index'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(columns);
         drop(migrated);
 
         let _ = std::fs::remove_file(&path);

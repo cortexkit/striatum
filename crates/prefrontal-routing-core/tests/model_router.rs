@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use prefrontal_routing_core::model_facts::{
     make_capacity_key, make_route_key, Confidence, ModelFact, ModelPromptDefaults,
-    ModelRequirements, ModelRoute, ModelScores, ReasoningEffort,
+    ModelRequirements, ModelRoute, ModelScores, ReasoningEffort, ScoreProvenance,
 };
 use prefrontal_routing_core::model_facts_seed::model_facts_seed;
 use prefrontal_routing_core::model_router::{
@@ -55,6 +55,10 @@ fn fact(b: FactBuilder) -> ModelFact {
         notes: None,
         speed_multiplier: None,
         subscription_multiplier: None,
+        score_provenance: ScoreProvenance::Curated,
+        aa_index: None,
+        review_by_ms: None,
+        eq_source: None,
     }
 }
 
@@ -1971,4 +1975,51 @@ fn base_preference_spec_re_admits_the_fast_variant() {
         .rejected
         .iter()
         .any(|rejected| rejected.reason == "fast_variant_not_opted_in"));
+}
+
+#[test]
+fn unscored_rows_are_rejected_while_aa_inferred_rows_are_admitted() {
+    let mut inferred = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "inferred".into(),
+        scores: scores(60.0, 1700.0, 100.0),
+        ..Default::default()
+    });
+    inferred.score_provenance = ScoreProvenance::AaInferred;
+    inferred.aa_index = Some(40.0);
+
+    let mut unscored = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "unscored".into(),
+        scores: scores(99.0, 2000.0, 200.0),
+        ..Default::default()
+    });
+    unscored.score_provenance = ScoreProvenance::Unscored;
+
+    let selected = select_model_route(input(
+        vec![inferred.clone(), unscored.clone()],
+        req(20.0, 0.0),
+        Extra::default(),
+    ))
+    .expect("aa_inferred is routable");
+    assert_eq!(selected.model.model_id, "inferred");
+    assert!(
+        selected
+            .explanation
+            .iter()
+            .any(|line| line == "provenance=aa_inferred"),
+        "live pick must be attributable: {:?}",
+        selected.explanation
+    );
+    assert!(selected
+        .rejected
+        .iter()
+        .any(|rejected| rejected.route_key == "p/unscored" && rejected.reason == "unscored"));
+
+    let only_unscored = select_model_route(input(vec![unscored], req(20.0, 0.0), Extra::default()));
+    let err = only_unscored.expect_err("unscored-only catalog must not route");
+    assert!(err
+        .rejected
+        .iter()
+        .any(|rejected| rejected.reason == "unscored"));
 }

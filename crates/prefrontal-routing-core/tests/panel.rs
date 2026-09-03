@@ -5,7 +5,7 @@ use prefrontal_routing_core::{
     select_panel, Confidence, InvalidPanelRequest, ModelFact, ModelPromptDefaults,
     ModelRequirements, ModelRouteStateSnapshot, ModelScores, PanelCauseReason, PanelClass,
     PanelDiversity, PanelRosterEntry, PanelSelection, PanelSelectionPolicy, PanelShortfallCode,
-    PanelSpec, RequiredCapabilities, RouteRuntimeState, SeatedSiblingVariant,
+    PanelSpec, RequiredCapabilities, RouteRuntimeState, ScoreProvenance, SeatedSiblingVariant,
     SelectModelRouteInput, SelectPanelInput, DEFAULT_DEMAND_EXPONENT,
 };
 use serde_json::{json, Map};
@@ -32,6 +32,10 @@ fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
         notes: None,
         speed_multiplier: None,
         subscription_multiplier: None,
+        score_provenance: ScoreProvenance::Curated,
+        aa_index: None,
+        review_by_ms: None,
+        eq_source: None,
     }
 }
 

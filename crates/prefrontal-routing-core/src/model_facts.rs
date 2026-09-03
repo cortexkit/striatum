@@ -169,6 +169,41 @@ pub enum Confidence {
     Unknown,
 }
 
+/// Closed score provenance on a catalog row.
+///
+/// `curated` is a migration or operator seed (`source='seed'` in the store).
+/// `override` is `route.model_upsert` or config. `aa_inferred` is the provisional
+/// AA-index interpolation. `unscored` is a model known to the catalog with no
+/// score yet (the Fusiform consumer's target) and is not routable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoreProvenance {
+    #[default]
+    Curated,
+    Override,
+    AaInferred,
+    Unscored,
+}
+
+impl ScoreProvenance {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScoreProvenance::Curated => "curated",
+            ScoreProvenance::Override => "override",
+            ScoreProvenance::AaInferred => "aa_inferred",
+            ScoreProvenance::Unscored => "unscored",
+        }
+    }
+
+    pub fn is_curated(&self) -> bool {
+        matches!(self, ScoreProvenance::Curated)
+    }
+
+    pub fn is_routable(&self) -> bool {
+        !matches!(self, ScoreProvenance::Unscored)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFact {
@@ -210,6 +245,18 @@ pub struct ModelFact {
     /// subsidy known" and behaves as 1.0; it is never persisted, only overlaid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_multiplier: Option<f64>,
+    /// Closed score provenance. Legacy rows and serde-defaulted facts are curated.
+    #[serde(default, skip_serializing_if = "ScoreProvenance::is_curated")]
+    pub score_provenance: ScoreProvenance,
+    /// Raw Artificial Analysis intelligence index used to infer this row's Elo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aa_index: Option<f64>,
+    /// Unix milliseconds after which an `aa_inferred` row is past due for hand review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_by_ms: Option<i64>,
+    /// How EQ was chosen for an `aa_inferred` row (`aa_index` or `neighbor:<route>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eq_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

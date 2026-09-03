@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
-use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores};
+use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
     make_route_key, model_facts_seed, FactSource, FailureBackoffConfig, RouteStateStore,
     RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
@@ -53,6 +53,94 @@ pub fn default_providers_without_prompt_cache() -> Vec<String> {
 struct RoutingConfigFile {
     #[serde(default)]
     model_routing: ModelRoutingSection,
+    #[serde(default)]
+    aa: AaSection,
+}
+
+/// Artificial Analysis ingest settings. The API key is never logged or served.
+#[derive(Deserialize, Default, Clone)]
+pub struct AaSection {
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Explicit router key (`provider/model[/variant]`) → AA slug. No fuzzy join.
+    #[serde(default)]
+    pub model_map: HashMap<String, String>,
+    /// Days until an `aa_inferred` row is flagged past-due. Default 14.
+    #[serde(default)]
+    pub review_by_days: Option<u64>,
+}
+
+impl std::fmt::Debug for AaSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AaSection")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("model_map", &self.model_map)
+            .field("review_by_days", &self.review_by_days)
+            .finish()
+    }
+}
+
+/// Default review window for an AA-inferred score: two weeks.
+pub const DEFAULT_AA_REVIEW_BY_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+
+#[derive(Clone)]
+pub struct AaConfig {
+    pub api_key: Option<String>,
+    pub model_map: HashMap<String, String>,
+    pub review_by_ms: i64,
+}
+
+impl std::fmt::Debug for AaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AaConfig")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("model_map", &self.model_map)
+            .field("review_by_ms", &self.review_by_ms)
+            .finish()
+    }
+}
+
+impl Default for AaConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model_map: HashMap::new(),
+            review_by_ms: DEFAULT_AA_REVIEW_BY_MS,
+        }
+    }
+}
+
+/// Read the AA ingest section. Missing file → empty config. The API key is
+/// returned for fetch use only; callers must never log or serialize it.
+pub fn read_aa_config(path: &Path) -> Result<AaConfig, String> {
+    let document = match std::fs::read_to_string(path) {
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AaConfig::default());
+        }
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let json = jsonc_to_json(&document)
+        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
+    let config: RoutingConfigFile = serde_json::from_str(&json)
+        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
+    let review_by_ms = match config.aa.review_by_days {
+        Some(days) if days > 0 => (days as i64).saturating_mul(24 * 60 * 60 * 1000),
+        Some(_) => {
+            return Err("aa.review_by_days must be a positive integer".to_string());
+        }
+        None => DEFAULT_AA_REVIEW_BY_MS,
+    };
+    let api_key = config
+        .aa
+        .api_key
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    Ok(AaConfig {
+        api_key,
+        model_map: config.aa.model_map,
+        review_by_ms,
+    })
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -608,6 +696,10 @@ fn apply_overrides<S: RouteStateStore>(
                 notes: None,
                 speed_multiplier: None,
                 subscription_multiplier: None,
+                score_provenance: ScoreProvenance::Curated,
+                aa_index: None,
+                review_by_ms: None,
+                eq_source: None,
             });
         if base.max_output_tokens.is_none() {
             base.max_output_tokens = existing_fact.and_then(|fact| fact.max_output_tokens);
@@ -715,6 +807,10 @@ mod tests {
             notes: None,
             speed_multiplier: None,
             subscription_multiplier: None,
+            score_provenance: ScoreProvenance::Curated,
+            aa_index: None,
+            review_by_ms: None,
+            eq_source: None,
         };
         let ov = ModelFactOverride {
             vision: Some(true),
