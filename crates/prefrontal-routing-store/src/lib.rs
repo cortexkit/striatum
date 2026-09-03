@@ -17,7 +17,7 @@ use prefrontal_routing_core::model_facts::{
 use prefrontal_routing_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, failure_backoff_transition, DecisionInput,
-    DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffTransition,
+    DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffState, FailureBackoffTransition,
     ProviderCooldownState, RouteStateResult, RouteStateStore, RouteStateStoreError,
     RouteStateUpdate, UsageObservation, OBSERVED_SPEED_MIN_OUTPUT_TOKENS,
     OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT, OBSERVED_SPEED_WINDOW_MS,
@@ -1541,6 +1541,45 @@ impl RouteStateStore for SqliteRouteStateStore {
             .map_err(err)
     }
 
+    fn clear_failure_backoff(
+        &self,
+        route_key: &str,
+    ) -> RouteStateResult<Option<FailureBackoffState>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let tx = c.unchecked_transaction()?;
+                let prior = tx
+                    .query_row(
+                        "SELECT consecutive_terminal_failures, failure_backoff_until,
+                                failure_backoff_reason
+                         FROM model_route_state WHERE route_key = ?1",
+                        [route_key],
+                        |row| {
+                            Ok(FailureBackoffState {
+                                consecutive_terminal_failures: row.get::<_, i64>(0)?.max(0) as u32,
+                                failure_backoff_until: row.get(1)?,
+                                failure_backoff_reason: row.get(2)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+                if prior.is_some() {
+                    tx.execute(
+                        "UPDATE model_route_state
+                         SET consecutive_terminal_failures = 0,
+                             failure_backoff_until = NULL,
+                             failure_backoff_reason = NULL,
+                             updated_at = ?1
+                         WHERE route_key = ?2",
+                        params![now_ms(), route_key],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(prior)
+            })
+            .map_err(err)
+    }
+
     fn get_decisions_for_task(&self, task_id: &str) -> RouteStateResult<Vec<DecisionRow>> {
         self.store
             .with_conn(|c: &Connection| {
@@ -1877,6 +1916,75 @@ fn confidence_str(c: Confidence) -> &'static str {
 mod tests {
     use super::*;
     use prefrontal_routing_core::ScoreProvenance;
+
+    #[test]
+    fn clear_failure_backoff_returns_prior_state_and_zeroes_route_fields() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "prefrontal-routing-clear-failure-backoff-{}-{timestamp}.sqlite",
+            std::process::id()
+        ));
+        let descriptor = dev_descriptor(
+            "prefrontal-routing-clear-failure-backoff",
+            path.to_string_lossy(),
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        store
+            .store
+            .with_conn(|connection| {
+                connection.execute(
+                    "INSERT INTO model_route_state (
+                       route_key, capacity_key, provider_id, model_id, updated_at,
+                       consecutive_terminal_failures, failure_backoff_until,
+                       failure_backoff_reason
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        "test-provider/test-model",
+                        "test-provider/test-model",
+                        "test-provider",
+                        "test-model",
+                        1_i64,
+                        3_i64,
+                        1_000_i64,
+                        "consecutive terminal send failures: 3"
+                    ],
+                )
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .clear_failure_backoff("test-provider/test-model")
+                .unwrap(),
+            Some(FailureBackoffState {
+                consecutive_terminal_failures: 3,
+                failure_backoff_until: Some(1_000.0),
+                failure_backoff_reason: Some("consecutive terminal send failures: 3".into()),
+            })
+        );
+        let after: (i64, Option<f64>, Option<String>) = store
+            .store
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT consecutive_terminal_failures, failure_backoff_until,
+                            failure_backoff_reason
+                     FROM model_route_state WHERE route_key = ?1",
+                    ["test-provider/test-model"],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(after, (0, None, None));
+        drop(store);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+    }
 
     #[test]
     fn migration_031_drops_a_populated_catalog_generation_table_through_the_store_runner() {
