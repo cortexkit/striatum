@@ -2014,12 +2014,37 @@ fn unscored_rows_are_rejected_while_aa_inferred_rows_are_admitted() {
     assert!(selected
         .rejected
         .iter()
-        .any(|rejected| rejected.route_key == "p/unscored" && rejected.reason == "unscored"));
+        .any(|rejected| rejected.route_key == "p/unscored"
+            && rejected.reason == "unscored_awaiting_placement"));
+}
 
-    let only_unscored = select_model_route(input(vec![unscored], req(20.0, 0.0), Extra::default()));
-    let err = only_unscored.expect_err("unscored-only catalog must not route");
-    assert!(err
-        .rejected
-        .iter()
-        .any(|rejected| rejected.reason == "unscored"));
+#[test]
+fn unscored_zero_score_row_is_unroutable_at_zero_demand_with_typed_rejection() {
+    let mut unscored = fact(FactBuilder {
+        provider_id: "catalog-provider".into(),
+        model_id: "awaiting-placement".into(),
+        scores: scores(0.0, 0.0, 0.0),
+        supports_vision: Some(true),
+        ..Default::default()
+    });
+    unscored.score_provenance = ScoreProvenance::Unscored;
+
+    let outcome = select_model_route(input(
+        vec![unscored],
+        req(0.0, 0.0),
+        Extra {
+            required_capabilities: Some(
+                prefrontal_routing_core::model_router::RequiredCapabilities {
+                    vision: Some(true),
+                    min_context: None,
+                },
+            ),
+            ..Extra::default()
+        },
+    ));
+    let refusal = outcome.expect_err(
+        "an unscored row must not route even when zero scores clear a zero-demand capability request",
+    );
+    assert_eq!(refusal.rejected.len(), 1);
+    assert_eq!(refusal.rejected[0].reason, "unscored_awaiting_placement");
 }

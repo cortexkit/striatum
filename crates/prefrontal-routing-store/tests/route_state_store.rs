@@ -2147,17 +2147,19 @@ fn list_inferred_flags_a_row_past_review_by() {
 }
 
 #[test]
-fn unscored_rows_are_hidden_from_selection_facts() {
+fn unscored_rows_retain_provenance_in_the_fact_loader() {
     let rig = Rig::new("unscored-hidden");
     let store = rig.open();
     let mut unscored = fact("custom", "unscored-probe");
     unscored.score_provenance = ScoreProvenance::Unscored;
     store.upsert_fact(&unscored, FactSource::Unscored).unwrap();
-    assert!(store
+    let loaded = store
         .get_facts()
         .unwrap()
-        .iter()
-        .all(|fact| fact.provider_id != "custom" || fact.model_id != "unscored-probe"));
+        .into_iter()
+        .find(|fact| fact.provider_id == "custom" && fact.model_id == "unscored-probe")
+        .expect("the admission layer needs the unscored provenance");
+    assert_eq!(loaded.score_provenance, ScoreProvenance::Unscored);
     assert_eq!(
         store.list_unscored_rows().unwrap()[0].route_key,
         "custom/unscored-probe"

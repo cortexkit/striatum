@@ -1262,8 +1262,7 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 let mut stmt = c.prepare(
                     "SELECT * FROM model_facts
-                     WHERE source != 'unscored'
-                       AND COALESCE(fusiform_present, 1) = 1",
+                     WHERE COALESCE(fusiform_present, 1) = 1",
                 )?;
                 let rows = stmt.query_map([], row_to_fact)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()

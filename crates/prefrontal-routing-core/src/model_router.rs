@@ -407,7 +407,7 @@ pub fn admit_routes(
         if fact.score_provenance == ScoreProvenance::Unscored {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
-                reason: "unscored".to_string(),
+                reason: "unscored_awaiting_placement".to_string(),
                 detail: None,
             });
             continue;
