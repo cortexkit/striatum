@@ -16,6 +16,7 @@
 
 mod aa_ingest;
 mod config_overrides;
+mod fusiform_catalog;
 mod quota_consumer;
 
 use std::{
@@ -24,11 +25,12 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use cortexkit_store_types::StorageDescriptor;
+use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::model_router::{
     select_model_route_with_config, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
@@ -40,8 +42,8 @@ use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CO
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, make_route_key, maybe_upgrade_to_fast_variant,
     relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
-    select_panel_with_config, validate_panel_spec, BreakGlassCandidate, DecisionInput,
-    DecisionOutcomeUpdate, FailureBackoffConfig, FastVariantUpgradeInput, ModelFact,
+    select_panel_with_config, validate_panel_spec, BreakGlassCandidate, CatalogFactField,
+    DecisionInput, DecisionOutcomeUpdate, FailureBackoffConfig, FastVariantUpgradeInput, ModelFact,
     ModelRequirements, ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection,
     PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
     SelectPanelInput, SelectedPanel,
@@ -104,6 +106,8 @@ const QUOTA_STATUS_OP: &str = "route.quota_status";
 const ROUTE_MODEL_SEED_AA_OP: &str = "route.model_seed_aa";
 /// Operator worklist: every `aa_inferred` row plus unscored catalog rows.
 const ROUTE_LIST_INFERRED_OP: &str = "route.list_inferred";
+/// Focused alias for operators that only need never-scored Fusiform discoveries.
+const ROUTE_LIST_UNSCORED_OP: &str = "route.list_unscored";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 /// How often the background task refreshes quota windows from insula.
@@ -431,8 +435,18 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     // never blocking on a live cross-module call. Quota being absent is non-fatal
     // (seed-only routing).
     let quota_cache: SharedQuotaCache = Arc::new(Mutex::new(QuotaCache::default()));
+    let catalog_health: SharedCatalogHealth = Arc::new(Mutex::new(CatalogReachHealth::new(
+        config_overrides::DEFAULT_CATALOG_POLL_MS,
+    )));
 
-    let loop_result = module_loop(&mut read_half, tx.clone(), &config, quota_cache).await;
+    let loop_result = module_loop(
+        &mut read_half,
+        tx.clone(),
+        &config,
+        quota_cache,
+        catalog_health,
+    )
+    .await;
     drop(tx);
 
     let writer_result = writer
@@ -528,6 +542,7 @@ async fn module_loop<R>(
     writer: mpsc::Sender<Frame>,
     config: &ModuleConfig,
     quota_cache: SharedQuotaCache,
+    catalog_health: SharedCatalogHealth,
 ) -> Result<(), ModuleError>
 where
     R: AsyncRead + Unpin,
@@ -572,6 +587,23 @@ where
 
     // Read `min_best_effort_adequacy` from the same config file. Clamp to [0,1];
     // reject NaN loudly. Absent means use the module default (0.6).
+    let catalog_poll_ms = match config_overrides::read_catalog_poll_ms(&override_path) {
+        Ok(poll_ms) => poll_ms,
+        Err(error) => {
+            tracing::warn!(error = %error, "invalid catalog.poll_ms; using ten-minute default");
+            config_overrides::DEFAULT_CATALOG_POLL_MS
+        }
+    };
+    if let Ok(mut health) = catalog_health.lock() {
+        health.set_poll_ms(catalog_poll_ms);
+    }
+    tokio::spawn(fusiform_catalog::catalog_refresh_loop(
+        config.connection_file_path.clone(),
+        Arc::clone(&store),
+        Arc::clone(&catalog_health),
+        catalog_poll_ms,
+    ));
+
     let min_band: SharedMinBand = Arc::new(std::sync::Mutex::new(
         match config_overrides::read_min_best_effort_adequacy(&override_path) {
             Ok(Some(val)) => {
@@ -604,6 +636,7 @@ where
             &mut route_epochs,
             &min_band,
             &override_path,
+            &catalog_health,
         )
         .await?
         {
@@ -689,6 +722,7 @@ async fn handle_frame(
     route_epochs: &mut RouteEpochs,
     min_band: &SharedMinBand,
     routing_config_path: &Path,
+    catalog_health: &SharedCatalogHealth,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
         FrameType::Ping if frame.header.channel == 0 => {
@@ -711,7 +745,7 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, route_epochs).await?;
+            handle_control_request(frame, writer, route_epochs, catalog_health).await?;
             Ok(true)
         }
         FrameType::Request => {
@@ -750,6 +784,7 @@ async fn handle_control_request(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     route_epochs: &mut RouteEpochs,
+    catalog_health: &SharedCatalogHealth,
 ) -> Result<(), ModuleError> {
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
@@ -781,7 +816,14 @@ async fn handle_control_request(
             // Routing is stateless: the catalog is machine-global and selection depends
             // only on the request body, so there is no domain state that can wedge: a
             // reply on this real dispatch path is itself the liveness proof the prober wants.
-            let body = serde_json::to_vec(&ModuleControlResponse::from(HealthReport::ok()))
+            let mut report = HealthReport::ok();
+            report.metrics = Some(json!({
+                "fusiformCatalog": catalog_health
+                    .lock()
+                    .map(|health| health.snapshot(now_ms()))
+                    .unwrap_or_else(|_| json!({ "reach": "never-reached", "lastError": "health lock poisoned" })),
+            }));
+            let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(ModuleError::Json)?;
             let response = Frame::build_with_version(
                 frame.header.ver,
@@ -1091,6 +1133,15 @@ fn merge_model_upsert(
     params: &ModelUpsertParams,
 ) -> Result<ModelFact, String> {
     let mut fact = match existing {
+        Some(fact)
+            if fact.score_provenance == ScoreProvenance::Unscored
+                && (params.elo.is_none() || params.eq.is_none()) =>
+        {
+            return Err(format!(
+                "model_upsert: route {}/{} is unscored; elo and eq are required to place it",
+                params.provider_id, params.model_id
+            ));
+        }
         Some(fact) => fact,
         None => {
             let (Some(elo), Some(eq)) = (params.elo, params.eq) else {
@@ -1280,6 +1331,34 @@ async fn handle_model_upsert(
         )
         .await;
     }
+    let mut fact_fields = Vec::new();
+    if params.context_window.is_some() {
+        fact_fields.push(CatalogFactField::ContextWindow);
+    }
+    if params.max_output_tokens.is_some() {
+        fact_fields.push(CatalogFactField::MaxOutputTokens);
+    }
+    if params.cost_per_m_tok_out.is_some() {
+        fact_fields.push(CatalogFactField::CostPerMtokOut);
+    }
+    if params.supports_vision.is_some() {
+        fact_fields.push(CatalogFactField::SupportsVision);
+    }
+    if params.supports_tool_use.is_some() {
+        fact_fields.push(CatalogFactField::SupportsToolUse);
+    }
+    if let Err(error) = store.mark_operator_fact_fields(&route_key, &fact_fields) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "store_error",
+            &format!("model_upsert provenance write: {error}"),
+        )
+        .await;
+    }
     let result = json!({
         "routeKey": route_key,
         "created": created,
@@ -1433,6 +1512,47 @@ async fn handle_list_inferred(
     }
 }
 
+async fn handle_list_unscored(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    match store.list_unscored_rows() {
+        Ok(rows) => {
+            let body = serde_json::to_vec(&json!({ "result": rows })).map_err(ModuleError::Json)?;
+            let response = Frame::build_with_version(
+                ver,
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                corr,
+                body,
+            )
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
+            send(writer, response).await
+        }
+        Err(error) => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("list_unscored: {error}"),
+            )
+            .await
+        }
+    }
+}
+
 /// route.model_facts: serve the durable catalog without reconstructing facts in
 /// the plugin. Inventory consumers receive every stored capability field and the
 /// explicit exclusion bit, so an absent capability remains unknown rather than
@@ -1476,6 +1596,24 @@ async fn handle_model_facts(
     )
     .map_err(|error| ModuleError::Message(error.to_string()))?;
     send(writer, response).await
+}
+
+fn warn_missing_session_model_once(provider_id: &str, model_id: &str) -> bool {
+    static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut warned) = warned.lock() else {
+        return false;
+    };
+    if !warned.insert((provider_id.to_string(), model_id.to_string())) {
+        return false;
+    }
+    tracing::warn!(
+        provider_id,
+        model_id,
+        pair = %format!("({provider_id}, {model_id})"),
+        "session model has no model_facts row"
+    );
+    true
 }
 
 async fn handle_model_fact(
@@ -1529,7 +1667,10 @@ async fn handle_model_fact(
             // remains conservative in its own path and may treat the same absence as no.
             "supportsVision": fact.supports_vision,
         }),
-        Ok(None) => json!({ "known": false, "supportsVision": null }),
+        Ok(None) => {
+            warn_missing_session_model_once(&params.provider_id, &params.model_id);
+            json!({ "known": false, "supportsVision": null })
+        }
         Err(error) => {
             return send_route_error(
                 writer,
@@ -1895,6 +2036,9 @@ async fn handle_select_request(
     }
     if envelope.method == ROUTE_LIST_INFERRED_OP {
         return handle_list_inferred(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_LIST_UNSCORED_OP {
+        return handle_list_unscored(frame, writer, store).await;
     }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(frame, writer, quota_cache, store, routing_config_path).await;
@@ -3376,6 +3520,7 @@ fn handles(method: &str) -> bool {
             | ROUTE_MODEL_UPSERT_OP
             | ROUTE_MODEL_SEED_AA_OP
             | ROUTE_LIST_INFERRED_OP
+            | ROUTE_LIST_UNSCORED_OP
             | ROUTE_SELECT_PANEL_OP
             | ROUTE_SET_DECISION_OUTCOME_OP
             | ROUTE_RECORD_USAGE_OP
@@ -3461,6 +3606,13 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 kind: ManagementOperationKind::Query,
                 description: Some(
                     "List aa_inferred scores and unscored catalog rows for hand review".to_string(),
+                ),
+            },
+            ManagementOperation {
+                name: ROUTE_LIST_UNSCORED_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: Some(
+                    "List Fusiform-discovered catalog rows awaiting operator scores".to_string(),
                 ),
             },
             ManagementOperation {
@@ -3664,11 +3816,23 @@ mod tests {
         params.eq = Some(1700.0);
         assert!(merge_model_upsert(None, &params).is_err());
         params.elo = Some(1500.0);
-        let fact = merge_model_upsert(None, &params).expect("both scores create");
-        assert_eq!(fact.scores.elo, 1500.0);
-        assert_eq!(fact.scores.eq, 1700.0);
-        assert_eq!(fact.scores.speed, 100.0, "new route speed defaults neutral");
-        assert_eq!(fact.confidence, Confidence::Curated);
+        let created_fact = merge_model_upsert(None, &params).expect("both scores create");
+        assert_eq!(created_fact.scores.elo, 1500.0);
+        assert_eq!(created_fact.scores.eq, 1700.0);
+        assert_eq!(
+            created_fact.scores.speed, 100.0,
+            "new route speed defaults neutral"
+        );
+        assert_eq!(created_fact.confidence, Confidence::Curated);
+
+        let mut unscored = fact("newco", "catalog-only");
+        unscored.score_provenance = ScoreProvenance::Unscored;
+        let mut incomplete = upsert_params("newco", "catalog-only");
+        incomplete.supports_vision = Some(false);
+        assert!(merge_model_upsert(Some(unscored.clone()), &incomplete).is_err());
+        incomplete.elo = Some(1500.0);
+        incomplete.eq = Some(1700.0);
+        assert!(merge_model_upsert(Some(unscored), &incomplete).is_ok());
     }
 
     #[test]
@@ -3761,6 +3925,7 @@ mod tests {
     async fn route_bind_replaces_the_epoch_for_a_reused_channel() {
         let (writer, mut replies) = mpsc::channel(2);
         let mut route_epochs = RouteEpochs::new();
+        let catalog_health = Arc::new(Mutex::new(CatalogReachHealth::new(600_000)));
 
         for (corr, epoch) in [(1, 41), (2, 42)] {
             let body = serde_json::to_vec(&json!({
@@ -3778,7 +3943,7 @@ mod tests {
             let frame =
                 Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap();
 
-            handle_control_request(frame, &writer, &mut route_epochs)
+            handle_control_request(frame, &writer, &mut route_epochs, &catalog_health)
                 .await
                 .unwrap();
             let ack = replies.recv().await.unwrap();
@@ -5522,7 +5687,24 @@ mod tests {
         }
         assert!(handles(ROUTE_MODEL_SEED_AA_OP));
         assert!(handles(ROUTE_LIST_INFERRED_OP));
+        assert!(handles(ROUTE_LIST_UNSCORED_OP));
         assert!(!handles("route.unknown"));
+    }
+
+    #[test]
+    fn missing_session_model_warning_is_deduplicated_by_exact_pair() {
+        let provider = "warning-proof-provider";
+        let model = "warning-proof-model";
+        assert!(warn_missing_session_model_once(provider, model));
+        assert!(!warn_missing_session_model_once(provider, model));
+        assert!(warn_missing_session_model_once(
+            provider,
+            "warning-proof-model-2"
+        ));
+        assert!(warn_missing_session_model_once(
+            "warning-proof-provider-2",
+            model
+        ));
     }
 
     #[tokio::test]

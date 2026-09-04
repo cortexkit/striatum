@@ -10,12 +10,15 @@ use prefrontal_routing_core::model_facts::{
 };
 use prefrontal_routing_core::{
     admit_routes, derive_provider_key, make_capacity_key, make_route_key, relax_earliest_reset,
-    select_model_route, BreakGlassCandidate, DecisionInput, DecisionOutcomeUpdate, FactSource,
-    FailureBackoffConfig, ModelRequirements, RouteFailureReason, RouteOutcome, RouteStateStore,
-    RouteStateUpdate, RoutingConfig, SelectModelRouteInput, UsageObservation,
-    FAILURE_BACKOFF_INITIAL_MS,
+    select_model_route, BreakGlassCandidate, CatalogFactField, DecisionInput,
+    DecisionOutcomeUpdate, FactSource, FailureBackoffConfig, ModelRequirements, RouteFailureReason,
+    RouteOutcome, RouteStateStore, RouteStateUpdate, RoutingConfig, SelectModelRouteInput,
+    UsageObservation, FAILURE_BACKOFF_INITIAL_MS,
 };
-use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
+use prefrontal_routing_store::{
+    dev_descriptor, DecisionListFilter, FusiformCatalogCursor, FusiformFactUpdate,
+    SqliteRouteStateStore,
+};
 
 static N: AtomicU64 = AtomicU64::new(0);
 
@@ -2179,4 +2182,128 @@ fn aa_index_cache_replace_is_wholesale() {
         .unwrap();
     assert_eq!(store.get_aa_index("slug-a").unwrap(), None);
     assert_eq!(store.get_aa_index("slug-c").unwrap(), Some((12.0, 20)));
+}
+
+#[test]
+fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_overrides() {
+    let rig = Rig::new("fusiform-precedence");
+    let store = rig.open();
+    let route_key = make_route_key("anthropic", "claude-opus-4-5", None);
+    let initial = store.get_fact_by_route_key(&route_key).unwrap().unwrap();
+    let initial_elo = initial.scores.elo;
+    assert_eq!(initial.supports_vision, Some(true));
+
+    let update = |vision| FusiformFactUpdate {
+        provider_id: "anthropic".to_string(),
+        model_id: "claude-opus-4-5".to_string(),
+        present: true,
+        context_window: Some(250_000.0),
+        max_output_tokens: Some(32_000),
+        cost_tier: Some(3.0),
+        cost_per_mtok_out: Some(12.0),
+        supports_vision: Some(vision),
+        supports_tool_use: Some(true),
+    };
+    store
+        .apply_fusiform_catalog(
+            &[update(false)],
+            FusiformCatalogCursor {
+                catalog_version: 1,
+                resolved_at_ms: 100,
+            },
+        )
+        .unwrap();
+    let fusiform = store.get_fact_by_route_key(&route_key).unwrap().unwrap();
+    assert_eq!(fusiform.supports_vision, Some(false));
+    assert_eq!(
+        fusiform.scores.elo, initial_elo,
+        "Fusiform cannot alter Elo"
+    );
+
+    let mut operator = fusiform;
+    operator.scores.elo = initial_elo + 321.0;
+    operator.supports_vision = Some(false);
+    store.upsert_fact(&operator, FactSource::Override).unwrap();
+    store
+        .mark_operator_fact_fields(&route_key, &[CatalogFactField::SupportsVision])
+        .unwrap();
+    store
+        .apply_fusiform_catalog(
+            &[update(true)],
+            FusiformCatalogCursor {
+                catalog_version: 2,
+                resolved_at_ms: 200,
+            },
+        )
+        .unwrap();
+    let replayed = store.get_fact_by_route_key(&route_key).unwrap().unwrap();
+    assert_eq!(
+        replayed.scores.elo,
+        initial_elo + 321.0,
+        "operator Elo must survive replay"
+    );
+    assert_eq!(
+        replayed.supports_vision,
+        Some(false),
+        "an override of the same factual field has precedence"
+    );
+    let catalog = store
+        .get_catalog_facts()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.fact.provider_id == "anthropic" && row.fact.model_id == "claude-opus-4-5")
+        .unwrap();
+    assert_eq!(catalog.facts_source.as_deref(), Some("fusiform"));
+    assert_eq!(catalog.fusiform_version, Some(2));
+}
+
+#[test]
+fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
+    let rig = Rig::new("fusiform-pair-key");
+    let store = rig.open();
+    let fact = |provider: &str| FusiformFactUpdate {
+        provider_id: provider.to_string(),
+        model_id: "shared-spelling".to_string(),
+        present: true,
+        context_window: Some(128_000.0),
+        max_output_tokens: Some(8_192),
+        cost_tier: Some(1.0),
+        cost_per_mtok_out: Some(2.0),
+        supports_vision: Some(provider == "provider-a"),
+        supports_tool_use: Some(true),
+    };
+    store
+        .apply_fusiform_catalog(
+            &[fact("provider-a"), fact("provider-b")],
+            FusiformCatalogCursor {
+                catalog_version: 7,
+                resolved_at_ms: 700,
+            },
+        )
+        .unwrap();
+
+    let rows = store
+        .get_catalog_facts()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.fact.model_id == "shared-spelling")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].fact.provider_id, "provider-a");
+    assert_eq!(rows[0].fact.supports_vision, Some(true));
+    assert_eq!(rows[1].fact.provider_id, "provider-b");
+    assert_eq!(rows[1].fact.supports_vision, Some(false));
+}
+
+#[test]
+fn fusiform_cursor_is_committed_with_the_applied_snapshot() {
+    let rig = Rig::new("fusiform-cursor");
+    let store = rig.open();
+    assert_eq!(store.fusiform_catalog_cursor().unwrap(), None);
+    let cursor = FusiformCatalogCursor {
+        catalog_version: 11,
+        resolved_at_ms: 1_234,
+    };
+    store.apply_fusiform_catalog(&[], cursor).unwrap();
+    assert_eq!(store.fusiform_catalog_cursor().unwrap(), Some(cursor));
 }

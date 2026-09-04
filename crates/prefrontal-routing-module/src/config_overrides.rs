@@ -18,14 +18,16 @@ use std::time::SystemTime;
 
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
-    make_route_key, model_facts_seed, FactSource, FailureBackoffConfig, RouteStateStore,
-    RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
+    make_route_key, model_facts_seed, CatalogFactField, FactSource, FailureBackoffConfig,
+    RouteStateStore, RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD,
+    DEFAULT_DEMAND_EXPONENT,
 };
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
+pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,14 @@ struct RoutingConfigFile {
     model_routing: ModelRoutingSection,
     #[serde(default)]
     aa: AaSection,
+    #[serde(default)]
+    catalog: CatalogSection,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CatalogSection {
+    #[serde(default)]
+    poll_ms: Option<u64>,
 }
 
 /// Artificial Analysis ingest settings. The API key is never logged or served.
@@ -336,6 +346,26 @@ pub fn apply_overrides_from_config<S: RouteStateStore>(
 
 /// Read `min_best_effort_adequacy` from the routing config file, validating and
 /// clamping the value. Returns `None` when absent or the file is missing.
+/// Poll cadence for the Fusiform catalog consumer. Missing configuration uses
+/// ten minutes; zero is refused because it would create a reconnect hot loop.
+pub fn read_catalog_poll_ms(path: &Path) -> Result<u64, String> {
+    let doc = match std::fs::read_to_string(path) {
+        Ok(doc) => doc,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_CATALOG_POLL_MS)
+        }
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let json = jsonc_to_json(&doc).map_err(|message| format!("invalid jsonc: {message}"))?;
+    let config: RoutingConfigFile =
+        serde_json::from_str(&json).map_err(|error| format!("invalid config: {error}"))?;
+    match config.catalog.poll_ms {
+        Some(0) => Err("catalog.poll_ms must be greater than zero".to_string()),
+        Some(poll_ms) => Ok(poll_ms),
+        None => Ok(DEFAULT_CATALOG_POLL_MS),
+    }
+}
+
 pub fn read_failure_backoff_config(path: &Path) -> Result<FailureBackoffConfig, String> {
     let doc = match std::fs::read_to_string(path) {
         Ok(document) => document,
@@ -675,10 +705,9 @@ fn apply_overrides<S: RouteStateStore>(
             }
         }
         let existing_fact = store.get_fact_by_route_key(&route_key).ok().flatten();
-        let mut base = seed_by_key
-            .get(&route_key)
-            .cloned()
-            .or_else(|| existing_fact.clone())
+        let mut base = existing_fact
+            .clone()
+            .or_else(|| seed_by_key.get(&route_key).cloned())
             .unwrap_or_else(|| ModelFact {
                 provider_id,
                 model_id,
@@ -707,6 +736,19 @@ fn apply_overrides<S: RouteStateStore>(
         store
             .upsert_fact(&merge_override(&base, ov), FactSource::Override)
             .map_err(|e| format!("upsert override {route_key}: {e}"))?;
+        let mut fact_fields = Vec::new();
+        if ov.context_window.is_some() {
+            fact_fields.push(CatalogFactField::ContextWindow);
+        }
+        if ov.cost_per_mtok_out.is_some() {
+            fact_fields.push(CatalogFactField::CostPerMtokOut);
+        }
+        if ov.vision.is_some() {
+            fact_fields.push(CatalogFactField::SupportsVision);
+        }
+        store
+            .mark_operator_fact_fields(&route_key, &fact_fields)
+            .map_err(|e| format!("stamp override provenance {route_key}: {e}"))?;
         next_override_keys.insert(route_key);
         outcome.applied += 1;
     }
@@ -1383,5 +1425,35 @@ mod tests {
         assert_eq!(sol(&facts), 1_750.0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod catalog_poll_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_poll_ms_defaults_reads_and_rejects_zero() {
+        let missing = std::env::temp_dir().join(format!(
+            "prefrontal-routing-missing-catalog-poll-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(
+            read_catalog_poll_ms(&missing).unwrap(),
+            DEFAULT_CATALOG_POLL_MS
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "prefrontal-routing-catalog-poll-{}.jsonc",
+            std::process::id()
+        ));
+        std::fs::write(&path, r#"{ "catalog": { "poll_ms": 1234 } }"#).unwrap();
+        assert_eq!(read_catalog_poll_ms(&path).unwrap(), 1234);
+        std::fs::write(&path, r#"{ "catalog": { "poll_ms": 0 } }"#).unwrap();
+        assert!(read_catalog_poll_ms(&path)
+            .unwrap_err()
+            .contains("greater than zero"));
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -16,10 +16,10 @@ use prefrontal_routing_core::model_facts::{
 };
 use prefrontal_routing_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
 use prefrontal_routing_core::{
-    derive_provider_key, fact_to_route, failure_backoff_transition, DecisionInput,
-    DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffState, FailureBackoffTransition,
-    ProviderCooldownState, RouteStateResult, RouteStateStore, RouteStateStoreError,
-    RouteStateUpdate, UsageObservation, OBSERVED_SPEED_MIN_OUTPUT_TOKENS,
+    derive_provider_key, fact_to_route, failure_backoff_transition, CatalogFactField,
+    DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffState,
+    FailureBackoffTransition, ProviderCooldownState, RouteStateResult, RouteStateStore,
+    RouteStateStoreError, RouteStateUpdate, UsageObservation, OBSERVED_SPEED_MIN_OUTPUT_TOKENS,
     OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT, OBSERVED_SPEED_WINDOW_MS,
     USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
 };
@@ -113,11 +113,13 @@ const MIGRATION_031: &str = include_str!("../migrations/031_drop_catalog_generat
 const MIGRATION_032: &str = include_str!("../migrations/032_consecutive_failure_backoff.sql");
 /// Migration 33: AA-inferred provenance columns and the AA index cache.
 const MIGRATION_033: &str = include_str!("../migrations/033_aa_inferred_provenance.sql");
+/// Migration 34: Fusiform facts, per-field overrides, and the replay cursor.
+const MIGRATION_034: &str = include_str!("../migrations/034_fusiform_catalog.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 
-fn route_state_migrations() -> [Migration; 33] {
+fn route_state_migrations() -> [Migration; 34] {
     [
         Migration {
             version: 1,
@@ -251,6 +253,10 @@ fn route_state_migrations() -> [Migration; 33] {
             version: 33,
             statements: MIGRATION_033,
         },
+        Migration {
+            version: 34,
+            statements: MIGRATION_034,
+        },
     ]
 }
 
@@ -274,6 +280,34 @@ pub struct CatalogFact {
     #[serde(flatten)]
     pub fact: ModelFact,
     pub excluded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facts_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fusiform_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fusiform_present: Option<bool>,
+}
+
+/// Durable cursor committed atomically with a Fusiform catalog snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FusiformCatalogCursor {
+    pub catalog_version: i64,
+    pub resolved_at_ms: i64,
+}
+
+/// The factual fields Fusiform may author. No score, variant, exclusion, speed
+/// multiplier, or prompt-default field exists in this type by construction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusiformFactUpdate {
+    pub provider_id: String,
+    pub model_id: String,
+    pub present: bool,
+    pub context_window: Option<f64>,
+    pub max_output_tokens: Option<u64>,
+    pub cost_tier: Option<f64>,
+    pub cost_per_mtok_out: Option<f64>,
+    pub supports_vision: Option<bool>,
+    pub supports_tool_use: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -297,6 +331,7 @@ struct CatalogFingerprintRow {
     confidence: String,
     speed_multiplier: Option<f64>,
     excluded: bool,
+    fusiform_present: Option<bool>,
 }
 
 /// BLAKE3 over every routing-read `model_facts` column: route/capacity identity,
@@ -318,7 +353,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 json_extract(scores_json, '$.speed') AS speed,
                 context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
-                speed_multiplier, excluded
+                speed_multiplier, excluded, fusiform_present
          FROM model_facts
          ORDER BY route_key",
     )?;
@@ -343,6 +378,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             confidence: row.get(16)?,
             speed_multiplier: row.get(17)?,
             excluded: row.get::<_, i64>(18)? != 0,
+            fusiform_present: row.get::<_, Option<i64>>(19)?.map(|value| value != 0),
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -524,9 +560,190 @@ impl SqliteRouteStateStore {
                     Ok(CatalogFact {
                         fact: row_to_fact(row)?,
                         excluded: row.get::<_, i64>("excluded")? != 0,
+                        facts_source: row.get("facts_source")?,
+                        fusiform_version: row.get("fusiform_version")?,
+                        fusiform_present: row
+                            .get::<_, Option<i64>>("fusiform_present")?
+                            .map(|value| value != 0),
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)
+    }
+
+    /// Read the last Fusiform snapshot cursor committed with catalog facts.
+    pub fn fusiform_catalog_cursor(&self) -> RouteStateResult<Option<FusiformCatalogCursor>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                connection
+                    .query_row(
+                        "SELECT catalog_version, resolved_at_ms
+                         FROM fusiform_catalog_cursor WHERE singleton = 1",
+                        [],
+                        |row| {
+                            Ok(FusiformCatalogCursor {
+                                catalog_version: row.get(0)?,
+                                resolved_at_ms: row.get(1)?,
+                            })
+                        },
+                    )
+                    .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Apply one complete Fusiform snapshot and advance its cursor atomically.
+    /// Matching is always the exact `(provider_id, model_id)` pair; variants of
+    /// that pair receive the same external facts without changing variant policy.
+    pub fn apply_fusiform_catalog(
+        &self,
+        facts: &[FusiformFactUpdate],
+        cursor: FusiformCatalogCursor,
+    ) -> RouteStateResult<()> {
+        let scores_json = serde_json::to_string(&ModelScores::default()).map_err(err)?;
+        self.store
+            .with_conn(|connection: &Connection| {
+                let tx = connection.unchecked_transaction()?;
+                for fact in facts {
+                    if fact.provider_id.trim().is_empty() || fact.model_id.trim().is_empty() {
+                        return Err(rusqlite::Error::InvalidParameterName(
+                            "Fusiform provider/model identity must be non-empty".to_string(),
+                        ));
+                    }
+                    let route_key = prefrontal_routing_core::make_route_key(
+                        &fact.provider_id,
+                        &fact.model_id,
+                        None,
+                    );
+                    let matching_rows: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM model_facts
+                         WHERE provider_id = ?1 AND model_id = ?2",
+                        params![fact.provider_id, fact.model_id],
+                        |row| row.get(0),
+                    )?;
+                    if matching_rows == 0 {
+                        tx.execute(
+                            "INSERT INTO model_facts (
+                               route_key, capacity_key, provider_id, model_id, variant, family,
+                               scores_json, context_window, max_output_tokens, cost_tier,
+                               cost_per_mtok_out, supports_vision, supports_tool_use,
+                               prompt_defaults_json, confidence, notes, speed_multiplier,
+                               excluded, source, updated_at, aa_index, review_by_ms, eq_source,
+                               facts_source, fusiform_version, fusiform_present,
+                               context_window_source, max_output_tokens_source, cost_tier_source,
+                               cost_per_mtok_out_source, supports_vision_source,
+                               supports_tool_use_source
+                             ) VALUES (
+                               ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
+                               ?8, ?9, ?10, NULL, 'unknown',
+                               'discovered by Fusiform; awaiting operator score placement',
+                               NULL, 0, 'unscored', ?11, NULL, NULL, NULL,
+                               'fusiform', ?12, ?13,
+                               'fusiform', 'fusiform', 'fusiform', 'fusiform',
+                               'fusiform', 'fusiform'
+                             )",
+                            params![
+                                route_key,
+                                fact.provider_id,
+                                fact.model_id,
+                                scores_json,
+                                fact.context_window,
+                                fact.max_output_tokens,
+                                fact.cost_tier,
+                                fact.cost_per_mtok_out,
+                                bool_to_int(fact.supports_vision),
+                                bool_to_int(fact.supports_tool_use),
+                                now_ms(),
+                                cursor.catalog_version,
+                                if fact.present { 1_i64 } else { 0_i64 },
+                            ],
+                        )?;
+                        let provider_key = derive_provider_key(&fact.provider_id).ok_or_else(|| {
+                            rusqlite::Error::InvalidParameterName(format!(
+                                "provider {} has no canonical key",
+                                fact.provider_id
+                            ))
+                        })?;
+                        tx.execute(
+                            "INSERT OR IGNORE INTO model_route_state (
+                               route_key, capacity_key, provider_id, model_id, variant,
+                               cooldown_until, quota_exhausted_until, quota_pressure,
+                               latency_ema_ms, success_ema, failure_count, quota_error_count,
+                               last_error, last_error_at, updated_at
+                             )
+                             SELECT ?1, ?1, ?2, ?3, NULL,
+                                    provider.cooldown_until, provider.quota_exhausted_until,
+                                    provider.quota_pressure, NULL, NULL, 0, 0,
+                                    provider.last_error, provider.last_error_at, ?5
+                             FROM (SELECT ?4 AS provider_key) AS route
+                             LEFT JOIN provider_cooldown_state AS provider
+                               ON provider.provider_key = route.provider_key",
+                            params![
+                                route_key,
+                                fact.provider_id,
+                                fact.model_id,
+                                provider_key,
+                                now_ms(),
+                            ],
+                        )?;
+                    } else {
+                        tx.execute(
+                            "UPDATE model_facts SET
+                               context_window = CASE WHEN context_window_source = 'override'
+                                 THEN context_window ELSE ?1 END,
+                               max_output_tokens = CASE WHEN max_output_tokens_source = 'override'
+                                 THEN max_output_tokens ELSE ?2 END,
+                               cost_tier = CASE WHEN cost_tier_source = 'override'
+                                 THEN cost_tier ELSE ?3 END,
+                               cost_per_mtok_out = CASE WHEN cost_per_mtok_out_source = 'override'
+                                 THEN cost_per_mtok_out ELSE ?4 END,
+                               supports_vision = CASE WHEN supports_vision_source = 'override'
+                                 THEN supports_vision ELSE ?5 END,
+                               supports_tool_use = CASE WHEN supports_tool_use_source = 'override'
+                                 THEN supports_tool_use ELSE ?6 END,
+                               context_window_source = CASE WHEN context_window_source = 'override'
+                                 THEN context_window_source ELSE 'fusiform' END,
+                               max_output_tokens_source = CASE WHEN max_output_tokens_source = 'override'
+                                 THEN max_output_tokens_source ELSE 'fusiform' END,
+                               cost_tier_source = CASE WHEN cost_tier_source = 'override'
+                                 THEN cost_tier_source ELSE 'fusiform' END,
+                               cost_per_mtok_out_source = CASE WHEN cost_per_mtok_out_source = 'override'
+                                 THEN cost_per_mtok_out_source ELSE 'fusiform' END,
+                               supports_vision_source = CASE WHEN supports_vision_source = 'override'
+                                 THEN supports_vision_source ELSE 'fusiform' END,
+                               supports_tool_use_source = CASE WHEN supports_tool_use_source = 'override'
+                                 THEN supports_tool_use_source ELSE 'fusiform' END,
+                               facts_source = 'fusiform', fusiform_version = ?7,
+                               fusiform_present = ?8, updated_at = ?9
+                             WHERE provider_id = ?10 AND model_id = ?11",
+                            params![
+                                fact.context_window,
+                                fact.max_output_tokens,
+                                fact.cost_tier,
+                                fact.cost_per_mtok_out,
+                                bool_to_int(fact.supports_vision),
+                                bool_to_int(fact.supports_tool_use),
+                                cursor.catalog_version,
+                                if fact.present { 1_i64 } else { 0_i64 },
+                                now_ms(),
+                                fact.provider_id,
+                                fact.model_id,
+                            ],
+                        )?;
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO fusiform_catalog_cursor (
+                       singleton, catalog_version, resolved_at_ms, updated_at
+                     ) VALUES (1, ?1, ?2, ?3)
+                     ON CONFLICT(singleton) DO UPDATE SET
+                       catalog_version = excluded.catalog_version,
+                       resolved_at_ms = excluded.resolved_at_ms,
+                       updated_at = excluded.updated_at",
+                    params![cursor.catalog_version, cursor.resolved_at_ms, now_ms()],
+                )?;
+                tx.commit()
             })
             .map_err(err)
     }
@@ -602,6 +819,7 @@ impl SqliteRouteStateStore {
                 let mut stmt = c.prepare(
                     "SELECT route_key FROM model_facts
                      WHERE source = 'unscored'
+                       AND COALESCE(fusiform_present, 1) = 1
                      ORDER BY route_key",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -1001,10 +1219,52 @@ impl RouteStateStore for SqliteRouteStateStore {
             .map_err(err)
     }
 
+    fn mark_operator_fact_fields(
+        &self,
+        route_key: &str,
+        fields: &[CatalogFactField],
+    ) -> RouteStateResult<()> {
+        let marked = |field| {
+            if fields.contains(&field) {
+                Some("override")
+            } else {
+                None
+            }
+        };
+        self.store
+            .with_conn(|connection: &Connection| {
+                connection.execute(
+                    "UPDATE model_facts SET
+                       context_window_source = COALESCE(?2, context_window_source),
+                       max_output_tokens_source = COALESCE(?3, max_output_tokens_source),
+                       cost_tier_source = COALESCE(?4, cost_tier_source),
+                       cost_per_mtok_out_source = COALESCE(?5, cost_per_mtok_out_source),
+                       supports_vision_source = COALESCE(?6, supports_vision_source),
+                       supports_tool_use_source = COALESCE(?7, supports_tool_use_source)
+                     WHERE route_key = ?1",
+                    params![
+                        route_key,
+                        marked(CatalogFactField::ContextWindow),
+                        marked(CatalogFactField::MaxOutputTokens),
+                        marked(CatalogFactField::CostTier),
+                        marked(CatalogFactField::CostPerMtokOut),
+                        marked(CatalogFactField::SupportsVision),
+                        marked(CatalogFactField::SupportsToolUse),
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(err)
+    }
+
     fn get_facts(&self) -> RouteStateResult<Vec<ModelFact>> {
         self.store
             .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare("SELECT * FROM model_facts WHERE source != 'unscored'")?;
+                let mut stmt = c.prepare(
+                    "SELECT * FROM model_facts
+                     WHERE source != 'unscored'
+                       AND COALESCE(fusiform_present, 1) = 1",
+                )?;
                 let rows = stmt.query_map([], row_to_fact)?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })

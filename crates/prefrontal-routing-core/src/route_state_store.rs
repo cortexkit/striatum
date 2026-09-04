@@ -26,6 +26,18 @@ pub enum FactSource {
     Unscored,
 }
 
+/// Catalog fact fields that an operator can override independently of score policy.
+/// Fusiform owns these facts unless the same field has this explicit override stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogFactField {
+    ContextWindow,
+    MaxOutputTokens,
+    CostTier,
+    CostPerMtokOut,
+    SupportsVision,
+    SupportsToolUse,
+}
+
 impl FactSource {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -229,6 +241,16 @@ pub trait RouteStateStore {
     /// Upsert a fact (by route key), tagging its provenance. Used for runtime
     /// config overrides; the curated seed is applied once via migration, not here.
     fn upsert_fact(&self, fact: &ModelFact, source: FactSource) -> RouteStateResult<()>;
+
+    /// Stamp only the named fact fields as operator-owned. Backends predating
+    /// per-field provenance may keep the default no-op implementation.
+    fn mark_operator_fact_fields(
+        &self,
+        _route_key: &str,
+        _fields: &[CatalogFactField],
+    ) -> RouteStateResult<()> {
+        Ok(())
+    }
 
     /// All facts currently in the store (seed + overrides).
     fn get_facts(&self) -> RouteStateResult<Vec<ModelFact>>;
