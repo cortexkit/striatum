@@ -2261,6 +2261,8 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
 
 #[test]
 fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
+    // Two operator-known providers (both seeded in the catalog) serve the same
+    // model spelling: two rows, keyed on the pair, never a bare-id merge.
     let rig = Rig::new("fusiform-pair-key");
     let store = rig.open();
     let fact = |provider: &str| FusiformFactUpdate {
@@ -2271,12 +2273,12 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
         max_output_tokens: Some(8_192),
         cost_tier: Some(1.0),
         cost_per_mtok_out: Some(2.0),
-        supports_vision: Some(provider == "provider-a"),
+        supports_vision: Some(provider == "anthropic"),
         supports_tool_use: Some(true),
     };
     store
         .apply_fusiform_catalog(
-            &[fact("provider-a"), fact("provider-b")],
+            &[fact("anthropic"), fact("openai")],
             FusiformCatalogCursor {
                 catalog_version: 7,
                 resolved_at_ms: 700,
@@ -2291,10 +2293,51 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
         .filter(|row| row.fact.model_id == "shared-spelling")
         .collect::<Vec<_>>();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].fact.provider_id, "provider-a");
+    assert_eq!(rows[0].fact.provider_id, "anthropic");
     assert_eq!(rows[0].fact.supports_vision, Some(true));
-    assert_eq!(rows[1].fact.provider_id, "provider-b");
+    assert_eq!(rows[1].fact.provider_id, "openai");
     assert_eq!(rows[1].fact.supports_vision, Some(false));
+}
+
+#[test]
+fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
+    // Live catalog: ~7,500 models across ~200 providers. A first-sight row exists
+    // only under a provider that already has any fact row; the rest are not stored.
+    let rig = Rig::new("fusiform-provider-scope");
+    let store = rig.open();
+    let fact = |provider: &str, model: &str| FusiformFactUpdate {
+        provider_id: provider.to_string(),
+        model_id: model.to_string(),
+        present: true,
+        context_window: Some(64_000.0),
+        max_output_tokens: Some(4_096),
+        cost_tier: Some(1.0),
+        cost_per_mtok_out: Some(1.0),
+        supports_vision: Some(false),
+        supports_tool_use: Some(true),
+    };
+    store
+        .apply_fusiform_catalog(
+            &[
+                fact("302ai", "MiniMax-M2.7"),
+                fact("anthropic", "claude-never-seen"),
+            ],
+            FusiformCatalogCursor {
+                catalog_version: 9,
+                resolved_at_ms: 900,
+            },
+        )
+        .unwrap();
+    let rows = store.get_catalog_facts().unwrap();
+    assert!(
+        !rows.iter().any(|row| row.fact.provider_id == "302ai"),
+        "an unknown provider's model must not be stored"
+    );
+    let minted = rows
+        .iter()
+        .find(|row| row.fact.model_id == "claude-never-seen")
+        .expect("a known provider's new model is minted");
+    assert_eq!(minted.fact.provider_id, "anthropic");
 }
 
 #[test]

@@ -623,6 +623,20 @@ impl SqliteRouteStateStore {
                         |row| row.get(0),
                     )?;
                     if matching_rows == 0 {
+                        // First sight of a model. Fusiform serves ~7,500 models across
+                        // ~200 providers; a first-sight row is minted only under a
+                        // provider the operator already routes (one that has any fact
+                        // row), so `route.list_unscored` stays an operator worklist and
+                        // the candidate scan is not 7,000 rejections deep. Models under
+                        // unknown providers are not stored at all.
+                        let known_provider: i64 = tx.query_row(
+                            "SELECT COUNT(*) FROM model_facts WHERE provider_id = ?1",
+                            params![fact.provider_id],
+                            |row| row.get(0),
+                        )?;
+                        if known_provider == 0 {
+                            continue;
+                        }
                         tx.execute(
                             "INSERT INTO model_facts (
                                route_key, capacity_key, provider_id, model_id, variant, family,

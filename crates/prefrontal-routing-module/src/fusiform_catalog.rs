@@ -117,12 +117,26 @@ struct CatalogModelFacts {
     output_rate: Option<CatalogRate>,
 }
 
+/// Fusiform `RateValue`, tagged by `state` (fusiform-core lib.rs): `priced`
+/// carries an amount (currency/units/exponent), `stated_zero` and `unpriced`
+/// carry no amount at all. The first live catalog page decoded with a flat
+/// struct that required `currency` and failed on the first non-priced rate
+/// (`missing field currency`), so the consumer never reached; this shape is
+/// the producer's, not a guess.
 #[derive(Debug, Clone, Deserialize)]
-struct CatalogRate {
-    currency: String,
-    exponent: u32,
-    state: String,
-    units: i64,
+#[serde(tag = "state", rename_all = "snake_case")]
+enum CatalogRate {
+    Priced {
+        currency: String,
+        exponent: u32,
+        units: i64,
+    },
+    StatedZero,
+    Unpriced {
+        #[serde(default)]
+        #[allow(dead_code)]
+        reason: Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -132,11 +146,22 @@ struct CatalogSnapshot {
 }
 
 fn output_cost(rate: Option<&CatalogRate>) -> Option<f64> {
-    let rate = rate?;
-    if rate.state != "priced" || rate.currency != "USD" || rate.units < 0 || rate.exponent > 18 {
-        return None;
+    match rate? {
+        CatalogRate::Priced {
+            currency,
+            exponent,
+            units,
+        } => {
+            if currency != "USD" || *units < 0 || *exponent > 18 {
+                return None;
+            }
+            Some(*units as f64 / 10_f64.powi(*exponent as i32))
+        }
+        // A stated zero is a real price of zero; whether zero is "free" is
+        // routing policy downstream, and it must not read as absent.
+        CatalogRate::StatedZero => Some(0.0),
+        CatalogRate::Unpriced { .. } => None,
     }
-    Some(rate.units as f64 / 10_f64.powi(rate.exponent as i32))
 }
 
 fn cost_tier(cost_per_mtok_out: Option<f64>) -> Option<f64> {
@@ -635,6 +660,24 @@ mod tests {
                 .unwrap()
                 .catalog_version
         );
+    }
+
+    #[test]
+    fn rate_value_decodes_all_three_producer_states() {
+        // Producer enum (fusiform-core RateValue): priced | stated_zero | unpriced.
+        // The fixture only exercises `priced`; the live catalog carries the others.
+        let priced: CatalogRate = serde_json::from_value(json!({
+            "currency": "USD", "exponent": 9, "state": "priced", "units": 15000000000_i64,
+            "unit_provenance": {"kind": "assumed_by_policy", "policy": "models-dev-usd-v1"}
+        }))
+        .unwrap();
+        assert_eq!(output_cost(Some(&priced)), Some(15.0));
+        let zero: CatalogRate = serde_json::from_value(json!({ "state": "stated_zero" })).unwrap();
+        assert_eq!(output_cost(Some(&zero)), Some(0.0));
+        let unpriced: CatalogRate =
+            serde_json::from_value(json!({ "state": "unpriced", "reason": "source_omitted" }))
+                .unwrap();
+        assert_eq!(output_cost(Some(&unpriced)), None);
     }
 
     #[test]
