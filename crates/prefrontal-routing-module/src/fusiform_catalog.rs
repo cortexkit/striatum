@@ -158,9 +158,22 @@ fn cost_tier(cost_per_mtok_out: Option<f64>) -> Option<f64> {
     })
 }
 
+/// The tool surface wraps every reply as `{"result": <payload>}` while the producer
+/// fixture pins the bare payload; accept both so the fixture pin and the live wire
+/// decode through one path.
+fn unwrap_tool_result(bytes: &[u8]) -> Result<Value, FusiformCatalogError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(FusiformCatalogError::Json)?;
+    Ok(match value {
+        Value::Object(ref map) if map.len() == 1 && map.contains_key("result") => {
+            value["result"].clone()
+        }
+        other => other,
+    })
+}
+
 fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogError> {
     let reply: CatalogGetReply =
-        serde_json::from_slice(bytes).map_err(FusiformCatalogError::Json)?;
+        serde_json::from_value(unwrap_tool_result(bytes)?).map_err(FusiformCatalogError::Json)?;
     let mut facts = Vec::with_capacity(reply.models.len());
     for (served_key, model) in reply.models {
         let (provider_id, model_id) = served_key
@@ -204,7 +217,7 @@ fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogEr
 }
 
 fn decode_catalog_status(bytes: &[u8]) -> Result<CatalogStatusReply, FusiformCatalogError> {
-    serde_json::from_slice(bytes).map_err(FusiformCatalogError::Json)
+    serde_json::from_value(unwrap_tool_result(bytes)?).map_err(FusiformCatalogError::Json)
 }
 
 /// Short-lived Fusiform connection. Callers create one per bootstrap/poll cycle
@@ -268,7 +281,10 @@ impl FusiformCatalogConsumer {
             corr,
             serde_json::to_vec(&json!({
                 "op": "route.open",
-                "target": { "kind": "management_surface", "module_id": FUSIFORM_MODULE_ID },
+                // Fusiform serves catalog.* on its TOOL surface (fusiform-module lib.rs
+                // `provides: ToolProvider`); a management_surface bind answers
+                // target_unavailable and the consumer sits at never-reached forever.
+                "target": { "kind": "tool_provider", "module_id": FUSIFORM_MODULE_ID },
                 "identity": {
                     "project_root": project_root,
                     "harness": "prefrontal-routing",
@@ -520,6 +536,7 @@ pub async fn catalog_refresh_loop(
     let project_root = std::env::temp_dir().join("prefrontal-routing-fusiform-consumer");
     let _ = std::fs::create_dir_all(&project_root);
     let mut bootstrapped = false;
+    let mut last_logged_error: Option<String> = None;
     loop {
         let result = match FusiformCatalogConsumer::connect(&connection_file_path, &project_root)
             .await
@@ -534,7 +551,13 @@ pub async fn catalog_refresh_loop(
                 tokio::time::sleep(Duration::from_millis(poll_ms)).await;
             }
             Err(reason) => {
-                tracing::debug!(error = %reason, "Fusiform catalog refresh cycle failed");
+                // One line per DISTINCT reason: a repeating failure is visible in the
+                // health snapshot's lastError, a changing one is worth a log line.
+                let rendered = reason.to_string();
+                if last_logged_error.as_deref() != Some(rendered.as_str()) {
+                    eprintln!("[prefrontal-routing] fusiform catalog cycle failed: {rendered}");
+                    last_logged_error = Some(rendered);
+                }
                 if let Ok(mut health) = health.lock() {
                     health.note_error(reason);
                 }
@@ -585,6 +608,33 @@ mod tests {
 
     fn get_reply(name: &str) -> Vec<u8> {
         serde_json::to_vec(&fixture()[name]["response"]).unwrap()
+    }
+
+    #[test]
+    fn tool_surface_result_envelope_and_bare_payload_decode_identically() {
+        // Live wire: the ToolProvider surface answers {"result": <payload>}; the
+        // producer fixture pins the bare payload. Both must yield one snapshot.
+        let bare = get_reply("catalog.get — one model, current");
+        let wrapped = serde_json::to_vec(
+            &json!({ "result": fixture()["catalog.get — one model, current"]["response"] }),
+        )
+        .unwrap();
+        let a = decode_catalog_get(&bare).unwrap();
+        let b = decode_catalog_get(&wrapped).unwrap();
+        assert_eq!(a.facts.len(), b.facts.len());
+        assert_eq!(a.facts[0].provider_id, b.facts[0].provider_id);
+        assert_eq!(a.facts[0].model_id, b.facts[0].model_id);
+        let status_wrapped =
+            serde_json::to_vec(&json!({ "result": fixture()["catalog.status"]["response"] }))
+                .unwrap();
+        assert_eq!(
+            decode_catalog_status(&status_wrapped)
+                .unwrap()
+                .catalog_version,
+            decode_catalog_status(&get_reply("catalog.status"))
+                .unwrap()
+                .catalog_version
+        );
     }
 
     #[test]
