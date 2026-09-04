@@ -10,6 +10,7 @@ name = "ck-prefrontal-routing"
 path = "src/main.rs"
 
 [dependencies]
+prefrontal-ckcred-client = { path = "../prefrontal-ckcred-client" }
 prefrontal-routing-core = { path = "../prefrontal-routing-core" }
 prefrontal-routing-store = { path = "../prefrontal-routing-store" }
 cortexkit-store-types = { workspace = true }
