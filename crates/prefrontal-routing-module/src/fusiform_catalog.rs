@@ -737,6 +737,16 @@ mod tests {
             "catalog.get — a model whose reasoning capability is unknown",
         ))
         .unwrap();
+        // First-sight rows are minted only under operator-known providers; make the
+        // fixture's synthetic provider known with one placeholder fact so the
+        // capability arm (not the provider scope) is what this test exercises.
+        use prefrontal_routing_core::route_state_store::RouteStateStore as _;
+        let mut placeholder = row.fact.clone();
+        placeholder.provider_id = "synthetic".to_string();
+        placeholder.model_id = "placeholder".to_string();
+        store
+            .upsert_fact(&placeholder, prefrontal_routing_core::FactSource::Seed)
+            .unwrap();
         store
             .apply_fusiform_catalog(&unknown.facts, unknown.cursor)
             .unwrap();
