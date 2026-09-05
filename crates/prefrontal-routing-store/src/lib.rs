@@ -527,9 +527,21 @@ impl SqliteRouteStateStore {
     /// lease per database, by construction), so there is no lease-dir to pass.
     pub fn open(descriptor: &StorageDescriptor) -> RouteStateResult<Self> {
         let store = open_sqlite(descriptor).map_err(err)?;
-        store
+        // A store written by a longer chain than this binary carries used to
+        // migrate as a silent no-op and then serve a schema the binary cannot
+        // query. The route-state chain rebuilds tables and re-keys facts, so an
+        // ahead store is refused here, naming both versions.
+        let outcome = store
             .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations())
             .map_err(err)?;
+        if outcome.store_ahead() {
+            return Err(err(format!(
+                "store_ahead: namespace {ROUTE_STATE_NAMESPACE} is at version {} but this binary's chain ends at {}; \
+                 this binary would serve a schema it cannot query (binary rollback or reset numbering); \
+                 deploy a binary carrying version {} or newer",
+                outcome.recorded, outcome.chain_max, outcome.recorded
+            )));
+        }
         Ok(Self { store })
     }
 
