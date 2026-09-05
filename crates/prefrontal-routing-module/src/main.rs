@@ -1666,10 +1666,14 @@ async fn handle_model_fact(
             // Capability reads preserve an absent flag as cannot-verify. Routing admission
             // remains conservative in its own path and may treat the same absence as no.
             "supportsVision": fact.supports_vision,
+            // The provider's own output ceiling, so a caller that PINS this route (the
+            // consult synthesizer pin) can size its send to the pinned model instead of
+            // inheriting another member's cap; absent when the catalog does not know it.
+            "maxOutputTokens": fact.max_output_tokens,
         }),
         Ok(None) => {
             warn_missing_session_model_once(&params.provider_id, &params.model_id);
-            json!({ "known": false, "supportsVision": null })
+            json!({ "known": false, "supportsVision": null, "maxOutputTokens": null })
         }
         Err(error) => {
             return send_route_error(
@@ -4025,7 +4029,8 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(
             body["result"],
-            json!({ "known": true, "supportsVision": true })
+            json!({ "known": true, "supportsVision": true, "maxOutputTokens": 64000 }),
+            "the reply carries the catalog's own output ceiling so a caller that pins this route can size its send to it"
         );
     }
 
