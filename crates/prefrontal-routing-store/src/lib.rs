@@ -25,7 +25,7 @@ use prefrontal_routing_core::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
@@ -118,6 +118,27 @@ const MIGRATION_034: &str = include_str!("../migrations/034_fusiform_catalog.sql
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
+
+/// Fetch one route's bounded observed-speed sample set through the route/time index.
+/// The batched lookup prepares this statement once and reuses it for every
+/// effective catalog key.
+pub const OBSERVED_SPEED_SAMPLES_SQL: &str = "SELECT output_tokens, duration_ms
+     FROM model_route_usage INDEXED BY model_route_usage_route_observed_idx
+     WHERE route_key = ?1
+       AND observed_at >= ?2
+       AND observed_at <= ?3
+       AND output_tokens >= ?4
+       AND duration_ms >= ?5
+     ORDER BY observed_at DESC
+     LIMIT ?6";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedSpeedAggregate {
+    route_key: String,
+    sample_count: i64,
+    output_tokens: i64,
+    duration_ms: i64,
+}
 
 fn route_state_migrations() -> [Migration; 34] {
     [
@@ -990,66 +1011,86 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Aggregate each route's most-recent eligible usage samples in one query.
-    /// The window ranking preserves the per-route cap that `get_observed_speed`
-    /// applies for a singular lookup, without issuing one query per catalog fact.
-    fn get_observed_speeds(&self, now: f64) -> RouteStateResult<HashMap<String, f64>> {
+    /// Fetch each effective catalog route through its own bounded index seek while
+    /// retaining one store call, connection checkout, and prepared statement.
+    fn get_observed_speed_aggregates(
+        &self,
+        observed_route_keys: &BTreeSet<String>,
+        now: f64,
+    ) -> RouteStateResult<Vec<ObservedSpeedAggregate>> {
+        if observed_route_keys.is_empty() {
+            return Ok(Vec::new());
+        }
         self.store
             .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(
-                    "WITH ranked_usage AS (
-                       SELECT route_key, output_tokens, duration_ms,
-                              ROW_NUMBER() OVER (
-                                PARTITION BY route_key ORDER BY observed_at DESC
-                              ) AS sample_rank
-                       FROM model_route_usage
-                       WHERE observed_at >= ?1
-                         AND observed_at <= ?2
-                         AND output_tokens >= ?3
-                         AND duration_ms >= ?4
-                     )
-                     SELECT route_key, COUNT(*), SUM(output_tokens), SUM(duration_ms)
-                     FROM ranked_usage
-                     WHERE sample_rank <= ?5
-                     GROUP BY route_key",
-                )?;
-                let rows = stmt.query_map(
-                    params![
-                        (now - OBSERVED_SPEED_WINDOW_MS).floor() as i64,
-                        now.floor() as i64,
-                        USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
-                        USAGE_MIN_DURATION_MS.floor() as i64,
-                        OBSERVED_SPEED_SAMPLE_LIMIT,
-                    ],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    },
-                )?;
-                let mut speeds = HashMap::new();
-                for row in rows {
-                    let (route_key, count, output_tokens, duration_ms) = row?;
-                    // Keep the singular lookup's trust gates byte-for-byte: absent
-                    // or untrusted aggregates leave the catalog speed untouched.
-                    if count < OBSERVED_SPEED_MIN_SAMPLES as i64
-                        || (output_tokens as f64) < OBSERVED_SPEED_MIN_OUTPUT_TOKENS
-                        || duration_ms <= 0
-                    {
-                        continue;
+                let mut stmt = c.prepare(OBSERVED_SPEED_SAMPLES_SQL)?;
+                let mut aggregates = Vec::with_capacity(observed_route_keys.len());
+                for route_key in observed_route_keys {
+                    let rows = stmt.query_map(
+                        params![
+                            route_key,
+                            (now - OBSERVED_SPEED_WINDOW_MS).floor() as i64,
+                            now.floor() as i64,
+                            USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
+                            USAGE_MIN_DURATION_MS.floor() as i64,
+                            OBSERVED_SPEED_SAMPLE_LIMIT,
+                        ],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )?;
+                    let mut sample_count = 0_i64;
+                    let mut output_tokens = 0_i64;
+                    let mut duration_ms = 0_i64;
+                    for row in rows {
+                        let (output, duration) = row?;
+                        sample_count += 1;
+                        output_tokens += output;
+                        duration_ms += duration;
                     }
-                    let speed = (output_tokens as f64 / duration_ms as f64) * 1000.0;
-                    if speed.is_finite() && speed > 0.0 {
-                        speeds.insert(route_key, speed);
+                    if sample_count > 0 {
+                        aggregates.push(ObservedSpeedAggregate {
+                            route_key: route_key.clone(),
+                            sample_count,
+                            output_tokens,
+                            duration_ms,
+                        });
                     }
                 }
-                Ok(speeds)
+                Ok(aggregates)
             })
             .map_err(err)
     }
+
+    fn get_observed_speeds(
+        &self,
+        observed_route_keys: &BTreeSet<String>,
+        now: f64,
+    ) -> RouteStateResult<HashMap<String, f64>> {
+        let mut speeds = HashMap::new();
+        for aggregate in self.get_observed_speed_aggregates(observed_route_keys, now)? {
+            // Keep the singular lookup's trust gates unchanged: absent or
+            // untrusted aggregates leave the catalog speed untouched.
+            if aggregate.sample_count < OBSERVED_SPEED_MIN_SAMPLES as i64
+                || (aggregate.output_tokens as f64) < OBSERVED_SPEED_MIN_OUTPUT_TOKENS
+                || aggregate.duration_ms <= 0
+            {
+                continue;
+            }
+            let speed = (aggregate.output_tokens as f64 / aggregate.duration_ms as f64) * 1000.0;
+            if speed.is_finite() && speed > 0.0 {
+                speeds.insert(aggregate.route_key, speed);
+            }
+        }
+        Ok(speeds)
+    }
+}
+
+fn observed_route_key_for_fact(fact: &ModelFact) -> String {
+    let observed_variant = fact
+        .prompt_defaults
+        .as_ref()
+        .and_then(|defaults| defaults.variant.as_deref())
+        .or(fact.variant.as_deref());
+    prefrontal_routing_core::make_route_key(&fact.provider_id, &fact.model_id, observed_variant)
 }
 
 fn decision_explain_row(row: &Row<'_>) -> rusqlite::Result<DecisionExplainRow> {
@@ -1960,17 +2001,7 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 // The most-recent eligible rows in the trailing window, capped at the
                 // sample limit: same query shape + gates as the TS getObservedSpeed.
-                let mut stmt = c.prepare(
-                    "SELECT output_tokens, duration_ms
-                     FROM model_route_usage
-                     WHERE route_key = ?1
-                       AND observed_at >= ?2
-                       AND observed_at <= ?3
-                       AND output_tokens >= ?4
-                       AND duration_ms >= ?5
-                     ORDER BY observed_at DESC
-                     LIMIT ?6",
-                )?;
+                let mut stmt = c.prepare(OBSERVED_SPEED_SAMPLES_SQL)?;
                 let rows = stmt.query_map(
                     params![
                         route_key,
@@ -2010,22 +2041,16 @@ impl RouteStateStore for SqliteRouteStateStore {
 
     fn get_facts_with_observed_speed(&self, now: f64) -> RouteStateResult<Vec<ModelFact>> {
         let facts = self.get_facts()?;
-        let observed_speeds = self.get_observed_speeds(now)?;
+        // Multiple catalog facts can resolve to the same prompt-default variant.
+        // Deduplicating here prevents repeated seeks without consulting usage for keys.
+        let observed_route_keys = facts
+            .iter()
+            .map(observed_route_key_for_fact)
+            .collect::<BTreeSet<_>>();
+        let observed_speeds = self.get_observed_speeds(&observed_route_keys, now)?;
         let mut overlaid = Vec::with_capacity(facts.len());
         for mut fact in facts {
-            // The observed route key is provider/model + the fact's prompt-default
-            // variant (falling back to its own variant), so a max-effort sibling's
-            // observations attach to the right fact (ported from observedRouteKeyForFact).
-            let observed_variant = fact
-                .prompt_defaults
-                .as_ref()
-                .and_then(|d| d.variant.clone())
-                .or_else(|| fact.variant.clone());
-            let observed_route_key = prefrontal_routing_core::make_route_key(
-                &fact.provider_id,
-                &fact.model_id,
-                observed_variant.as_deref(),
-            );
+            let observed_route_key = observed_route_key_for_fact(&fact);
             if let Some(speed) = observed_speeds.get(&observed_route_key) {
                 fact.scores.speed = *speed;
             }
@@ -2040,9 +2065,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                 fact.scores.speed *= multiplier;
                 fact.speed_multiplier = Some(multiplier);
             }
-            // Subscription subsidy is overlaid the same way: it is not persisted,
-            // only read from the boot-time config registry and attached to the fact
-            // so the objective can price the route at list ÷ multiplier.
+            // Subscription subsidy is overlaid rather than persisted. Selection
+            // refreshes the process-global registry from configuration before this
+            // read so the objective can price the route at list ÷ multiplier.
             if let Some(multiplier) =
                 prefrontal_routing_core::model_facts::get_subscription_multiplier(&route_key)
             {
@@ -2383,5 +2408,273 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
         let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+    }
+
+    const OLD_OBSERVED_SPEED_AGGREGATE_SQL: &str = "WITH ranked_usage AS (
+       SELECT route_key, output_tokens, duration_ms,
+              ROW_NUMBER() OVER (
+                PARTITION BY route_key ORDER BY observed_at DESC
+              ) AS sample_rank
+       FROM model_route_usage
+       WHERE observed_at >= ?1
+         AND observed_at <= ?2
+         AND output_tokens >= ?3
+         AND duration_ms >= ?4
+     )
+     SELECT route_key, COUNT(*), SUM(output_tokens), SUM(duration_ms)
+     FROM ranked_usage
+     WHERE sample_rank <= ?5
+     GROUP BY route_key";
+
+    fn observed_speed_test_store(label: &str) -> (std::path::PathBuf, SqliteRouteStateStore) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "prefrontal-routing-observed-speed-{label}-{}-{timestamp}.sqlite",
+            std::process::id()
+        ));
+        let descriptor = dev_descriptor(
+            &format!("prefrontal-routing-observed-speed-{label}"),
+            path.to_string_lossy(),
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        (path, store)
+    }
+
+    fn insert_usage_row(
+        store: &SqliteRouteStateStore,
+        id: &str,
+        route_key: &str,
+        output_tokens: i64,
+        duration_ms: i64,
+        observed_at: i64,
+    ) {
+        store
+            .store
+            .with_conn(|connection| {
+                connection.execute(
+                    "INSERT INTO model_route_usage
+                       (id, task_id, route_key, capacity_key, provider_id,
+                        input_tokens, output_tokens, duration_ms, observed_at)
+                     VALUES (?1, NULL, ?2, ?2, 'test', NULL, ?3, ?4, ?5)",
+                    params![id, route_key, output_tokens, duration_ms, observed_at],
+                )
+            })
+            .unwrap();
+    }
+
+    fn old_observed_speed_aggregates(
+        store: &SqliteRouteStateStore,
+        now: f64,
+    ) -> Vec<ObservedSpeedAggregate> {
+        let mut aggregates = store
+            .store
+            .with_conn(|connection| {
+                let mut statement = connection.prepare(OLD_OBSERVED_SPEED_AGGREGATE_SQL)?;
+                let rows = statement.query_map(
+                    params![
+                        (now - OBSERVED_SPEED_WINDOW_MS).floor() as i64,
+                        now.floor() as i64,
+                        USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
+                        USAGE_MIN_DURATION_MS.floor() as i64,
+                        OBSERVED_SPEED_SAMPLE_LIMIT,
+                    ],
+                    |row| {
+                        Ok(ObservedSpeedAggregate {
+                            route_key: row.get(0)?,
+                            sample_count: row.get(1)?,
+                            output_tokens: row.get(2)?,
+                            duration_ms: row.get(3)?,
+                        })
+                    },
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        aggregates.sort_by(|left, right| left.route_key.cmp(&right.route_key));
+        aggregates
+    }
+
+    fn remove_observed_speed_test_store(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+    }
+
+    #[test]
+    fn bounded_observed_speed_aggregates_match_the_shipped_window_oracle() {
+        let (path, store) = observed_speed_test_store("equivalence");
+        let now = OBSERVED_SPEED_WINDOW_MS + 10_000.0;
+        let window_start = (now - OBSERVED_SPEED_WINDOW_MS) as i64;
+        let route_keys = BTreeSet::from([
+            "test/more-than-limit".to_string(),
+            "test/exactly-limit".to_string(),
+            "test/insufficient".to_string(),
+            "test/zero-eligible".to_string(),
+        ]);
+
+        for index in 0..25_i64 {
+            insert_usage_row(
+                &store,
+                &format!("more-{index}"),
+                "test/more-than-limit",
+                1_000 + index,
+                1_000,
+                window_start + 100 + index,
+            );
+        }
+        for index in 0..OBSERVED_SPEED_SAMPLE_LIMIT {
+            insert_usage_row(
+                &store,
+                &format!("exact-{index}"),
+                "test/exactly-limit",
+                2_000,
+                1_000,
+                window_start + 200 + index,
+            );
+        }
+        for index in 0..(OBSERVED_SPEED_MIN_SAMPLES as i64 - 1) {
+            insert_usage_row(
+                &store,
+                &format!("insufficient-{index}"),
+                "test/insufficient",
+                3_000,
+                1_000,
+                window_start + 300 + index,
+            );
+        }
+
+        insert_usage_row(
+            &store,
+            "more-outside-window",
+            "test/more-than-limit",
+            50_000,
+            1_000,
+            window_start - 1,
+        );
+        insert_usage_row(
+            &store,
+            "more-below-token-floor",
+            "test/more-than-limit",
+            USAGE_MIN_OUTPUT_TOKENS as i64 - 1,
+            1_000,
+            window_start + 1_000,
+        );
+        insert_usage_row(
+            &store,
+            "more-below-duration-floor",
+            "test/more-than-limit",
+            50_000,
+            USAGE_MIN_DURATION_MS as i64 - 1,
+            window_start + 1_001,
+        );
+        insert_usage_row(
+            &store,
+            "zero-outside-window",
+            "test/zero-eligible",
+            50_000,
+            1_000,
+            window_start - 1,
+        );
+        insert_usage_row(
+            &store,
+            "zero-below-token-floor",
+            "test/zero-eligible",
+            USAGE_MIN_OUTPUT_TOKENS as i64 - 1,
+            1_000,
+            window_start + 1_100,
+        );
+        insert_usage_row(
+            &store,
+            "zero-below-duration-floor",
+            "test/zero-eligible",
+            50_000,
+            USAGE_MIN_DURATION_MS as i64 - 1,
+            window_start + 1_101,
+        );
+
+        let expected = old_observed_speed_aggregates(&store, now);
+        let actual = store
+            .get_observed_speed_aggregates(&route_keys, now)
+            .unwrap();
+        assert_eq!(actual, expected);
+        let sample_count = |route_key: &str| {
+            actual
+                .iter()
+                .find(|aggregate| aggregate.route_key == route_key)
+                .unwrap()
+                .sample_count
+        };
+        assert_eq!(
+            sample_count("test/more-than-limit"),
+            OBSERVED_SPEED_SAMPLE_LIMIT
+        );
+        assert_eq!(
+            sample_count("test/exactly-limit"),
+            OBSERVED_SPEED_SAMPLE_LIMIT
+        );
+        assert_eq!(
+            sample_count("test/insufficient"),
+            OBSERVED_SPEED_MIN_SAMPLES as i64 - 1
+        );
+
+        let trusted = store.get_observed_speeds(&route_keys, now).unwrap();
+        assert_eq!(trusted.len(), 2);
+        assert!(trusted.contains_key("test/more-than-limit"));
+        assert!(trusted.contains_key("test/exactly-limit"));
+        assert!(!trusted.contains_key("test/insufficient"));
+        assert!(!trusted.contains_key("test/zero-eligible"));
+
+        drop(store);
+        remove_observed_speed_test_store(&path);
+    }
+
+    #[test]
+    #[ignore = "prints a local wall-time comparison for the shipped and bounded query shapes"]
+    fn observed_speed_bounded_seek_benchmark() {
+        let (path, store) = observed_speed_test_store("benchmark");
+        let now = OBSERVED_SPEED_WINDOW_MS + 200_000.0;
+        let window_start = (now - OBSERVED_SPEED_WINDOW_MS) as i64;
+        store
+            .store
+            .with_conn(|connection| {
+                connection.execute(
+                    "WITH RECURSIVE sequence(n) AS (
+                       VALUES(1)
+                       UNION ALL
+                       SELECT n + 1 FROM sequence WHERE n < 100000
+                     )
+                     INSERT INTO model_route_usage
+                       (id, task_id, route_key, capacity_key, provider_id,
+                        input_tokens, output_tokens, duration_ms, observed_at)
+                     SELECT printf('benchmark-%d', n), NULL, 'benchmark/route',
+                            'benchmark/route', 'benchmark', NULL, 1000, 1000, ?1 + n
+                     FROM sequence",
+                    [window_start],
+                )
+            })
+            .unwrap();
+
+        let shipped_started = std::time::Instant::now();
+        let expected = old_observed_speed_aggregates(&store, now);
+        let shipped_elapsed = shipped_started.elapsed();
+        let route_keys = BTreeSet::from(["benchmark/route".to_string()]);
+        let bounded_started = std::time::Instant::now();
+        let actual = store
+            .get_observed_speed_aggregates(&route_keys, now)
+            .unwrap();
+        let bounded_elapsed = bounded_started.elapsed();
+        assert_eq!(actual, expected);
+        println!(
+            "observed_speed_benchmark rows=100000 shipped_ms={:.3} bounded_ms={:.3}",
+            shipped_elapsed.as_secs_f64() * 1_000.0,
+            bounded_elapsed.as_secs_f64() * 1_000.0,
+        );
+
+        drop(store);
+        remove_observed_speed_test_store(&path);
     }
 }

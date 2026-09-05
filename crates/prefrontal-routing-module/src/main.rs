@@ -3727,8 +3727,10 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores};
-    use prefrontal_routing_core::FactSource;
+    use prefrontal_routing_core::model_facts::{
+        Confidence, ModelFact, ModelPromptDefaults, ModelScores,
+    };
+    use prefrontal_routing_core::{FactSource, UsageObservation};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -3932,6 +3934,55 @@ mod tests {
 
     fn usage(v: serde_json::Value) -> ProviderUsage {
         serde_json::from_value(v).expect("provider usage")
+    }
+
+    #[test]
+    fn prepare_selection_inputs_preserves_the_catalog_observed_speed_overlay() {
+        let rig = Rig::new("selection-input-observed-speed");
+        let store = Arc::new(rig.open_store());
+        let mut base = fact("observed-caller", "fixture");
+        base.prompt_defaults = Some(ModelPromptDefaults {
+            variant: Some("high".into()),
+            ..Default::default()
+        });
+        let mut sibling = base.clone();
+        sibling.variant = Some("low".into());
+        store.upsert_fact(&base, FactSource::Override).unwrap();
+        store.upsert_fact(&sibling, FactSource::Override).unwrap();
+
+        let observed_at = now_ms().saturating_sub(10_000) as f64;
+        for index in 0..25 {
+            store
+                .record_usage_observation(&UsageObservation {
+                    id: format!("selection-input-observed-{index}"),
+                    route_key: "observed-caller/fixture/high".into(),
+                    capacity_key: "observed-caller/fixture".into(),
+                    provider_id: "observed-caller".into(),
+                    output_tokens: 1_000.0 + index as f64,
+                    duration_ms: 1_000.0,
+                    observed_at: observed_at + index as f64,
+                })
+                .unwrap();
+        }
+
+        let expected = store
+            .get_facts_with_observed_speed(now_ms() as f64)
+            .unwrap()
+            .into_iter()
+            .filter(|fact| fact.provider_id == "observed-caller")
+            .collect::<Vec<_>>();
+        let prepared =
+            prepare_selection_inputs(&Arc::new(Mutex::new(QuotaCache::default())), &store).unwrap();
+        let actual = prepared
+            .facts
+            .into_iter()
+            .filter(|fact| fact.provider_id == "observed-caller")
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 2);
+        assert!(actual.iter().all(|fact| fact.scores.speed > 1_000.0));
+        assert_eq!(actual[0].scores.speed, actual[1].scores.speed);
     }
 
     #[tokio::test]
