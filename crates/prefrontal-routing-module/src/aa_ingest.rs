@@ -5,9 +5,14 @@
 //! reply. Fetch failure is fail-open: the last cached table stays, and the
 //! cycle logs a key-free one-liner.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
+use prefrontal_ckcred_client::{
+    CredentialErrorClass, CredentialResolver, CredentialResolverError, ResolvedCredential,
+};
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
     aa_elo_curve, fact_to_route, infer_elo_from_aa, inherit_eq_from_curated_neighbors,
@@ -17,6 +22,8 @@ use prefrontal_routing_store::SqliteRouteStateStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[cfg(test)]
+use crate::config_overrides::DEFAULT_AA_API_KEY_REF;
 use crate::config_overrides::{self, AaConfig};
 
 const AA_MODELS_FREE_URL: &str = "https://artificialanalysis.ai/api/v2/language/models/free";
@@ -280,18 +287,120 @@ pub fn log_aa_ingest_failure(label: &str) {
 }
 
 pub fn log_aa_ingest_skipped() {
-    eprintln!("[prefrontal-routing] aa ingest skipped: no api key configured");
-    tracing::warn!("aa ingest skipped: no api key configured");
+    eprintln!("[prefrontal-routing] aa ingest skipped: no credential reference configured");
+    tracing::warn!("aa ingest skipped: no credential reference configured");
 }
 
-pub async fn aa_ingest_loop(store: std::sync::Arc<SqliteRouteStateStore>, config_path: PathBuf) {
+fn log_aa_credential_failure(class: CredentialErrorClass) {
+    let class = class.classifier_code();
+    eprintln!("[prefrontal-routing] aa ingest credential unavailable ({class}); skipping cycle");
+    tracing::warn!(class, "aa ingest credential unavailable; skipping cycle");
+}
+
+type AaFetchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<(String, f64)>, &'static str>> + Send + 'a>>;
+
+trait AaIndexFetcher: Send + Sync {
+    fn fetch<'a>(&'a self, api_key: &'a str) -> AaFetchFuture<'a>;
+}
+
+struct LiveAaIndexFetcher;
+
+impl AaIndexFetcher for LiveAaIndexFetcher {
+    fn fetch<'a>(&'a self, api_key: &'a str) -> AaFetchFuture<'a> {
+        Box::pin(fetch_aa_index(api_key))
+    }
+}
+
+trait AaCredentialFailureLogger: Send + Sync {
+    fn log(&self, class: CredentialErrorClass);
+}
+
+struct LiveAaCredentialFailureLogger;
+
+impl AaCredentialFailureLogger for LiveAaCredentialFailureLogger {
+    fn log(&self, class: CredentialErrorClass) {
+        log_aa_credential_failure(class);
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AaCredentialLogState {
+    last_class: Option<CredentialErrorClass>,
+}
+
+impl AaCredentialLogState {
+    fn should_log(&mut self, class: CredentialErrorClass) -> bool {
+        if self.last_class == Some(class) {
+            return false;
+        }
+        self.last_class = Some(class);
+        true
+    }
+
+    fn note_success(&mut self) {
+        self.last_class = None;
+    }
+}
+
+async fn resolve_aa_credential(
+    resolver: &dyn CredentialResolver,
+    credential_id: &str,
+) -> Result<ResolvedCredential, CredentialResolverError> {
+    match resolver.get_scoped(credential_id).await {
+        Err(error) if error.class == CredentialErrorClass::Transport => {
+            // The client drops its failed cached connection on a transport error.
+            // One more call therefore performs the bounded redial; the hourly loop,
+            // rather than an internal retry ladder, owns the next attempt after that.
+            resolver.get_scoped(credential_id).await
+        }
+        result => result,
+    }
+}
+
+pub async fn aa_ingest_loop(
+    store: std::sync::Arc<SqliteRouteStateStore>,
+    config_path: PathBuf,
+    resolver: std::sync::Arc<dyn CredentialResolver>,
+) {
+    let mut credential_log_state = AaCredentialLogState::default();
     loop {
-        run_aa_ingest_cycle(store.as_ref(), &config_path).await;
+        run_aa_ingest_cycle(
+            store.as_ref(),
+            &config_path,
+            resolver.as_ref(),
+            &mut credential_log_state,
+        )
+        .await;
         tokio::time::sleep(AA_INGEST_INTERVAL).await;
     }
 }
 
-pub async fn run_aa_ingest_cycle(store: &SqliteRouteStateStore, config_path: &Path) {
+pub async fn run_aa_ingest_cycle(
+    store: &SqliteRouteStateStore,
+    config_path: &Path,
+    resolver: &dyn CredentialResolver,
+    credential_log_state: &mut AaCredentialLogState,
+) {
+    run_aa_ingest_cycle_with(
+        store,
+        config_path,
+        resolver,
+        credential_log_state,
+        &LiveAaIndexFetcher,
+        &LiveAaCredentialFailureLogger,
+    )
+    .await;
+}
+
+async fn run_aa_ingest_cycle_with(
+    store: &SqliteRouteStateStore,
+    config_path: &Path,
+    resolver: &dyn CredentialResolver,
+    credential_log_state: &mut AaCredentialLogState,
+    fetcher: &dyn AaIndexFetcher,
+    credential_logger: &dyn AaCredentialFailureLogger,
+) {
     let config = match config_overrides::read_aa_config(config_path) {
         Ok(config) => config,
         Err(_) => {
@@ -299,11 +408,29 @@ pub async fn run_aa_ingest_cycle(store: &SqliteRouteStateStore, config_path: &Pa
             return;
         }
     };
-    let Some(api_key) = config.api_key.as_deref() else {
+    let Some(api_key_ref) = config.api_key_ref.as_deref() else {
         log_aa_ingest_skipped();
         return;
     };
-    match fetch_aa_index(api_key).await {
+    let credential = match resolve_aa_credential(resolver, api_key_ref).await {
+        Ok(credential) => {
+            credential_log_state.note_success();
+            credential
+        }
+        Err(error) => {
+            if credential_log_state.should_log(error.class) {
+                credential_logger.log(error.class);
+            }
+            return;
+        }
+    };
+    let fetch_result = match std::str::from_utf8(credential.expose()) {
+        Ok(api_key) => fetcher.fetch(api_key).await,
+        Err(_) => Err("credential_payload"),
+    };
+    // Dropping the resolved record scrubs its payload before any store or log work.
+    drop(credential);
+    match fetch_result {
         Ok(rows) => {
             if store.replace_aa_index_table(&rows, now_ms()).is_err() {
                 log_aa_ingest_failure("store");
@@ -317,8 +444,9 @@ pub async fn run_aa_ingest_cycle(store: &SqliteRouteStateStore, config_path: &Pa
 mod tests {
     use super::*;
     use prefrontal_routing_store::dev_descriptor;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     static N: AtomicU64 = AtomicU64::new(0);
 
@@ -356,6 +484,85 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.path);
             }
         }
+    }
+
+    struct ScriptedCredentialResolver {
+        replies: Mutex<VecDeque<Result<ResolvedCredential, CredentialResolverError>>>,
+        scoped_requests: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedCredentialResolver {
+        fn new(replies: Vec<Result<ResolvedCredential, CredentialResolverError>>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                scoped_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CredentialResolver for ScriptedCredentialResolver {
+        fn resolve<'a>(
+            &'a self,
+            _raw_handle: &'a str,
+            _min_ttl_ms: Option<u64>,
+            _force_refresh: bool,
+        ) -> prefrontal_ckcred_client::CredentialResolverFuture<
+            'a,
+            Result<ResolvedCredential, CredentialResolverError>,
+        > {
+            Box::pin(async { panic!("AA ingest uses only principal-scoped credentials") })
+        }
+
+        fn get_scoped<'a>(
+            &'a self,
+            credential_id: &'a str,
+        ) -> prefrontal_ckcred_client::CredentialResolverFuture<
+            'a,
+            Result<ResolvedCredential, CredentialResolverError>,
+        > {
+            Box::pin(async move {
+                self.scoped_requests
+                    .lock()
+                    .unwrap()
+                    .push(credential_id.to_string());
+                self.replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("credential script exhausted")
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingFetcher {
+        keys: Mutex<Vec<String>>,
+    }
+
+    impl AaIndexFetcher for RecordingFetcher {
+        fn fetch<'a>(&'a self, api_key: &'a str) -> AaFetchFuture<'a> {
+            Box::pin(async move {
+                self.keys.lock().unwrap().push(api_key.to_string());
+                Ok(vec![("fetched-slug".to_string(), 42.0)])
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCredentialLogger {
+        classes: Mutex<Vec<CredentialErrorClass>>,
+    }
+
+    impl AaCredentialFailureLogger for RecordingCredentialLogger {
+        fn log(&self, class: CredentialErrorClass) {
+            self.classes.lock().unwrap().push(class);
+        }
+    }
+
+    fn write_enabled_config(dir: &tempfile_dir::Dir) -> PathBuf {
+        let path = dir.path.join("alfonso-routing.jsonc");
+        std::fs::write(&path, r#"{ "aa": {} }"#).unwrap();
+        path
     }
 
     #[test]
@@ -470,7 +677,7 @@ mod tests {
             .replace_aa_index_table(&[("new-slug".into(), 20.0)], 1)
             .unwrap();
         let mut config = AaConfig {
-            api_key: Some(secret.into()),
+            api_key_ref: Some("apikey:test-aa".into()),
             model_map: HashMap::new(),
             review_by_ms: 14 * 24 * 60 * 60 * 1000,
         };
@@ -494,6 +701,148 @@ mod tests {
             "list_inferred reply leaked api key: {listed}"
         );
         assert!(!format!("{config:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn credential_absent_skips_all_http_calls_and_logs_once_until_class_changes() {
+        let (dir, store) = open_store();
+        let config_path = write_enabled_config(&dir);
+        let resolver = ScriptedCredentialResolver::new(vec![
+            Err(CredentialResolverError::new(
+                CredentialErrorClass::CredentialAbsent,
+                "credential is absent",
+            )),
+            Err(CredentialResolverError::new(
+                CredentialErrorClass::CredentialAbsent,
+                "credential is still absent",
+            )),
+            Err(CredentialResolverError::new(
+                CredentialErrorClass::Unauthorized,
+                "credential grant is absent",
+            )),
+        ]);
+        let fetcher = RecordingFetcher::default();
+        let logger = RecordingCredentialLogger::default();
+        let mut log_state = AaCredentialLogState::default();
+
+        for _ in 0..3 {
+            run_aa_ingest_cycle_with(
+                &store,
+                &config_path,
+                &resolver,
+                &mut log_state,
+                &fetcher,
+                &logger,
+            )
+            .await;
+        }
+
+        assert!(fetcher.keys.lock().unwrap().is_empty());
+        assert_eq!(
+            logger.classes.lock().unwrap().as_slice(),
+            &[
+                CredentialErrorClass::CredentialAbsent,
+                CredentialErrorClass::Unauthorized
+            ],
+            "a repeated class stays quiet while a changed class is reported once"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_ingest_cycle_resolves_again_and_fetches_with_the_rotated_record() {
+        let (dir, store) = open_store();
+        let config_path = write_enabled_config(&dir);
+        let resolver = ScriptedCredentialResolver::new(vec![
+            Ok(ResolvedCredential::new(
+                b"first-key".to_vec(),
+                "record-v1".into(),
+                None,
+            )),
+            Ok(ResolvedCredential::new(
+                b"rotated-key".to_vec(),
+                "record-v2".into(),
+                None,
+            )),
+        ]);
+        let fetcher = RecordingFetcher::default();
+        let logger = RecordingCredentialLogger::default();
+        let mut log_state = AaCredentialLogState::default();
+
+        for _ in 0..2 {
+            run_aa_ingest_cycle_with(
+                &store,
+                &config_path,
+                &resolver,
+                &mut log_state,
+                &fetcher,
+                &logger,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            fetcher.keys.lock().unwrap().as_slice(),
+            &["first-key", "rotated-key"],
+            "the second record version must carry its own rotated payload"
+        );
+        assert_eq!(
+            resolver.scoped_requests.lock().unwrap().as_slice(),
+            &[DEFAULT_AA_API_KEY_REF, DEFAULT_AA_API_KEY_REF]
+        );
+        assert!(logger.classes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transport_failure_gets_one_redial_before_the_cycle_skips() {
+        let (dir, store) = open_store();
+        let config_path = write_enabled_config(&dir);
+        let resolver = ScriptedCredentialResolver::new(vec![
+            Err(CredentialResolverError::transport("first connection lost")),
+            Err(CredentialResolverError::transport("redial failed")),
+        ]);
+        let fetcher = RecordingFetcher::default();
+        let logger = RecordingCredentialLogger::default();
+        let mut log_state = AaCredentialLogState::default();
+
+        run_aa_ingest_cycle_with(
+            &store,
+            &config_path,
+            &resolver,
+            &mut log_state,
+            &fetcher,
+            &logger,
+        )
+        .await;
+
+        assert_eq!(resolver.scoped_requests.lock().unwrap().len(), 2);
+        assert!(fetcher.keys.lock().unwrap().is_empty());
+        assert_eq!(
+            logger.classes.lock().unwrap().as_slice(),
+            &[CredentialErrorClass::Transport]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live subc, a supervised launch nonce, and the AA claustrum grant"]
+    async fn live_aa_models_payload_contains_the_operator_map_slugs() {
+        let home = std::env::var_os("HOME").expect("HOME is required for the live connection path");
+        let resolver = prefrontal_ckcred_client::CkcredCredentialResolver::new(
+            PathBuf::from(home).join(".local/share/cortexkit/run/subc-connection.json"),
+            std::env::current_dir().unwrap(),
+            "prefrontal-routing",
+        );
+        let credential = resolver
+            .get_scoped(DEFAULT_AA_API_KEY_REF)
+            .await
+            .expect("the routing principal must read the AA key");
+        let api_key = std::str::from_utf8(credential.expose()).expect("AA key must be UTF-8");
+        let rows = fetch_aa_index(api_key).await.expect("live AA models fetch");
+        drop(credential);
+        let slugs: std::collections::HashSet<_> = rows.into_iter().map(|(slug, _)| slug).collect();
+
+        for expected in ["gemini-3-8-flash", "glm-5-3", "glm-5-3-flash"] {
+            assert!(slugs.contains(expected), "AA payload missing {expected}");
+        }
     }
 
     #[test]

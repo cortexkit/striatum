@@ -560,9 +560,18 @@ where
         Arc::clone(&quota_cache),
         Arc::clone(&store),
     ));
+    let aa_credential_resolver: Arc<dyn prefrontal_ckcred_client::CredentialResolver> =
+        Arc::new(prefrontal_ckcred_client::CkcredCredentialResolver::new(
+            config.connection_file_path.clone(),
+            std::env::current_dir().map_err(|error| {
+                ModuleError::Message(format!("resolve routing credential project root: {error}"))
+            })?,
+            DEFAULT_MODULE_ID,
+        ));
     tokio::spawn(aa_ingest::aa_ingest_loop(
         Arc::clone(&store),
         config_overrides::config_path(),
+        aa_credential_resolver,
     ));
 
     // Merge the user's model-fact overrides (model_routing.models) from the module's

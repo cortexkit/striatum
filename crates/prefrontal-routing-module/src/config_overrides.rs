@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
+pub const DEFAULT_AA_API_KEY_REF: &str = "apikey:artificial-analysis";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
 
@@ -56,7 +57,7 @@ struct RoutingConfigFile {
     #[serde(default)]
     model_routing: ModelRoutingSection,
     #[serde(default)]
-    aa: AaSection,
+    aa: Option<AaSection>,
     #[serde(default)]
     catalog: CatalogSection,
 }
@@ -67,11 +68,25 @@ struct CatalogSection {
     poll_ms: Option<u64>,
 }
 
-/// Artificial Analysis ingest settings. The API key is never logged or served.
+/// Artificial Analysis ingest settings. Credential bytes stay in claustrum.
+///
+/// The operator-owned config uses explicit router-key-to-AA-slug entries because
+/// accepting approximate model names could attach a score to the wrong route:
+///
+/// ```jsonc
+/// aa: {
+///   api_key_ref: "apikey:artificial-analysis",
+///   model_map: {
+///     "google/gemini-3.8-flash": "gemini-3-8-flash",
+///     "ollama-cloud/glm-5.3": "glm-5-3",
+///     "ollama-cloud/glm-5.3-flash": "glm-5-3-flash",
+///   },
+/// }
+/// ```
 #[derive(Deserialize, Default, Clone)]
 pub struct AaSection {
     #[serde(default)]
-    pub api_key: Option<String>,
+    pub api_key_ref: Option<String>,
     /// Explicit router key (`provider/model[/variant]`) → AA slug. No fuzzy join.
     #[serde(default)]
     pub model_map: HashMap<String, String>,
@@ -83,7 +98,7 @@ pub struct AaSection {
 impl std::fmt::Debug for AaSection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AaSection")
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_ref", &self.api_key_ref)
             .field("model_map", &self.model_map)
             .field("review_by_days", &self.review_by_days)
             .finish()
@@ -95,7 +110,7 @@ pub const DEFAULT_AA_REVIEW_BY_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 
 #[derive(Clone)]
 pub struct AaConfig {
-    pub api_key: Option<String>,
+    pub api_key_ref: Option<String>,
     pub model_map: HashMap<String, String>,
     pub review_by_ms: i64,
 }
@@ -103,7 +118,7 @@ pub struct AaConfig {
 impl std::fmt::Debug for AaConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AaConfig")
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key_ref", &self.api_key_ref)
             .field("model_map", &self.model_map)
             .field("review_by_ms", &self.review_by_ms)
             .finish()
@@ -113,15 +128,15 @@ impl std::fmt::Debug for AaConfig {
 impl Default for AaConfig {
     fn default() -> Self {
         Self {
-            api_key: None,
+            api_key_ref: None,
             model_map: HashMap::new(),
             review_by_ms: DEFAULT_AA_REVIEW_BY_MS,
         }
     }
 }
 
-/// Read the AA ingest section. Missing file → empty config. The API key is
-/// returned for fetch use only; callers must never log or serialize it.
+/// Read the AA ingest section. Missing file or section disables ingest. A
+/// present section defaults to the operator's claustrum credential ID.
 pub fn read_aa_config(path: &Path) -> Result<AaConfig, String> {
     let document = match std::fs::read_to_string(path) {
         Ok(document) => document,
@@ -132,23 +147,40 @@ pub fn read_aa_config(path: &Path) -> Result<AaConfig, String> {
     };
     let json = jsonc_to_json(&document)
         .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
-    let config: RoutingConfigFile = serde_json::from_str(&json)
+    let raw: serde_json::Value = serde_json::from_str(&json)
         .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
-    let review_by_ms = match config.aa.review_by_days {
+    if raw
+        .get("aa")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|aa| aa.contains_key("api_key"))
+    {
+        return Err(
+            "aa.api_key is not accepted; set aa.api_key_ref and store the secret with `ck auth put --id apikey:artificial-analysis --kind api_key`"
+                .to_string(),
+        );
+    }
+    let config: RoutingConfigFile = serde_json::from_value(raw)
+        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
+    let Some(aa) = config.aa else {
+        return Ok(AaConfig::default());
+    };
+    let review_by_ms = match aa.review_by_days {
         Some(days) if days > 0 => (days as i64).saturating_mul(24 * 60 * 60 * 1000),
         Some(_) => {
             return Err("aa.review_by_days must be a positive integer".to_string());
         }
         None => DEFAULT_AA_REVIEW_BY_MS,
     };
-    let api_key = config
-        .aa
-        .api_key
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty());
+    let api_key_ref = match aa.api_key_ref {
+        Some(reference) if reference.trim().is_empty() => {
+            return Err("aa.api_key_ref must be a non-empty credential id".to_string());
+        }
+        Some(reference) => reference.trim().to_string(),
+        None => DEFAULT_AA_API_KEY_REF.to_string(),
+    };
     Ok(AaConfig {
-        api_key,
-        model_map: config.aa.model_map,
+        api_key_ref: Some(api_key_ref),
+        model_map: aa.model_map,
         review_by_ms,
     })
 }
@@ -809,6 +841,29 @@ mod tests {
     fn multiplier_map_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn plaintext_aa_api_key_is_refused_with_vault_cutover_guidance() {
+        let path = std::env::temp_dir().join(format!(
+            "prefrontal-routing-aa-config-{}.jsonc",
+            std::process::id()
+        ));
+        std::fs::write(&path, r#"{ "aa": { "api_key": "must-not-load" } }"#).unwrap();
+
+        let error = read_aa_config(&path).expect_err("plaintext credentials must be refused");
+
+        assert!(error.contains("api_key_ref"));
+        assert!(error.contains("ck auth put --id apikey:artificial-analysis --kind api_key"));
+
+        std::fs::write(&path, r#"{ "aa": {} }"#).unwrap();
+        assert_eq!(
+            read_aa_config(&path).unwrap().api_key_ref.as_deref(),
+            Some(DEFAULT_AA_API_KEY_REF)
+        );
+        std::fs::write(&path, r#"{ "model_routing": {} }"#).unwrap();
+        assert_eq!(read_aa_config(&path).unwrap().api_key_ref, None);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
