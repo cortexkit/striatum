@@ -29,6 +29,7 @@ use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, AdmittedRoute,
     ModelRouteStateSnapshot, ObjectiveBreakdown, RequiredCapabilities, SelectedModel,
 };
+use crate::provider_model_spec::ExclusionPolicy;
 use crate::routing_config::{RoutingConfig, ADEQUACY_FLOOR, DEFAULT_ROUTING_CONFIG};
 
 /// Ordered persona model recommendations, already normalized to the canonical
@@ -231,10 +232,13 @@ pub fn select_seat_route_with_config(
     }
 
     let exact_model_pins: Vec<String> = input.model_pin.iter().cloned().collect();
+    // Seat routing takes the operator fence through its available-model set, which
+    // the caller resolves against the operator policy before it gets here, so only
+    // the per-request exclusions are applied at admission.
     let admission = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),
-        &input.exclude_route_keys,
+        ExclusionPolicy::caller_only(&input.exclude_route_keys),
         &[],
         &exact_model_pins,
         input.required_capabilities,

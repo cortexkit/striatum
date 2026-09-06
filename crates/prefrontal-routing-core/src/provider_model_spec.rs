@@ -99,19 +99,105 @@ pub fn resolve_spec(specs: &[ParsedSpec], key: &str, base: bool) -> bool {
     result
 }
 
+/// The two exclusion lists a selection applies, deliberately kept apart.
+///
+/// `operator` is the standing fence the machine's owner wrote in the user-global
+/// config; `caller` is what a single call adds on top (the route that just failed,
+/// a consult's per-attempt exclusions). They are resolved SEPARATELY and the
+/// results OR-ed. Concatenating them into one list would let a caller negation
+/// ("-anthropic") cancel an operator entry, because within one list the last
+/// matching entry wins: a caller must only ever be able to ADD an exclusion.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExclusionPolicy<'a> {
+    pub operator: &'a [String],
+    pub caller: &'a [String],
+}
+
+impl<'a> ExclusionPolicy<'a> {
+    /// Per-call exclusions with no operator fence attached. Used by selection
+    /// paths that already meet the fence another way (they run against an
+    /// available-model set the fence has filtered) and by pinned selections,
+    /// which bypass exclusion by design.
+    pub fn caller_only(caller: &'a [String]) -> Self {
+        Self {
+            operator: &[],
+            caller,
+        }
+    }
+
+    /// Neither list. Explicit roster pins admit with no exclusion applied at all.
+    pub fn none() -> ExclusionPolicy<'static> {
+        ExclusionPolicy {
+            operator: &[],
+            caller: &[],
+        }
+    }
+}
+
+/// Which of the two lists excluded a route. They stay distinct because they mean
+/// different things to whoever reads the rejection: the operator fence is a
+/// standing policy decision, a caller exclusion is one attempt's local choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionSource {
+    Operator,
+    Caller,
+}
+
+/// Both exclusion lists parsed once for a selection pass.
+#[derive(Debug, Clone, Default)]
+pub struct ExclusionSpecs {
+    operator: Vec<ParsedSpec>,
+    caller: Vec<ParsedSpec>,
+}
+
+impl ExclusionSpecs {
+    pub fn parse(policy: ExclusionPolicy<'_>) -> Self {
+        Self {
+            operator: parse_spec_list(policy.operator),
+            caller: parse_spec_list(policy.caller),
+        }
+    }
+
+    /// The list that excludes `key`, if either does. The operator fence is checked
+    /// first so a route that both lists name is reported as the standing policy
+    /// decision it is, not as one attempt's local exclusion.
+    pub fn source_for(&self, key: &str) -> Option<ExclusionSource> {
+        if resolve_spec(&self.operator, key, false) {
+            return Some(ExclusionSource::Operator);
+        }
+        if resolve_spec(&self.caller, key, false) {
+            return Some(ExclusionSource::Caller);
+        }
+        None
+    }
+
+    pub fn excludes(&self, key: &str) -> bool {
+        self.source_for(key).is_some()
+    }
+}
+
 /// Remove keys matching an exclude spec list from an available-model set. base =
 /// false (nothing excluded); a positive match excludes, a negation keeps the key.
 pub fn filter_excluded_keys(
     available: &std::collections::HashSet<String>,
     exclude_entries: &[String],
 ) -> std::collections::HashSet<String> {
-    let specs = parse_spec_list(exclude_entries);
-    if specs.is_empty() {
+    filter_excluded_keys_with_policy(available, ExclusionPolicy::caller_only(exclude_entries))
+}
+
+/// Remove every key either exclusion list rejects. Union semantics: see
+/// [`ExclusionPolicy`] for why the two lists are never concatenated.
+pub fn filter_excluded_keys_with_policy(
+    available: &std::collections::HashSet<String>,
+    policy: ExclusionPolicy<'_>,
+) -> std::collections::HashSet<String> {
+    if policy.operator.is_empty() && policy.caller.is_empty() {
         return available.clone();
     }
+    let specs = ExclusionSpecs::parse(policy);
     available
         .iter()
-        .filter(|key| !resolve_spec(&specs, key, false))
+        .filter(|key| !specs.excludes(key))
         .cloned()
         .collect()
 }
@@ -161,6 +247,45 @@ mod tests {
         assert!(resolve_spec(&s, "openai/gpt-5.5", false)); // capacity key
         assert!(resolve_spec(&s, "openai/gpt-5.5/high", false)); // variant route
         assert!(!resolve_spec(&s, "openai/gpt-5.5-mini", false)); // different model, no prefix match
+    }
+
+    #[test]
+    fn caller_negation_cannot_lift_an_operator_exclusion() {
+        // The operator fences the whole provider; the caller tries to negate it.
+        // Resolved as one concatenated list the caller would win (last match wins),
+        // which is exactly what union semantics must prevent.
+        let operator = vec!["anthropic".to_string()];
+        let caller = vec!["-anthropic".to_string()];
+        let specs = ExclusionSpecs::parse(ExclusionPolicy {
+            operator: &operator,
+            caller: &caller,
+        });
+        assert_eq!(
+            specs.source_for("anthropic/claude-opus-4-8"),
+            Some(ExclusionSource::Operator)
+        );
+
+        // A caller-only exclusion still reports as the caller's own.
+        let caller_only = vec!["openai/gpt-5.4".to_string()];
+        let specs = ExclusionSpecs::parse(ExclusionPolicy::caller_only(&caller_only));
+        assert_eq!(
+            specs.source_for("openai/gpt-5.4"),
+            Some(ExclusionSource::Caller)
+        );
+        assert_eq!(specs.source_for("openai/gpt-5.5"), None);
+
+        // An operator negation inside the operator's OWN list still works: the
+        // union is between lists, not within one.
+        let operator = vec!["openai".to_string(), "-openai/gpt-5.5".to_string()];
+        let specs = ExclusionSpecs::parse(ExclusionPolicy {
+            operator: &operator,
+            caller: &[],
+        });
+        assert_eq!(specs.source_for("openai/gpt-5.5"), None);
+        assert_eq!(
+            specs.source_for("openai/gpt-5.4"),
+            Some(ExclusionSource::Operator)
+        );
     }
 
     #[test]

@@ -19,14 +19,15 @@ use std::time::SystemTime;
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
     make_route_key, model_facts_seed, CatalogFactField, FactSource, FailureBackoffConfig,
-    RouteStateStore, RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD,
-    DEFAULT_DEMAND_EXPONENT,
+    ModelRoutingPolicyInput, RouteStateStore, RoutingConfig,
+    DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
 };
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
+const OPERATOR_CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso.jsonc";
 pub const DEFAULT_AA_API_KEY_REF: &str = "apikey:artificial-analysis";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
@@ -50,6 +51,27 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
 
 pub fn default_providers_without_prompt_cache() -> Vec<String> {
     vec!["ollama-cloud".to_string()]
+}
+
+/// The slice of the operator's user-global Alfonso config this module reads.
+/// Deliberately its own minimal type rather than a reuse of [`RoutingConfigFile`]:
+/// alfonso.jsonc is a large document owned by other subsystems, and decoding it
+/// through a struct that also claims `models`, `elo_overrides` and friends would
+/// let an unrelated shape elsewhere in that file fail the whole policy read.
+#[derive(Debug, Deserialize, Default)]
+struct OperatorConfigFile {
+    #[serde(default)]
+    model_routing: OperatorRoutingSection,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OperatorRoutingSection {
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default)]
+    subscription: Vec<String>,
+    #[serde(default, alias = "preferFastWhenRelaxed")]
+    prefer_fast_when_relaxed: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -240,18 +262,29 @@ struct ModelFactOverride {
     subscription_multiplier: Option<f64>,
 }
 
-/// The config-home path for this module's own config file. Honors
-/// XDG_CONFIG_HOME, else `$HOME/.config`, matching the daemon's own resolution.
-pub fn config_path() -> PathBuf {
+/// Resolve a path under the user's config home. Honors XDG_CONFIG_HOME, else
+/// `$HOME/.config`, matching the daemon's own resolution.
+fn config_home_path(relative: &str) -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(xdg).join(CONFIG_RELATIVE_PATH);
+        return PathBuf::from(xdg).join(relative);
     }
     if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home)
-            .join(".config")
-            .join(CONFIG_RELATIVE_PATH);
+        return PathBuf::from(home).join(".config").join(relative);
     }
-    PathBuf::from(".config").join(CONFIG_RELATIVE_PATH)
+    PathBuf::from(".config").join(relative)
+}
+
+/// The config-home path for this module's own config file.
+pub fn config_path() -> PathBuf {
+    config_home_path(CONFIG_RELATIVE_PATH)
+}
+
+/// The config-home path for the operator's user-global Alfonso config, which owns
+/// `model_routing.{exclude, subscription, prefer_fast_when_relaxed}`. This module
+/// reads that policy itself because it is the routing authority: a policy applied
+/// only where a caller remembers to attach it is not a policy.
+pub fn operator_config_path() -> PathBuf {
+    config_home_path(OPERATOR_CONFIG_RELATIVE_PATH)
 }
 
 pub fn auth_json_path() -> PathBuf {
@@ -682,6 +715,155 @@ where
             Err(error)
         }
     }
+}
+
+/// The operator's routing policy as it was last read, keyed by config path.
+#[derive(Debug, Clone)]
+struct OperatorPolicyCache {
+    /// Freshness key of the document behind `policy`: (mtime, byte length). Same
+    /// two-part key as the prompt-cache provider list, for the same reason: two
+    /// writes can land inside one filesystem clock tick.
+    key: (Option<SystemTime>, Option<u64>),
+    /// The last document that parsed. A malformed live edit keeps this value: an
+    /// operator who breaks their config while editing must not silently lose the
+    /// fence and have routing start picking the models they excluded.
+    policy: ModelRoutingPolicyInput,
+    /// Freshness key of the malformed document already reported, so a broken file
+    /// logs once per edit rather than once per selection.
+    reported_failure: Option<(Option<SystemTime>, Option<u64>)>,
+}
+
+fn operator_policy_cache() -> &'static Mutex<HashMap<PathBuf, OperatorPolicyCache>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, OperatorPolicyCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The operator's `model_routing` policy from the user-global Alfonso config.
+///
+/// This is the routing fence, so it never fails into an empty policy: a missing
+/// file or missing field IS an empty policy (the operator excluded nothing), but a
+/// malformed file keeps the last policy that parsed and logs once per edit. The
+/// file is re-read only after its mtime or length changes, so selection reads it
+/// on the hot path without re-parsing per request and an operator edit takes
+/// effect on the next selection with no restart.
+pub fn read_operator_routing_policy(path: &Path) -> ModelRoutingPolicyInput {
+    read_operator_routing_policy_with_reader(path, |path| {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("reading {}: {error}", path.display()))
+    })
+}
+
+fn read_operator_routing_policy_with_reader<F>(path: &Path, read_file: F) -> ModelRoutingPolicyInput
+where
+    F: FnOnce(&Path) -> Result<String, String>,
+{
+    let (key, missing) = match std::fs::metadata(path) {
+        Ok(metadata) => ((metadata.modified().ok(), Some(metadata.len())), false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ((None, None), true),
+        // Unreadable for another reason: fall through to the read, which reports
+        // the concrete error and preserves the last good policy.
+        Err(_) => ((None, None), false),
+    };
+
+    // A poisoned lock means some other thread panicked while holding a plain
+    // cache. Recover the map instead of returning an empty fence.
+    let mut cache = operator_policy_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cached) = cache.get(path) {
+        if cached.key == key || cached.reported_failure == Some(key) {
+            return cached.policy.clone();
+        }
+    }
+
+    let parsed = if missing {
+        Ok(ModelRoutingPolicyInput::default())
+    } else {
+        read_file(path).and_then(|doc| parse_operator_routing_policy(path, &doc))
+    };
+
+    match parsed {
+        Ok(policy) => {
+            cache.insert(
+                path.to_path_buf(),
+                OperatorPolicyCache {
+                    key,
+                    policy: policy.clone(),
+                    reported_failure: None,
+                },
+            );
+            policy
+        }
+        Err(error) => {
+            let last_good = cache.get(path).cloned();
+            let policy = last_good
+                .as_ref()
+                .map(|cached| cached.policy.clone())
+                .unwrap_or_default();
+            eprintln!(
+                "[prefrontal-routing] operator routing policy {} is unusable ({error}); keeping the last good policy ({} exclusion entries)",
+                path.display(),
+                policy.exclude.len()
+            );
+            cache.insert(
+                path.to_path_buf(),
+                OperatorPolicyCache {
+                    // Keep the last GOOD document's key so repairing the file (or
+                    // reverting it) is seen as a change and re-read.
+                    key: last_good.map(|cached| cached.key).unwrap_or((None, None)),
+                    policy: policy.clone(),
+                    reported_failure: Some(key),
+                },
+            );
+            policy
+        }
+    }
+}
+
+fn parse_operator_routing_policy(
+    path: &Path,
+    document: &str,
+) -> Result<ModelRoutingPolicyInput, String> {
+    let json = jsonc_to_json(document)
+        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
+    let config: OperatorConfigFile = serde_json::from_str(&json)
+        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
+    let section = config.model_routing;
+    Ok(ModelRoutingPolicyInput {
+        exclude: clean_spec_entries(section.exclude),
+        subscription: clean_spec_entries(section.subscription),
+        prefer_fast_when_relaxed: clean_spec_entries(section.prefer_fast_when_relaxed),
+    })
+}
+
+fn clean_spec_entries(entries: Vec<String>) -> Vec<String> {
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// A stable identity for one operator policy, recorded with a decision so
+/// `route.explain` can say WHICH fence produced it. Derived from the policy's
+/// entries rather than the whole config file: unrelated edits elsewhere in
+/// alfonso.jsonc must not read as a routing-policy change.
+pub fn operator_policy_revision(policy: &ModelRoutingPolicyInput) -> String {
+    let mut hasher = Sha256::new();
+    for (label, entries) in [
+        ("exclude", &policy.exclude),
+        ("subscription", &policy.subscription),
+        ("prefer_fast_when_relaxed", &policy.prefer_fast_when_relaxed),
+    ] {
+        hasher.update(label.as_bytes());
+        hasher.update([0u8]);
+        for entry in entries {
+            hasher.update(entry.as_bytes());
+            hasher.update([0u8]);
+        }
+        hasher.update([0x1eu8]);
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn apply_overrides<S: RouteStateStore>(
@@ -1430,6 +1612,171 @@ mod tests {
             4,
             "parse failure did not serve stale policy"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn operator_routing_policy_defaults_to_empty_and_reloads_on_edit() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-operator-policy-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A missing file is an empty policy: the operator excluded nothing.
+        let missing = dir.join("missing.jsonc");
+        assert_eq!(
+            read_operator_routing_policy(&missing),
+            ModelRoutingPolicyInput::default()
+        );
+
+        let path = dir.join("alfonso.jsonc");
+        let set_mtime = |seconds| {
+            let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)),
+            )
+            .unwrap();
+        };
+        let reads = AtomicUsize::new(0);
+        let read_file = |path: &std::path::Path| {
+            reads.fetch_add(1, Ordering::Relaxed);
+            std::fs::read_to_string(path).map_err(|error| error.to_string())
+        };
+
+        // Comments and trailing commas: the operator's real file is JSONC.
+        std::fs::write(
+            &path,
+            r#"{
+              // routing fence
+              "model_routing": {
+                "exclude": ["anthropic", " ollama-cloud/glm-5.1 ", ""],
+                "subscription": ["kimi-for-coding"],
+                "prefer_fast_when_relaxed": ["openai"],
+              },
+            }"#,
+        )
+        .unwrap();
+        set_mtime(1_700_000_000);
+        let first = read_operator_routing_policy_with_reader(&path, read_file);
+        assert_eq!(first.exclude, vec!["anthropic", "ollama-cloud/glm-5.1"]);
+        assert_eq!(first.subscription, vec!["kimi-for-coding"]);
+        assert_eq!(first.prefer_fast_when_relaxed, vec!["openai"]);
+        assert_eq!(
+            read_operator_routing_policy_with_reader(&path, read_file),
+            first
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "unchanged mtime reused the cached policy"
+        );
+
+        // A live edit takes effect on the next read with no restart.
+        std::fs::write(&path, r#"{ "model_routing": { "exclude": ["xai"] } }"#).unwrap();
+        set_mtime(1_700_000_001);
+        let reloaded = read_operator_routing_policy_with_reader(&path, read_file);
+        assert_eq!(reloaded.exclude, vec!["xai"]);
+        assert_eq!(reads.load(Ordering::Relaxed), 2, "changed mtime reparsed");
+
+        // An absent model_routing block is an empty policy, not a parse failure.
+        std::fs::write(&path, r#"{ "push": { "enabled": true } }"#).unwrap();
+        set_mtime(1_700_000_002);
+        assert_eq!(
+            read_operator_routing_policy_with_reader(&path, read_file),
+            ModelRoutingPolicyInput::default()
+        );
+
+        // Two policies differ by revision; the same policy hashes the same.
+        assert_ne!(
+            operator_policy_revision(&first),
+            operator_policy_revision(&reloaded)
+        );
+        assert_eq!(
+            operator_policy_revision(&first),
+            operator_policy_revision(&first.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_operator_config_keeps_the_last_good_policy_and_reports_once() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-operator-policy-broken-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("alfonso.jsonc");
+        let set_mtime = |seconds| {
+            let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+            file.set_times(
+                std::fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)),
+            )
+            .unwrap();
+        };
+        let reads = AtomicUsize::new(0);
+        let read_file = |path: &std::path::Path| {
+            reads.fetch_add(1, Ordering::Relaxed);
+            std::fs::read_to_string(path).map_err(|error| error.to_string())
+        };
+
+        std::fs::write(
+            &path,
+            r#"{ "model_routing": { "exclude": ["anthropic"] } }"#,
+        )
+        .unwrap();
+        set_mtime(1_700_000_000);
+        assert_eq!(
+            read_operator_routing_policy_with_reader(&path, read_file).exclude,
+            vec!["anthropic"]
+        );
+
+        // Half-finished edit. The fence must NOT drop to empty: routing would
+        // immediately start selecting the very routes the operator excluded.
+        std::fs::write(&path, "{ \"model_routing\": { \"exclude\": [").unwrap();
+        set_mtime(1_700_000_001);
+        assert_eq!(
+            read_operator_routing_policy_with_reader(&path, read_file).exclude,
+            vec!["anthropic"],
+            "a malformed file keeps the last policy that parsed"
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+
+        // Still broken and unedited: no re-read, so no repeated report either.
+        assert_eq!(
+            read_operator_routing_policy_with_reader(&path, read_file).exclude,
+            vec!["anthropic"]
+        );
+        assert_eq!(
+            read_operator_routing_policy_with_reader(&path, read_file).exclude,
+            vec!["anthropic"]
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            2,
+            "a broken file is reported once per edit, not once per selection"
+        );
+
+        // Repairing it is an edit, so the new policy is picked up.
+        std::fs::write(&path, r#"{ "model_routing": { "exclude": ["xai"] } }"#).unwrap();
+        set_mtime(1_700_000_002);
+        assert_eq!(
+            read_operator_routing_policy_with_reader(&path, read_file).exclude,
+            vec!["xai"]
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -11,9 +11,9 @@ use prefrontal_routing_core::model_facts::{
 use prefrontal_routing_core::{
     admit_routes, derive_provider_key, make_capacity_key, make_route_key, relax_earliest_reset,
     select_model_route, BreakGlassCandidate, CatalogFactField, DecisionInput,
-    DecisionOutcomeUpdate, FactSource, FailureBackoffConfig, ModelRequirements, RouteFailureReason,
-    RouteOutcome, RouteStateStore, RouteStateUpdate, RoutingConfig, SelectModelRouteInput,
-    UsageObservation, FAILURE_BACKOFF_INITIAL_MS,
+    DecisionOutcomeUpdate, ExclusionPolicy, FactSource, FailureBackoffConfig, ModelRequirements,
+    RouteFailureReason, RouteOutcome, RouteStateStore, RouteStateUpdate, RoutingConfig,
+    SelectModelRouteInput, UsageObservation, FAILURE_BACKOFF_INITIAL_MS,
 };
 use prefrontal_routing_store::{
     dev_descriptor, DecisionListFilter, FusiformCatalogCursor, FusiformFactUpdate,
@@ -651,7 +651,7 @@ fn three_consecutive_session_failures_cool_qwen_by_name_and_preserve_quota_wall(
     let quota_admission = admit_routes(
         std::slice::from_ref(&fact),
         Some(&snapshot),
-        &[],
+        ExclusionPolicy::default(),
         &[],
         &[],
         None,
@@ -680,7 +680,7 @@ fn three_consecutive_session_failures_cool_qwen_by_name_and_preserve_quota_wall(
     let backoff_admission = admit_routes(
         &[fact],
         Some(&backoff_only),
-        &[],
+        ExclusionPolicy::default(),
         &[],
         &[],
         None,
@@ -1131,6 +1131,7 @@ fn persisted_double_mirror_break_glass_clears_only_the_rejected_candidate() {
         facts: vec![route.clone()],
         runtime_snapshot: Some(snapshot.clone()),
         exclude_route_keys: Vec::new(),
+        operator_exclude_keys: Vec::new(),
         prefer_fast_specs: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
@@ -1172,6 +1173,7 @@ fn persisted_double_mirror_break_glass_clears_only_the_rejected_candidate() {
         facts: vec![route],
         runtime_snapshot: Some(relaxed.snapshot),
         exclude_route_keys: Vec::new(),
+        operator_exclude_keys: Vec::new(),
         prefer_fast_specs: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,

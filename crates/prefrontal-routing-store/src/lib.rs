@@ -300,7 +300,15 @@ fn err(e: impl std::fmt::Display) -> RouteStateStoreError {
 pub struct CatalogFact {
     #[serde(flatten)]
     pub fact: ModelFact,
+    /// Whether routing's exclusion policy fences this route. Computed by the
+    /// serving module from the live operator policy, never read from the durable
+    /// row: nothing has ever written that column.
     pub excluded: bool,
+    /// No price and no cost tier: nobody has published what this route costs.
+    /// Selection ranks such a route at MAXIMUM cost (never as free), so an
+    /// inventory reader has to be able to see the difference between "expensive"
+    /// and "nobody knows". Derived from the row, so it can never go stale.
+    pub price_unknown: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facts_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -590,8 +598,11 @@ impl SqliteRouteStateStore {
                 let mut statement =
                     connection.prepare("SELECT * FROM model_facts ORDER BY route_key")?;
                 let rows = statement.query_map([], |row| {
+                    let fact = row_to_fact(row)?;
                     Ok(CatalogFact {
-                        fact: row_to_fact(row)?,
+                        price_unknown: fact.cost_per_m_tok_out.is_none()
+                            && fact.cost_tier.is_none(),
+                        fact,
                         excluded: row.get::<_, i64>("excluded")? != 0,
                         facts_source: row.get("facts_source")?,
                         fusiform_version: row.get("fusiform_version")?,

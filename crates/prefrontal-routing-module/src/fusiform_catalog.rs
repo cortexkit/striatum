@@ -145,22 +145,76 @@ struct CatalogSnapshot {
     facts: Vec<FusiformFactUpdate>,
 }
 
-fn output_cost(rate: Option<&CatalogRate>) -> Option<f64> {
-    match rate? {
+/// What a served output rate yields, or why it yields no price.
+///
+/// A bare `None` made three different situations identical: the producer served
+/// no rate at all, the producer said "unpriced", and this consumer REFUSED to
+/// decode a rate it was given. Only the third is a consumer defect, and it is the
+/// one that must never hide among the other two.
+#[derive(Debug, Clone, PartialEq)]
+enum OutputPrice {
+    /// Output dollars per million tokens.
+    Known(f64),
+    /// Nothing to decode: no `rate.output` key on the model, or an explicit
+    /// `unpriced` state. Checked in Fusiform's own store on 2026-09-06 for
+    /// ollama-cloud: it holds existence, limits and capabilities for those models
+    /// and no price record whatsoever, because the catalog it reads publishes no
+    /// price for them. Those routes are genuinely unpriced rather than
+    /// mis-decoded, and routing ranks them at maximum cost while saying so in its
+    /// explanation.
+    NotPublished,
+    /// A rate WAS served and this consumer declined it: a currency it cannot
+    /// convert, a negative amount, or an exponent outside the range it can scale.
+    /// Silently dropping these would read exactly like "no price published".
+    Refused(String),
+}
+
+fn output_cost(rate: Option<&CatalogRate>) -> OutputPrice {
+    let Some(rate) = rate else {
+        return OutputPrice::NotPublished;
+    };
+    match rate {
         CatalogRate::Priced {
             currency,
             exponent,
             units,
         } => {
-            if currency != "USD" || *units < 0 || *exponent > 18 {
-                return None;
+            if currency != "USD" {
+                return OutputPrice::Refused(format!(
+                    "rate is denominated in {currency}; this consumer converts no currency"
+                ));
             }
-            Some(*units as f64 / 10_f64.powi(*exponent as i32))
+            if *units < 0 {
+                return OutputPrice::Refused(format!("rate has negative units ({units})"));
+            }
+            if *exponent > 18 {
+                return OutputPrice::Refused(format!(
+                    "rate exponent {exponent} exceeds the scale this consumer can apply"
+                ));
+            }
+            OutputPrice::Known(*units as f64 / 10_f64.powi(*exponent as i32))
         }
         // A stated zero is a real price of zero; whether zero is "free" is
         // routing policy downstream, and it must not read as absent.
-        CatalogRate::StatedZero => Some(0.0),
-        CatalogRate::Unpriced { .. } => None,
+        CatalogRate::StatedZero => OutputPrice::Known(0.0),
+        CatalogRate::Unpriced { .. } => OutputPrice::NotPublished,
+    }
+}
+
+/// Report one refused rate per model per process. A refusal persists across every
+/// poll while the upstream keeps publishing that rate, so logging it per cycle
+/// would bury it; logging it never is how it stayed invisible.
+fn report_refused_rate_once(served_key: &str, detail: &str) {
+    static REPORTED: std::sync::OnceLock<Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let reported = REPORTED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+    let Ok(mut reported) = reported.lock() else {
+        return;
+    };
+    if reported.insert(format!("{served_key}\u{1e}{detail}")) {
+        eprintln!(
+            "[prefrontal-routing] fusiform served an output rate for {served_key} that this consumer cannot decode ({detail}); the route will be priced as unknown and ranked at maximum cost"
+        );
     }
 }
 
@@ -219,7 +273,14 @@ fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogEr
             .as_ref()
             .map(|modalities| modalities.iter().any(|value| value == "image"))
             .or(model.attachment);
-        let cost_per_mtok_out = output_cost(model.output_rate.as_ref());
+        let cost_per_mtok_out = match output_cost(model.output_rate.as_ref()) {
+            OutputPrice::Known(cost) => Some(cost),
+            OutputPrice::NotPublished => None,
+            OutputPrice::Refused(detail) => {
+                report_refused_rate_once(&served_key, &detail);
+                None
+            }
+        };
         facts.push(FusiformFactUpdate {
             provider_id: provider_id.to_string(),
             model_id: model_id.to_string(),
@@ -671,13 +732,51 @@ mod tests {
             "unit_provenance": {"kind": "assumed_by_policy", "policy": "models-dev-usd-v1"}
         }))
         .unwrap();
-        assert_eq!(output_cost(Some(&priced)), Some(15.0));
+        assert_eq!(output_cost(Some(&priced)), OutputPrice::Known(15.0));
         let zero: CatalogRate = serde_json::from_value(json!({ "state": "stated_zero" })).unwrap();
-        assert_eq!(output_cost(Some(&zero)), Some(0.0));
+        assert_eq!(output_cost(Some(&zero)), OutputPrice::Known(0.0));
         let unpriced: CatalogRate =
             serde_json::from_value(json!({ "state": "unpriced", "reason": "source_omitted" }))
                 .unwrap();
-        assert_eq!(output_cost(Some(&unpriced)), None);
+        assert_eq!(output_cost(Some(&unpriced)), OutputPrice::NotPublished);
+    }
+
+    #[test]
+    fn an_absent_rate_is_not_published_and_a_declined_rate_says_so() {
+        // The ollama-cloud shape: Fusiform serves the model with limits and
+        // capabilities and NO rate.output key at all, because the upstream catalog
+        // it reads publishes no price for those models. All 23 ollama-cloud rows in
+        // the live routing store are this case (checked 2026-09-06 in Fusiform's
+        // own store, which holds no price record for that provider at all).
+        assert_eq!(output_cost(None), OutputPrice::NotPublished);
+        let served: CatalogModelFacts = serde_json::from_value(json!({
+            "existence": "present",
+            "capability.tool_call": true,
+            "limit.context": 262_144,
+            "limit.output": 65_536
+        }))
+        .unwrap();
+        assert!(served.output_rate.is_none());
+
+        // A rate this consumer declines must be distinguishable from one that was
+        // never published: the first is a consumer gap to fix, the second is not.
+        let foreign: CatalogRate = serde_json::from_value(json!({
+            "currency": "EUR", "exponent": 9, "state": "priced", "units": 15000000000_i64
+        }))
+        .unwrap();
+        let OutputPrice::Refused(detail) = output_cost(Some(&foreign)) else {
+            panic!("a non-USD rate must be reported as refused, not as unpublished");
+        };
+        assert!(detail.contains("EUR"), "{detail}");
+
+        let oversized: CatalogRate = serde_json::from_value(json!({
+            "currency": "USD", "exponent": 30, "state": "priced", "units": 1_i64
+        }))
+        .unwrap();
+        assert!(matches!(
+            output_cost(Some(&oversized)),
+            OutputPrice::Refused(_)
+        ));
     }
 
     #[test]

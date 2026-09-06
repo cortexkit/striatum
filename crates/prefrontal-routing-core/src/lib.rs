@@ -58,7 +58,7 @@ pub use model_router::{
     AdmittedRoute, BelowFloorWarning, GoverningWindow, ModelRouteStateSnapshot, NoRouteError,
     ObjectiveBreakdown, PromptParams, RejectedCandidate, RejectedRoute, RequiredCapabilities,
     RouteFailureReason, RouteRuntimeState, SelectModelRouteInput, SelectedModel,
-    SelectedModelRoute, SelectedRouteScore,
+    SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
 };
 pub use panel::{
     select_panel, select_panel_with_config, validate_panel_spec, InvalidPanelRequest, PanelCause,
@@ -68,7 +68,8 @@ pub use panel::{
     SiblingCollapse,
 };
 pub use provider_model_spec::{
-    filter_excluded_keys, parse_spec, parse_spec_list, resolve_spec, ParsedSpec,
+    filter_excluded_keys, filter_excluded_keys_with_policy, parse_spec, parse_spec_list,
+    resolve_spec, ExclusionPolicy, ExclusionSource, ExclusionSpecs, ParsedSpec,
 };
 pub use quota::{
     merge_quota_overlay, merge_quota_overlay_with, ProviderUsage, DEFAULT_HARD_BLOCK_THRESHOLD,

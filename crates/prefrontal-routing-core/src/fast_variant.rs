@@ -17,7 +17,7 @@ use crate::model_router::{
     ModelRouteStateSnapshot, PromptParams, RequiredCapabilities, RouteRuntimeState, SelectedModel,
     SelectedModelRoute,
 };
-use crate::provider_model_spec::{parse_spec_list, resolve_spec, ParsedSpec};
+use crate::provider_model_spec::{parse_spec_list, resolve_spec, ExclusionPolicy, ParsedSpec};
 use crate::route_scoring::score_adequacy;
 use crate::routing_config::RoutingConfig;
 
@@ -177,10 +177,13 @@ pub fn maybe_upgrade_to_fast_variant(
 
     // Recompute the static request frontier without quota state. A transient
     // quota signal may permit the upgrade, but it must never redefine the bar.
+    // The operator fence reaches this path through `available_models`, which the
+    // selection resolved against the operator policy before the upgrade was
+    // considered: an operator-excluded fast sibling is not in that set.
     let top_routable = admit_routes(
         input.facts,
         None,
-        input.exclude_route_keys,
+        ExclusionPolicy::caller_only(input.exclude_route_keys),
         input.prefer_fast_specs,
         &[],
         input.required_capabilities,

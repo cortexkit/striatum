@@ -43,10 +43,10 @@ use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, make_route_key, maybe_upgrade_to_fast_variant,
     relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
     select_panel_with_config, validate_panel_spec, BreakGlassCandidate, CatalogFactField,
-    DecisionInput, DecisionOutcomeUpdate, FailureBackoffConfig, FastVariantUpgradeInput, ModelFact,
-    ModelRequirements, ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection,
-    PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
-    SelectPanelInput, SelectedPanel,
+    DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy, ExclusionSpecs, FailureBackoffConfig,
+    FastVariantUpgradeInput, ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput,
+    PanelRosterEntry, PanelSelection, PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy,
+    RouteOutcome, RouteStateStore, SelectPanelInput, SelectedPanel,
 };
 use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
@@ -580,6 +580,9 @@ where
     // file is a no-op; a parse error is logged but never aborts boot (routing
     // degrades to the seed catalog).
     let override_path = config_overrides::config_path();
+    // The operator's user-global config, read live per selection: it owns the
+    // routing fence (model_routing.exclude and friends).
+    let operator_config_path = config_overrides::operator_config_path();
     match config_overrides::apply_overrides_from_config(store.as_ref(), &override_path) {
         Ok(outcome) => {
             if outcome.applied > 0 || outcome.reverted > 0 || !outcome.skipped.is_empty() {
@@ -645,6 +648,7 @@ where
             &mut route_epochs,
             &min_band,
             &override_path,
+            &operator_config_path,
             &catalog_health,
         )
         .await?
@@ -731,6 +735,7 @@ async fn handle_frame(
     route_epochs: &mut RouteEpochs,
     min_band: &SharedMinBand,
     routing_config_path: &Path,
+    operator_config_path: &Path,
     catalog_health: &SharedCatalogHealth,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
@@ -771,6 +776,7 @@ async fn handle_frame(
             let store = Arc::clone(store);
             let min_band = Arc::clone(min_band);
             let routing_config_path = routing_config_path.to_path_buf();
+            let operator_config_path = operator_config_path.to_path_buf();
             tokio::spawn(async move {
                 let _ = handle_select_request(
                     frame,
@@ -780,6 +786,7 @@ async fn handle_frame(
                     &store,
                     &min_band,
                     &routing_config_path,
+                    &operator_config_path,
                 )
                 .await;
             });
@@ -1057,6 +1064,23 @@ fn provider_auth_types(raw: Option<&HashMap<String, String>>) -> HashMap<String,
     }
 }
 
+/// One line naming the two policy sources a selection merged. It is recorded with
+/// the decision so `route.explain` can answer "whose list excluded this route"
+/// later, without re-reading config files that may have changed since.
+fn policy_sources_line(
+    operator: &ModelRoutingPolicyInput,
+    caller_exclude_entries: usize,
+    caller_exclude_route_keys: usize,
+) -> String {
+    format!(
+        "policy sources: operator {} ({} exclude entries), caller ({} exclude entries, {} excluded route keys)",
+        config_overrides::operator_policy_revision(operator),
+        operator.exclude.len(),
+        caller_exclude_entries,
+        caller_exclude_route_keys,
+    )
+}
+
 fn no_route_error(
     reason: RouteFailureReason,
     message: String,
@@ -1072,7 +1096,10 @@ fn no_route_error(
     }
 }
 
-fn resolve_select_request(params: &SelectParams) -> Result<ResolvedSelectRequest, NoRouteError> {
+fn resolve_select_request(
+    params: &SelectParams,
+    operator_policy: &ModelRoutingPolicyInput,
+) -> Result<ResolvedSelectRequest, NoRouteError> {
     let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
         (requirements, params.required_capabilities)
     } else {
@@ -1100,6 +1127,7 @@ fn resolve_select_request(params: &SelectParams) -> Result<ResolvedSelectRequest
         .extend(params.prefer_fast_specs.iter().cloned());
     let policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
+        operator_policy,
         &routing_policy,
         &provider_auth_types(params.provider_auth_types.as_ref()),
         params.suppress_fast_variant,
@@ -1118,7 +1146,7 @@ fn resolve_select_request(params: &SelectParams) -> Result<ResolvedSelectRequest
         return Err(no_route_error(
             RouteFailureReason::NoAvailableModel,
             format!(
-                "No models available to route {}: all {} connected models are excluded by model_routing.exclude. Loosen the exclude list.",
+                "No models available to route {}: all {} connected models are excluded by the operator and caller exclude lists. Loosen model_routing.exclude.",
                 params.target_agent, policy.connected_model_count
             ),
             requirements,
@@ -1570,6 +1598,7 @@ async fn handle_model_facts(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
+    operator_config_path: &Path,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -1577,7 +1606,7 @@ async fn handle_model_facts(
         frame.header.epoch,
         frame.header.corr,
     );
-    let facts = match store.get_catalog_facts() {
+    let mut facts = match store.get_catalog_facts() {
         Ok(facts) => facts,
         Err(error) => {
             return send_route_error(
@@ -1592,6 +1621,23 @@ async fn handle_model_facts(
             .await;
         }
     };
+    // `excluded` is stamped from the live operator policy at read time, using the
+    // same predicate selection applies. The stored column has never been written by
+    // anything (it reads 0 on every row), so serving it raw told every inventory
+    // consumer that nothing is excluded while routing was excluding 30+ routes.
+    let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
+    let exclusions = ExclusionSpecs::parse(ExclusionPolicy {
+        operator: &operator_policy.exclude,
+        caller: &[],
+    });
+    for fact in &mut facts {
+        let route_key = make_route_key(
+            &fact.fact.provider_id,
+            &fact.fact.model_id,
+            fact.fact.variant.as_deref(),
+        );
+        fact.excluded = exclusions.excludes(&route_key);
+    }
     let body =
         serde_json::to_vec(&json!({ "result": { "facts": facts } })).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
@@ -1714,6 +1760,7 @@ async fn handle_model_fact(
 async fn handle_resolve_policy(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
+    operator_config_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -1734,8 +1781,12 @@ async fn handle_resolve_policy(
             .await;
         }
     };
+    // Same baseline as selection: a caller asking what its policy resolves to must
+    // be told the fenced answer, not an optimistic one the router would refuse.
+    let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     let resolved = resolve_routing_policy(
         params.available_models,
+        &operator_policy,
         &params.routing_policy,
         &provider_auth_types(params.provider_auth_types.as_ref()),
         params.suppress_fast_variant,
@@ -1940,6 +1991,7 @@ async fn handle_select_request(
     store: &SharedStore,
     min_band: &SharedMinBand,
     routing_config_path: &Path,
+    operator_config_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     frame.header.epoch = route_epoch;
@@ -2033,13 +2085,13 @@ async fn handle_select_request(
         return handle_route_decisions_list(frame, writer, store).await;
     }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
-        return handle_resolve_policy(frame, writer).await;
+        return handle_resolve_policy(frame, writer, operator_config_path).await;
     }
     if envelope.method == ROUTE_MODEL_FACT_OP {
         return handle_model_fact(frame, writer, store).await;
     }
     if envelope.method == ROUTE_MODEL_FACTS_OP {
-        return handle_model_facts(frame, writer, store).await;
+        return handle_model_facts(frame, writer, store, operator_config_path).await;
     }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         return handle_model_upsert(frame, writer, store).await;
@@ -2054,7 +2106,15 @@ async fn handle_select_request(
         return handle_list_unscored(frame, writer, store).await;
     }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
-        return handle_select_panel(frame, writer, quota_cache, store, routing_config_path).await;
+        return handle_select_panel(
+            frame,
+            writer,
+            quota_cache,
+            store,
+            routing_config_path,
+            operator_config_path,
+        )
+        .await;
     }
 
     if envelope.method != ROUTE_SELECT_OP {
@@ -2085,7 +2145,11 @@ async fn handle_select_request(
             .await;
         }
     };
-    let resolved_request = match resolve_select_request(&params) {
+    // The operator fence is read HERE, on the module side, for every selection.
+    // Callers may attach their own policy, but a caller that attaches none (every
+    // selection minted inside the daemon) still gets the operator's exclude list.
+    let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
+    let resolved_request = match resolve_select_request(&params, &operator_policy) {
         Ok(resolved) => resolved,
         Err(no_route) => {
             let requirements = no_route
@@ -2098,6 +2162,11 @@ async fn handle_select_request(
                 Some(&no_route),
                 &params,
                 None,
+                Some(&policy_sources_line(
+                    &operator_policy,
+                    params.routing_policy.exclude.len(),
+                    params.exclude_route_keys.len(),
+                )),
             );
             let _ = store.record_decision(&decision);
             return send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
@@ -2164,6 +2233,7 @@ async fn handle_select_request(
         .cloned()
         .collect();
     let exclude = params.exclude_route_keys.clone();
+    let operator_exclude = operator_policy.exclude.clone();
     let prefer_fast = resolved_request.policy.prefer_fast_specs.clone();
     let requirements = resolved_request.requirements;
     let required_capabilities = resolved_request.required_capabilities;
@@ -2182,6 +2252,7 @@ async fn handle_select_request(
                 facts: facts.clone(),
                 runtime_snapshot: Some(snap),
                 exclude_route_keys: exclude.clone(),
+                operator_exclude_keys: operator_exclude.clone(),
                 prefer_fast_specs: prefer_fast.clone(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
@@ -2282,8 +2353,14 @@ async fn handle_select_request(
     // errors), so a returned id always maps to a committed row; never an id whose
     // write then failed (the contract requirement). A failed selection records a
     // no-selection row and surfaces the typed routing failure.
+    let policy_sources = policy_sources_line(
+        &operator_policy,
+        params.routing_policy.exclude.len(),
+        params.exclude_route_keys.len(),
+    );
     match selection {
-        Ok(selected) => {
+        Ok(mut selected) => {
+            selected.explanation.push(policy_sources.clone());
             let decision = decision_input_for(
                 &target_agent,
                 &requirements,
@@ -2291,6 +2368,7 @@ async fn handle_select_request(
                 None,
                 &params,
                 Some(&provenance),
+                Some(&policy_sources),
             );
             match store.record_decision(&decision) {
                 Ok(decision_id) => {
@@ -2345,6 +2423,7 @@ async fn handle_select_request(
                 Some(&no_route),
                 &params,
                 Some(&provenance),
+                Some(&policy_sources),
             );
             let _ = store.record_decision(&decision);
             send_no_route(writer, ver, channel, epoch, corr, &no_route).await
@@ -2358,6 +2437,7 @@ async fn handle_select_panel(
     quota_cache: &SharedQuotaCache,
     store: &SharedStore,
     routing_config_path: &Path,
+    operator_config_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -2437,8 +2517,17 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
+    // The operator fence is NOT applied to the available-model set here: an
+    // explicit roster is a pin, and pins bypass exclusion by design. It is handed
+    // to panel admission instead, which applies it to automatic (n_pick) seats
+    // only. Subscription policy has no such carve-out and merges as usual.
+    let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
+        &ModelRoutingPolicyInput {
+            subscription: operator_policy.subscription.clone(),
+            ..ModelRoutingPolicyInput::default()
+        },
         &ModelRoutingPolicyInput {
             subscription: params.subscription_keys.clone(),
             ..ModelRoutingPolicyInput::default()
@@ -2459,6 +2548,7 @@ async fn handle_select_panel(
             facts: prepared.facts,
             runtime_snapshot: Some(prepared.snapshot),
             exclude_route_keys: params.exclude_route_keys.clone(),
+            operator_exclude_keys: operator_policy.exclude.clone(),
             required_capabilities: params.required_capabilities,
             available_models,
             is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
@@ -2474,7 +2564,12 @@ async fn handle_select_panel(
                 .await;
         }
     };
-    let decision = panel_decision_input(&params, &panel, &provenance);
+    let decision = panel_decision_input(
+        &params,
+        &panel,
+        &provenance,
+        &policy_sources_line(&operator_policy, 0, params.exclude_route_keys.len()),
+    );
     let decision_id = match store.record_decision(&decision) {
         Ok(id) => id,
         Err(e) => {
@@ -2525,6 +2620,7 @@ fn panel_decision_input(
     params: &SelectPanelParams,
     panel: &SelectedPanel,
     provenance: &DecisionProvenance,
+    policy_sources: &str,
 ) -> DecisionInput {
     let causes = panel
         .shortfall
@@ -2542,11 +2638,15 @@ fn panel_decision_input(
             "causes": causes,
             "selection": "n_pick",
             "policy": panel.policy,
+            "policySources": policy_sources,
         })
     } else {
         json!({
             "members": member_route_keys,
             "causes": causes,
+            // Recorded even though roster pins bypass exclusion, so a reader can
+            // see WHICH fence was in force when the pinned panel was seated.
+            "policySources": policy_sources,
         })
     };
     DecisionInput {
@@ -2589,6 +2689,7 @@ fn decision_input_for(
     no_route: Option<&NoRouteError>,
     params: &SelectParams,
     provenance: Option<&DecisionProvenance>,
+    policy_sources: Option<&str>,
 ) -> DecisionInput {
     let requirements_json = serde_json::to_string(requirements).unwrap_or_else(|_| "null".into());
     let quota_signal_json = provenance.map(|value| value.quota_signal_json.clone());
@@ -2658,6 +2759,7 @@ fn decision_input_for(
                         "message": &failure.message,
                         "bestRejected": failure.best_rejected.as_ref(),
                         "earliestReset": failure.earliest_reset,
+                        "policySources": policy_sources,
                     }))
                     .unwrap_or_else(|_| "{}".into()),
                 ),
@@ -4028,6 +4130,19 @@ mod tests {
     }
 
     async fn run_route_wire_request(store: &SharedStore, request: serde_json::Value) -> Frame {
+        run_route_wire_request_with_operator_config(
+            store,
+            request,
+            Path::new("/nonexistent/alfonso.jsonc"),
+        )
+        .await
+    }
+
+    async fn run_route_wire_request_with_operator_config(
+        store: &SharedStore,
+        request: serde_json::Value,
+        operator_config_path: &Path,
+    ) -> Frame {
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
@@ -4047,6 +4162,7 @@ mod tests {
             store,
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            operator_config_path,
         )
         .await
         .unwrap();
@@ -4110,17 +4226,37 @@ mod tests {
         store
             .upsert_fact(&live_fact, FactSource::Override)
             .expect("write fixture directly to the routing store");
+        store
+            .upsert_fact(&fact("fixture", "wire-kept"), FactSource::Override)
+            .expect("write the companion row the operator does not exclude");
+        let mut unpriced = fact("fixture", "wire-unpriced");
+        unpriced.cost_per_m_tok_out = None;
+        unpriced.cost_tier = None;
+        store
+            .upsert_fact(&unpriced, FactSource::Override)
+            .expect("write the row nobody has published a price for");
+        // Stamp the STORED column on the row the operator does NOT exclude. Nothing
+        // in the running system has ever written that column, so a reader serving it
+        // raw answers with a value no policy produced; this row proves the served
+        // answer comes from the live operator policy instead.
         rusqlite::Connection::open(rig.dir.join("store.db"))
             .expect("open fixture database")
             .execute(
-                "UPDATE model_facts SET excluded = 1 WHERE route_key = 'fixture/wire-only'",
+                "UPDATE model_facts SET excluded = 1 WHERE route_key = 'fixture/wire-kept'",
                 [],
             )
-            .expect("mark the fixture route excluded");
+            .expect("stamp the stale exclusion column");
+        let operator_config = rig.dir.join("alfonso.jsonc");
+        std::fs::write(
+            &operator_config,
+            r#"{ "model_routing": { "exclude": ["fixture/wire-only"] } }"#,
+        )
+        .unwrap();
 
-        let response = run_route_wire_request(
+        let response = run_route_wire_request_with_operator_config(
             &store,
             json!({ "method": ROUTE_MODEL_FACTS_OP, "params": {} }),
+            &operator_config,
         )
         .await;
 
@@ -4142,7 +4278,30 @@ mod tests {
         assert_eq!(fact["costPerMTokOut"], 7.25);
         assert_eq!(fact["supportsVision"], false);
         assert_eq!(fact["supportsToolUse"], true);
-        assert_eq!(fact["excluded"], true);
+        assert_eq!(
+            fact["excluded"], true,
+            "the operator's exclude list decides what model_facts reports as excluded"
+        );
+        let kept = facts
+            .iter()
+            .find(|candidate| {
+                candidate["providerID"] == "fixture" && candidate["modelID"] == "wire-kept"
+            })
+            .expect("the companion row is served too");
+        assert_eq!(
+            kept["excluded"], false,
+            "a stale stored excluded=1 must not be served as policy state"
+        );
+        // A route nobody has priced is ranked at MAXIMUM cost by selection, so an
+        // inventory reader must be able to tell it apart from an expensive one.
+        assert_eq!(kept["priceUnknown"], false);
+        let unpriced_row = facts
+            .iter()
+            .find(|candidate| {
+                candidate["providerID"] == "fixture" && candidate["modelID"] == "wire-unpriced"
+            })
+            .expect("the unpriced row is served too");
+        assert_eq!(unpriced_row["priceUnknown"], true);
     }
 
     #[test]
@@ -4487,6 +4646,24 @@ mod tests {
         facts: &[ModelFact],
     ) -> (Frame, Rig) {
         let rig = Rig::new(label);
+        let response = run_select_against_rig(
+            &rig,
+            params,
+            facts,
+            &PathBuf::from("/nonexistent/alfonso.jsonc"),
+        )
+        .await;
+        (response, rig)
+    }
+
+    /// Drive one `route.select` against an existing rig, so a test can control the
+    /// operator config file the module reads (and edit it between selections).
+    async fn run_select_against_rig(
+        rig: &Rig,
+        params: serde_json::Value,
+        facts: &[ModelFact],
+        operator_config_path: &Path,
+    ) -> Frame {
         let store = Arc::new(rig.open_store());
         for fact in facts {
             store.upsert_fact(fact, FactSource::Override).unwrap();
@@ -4511,10 +4688,11 @@ mod tests {
             &store,
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            operator_config_path,
         )
         .await
         .unwrap();
-        (rx.recv().await.unwrap(), rig)
+        rx.recv().await.unwrap()
     }
 
     #[tokio::test]
@@ -4552,6 +4730,7 @@ mod tests {
             &store,
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/alfonso.jsonc"),
         )
         .await
         .unwrap();
@@ -4644,6 +4823,7 @@ mod tests {
             &store,
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/alfonso.jsonc"),
         )
         .await
         .unwrap();
@@ -4914,6 +5094,7 @@ mod tests {
             &store,
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/alfonso.jsonc"),
         )
         .await
         .unwrap();
@@ -4968,6 +5149,141 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("all 1 connected models are excluded"));
+    }
+
+    /// Point a config file's mtime at a fixed second so a live-edit test does not
+    /// depend on the filesystem clock's resolution.
+    fn set_config_mtime(path: &Path, seconds: u64) {
+        let file = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+        )
+        .unwrap();
+    }
+
+    fn rejection_reason(body: &serde_json::Value, route_key: &str) -> Option<String> {
+        body["result"]["selected"]["rejected"]
+            .as_array()?
+            .iter()
+            .find(|rejected| rejected["routeKey"] == route_key)?["reason"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    #[tokio::test]
+    async fn operator_exclude_fences_selections_that_send_no_policy_of_their_own() {
+        // Every selection minted inside the daemon sends no routingPolicy at all.
+        // Before the module read the operator's config itself, those selections saw
+        // an empty exclude list and picked excluded routes.
+        let rig = Rig::new("operator-baseline-fence");
+        let facts = [
+            fact("anthropic", "claude-opus-4-8"),
+            fact("openai", "gpt-5.5"),
+        ];
+        let operator_config = rig.dir.join("alfonso.jsonc");
+        std::fs::write(
+            &operator_config,
+            r#"{ "model_routing": { "exclude": ["anthropic"] } }"#,
+        )
+        .unwrap();
+        set_config_mtime(&operator_config, 1_700_000_000);
+        let select_params = |routing_policy: Option<serde_json::Value>| {
+            let mut params = json!({
+                "targetAgent": "explore",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["anthropic/claude-opus-4-8", "openai/gpt-5.5"],
+                "providerAuthTypes": {},
+                "taskId": "operator-baseline-fence"
+            });
+            if let Some(routing_policy) = routing_policy {
+                params["routingPolicy"] = routing_policy;
+            }
+            params
+        };
+
+        let baseline =
+            run_select_against_rig(&rig, select_params(None), &facts, &operator_config).await;
+        assert_eq!(baseline.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&baseline.body).unwrap();
+        assert_eq!(body["result"]["selected"]["routeKey"], "openai/gpt-5.5");
+        assert_eq!(
+            rejection_reason(&body, "anthropic/claude-opus-4-8").as_deref(),
+            Some("excluded_by_operator"),
+            "an operator-fenced route reports the fence, not a generic unavailability"
+        );
+
+        // A caller negation of an operator entry cannot lift it. Union only.
+        let negated = run_select_against_rig(
+            &rig,
+            select_params(Some(json!({ "exclude": ["-anthropic"] }))),
+            &facts,
+            &operator_config,
+        )
+        .await;
+        let negated_body: serde_json::Value = serde_json::from_slice(&negated.body).unwrap();
+        assert_eq!(
+            negated_body["result"]["selected"]["routeKey"],
+            "openai/gpt-5.5"
+        );
+        assert_eq!(
+            rejection_reason(&negated_body, "anthropic/claude-opus-4-8").as_deref(),
+            Some("excluded_by_operator")
+        );
+
+        // A caller-supplied route key keeps reporting as the caller's own exclusion,
+        // so a reroute after failure stays distinguishable from the standing fence.
+        let caller_excluded = run_select_against_rig(
+            &rig,
+            {
+                let mut params = select_params(None);
+                params["excludeRouteKeys"] = json!(["openai/gpt-5.5"]);
+                params["availableModels"] = json!(["openai/gpt-5.5", "openai/gpt-5.4"]);
+                params
+            },
+            &[fact("openai", "gpt-5.4")],
+            &operator_config,
+        )
+        .await;
+        let caller_body: serde_json::Value = serde_json::from_slice(&caller_excluded.body).unwrap();
+        assert_eq!(
+            rejection_reason(&caller_body, "openai/gpt-5.5").as_deref(),
+            Some("excluded")
+        );
+
+        // The decision records which two policy sources produced it, so route.explain
+        // can answer "whose list excluded this" after the config file has moved on.
+        let explanation = body["result"]["selected"]["explanation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line.as_str())
+            .find(|line| line.starts_with("policy sources:"))
+            .expect("the selection explanation names its policy sources")
+            .to_string();
+        assert!(
+            explanation.contains("operator sha256:") && explanation.contains("1 exclude entries"),
+            "unexpected policy-source line: {explanation}"
+        );
+
+        // Live edit: a new exclude list takes effect on the next selection, no restart.
+        std::fs::write(
+            &operator_config,
+            r#"{ "model_routing": { "exclude": ["openai"] } }"#,
+        )
+        .unwrap();
+        set_config_mtime(&operator_config, 1_700_000_001);
+        let reloaded =
+            run_select_against_rig(&rig, select_params(None), &facts, &operator_config).await;
+        let reloaded_body: serde_json::Value = serde_json::from_slice(&reloaded.body).unwrap();
+        assert_eq!(
+            reloaded_body["result"]["selected"]["routeKey"], "anthropic/claude-opus-4-8",
+            "the edited exclude list is in force without a module restart"
+        );
+        assert_eq!(
+            rejection_reason(&reloaded_body, "openai/gpt-5.5").as_deref(),
+            Some("excluded_by_operator")
+        );
     }
 
     #[tokio::test]
@@ -5317,6 +5633,7 @@ mod tests {
                 &store,
                 &min_band,
                 Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                Path::new("/nonexistent/alfonso.jsonc"),
             )
             .await
             .unwrap();
@@ -5416,6 +5733,7 @@ mod tests {
             &store,
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/alfonso.jsonc"),
         )
         .await
         .unwrap();
@@ -5535,7 +5853,7 @@ mod tests {
             quota_signal_json: r#"{"state":"none","reason":"quota signal: none"}"#.into(),
             policy_revision: "test-policy".into(),
         };
-        let decision = panel_decision_input(&params, &panel, &provenance);
+        let decision = panel_decision_input(&params, &panel, &provenance, "policy sources: test");
         let explanation: serde_json::Value =
             serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
         assert_eq!(explanation["selection"], "n_pick");
@@ -5613,6 +5931,7 @@ mod tests {
             &store,
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/alfonso.jsonc"),
         )
         .await
         .unwrap();
@@ -5671,6 +5990,7 @@ mod tests {
                 store,
                 &Arc::new(Mutex::new(None)),
                 config_path,
+                Path::new("/nonexistent/alfonso.jsonc"),
             )
             .await
             .unwrap();
@@ -5808,6 +6128,7 @@ mod tests {
             &store,
             &Arc::new(Mutex::new(None)),
             &config_path,
+            Path::new("/nonexistent/alfonso.jsonc"),
         )
         .await
         .unwrap();

@@ -23,13 +23,24 @@ use crate::model_facts::{
     fact_to_route, make_capacity_key, ModelFact, ModelMetric, ModelRequirements, ModelRoute,
     ScoreProvenance, FAST_SUFFIX,
 };
-use crate::provider_model_spec::{parse_spec_list, resolve_spec};
+use crate::provider_model_spec::{
+    parse_spec_list, resolve_spec, ExclusionPolicy, ExclusionSource, ExclusionSpecs,
+};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 use crate::routing_config::{
     RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, COST_REFERENCE_PER_MTOK,
     DEFAULT_ROUTING_CONFIG, EFFECTIVELY_FREE_SELECTION_COST, MIN_BEST_EFFORT_ADEQUACY,
     OBJECTIVE_WEIGHT_QUOTA, RELATIVE_SHORTLIST_DELTA, SPEED_CEILING_TPS, SPEED_FLOOR_TPS,
 };
+
+/// A route the operator's standing policy fences off. Distinct from [`REASON_EXCLUDED`]
+/// so a reader of a rejection can tell "the machine owner said never" from "this
+/// attempt skipped it". Both the producer and every consumer that maps rejection
+/// reasons use these constants, so renaming one cannot silently split the mapping.
+pub const REASON_EXCLUDED_BY_OPERATOR: &str = "excluded_by_operator";
+/// A route the CALLER excluded for this attempt: the route that just failed on a
+/// reroute, or a consult's `exclude_route_keys`.
+pub const REASON_EXCLUDED: &str = "excluded";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GoverningWindow {
@@ -111,7 +122,11 @@ pub struct SelectModelRouteInput<'a> {
     pub available_models: HashSet<String>,
     pub facts: Vec<ModelFact>,
     pub runtime_snapshot: Option<ModelRouteStateSnapshot>,
+    /// Per-attempt exclusions supplied by the caller (a route that just failed).
     pub exclude_route_keys: Vec<String>,
+    /// The operator's standing exclude list, applied as the baseline under the
+    /// caller's. Union only: see [`ExclusionPolicy`].
+    pub operator_exclude_keys: Vec<String>,
     /// Base-model specs that deliberately admit matching priority-tier siblings.
     pub prefer_fast_specs: Vec<String>,
     pub required_capabilities: Option<RequiredCapabilities>,
@@ -387,7 +402,7 @@ pub struct AdmissionResult {
 pub fn admit_routes(
     facts: &[ModelFact],
     runtime_snapshot: Option<&ModelRouteStateSnapshot>,
-    exclude_route_keys: &[String],
+    exclusions: ExclusionPolicy<'_>,
     prefer_fast_specs: &[String],
     exact_model_pins: &[String],
     required_capabilities: Option<RequiredCapabilities>,
@@ -396,7 +411,7 @@ pub fn admit_routes(
     config: &RoutingConfig,
 ) -> AdmissionResult {
     let now = runtime_snapshot.map(|s| s.now).unwrap_or_else(now_millis);
-    let exclusion_specs = parse_spec_list(exclude_route_keys);
+    let exclusion_specs = ExclusionSpecs::parse(exclusions);
     let prefer_fast_specs = parse_spec_list(prefer_fast_specs);
     let mut static_candidates = Vec::new();
     let mut top_routable = TopRoutableScores::default();
@@ -412,10 +427,16 @@ pub fn admit_routes(
             });
             continue;
         }
-        if resolve_spec(&exclusion_specs, &route.route_key, false) {
+        // Exclusion is checked BEFORE availability so an operator-fenced route
+        // reports the fence as its reason. The fence also filters the caller's
+        // available-model set upstream, and "not_available" there would hide why.
+        if let Some(source) = exclusion_specs.source_for(&route.route_key) {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
-                reason: "excluded".to_string(),
+                reason: match source {
+                    ExclusionSource::Operator => REASON_EXCLUDED_BY_OPERATOR.to_string(),
+                    ExclusionSource::Caller => REASON_EXCLUDED.to_string(),
+                },
                 detail: None,
             });
             continue;
@@ -554,7 +575,11 @@ pub(crate) fn compute_objective(
     } else if let Some(tier) = route.fact.cost_tier {
         format!("tier {}, {coverage}", fmt_num(tier))
     } else {
-        format!("unknown price, {coverage}")
+        // An unpriced route is ranked at the MAXIMUM cost (see
+        // `normalized_metered_cost`), never as free. Say so on the line: a route
+        // losing every cost comparison because nobody knows its price looks
+        // identical to one losing because it is genuinely expensive.
+        format!("price unknown (ranked as max), {coverage}")
     };
     notes.push(format!("cost +{cost:.2} ({detail})"));
 
@@ -656,7 +681,10 @@ pub fn select_model_route_with_config(
     } = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),
-        &input.exclude_route_keys,
+        ExclusionPolicy {
+            operator: &input.operator_exclude_keys,
+            caller: &input.exclude_route_keys,
+        },
         &input.prefer_fast_specs,
         &[],
         caps,

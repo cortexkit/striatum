@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::model_facts::ModelRequirements;
 use crate::model_router::RequiredCapabilities;
-use crate::provider_model_spec::{filter_excluded_keys, parse_spec_list, resolve_spec};
+use crate::provider_model_spec::{
+    filter_excluded_keys_with_policy, parse_spec_list, resolve_spec, ExclusionPolicy,
+};
 
 pub const CURATED_SUBSCRIPTION_PROVIDERS: [&str; 2] = ["opencode-go", "ollama-cloud"];
 
@@ -104,6 +106,11 @@ pub fn resolve_launch_requirements(
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRoutingPolicyInput {
+    /// Routes this policy refuses. Every selection merges the operator's list with
+    /// the caller's as a UNION: the two lists are resolved independently and the
+    /// results OR-ed, so a negation here ("-anthropic") can only cancel an entry
+    /// in the SAME list. A caller can add an exclusion; it can never lift one the
+    /// operator wrote.
     #[serde(default)]
     pub exclude: Vec<String>,
     #[serde(default)]
@@ -123,21 +130,38 @@ pub struct ResolvedRoutingPolicy {
 
 /// Apply exclusion and subscription policy to raw connected-model and auth facts.
 /// The output is deterministic so it can be returned as selection provenance.
+///
+/// `operator` is the machine owner's standing policy, read from the user-global
+/// config by whoever serves the selection; `caller` is the per-call policy a
+/// client attached to its own request. The operator policy is the BASELINE: it is
+/// a required argument rather than an option so no selection path can reach the
+/// scorer without it (a selection that silently saw an empty fence is the exact
+/// defect this signature exists to make impossible).
 pub fn resolve_routing_policy(
     available_models: impl IntoIterator<Item = String>,
-    policy: &ModelRoutingPolicyInput,
+    operator: &ModelRoutingPolicyInput,
+    caller: &ModelRoutingPolicyInput,
     provider_auth_types: &HashMap<String, String>,
     suppress_fast_variant: bool,
 ) -> ResolvedRoutingPolicy {
     let connected: HashSet<String> = available_models.into_iter().collect();
     let connected_model_count = connected.len();
-    let filtered = filter_excluded_keys(&connected, &policy.exclude);
+    let filtered = filter_excluded_keys_with_policy(
+        &connected,
+        ExclusionPolicy {
+            operator: &operator.exclude,
+            caller: &caller.exclude,
+        },
+    );
 
+    // Subscription and fast-variant specs are additive lists rather than a fence,
+    // so the caller's entries follow the operator's and refine them for this call.
     let mut subscription_specs = CURATED_SUBSCRIPTION_PROVIDERS
         .iter()
         .map(|provider| (*provider).to_string())
         .collect::<Vec<_>>();
-    subscription_specs.extend(policy.subscription.iter().cloned());
+    subscription_specs.extend(operator.subscription.iter().cloned());
+    subscription_specs.extend(caller.subscription.iter().cloned());
     let subscription_specs = parse_spec_list(&subscription_specs);
 
     let mut available_models = filtered.into_iter().collect::<Vec<_>>();
@@ -160,7 +184,12 @@ pub fn resolve_routing_policy(
         prefer_fast_specs: if suppress_fast_variant {
             Vec::new()
         } else {
-            policy.prefer_fast_when_relaxed.clone()
+            operator
+                .prefer_fast_when_relaxed
+                .iter()
+                .chain(caller.prefer_fast_when_relaxed.iter())
+                .cloned()
+                .collect()
         },
         connected_model_count,
     }
@@ -188,7 +217,22 @@ mod tests {
     fn resolve(keys: &[&str], policy: ModelRoutingPolicyInput) -> ResolvedRoutingPolicy {
         resolve_routing_policy(
             keys.iter().map(|key| (*key).to_string()),
+            &ModelRoutingPolicyInput::default(),
             &policy,
+            &auth_types(),
+            false,
+        )
+    }
+
+    fn resolve_with_operator(
+        keys: &[&str],
+        operator: ModelRoutingPolicyInput,
+        caller: ModelRoutingPolicyInput,
+    ) -> ResolvedRoutingPolicy {
+        resolve_routing_policy(
+            keys.iter().map(|key| (*key).to_string()),
+            &operator,
+            &caller,
             &auth_types(),
             false,
         )
@@ -224,6 +268,7 @@ mod tests {
                 "anthropic/claude-opus-4-8".to_string(),
                 "opencode-go/qwen3.7-max".to_string(),
             ],
+            &ModelRoutingPolicyInput::default(),
             &ModelRoutingPolicyInput::default(),
             &HashMap::new(),
             false,
@@ -282,6 +327,7 @@ mod tests {
 
         let suppressed = resolve_routing_policy(
             ["openai/gpt-5.5".to_string()],
+            &ModelRoutingPolicyInput::default(),
             &ModelRoutingPolicyInput {
                 prefer_fast_when_relaxed: vec!["openai".into()],
                 ..ModelRoutingPolicyInput::default()
@@ -290,6 +336,69 @@ mod tests {
             true,
         );
         assert!(suppressed.prefer_fast_specs.is_empty());
+    }
+
+    #[test]
+    fn operator_policy_is_the_baseline_a_caller_cannot_lift() {
+        // An EMPTY caller policy is the module-side shape that used to see no fence
+        // at all: every selection originating inside the daemon sent no policy, so
+        // the operator's exclude list never reached the router.
+        let baseline = resolve_with_operator(
+            &["anthropic/claude-opus-4-8", "openai/gpt-5.5"],
+            ModelRoutingPolicyInput {
+                exclude: vec!["anthropic".into()],
+                ..ModelRoutingPolicyInput::default()
+            },
+            ModelRoutingPolicyInput::default(),
+        );
+        assert_eq!(baseline.available_models, vec!["openai/gpt-5.5"]);
+
+        // A caller negation of an operator entry does not lift it.
+        let negated = resolve_with_operator(
+            &["anthropic/claude-opus-4-8", "openai/gpt-5.5"],
+            ModelRoutingPolicyInput {
+                exclude: vec!["anthropic".into()],
+                ..ModelRoutingPolicyInput::default()
+            },
+            ModelRoutingPolicyInput {
+                exclude: vec!["-anthropic".into()],
+                ..ModelRoutingPolicyInput::default()
+            },
+        );
+        assert_eq!(negated.available_models, vec!["openai/gpt-5.5"]);
+
+        // The caller may still ADD an exclusion of its own.
+        let widened = resolve_with_operator(
+            &["anthropic/claude-opus-4-8", "openai/gpt-5.5"],
+            ModelRoutingPolicyInput {
+                exclude: vec!["anthropic".into()],
+                ..ModelRoutingPolicyInput::default()
+            },
+            ModelRoutingPolicyInput {
+                exclude: vec!["openai".into()],
+                ..ModelRoutingPolicyInput::default()
+            },
+        );
+        assert!(widened.available_models.is_empty());
+        assert_eq!(widened.connected_model_count, 2);
+
+        // Subscription and fast-variant specs merge from both sources.
+        let merged = resolve_with_operator(
+            &["fireworks-ai/llama", "openai/gpt-5.5"],
+            ModelRoutingPolicyInput {
+                subscription: vec!["fireworks-ai".into()],
+                prefer_fast_when_relaxed: vec!["openai".into()],
+                ..ModelRoutingPolicyInput::default()
+            },
+            ModelRoutingPolicyInput {
+                prefer_fast_when_relaxed: vec!["fireworks-ai".into()],
+                ..ModelRoutingPolicyInput::default()
+            },
+        );
+        assert!(merged
+            .subscription_keys
+            .contains(&"fireworks-ai/llama".to_string()));
+        assert_eq!(merged.prefer_fast_specs, vec!["openai", "fireworks-ai"]);
     }
 
     #[test]

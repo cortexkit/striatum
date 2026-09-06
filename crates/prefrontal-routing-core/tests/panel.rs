@@ -77,6 +77,7 @@ fn panel_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput
         facts,
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
+        operator_exclude_keys: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
     }
@@ -98,6 +99,7 @@ fn n_pick_input(
         facts,
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
+        operator_exclude_keys: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
     }
@@ -112,6 +114,46 @@ fn openai_sibling(model: &str, elo: f64) -> ModelFact {
         reasoning_effort: None,
     });
     fact
+}
+
+#[test]
+fn operator_exclusion_fences_automatic_seats_and_names_its_own_cause() {
+    let facts = vec![
+        fact("fenced", 1_800.0, Some("a")),
+        fact("kept", 1_700.0, Some("b")),
+        fact("rerouted", 1_650.0, Some("c")),
+    ];
+    let mut input = n_pick_input(facts, spec(3, 0.0, PanelDiversity::None), 1_000, 100_000);
+    input.operator_exclude_keys = vec!["p/fenced".into()];
+    // The caller's own exclusion of a DIFFERENT route must stay distinguishable
+    // from the operator's: one is fixed by editing a config, the other by asking
+    // for something else.
+    input.exclude_route_keys = vec!["p/rerouted".into()];
+    let panel = select_panel(input).unwrap();
+
+    assert_eq!(
+        panel
+            .members
+            .iter()
+            .map(|member| member.route_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p/kept"]
+    );
+    let causes = &panel
+        .shortfall
+        .expect("a fenced panel reports its shortfall")
+        .causes;
+    let cause_for = |model: &str| {
+        causes
+            .iter()
+            .find(|cause| cause.model == model)
+            .map(|cause| cause.reason)
+    };
+    assert_eq!(
+        cause_for("p/fenced"),
+        Some(PanelCauseReason::ExcludedByOperator)
+    );
+    assert_eq!(cause_for("p/rerouted"), Some(PanelCauseReason::Excluded));
 }
 
 #[test]
@@ -199,6 +241,7 @@ fn admission_is_shared_not_reimplemented() {
         facts: facts.clone(),
         runtime_snapshot: Some(snapshot.clone()),
         exclude_route_keys: vec!["p/excluded".into()],
+        operator_exclude_keys: Vec::new(),
         prefer_fast_specs: Vec::new(),
         required_capabilities: capabilities,
         is_subscription_route: None,
@@ -232,6 +275,9 @@ fn admission_is_shared_not_reimplemented() {
         facts,
         runtime_snapshot: Some(snapshot),
         exclude_route_keys: vec!["p/excluded".into()],
+        // Provider-wide operator fence: if the standing policy leaked into a pinned
+        // roster it would empty this panel outright, not merely drop one seat.
+        operator_exclude_keys: vec!["p".into()],
         required_capabilities: capabilities,
         available_models: available,
         is_subscription_route: None,
@@ -252,14 +298,19 @@ fn admission_is_shared_not_reimplemented() {
             .any(|cause| cause.model == model && cause.reason == reason));
     }
     assert!(
-        !causes
-            .iter()
-            .any(|cause| cause.reason == PanelCauseReason::Excluded),
-        "roster pins must bypass the exclusion list"
+        !causes.iter().any(|cause| matches!(
+            cause.reason,
+            PanelCauseReason::Excluded | PanelCauseReason::ExcludedByOperator
+        )),
+        "roster pins must bypass both the caller and operator exclusion lists"
     );
     assert!(
         panel.members.iter().any(|m| m.route_key == "p/excluded"),
         "the excluded-but-pinned model must be seated"
+    );
+    assert!(
+        panel.members.iter().any(|m| m.route_key == "p/winner"),
+        "an operator-excluded provider stays seatable through a deliberate pin"
     );
 
     let exhausted = vec![fact("only", 60.0, Some("a"))];
@@ -283,6 +334,7 @@ fn admission_is_shared_not_reimplemented() {
             ..Default::default()
         }),
         exclude_route_keys: Vec::new(),
+        operator_exclude_keys: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
     })
@@ -418,6 +470,7 @@ fn shortfall_precedence_and_empty_success() {
         available_models: HashSet::new(),
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
+        operator_exclude_keys: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
     })

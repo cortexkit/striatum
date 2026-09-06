@@ -11,8 +11,9 @@ use crate::model_facts::{
 };
 use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, ModelRouteStateSnapshot,
-    RequiredCapabilities,
+    RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
 };
+use crate::provider_model_spec::ExclusionPolicy;
 use crate::routing_config::{demand_bar, RoutingConfig, DEFAULT_ROUTING_CONFIG};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -72,6 +73,9 @@ pub struct SelectPanelInput<'a> {
     pub facts: Vec<ModelFact>,
     pub runtime_snapshot: Option<ModelRouteStateSnapshot>,
     pub exclude_route_keys: Vec<String>,
+    /// The operator's standing exclude list. Applied to automatic (n_pick)
+    /// admission only; an explicit roster is a pin and pins bypass exclusion.
+    pub operator_exclude_keys: Vec<String>,
     pub required_capabilities: Option<RequiredCapabilities>,
     pub available_models: HashSet<String>,
     pub is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
@@ -102,7 +106,12 @@ pub struct PanelRunnerUp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelCauseReason {
+    /// Rejected by a caller-supplied exclusion for this panel request.
     Excluded,
+    /// Rejected by the operator's standing exclude list. Separate from `Excluded`
+    /// because the fix is different: one is loosening a config file, the other is
+    /// changing what this call asked for.
+    ExcludedByOperator,
     Unavailable,
     QuotaExhausted,
     BackoffActive,
@@ -256,16 +265,18 @@ pub fn select_panel_with_config(
         PanelSelection::NPick => input.facts.clone(),
     };
 
-    // Explicit roster pins BYPASS the exclusion list by design: the global
+    // Explicit roster pins BYPASS BOTH exclusion lists by design: the operator's
     // model_routing.exclude reserves scarce models (kimi, anthropic/fable) from
     // automatic routing precisely SO they remain usable via deliberate roster
     // pins. Applying the list here silently shrank pinned audit panels to the
     // unexcluded seats. Availability, quota/cooldown, and capability gates
     // still apply to pins: only the exclusion predicate is roster-exempt.
-    let no_exclusions: Vec<String> = Vec::new();
     let effective_exclusions = match input.selection {
-        PanelSelection::Roster => &no_exclusions,
-        PanelSelection::NPick => &input.exclude_route_keys,
+        PanelSelection::Roster => ExclusionPolicy::none(),
+        PanelSelection::NPick => ExclusionPolicy {
+            operator: &input.operator_exclude_keys,
+            caller: &input.exclude_route_keys,
+        },
     };
     let exact_model_pins: Vec<String> = match input.selection {
         PanelSelection::Roster => input
@@ -293,7 +304,8 @@ pub fn select_panel_with_config(
     causes.extend(admission.rejected.into_iter().map(|rejected| PanelCause {
         model: rejected.route_key,
         reason: match rejected.reason.as_str() {
-            "excluded" => PanelCauseReason::Excluded,
+            REASON_EXCLUDED => PanelCauseReason::Excluded,
+            REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
             "quota_exhausted" | "cooldown_active" => PanelCauseReason::QuotaExhausted,
             "backoff_active" => PanelCauseReason::BackoffActive,
             "missing_vision" | "context_too_small" => PanelCauseReason::Capability,

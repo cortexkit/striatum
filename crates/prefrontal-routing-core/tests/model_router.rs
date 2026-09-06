@@ -18,7 +18,7 @@ use prefrontal_routing_core::model_router::{
     admit_routes, select_model_route, select_model_route_with_config, ModelRouteStateSnapshot,
     RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
 };
-use prefrontal_routing_core::{DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY};
+use prefrontal_routing_core::{ExclusionPolicy, DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY};
 
 // ── builders mirroring the TS test helpers ──────────────────────────────────
 
@@ -110,6 +110,7 @@ fn input<'a>(
         facts,
         runtime_snapshot: extra.runtime_snapshot,
         exclude_route_keys: Vec::new(),
+        operator_exclude_keys: Vec::new(),
         prefer_fast_specs: extra.prefer_fast_specs,
         required_capabilities: extra.required_capabilities,
         is_subscription_route: extra.is_subscription_route,
@@ -449,7 +450,7 @@ fn quota_exhaustion_does_not_change_the_request_frontier() {
     let baseline = admit_routes(
         &facts,
         None,
-        &[],
+        ExclusionPolicy::default(),
         &[],
         &[],
         None,
@@ -461,7 +462,7 @@ fn quota_exhaustion_does_not_change_the_request_frontier() {
     let pressured = admit_routes(
         &facts,
         Some(&quota),
-        &[],
+        ExclusionPolicy::default(),
         &[],
         &[],
         None,
@@ -1266,6 +1267,14 @@ fn unknown_price_normalizes_to_maximum_cost() {
         "unknown price must normalize to max cost, got {}",
         r.score.objective.cost
     );
+    // Ranking an unpriced route at the maximum is a real decision about a route
+    // nobody has a price for, so the explanation says so instead of leaving a
+    // reader to conclude the model is expensive.
+    let explanation = r.explanation.join("\n");
+    assert!(
+        explanation.contains("price unknown (ranked as max)"),
+        "{explanation}"
+    );
 }
 
 #[test]
@@ -1819,7 +1828,7 @@ fn top_routable_excludes_config_excluded_fable() {
     let excluded = admit_routes(
         &facts,
         None,
-        &["anthropic/claude-fable-5".into()],
+        ExclusionPolicy::caller_only(&["anthropic/claude-fable-5".into()]),
         &[],
         &[],
         None,
@@ -1832,7 +1841,7 @@ fn top_routable_excludes_config_excluded_fable() {
     let admitted = admit_routes(
         &facts,
         None,
-        &[],
+        ExclusionPolicy::default(),
         &[],
         &[],
         None,
@@ -1863,7 +1872,7 @@ fn iq_endpoints_admit_all_at_zero_and_clear_only_the_top_at_100() {
     let zero = admit_routes(
         &facts,
         None,
-        &[],
+        ExclusionPolicy::default(),
         &[],
         &[],
         None,
@@ -1880,7 +1889,7 @@ fn iq_endpoints_admit_all_at_zero_and_clear_only_the_top_at_100() {
     let max = admit_routes(
         &facts,
         None,
-        &[],
+        ExclusionPolicy::default(),
         &[],
         &[],
         None,
