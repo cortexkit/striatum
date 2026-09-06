@@ -3658,11 +3658,9 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // subc-protocol (sibling commit 9f3e6faa); optional declarations stay at
     // their absent defaults: no capabilities, no self-signals, and no
     // provenance until the deploy script injects CK_BUILD_* facts.
-    ModuleManifest::builder(
-        module_id,
-        env!("CARGO_PKG_VERSION"),
-        TrustTier::FirstParty,
-        Bindings {
+    ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+    .trust_tier(Some(TrustTier::FirstParty))
+    .bindings(Some(Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -3673,8 +3671,7 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 requires: Vec::new(),
                 optional: Vec::new(),
             },
-        },
-    )
+        }))
     .protocol_ver(PROTOCOL_VERSION)
     .provides(vec![ProviderRole::ManagementSurface {
         // Deliberate lane, not a default: routing serves concurrent
