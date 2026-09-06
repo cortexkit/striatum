@@ -1001,14 +1001,18 @@ fn decision_rejections_keep_twelve_entries_and_summarize_the_rest() {
 
     let rig = Rig::new("decision-rejection-truncation");
     let store = rig.open();
+    // Twelve catalog-tail rows arrive first (the ledger stores them in producer
+    // order); the three runtime walls arrive last. The bound must keep the walls,
+    // which is what an operator reads when asking why a provider was skipped.
     let mut rejected = (0..12)
-        .map(|i| serde_json::json!({ "routeKey": format!("kept-{i}"), "reason": "admission" }))
+        .map(|i| serde_json::json!({ "routeKey": format!("tail-{i}"), "reason": "unscored_awaiting_placement" }))
         .collect::<Vec<_>>();
-    rejected.extend([
-        serde_json::json!({ "routeKey": "omitted-0", "reason": "quota_exhausted" }),
-        serde_json::json!({ "routeKey": "omitted-1", "reason": "quota_exhausted" }),
-        serde_json::json!({ "routeKey": "omitted-2", "reason": "context_too_small" }),
-    ]);
+    let walls = [
+        serde_json::json!({ "routeKey": "wall-0", "reason": "quota_exhausted", "detail": "wall for 60s more" }),
+        serde_json::json!({ "routeKey": "wall-1", "reason": "cooldown_active", "detail": "wall for 61s more" }),
+        serde_json::json!({ "routeKey": "wall-2", "reason": "backoff_active", "detail": "3 failures" }),
+    ];
+    rejected.extend(walls.iter().cloned());
     let raw = serde_json::to_string(&rejected).unwrap();
     store
         .record_decision(&DecisionInput {
@@ -1032,15 +1036,17 @@ fn decision_rejections_keep_twelve_entries_and_summarize_the_rest() {
         .unwrap();
     let stored: Vec<serde_json::Value> = serde_json::from_str(&stored).unwrap();
     assert_eq!(stored.len(), 13);
-    assert_eq!(&stored[..12], &rejected[..12]);
+    assert_eq!(
+        &stored[..3],
+        &walls[..],
+        "runtime walls must survive the bound ahead of the catalog tail"
+    );
+    assert_eq!(&stored[3..12], &rejected[..9]);
     assert_eq!(
         stored[12],
         serde_json::json!({
             "truncated": 3,
-            "reasons": {
-                "context_too_small": 1,
-                "quota_exhausted": 2,
-            },
+            "reasons": { "unscored_awaiting_placement": 3 },
         })
     );
 }

@@ -347,6 +347,13 @@ pub(crate) fn latest_deadline(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     }
 }
 
+/// `until` and `now` are epoch milliseconds as f64. Rendered as a remaining
+/// duration plus both raw values so a unit mismatch is visible at a glance.
+fn wall_detail(until: f64, now: f64) -> String {
+    let remaining_s = ((until - now) / 1000.0).round();
+    format!("wall for {remaining_s}s more (until_ms={until:.0}, now_ms={now:.0})")
+}
+
 fn merged_runtime_state(
     route: &ModelRoute,
     snapshot: Option<&ModelRouteStateSnapshot>,
@@ -485,22 +492,23 @@ pub fn admit_routes(
     let mut admitted = Vec::new();
     for (fact, route) in static_candidates {
         let runtime = merged_runtime_state(&route, runtime_snapshot);
-        if runtime.cooldown_until.is_some_and(|until| until > now) {
+        // A wall rejection names the deadline it was compared against. Without it a
+        // ledger row reading `quota_exhausted` cannot be told apart from a stale stored
+        // wall, a live overlay wall, or a clock in the wrong unit, and the operator's
+        // own quota view showing free capacity has nothing to argue with.
+        if let Some(until) = runtime.cooldown_until.filter(|until| *until > now) {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "cooldown_active".to_string(),
-                detail: None,
+                detail: Some(wall_detail(until, now)),
             });
             continue;
         }
-        if runtime
-            .quota_exhausted_until
-            .is_some_and(|until| until > now)
-        {
+        if let Some(until) = runtime.quota_exhausted_until.filter(|until| *until > now) {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "quota_exhausted".to_string(),
-                detail: None,
+                detail: Some(wall_detail(until, now)),
             });
             continue;
         }
