@@ -37,13 +37,16 @@ pub enum FailureBackoffTransition {
 /// Whether a terminal outcome is evidence about the selected provider route.
 ///
 /// `LocalNetwork` identifies failures that every route on this host would see;
-/// `NoDispatch` identifies launch failures before the host prompt reaches a provider.
-/// Neither may charge an individual route's terminal-failure streak.
+/// `NoDispatch` identifies launch failures before the host prompt reaches a provider;
+/// `ContentPolicy` identifies a provider refusing the REQUEST on policy grounds (the
+/// prompt, not the route, is what failed, and a reworded prompt succeeds on the same
+/// route). None of the three may charge an individual route's terminal-failure streak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureAttribution {
     RouteAttributable,
     LocalNetwork,
     NoDispatch,
+    ContentPolicy,
 }
 
 /// Only outcomes that prove the selected route could not complete its send count.
@@ -81,6 +84,23 @@ pub fn classify_failure_attribution(
     .any(|class| error.contains(class))
     {
         return FailureAttribution::LocalNetwork;
+    }
+    // Provider policy refusals name the request as the cause. Signatures observed live:
+    // OpenAI's cyber-program refusal (2026-09-06, a review brief), plus the generic
+    // content-filter wordings the major providers use.
+    if [
+        "flagged for possible cybersecurity risk",
+        "trusted access for cyber",
+        "content_filter",
+        "content filter",
+        "content management policy",
+        "content policy",
+        "safety system",
+    ]
+    .iter()
+    .any(|class| error.contains(class))
+    {
+        return FailureAttribution::ContentPolicy;
     }
 
     match outcome {
@@ -130,6 +150,7 @@ pub fn failure_backoff_transition(
         FailureAttribution::RouteAttributable => {}
         FailureAttribution::LocalNetwork => return FailureBackoffTransition::Unchanged,
         FailureAttribution::NoDispatch => return FailureBackoffTransition::Unchanged,
+        FailureAttribution::ContentPolicy => return FailureBackoffTransition::Unchanged,
     }
 
     let consecutive_failures = previous_consecutive_failures.saturating_add(1);
@@ -164,6 +185,42 @@ mod tests {
 
     const SPECIMEN_ERROR: &str =
         "Access to model denied. Please make sure you are eligible for using the model.";
+
+    /// Verbatim from the live routing store (openai/gpt-6-astra, 2026-09-06).
+    const CONTENT_POLICY_SPECIMEN: &str = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
+
+    #[test]
+    fn a_provider_content_policy_refusal_does_not_charge_the_route() {
+        assert_eq!(
+            classify_failure_attribution(RouteOutcome::SessionError, Some(CONTENT_POLICY_SPECIMEN)),
+            FailureAttribution::ContentPolicy
+        );
+        assert_eq!(
+            failure_backoff_transition(
+                2,
+                RouteOutcome::SessionError,
+                Some(CONTENT_POLICY_SPECIMEN),
+                1_000,
+                FailureBackoffConfig::default(),
+            ),
+            FailureBackoffTransition::Unchanged,
+            "the third strike would have opened a 10m backoff; a policy refusal is not route evidence"
+        );
+        // Control: the eligibility refusal stays route evidence.
+        assert!(matches!(
+            failure_backoff_transition(
+                2,
+                RouteOutcome::SessionError,
+                Some(SPECIMEN_ERROR),
+                1_000,
+                FailureBackoffConfig::default(),
+            ),
+            FailureBackoffTransition::Failure {
+                consecutive_failures: 3,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn third_consecutive_session_error_starts_ten_minute_backoff_with_verbatim_reason() {
