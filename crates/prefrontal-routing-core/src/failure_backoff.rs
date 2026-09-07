@@ -51,7 +51,8 @@ pub enum FailureAttribution {
 
 /// Only outcomes that prove the selected route could not complete its send count.
 /// `error`, `session_error`, and `launch_failed` count. `cancelled` is a user abort,
-/// while `interrupted` is a harness cancellation; neither says the route failed.
+/// `interrupted` is a harness cancellation, and quota exhaustion has its own exact cooldown;
+/// none of those three belongs in the generic failure streak.
 pub fn is_terminal_send_failure(outcome: RouteOutcome) -> bool {
     matches!(
         outcome,
@@ -124,6 +125,7 @@ pub fn classify_failure_attribution(
         RouteOutcome::SessionError => FailureAttribution::RouteAttributable,
         RouteOutcome::Cancelled => FailureAttribution::RouteAttributable,
         RouteOutcome::Interrupted => FailureAttribution::RouteAttributable,
+        RouteOutcome::QuotaExhausted { .. } => FailureAttribution::RouteAttributable,
     }
 }
 

@@ -2784,8 +2784,11 @@ struct SetDecisionOutcomeParams {
     // would expect `decisionId`, the lone casing drift that broke the round-trip.
     #[serde(rename = "decisionID")]
     decision_id: String,
-    /// completed | error | session_error | cancelled | interrupted | launch_failed
+    /// completed | error | session_error | cancelled | interrupted | launch_failed | quota_exhausted
     outcome: String,
+    /// Host-parsed reset delay for a quota_exhausted outcome.
+    #[serde(default)]
+    retry_after_secs: Option<u64>,
     /// Exact terminal send error surfaced by the harness, when one was available.
     #[serde(default)]
     last_error: Option<String>,
@@ -2870,7 +2873,7 @@ struct RecordCooldownParams {
     last_error: Option<String>,
 }
 
-fn parse_outcome(s: &str) -> Option<RouteOutcome> {
+fn parse_outcome(s: &str, retry_after_secs: Option<u64>) -> Option<RouteOutcome> {
     match s {
         "completed" => Some(RouteOutcome::Completed),
         "error" => Some(RouteOutcome::Error),
@@ -2878,6 +2881,9 @@ fn parse_outcome(s: &str) -> Option<RouteOutcome> {
         "cancelled" => Some(RouteOutcome::Cancelled),
         "interrupted" => Some(RouteOutcome::Interrupted),
         "launch_failed" => Some(RouteOutcome::LaunchFailed),
+        "quota_exhausted" => retry_after_secs
+            .filter(|seconds| *seconds > 0)
+            .map(|retry_after_secs| RouteOutcome::QuotaExhausted { retry_after_secs }),
         _ => None,
     }
 }
@@ -2943,7 +2949,7 @@ async fn handle_set_decision_outcome(
                 .await;
             }
         };
-    let Some(outcome) = parse_outcome(&params.outcome) else {
+    let Some(outcome) = parse_outcome(&params.outcome, params.retry_after_secs) else {
         return send_route_error(
             writer,
             ver,
@@ -3832,6 +3838,18 @@ mod tests {
     use prefrontal_routing_core::{FactSource, UsageObservation};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn quota_outcome_requires_and_carries_retry_after_secs() {
+        assert_eq!(
+            parse_outcome("quota_exhausted", Some(580)),
+            Some(RouteOutcome::QuotaExhausted {
+                retry_after_secs: 580,
+            })
+        );
+        assert_eq!(parse_outcome("quota_exhausted", None), None);
+        assert_eq!(parse_outcome("quota_exhausted", Some(0)), None);
+    }
 
     #[test]
     fn quota_provenance_records_the_pacing_window_model() {

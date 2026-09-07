@@ -1795,6 +1795,48 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let provider_id = selected_provider_id.unwrap_or(parsed_provider_id);
                 let model_id = selected_model_id.unwrap_or(parsed_model_id);
                 let capacity_key = format!("{provider_id}/{model_id}");
+                if let Some(retry_after_secs) = update.outcome.retry_after_secs() {
+                    let quota_exhausted_until = update
+                        .observed_at_ms
+                        .saturating_add((retry_after_secs.min(i64::MAX as u64) as i64).saturating_mul(1_000))
+                        as f64;
+                    let surfaced_error = update
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| update.outcome.as_str().to_string());
+                    tx.execute(
+                        "INSERT INTO model_route_state (
+                           route_key, capacity_key, provider_id, model_id, variant,
+                           quota_exhausted_until, failure_count, quota_error_count,
+                           last_error, last_error_at, updated_at
+                         ) VALUES (?1,?2,?3,?4,?5,?6,1,1,?7,?8,?8)
+                         ON CONFLICT(route_key) DO UPDATE SET
+                           capacity_key=excluded.capacity_key,
+                           provider_id=excluded.provider_id,
+                           model_id=excluded.model_id,
+                           variant=excluded.variant,
+                           quota_exhausted_until=CASE
+                             WHEN model_route_state.quota_exhausted_until IS NULL
+                               OR model_route_state.quota_exhausted_until < excluded.quota_exhausted_until
+                             THEN excluded.quota_exhausted_until
+                             ELSE model_route_state.quota_exhausted_until END,
+                           failure_count=model_route_state.failure_count + 1,
+                           quota_error_count=model_route_state.quota_error_count + 1,
+                           last_error=excluded.last_error,
+                           last_error_at=excluded.last_error_at,
+                           updated_at=excluded.updated_at",
+                        params![
+                            route_key,
+                            capacity_key,
+                            provider_id,
+                            model_id,
+                            variant,
+                            quota_exhausted_until,
+                            surfaced_error,
+                            update.observed_at_ms,
+                        ],
+                    )?;
+                }
                 let existing: Option<(i64, Option<f64>, Option<String>)> = tx
                     .query_row(
                         "SELECT consecutive_terminal_failures, failure_backoff_until,

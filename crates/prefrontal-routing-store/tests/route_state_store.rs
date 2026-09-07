@@ -562,6 +562,79 @@ fn record_decision_and_set_outcome() {
     assert_eq!(decisions[0].outcome.as_deref(), Some("completed"));
 }
 
+#[test]
+fn quota_outcome_retry_after_cools_route_until_the_reported_reset_mutation_proof() {
+    const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
+    const OBSERVED_AT: i64 = 1_000;
+    const RETRY_AFTER_SECS: u64 = 9 * 60 + 40;
+    let rig = Rig::new("quota-outcome-retry-after");
+    let store = rig.open();
+    let decision_id = selected_decision(&store, "dec-quota-outcome", ROUTE);
+
+    set_outcome(
+        &store,
+        &decision_id,
+        RouteOutcome::QuotaExhausted {
+            retry_after_secs: RETRY_AFTER_SECS,
+        },
+        Some("host account pool rate-limited"),
+        OBSERVED_AT,
+    );
+
+    let expected_reset = (OBSERVED_AT + RETRY_AFTER_SECS as i64 * 1_000) as f64;
+    let snapshot = store.build_snapshot(OBSERVED_AT as f64 + 1.0).unwrap();
+    let fact = store
+        .get_fact_by_route_key(ROUTE)
+        .unwrap()
+        .expect("qwen fact");
+    let available: std::collections::HashSet<String> = [ROUTE.to_string()].into_iter().collect();
+    let blocked = admit_routes(
+        std::slice::from_ref(&fact),
+        Some(&snapshot),
+        ExclusionPolicy::default(),
+        &[],
+        &[],
+        None,
+        &available,
+        &ModelRequirements { iq: 80.0, eq: 20.0 },
+        &RoutingConfig::default(),
+    );
+    assert_eq!(
+        blocked.rejected.len(),
+        1,
+        "ignoring retry_after_secs leaves the exhausted route selectable"
+    );
+    assert_eq!(blocked.rejected[0].reason, "quota_exhausted");
+    assert_eq!(
+        snapshot
+            .by_route
+            .get(ROUTE)
+            .and_then(|state| state.quota_exhausted_until),
+        Some(expected_reset),
+        "retry_after_secs must write the exact route quota horizon"
+    );
+
+    let after_reset = store.build_snapshot(expected_reset + 1.0).unwrap();
+    let selectable = admit_routes(
+        &[fact],
+        Some(&after_reset),
+        ExclusionPolicy::default(),
+        &[],
+        &[],
+        None,
+        &available,
+        &ModelRequirements { iq: 80.0, eq: 20.0 },
+        &RoutingConfig::default(),
+    );
+    assert!(
+        selectable
+            .rejected
+            .iter()
+            .all(|route| route.route_key != ROUTE),
+        "the route becomes selectable after the reported reset"
+    );
+}
+
 fn selected_decision(store: &impl RouteStateStore, id: &str, route_key: &str) -> String {
     let (provider_id, model_id) = route_key.split_once('/').unwrap();
     store

@@ -124,6 +124,7 @@ pub enum RouteOutcome {
     Cancelled,
     Interrupted,
     LaunchFailed,
+    QuotaExhausted { retry_after_secs: u64 },
 }
 
 impl RouteOutcome {
@@ -135,6 +136,14 @@ impl RouteOutcome {
             RouteOutcome::Cancelled => "cancelled",
             RouteOutcome::Interrupted => "interrupted",
             RouteOutcome::LaunchFailed => "launch_failed",
+            RouteOutcome::QuotaExhausted { .. } => "quota_exhausted",
+        }
+    }
+
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            RouteOutcome::QuotaExhausted { retry_after_secs } => Some(*retry_after_secs),
+            _ => None,
         }
     }
 }
