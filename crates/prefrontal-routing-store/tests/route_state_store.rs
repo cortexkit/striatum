@@ -1557,7 +1557,7 @@ fn panel_decision_kind_and_migration() {
         .iter()
         .find(|fact| fact.model_id == "antigravity-claude-opus-4-6-thinking")
         .unwrap();
-    assert_eq!(hosted_claude.family.as_deref(), Some("anthropic"));
+    assert_eq!(hosted_claude.family.as_deref(), Some("claude"));
     let kimi = facts
         .iter()
         .find(|fact| fact.model_id == "kimi-k2.6")
@@ -1795,7 +1795,7 @@ fn migration_008_seeds_fable_for_roster_seating_without_entering_routing() {
         .find(|fact| fact.model_id == "claude-fable-5")
         .expect("fable-5 fact row exists after migration 008");
     assert_eq!(fable.provider_id, "anthropic");
-    assert_eq!(fable.family.as_deref(), Some("anthropic"));
+    assert_eq!(fable.family.as_deref(), Some("claude"));
     assert_eq!(fable.scores.elo, 1_911.0);
     assert!(fable.scores.eq > 2115.5, "eq curated above opus-4-8");
     // Migration 019 corrected this to the real list price ($10 in / $50 out);

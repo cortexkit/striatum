@@ -204,6 +204,112 @@ impl ScoreProvenance {
     }
 }
 
+/// Closed lineage vocabulary shared by routing, persona templates, and room seats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrandFamily {
+    Claude,
+    Gpt,
+    Gemini,
+    Grok,
+    Qwen,
+    Kimi,
+    Glm,
+    Deepseek,
+    Minimax,
+    Mistral,
+    Llama,
+    Other,
+}
+
+impl GrandFamily {
+    pub const ALL: [Self; 12] = [
+        Self::Claude,
+        Self::Gpt,
+        Self::Gemini,
+        Self::Grok,
+        Self::Qwen,
+        Self::Kimi,
+        Self::Glm,
+        Self::Deepseek,
+        Self::Minimax,
+        Self::Mistral,
+        Self::Llama,
+        Self::Other,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Gpt => "gpt",
+            Self::Gemini => "gemini",
+            Self::Grok => "grok",
+            Self::Qwen => "qwen",
+            Self::Kimi => "kimi",
+            Self::Glm => "glm",
+            Self::Deepseek => "deepseek",
+            Self::Minimax => "minimax",
+            Self::Mistral => "mistral",
+            Self::Llama => "llama",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|family| family.as_str() == value)
+    }
+}
+
+/// Historical store spellings accepted only by the versioned normalization migration.
+pub const GRAND_FAMILY_NORMALIZATIONS: [(&str, GrandFamily); 5] = [
+    ("anthropic", GrandFamily::Claude),
+    ("openai", GrandFamily::Gpt),
+    ("openai-gpt", GrandFamily::Gpt),
+    ("google-gemini", GrandFamily::Gemini),
+    ("xai-grok", GrandFamily::Grok),
+];
+
+pub fn normalize_grand_family_id(value: &str) -> Option<GrandFamily> {
+    GrandFamily::from_wire(value).or_else(|| {
+        GRAND_FAMILY_NORMALIZATIONS
+            .into_iter()
+            .find_map(|(historical, family)| (historical == value).then_some(family))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FamilySource {
+    Override,
+    Rule,
+    Curated,
+    #[default]
+    Absent,
+}
+
+impl FamilySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::Rule => "rule",
+            Self::Curated => "curated",
+            Self::Absent => "absent",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "override" => Some(Self::Override),
+            "rule" => Some(Self::Rule),
+            "curated" => Some(Self::Curated),
+            "absent" => Some(Self::Absent),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFact {
@@ -271,36 +377,18 @@ pub struct ModelRoute {
     pub fact: ModelFact,
 }
 
-/// Canonical grand-family id grammar: `^[a-z0-9][a-z0-9._-]{0,63}$`.
-///
-/// One vocabulary is shared by every family consumer: model facts, persona
-/// family prompt selectors, and seat family-diversity routing, so a family
-/// label written for one surface always means the same thing on the others.
+/// Return whether a wire value belongs to the closed grand-family vocabulary.
 pub fn is_valid_grand_family_id(id: &str) -> bool {
-    let bytes = id.as_bytes();
-    if bytes.is_empty() || bytes.len() > 64 {
-        return false;
-    }
-    if !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
-        return false;
-    }
-    bytes[1..]
-        .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+    GrandFamily::from_wire(id).is_some()
 }
 
 impl ModelFact {
-    /// The canonical optional grand-family fact for this route.
-    ///
-    /// Grand families are curated data carried by the fact (`family`); they are
-    /// NEVER inferred from provider or model names. A curated value that does
-    /// not match the canonical lowercase grammar is treated as absent rather
-    /// than silently normalized, so prompt family selectors and diversity
-    /// routing always consume one validated vocabulary.
+    /// Grand families are curated catalog data and are never inferred from route names.
     pub fn grand_family_id(&self) -> Option<&str> {
         self.family
             .as_deref()
-            .filter(|id| is_valid_grand_family_id(id))
+            .and_then(GrandFamily::from_wire)
+            .map(GrandFamily::as_str)
     }
 }
 

@@ -12,7 +12,8 @@
 use cortexkit_store::{open_sqlite, Migration, SqliteStore};
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use prefrontal_routing_core::model_facts::{
-    Confidence, ModelFact, ModelPromptDefaults, ModelScores,
+    normalize_grand_family_id, Confidence, FamilySource, GrandFamily, ModelFact,
+    ModelPromptDefaults, ModelScores,
 };
 use prefrontal_routing_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
 use prefrontal_routing_core::{
@@ -115,6 +116,8 @@ const MIGRATION_032: &str = include_str!("../migrations/032_consecutive_failure_
 const MIGRATION_033: &str = include_str!("../migrations/033_aa_inferred_provenance.sql");
 /// Migration 34: Fusiform facts, per-field overrides, and the replay cursor.
 const MIGRATION_034: &str = include_str!("../migrations/034_fusiform_catalog.sql");
+/// Migration 35: canonical model-family spellings and independent provenance.
+const MIGRATION_035: &str = include_str!("../migrations/035_model_family_vocabulary.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -140,7 +143,7 @@ struct ObservedSpeedAggregate {
     duration_ms: i64,
 }
 
-fn route_state_migrations() -> [Migration; 34] {
+fn route_state_migrations() -> [Migration; 35] {
     [
         Migration {
             version: 1,
@@ -278,6 +281,10 @@ fn route_state_migrations() -> [Migration; 34] {
             version: 34,
             statements: MIGRATION_034,
         },
+        Migration {
+            version: 35,
+            statements: MIGRATION_035,
+        },
     ]
 }
 
@@ -290,6 +297,34 @@ fn now_ms() -> i64 {
 
 fn err(e: impl std::fmt::Display) -> RouteStateStoreError {
     RouteStateStoreError(e.to_string())
+}
+
+fn validate_family_spellings(store: &SqliteStore) -> RouteStateResult<()> {
+    let unknown = store
+        .with_conn(|connection: &Connection| {
+            let mut statement = connection.prepare(
+                "SELECT route_key, family FROM model_facts WHERE family IS NOT NULL ORDER BY route_key",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let unknown = rows
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(_, family)| GrandFamily::from_wire(family).is_none())
+                .map(|(route_key, family)| format!("{route_key}={family}"))
+                .collect::<Vec<_>>();
+            Ok(unknown)
+        })
+        .map_err(err)?;
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(err(format!(
+            "unknown model family spelling(s): {}",
+            unknown.join(", ")
+        )))
+    }
 }
 
 /// One catalog row served to read-only consumers. `excluded` stays separate from
@@ -575,6 +610,7 @@ impl SqliteRouteStateStore {
                 outcome.recorded, outcome.chain_max, outcome.recorded
             )));
         }
+        validate_family_spellings(&store)?;
         Ok(Self { store })
     }
 
@@ -1186,6 +1222,17 @@ fn bool_to_int(v: Option<bool>) -> Option<i64> {
 
 impl RouteStateStore for SqliteRouteStateStore {
     fn upsert_fact(&self, fact: &ModelFact, source: FactSource) -> RouteStateResult<()> {
+        let mut fact = fact.clone();
+        if let Some(family) = fact.family.as_deref() {
+            let normalized = normalize_grand_family_id(family).ok_or_else(|| {
+                err(format!(
+                    "unknown model family spelling for {}/{}: {family}",
+                    fact.provider_id, fact.model_id
+                ))
+            })?;
+            fact.family = Some(normalized.as_str().to_string());
+        }
+        let fact = &fact;
         let route = fact_to_route(fact);
         let provider_key = derive_provider_key(&fact.provider_id)
             .ok_or_else(|| err("model fact has no canonical provider key"))?;
@@ -1225,16 +1272,20 @@ impl RouteStateStore for SqliteRouteStateStore {
                         }
                     }
                 }
-                tx.execute(
-                    "INSERT INTO model_facts (
-                       route_key, capacity_key, provider_id, model_id, variant, family,
+                 tx.execute(
+                     "INSERT INTO model_facts (
+                       route_key, capacity_key, provider_id, model_id, variant, family, family_source,
                        scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
-                        supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
-                        source, updated_at, aa_index, review_by_ms, eq_source
-                      ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)
-                     ON CONFLICT(route_key) DO UPDATE SET
+                         supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
+                         source, updated_at, aa_index, review_by_ms, eq_source
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
+                      ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,
+                       family_source=CASE
+                         WHEN model_facts.family_source IN ('override', 'rule') THEN model_facts.family_source
+                         ELSE excluded.family_source
+                       END,
                        scores_json=excluded.scores_json, context_window=excluded.context_window,
                        max_output_tokens=excluded.max_output_tokens, cost_tier=excluded.cost_tier,
                        cost_per_mtok_out=excluded.cost_per_mtok_out,
@@ -1250,9 +1301,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                         fact.provider_id,
                         fact.model_id,
                         fact.variant,
-                        fact.family,
-                        scores_json,
-                        fact.context_window,
+                         fact.family,
+                         if fact.family.is_some() {
+                             FamilySource::Curated.as_str()
+                         } else {
+                             FamilySource::Absent.as_str()
+                         },
+                         scores_json,
+                         fact.context_window,
                         fact.max_output_tokens,
                         fact.cost_tier,
                         fact.cost_per_m_tok_out,
@@ -1335,6 +1391,55 @@ impl RouteStateStore for SqliteRouteStateStore {
                     ],
                 )?;
                 Ok(())
+            })
+            .map_err(err)
+    }
+
+    fn set_model_family(
+        &self,
+        route_key: &str,
+        family: Option<GrandFamily>,
+        source: FamilySource,
+    ) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                connection.execute(
+                    "UPDATE model_facts SET family = ?2, family_source = ?3, updated_at = ?4
+                     WHERE route_key = ?1",
+                    params![
+                        route_key,
+                        family.map(GrandFamily::as_str),
+                        source.as_str(),
+                        now_ms()
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(err)
+    }
+
+    fn get_model_family(
+        &self,
+        route_key: &str,
+    ) -> RouteStateResult<Option<(Option<GrandFamily>, FamilySource)>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                connection
+                    .query_row(
+                        "SELECT family, family_source FROM model_facts WHERE route_key = ?1",
+                        [route_key],
+                        |row| {
+                            let family = row
+                                .get::<_, Option<String>>(0)?
+                                .as_deref()
+                                .and_then(GrandFamily::from_wire);
+                            let source_raw = row.get::<_, String>(1)?;
+                            let source = FamilySource::from_wire(&source_raw)
+                                .unwrap_or(FamilySource::Absent);
+                            Ok((family, source))
+                        },
+                    )
+                    .optional()
             })
             .map_err(err)
     }
@@ -2465,6 +2570,100 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
         let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+    }
+
+    #[test]
+    fn migration_035_normalizes_every_historical_family_spelling() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "prefrontal-routing-family-migration-{}-{timestamp}.sqlite",
+            std::process::id()
+        ));
+        let descriptor = dev_descriptor(
+            "prefrontal-routing-family-migration",
+            path.to_string_lossy(),
+        );
+        let fixtures = [
+            (
+                "anthropic/claude-opus-4-5",
+                "anthropic",
+                GrandFamily::Claude,
+            ),
+            ("openai/gpt-5.4", "openai", GrandFamily::Gpt),
+            ("openai/gpt-5.5", "openai-gpt", GrandFamily::Gpt),
+            (
+                "google/antigravity-gemini-3.1-pro",
+                "google-gemini",
+                GrandFamily::Gemini,
+            ),
+            ("xai/grok-4.3", "xai-grok", GrandFamily::Grok),
+        ];
+
+        let legacy = open_sqlite(&descriptor).unwrap();
+        let migrations = route_state_migrations();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &migrations[..34])
+            .unwrap();
+        legacy
+            .with_conn(|connection| {
+                for (route_key, spelling, _) in fixtures {
+                    connection.execute(
+                        "UPDATE model_facts SET family = ?2 WHERE route_key = ?1",
+                        params![route_key, spelling],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(legacy);
+
+        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        for (route_key, _, expected) in fixtures {
+            assert_eq!(
+                migrated.get_model_family(route_key).unwrap(),
+                Some((Some(expected), FamilySource::Curated))
+            );
+        }
+        drop(migrated);
+        remove_observed_speed_test_store(&path);
+    }
+
+    #[test]
+    fn migration_035_refuses_and_lists_unknown_family_rows() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "prefrontal-routing-family-refusal-{}-{timestamp}.sqlite",
+            std::process::id()
+        ));
+        let descriptor =
+            dev_descriptor("prefrontal-routing-family-refusal", path.to_string_lossy());
+        let legacy = open_sqlite(&descriptor).unwrap();
+        let migrations = route_state_migrations();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &migrations[..34])
+            .unwrap();
+        legacy
+            .with_conn(|connection| {
+                connection.execute(
+                    "UPDATE model_facts SET family = 'mystery-family' WHERE route_key = 'openai/gpt-5.4'",
+                    [],
+                )
+            })
+            .unwrap();
+        drop(legacy);
+
+        let error = match SqliteRouteStateStore::open(&descriptor) {
+            Ok(_) => panic!("unknown family spelling was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.0.contains("openai/gpt-5.4=mystery-family"), "{error}");
+        remove_observed_speed_test_store(&path);
     }
 
     const OLD_OBSERVED_SPEED_AGGREGATE_SQL: &str = "WITH ranked_usage AS (

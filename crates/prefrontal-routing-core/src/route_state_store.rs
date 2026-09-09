@@ -12,7 +12,7 @@
 //! domain. Quota windows are NOT here; they live in `insula` (formerly `ai-provider-quota`) and are
 //! consumed module-to-module (see `crate::quota`).
 
-use crate::model_facts::ModelFact;
+use crate::model_facts::{FamilySource, GrandFamily, ModelFact};
 use crate::model_router::ModelRouteStateSnapshot;
 
 /// Provenance of a stored fact. The closed vocabulary the router and listing ops
@@ -259,6 +259,32 @@ pub trait RouteStateStore {
         _fields: &[CatalogFactField],
     ) -> RouteStateResult<()> {
         Ok(())
+    }
+
+    /// Update only the family fact and its provenance without changing score ownership.
+    fn set_model_family(
+        &self,
+        _route_key: &str,
+        _family: Option<GrandFamily>,
+        _source: FamilySource,
+    ) -> RouteStateResult<()> {
+        Ok(())
+    }
+
+    /// Read one family fact with its independent provenance.
+    fn get_model_family(
+        &self,
+        route_key: &str,
+    ) -> RouteStateResult<Option<(Option<GrandFamily>, FamilySource)>> {
+        Ok(self.get_fact_by_route_key(route_key)?.map(|fact| {
+            let family = fact.family.as_deref().and_then(GrandFamily::from_wire);
+            let source = if family.is_some() {
+                FamilySource::Curated
+            } else {
+                FamilySource::Absent
+            };
+            (family, source)
+        }))
     }
 
     /// All facts currently in the store (seed + overrides).

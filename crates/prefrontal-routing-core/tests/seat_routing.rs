@@ -149,16 +149,16 @@ impl InputBuilder {
 // ── canonical grand-family facts (no inference from names) ──────────────────
 
 #[test]
-fn grand_family_grammar_accepts_canonical_lowercase_ids() {
-    for id in ["openai-gpt", "anthropic", "deepseek", "a", "x1", "g.l_m-5"] {
+fn grand_family_vocabulary_accepts_only_closed_wire_ids() {
+    for id in [
+        "claude", "gpt", "gemini", "grok", "qwen", "kimi", "glm", "deepseek", "minimax", "mistral",
+        "llama", "other",
+    ] {
         assert!(is_valid_grand_family_id(id), "{id} should be canonical");
     }
-    for id in ["", "GPT", "openai gpt", "-gpt", ".gpt", "família", "a/b"] {
+    for id in ["", "GPT", "openai-gpt", "anthropic", "xai-grok", "a/b"] {
         assert!(!is_valid_grand_family_id(id), "{id} should be rejected");
     }
-    let too_long = "a".repeat(65);
-    assert!(!is_valid_grand_family_id(&too_long));
-    assert!(is_valid_grand_family_id(&"a".repeat(64)));
 }
 
 #[test]
@@ -198,8 +198,8 @@ fn seed_family_vocabulary_is_canonical() {
 #[test]
 fn incumbent_families_resolve_from_facts_only() {
     let facts = vec![
-        fact("anthropic", "opus", Some("anthropic"), 50.0, 5.0),
-        fact("openai", "gpt", Some("openai-gpt"), 50.0, 5.0),
+        fact("anthropic", "opus", Some("claude"), 50.0, 5.0),
+        fact("openai", "gpt", Some("gpt"), 50.0, 5.0),
         fact("mystery", "m1", None, 50.0, 5.0),
     ];
     let incumbents = incumbent_grand_families(
@@ -212,7 +212,7 @@ fn incumbent_families_resolve_from_facts_only() {
     );
     // Only the labeled, matching incumbent contributes; unknown-family and
     // unmatched incumbents contribute nothing (and never fail resolution).
-    assert_eq!(incumbents, families(&["anthropic"]));
+    assert_eq!(incumbents, families(&["claude"]));
 }
 
 // ── criterion 6: explicit pins ──────────────────────────────────────────────
@@ -220,8 +220,8 @@ fn incumbent_families_resolve_from_facts_only() {
 #[test]
 fn adequate_pin_wins_over_recommendations_and_cheaper_routes() {
     let facts = vec![
-        fact("cheap", "adequate", Some("fam-a"), 50.0, 1.0),
-        fact("pinned", "target", Some("fam-b"), 50.0, 20.0),
+        fact("cheap", "adequate", Some("gpt"), 50.0, 1.0),
+        fact("pinned", "target", Some("claude"), 50.0, 20.0),
     ];
     let selection = select_seat_route(
         InputBuilder::new(facts)
@@ -236,13 +236,13 @@ fn adequate_pin_wins_over_recommendations_and_cheaper_routes() {
     assert_eq!(selection.route_key, "pinned/target");
     assert!(selection.pinned);
     assert_eq!(selection.recommendation, None);
-    assert_eq!(selection.grand_family_id.as_deref(), Some("fam-b"));
+    assert_eq!(selection.grand_family_id.as_deref(), Some("claude"));
 }
 
 #[test]
 fn unavailable_pin_fails_with_no_selection() {
     // Pin names a model absent from the catalog entirely.
-    let facts = vec![fact("other", "adequate", Some("fam-a"), 50.0, 1.0)];
+    let facts = vec![fact("other", "adequate", Some("gpt"), 50.0, 1.0)];
     let err = select_seat_route(InputBuilder::new(facts).pin("ghost/model").build())
         .expect_err("unavailable pin must fail before any effect");
     assert!(matches!(err, SeatRouteError::ModelPinUnavailable { .. }));
@@ -252,8 +252,8 @@ fn unavailable_pin_fails_with_no_selection() {
 #[test]
 fn known_but_logged_out_pin_fails_as_unavailable() {
     let facts = vec![
-        fact("pinned", "target", Some("fam-b"), 50.0, 5.0),
-        fact("other", "adequate", Some("fam-a"), 50.0, 1.0),
+        fact("pinned", "target", Some("claude"), 50.0, 5.0),
+        fact("other", "adequate", Some("gpt"), 50.0, 1.0),
     ];
     // Available set excludes the pinned route: caller is not logged into it.
     let available: HashSet<String> = ["other/adequate".to_string()].into_iter().collect();
@@ -270,8 +270,8 @@ fn known_but_logged_out_pin_fails_as_unavailable() {
 #[test]
 fn quota_exhausted_pin_fails_as_unavailable() {
     let facts = vec![
-        fact("pinned", "target", Some("fam-b"), 50.0, 5.0),
-        fact("other", "adequate", Some("fam-a"), 50.0, 1.0),
+        fact("pinned", "target", Some("claude"), 50.0, 5.0),
+        fact("other", "adequate", Some("gpt"), 50.0, 1.0),
     ];
     let mut snapshot = ModelRouteStateSnapshot {
         now: 1_000.0,
@@ -302,8 +302,8 @@ fn quota_exhausted_pin_fails_as_unavailable() {
 #[test]
 fn inadequate_pin_fails_with_named_adequacy_error() {
     let facts = vec![
-        fact("pinned", "weak", Some("fam-b"), 30.0, 5.0),
-        fact("other", "adequate", Some("fam-a"), 50.0, 1.0),
+        fact("pinned", "weak", Some("claude"), 30.0, 5.0),
+        fact("other", "adequate", Some("gpt"), 50.0, 1.0),
     ];
     let err = select_seat_route(InputBuilder::new(facts).pin("pinned/weak").build())
         .expect_err("inadequate pin must fail, not silently reroute");
@@ -322,7 +322,7 @@ fn inadequate_pin_fails_with_named_adequacy_error() {
 
 #[test]
 fn malformed_pin_is_rejected() {
-    let facts = vec![fact("other", "adequate", Some("fam-a"), 50.0, 1.0)];
+    let facts = vec![fact("other", "adequate", Some("gpt"), 50.0, 1.0)];
     for pin in ["no-slash", "a/b/c", "/model", "provider/"] {
         let err = select_seat_route(InputBuilder::new(facts.clone()).pin(pin).build())
             .expect_err("malformed pin must fail");
@@ -335,9 +335,9 @@ fn malformed_pin_is_rejected() {
 #[test]
 fn recommendation_tiers_apply_in_model_provider_family_order() {
     let facts = vec![
-        fact("prov-a", "model-a", Some("fam-a"), 50.0, 1.0),
-        fact("prov-b", "model-b", Some("fam-b"), 50.0, 2.0),
-        fact("prov-c", "model-c", Some("fam-c"), 50.0, 3.0),
+        fact("prov-a", "model-a", Some("gpt"), 50.0, 1.0),
+        fact("prov-b", "model-b", Some("claude"), 50.0, 2.0),
+        fact("prov-c", "model-c", Some("gemini"), 50.0, 3.0),
     ];
     // All three tiers name an available adequate route; the model tier wins.
     let selection = select_seat_route(
@@ -345,7 +345,7 @@ fn recommendation_tiers_apply_in_model_provider_family_order() {
             .recommendations(SeatRecommendations {
                 models: vec!["prov-c/model-c".to_string()],
                 providers: vec!["prov-b".to_string()],
-                families: vec!["fam-a".to_string()],
+                families: vec!["gpt".to_string()],
             })
             .build(),
     )
@@ -361,7 +361,7 @@ fn recommendation_tiers_apply_in_model_provider_family_order() {
             .recommendations(SeatRecommendations {
                 models: vec!["ghost/none".to_string()],
                 providers: vec!["prov-b".to_string()],
-                families: vec!["fam-a".to_string()],
+                families: vec!["gpt".to_string()],
             })
             .build(),
     )
@@ -376,8 +376,8 @@ fn recommendation_tiers_apply_in_model_provider_family_order() {
 #[test]
 fn recommendation_entries_are_ordered_preferences_within_a_tier() {
     let facts = vec![
-        fact("prov-a", "model-a", Some("fam-a"), 50.0, 1.0),
-        fact("prov-b", "model-b", Some("fam-b"), 50.0, 2.0),
+        fact("prov-a", "model-a", Some("gpt"), 50.0, 1.0),
+        fact("prov-b", "model-b", Some("claude"), 50.0, 2.0),
     ];
     // First declared entry is unavailable/inadequate → the second wins the
     // tier; entry order, not catalog order, decides.
@@ -400,8 +400,8 @@ fn recommendation_entries_are_ordered_preferences_within_a_tier() {
 #[test]
 fn inadequate_recommendation_falls_through_to_any_adequate_route() {
     let facts = vec![
-        fact("prov-a", "weak", Some("fam-a"), 30.0, 1.0),
-        fact("prov-b", "strong", Some("fam-b"), 50.0, 2.0),
+        fact("prov-a", "weak", Some("gpt"), 30.0, 1.0),
+        fact("prov-b", "strong", Some("claude"), 50.0, 2.0),
     ];
     // The recommended model exists and is available but is inadequate: a
     // recommendation is a preference, so routing continues over all adequate
@@ -426,12 +426,12 @@ fn diversity_prefers_family_absent_from_incumbents() {
     // Families A and B adequate; incumbents all map to A → seat routes to B,
     // even though the A route is cheaper.
     let facts = vec![
-        fact("prov-a", "model-a", Some("fam-a"), 50.0, 1.0),
-        fact("prov-b", "model-b", Some("fam-b"), 50.0, 10.0),
+        fact("prov-a", "model-a", Some("gpt"), 50.0, 1.0),
+        fact("prov-b", "model-b", Some("claude"), 50.0, 10.0),
     ];
     let selection = select_seat_route(
         InputBuilder::new(facts)
-            .incumbents(families(&["fam-a"]))
+            .incumbents(families(&["gpt"]))
             .build(),
     )
     .expect("route must select");
@@ -443,12 +443,12 @@ fn diversity_prefers_family_absent_from_incumbents() {
 fn diversity_is_preference_not_gate_when_only_incumbent_family_is_adequate() {
     // Only family A adequate; incumbents are A → seat A anyway.
     let facts = vec![
-        fact("prov-a", "model-a", Some("fam-a"), 50.0, 1.0),
-        fact("prov-b", "weak-b", Some("fam-b"), 30.0, 1.0),
+        fact("prov-a", "model-a", Some("gpt"), 50.0, 1.0),
+        fact("prov-b", "weak-b", Some("claude"), 30.0, 1.0),
     ];
     let selection = select_seat_route(
         InputBuilder::new(facts)
-            .incumbents(families(&["fam-a"]))
+            .incumbents(families(&["gpt"]))
             .build(),
     )
     .expect("fallback to incumbent family must select");
@@ -458,15 +458,15 @@ fn diversity_is_preference_not_gate_when_only_incumbent_family_is_adequate() {
 
 #[test]
 fn unknown_family_never_satisfies_the_diversity_preference() {
-    // The unlabeled route is cheaper, but an unknown family cannot count as
-    // "different from the incumbents"; the labeled fam-b route is preferred.
+    // An unknown family cannot establish diversity from the incumbents.
+    // The labeled Claude route is preferred despite its higher cost.
     let facts = vec![
         fact("prov-x", "unlabeled", None, 50.0, 1.0),
-        fact("prov-b", "model-b", Some("fam-b"), 50.0, 10.0),
+        fact("prov-b", "model-b", Some("claude"), 50.0, 10.0),
     ];
     let selection = select_seat_route(
         InputBuilder::new(facts)
-            .incumbents(families(&["fam-a"]))
+            .incumbents(families(&["gpt"]))
             .build(),
     )
     .expect("route must select");
@@ -481,16 +481,16 @@ fn unknown_family_route_remains_adequate_and_selectable() {
     // via the deterministic fallback.
     let facts = vec![
         fact("prov-x", "unlabeled", None, 50.0, 1.0),
-        fact("prov-a", "model-a", Some("fam-a"), 50.0, 10.0),
+        fact("prov-a", "model-a", Some("gpt"), 50.0, 10.0),
     ];
     let selection = select_seat_route(
         InputBuilder::new(facts)
-            .incumbents(families(&["fam-a"]))
+            .incumbents(families(&["gpt"]))
             .build(),
     )
     .expect("route must select");
-    // Neither candidate satisfies diversity (unlabeled cannot; fam-a matches
-    // the incumbents), so the cheapest adequate route wins the fallback.
+    // Neither candidate adds diversity: the unknown family proves nothing, and GPT matches.
+    // The deterministic fallback therefore chooses the cheapest adequate route.
     assert_eq!(selection.route_key, "prov-x/unlabeled");
     assert!(!selection.diversity_satisfied);
     assert_eq!(selection.grand_family_id, None);
@@ -508,7 +508,7 @@ fn all_family_facts_absent_is_deterministic_cost_order() {
     for _ in 0..3 {
         let selection = select_seat_route(
             InputBuilder::new(facts.clone())
-                .incumbents(families(&["fam-a"]))
+                .incumbents(families(&["gpt"]))
                 .build(),
         )
         .expect("route must select");
@@ -523,9 +523,9 @@ fn no_adequate_route_fails_with_no_selection() {
     // Available routes exist but none clears the gate → typed refusal, no
     // best-effort fallback, and therefore no invitation or session effect.
     let facts = vec![
-        fact("prov-top", "top", Some("fam-top"), 100.0, 3.0),
-        fact("prov-a", "weak-a", Some("fam-a"), 30.0, 1.0),
-        fact("prov-b", "weak-b", Some("fam-b"), 30.0, 2.0),
+        fact("prov-top", "top", Some("other"), 100.0, 3.0),
+        fact("prov-a", "weak-a", Some("gpt"), 30.0, 1.0),
+        fact("prov-b", "weak-b", Some("claude"), 30.0, 2.0),
     ];
     let snapshot = ModelRouteStateSnapshot {
         now: 1_000.0,
@@ -546,7 +546,7 @@ fn no_adequate_route_fails_with_no_selection() {
 
 #[test]
 fn empty_availability_fails_with_no_selection() {
-    let facts = vec![fact("prov-a", "model-a", Some("fam-a"), 50.0, 1.0)];
+    let facts = vec![fact("prov-a", "model-a", Some("gpt"), 50.0, 1.0)];
     let err = select_seat_route(InputBuilder::new(facts).available(HashSet::new()).build())
         .expect_err("nothing available must refuse");
     assert!(matches!(err, SeatRouteError::NoAdequateRoute { .. }));
@@ -557,8 +557,8 @@ fn deterministic_tie_breaks_follow_existing_cost_speed_route_key_chain() {
     // Equal cost and speed everywhere → the route-key lexicographic tail
     // decides, deterministically across repeated runs.
     let facts = vec![
-        fact("prov-b", "model", Some("fam-b"), 50.0, 5.0),
-        fact("prov-a", "model", Some("fam-a"), 50.0, 5.0),
+        fact("prov-b", "model", Some("claude"), 50.0, 5.0),
+        fact("prov-a", "model", Some("gpt"), 50.0, 5.0),
     ];
     for _ in 0..3 {
         let selection =
@@ -574,13 +574,13 @@ fn recommendation_lists_preserve_declared_order_end_to_end() {
     // Two adequate family-tier entries: the FIRST declared family wins even
     // though the second's route is cheaper: order is preference, not score.
     let facts = vec![
-        fact("prov-a", "model-a", Some("fam-a"), 50.0, 10.0),
-        fact("prov-b", "model-b", Some("fam-b"), 50.0, 1.0),
+        fact("prov-a", "model-a", Some("gpt"), 50.0, 10.0),
+        fact("prov-b", "model-b", Some("claude"), 50.0, 1.0),
     ];
     let selection = select_seat_route(
         InputBuilder::new(facts)
             .recommendations(SeatRecommendations {
-                families: vec!["fam-a".to_string(), "fam-b".to_string()],
+                families: vec!["gpt".to_string(), "claude".to_string()],
                 ..Default::default()
             })
             .build(),
@@ -589,7 +589,7 @@ fn recommendation_lists_preserve_declared_order_end_to_end() {
     assert_eq!(selection.route_key, "prov-a/model-a");
     let matched = selection.recommendation.expect("family tier matched");
     assert_eq!(matched.tier, SeatRecommendationTier::Family);
-    assert_eq!(matched.entry, "fam-a");
+    assert_eq!(matched.entry, "gpt");
 }
 
 #[test]
@@ -598,12 +598,12 @@ fn family_recommendations_use_the_canonical_fact_vocabulary() {
     // a malformed curated label (treated as absent) can never match.
     let facts = vec![
         fact("prov-a", "model-a", Some("Not Canonical"), 50.0, 1.0),
-        fact("prov-b", "model-b", Some("fam-b"), 50.0, 10.0),
+        fact("prov-b", "model-b", Some("claude"), 50.0, 10.0),
     ];
     let selection = select_seat_route(
         InputBuilder::new(facts)
             .recommendations(SeatRecommendations {
-                families: vec!["fam-b".to_string()],
+                families: vec!["claude".to_string()],
                 ..Default::default()
             })
             .build(),
@@ -616,9 +616,9 @@ fn family_recommendations_use_the_canonical_fact_vocabulary() {
 fn selection_reports_grand_family_for_prompt_variant_consumers() {
     // The routing result carries the same canonical family id the prompt
     // family selectors consume, so both surfaces share one vocabulary.
-    let facts = vec![fact("prov-b", "model-b", Some("fam-b"), 50.0, 1.0)];
+    let facts = vec![fact("prov-b", "model-b", Some("claude"), 50.0, 1.0)];
     let selection = select_seat_route(InputBuilder::new(facts).build()).expect("route must select");
-    assert_eq!(selection.grand_family_id.as_deref(), Some("fam-b"));
+    assert_eq!(selection.grand_family_id.as_deref(), Some("claude"));
     assert!(is_valid_grand_family_id(
         selection.grand_family_id.as_deref().unwrap()
     ));
@@ -626,9 +626,9 @@ fn selection_reports_grand_family_for_prompt_variant_consumers() {
 
 #[test]
 fn automatic_seat_routing_contains_fast_variant_with_catalogued_base() {
-    let mut base = fact("openai", "gpt-5.6-sol", Some("openai-gpt"), 60.0, 10.0);
+    let mut base = fact("openai", "gpt-5.6-sol", Some("gpt"), 60.0, 10.0);
     base.scores.speed = 50.0;
-    let mut fast = fact("openai", "gpt-5.6-sol-fast", Some("openai-gpt"), 60.0, 10.0);
+    let mut fast = fact("openai", "gpt-5.6-sol-fast", Some("gpt"), 60.0, 10.0);
     fast.scores.speed = 200.0;
 
     let selected = select_seat_route(InputBuilder::new(vec![base, fast]).build()).unwrap();
@@ -639,8 +639,8 @@ fn automatic_seat_routing_contains_fast_variant_with_catalogued_base() {
 
 #[test]
 fn exact_fast_variant_seat_pin_bypasses_automatic_containment() {
-    let base = fact("openai", "gpt-5.6-sol", Some("openai-gpt"), 60.0, 10.0);
-    let fast = fact("openai", "gpt-5.6-sol-fast", Some("openai-gpt"), 60.0, 20.0);
+    let base = fact("openai", "gpt-5.6-sol", Some("gpt"), 60.0, 10.0);
+    let fast = fact("openai", "gpt-5.6-sol-fast", Some("gpt"), 60.0, 20.0);
 
     let selected = select_seat_route(
         InputBuilder::new(vec![base, fast])

@@ -18,10 +18,11 @@ use std::time::SystemTime;
 
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
-    make_route_key, model_facts_seed, CatalogFactField, FactSource, FailureBackoffConfig,
-    ModelRoutingPolicyInput, RouteStateStore, RoutingConfig,
-    DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
+    make_capacity_key, make_route_key, model_facts_seed, CatalogFactField, FactSource,
+    FailureBackoffConfig, FamilySource, GrandFamily, ModelRoutingPolicyInput, RouteStateStore,
+    RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
 };
+use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
@@ -79,6 +80,8 @@ struct RoutingConfigFile {
     #[serde(default)]
     model_routing: ModelRoutingSection,
     #[serde(default)]
+    model_families: ModelFamilyRules,
+    #[serde(default)]
     aa: Option<AaSection>,
     #[serde(default)]
     catalog: CatalogSection,
@@ -88,6 +91,89 @@ struct RoutingConfigFile {
 struct CatalogSection {
     #[serde(default)]
     poll_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelFamilyRule {
+    family: GrandFamily,
+    globs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelFamilyRules(Vec<ModelFamilyRule>);
+
+impl Default for ModelFamilyRules {
+    fn default() -> Self {
+        let rules = [
+            (
+                GrandFamily::Claude,
+                &["*/claude-*", "anthropic/*", "google/antigravity-claude-*"][..],
+            ),
+            (
+                GrandFamily::Gpt,
+                &["openai/*", "*/gpt-*", "*/o1*", "*/o3*", "*/o4*"][..],
+            ),
+            (GrandFamily::Gemini, &["*/gemini-*", "google/*"][..]),
+            (GrandFamily::Grok, &["*/grok-*", "xai/*"][..]),
+            (GrandFamily::Qwen, &["*/qwen*", "alibaba-*/*"][..]),
+            (GrandFamily::Kimi, &["*/kimi*", "moonshotai/*"][..]),
+            (GrandFamily::Glm, &["*/glm-*", "zai/*"][..]),
+            (GrandFamily::Deepseek, &["*/deepseek-*", "deepseek/*"][..]),
+            (GrandFamily::Minimax, &["*/minimax-*", "minimax/*"][..]),
+            (GrandFamily::Mistral, &["*/mistral-*", "mistral/*"][..]),
+            (GrandFamily::Llama, &["*/llama-*", "meta/*"][..]),
+            (GrandFamily::Other, &["*"][..]),
+        ];
+        Self(
+            rules
+                .into_iter()
+                .map(|(family, globs)| ModelFamilyRule {
+                    family,
+                    globs: globs.iter().map(|glob| (*glob).to_string()).collect(),
+                })
+                .collect(),
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelFamilyRules {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RulesVisitor;
+
+        impl<'de> Visitor<'de> for RulesVisitor {
+            type Value = ModelFamilyRules;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an ordered map of grand-family ids to route globs")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut rules = Vec::new();
+                while let Some((wire_family, globs)) = map.next_entry::<String, Vec<String>>()? {
+                    let family = GrandFamily::from_wire(&wire_family).ok_or_else(|| {
+                        serde::de::Error::custom(format!(
+                            "unknown model_families key `{wire_family}`"
+                        ))
+                    })?;
+                    if globs.iter().any(|glob| glob.trim().is_empty()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "model_families.{wire_family} entries must be non-empty route globs"
+                        )));
+                    }
+                    rules.push(ModelFamilyRule { family, globs });
+                }
+                Ok(ModelFamilyRules(rules))
+            }
+        }
+
+        deserializer.deserialize_map(RulesVisitor)
+    }
 }
 
 /// Artificial Analysis ingest settings. Credential bytes stay in claustrum.
@@ -389,24 +475,136 @@ pub fn validate_min_best_effort_adequacy(raw: f64) -> Result<f64, String> {
     Ok(raw.clamp(0.0, 1.0))
 }
 
-/// Read the config file (if present) and reconcile model-fact overrides against the
-/// store. Missing file = a clean no-op. A parse error is returned so the caller can
-/// log it without aborting boot (routing degrades to the seed). Pure-ish: all
-/// effects go through the `RouteStateStore` trait, so it is testable with any store.
+/// Reconcile explicit overrides and the default family rules against the store.
+/// A missing file keeps catalog families complete while adding no explicit override.
 pub fn apply_overrides_from_config<S: RouteStateStore>(
     store: &S,
     path: &std::path::Path,
 ) -> Result<OverrideOutcome, String> {
+    let config = read_routing_config(path)?.unwrap_or_default();
+    let outcome = apply_overrides(store, &config.model_routing.models)?;
+    apply_family_rules(store, &config.model_families, &config.model_routing.models)?;
+    Ok(outcome)
+}
+
+fn read_routing_config(path: &Path) -> Result<Option<RoutingConfigFile>, String> {
     let doc = match std::fs::read_to_string(path) {
-        Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(OverrideOutcome::default()),
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
     };
-    let json =
-        jsonc_to_json(&doc).map_err(|m| format!("invalid jsonc in {}: {m}", path.display()))?;
-    let config: RoutingConfigFile = serde_json::from_str(&json)
-        .map_err(|e| format!("invalid config in {}: {e}", path.display()))?;
-    apply_overrides(store, &config.model_routing.models)
+    let json = jsonc_to_json(&doc)
+        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|error| format!("invalid config in {}: {error}", path.display()))
+}
+
+pub(crate) fn apply_family_rules_from_config<S: RouteStateStore>(
+    store: &S,
+    path: &Path,
+) -> Result<usize, String> {
+    let config = read_routing_config(path)?.unwrap_or_default();
+    apply_family_rules(store, &config.model_families, &config.model_routing.models)
+}
+
+fn glob_matches(pattern: &str, candidate: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let candidate = candidate.as_bytes();
+    let mut previous = vec![false; candidate.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut next = vec![false; candidate.len() + 1];
+        if *token == b'*' {
+            next[0] = previous[0];
+            for index in 1..=candidate.len() {
+                next[index] = previous[index] || next[index - 1];
+            }
+        } else {
+            for index in 1..=candidate.len() {
+                next[index] =
+                    previous[index - 1] && (*token == b'?' || *token == candidate[index - 1]);
+            }
+        }
+        previous = next;
+    }
+    previous[candidate.len()]
+}
+
+fn matching_family(rules: &ModelFamilyRules, route_key: &str) -> Option<GrandFamily> {
+    rules.0.iter().find_map(|rule| {
+        rule.globs
+            .iter()
+            .any(|glob| glob_matches(glob, route_key))
+            .then_some(rule.family)
+    })
+}
+
+fn apply_family_rules<S: RouteStateStore>(
+    store: &S,
+    rules: &ModelFamilyRules,
+    overrides: &HashMap<String, ModelFactOverride>,
+) -> Result<usize, String> {
+    let mut explicit = HashMap::new();
+    for (key, model_override) in overrides {
+        let Some(family) = &model_override.family else {
+            continue;
+        };
+        let Some((provider_id, model_id, variant)) = parse_model_key(key) else {
+            continue;
+        };
+        let family = family
+            .as_deref()
+            .map(|wire| {
+                GrandFamily::from_wire(wire).ok_or_else(|| {
+                    format!("model_routing.models.{key}.family has unknown value `{wire}`")
+                })
+            })
+            .transpose()?;
+        explicit.insert(
+            make_route_key(&provider_id, &model_id, variant.as_deref()),
+            family,
+        );
+    }
+
+    let facts = store
+        .get_facts()
+        .map_err(|error| format!("listing model families: {error}"))?;
+    let mut updated = 0;
+    for fact in facts {
+        let route_key = make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
+        let (family, source) = if let Some(family) = explicit.get(&route_key) {
+            (*family, FamilySource::Override)
+        } else {
+            let capacity_key = make_capacity_key(&fact.provider_id, &fact.model_id);
+            if let Some(family) = matching_family(rules, &capacity_key) {
+                (Some(family), FamilySource::Rule)
+            } else {
+                let current = store
+                    .get_model_family(&route_key)
+                    .map_err(|error| format!("reading model family {route_key}: {error}"))?;
+                match current {
+                    Some((_, FamilySource::Rule)) => (None, FamilySource::Absent),
+                    Some((_, FamilySource::Override)) => {
+                        let restored = fact.family.as_deref().and_then(GrandFamily::from_wire);
+                        let source = if restored.is_some() {
+                            FamilySource::Curated
+                        } else {
+                            FamilySource::Absent
+                        };
+                        (restored, source)
+                    }
+                    Some((family, source)) => (family, source),
+                    None => continue,
+                }
+            }
+        };
+        store
+            .set_model_family(&route_key, family, source)
+            .map_err(|error| format!("writing model family {route_key}: {error}"))?;
+        updated += 1;
+    }
+    Ok(updated)
 }
 
 /// Read `min_best_effort_adequacy` from the routing config file, validating and
@@ -1013,6 +1211,8 @@ fn apply_overrides<S: RouteStateStore>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     /// SUBSCRIPTION_MULTIPLIERS in model_facts is one process-global map that
@@ -1111,11 +1311,107 @@ mod tests {
         );
         let cleared: ModelFactOverride = serde_json::from_str(r#"{"family":null}"#).unwrap();
         assert_eq!(merge_override(&base, &cleared).family, None);
-        let set: ModelFactOverride = serde_json::from_str(r#"{"family":"new-lineage"}"#).unwrap();
+        let set: ModelFactOverride = serde_json::from_str(r#"{"family":"gpt"}"#).unwrap();
+        assert_eq!(merge_override(&base, &set).family.as_deref(), Some("gpt"));
+    }
+
+    fn family_rule_rig(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        prefrontal_routing_store::SqliteRouteStateStore,
+    ) {
+        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "prefrontal-routing-family-rules-{label}-{}-{timestamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("store.sqlite");
+        let config_path = root.join("alfonso-routing.jsonc");
+        let descriptor = dev_descriptor(label, db_path.to_string_lossy().into_owned());
+        (
+            root,
+            config_path,
+            SqliteRouteStateStore::open(&descriptor).unwrap(),
+        )
+    }
+
+    #[test]
+    fn explicit_family_override_beats_matching_rule() {
+        let _guard = multiplier_map_guard();
+        let (root, config_path, store) = family_rule_rig("override-wins");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "model_families": { "gpt": ["openai/*"] },
+                "model_routing": {
+                    "models": { "openai/gpt-5.4": { "family": "other" } }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        apply_overrides_from_config(&store, &config_path).unwrap();
         assert_eq!(
-            merge_override(&base, &set).family.as_deref(),
-            Some("new-lineage")
+            store.get_model_family("openai/gpt-5.4").unwrap(),
+            Some((Some(GrandFamily::Other), FamilySource::Override))
         );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn family_glob_order_uses_the_first_written_match() {
+        let _guard = multiplier_map_guard();
+        let (root, config_path, store) = family_rule_rig("first-match");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "model_families": {
+                    "other": ["google/*"],
+                    "claude": ["google/antigravity-claude-*"]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        apply_overrides_from_config(&store, &config_path).unwrap();
+        assert_eq!(
+            store
+                .get_model_family("google/antigravity-claude-opus-4-6-thinking")
+                .unwrap(),
+            Some((Some(GrandFamily::Other), FamilySource::Rule))
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn example_family_rules_cover_every_seed_catalog_row() {
+        let _guard = multiplier_map_guard();
+        let (root, _config_path, store) = family_rule_rig("example-coverage");
+        let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/alfonso-routing.example.jsonc");
+        apply_overrides_from_config(&store, &example).unwrap();
+        let facts = store.get_facts().unwrap();
+        let absent = facts.iter().filter(|fact| fact.family.is_none()).count();
+        assert_eq!(
+            absent, 0,
+            "the shipped catch-all must cover new catalog rows"
+        );
+        let mut counts = BTreeMap::<String, usize>::new();
+        for fact in facts {
+            *counts.entry(fact.family.unwrap()).or_default() += 1;
+        }
+        eprintln!("example model-family counts: {counts:?}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

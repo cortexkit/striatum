@@ -49,8 +49,9 @@ pub use launch_policy::{
 };
 pub use model_facts::{
     derive_provider_key, fact_to_route, is_valid_grand_family_id, make_capacity_key,
-    make_route_key, Confidence, ModelFact, ModelMetric, ModelPromptDefaults, ModelRequirements,
-    ModelRoute, ModelScores, ReasoningEffort, ScoreProvenance, MODEL_METRICS,
+    make_route_key, normalize_grand_family_id, Confidence, FamilySource, GrandFamily, ModelFact,
+    ModelMetric, ModelPromptDefaults, ModelRequirements, ModelRoute, ModelScores, ReasoningEffort,
+    ScoreProvenance, GRAND_FAMILY_NORMALIZATIONS, MODEL_METRICS,
 };
 pub use model_facts_seed::model_facts_seed;
 pub use model_router::{

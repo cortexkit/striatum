@@ -573,11 +573,16 @@ async fn bootstrap_cycle<C: CatalogWire>(
     client: &mut C,
     store: &SqliteRouteStateStore,
     health: &SharedCatalogHealth,
+    family_config_path: Option<&Path>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let snapshot = client.catalog_get().await?;
     store
         .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
         .map_err(|reason| error(format!("apply catalog.get: {reason}")))?;
+    if let Some(path) = family_config_path {
+        crate::config_overrides::apply_family_rules_from_config(store, path)
+            .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
+    }
     if let Ok(mut health) = health.lock() {
         health.note_reached(now_ms());
     }
@@ -589,6 +594,7 @@ async fn poll_cycle<C: CatalogWire>(
     client: &mut C,
     store: &SqliteRouteStateStore,
     health: &SharedCatalogHealth,
+    family_config_path: Option<&Path>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let status = client.catalog_status().await?;
     if let Ok(mut health) = health.lock() {
@@ -605,6 +611,10 @@ async fn poll_cycle<C: CatalogWire>(
         store
             .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
             .map_err(|reason| error(format!("apply catalog replay: {reason}")))?;
+        if let Some(path) = family_config_path {
+            crate::config_overrides::apply_family_rules_from_config(store, path)
+                .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
+        }
         1
     } else {
         0
@@ -623,14 +633,18 @@ pub async fn catalog_refresh_loop(
     let _ = std::fs::create_dir_all(&project_root);
     let mut bootstrapped = false;
     let mut last_logged_error: Option<String> = None;
+    let family_config_path = crate::config_overrides::config_path();
     loop {
-        let result = match FusiformCatalogConsumer::connect(&connection_file_path, &project_root)
-            .await
-        {
-            Ok(mut consumer) if bootstrapped => poll_cycle(&mut consumer, &store, &health).await,
-            Ok(mut consumer) => bootstrap_cycle(&mut consumer, &store, &health).await,
-            Err(reason) => Err(reason),
-        };
+        let result =
+            match FusiformCatalogConsumer::connect(&connection_file_path, &project_root).await {
+                Ok(mut consumer) if bootstrapped => {
+                    poll_cycle(&mut consumer, &store, &health, Some(&family_config_path)).await
+                }
+                Ok(mut consumer) => {
+                    bootstrap_cycle(&mut consumer, &store, &health, Some(&family_config_path)).await
+                }
+                Err(reason) => Err(reason),
+            };
         match result {
             Ok(_) => {
                 bootstrapped = true;
@@ -903,7 +917,9 @@ mod tests {
             get_calls: 0,
             closed: false,
         };
-        let outcome = poll_cycle(&mut unchanged, &store, &health).await.unwrap();
+        let outcome = poll_cycle(&mut unchanged, &store, &health, None)
+            .await
+            .unwrap();
         assert_eq!(outcome.get_calls, 0);
         assert_eq!(unchanged.get_calls, 0);
         assert!(unchanged.closed);
@@ -916,7 +932,9 @@ mod tests {
             get_calls: 0,
             closed: false,
         };
-        let outcome = poll_cycle(&mut advanced, &store, &health).await.unwrap();
+        let outcome = poll_cycle(&mut advanced, &store, &health, None)
+            .await
+            .unwrap();
         assert_eq!(outcome.get_calls, 1);
         assert_eq!(advanced.get_calls, 1);
         assert!(advanced.closed);
@@ -946,7 +964,9 @@ mod tests {
             get_calls: 0,
             closed: false,
         };
-        bootstrap_cycle(&mut wire, &store, &health).await.unwrap();
+        bootstrap_cycle(&mut wire, &store, &health, None)
+            .await
+            .unwrap();
         assert_eq!(
             health.lock().unwrap().snapshot(now_ms())["reach"],
             "reached"

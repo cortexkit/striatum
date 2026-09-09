@@ -1716,19 +1716,44 @@ async fn handle_model_fact(
     };
     let route_key = make_route_key(&params.provider_id, &params.model_id, None);
     let result = match store.get_fact_by_route_key(&route_key) {
-        Ok(Some(fact)) => json!({
-            "known": true,
-            // Capability reads preserve an absent flag as cannot-verify. Routing admission
-            // remains conservative in its own path and may treat the same absence as no.
-            "supportsVision": fact.supports_vision,
-            // The provider's own output ceiling, so a caller that PINS this route (the
-            // consult synthesizer pin) can size its send to the pinned model instead of
-            // inheriting another member's cap; absent when the catalog does not know it.
-            "maxOutputTokens": fact.max_output_tokens,
-        }),
+        Ok(Some(fact)) => {
+            let (family, family_source) = match store.get_model_family(&route_key) {
+                Ok(Some(family)) => family,
+                Ok(None) => (None, prefrontal_routing_core::FamilySource::Absent),
+                Err(error) => {
+                    return send_route_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "store_error",
+                        &format!("model_fact family: {error}"),
+                    )
+                    .await;
+                }
+            };
+            json!({
+                "known": true,
+                // Capability reads preserve an absent flag as cannot-verify. Routing admission
+                // remains conservative in its own path and may treat the same absence as no.
+                "supportsVision": fact.supports_vision,
+                // The provider's own output ceiling lets pinned callers size the send for
+                // this exact route instead of inheriting another panel member's limit.
+                "maxOutputTokens": fact.max_output_tokens,
+                "family": family.map(prefrontal_routing_core::GrandFamily::as_str),
+                "familySource": family_source.as_str(),
+            })
+        }
         Ok(None) => {
             warn_missing_session_model_once(&params.provider_id, &params.model_id);
-            json!({ "known": false, "supportsVision": null, "maxOutputTokens": null })
+            json!({
+                "known": false,
+                "supportsVision": null,
+                "maxOutputTokens": null,
+                "family": null,
+                "familySource": "absent"
+            })
         }
         Err(error) => {
             return send_route_error(
@@ -4220,7 +4245,13 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(
             body["result"],
-            json!({ "known": true, "supportsVision": true, "maxOutputTokens": 64000 }),
+            json!({
+                "known": true,
+                "supportsVision": true,
+                "maxOutputTokens": 64000,
+                "family": "claude",
+                "familySource": "curated"
+            }),
             "the reply carries the catalog's own output ceiling so a caller that pins this route can size its send to it"
         );
     }
