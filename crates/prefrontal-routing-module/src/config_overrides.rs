@@ -116,7 +116,10 @@ impl Default for ModelFamilyRules {
             (GrandFamily::Gemini, &["*/gemini-*", "google/*"][..]),
             (GrandFamily::Grok, &["*/grok-*", "xai/*"][..]),
             (GrandFamily::Qwen, &["*/qwen*", "alibaba-*/*"][..]),
-            (GrandFamily::Kimi, &["*/kimi*", "moonshotai/*"][..]),
+            (
+                GrandFamily::Kimi,
+                &["*/kimi*", "moonshotai/*", "kimi-for-coding/*"][..],
+            ),
             (GrandFamily::Glm, &["*/glm-*", "zai/*"][..]),
             (GrandFamily::Deepseek, &["*/deepseek-*", "deepseek/*"][..]),
             (GrandFamily::Minimax, &["*/minimax-*", "minimax/*"][..]),
