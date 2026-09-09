@@ -554,6 +554,19 @@ fn normalized_speed(speed: f64) -> f64 {
 /// explanation carries the effective price, the list price, the multiplier when it
 /// is not 1.0, and whether the route is subscription-covered, so a reader can tell
 /// "cheap because subsidized" from "cheap because it is a cheap model".
+/// The selection cost of a route. An unpublished price under a subscription plan is
+/// a zero marginal token cost: the plan is the operator's own business fact, and
+/// the catalog (models.dev via Fusiform) publishes no per-token rate for
+/// subscription planes such as ollama-cloud at all. Ranking those routes at the
+/// maximum priced every glm, deepseek, and kimi route on the plan above sol. An
+/// unpublished price under a metered provider still ranks at the maximum.
+pub(crate) fn selection_cost(fact: &ModelFact, is_subscription: bool) -> f64 {
+    if is_subscription && fact.cost_per_m_tok_out.is_none() && fact.cost_tier.is_none() {
+        return 0.0;
+    }
+    normalized_metered_cost(fact)
+}
+
 pub(crate) fn compute_objective(
     route: &ModelRoute,
     runtime: &RouteRuntimeState,
@@ -561,7 +574,7 @@ pub(crate) fn compute_objective(
 ) -> (ObjectiveBreakdown, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
 
-    let cost = normalized_metered_cost(&route.fact);
+    let cost = selection_cost(&route.fact, is_subscription);
     let multiplier = subscription_multiplier(&route.fact);
     let coverage = if is_subscription {
         "subscription-covered"
@@ -582,11 +595,13 @@ pub(crate) fn compute_objective(
         detail
     } else if let Some(tier) = route.fact.cost_tier {
         format!("tier {}, {coverage}", fmt_num(tier))
+    } else if is_subscription {
+        "price unpublished, subscription plan: marginal token cost zero".to_string()
     } else {
-        // An unpriced route is ranked at the MAXIMUM cost (see
-        // `normalized_metered_cost`), never as free. Say so on the line: a route
-        // losing every cost comparison because nobody knows its price looks
-        // identical to one losing because it is genuinely expensive.
+        // An unpriced metered route is ranked at the MAXIMUM cost (see
+        // `selection_cost`), never as free. Say so on the line: a route losing
+        // every cost comparison because nobody knows its price looks identical
+        // to one losing because it is genuinely expensive.
         format!("price unknown (ranked as max), {coverage}")
     };
     notes.push(format!("cost +{cost:.2} ({detail})"));

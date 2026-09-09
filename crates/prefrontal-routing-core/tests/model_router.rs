@@ -1277,6 +1277,56 @@ fn unknown_price_normalizes_to_maximum_cost() {
     );
 }
 
+/// A subscription plane publishes no per-token rate (ollama-cloud in Fusiform holds
+/// existence, limits, and capabilities only), so an unpriced route on a plan the
+/// operator pays for costs zero and beats a cheap metered route on the same demand;
+/// the same unpriced fact on a metered provider still ranks at the maximum.
+#[test]
+fn unpublished_price_on_a_subscription_plan_is_zero_marginal_cost() {
+    let plan = fact(FactBuilder {
+        provider_id: "ollama-cloud".into(),
+        model_id: "glm-5.3-flash".into(),
+        scores: scores(55.0, 1610.0, 60.0),
+        ..Default::default()
+    });
+    let metered = fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "sol".into(),
+        scores: scores(55.0, 1838.0, 60.0),
+        // Above the effectively-free bucket, so cost decides ahead of adequacy.
+        cost_per_m_tok_out: Some(6.0),
+        ..Default::default()
+    });
+    let r = select_model_route(input(
+        vec![plan.clone(), metered],
+        req(40.0, 0.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|route: &ModelRoute| {
+                route.fact.provider_id == "ollama-cloud"
+            })),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(r.route_key, "ollama-cloud/glm-5.3-flash");
+    assert!(
+        (r.score.objective.cost - 0.0).abs() < 1e-9,
+        "{}",
+        r.score.objective.cost
+    );
+    assert!(
+        r.explanation
+            .join("\n")
+            .contains("subscription plan: marginal token cost zero"),
+        "{}",
+        r.explanation.join("\n")
+    );
+
+    let metered_unpriced =
+        select_model_route(input(vec![plan], req(40.0, 0.0), Extra::default())).unwrap();
+    assert!((metered_unpriced.score.objective.cost - 1.0).abs() < 1e-9);
+}
+
 #[test]
 fn explanation_carries_effective_list_multiplier_and_coverage() {
     let mut route = fact(FactBuilder {
