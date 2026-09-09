@@ -2051,12 +2051,18 @@ impl RouteStateStore for SqliteRouteStateStore {
                         },
                     )
                     .optional()?;
+                // The operator's one clear verb lifts every route-level wall, not only
+                // the failure streak: a cooldown or quota horizon written from a
+                // misread error (a stack-frame offset read as a status code, a Bun
+                // chunk hash read as hours) has no other exit before it expires.
                 if prior.is_some() {
                     tx.execute(
                         "UPDATE model_route_state
                          SET consecutive_terminal_failures = 0,
                              failure_backoff_until = NULL,
                              failure_backoff_reason = NULL,
+                             cooldown_until = NULL,
+                             quota_exhausted_until = NULL,
                              updated_at = ?1
                          WHERE route_key = ?2",
                         params![now_ms(), route_key],
@@ -2411,8 +2417,8 @@ mod tests {
                     "INSERT INTO model_route_state (
                        route_key, capacity_key, provider_id, model_id, updated_at,
                        consecutive_terminal_failures, failure_backoff_until,
-                       failure_backoff_reason
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                       failure_backoff_reason, cooldown_until, quota_exhausted_until
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         "test-provider/test-model",
                         "test-provider/test-model",
@@ -2421,7 +2427,10 @@ mod tests {
                         1_i64,
                         3_i64,
                         1_000_i64,
-                        "consecutive terminal send failures: 3"
+                        "consecutive terminal send failures: 3",
+                        // A 17-day wall, the shape a misread stack trace once wrote.
+                        1_500_000_000_000_i64,
+                        1_500_000_000_000_i64
                     ],
                 )
             })
@@ -2437,19 +2446,27 @@ mod tests {
                 failure_backoff_reason: Some("consecutive terminal send failures: 3".into()),
             })
         );
-        let after: (i64, Option<f64>, Option<String>) = store
+        let after: (i64, Option<f64>, Option<String>, Option<f64>, Option<f64>) = store
             .store
             .with_conn(|connection| {
                 connection.query_row(
                     "SELECT consecutive_terminal_failures, failure_backoff_until,
-                            failure_backoff_reason
+                            failure_backoff_reason, cooldown_until, quota_exhausted_until
                      FROM model_route_state WHERE route_key = ?1",
                     ["test-provider/test-model"],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
             })
             .unwrap();
-        assert_eq!(after, (0, None, None));
+        assert_eq!(after, (0, None, None, None, None));
         drop(store);
 
         let _ = std::fs::remove_file(&path);
