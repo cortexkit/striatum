@@ -37,9 +37,16 @@ pub struct AdequacyScore {
 
 impl AdequacyScore {
     /// Whether the route clears the normal adequacy gate. Fit remains a ratio,
-    /// so a route may clear while slightly below one component's exact bar.
+    /// so a route may clear while slightly below one component's exact bar, but
+    /// every demanded metric must clear the floor on its own: the blended
+    /// adequacy is a requirement-weighted mean, and a mean lets an easy eq
+    /// demand lift a route whose elo fit is below the floor (on 2026-09-10 a
+    /// 1710-elo model cleared an iq-100 bar of 1902 at blended 0.92 because its
+    /// eq fit was 1.0, and took a hunter the demand had priced for the top model).
     pub fn clears_adequacy_floor(&self) -> bool {
-        self.capability_only || self.adequacy >= ADEQUACY_FLOOR
+        self.capability_only
+            || (self.adequacy >= ADEQUACY_FLOOR
+                && self.metrics.values().all(|fit| fit.fit >= ADEQUACY_FLOOR))
     }
 }
 
@@ -131,5 +138,50 @@ fn fmt_num(n: f64) -> String {
         format!("{}", n as i64)
     } else {
         format!("{}", n)
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn score(fits: &[(ModelMetric, f64, f64)]) -> AdequacyScore {
+        let mut metrics = BTreeMap::new();
+        let mut numerator = 0.0;
+        let mut denominator = 0.0;
+        for (metric, requirement, fit) in fits {
+            numerator += fit * requirement;
+            denominator += requirement;
+            metrics.insert(
+                *metric,
+                MetricFit {
+                    requirement: *requirement,
+                    fact: 0.0,
+                    target: 0.0,
+                    fit: *fit,
+                },
+            );
+        }
+        AdequacyScore {
+            adequacy: numerator / denominator,
+            raw_adequacy: numerator / denominator,
+            metrics,
+            capability_only: false,
+            explanation: Vec::new(),
+        }
+    }
+
+    /// The live specimen: elo fit 0.899 (1710 against an iq-100 bar of 1902) and
+    /// eq fit 1.0 blend to 0.92, above the floor; the elo shortfall alone must
+    /// refuse the route.
+    #[test]
+    fn a_metric_below_the_floor_is_not_papered_over_by_the_blend() {
+        let specimen = score(&[(ModelMetric::Elo, 100.0, 0.899), (ModelMetric::Eq, 30.0, 1.0)]);
+        assert!(specimen.adequacy > ADEQUACY_FLOOR, "the blend clears on its own");
+        assert!(!specimen.clears_adequacy_floor());
+
+        let both_clear = score(&[(ModelMetric::Elo, 100.0, 0.95), (ModelMetric::Eq, 30.0, 1.0)]);
+        assert!(both_clear.clears_adequacy_floor());
     }
 }
