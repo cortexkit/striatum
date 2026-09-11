@@ -15,6 +15,7 @@
 //! module runs the pure `prefrontal-routing-core` scorer and returns the selection.
 
 mod aa_ingest;
+mod available_models_text;
 mod config_overrides;
 mod fusiform_catalog;
 mod quota_consumer;
@@ -2118,6 +2119,9 @@ async fn handle_select_request(
     if envelope.method == ROUTE_MODEL_FACTS_OP {
         return handle_model_facts(frame, writer, store, operator_config_path).await;
     }
+    if envelope.method == available_models_text::OP {
+        return available_models_text::handle(frame, writer, store, operator_config_path).await;
+    }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         return handle_model_upsert(frame, writer, store).await;
     }
@@ -3663,6 +3667,7 @@ fn handles(method: &str) -> bool {
             | ROUTE_RESOLVE_POLICY_OP
             | ROUTE_MODEL_FACT_OP
             | ROUTE_MODEL_FACTS_OP
+            | available_models_text::OP
             | ROUTE_MODEL_UPSERT_OP
             | ROUTE_MODEL_SEED_AA_OP
             | ROUTE_LIST_INFERRED_OP
@@ -3728,6 +3733,11 @@ fn manifest(module_id: &str) -> ModuleManifest {
             },
             ManagementOperation {
                 name: ROUTE_MODEL_FACTS_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: available_models_text::OP.to_string(),
                 kind: ManagementOperationKind::Query,
                 description: None,
             },
@@ -6097,6 +6107,45 @@ mod tests {
             Some(12.0)
         );
         assert!(!retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+    }
+
+    #[tokio::test]
+    async fn routing_available_models_text_is_a_query_served_by_its_dispatch_arm() {
+        let rig = Rig::new("available-models-wire");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("wireco", "model"), FactSource::Seed)
+            .unwrap();
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": available_models_text::OP,
+                "params": {
+                    "availableModels": ["wireco/model"],
+                    "subscriptionEntries": [],
+                    "providerAuthTypes": {}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(body["result"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("wireco/model") && text.contains("← recommended")));
+
+        let routing_manifest = manifest(DEFAULT_MODULE_ID);
+        let operation = routing_manifest
+            .provides
+            .iter()
+            .find_map(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => operations
+                    .iter()
+                    .find(|operation| operation.name == available_models_text::OP),
+                _ => None,
+            })
+            .expect("available models text operation is advertised");
+        assert_eq!(operation.kind, ManagementOperationKind::Query);
     }
 
     #[test]
