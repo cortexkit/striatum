@@ -51,6 +51,16 @@ const WINDOW_SLOTS: [&str; 3] = ["primary", "secondary", "tertiary"];
 
 /// Parse an RFC3339/ISO-8601 timestamp to ms epoch, mirroring JS `Date.parse`.
 /// Returns `None` when the provider omitted or malformed the recovery time.
+/// Ms epoch of the source's observation time, when the producer published one.
+pub fn fetched_at_ms(entry: &ProviderUsage) -> Option<u64> {
+    entry
+        .fetched_at
+        .as_deref()
+        .and_then(chrono_parse_rfc3339)
+        .filter(|ms| ms.is_finite() && *ms >= 0.0)
+        .map(|ms| ms as u64)
+}
+
 fn parse_resets_at(s: &str) -> Option<f64> {
     // The wire emits RFC3339 (what the quota module serializes); chrono via the
     // `time`-free path isn't a dep here, so parse the common shape directly.
@@ -361,6 +371,7 @@ mod tests {
     fn aggregate_extractor_emits_account_windows() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "codex".into(),
             account: None,
@@ -390,6 +401,7 @@ mod tests {
         // an exhausted weekly window to omit resetsAt.
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "ollama".into(),
             account: None,
@@ -421,6 +433,7 @@ mod tests {
     fn idle_no_reset_window_stays_skipped() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "ollama".into(),
             account: None,
@@ -448,6 +461,7 @@ mod tests {
     fn malformed_reset_does_not_hide_burning_window() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "ollama".into(),
             account: None,
@@ -474,6 +488,7 @@ mod tests {
     fn antigravity_maps_extra_windows_to_capacity_keys_and_skips_unmatched() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
@@ -547,6 +562,7 @@ mod tests {
         // rather than the whole entry being dropped.
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
@@ -608,6 +624,7 @@ mod tests {
         // be read as the hazard being handled.
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: Some("google".into()),
             provider: "gemini".into(),
             account: None,
@@ -659,6 +676,7 @@ mod tests {
         // both are live on the same host in the same week.
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
@@ -727,6 +745,7 @@ mod tests {
     fn antigravity_with_no_extras_emits_nothing() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "antigravity".into(),
             account: None,

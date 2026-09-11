@@ -307,7 +307,13 @@ fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observ
                 .clone()
                 .filter(|slug| !slug.is_empty())
                 .unwrap_or_else(|| entry.provider.clone());
-            (key, observed_at_ms)
+            // The source's own observation time bounds freshness when it is
+            // published; a producer that omits it keeps the poll time. Never
+            // later than the poll: a source clock ahead of ours cannot mint
+            // freshness we did not observe.
+            let observed = prefrontal_routing_core::fetched_at_ms(entry)
+                .map_or(observed_at_ms, |fetched| fetched.min(observed_at_ms));
+            (key, observed)
         })
         .collect();
     merge_quota_windows(&mut cache.windows, fresh, &mut cache.retained_degraded_keys);
@@ -4654,6 +4660,50 @@ mod tests {
             cache.provider_observed_at_ms.get("balance-provider"),
             Some(&10),
             "pool-only entries are successful quota observations, not degraded usage={{}}"
+        );
+    }
+
+    /// The upgrade gate reads this map against QUOTA_FRESH_FOR_UPGRADE_MS. A
+    /// cache-served reading whose source time lags the poll by more than the
+    /// horizon must not be admitted as fresh; an entry without fetchedAt keeps
+    /// the poll time (older producers).
+    #[test]
+    fn quota_freshness_is_bounded_by_the_sources_fetched_at() {
+        let mut cache = QuotaCache::default();
+        // Poll at 2026-09-11T15:00:00Z plus 194 s; the source observed at 15:00:00Z.
+        let poll_ms: u64 = 1_789_138_800_000 + 194_000;
+        let lagging = usage(serde_json::json!({
+            "provider": "antigravity",
+            "fetchedAt": "2026-09-11T15:00:00Z",
+            "usage": { "primary": { "usedPercent": 6.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }));
+        let unstamped = usage(serde_json::json!({
+            "provider": "codex",
+            "usage": { "primary": { "usedPercent": 24.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }));
+        let ahead = usage(serde_json::json!({
+            "provider": "gemini",
+            "fetchedAt": "2026-09-11T15:10:00Z",
+            "usage": { "primary": { "usedPercent": 1.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        }));
+
+        apply_quota_refresh(&mut cache, vec![lagging, unstamped, ahead], poll_ms);
+
+        let observed = |name: &str| *cache.provider_observed_at_ms.get(name).unwrap();
+        assert_eq!(observed("antigravity"), 1_789_138_800_000);
+        assert!(
+            poll_ms - observed("antigravity") > QUOTA_FRESH_FOR_UPGRADE_MS,
+            "a reading 194 s old at the source is outside the 180 s upgrade horizon"
+        );
+        assert_eq!(
+            observed("codex"),
+            poll_ms,
+            "no fetchedAt keeps the poll time"
+        );
+        assert_eq!(
+            observed("gemini"),
+            poll_ms,
+            "a source clock ahead of ours cannot mint freshness"
         );
     }
 

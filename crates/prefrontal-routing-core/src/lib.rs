@@ -77,7 +77,7 @@ pub use quota::{
     NO_RESET_REPROBE_HORIZON_MS,
 };
 pub use quota_extract::{
-    extract_windows, match_capacity_key_by_title, ExtractedWindow, WindowScopeKind,
+    extract_windows, fetched_at_ms, match_capacity_key_by_title, ExtractedWindow, WindowScopeKind,
 };
 pub use quota_pace::{
     clamp01, project_quota_pressure, smoothstep, PaceConfig, PaceError, PaceInput, PaceReason,

@@ -198,6 +198,12 @@ pub struct ProviderUsage {
     /// discloses that it is happening so consumers can price the aging.
     #[serde(default)]
     pub stale: Option<StaleDisclosure>,
+    /// When the SOURCE observed this reading (RFC3339), not when the producer
+    /// answered the poll. A cache-served lane (antigravity) can be healthy,
+    /// undisclosed, and minutes old at once; freshness that stamps poll time
+    /// would call it current. Absent on older producers.
+    #[serde(default)]
+    pub fetched_at: Option<String>,
 }
 
 /// Why a preserved reading is aging: `since` stamps the first failed refresh
