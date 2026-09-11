@@ -51,6 +51,16 @@ const WINDOW_SLOTS: [&str; 3] = ["primary", "secondary", "tertiary"];
 
 /// Parse an RFC3339/ISO-8601 timestamp to ms epoch, mirroring JS `Date.parse`.
 /// Returns `None` when the provider omitted or malformed the recovery time.
+/// Ms epoch of the source's observation time, when the producer published one.
+pub fn fetched_at_ms(entry: &ProviderUsage) -> Option<u64> {
+    entry
+        .fetched_at
+        .as_deref()
+        .and_then(chrono_parse_rfc3339)
+        .filter(|ms| ms.is_finite() && *ms >= 0.0)
+        .map(|ms| ms as u64)
+}
+
 fn parse_resets_at(s: &str) -> Option<f64> {
     // The wire emits RFC3339 (what the quota module serializes); chrono via the
     // `time`-free path isn't a dep here, so parse the common shape directly.
