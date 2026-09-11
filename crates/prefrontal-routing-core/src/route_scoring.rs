@@ -177,11 +177,20 @@ mod floor_tests {
     /// refuse the route.
     #[test]
     fn a_metric_below_the_floor_is_not_papered_over_by_the_blend() {
-        let specimen = score(&[(ModelMetric::Elo, 100.0, 0.899), (ModelMetric::Eq, 30.0, 1.0)]);
-        assert!(specimen.adequacy > ADEQUACY_FLOOR, "the blend clears on its own");
+        let specimen = score(&[
+            (ModelMetric::Elo, 100.0, 0.899),
+            (ModelMetric::Eq, 30.0, 1.0),
+        ]);
+        assert!(
+            specimen.adequacy > ADEQUACY_FLOOR,
+            "the blend clears on its own"
+        );
         assert!(!specimen.clears_adequacy_floor());
 
-        let both_clear = score(&[(ModelMetric::Elo, 100.0, 0.95), (ModelMetric::Eq, 30.0, 1.0)]);
+        let both_clear = score(&[
+            (ModelMetric::Elo, 100.0, 0.95),
+            (ModelMetric::Eq, 30.0, 1.0),
+        ]);
         assert!(both_clear.clears_adequacy_floor());
     }
 }
