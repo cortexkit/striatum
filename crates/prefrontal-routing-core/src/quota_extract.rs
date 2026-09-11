@@ -371,6 +371,7 @@ mod tests {
     fn aggregate_extractor_emits_account_windows() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "codex".into(),
             account: None,
@@ -400,6 +401,7 @@ mod tests {
         // an exhausted weekly window to omit resetsAt.
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "ollama".into(),
             account: None,
@@ -431,6 +433,7 @@ mod tests {
     fn idle_no_reset_window_stays_skipped() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "ollama".into(),
             account: None,
@@ -458,6 +461,7 @@ mod tests {
     fn malformed_reset_does_not_hide_burning_window() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "ollama".into(),
             account: None,
@@ -484,6 +488,7 @@ mod tests {
     fn antigravity_maps_extra_windows_to_capacity_keys_and_skips_unmatched() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
@@ -557,6 +562,7 @@ mod tests {
         // rather than the whole entry being dropped.
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
@@ -618,6 +624,7 @@ mod tests {
         // be read as the hazard being handled.
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: Some("google".into()),
             provider: "gemini".into(),
             account: None,
@@ -669,6 +676,7 @@ mod tests {
         // both are live on the same host in the same week.
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
@@ -737,6 +745,7 @@ mod tests {
     fn antigravity_with_no_extras_emits_nothing() {
         let entry = ProviderUsage {
             stale: None,
+            fetched_at: None,
             api_provider: None,
             provider: "antigravity".into(),
             account: None,
