@@ -18,6 +18,7 @@ mod aa_ingest;
 mod available_models_text;
 mod config_overrides;
 mod fusiform_catalog;
+mod model_resolution;
 mod quota_consumer;
 
 use std::{
@@ -2125,6 +2126,15 @@ async fn handle_select_request(
     if envelope.method == ROUTE_MODEL_FACTS_OP {
         return handle_model_facts(frame, writer, store, operator_config_path).await;
     }
+    if envelope.method == model_resolution::RESOLVE_MODEL_OP {
+        return model_resolution::handle_resolve_model(frame, writer).await;
+    }
+    if envelope.method == model_resolution::MODEL_CAPABILITIES_OP {
+        return model_resolution::handle_model_capabilities(frame, writer, store).await;
+    }
+    if envelope.method == model_resolution::AGENT_MODEL_REQUIREMENTS_OP {
+        return model_resolution::handle_agent_model_requirements(frame, writer).await;
+    }
     if envelope.method == available_models_text::OP {
         return available_models_text::handle(frame, writer, store, operator_config_path).await;
     }
@@ -2831,20 +2841,6 @@ struct SetDecisionOutcomeParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RecordUsageParams {
-    /// The message id: the idempotency key.
-    id: String,
-    route_key: String,
-    capacity_key: String,
-    #[serde(rename = "providerID")]
-    provider_id: String,
-    output_tokens: f64,
-    duration_ms: f64,
-    observed_at: f64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CooldownStatusParams {
     route_key: String,
     capacity_key: String,
@@ -3037,34 +3033,45 @@ async fn handle_record_usage(
         frame.header.epoch,
         frame.header.corr,
     );
-    let params: RecordUsageParams = match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body)
-    {
-        Ok(b) => b.params,
-        Err(e) => {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "invalid_request",
-                &format!("record_usage params not decodable: {e}"),
-            )
-            .await;
+    let params: prefrontal_routing_core::NativeUsageFacts =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(body) => body.params,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("record_usage params not decodable: {error}"),
+                )
+                .await;
+            }
+        };
+    let observation = match model_resolution::usage_observation_from_store(params, store) {
+        Ok(observation) => observation,
+        Err(error) => {
+            return send_route_error(writer, ver, channel, epoch, corr, "store_error", &error)
+                .await;
         }
     };
-    let obs = prefrontal_routing_core::UsageObservation {
-        id: params.id,
-        route_key: params.route_key,
-        capacity_key: params.capacity_key,
-        provider_id: params.provider_id,
-        output_tokens: params.output_tokens,
-        duration_ms: params.duration_ms,
-        observed_at: params.observed_at,
+    let Some(observation) = observation else {
+        let body = serde_json::to_vec(&json!({ "result": { "recorded": false } }))
+            .map_err(ModuleError::Json)?;
+        let response = Frame::build_with_version(
+            ver,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            body,
+        )
+        .map_err(|error| ModuleError::Message(error.to_string()))?;
+        return send(writer, response).await;
     };
-    match store.record_usage_observation(&obs) {
-        // `recorded` reports whether a NEW row was inserted (false = gated out or a
-        // duplicate); either way the op succeeded, so the consumer never retries it.
+    match store.record_usage_observation(&observation) {
         Ok(recorded) => {
             let body = serde_json::to_vec(&json!({ "result": { "recorded": recorded } }))
                 .map_err(ModuleError::Json)?;
@@ -3077,10 +3084,10 @@ async fn handle_record_usage(
                 corr,
                 body,
             )
-            .map_err(|e| ModuleError::Message(e.to_string()))?;
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
             send(writer, response).await
         }
-        Err(e) => {
+        Err(error) => {
             send_route_error(
                 writer,
                 ver,
@@ -3088,7 +3095,7 @@ async fn handle_record_usage(
                 epoch,
                 corr,
                 "store_error",
-                &format!("record_usage: {e}"),
+                &format!("record_usage: {error}"),
             )
             .await
         }
@@ -3673,6 +3680,9 @@ fn handles(method: &str) -> bool {
             | ROUTE_RESOLVE_POLICY_OP
             | ROUTE_MODEL_FACT_OP
             | ROUTE_MODEL_FACTS_OP
+            | model_resolution::RESOLVE_MODEL_OP
+            | model_resolution::MODEL_CAPABILITIES_OP
+            | model_resolution::AGENT_MODEL_REQUIREMENTS_OP
             | available_models_text::OP
             | ROUTE_MODEL_UPSERT_OP
             | ROUTE_MODEL_SEED_AA_OP
@@ -3739,6 +3749,21 @@ fn manifest(module_id: &str) -> ModuleManifest {
             },
             ManagementOperation {
                 name: ROUTE_MODEL_FACTS_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: model_resolution::RESOLVE_MODEL_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: model_resolution::MODEL_CAPABILITIES_OP.to_string(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            },
+            ManagementOperation {
+                name: model_resolution::AGENT_MODEL_REQUIREMENTS_OP.to_string(),
                 kind: ManagementOperationKind::Query,
                 description: None,
             },
