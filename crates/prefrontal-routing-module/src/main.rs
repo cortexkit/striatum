@@ -25,7 +25,7 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, Once, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -586,9 +586,8 @@ where
     // file is a no-op; a parse error is logged but never aborts boot (routing
     // degrades to the seed catalog).
     let override_path = config_overrides::config_path();
-    // The operator's user-global config, read live per selection: it owns the
-    // routing fence (model_routing.exclude and friends).
-    let operator_config_path = config_overrides::operator_config_path();
+    // Selection policy and model-fact overrides share the routing-owned file.
+    let operator_config_path = override_path.clone();
     match config_overrides::apply_overrides_from_config(store.as_ref(), &override_path) {
         Ok(outcome) => {
             if outcome.applied > 0 || outcome.reverted > 0 || !outcome.skipped.is_empty() {
@@ -896,14 +895,14 @@ struct SelectParams {
     exclude_route_keys: Vec<String>,
     #[serde(default)]
     required_capabilities: Option<RequiredCapabilities>,
-    /// Legacy callers carry raw subscription specs in this field. The module
-    /// resolves them together with OAuth and curated provider facts.
+    /// Retained for one release so older callers decode; routing ignores these
+    /// caller-policy fields in favor of its routing-owned config.
     #[serde(default)]
     subscription_keys: Vec<String>,
     #[serde(default)]
     prefer_fast_specs: Vec<String>,
     #[serde(default)]
-    routing_policy: ModelRoutingPolicyInput,
+    routing_policy: Option<ModelRoutingPolicyInput>,
     #[serde(default)]
     provider_auth_types: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -1000,7 +999,7 @@ struct ResolvePolicyParams {
     #[serde(default)]
     available_models: Vec<String>,
     #[serde(default)]
-    routing_policy: ModelRoutingPolicyInput,
+    routing_policy: Option<ModelRoutingPolicyInput>,
     #[serde(default)]
     provider_auth_types: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -1070,21 +1069,32 @@ fn provider_auth_types(raw: Option<&HashMap<String, String>>) -> HashMap<String,
     }
 }
 
-/// One line naming the two policy sources a selection merged. It is recorded with
-/// the decision so `route.explain` can answer "whose list excluded this route"
-/// later, without re-reading config files that may have changed since.
-fn policy_sources_line(
-    operator: &ModelRoutingPolicyInput,
-    caller_exclude_entries: usize,
-    caller_exclude_route_keys: usize,
-) -> String {
+/// Record the sole policy source with each decision so explanations remain tied
+/// to the exact routing-owned document used for selection.
+fn policy_sources_line(operator: &ModelRoutingPolicyInput) -> String {
     format!(
-        "policy sources: operator {} ({} exclude entries), caller ({} exclude entries, {} excluded route keys)",
+        "policy sources: operator {} ({} exclude entries)",
         config_overrides::operator_policy_revision(operator),
         operator.exclude.len(),
-        caller_exclude_entries,
-        caller_exclude_route_keys,
     )
+}
+
+fn claim_ignored_caller_policy_warning(sent: bool, warned: &Once) -> bool {
+    if !sent {
+        return false;
+    }
+    let mut claimed = false;
+    warned.call_once(|| claimed = true);
+    claimed
+}
+
+fn warn_ignored_caller_policy_once(sent: bool) {
+    static WARNED: Once = Once::new();
+    if claim_ignored_caller_policy_warning(sent, &WARNED) {
+        eprintln!(
+            "[prefrontal-routing] ignoring caller-supplied model routing policy; configure model_routing in ~/.config/cortexkit/alfonso-routing.jsonc"
+        );
+    }
 }
 
 fn no_route_error(
@@ -1124,17 +1134,10 @@ fn resolve_select_request(
         }
     };
 
-    let mut routing_policy = params.routing_policy.clone();
-    routing_policy
-        .subscription
-        .extend(params.subscription_keys.iter().cloned());
-    routing_policy
-        .prefer_fast_when_relaxed
-        .extend(params.prefer_fast_specs.iter().cloned());
     let policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
         operator_policy,
-        &routing_policy,
+        &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref()),
         params.suppress_fast_variant,
     );
@@ -1152,7 +1155,7 @@ fn resolve_select_request(
         return Err(no_route_error(
             RouteFailureReason::NoAvailableModel,
             format!(
-                "No models available to route {}: all {} connected models are excluded by the operator and caller exclude lists. Loosen model_routing.exclude.",
+                "No models available to route {}: all {} connected models are excluded by operator policy or per-attempt route exclusions. Loosen model_routing.exclude.",
                 params.target_agent, policy.connected_model_count
             ),
             requirements,
@@ -1812,13 +1815,13 @@ async fn handle_resolve_policy(
             .await;
         }
     };
-    // Same baseline as selection: a caller asking what its policy resolves to must
-    // be told the fenced answer, not an optimistic one the router would refuse.
+    warn_ignored_caller_policy_once(params.routing_policy.is_some());
+    // Policy queries resolve the same routing-owned policy selection enforces.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     let resolved = resolve_routing_policy(
         params.available_models,
         &operator_policy,
-        &params.routing_policy,
+        &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref()),
         params.suppress_fast_variant,
     );
@@ -2176,9 +2179,12 @@ async fn handle_select_request(
             .await;
         }
     };
+    warn_ignored_caller_policy_once(
+        params.routing_policy.is_some()
+            || !params.subscription_keys.is_empty()
+            || !params.prefer_fast_specs.is_empty(),
+    );
     // The operator fence is read HERE, on the module side, for every selection.
-    // Callers may attach their own policy, but a caller that attaches none (every
-    // selection minted inside the daemon) still gets the operator's exclude list.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     let resolved_request = match resolve_select_request(&params, &operator_policy) {
         Ok(resolved) => resolved,
@@ -2193,11 +2199,7 @@ async fn handle_select_request(
                 Some(&no_route),
                 &params,
                 None,
-                Some(&policy_sources_line(
-                    &operator_policy,
-                    params.routing_policy.exclude.len(),
-                    params.exclude_route_keys.len(),
-                )),
+                Some(&policy_sources_line(&operator_policy)),
             );
             let _ = store.record_decision(&decision);
             return send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
@@ -2384,11 +2386,7 @@ async fn handle_select_request(
     // errors), so a returned id always maps to a committed row; never an id whose
     // write then failed (the contract requirement). A failed selection records a
     // no-selection row and surfaces the typed routing failure.
-    let policy_sources = policy_sources_line(
-        &operator_policy,
-        params.routing_policy.exclude.len(),
-        params.exclude_route_keys.len(),
-    );
+    let policy_sources = policy_sources_line(&operator_policy);
     match selection {
         Ok(mut selected) => {
             selected.explanation.push(policy_sources.clone());
@@ -2548,10 +2546,11 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
-    // The operator fence is NOT applied to the available-model set here: an
-    // explicit roster is a pin, and pins bypass exclusion by design. It is handed
-    // to panel admission instead, which applies it to automatic (n_pick) seats
-    // only. Subscription policy has no such carve-out and merges as usual.
+    warn_ignored_caller_policy_once(
+        !params.exclude_route_keys.is_empty() || !params.subscription_keys.is_empty(),
+    );
+    // Explicit roster pins bypass exclusions; automatic panel seats receive the
+    // operator fence. Subscription classification always comes from routing.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
@@ -2559,10 +2558,7 @@ async fn handle_select_panel(
             subscription: operator_policy.subscription.clone(),
             ..ModelRoutingPolicyInput::default()
         },
-        &ModelRoutingPolicyInput {
-            subscription: params.subscription_keys.clone(),
-            ..ModelRoutingPolicyInput::default()
-        },
+        &ModelRoutingPolicyInput::default(),
         &provider_auth_types(None),
         false,
     );
@@ -2578,7 +2574,7 @@ async fn handle_select_panel(
             pro_member_max_package_tokens: params.pro_member_max_package_tokens,
             facts: prepared.facts,
             runtime_snapshot: Some(prepared.snapshot),
-            exclude_route_keys: params.exclude_route_keys.clone(),
+            exclude_route_keys: Vec::new(),
             operator_exclude_keys: operator_policy.exclude.clone(),
             required_capabilities: params.required_capabilities,
             available_models,
@@ -2599,7 +2595,7 @@ async fn handle_select_panel(
         &params,
         &panel,
         &provenance,
-        &policy_sources_line(&operator_policy, 0, params.exclude_route_keys.len()),
+        &policy_sources_line(&operator_policy),
     );
     let decision_id = match store.record_decision(&decision) {
         Ok(id) => id,
@@ -3871,6 +3867,14 @@ mod tests {
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn ignored_caller_policy_warning_is_claimed_once_per_boot() {
+        let warned = Once::new();
+        assert!(!claim_ignored_caller_policy_warning(false, &warned));
+        assert!(claim_ignored_caller_policy_warning(true, &warned));
+        assert!(!claim_ignored_caller_policy_warning(true, &warned));
+    }
+
+    #[test]
     fn quota_outcome_requires_and_carries_retry_after_secs() {
         assert_eq!(
             parse_outcome("quota_exhausted", Some(580)),
@@ -4179,7 +4183,7 @@ mod tests {
         run_route_wire_request_with_operator_config(
             store,
             request,
-            Path::new("/nonexistent/alfonso.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
         )
         .await
     }
@@ -4207,7 +4211,7 @@ mod tests {
             &quota_cache,
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
         )
         .await
@@ -4298,7 +4302,7 @@ mod tests {
                 [],
             )
             .expect("stamp the stale exclusion column");
-        let operator_config = rig.dir.join("alfonso.jsonc");
+        let operator_config = rig.dir.join("alfonso-routing.jsonc");
         std::fs::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": ["fixture/wire-only"] } }"#,
@@ -4746,7 +4750,7 @@ mod tests {
             &rig,
             params,
             facts,
-            &PathBuf::from("/nonexistent/alfonso.jsonc"),
+            &PathBuf::from("/nonexistent/alfonso-routing.jsonc"),
         )
         .await;
         (response, rig)
@@ -4783,7 +4787,7 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
         )
         .await
@@ -4825,8 +4829,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/alfonso.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
         )
         .await
         .unwrap();
@@ -4918,8 +4922,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/alfonso.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
         )
         .await
         .unwrap();
@@ -5189,8 +5193,8 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/alfonso.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
         )
         .await
         .unwrap();
@@ -5207,7 +5211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_select_reports_empty_and_policy_excluded_availability() {
+    async fn route_select_reports_empty_and_ignores_legacy_policy_exclusions() {
         let (empty, _empty_rig) = run_select_wire_request(
             "empty-launch-availability",
             json!({
@@ -5238,13 +5242,12 @@ mod tests {
             &[route],
         )
         .await;
-        assert_eq!(excluded.header.ty, FrameType::Error);
+        assert_eq!(excluded.header.ty, FrameType::Response);
         let excluded_body: serde_json::Value = serde_json::from_slice(&excluded.body).unwrap();
-        assert_eq!(excluded_body["code"], "no_available_model");
-        assert!(excluded_body["message"]
-            .as_str()
-            .unwrap()
-            .contains("all 1 connected models are excluded"));
+        assert_eq!(
+            excluded_body["result"]["selected"]["routeKey"],
+            "openai/gpt-5.5"
+        );
     }
 
     /// Point a config file's mtime at a fixed second so a live-edit test does not
@@ -5268,7 +5271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_exclude_fences_selections_that_send_no_policy_of_their_own() {
+    async fn routing_owned_exclude_wins_when_plugin_and_routing_files_differ() {
         // Every selection minted inside the daemon sends no routingPolicy at all.
         // Before the module read the operator's config itself, those selections saw
         // an empty exclude list and picked excluded routes.
@@ -5277,10 +5280,15 @@ mod tests {
             fact("anthropic", "claude-opus-4-8"),
             fact("openai", "gpt-5.5"),
         ];
-        let operator_config = rig.dir.join("alfonso.jsonc");
+        let operator_config = rig.dir.join("alfonso-routing.jsonc");
         std::fs::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": ["anthropic"] } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            rig.dir.join("alfonso.jsonc"),
+            r#"{ "model_routing": { "exclude": ["openai"] } }"#,
         )
         .unwrap();
         set_config_mtime(&operator_config, 1_700_000_000);
@@ -5309,10 +5317,10 @@ mod tests {
             "an operator-fenced route reports the fence, not a generic unavailability"
         );
 
-        // A caller negation of an operator entry cannot lift it. Union only.
+        // A legacy caller cannot add an exclusion to routing-owned policy.
         let negated = run_select_against_rig(
             &rig,
-            select_params(Some(json!({ "exclude": ["-anthropic"] }))),
+            select_params(Some(json!({ "exclude": ["openai"] }))),
             &facts,
             &operator_config,
         )
@@ -5347,8 +5355,7 @@ mod tests {
             Some("excluded")
         );
 
-        // The decision records which two policy sources produced it, so route.explain
-        // can answer "whose list excluded this" after the config file has moved on.
+        // The decision records only the routing-owned policy revision.
         let explanation = body["result"]["selected"]["explanation"]
             .as_array()
             .unwrap()
@@ -5358,7 +5365,9 @@ mod tests {
             .expect("the selection explanation names its policy sources")
             .to_string();
         assert!(
-            explanation.contains("operator sha256:") && explanation.contains("1 exclude entries"),
+            explanation.contains("operator sha256:")
+                && explanation.contains("1 exclude entries")
+                && !explanation.contains("caller"),
             "unexpected policy-source line: {explanation}"
         );
 
@@ -5383,7 +5392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_select_resolves_raw_launch_policy_before_shared_selection() {
+    async fn route_select_accepts_but_ignores_legacy_caller_policy() {
         let routes = [
             fact("openai", "gpt-5.5"),
             fact("opencode-go", "deepseek-v4-flash"),
@@ -5423,11 +5432,16 @@ mod tests {
                 "requirements": { "iq": 80.0, "eq": 30.0 },
                 "requiredCapabilities": { "vision": true, "minContext": 200_000.0 },
                 "availableModels": [
+                    "openai/gpt-5.5",
                     "opencode-go/deepseek-v4-flash",
                     "opencode-go/minimax-m2.5"
                 ],
-                "subscriptionKeys": ["opencode-go/minimax-m2.5"],
-                "preferFastSpecs": ["openai", "opencode-go/minimax-m2.5"]
+                "subscriptionKeys": [
+                    "openai/gpt-5.5",
+                    "opencode-go/deepseek-v4-flash",
+                    "opencode-go/minimax-m2.5"
+                ],
+                "preferFastSpecs": []
             })
         );
     }
@@ -5642,13 +5656,13 @@ mod tests {
         let request = json!({
             "method": ROUTE_RESOLVE_POLICY_OP,
             "params": {
-                "availableModels": ["openai/gpt-5.5", "opencode-go/minimax-m2.5"],
+                "availableModels": ["fixture/a", "fixture/b"],
                 "routingPolicy": {
-                    "exclude": ["openai"],
-                    "subscription": ["opencode-go"],
-                    "preferFastWhenRelaxed": []
+                    "exclude": ["fixture/a"],
+                    "subscription": ["fixture"],
+                    "preferFastWhenRelaxed": ["fixture"]
                 },
-                "providerAuthTypes": { "openai": "oauth", "opencode-go": "api" }
+                "providerAuthTypes": { "fixture": "api" }
             }
         });
         let (response, _rig, _store) = run_select_panel_wire_request(
@@ -5661,8 +5675,8 @@ mod tests {
         assert_eq!(
             body["result"],
             json!({
-                "availableModels": ["opencode-go/minimax-m2.5"],
-                "subscriptionKeys": ["opencode-go/minimax-m2.5"],
+                "availableModels": ["fixture/a", "fixture/b"],
+                "subscriptionKeys": [],
                 "preferFastSpecs": [],
                 "connectedModelCount": 2,
             })
@@ -5728,8 +5742,8 @@ mod tests {
                 &quota_cache,
                 &store,
                 &min_band,
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                Path::new("/nonexistent/alfonso.jsonc"),
+                Path::new("/nonexistent/alfonso-routing.jsonc"),
+                Path::new("/nonexistent/alfonso-routing.jsonc"),
             )
             .await
             .unwrap();
@@ -5828,8 +5842,8 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/alfonso.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
         )
         .await
         .unwrap();
@@ -6026,8 +6040,8 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/alfonso.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
         )
         .await
         .unwrap();
@@ -6086,7 +6100,7 @@ mod tests {
                 store,
                 &Arc::new(Mutex::new(None)),
                 config_path,
-                Path::new("/nonexistent/alfonso.jsonc"),
+                Path::new("/nonexistent/alfonso-routing.jsonc"),
             )
             .await
             .unwrap();
@@ -6224,7 +6238,7 @@ mod tests {
             &store,
             &Arc::new(Mutex::new(None)),
             &config_path,
-            Path::new("/nonexistent/alfonso.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
         )
         .await
         .unwrap();

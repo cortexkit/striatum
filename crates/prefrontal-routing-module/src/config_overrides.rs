@@ -3,7 +3,7 @@
 //! Ported from the TS `applyModelFactOverrides` + the subscription-classifier's
 //! config-read pattern. Per the locked contract with the daemon owner, routing
 //! config does NOT flow over subc-mediated config (that path is unwired); instead
-//! the module reads `~/.config/cortexkit/prefrontal-routing.jsonc` itself at boot and
+//! the module reads `~/.config/cortexkit/alfonso-routing.jsonc` itself at boot and
 //! merges the `model_routing.models` overrides onto the migration-applied seed.
 //!
 //! Overrides are upserted with source `override`; an override row that disappears
@@ -28,7 +28,6 @@ use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
-const OPERATOR_CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso.jsonc";
 pub const DEFAULT_AA_API_KEY_REF: &str = "apikey:artificial-analysis";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
@@ -52,27 +51,6 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
 
 pub fn default_providers_without_prompt_cache() -> Vec<String> {
     vec!["ollama-cloud".to_string()]
-}
-
-/// The slice of the operator's user-global Alfonso config this module reads.
-/// Deliberately its own minimal type rather than a reuse of [`RoutingConfigFile`]:
-/// alfonso.jsonc is a large document owned by other subsystems, and decoding it
-/// through a struct that also claims `models`, `elo_overrides` and friends would
-/// let an unrelated shape elsewhere in that file fail the whole policy read.
-#[derive(Debug, Deserialize, Default)]
-struct OperatorConfigFile {
-    #[serde(default)]
-    model_routing: OperatorRoutingSection,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct OperatorRoutingSection {
-    #[serde(default)]
-    exclude: Vec<String>,
-    #[serde(default)]
-    subscription: Vec<String>,
-    #[serde(default, alias = "preferFastWhenRelaxed")]
-    prefer_fast_when_relaxed: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -298,6 +276,15 @@ pub fn read_aa_config(path: &Path) -> Result<AaConfig, String> {
 
 #[derive(Debug, Deserialize, Default)]
 struct ModelRoutingSection {
+    /// Providers and models excluded from every automatic routing pool.
+    #[serde(default)]
+    exclude: Vec<String>,
+    /// Providers and models priced as subscription-backed in addition to auth facts.
+    #[serde(default)]
+    subscription: Vec<String>,
+    /// Routes eligible for a fast sibling while subscription quota is relaxed.
+    #[serde(default, alias = "preferFastWhenRelaxed")]
+    prefer_fast_when_relaxed: Vec<String>,
     /// Keyed by "provider/model" or "provider/model/variant".
     #[serde(default)]
     models: HashMap<String, ModelFactOverride>,
@@ -366,14 +353,6 @@ fn config_home_path(relative: &str) -> PathBuf {
 /// The config-home path for this module's own config file.
 pub fn config_path() -> PathBuf {
     config_home_path(CONFIG_RELATIVE_PATH)
-}
-
-/// The config-home path for the operator's user-global Alfonso config, which owns
-/// `model_routing.{exclude, subscription, prefer_fast_when_relaxed}`. This module
-/// reads that policy itself because it is the routing authority: a policy applied
-/// only where a caller remembers to attach it is not a policy.
-pub fn operator_config_path() -> PathBuf {
-    config_home_path(OPERATOR_CONFIG_RELATIVE_PATH)
 }
 
 pub fn auth_json_path() -> PathBuf {
@@ -939,7 +918,7 @@ fn operator_policy_cache() -> &'static Mutex<HashMap<PathBuf, OperatorPolicyCach
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The operator's `model_routing` policy from the user-global Alfonso config.
+/// The operator's `model_routing` policy from the routing-owned config.
 ///
 /// This is the routing fence, so it never fails into an empty policy: a missing
 /// file or missing field IS an empty policy (the operator excluded nothing), but a
@@ -1027,7 +1006,7 @@ fn parse_operator_routing_policy(
 ) -> Result<ModelRoutingPolicyInput, String> {
     let json = jsonc_to_json(document)
         .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
-    let config: OperatorConfigFile = serde_json::from_str(&json)
+    let config: RoutingConfigFile = serde_json::from_str(&json)
         .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
     let section = config.model_routing;
     Ok(ModelRoutingPolicyInput {
@@ -1047,8 +1026,8 @@ fn clean_spec_entries(entries: Vec<String>) -> Vec<String> {
 
 /// A stable identity for one operator policy, recorded with a decision so
 /// `route.explain` can say WHICH fence produced it. Derived from the policy's
-/// entries rather than the whole config file: unrelated edits elsewhere in
-/// alfonso.jsonc must not read as a routing-policy change.
+/// entries rather than the whole config file: unrelated routing settings must
+/// not read as a selection-policy change.
 pub fn operator_policy_revision(policy: &ModelRoutingPolicyInput) -> String {
     let mut hasher = Sha256::new();
     for (label, entries) in [
@@ -1456,7 +1435,7 @@ mod tests {
                 }
             }
         }"#;
-        let config_path = dir.join("prefrontal-routing.jsonc");
+        let config_path = dir.join("alfonso-routing.jsonc");
         std::fs::write(&config_path, config_content).unwrap();
 
         let outcome = apply_overrides_from_config(&store, &config_path).unwrap();
@@ -1565,7 +1544,7 @@ mod tests {
                 }
             }
         }"#;
-        let config_path = dir.join("prefrontal-routing.jsonc");
+        let config_path = dir.join("alfonso-routing.jsonc");
         std::fs::write(&config_path, config_content).unwrap();
 
         let outcome = apply_overrides_from_config(&store, &config_path).unwrap();
@@ -1761,7 +1740,7 @@ mod tests {
         );
 
         // File with the key → returns clamped value.
-        let config_path = dir.join("prefrontal-routing.jsonc");
+        let config_path = dir.join("alfonso-routing.jsonc");
         std::fs::write(
             &config_path,
             r#"{ "model_routing": { "min_best_effort_adequacy": 0.35 } }"#,
@@ -1807,7 +1786,7 @@ mod tests {
             vec!["ollama-cloud"]
         );
 
-        let path = dir.join("prefrontal-routing.jsonc");
+        let path = dir.join("alfonso-routing.jsonc");
         std::fs::write(
             &path,
             r#"{"model_routing":{"providers_without_prompt_cache":["ollama-cloud"," custom ","ollama-cloud"]}}"#,
@@ -1841,7 +1820,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("prefrontal-routing.jsonc");
+        let path = dir.join("alfonso-routing.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
@@ -1935,7 +1914,7 @@ mod tests {
             ModelRoutingPolicyInput::default()
         );
 
-        let path = dir.join("alfonso.jsonc");
+        let path = dir.join("alfonso-routing.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
@@ -2017,7 +1996,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("alfonso.jsonc");
+        let path = dir.join("alfonso-routing.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
