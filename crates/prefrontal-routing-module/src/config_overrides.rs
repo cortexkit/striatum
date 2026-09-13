@@ -1574,6 +1574,9 @@ mod tests {
     #[test]
     fn unreadable_override_base_is_not_replaced_from_defaults() {
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        // The loader replaces the process-global multiplier maps on its early
+        // arms too; serialize with the other loader tests.
+        let _guard = multiplier_map_guard();
         let dir = std::env::temp_dir().join(format!(
             "prefrontal-routing-override-read-fault-{}-{}",
             std::process::id(),
@@ -1621,6 +1624,9 @@ mod tests {
     #[test]
     fn unreadable_stale_override_base_is_not_reverted_from_seed() {
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        // The loader replaces the process-global multiplier maps on its early
+        // arms too; serialize with the other loader tests.
+        let _guard = multiplier_map_guard();
         let dir = std::env::temp_dir().join(format!(
             "prefrontal-routing-stale-override-read-fault-{}-{}",
             std::process::id(),
