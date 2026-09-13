@@ -1098,7 +1098,9 @@ fn apply_overrides<S: RouteStateStore>(
                 );
             }
         }
-        let existing_fact = store.get_fact_by_route_key(&route_key).ok().flatten();
+        let existing_fact = store
+            .get_fact_by_route_key(&route_key)
+            .map_err(|error| format!("reading override base {route_key}: {error}"))?;
         let mut base = existing_fact
             .clone()
             .or_else(|| seed_by_key.get(&route_key).cloned())
@@ -1162,8 +1164,9 @@ fn apply_overrides<S: RouteStateStore>(
                 if restored.max_output_tokens.is_none() {
                     restored.max_output_tokens = store
                         .get_fact_by_route_key(&route_key)
-                        .ok()
-                        .flatten()
+                        .map_err(|error| {
+                            format!("reading stale override base {route_key}: {error}")
+                        })?
                         .and_then(|fact| fact.max_output_tokens);
                 }
                 store
@@ -1566,6 +1569,102 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_override_base_is_not_replaced_from_defaults() {
+        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-override-read-fault-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("store.db");
+        let store = SqliteRouteStateStore::open(&dev_descriptor(
+            "prefrontal-routing",
+            db_path.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        let route_key = make_route_key(
+            &model_facts_seed()[0].provider_id,
+            &model_facts_seed()[0].model_id,
+            model_facts_seed()[0].variant.as_deref(),
+        );
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE model_facts SET context_window = 'bad', fusiform_present = 0 WHERE route_key = ?1",
+                [&route_key],
+            )
+            .unwrap();
+        assert!(store.get_fact_by_route_key(&route_key).is_err());
+        let config_path = dir.join("routing.jsonc");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "model_routing": {
+                    "models": { route_key.clone(): { "speed": 1200.0 } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let error = apply_overrides_from_config(&store, &config_path).unwrap_err();
+        assert!(error.contains("reading override base"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_stale_override_base_is_not_reverted_from_seed() {
+        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-stale-override-read-fault-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("store.db");
+        let store = SqliteRouteStateStore::open(&dev_descriptor(
+            "prefrontal-routing",
+            db_path.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        let seed = model_facts_seed()
+            .iter()
+            .find(|fact| fact.max_output_tokens.is_none())
+            .expect("the seed has a fact without max output metadata");
+        let route_key = make_route_key(&seed.provider_id, &seed.model_id, seed.variant.as_deref());
+        let config_path = dir.join("routing.jsonc");
+        std::fs::write(
+            &config_path,
+            serde_json::json!({
+                "model_routing": {
+                    "models": { route_key.clone(): { "speed": 1200.0 } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+        let connection = rusqlite::Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE model_facts SET context_window = 'bad', fusiform_present = 0 WHERE route_key = ?1",
+                [&route_key],
+            )
+            .unwrap();
+        assert!(store.get_fact_by_route_key(&route_key).is_err());
+        std::fs::write(&config_path, r#"{ "model_routing": { "models": {} } }"#).unwrap();
+        let error = apply_overrides_from_config(&store, &config_path).unwrap_err();
+        assert!(error.contains("reading stale override base"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

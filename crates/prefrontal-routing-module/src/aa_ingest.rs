@@ -35,6 +35,7 @@ pub enum SeedAaRefusal {
     NoAaMapping,
     AaIndexAbsent,
     ExistingCuratedOrOverride,
+    StoreReadFailed,
 }
 
 impl SeedAaRefusal {
@@ -43,6 +44,7 @@ impl SeedAaRefusal {
             SeedAaRefusal::NoAaMapping => "no_aa_mapping",
             SeedAaRefusal::AaIndexAbsent => "aa_index_absent",
             SeedAaRefusal::ExistingCuratedOrOverride => "existing_curated_or_override",
+            SeedAaRefusal::StoreReadFailed => "store_read_failed",
         }
     }
 
@@ -53,6 +55,7 @@ impl SeedAaRefusal {
             SeedAaRefusal::ExistingCuratedOrOverride => {
                 "a curated or override score already exists for this route"
             }
+            SeedAaRefusal::StoreReadFailed => "the routing catalog could not be read",
         }
     }
 }
@@ -131,10 +134,15 @@ pub fn seed_aa(
     let Some(slug) = aa_config.model_map.get(&route_key).cloned() else {
         return Err(SeedAaRefusal::NoAaMapping);
     };
-    let Some((aa_index, _)) = store.get_aa_index(&slug).ok().flatten() else {
+    let Some((aa_index, _)) = store
+        .get_aa_index(&slug)
+        .map_err(|_| SeedAaRefusal::StoreReadFailed)?
+    else {
         return Err(SeedAaRefusal::AaIndexAbsent);
     };
-    let existing = store.get_fact_by_route_key(&route_key).ok().flatten();
+    let existing = store
+        .get_fact_by_route_key(&route_key)
+        .map_err(|_| SeedAaRefusal::StoreReadFailed)?;
     if let Some(existing) = existing.as_ref() {
         if existing.score_provenance == ScoreProvenance::Curated
             || existing.score_provenance == ScoreProvenance::Override
@@ -147,7 +155,7 @@ pub fn seed_aa(
     let elo_interp = interpolate_elo(aa_index, curve).unwrap_or(elo);
     let neighbors: Vec<(f64, f64, String)> = store
         .get_facts()
-        .unwrap_or_default()
+        .map_err(|_| SeedAaRefusal::StoreReadFailed)?
         .into_iter()
         .filter(|fact| fact.score_provenance == ScoreProvenance::Curated)
         .map(|fact| {
@@ -596,6 +604,94 @@ mod tests {
         assert_eq!(
             seed_aa(&store, &params, &config, 1).unwrap_err(),
             SeedAaRefusal::AaIndexAbsent
+        );
+    }
+
+    #[test]
+    fn unreadable_aa_index_is_not_reported_as_absent() {
+        let (dir, store) = open_store();
+        store
+            .replace_aa_index_table(&[("fault-slug".into(), 60.0)], 1)
+            .unwrap();
+        let mut config = AaConfig::default();
+        config
+            .model_map
+            .insert("custom/fault-model".into(), "fault-slug".into());
+        let params = SeedAaParams {
+            provider_id: "custom".into(),
+            model_id: "fault-model".into(),
+            variant: None,
+        };
+        let connection = rusqlite::Connection::open(dir.path.join("store.db")).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE aa_index_cache RENAME COLUMN aa_index TO unavailable_aa_index;",
+            )
+            .unwrap();
+        assert!(store.get_aa_index("fault-slug").is_err());
+        assert_eq!(
+            seed_aa(&store, &params, &config, 1).unwrap_err(),
+            SeedAaRefusal::StoreReadFailed
+        );
+    }
+
+    #[test]
+    fn unreadable_existing_fact_does_not_bypass_curated_protection() {
+        let (dir, store) = open_store();
+        store
+            .replace_aa_index_table(&[("fault-slug".into(), 60.0)], 1)
+            .unwrap();
+        let route_key = "openai/gpt-5.5";
+        let connection = rusqlite::Connection::open(dir.path.join("store.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE model_facts SET context_window = 'bad', fusiform_present = 0 WHERE route_key = ?1",
+                [route_key],
+            )
+            .unwrap();
+        assert!(store.get_fact_by_route_key(route_key).is_err());
+        assert!(store.get_facts().is_ok());
+        let mut config = AaConfig::default();
+        config
+            .model_map
+            .insert(route_key.into(), "fault-slug".into());
+        let params = SeedAaParams {
+            provider_id: "openai".into(),
+            model_id: "gpt-5.5".into(),
+            variant: None,
+        };
+        assert_eq!(
+            seed_aa(&store, &params, &config, 1).unwrap_err(),
+            SeedAaRefusal::StoreReadFailed
+        );
+    }
+
+    #[test]
+    fn unreadable_neighbor_facts_do_not_default_inferred_eq() {
+        let (dir, store) = open_store();
+        store
+            .replace_aa_index_table(&[("fault-slug".into(), 60.0)], 1)
+            .unwrap();
+        let connection = rusqlite::Connection::open(dir.path.join("store.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE model_facts SET context_window = 'bad' WHERE route_key = (SELECT route_key FROM model_facts LIMIT 1)",
+                [],
+            )
+            .unwrap();
+        assert!(store.get_facts().is_err());
+        let mut config = AaConfig::default();
+        config
+            .model_map
+            .insert("custom/fault-model".into(), "fault-slug".into());
+        let params = SeedAaParams {
+            provider_id: "custom".into(),
+            model_id: "fault-model".into(),
+            variant: None,
+        };
+        assert_eq!(
+            seed_aa(&store, &params, &config, 1).unwrap_err(),
+            SeedAaRefusal::StoreReadFailed
         );
     }
 
