@@ -17,6 +17,7 @@ pub mod fast_variant;
 pub mod launch_policy;
 pub mod model_facts;
 pub mod model_facts_seed;
+pub mod model_resolution;
 pub mod model_router;
 pub mod panel;
 pub mod provider_model_spec;
@@ -54,6 +55,16 @@ pub use model_facts::{
     ScoreProvenance, GRAND_FAMILY_NORMALIZATIONS, MODEL_METRICS,
 };
 pub use model_facts_seed::model_facts_seed;
+pub use model_resolution::{
+    build_model_speed_observation, find_most_specific_fallback_entry, fuzzy_match_model,
+    resolve_compatible_model_settings, resolve_model_capabilities, resolve_model_id_alias,
+    resolve_model_pipeline, resolve_user_model_pin, DelegatedModelConfig, DesiredModelSettings,
+    FallbackEntry, ModelAliasResolution, ModelCapabilities, ModelCapabilitiesInput,
+    ModelCapabilitiesSnapshot, ModelCapabilitiesSnapshotEntry, ModelResolutionConstraints,
+    ModelResolutionIntent, ModelResolutionPolicy, ModelResolutionRequest, ModelResolutionResult,
+    ModelSettingsCompatibilityChange, ModelSettingsCompatibilityResult, NativeUsageFacts,
+    SnapshotLimit, SnapshotModalities, UserModelPinRequest, VariantFact,
+};
 pub use model_router::{
     admit_routes, select_model_route, select_model_route_with_config, AdmissionResult,
     AdmittedRoute, BelowFloorWarning, GoverningWindow, ModelRouteStateSnapshot, NoRouteError,
