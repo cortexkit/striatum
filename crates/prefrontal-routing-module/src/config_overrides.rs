@@ -1252,6 +1252,7 @@ mod tests {
     #[test]
     fn family_override_distinguishes_absent_null_and_value() {
         let base = ModelFact {
+            speed_is_fleet_median: false,
             provider_id: "p".into(),
             model_id: "m".into(),
             variant: None,
