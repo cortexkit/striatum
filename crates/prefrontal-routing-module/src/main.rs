@@ -1213,6 +1213,10 @@ fn merge_model_upsert(
                 max_output_tokens: None,
                 cost_tier: None,
                 cost_per_m_tok_out: None,
+                input_rate: None,
+                cache_read_rate: None,
+                cache_write_rate: None,
+                reasoning_rate: None,
                 supports_vision: None,
                 supports_tool_use: None,
                 prompt_defaults: None,
@@ -4093,6 +4097,7 @@ mod tests {
 
     fn fact(provider: &str, model: &str) -> ModelFact {
         ModelFact {
+            speed_is_fleet_median: false,
             provider_id: provider.into(),
             model_id: model.into(),
             variant: None,
@@ -4106,6 +4111,10 @@ mod tests {
             max_output_tokens: None,
             cost_tier: Some(2.0),
             cost_per_m_tok_out: Some(4.5),
+            input_rate: None,
+            cache_read_rate: None,
+            cache_write_rate: None,
+            reasoning_rate: None,
             supports_vision: Some(true),
             supports_tool_use: Some(true),
             prompt_defaults: None,

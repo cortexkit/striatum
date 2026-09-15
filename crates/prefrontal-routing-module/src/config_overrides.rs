@@ -1115,6 +1115,10 @@ fn apply_overrides<S: RouteStateStore>(
                 max_output_tokens: None,
                 cost_tier: None,
                 cost_per_m_tok_out: None,
+                input_rate: None,
+                cache_read_rate: None,
+                cache_write_rate: None,
+                reasoning_rate: None,
                 supports_vision: None,
                 supports_tool_use: None,
                 prompt_defaults: None,
@@ -1252,6 +1256,7 @@ mod tests {
     #[test]
     fn family_override_distinguishes_absent_null_and_value() {
         let base = ModelFact {
+            speed_is_fleet_median: false,
             provider_id: "p".into(),
             model_id: "m".into(),
             variant: None,
@@ -1265,6 +1270,10 @@ mod tests {
             max_output_tokens: None,
             cost_tier: Some(2.0),
             cost_per_m_tok_out: Some(4.0),
+            input_rate: None,
+            cache_read_rate: None,
+            cache_write_rate: None,
+            reasoning_rate: None,
             supports_vision: Some(false),
             supports_tool_use: Some(true),
             prompt_defaults: None,

@@ -376,6 +376,7 @@ mod tests {
         vision: bool,
     ) -> ModelFact {
         ModelFact {
+            speed_is_fleet_median: false,
             provider_id: provider.to_string(),
             model_id: model.to_string(),
             variant: None,
@@ -389,6 +390,10 @@ mod tests {
             max_output_tokens: None,
             cost_tier: None,
             cost_per_m_tok_out: Some(cost),
+            input_rate: None,
+            cache_read_rate: None,
+            cache_write_rate: None,
+            reasoning_rate: None,
             supports_vision: Some(vision),
             supports_tool_use: None,
             prompt_defaults: None,
