@@ -60,6 +60,7 @@ impl Drop for Rig {
 
 fn fact(provider: &str, model: &str) -> ModelFact {
     ModelFact {
+        speed_is_fleet_median: false,
         provider_id: provider.into(),
         model_id: model.into(),
         variant: None,
@@ -1494,6 +1495,80 @@ fn facts_with_observed_speed_overlays_only_routes_with_trusted_signal() {
         "overlaid speed got {}",
         pm_after.scores.speed
     );
+}
+
+/// A route with no observation of its own must enter at the fleet MEDIAN, not at
+/// zero. Zero is the worst value the speed tie-break can hold, and that tie-break
+/// decides the whole effectively-free bucket, so an unmeasured route would lose
+/// every comparison it enters - while winning one is the only way it is ever run
+/// and measured. The stand-in breaks that deadlock; a route with its own samples
+/// must still use them, and a hand-seeded catalog speed must still outrank the
+/// median.
+#[test]
+fn an_unmeasured_route_enters_at_the_fleet_median_rather_than_at_zero() {
+    let rig = Rig::new("usage-median-standin");
+    let store = rig.open();
+
+    // Two measured routes at 100 and 300 tok/s, and one never measured with no
+    // catalog speed of its own.
+    for (model, tps) in [("fast", 3000.0), ("slow", 1000.0)] {
+        let mut measured = fact("p", model);
+        measured.scores.speed = 0.0;
+        store.upsert_fact(&measured, FactSource::Override).unwrap();
+        for i in 0..5 {
+            store
+                .record_usage_observation(&obs(
+                    &format!("{model}{i}"),
+                    &format!("p/{model}"),
+                    tps,
+                    1000.0,
+                    1000.0 + i as f64,
+                ))
+                .unwrap();
+        }
+    }
+    let mut unmeasured = fact("p", "unmeasured");
+    unmeasured.scores.speed = 0.0;
+    store
+        .upsert_fact(&unmeasured, FactSource::Override)
+        .unwrap();
+
+    let facts = store.get_facts_with_observed_speed(10_000.0).unwrap();
+    let speed_of = |model: &str| {
+        facts
+            .iter()
+            .find(|f| f.provider_id == "p" && f.model_id == model)
+            .unwrap_or_else(|| panic!("{model} missing"))
+    };
+
+    let standin = speed_of("unmeasured");
+    assert!(
+        (standin.scores.speed - 2000.0).abs() < 1e-9,
+        "unmeasured route should enter at the median of 1000 and 3000, got {}",
+        standin.scores.speed
+    );
+    assert!(
+        standin.speed_is_fleet_median,
+        "a stand-in must be marked so a decision reader can tell it from a measurement"
+    );
+
+    // The measured routes keep their own observations, and are not marked.
+    assert!((speed_of("fast").scores.speed - 3000.0).abs() < 1e-9);
+    assert!(!speed_of("fast").speed_is_fleet_median);
+    assert!((speed_of("slow").scores.speed - 1000.0).abs() < 1e-9);
+
+    // A hand-seeded catalog speed is authoritative over the fleet median: the seed
+    // is somebody's measurement, the median is nobody's.
+    let seeded = fact("p", "seeded");
+    assert!(seeded.scores.speed > 0.0, "fixture must carry a seed speed");
+    store.upsert_fact(&seeded, FactSource::Override).unwrap();
+    let facts = store.get_facts_with_observed_speed(10_000.0).unwrap();
+    let seeded_after = facts
+        .iter()
+        .find(|f| f.provider_id == "p" && f.model_id == "seeded")
+        .unwrap();
+    assert!((seeded_after.scores.speed - 90.0).abs() < 1e-9);
+    assert!(!seeded_after.speed_is_fleet_median);
 }
 
 #[test]

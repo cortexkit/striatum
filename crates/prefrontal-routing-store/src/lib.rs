@@ -1135,6 +1135,25 @@ impl SqliteRouteStateStore {
     }
 }
 
+/// Median of the measured speeds, used as the stand-in for routes with none.
+/// Median rather than mean because one very fast or very slow route should not
+/// move where an unmeasured route enters the ranking.
+fn median_of(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut sorted: Vec<f64> = values
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    let middle = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 0 {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    })
+}
+
 fn observed_route_key_for_fact(fact: &ModelFact) -> String {
     let observed_variant = fact
         .prompt_defaults
@@ -1189,6 +1208,9 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
     };
     let source = FactSource::parse(&row.get::<_, String>("source")?);
     Ok(ModelFact {
+        // Read-time provenance, never stored: a fact loaded from the row has whatever
+        // speed the row holds, and the median stand-in is applied above this.
+        speed_is_fleet_median: false,
         provider_id: row.get("provider_id")?,
         model_id: row.get("model_id")?,
         variant: row.get::<_, Option<String>>("variant")?,
@@ -2216,11 +2238,31 @@ impl RouteStateStore for SqliteRouteStateStore {
             .map(observed_route_key_for_fact)
             .collect::<BTreeSet<_>>();
         let observed_speeds = self.get_observed_speeds(&observed_route_keys, now)?;
+        // A route with too few samples has NO speed, which is not the same as being
+        // slow - but `scores.speed` carries 0.0 for both, and 0.0 is the worst value
+        // the tie-break can hold. That tie-break decides the whole effectively-free
+        // bucket, so an unmeasured route loses every comparison it enters, and
+        // winning one is the only way it is ever run and measured. A model could
+        // therefore never earn its own speed (live: 231 of 291 catalog rows sit at
+        // 0.0, among them routes with the best elo on their price tier).
+        //
+        // Standing in for the unknown with the MEDIAN of what is measured breaks the
+        // deadlock without inventing an advantage: a new route enters as ordinary
+        // rather than as worst, gets picked when its price and quality justify it,
+        // and replaces the stand-in with its own observation after the sample floor.
+        // Falling back to the catalog number first keeps a hand-seeded speed
+        // authoritative over a fleet median.
+        let median_observed_speed = median_of(observed_speeds.values().copied());
         let mut overlaid = Vec::with_capacity(facts.len());
         for mut fact in facts {
             let observed_route_key = observed_route_key_for_fact(&fact);
             if let Some(speed) = observed_speeds.get(&observed_route_key) {
                 fact.scores.speed = *speed;
+            } else if fact.scores.speed <= 0.0 {
+                if let Some(median) = median_observed_speed {
+                    fact.scores.speed = median;
+                    fact.speed_is_fleet_median = true;
+                }
             }
             let route_key = prefrontal_routing_core::make_route_key(
                 &fact.provider_id,

@@ -345,6 +345,13 @@ pub struct ModelFact {
     pub notes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_multiplier: Option<f64>,
+    /// True when `scores.speed` is the fleet median standing in for a route that has
+    /// no observation of its own, so a reader of a decision can tell a measured speed
+    /// from a placeholder. Never persisted: it is applied at read time beside the
+    /// observed-speed overlay and must not survive into a stored fact, or the
+    /// placeholder would look like a measurement on the next read.
+    #[serde(skip)]
+    pub speed_is_fleet_median: bool,
     /// Subscription subsidy multiplier applied at read time (see
     /// [`get_subscription_multiplier`]). Divides `cost_per_m_tok_out` to yield the
     /// effective price. `None` (or a non-positive/non-finite value) means "no

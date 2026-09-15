@@ -252,6 +252,7 @@ mod tests {
 
     fn fact(provider: &str, model: &str, elo: f64) -> ModelFact {
         ModelFact {
+            speed_is_fleet_median: false,
             provider_id: provider.into(),
             model_id: model.into(),
             variant: None,

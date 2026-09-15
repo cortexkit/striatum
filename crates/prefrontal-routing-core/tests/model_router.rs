@@ -39,6 +39,7 @@ struct FactBuilder {
 /// `fact({ providerID, modelID, scores, ...partial })`: confidence defaults to curated.
 fn fact(b: FactBuilder) -> ModelFact {
     ModelFact {
+        speed_is_fleet_median: false,
         provider_id: b.provider_id,
         model_id: b.model_id,
         variant: b.variant,

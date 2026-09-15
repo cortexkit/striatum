@@ -1199,6 +1199,7 @@ fn merge_model_upsert(
                 ));
             };
             ModelFact {
+                speed_is_fleet_median: false,
                 provider_id: params.provider_id.clone(),
                 model_id: params.model_id.clone(),
                 variant: params.variant.clone(),

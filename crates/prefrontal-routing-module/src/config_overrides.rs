@@ -1105,6 +1105,7 @@ fn apply_overrides<S: RouteStateStore>(
             .clone()
             .or_else(|| seed_by_key.get(&route_key).cloned())
             .unwrap_or_else(|| ModelFact {
+                speed_is_fleet_median: false,
                 provider_id,
                 model_id,
                 variant,
