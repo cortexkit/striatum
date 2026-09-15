@@ -1273,45 +1273,276 @@ fn obs(id: &str, route: &str, out: f64, dur: f64, at: f64) -> UsageObservation {
         route_key: route.into(),
         capacity_key: "p/m".into(),
         provider_id: "p".into(),
+        input_tokens: None,
         output_tokens: out,
+        reasoning_tokens: None,
+        cached_read_tokens: None,
+        cache_write_tokens: None,
         duration_ms: dur,
+        workload_class: None,
+        account_key: None,
         observed_at: at,
     }
 }
 
-#[test]
-fn usage_rejects_samples_below_the_eligibility_gates() {
-    let rig = Rig::new("usage-gates");
-    let store = rig.open();
-    // Below MIN_OUTPUT_TOKENS (100).
-    assert!(!store
-        .record_usage_observation(&obs("a", "p/m", 50.0, 5000.0, 1000.0))
-        .unwrap());
-    // Below MIN_DURATION_MS (1000).
-    assert!(!store
-        .record_usage_observation(&obs("b", "p/m", 500.0, 500.0, 1000.0))
-        .unwrap());
-    // Empty id.
-    assert!(!store
-        .record_usage_observation(&obs("", "p/m", 500.0, 5000.0, 1000.0))
-        .unwrap());
-    // An eligible one inserts.
-    assert!(store
-        .record_usage_observation(&obs("c", "p/m", 500.0, 5000.0, 1000.0))
-        .unwrap());
+#[derive(Debug, PartialEq, Eq)]
+struct StoredUsageRow {
+    route_key: String,
+    capacity_key: String,
+    provider_id: String,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    cached_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    duration_ms: Option<i64>,
+    workload_class: Option<String>,
+    account_key: Option<String>,
+    observed_at: i64,
+}
+
+fn stored_usage_row(rig: &Rig, id: &str) -> StoredUsageRow {
+    rusqlite::Connection::open(rig.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT route_key, capacity_key, provider_id, input_tokens, output_tokens,
+                    reasoning_tokens, cached_read_tokens, cache_write_tokens, duration_ms,
+                    workload_class, account_key, observed_at
+             FROM model_route_usage
+             WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(StoredUsageRow {
+                    route_key: row.get(0)?,
+                    capacity_key: row.get(1)?,
+                    provider_id: row.get(2)?,
+                    input_tokens: row.get(3)?,
+                    output_tokens: row.get(4)?,
+                    reasoning_tokens: row.get(5)?,
+                    cached_read_tokens: row.get(6)?,
+                    cache_write_tokens: row.get(7)?,
+                    duration_ms: row.get(8)?,
+                    workload_class: row.get(9)?,
+                    account_key: row.get(10)?,
+                    observed_at: row.get(11)?,
+                })
+            },
+        )
+        .unwrap()
+}
+
+fn usage_row_counts(rig: &Rig) -> (i64, i64) {
+    rusqlite::Connection::open(rig.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT id) FROM model_route_usage",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+fn complete_usage(id: &str) -> UsageObservation {
+    let mut observation = obs(id, "p/m/high", 500.0, 5_000.0, 1_000.0);
+    observation.input_tokens = Some(100.0);
+    observation.reasoning_tokens = Some(25.0);
+    observation.cached_read_tokens = Some(300.0);
+    observation.cache_write_tokens = Some(0.0);
+    observation.workload_class = Some("ephemeral".into());
+    observation.account_key = Some("p/primary".into());
+    observation
 }
 
 #[test]
-fn usage_is_idempotent_by_message_id() {
-    let rig = Rig::new("usage-idem");
+fn migration_036_extends_the_single_usage_table_and_adds_the_class_time_index() {
+    let rig = Rig::new("usage-profile-migration");
     let store = rig.open();
-    assert!(store
-        .record_usage_observation(&obs("msg1", "p/m", 500.0, 5000.0, 1000.0))
-        .unwrap());
-    // Same id again → no new row (a redrive must not double-count).
+    let connection = rusqlite::Connection::open(rig.db_path()).unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(model_route_usage)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for column in [
+        "reasoning_tokens",
+        "cached_read_tokens",
+        "cache_write_tokens",
+        "workload_class",
+        "account_key",
+    ] {
+        assert!(
+            columns.iter().any(|actual| actual == column),
+            "missing {column}"
+        );
+    }
+    let usage_tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%usage%'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(usage_tables, vec!["model_route_usage"]);
+    let index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'model_route_usage_workload_class_observed_idx'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_count, 1);
+    drop(connection);
+    drop(store);
+}
+
+#[test]
+fn usage_records_rows_below_speed_eligibility_but_rejects_empty_ids() {
+    let rig = Rig::new("usage-gates");
+    let store = rig.open();
     assert!(!store
-        .record_usage_observation(&obs("msg1", "p/m", 999.0, 9999.0, 2000.0))
+        .record_usage_observation(&obs("a", "p/m", 50.0, 5_000.0, 1_000.0))
         .unwrap());
+    assert!(!store
+        .record_usage_observation(&obs("b", "p/m", 500.0, 500.0, 1_000.0))
+        .unwrap());
+    assert!(!store
+        .record_usage_observation(&obs("", "p/m", 500.0, 5_000.0, 1_000.0))
+        .unwrap());
+    assert!(store
+        .record_usage_observation(&obs("c", "p/m", 500.0, 5_000.0, 1_000.0))
+        .unwrap());
+    assert_eq!(usage_row_counts(&rig), (3, 3));
+}
+
+#[test]
+fn later_usable_delivery_fills_null_speed_columns_without_adding_a_row() {
+    let rig = Rig::new("usage-upgrade");
+    let store = rig.open();
+    let mut unusable = complete_usage("upgrade");
+    unusable.output_tokens = f64::NAN;
+    unusable.duration_ms = f64::INFINITY;
+    assert!(!store.record_usage_observation(&unusable).unwrap());
+    let before = stored_usage_row(&rig, "upgrade");
+    assert_eq!(before.output_tokens, None);
+    assert_eq!(before.duration_ms, None);
+
+    let mut later = complete_usage("upgrade");
+    later.route_key = "other/route".into();
+    later.capacity_key = "other/capacity".into();
+    later.provider_id = "other".into();
+    later.input_tokens = Some(999.0);
+    later.output_tokens = 250.0;
+    later.reasoning_tokens = Some(99.0);
+    later.cached_read_tokens = Some(999.0);
+    later.cache_write_tokens = Some(999.0);
+    later.duration_ms = 2_000.0;
+    later.workload_class = Some("head".into());
+    later.account_key = Some("other/account".into());
+    later.observed_at = 2_000.0;
+    assert!(store.record_usage_observation(&later).unwrap());
+
+    let after = stored_usage_row(&rig, "upgrade");
+    assert_eq!(after.output_tokens, Some(250));
+    assert_eq!(after.duration_ms, Some(2_000));
+    assert_eq!(after.input_tokens, before.input_tokens);
+    assert_eq!(after.reasoning_tokens, before.reasoning_tokens);
+    assert_eq!(after.cached_read_tokens, before.cached_read_tokens);
+    assert_eq!(after.cache_write_tokens, before.cache_write_tokens);
+    assert_eq!(after.workload_class, before.workload_class);
+    assert_eq!(after.account_key, before.account_key);
+    assert_eq!(after.route_key, before.route_key);
+    assert_eq!(after.capacity_key, before.capacity_key);
+    assert_eq!(after.provider_id, before.provider_id);
+    assert_eq!(after.observed_at, before.observed_at);
+    assert_eq!(usage_row_counts(&rig), (1, 1));
+}
+
+#[test]
+fn complete_usage_row_is_immutable_on_redelivery_and_message_ids_stay_unique() {
+    let rig = Rig::new("usage-complete-redelivery");
+    let store = rig.open();
+    let original = complete_usage("complete");
+    assert!(store.record_usage_observation(&original).unwrap());
+    let before = stored_usage_row(&rig, "complete");
+
+    let mut redelivery = complete_usage("complete");
+    redelivery.route_key = "other/route".into();
+    redelivery.capacity_key = "other/capacity".into();
+    redelivery.provider_id = "other".into();
+    redelivery.input_tokens = Some(200.0);
+    redelivery.output_tokens = 900.0;
+    redelivery.reasoning_tokens = Some(200.0);
+    redelivery.cached_read_tokens = Some(900.0);
+    redelivery.cache_write_tokens = Some(50.0);
+    redelivery.duration_ms = 9_000.0;
+    redelivery.workload_class = Some("head".into());
+    redelivery.account_key = Some("other/account".into());
+    redelivery.observed_at = 9_000.0;
+    assert!(!store.record_usage_observation(&redelivery).unwrap());
+    assert_eq!(stored_usage_row(&rig, "complete"), before);
+
+    let mut incomplete = complete_usage("upgrade");
+    incomplete.output_tokens = 0.0;
+    incomplete.duration_ms = -1.0;
+    assert!(!store.record_usage_observation(&incomplete).unwrap());
+    assert!(store
+        .record_usage_observation(&obs("upgrade", "p/m/high", 100.0, 1_000.0, 2_000.0))
+        .unwrap());
+    assert_eq!(usage_row_counts(&rig), (2, 2));
+}
+
+#[test]
+fn non_finite_output_is_stored_as_null() {
+    let rig = Rig::new("usage-non-finite-output");
+    let store = rig.open();
+    for (id, output) in [
+        ("nan", f64::NAN),
+        ("positive-infinity", f64::INFINITY),
+        ("negative-infinity", f64::NEG_INFINITY),
+    ] {
+        assert!(!store
+            .record_usage_observation(&obs(id, "p/m", output, 1_000.0, 1_000.0))
+            .unwrap());
+        assert_eq!(stored_usage_row(&rig, id).output_tokens, None);
+    }
+}
+
+#[test]
+fn non_positive_and_floor_zero_output_are_stored_as_null() {
+    let rig = Rig::new("usage-zero-output");
+    let store = rig.open();
+    for (id, output) in [("negative", -1.0), ("zero", 0.0), ("floor-zero", 0.99)] {
+        assert!(!store
+            .record_usage_observation(&obs(id, "p/m", output, 1_000.0, 1_000.0))
+            .unwrap());
+        assert_eq!(stored_usage_row(&rig, id).output_tokens, None);
+    }
+}
+
+#[test]
+fn non_finite_and_negative_duration_are_stored_as_null() {
+    let rig = Rig::new("usage-invalid-duration");
+    let store = rig.open();
+    for (id, duration) in [
+        ("nan", f64::NAN),
+        ("positive-infinity", f64::INFINITY),
+        ("negative-infinity", f64::NEG_INFINITY),
+        ("negative", -0.1),
+    ] {
+        assert!(!store
+            .record_usage_observation(&obs(id, "p/m", 100.0, duration, 1_000.0))
+            .unwrap());
+        assert_eq!(stored_usage_row(&rig, id).duration_ms, None);
+    }
+
+    assert!(!store
+        .record_usage_observation(&obs("zero", "p/m", 100.0, 0.0, 1_000.0))
+        .unwrap());
+    assert_eq!(stored_usage_row(&rig, "zero").duration_ms, Some(0));
 }
 
 #[test]

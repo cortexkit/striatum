@@ -4147,8 +4147,14 @@ mod tests {
                     route_key: "observed-caller/fixture/high".into(),
                     capacity_key: "observed-caller/fixture".into(),
                     provider_id: "observed-caller".into(),
+                    input_tokens: None,
                     output_tokens: 1_000.0 + index as f64,
+                    reasoning_tokens: None,
+                    cached_read_tokens: None,
+                    cache_write_tokens: None,
                     duration_ms: 1_000.0,
+                    workload_class: None,
+                    account_key: None,
                     observed_at: observed_at + index as f64,
                 })
                 .unwrap();

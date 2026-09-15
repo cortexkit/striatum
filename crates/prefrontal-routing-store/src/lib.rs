@@ -118,6 +118,8 @@ const MIGRATION_033: &str = include_str!("../migrations/033_aa_inferred_provenan
 const MIGRATION_034: &str = include_str!("../migrations/034_fusiform_catalog.sql");
 /// Migration 35: canonical model-family spellings and independent provenance.
 const MIGRATION_035: &str = include_str!("../migrations/035_model_family_vocabulary.sql");
+/// Migration 36: per-message token profile, attribution, and class/time lookup.
+const MIGRATION_036: &str = include_str!("../migrations/036_usage_profile.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -135,6 +137,19 @@ pub const OBSERVED_SPEED_SAMPLES_SQL: &str = "SELECT output_tokens, duration_ms
      ORDER BY observed_at DESC
      LIMIT ?6";
 
+/// Fetch one workload class's complete token-profile population through its class/time index.
+pub const WORKLOAD_CLASS_USAGE_SAMPLES_SQL: &str = "SELECT input_tokens, output_tokens,
+            reasoning_tokens, cached_read_tokens, cache_write_tokens
+     FROM model_route_usage INDEXED BY model_route_usage_workload_class_observed_idx
+     WHERE workload_class = ?1
+       AND observed_at > ?2
+       AND observed_at <= ?3
+       AND input_tokens IS NOT NULL
+       AND output_tokens IS NOT NULL
+       AND reasoning_tokens IS NOT NULL
+       AND cached_read_tokens IS NOT NULL
+       AND cache_write_tokens IS NOT NULL";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedSpeedAggregate {
     route_key: String,
@@ -143,7 +158,7 @@ struct ObservedSpeedAggregate {
     duration_ms: i64,
 }
 
-fn route_state_migrations() -> [Migration; 35] {
+fn route_state_migrations() -> [Migration; 36] {
     [
         Migration {
             version: 1,
@@ -284,6 +299,10 @@ fn route_state_migrations() -> [Migration; 35] {
         Migration {
             version: 35,
             statements: MIGRATION_035,
+        },
+        Migration {
+            version: 36,
+            statements: MIGRATION_036,
         },
     ]
 }
@@ -1242,6 +1261,24 @@ fn bool_to_int(v: Option<bool>) -> Option<i64> {
     v.map(|b| if b { 1 } else { 0 })
 }
 
+fn floored_i64(value: f64) -> Option<i64> {
+    let floored = value.floor();
+    (value.is_finite() && floored >= i64::MIN as f64 && floored < i64::MAX as f64)
+        .then_some(floored as i64)
+}
+
+fn stored_token_count(value: f64) -> Option<i64> {
+    (value >= 0.0).then(|| floored_i64(value)).flatten()
+}
+
+fn stored_output_tokens(value: f64) -> Option<i64> {
+    stored_token_count(value).filter(|tokens| *tokens > 0)
+}
+
+fn stored_workload_class(value: Option<&str>) -> Option<&str> {
+    value.filter(|class| matches!(*class, "ephemeral" | "head" | "gather" | "hire"))
+}
+
 impl RouteStateStore for SqliteRouteStateStore {
     fn upsert_fact(&self, fact: &ModelFact, source: FactSource) -> RouteStateResult<()> {
         let mut fact = fact.clone();
@@ -2139,10 +2176,6 @@ impl RouteStateStore for SqliteRouteStateStore {
     }
 
     fn record_usage_observation(&self, obs: &UsageObservation) -> RouteStateResult<bool> {
-        // Eligibility gates, ported verbatim from the TS recordUsageObservation: a
-        // sample must have non-empty keys and clear the per-sample minimums, else it
-        // is rejected (returns false, no row). These are the same constants used by
-        // get_observed_speed, so the write and the read agree on what "eligible" means.
         if obs.id.trim().is_empty()
             || obs.route_key.trim().is_empty()
             || obs.capacity_key.trim().is_empty()
@@ -2150,35 +2183,90 @@ impl RouteStateStore for SqliteRouteStateStore {
         {
             return Ok(false);
         }
-        if !obs.output_tokens.is_finite() || obs.output_tokens < USAGE_MIN_OUTPUT_TOKENS {
+        let Some(observed_at) = floored_i64(obs.observed_at) else {
             return Ok(false);
-        }
-        if !obs.duration_ms.is_finite() || obs.duration_ms < USAGE_MIN_DURATION_MS {
-            return Ok(false);
-        }
-        if !obs.observed_at.is_finite() {
-            return Ok(false);
-        }
+        };
+
+        let input_tokens = obs.input_tokens.and_then(stored_token_count);
+        let output_tokens = stored_output_tokens(obs.output_tokens);
+        let reasoning_tokens = obs.reasoning_tokens.and_then(stored_token_count);
+        let cached_read_tokens = obs.cached_read_tokens.and_then(stored_token_count);
+        let cache_write_tokens = obs.cache_write_tokens.and_then(stored_token_count);
+        let duration_ms = (obs.duration_ms >= 0.0)
+            .then(|| floored_i64(obs.duration_ms))
+            .flatten();
+        let workload_class = stored_workload_class(obs.workload_class.as_deref());
+
         self.store
             .with_conn(|c: &Connection| {
-                // Idempotent by message id: a redrive of the same message is a no-op.
-                let changes = c.execute(
-                    "INSERT INTO model_route_usage
-                       (id, task_id, route_key, capacity_key, provider_id,
-                        input_tokens, output_tokens, duration_ms, observed_at)
-                     VALUES (?1, NULL, ?2, ?3, ?4, NULL, ?5, ?6, ?7)
-                     ON CONFLICT(id) DO NOTHING",
-                    params![
-                        obs.id,
-                        obs.route_key,
-                        obs.capacity_key,
-                        obs.provider_id,
-                        obs.output_tokens.floor() as i64,
-                        obs.duration_ms.floor() as i64,
-                        obs.observed_at.floor() as i64,
-                    ],
-                )?;
-                Ok(changes > 0)
+                let held_speed_observation = c
+                    .query_row(
+                        "SELECT COALESCE(output_tokens >= ?2 AND duration_ms >= ?3, FALSE)
+                         FROM model_route_usage
+                         WHERE id = ?1",
+                        params![
+                            obs.id,
+                            USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
+                            USAGE_MIN_DURATION_MS.floor() as i64,
+                        ],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+
+                let stored_speed_values = c
+                    .query_row(
+                        "INSERT INTO model_route_usage
+                           (id, task_id, route_key, capacity_key, provider_id,
+                            input_tokens, output_tokens, duration_ms, observed_at,
+                            reasoning_tokens, cached_read_tokens, cache_write_tokens,
+                            workload_class, account_key)
+                         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                                 ?9, ?10, ?11, ?12, ?13)
+                         ON CONFLICT(id) DO UPDATE SET
+                           input_tokens = COALESCE(model_route_usage.input_tokens,
+                                                   excluded.input_tokens),
+                           output_tokens = COALESCE(model_route_usage.output_tokens,
+                                                    excluded.output_tokens),
+                           duration_ms = COALESCE(model_route_usage.duration_ms,
+                                                 excluded.duration_ms),
+                           reasoning_tokens = COALESCE(model_route_usage.reasoning_tokens,
+                                                       excluded.reasoning_tokens),
+                           cached_read_tokens = COALESCE(model_route_usage.cached_read_tokens,
+                                                         excluded.cached_read_tokens),
+                           cache_write_tokens = COALESCE(model_route_usage.cache_write_tokens,
+                                                         excluded.cache_write_tokens),
+                           workload_class = COALESCE(model_route_usage.workload_class,
+                                                     excluded.workload_class),
+                           account_key = COALESCE(model_route_usage.account_key,
+                                                  excluded.account_key)
+                         RETURNING output_tokens, duration_ms",
+                        params![
+                            obs.id,
+                            obs.route_key,
+                            obs.capacity_key,
+                            obs.provider_id,
+                            input_tokens,
+                            output_tokens,
+                            duration_ms,
+                            observed_at,
+                            reasoning_tokens,
+                            cached_read_tokens,
+                            cache_write_tokens,
+                            workload_class,
+                            obs.account_key.as_deref(),
+                        ],
+                        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                    )
+                    .optional()?;
+
+                let holds_speed_observation =
+                    stored_speed_values.is_some_and(|(output, duration)| {
+                        output
+                            .is_some_and(|tokens| tokens >= USAGE_MIN_OUTPUT_TOKENS.floor() as i64)
+                            && duration.is_some_and(|ms| ms >= USAGE_MIN_DURATION_MS.floor() as i64)
+                    });
+                Ok(!held_speed_observation && holds_speed_observation)
             })
             .map_err(err)
     }

@@ -1288,8 +1288,14 @@ pub fn build_model_speed_observation(
         route_key: make_route_key(provider_id, model_id, variant.as_deref()),
         capacity_key,
         provider_id: provider_id.to_string(),
+        input_tokens: None,
         output_tokens: total_output,
+        reasoning_tokens: facts.reasoning_tokens,
+        cached_read_tokens: None,
+        cache_write_tokens: None,
         duration_ms,
+        workload_class: None,
+        account_key: None,
         observed_at: facts.completed_ms,
     })
 }

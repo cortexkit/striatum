@@ -218,17 +218,23 @@ pub struct DecisionRow {
     pub created_at: f64,
 }
 
-/// One completed assistant-message TPS observation. `id` is the message id (the
-/// idempotency key: a redrive of the same message must not double-count). Mirrors
-/// the TS `ModelRouteUsageObservation` write fields.
+/// One completed assistant-message usage delivery. `id` is the message id (the
+/// idempotency key: a redrive of the same message must not double-count). Optional
+/// values distinguish an unavailable measurement from an authoritative zero.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageObservation {
     pub id: String,
     pub route_key: String,
     pub capacity_key: String,
     pub provider_id: String,
+    pub input_tokens: Option<f64>,
     pub output_tokens: f64,
+    pub reasoning_tokens: Option<f64>,
+    pub cached_read_tokens: Option<f64>,
+    pub cache_write_tokens: Option<f64>,
     pub duration_ms: f64,
+    pub workload_class: Option<String>,
+    pub account_key: Option<String>,
     pub observed_at: f64,
 }
 
@@ -373,10 +379,9 @@ pub trait RouteStateStore {
     }
 
     // ── Usage observations (observed TPS) ───────────────────
-    /// Record one completed-message TPS observation. Idempotent by `id` (the message
-    /// id): a redrive of the same message is a no-op. Returns true if a new row was
-    /// inserted, false if the observation was rejected by the eligibility gates or
-    /// was a duplicate. Mirrors the TS `recordUsageObservation`.
+    /// Record one completed-message usage delivery. Idempotent by `id`: a later
+    /// delivery only fills measurements that are still NULL. Returns true exactly
+    /// when this delivery newly makes the stored row eligible for observed speed.
     fn record_usage_observation(&self, obs: &UsageObservation) -> RouteStateResult<bool>;
 
     /// Aggregate recent eligible usage rows for a route into observed output
