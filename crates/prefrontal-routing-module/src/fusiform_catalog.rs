@@ -7,7 +7,7 @@
 //!
 //! | field group | default authority | operator override |
 //! | --- | --- | --- |
-//! | vision, tool use, context/output limits, output price/tier | Fusiform | an explicit override of that same field wins |
+//! | vision, tool use, context/output limits, rates/output tier | Fusiform | an explicit override of that same field wins |
 //! | Elo, EQ, speed, variants, exclusions, multipliers, prompt defaults | operator | always retained; Fusiform cannot represent them |
 //!
 //! Wire decoding is isolated here and pinned to the producer-real fixture copied
@@ -113,8 +113,16 @@ struct CatalogModelFacts {
     context: Option<u64>,
     #[serde(rename = "limit.output")]
     output: Option<u64>,
+    #[serde(rename = "rate.input")]
+    input_rate: Option<CatalogRate>,
+    #[serde(rename = "rate.cache_read")]
+    cache_read_rate: Option<CatalogRate>,
+    #[serde(rename = "rate.cache_write")]
+    cache_write_rate: Option<CatalogRate>,
     #[serde(rename = "rate.output")]
     output_rate: Option<CatalogRate>,
+    #[serde(rename = "rate.reasoning")]
+    reasoning_rate: Option<CatalogRate>,
 }
 
 /// Fusiform `RateValue`, tagged by `state` (fusiform-core lib.rs): `priced`
@@ -145,7 +153,7 @@ struct CatalogSnapshot {
     facts: Vec<FusiformFactUpdate>,
 }
 
-/// What a served output rate yields, or why it yields no price.
+/// What a served catalog rate yields, or why it yields no price.
 ///
 /// A bare `None` made three different situations identical: the producer served
 /// no rate at all, the producer said "unpriced", and this consumer REFUSED to
@@ -153,15 +161,13 @@ struct CatalogSnapshot {
 /// one that must never hide among the other two.
 #[derive(Debug, Clone, PartialEq)]
 enum OutputPrice {
-    /// Output dollars per million tokens.
+    /// Dollars per million tokens for the catalog field being decoded.
     Known(f64),
-    /// Nothing to decode: no `rate.output` key on the model, or an explicit
-    /// `unpriced` state. Checked in Fusiform's own store on 2026-09-06 for
-    /// ollama-cloud: it holds existence, limits and capabilities for those models
-    /// and no price record whatsoever, because the catalog it reads publishes no
-    /// price for them. Those routes are genuinely unpriced rather than
-    /// mis-decoded, and routing ranks them at maximum cost while saying so in its
-    /// explanation.
+    /// Nothing to decode: the rate key is absent or has an explicit `unpriced`
+    /// state. Checked in Fusiform's own store on 2026-09-06 for ollama-cloud: it
+    /// holds existence, limits and capabilities for those models and no price
+    /// records because the source catalog publishes none. These rates are
+    /// genuinely absent rather than mis-decoded.
     NotPublished,
     /// A rate WAS served and this consumer declined it: a currency it cannot
     /// convert, a negative amount, or an exponent outside the range it can scale.
@@ -169,7 +175,7 @@ enum OutputPrice {
     Refused(String),
 }
 
-fn output_cost(rate: Option<&CatalogRate>) -> OutputPrice {
+fn rate_cost(rate: Option<&CatalogRate>) -> OutputPrice {
     let Some(rate) = rate else {
         return OutputPrice::NotPublished;
     };
@@ -201,20 +207,31 @@ fn output_cost(rate: Option<&CatalogRate>) -> OutputPrice {
     }
 }
 
-/// Report one refused rate per model per process. A refusal persists across every
-/// poll while the upstream keeps publishing that rate, so logging it per cycle
-/// would bury it; logging it never is how it stayed invisible.
-fn report_refused_rate_once(served_key: &str, detail: &str) {
+/// Report one refusal per model and rate field per process. A refusal persists
+/// across every poll while the upstream keeps publishing that rate, so logging it
+/// per cycle would bury it; logging it never is how it stayed invisible.
+fn report_refused_rate_once(served_key: &str, catalog_key: &str, detail: &str) {
     static REPORTED: std::sync::OnceLock<Mutex<std::collections::BTreeSet<String>>> =
         std::sync::OnceLock::new();
     let reported = REPORTED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
     let Ok(mut reported) = reported.lock() else {
         return;
     };
-    if reported.insert(format!("{served_key}\u{1e}{detail}")) {
+    if reported.insert(format!("{served_key}\u{1e}{catalog_key}\u{1e}{detail}")) {
         eprintln!(
-            "[prefrontal-routing] fusiform served an output rate for {served_key} that this consumer cannot decode ({detail}); the route will be priced as unknown and ranked at maximum cost"
+            "[prefrontal-routing] fusiform served {catalog_key} for {served_key} but this consumer refused it ({detail}); that rate stays absent"
         );
+    }
+}
+
+fn decoded_rate(served_key: &str, catalog_key: &str, rate: Option<&CatalogRate>) -> Option<f64> {
+    match rate_cost(rate) {
+        OutputPrice::Known(cost) => Some(cost),
+        OutputPrice::NotPublished => None,
+        OutputPrice::Refused(detail) => {
+            report_refused_rate_once(served_key, catalog_key, &detail);
+            None
+        }
     }
 }
 
@@ -273,14 +290,21 @@ fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogEr
             .as_ref()
             .map(|modalities| modalities.iter().any(|value| value == "image"))
             .or(model.attachment);
-        let cost_per_mtok_out = match output_cost(model.output_rate.as_ref()) {
-            OutputPrice::Known(cost) => Some(cost),
-            OutputPrice::NotPublished => None,
-            OutputPrice::Refused(detail) => {
-                report_refused_rate_once(&served_key, &detail);
-                None
-            }
-        };
+        let cost_per_mtok_out =
+            decoded_rate(&served_key, "rate.output", model.output_rate.as_ref());
+        let input_rate = decoded_rate(&served_key, "rate.input", model.input_rate.as_ref());
+        let cache_read_rate = decoded_rate(
+            &served_key,
+            "rate.cache_read",
+            model.cache_read_rate.as_ref(),
+        );
+        let cache_write_rate = decoded_rate(
+            &served_key,
+            "rate.cache_write",
+            model.cache_write_rate.as_ref(),
+        );
+        let reasoning_rate =
+            decoded_rate(&served_key, "rate.reasoning", model.reasoning_rate.as_ref());
         facts.push(FusiformFactUpdate {
             provider_id: provider_id.to_string(),
             model_id: model_id.to_string(),
@@ -289,6 +313,10 @@ fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogEr
             max_output_tokens: model.output,
             cost_tier: cost_tier(cost_per_mtok_out),
             cost_per_mtok_out,
+            input_rate,
+            cache_read_rate,
+            cache_write_rate,
+            reasoning_rate,
             supports_vision,
             supports_tool_use: model.tool_call,
         });
@@ -746,13 +774,13 @@ mod tests {
             "unit_provenance": {"kind": "assumed_by_policy", "policy": "models-dev-usd-v1"}
         }))
         .unwrap();
-        assert_eq!(output_cost(Some(&priced)), OutputPrice::Known(15.0));
+        assert_eq!(rate_cost(Some(&priced)), OutputPrice::Known(15.0));
         let zero: CatalogRate = serde_json::from_value(json!({ "state": "stated_zero" })).unwrap();
-        assert_eq!(output_cost(Some(&zero)), OutputPrice::Known(0.0));
+        assert_eq!(rate_cost(Some(&zero)), OutputPrice::Known(0.0));
         let unpriced: CatalogRate =
             serde_json::from_value(json!({ "state": "unpriced", "reason": "source_omitted" }))
                 .unwrap();
-        assert_eq!(output_cost(Some(&unpriced)), OutputPrice::NotPublished);
+        assert_eq!(rate_cost(Some(&unpriced)), OutputPrice::NotPublished);
     }
 
     #[test]
@@ -762,7 +790,7 @@ mod tests {
         // it reads publishes no price for those models. All 23 ollama-cloud rows in
         // the live routing store are this case (checked 2026-09-06 in Fusiform's
         // own store, which holds no price record for that provider at all).
-        assert_eq!(output_cost(None), OutputPrice::NotPublished);
+        assert_eq!(rate_cost(None), OutputPrice::NotPublished);
         let served: CatalogModelFacts = serde_json::from_value(json!({
             "existence": "present",
             "capability.tool_call": true,
@@ -770,7 +798,11 @@ mod tests {
             "limit.output": 65_536
         }))
         .unwrap();
+        assert!(served.input_rate.is_none());
+        assert!(served.cache_read_rate.is_none());
+        assert!(served.cache_write_rate.is_none());
         assert!(served.output_rate.is_none());
+        assert!(served.reasoning_rate.is_none());
 
         // A rate this consumer declines must be distinguishable from one that was
         // never published: the first is a consumer gap to fix, the second is not.
@@ -778,7 +810,7 @@ mod tests {
             "currency": "EUR", "exponent": 9, "state": "priced", "units": 15000000000_i64
         }))
         .unwrap();
-        let OutputPrice::Refused(detail) = output_cost(Some(&foreign)) else {
+        let OutputPrice::Refused(detail) = rate_cost(Some(&foreign)) else {
             panic!("a non-USD rate must be reported as refused, not as unpublished");
         };
         assert!(detail.contains("EUR"), "{detail}");
@@ -788,9 +820,67 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            output_cost(Some(&oversized)),
+            rate_cost(Some(&oversized)),
             OutputPrice::Refused(_)
         ));
+    }
+
+    #[test]
+    fn unpublished_unpriced_and_refused_rates_remain_absent_and_zero_is_served() {
+        let mut response = fixture()["catalog.get — one model, current"]["response"].clone();
+        let model = response["models"]["anthropic/claude-sonnet-4-5"]
+            .as_object_mut()
+            .unwrap();
+        model.insert("rate.input".to_string(), json!({ "state": "stated_zero" }));
+        model.insert(
+            "rate.cache_read".to_string(),
+            json!({ "state": "unpriced", "reason": "source_omitted" }),
+        );
+        model.insert(
+            "rate.cache_write".to_string(),
+            json!({ "currency": "EUR", "exponent": 9, "state": "priced", "units": 1_i64 }),
+        );
+        model.remove("rate.reasoning");
+
+        let snapshot = decode_catalog_get(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let fact = &snapshot.facts[0];
+        assert_eq!(fact.input_rate, Some(0.0));
+        assert_eq!(fact.cache_read_rate, None);
+        assert_eq!(fact.cache_write_rate, None);
+        assert_eq!(fact.reasoning_rate, None);
+        assert_eq!(fact.cost_per_mtok_out, Some(15.0));
+
+        let rig = Rig::new("zero-and-absent-rates");
+        let store = rig.store();
+        store
+            .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
+            .unwrap();
+        use prefrontal_routing_core::RouteStateStore as _;
+        let stored = store
+            .get_fact_by_route_key("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .expect("fixture fact survives catalog sync");
+        assert_eq!(stored.input_rate, Some(0.0));
+        assert_eq!(stored.cache_read_rate, None);
+        assert_eq!(stored.cache_write_rate, None);
+        assert_eq!(stored.reasoning_rate, None);
+
+        response["models"]["anthropic/claude-sonnet-4-5"]["rate.reasoning"] = json!({ "currency": "USD", "exponent": 9, "state": "priced", "units": 2_000_000_000_i64 });
+        let priced_reasoning = decode_catalog_get(&serde_json::to_vec(&response).unwrap())
+            .unwrap()
+            .facts
+            .pop()
+            .unwrap();
+        assert_eq!(priced_reasoning.reasoning_rate, Some(2.0));
+
+        response["models"]["anthropic/claude-sonnet-4-5"]["rate.reasoning"] =
+            json!({ "currency": "USD", "exponent": 19, "state": "priced", "units": 1_i64 });
+        let refused_reasoning = decode_catalog_get(&serde_json::to_vec(&response).unwrap())
+            .unwrap()
+            .facts
+            .pop()
+            .unwrap();
+        assert_eq!(refused_reasoning.reasoning_rate, None);
     }
 
     #[test]
@@ -817,10 +907,36 @@ mod tests {
         assert_eq!(fact.context_window, Some(200_000.0));
         assert_eq!(fact.max_output_tokens, Some(64_000));
         assert_eq!(fact.cost_per_mtok_out, Some(15.0));
+        assert_eq!(fact.input_rate, Some(3.0));
+        assert_eq!(fact.cache_read_rate, Some(0.3));
+        assert_eq!(fact.cache_write_rate, Some(3.75));
+        assert_eq!(fact.reasoning_rate, None);
         assert_eq!(fact.cost_tier, Some(3.0));
 
         let status = decode_catalog_status(&get_reply("catalog.status")).unwrap();
         assert_eq!(status.catalog_version, 0);
+    }
+
+    #[test]
+    fn fixture_catalog_rates_reach_the_model_fact_used_by_selection_cost() {
+        use prefrontal_routing_core::RouteStateStore as _;
+
+        let rig = Rig::new("rate-card-selection-fact");
+        let store = rig.store();
+        let snapshot = decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
+        store
+            .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
+            .unwrap();
+
+        let fact = store
+            .get_fact_by_route_key("anthropic/claude-sonnet-4-5")
+            .unwrap()
+            .expect("fixture fact survives catalog sync");
+        assert_eq!(fact.input_rate, Some(3.0));
+        assert_eq!(fact.cache_read_rate, Some(0.3));
+        assert_eq!(fact.cache_write_rate, Some(3.75));
+        assert_eq!(fact.reasoning_rate, None);
+        assert_eq!(fact.cost_per_m_tok_out, Some(15.0));
     }
 
     #[test]

@@ -74,6 +74,10 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         max_output_tokens: None,
         cost_tier: Some(2.0),
         cost_per_m_tok_out: Some(4.5),
+        input_rate: None,
+        cache_read_rate: None,
+        cache_write_rate: None,
+        reasoning_rate: None,
         supports_vision: Some(true),
         supports_tool_use: Some(true),
         prompt_defaults: None,
@@ -2590,6 +2594,10 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
         max_output_tokens: Some(32_000),
         cost_tier: Some(3.0),
         cost_per_mtok_out: Some(12.0),
+        input_rate: Some(2.5),
+        cache_read_rate: Some(0.25),
+        cache_write_rate: Some(3.125),
+        reasoning_rate: Some(12.0),
         supports_vision: Some(vision),
         supports_tool_use: Some(true),
     };
@@ -2604,6 +2612,10 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
         .unwrap();
     let fusiform = store.get_fact_by_route_key(&route_key).unwrap().unwrap();
     assert_eq!(fusiform.supports_vision, Some(false));
+    assert_eq!(fusiform.input_rate, Some(2.5));
+    assert_eq!(fusiform.cache_read_rate, Some(0.25));
+    assert_eq!(fusiform.cache_write_rate, Some(3.125));
+    assert_eq!(fusiform.reasoning_rate, Some(12.0));
     assert_eq!(
         fusiform.scores.elo, initial_elo,
         "Fusiform cannot alter Elo"
@@ -2660,6 +2672,10 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
         max_output_tokens: Some(8_192),
         cost_tier: Some(1.0),
         cost_per_mtok_out: Some(2.0),
+        input_rate: None,
+        cache_read_rate: None,
+        cache_write_rate: None,
+        reasoning_rate: None,
         supports_vision: Some(provider == "anthropic"),
         supports_tool_use: Some(true),
     };
@@ -2700,6 +2716,10 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
         max_output_tokens: Some(4_096),
         cost_tier: Some(1.0),
         cost_per_mtok_out: Some(1.0),
+        input_rate: None,
+        cache_read_rate: None,
+        cache_write_rate: None,
+        reasoning_rate: None,
         supports_vision: Some(false),
         supports_tool_use: Some(true),
     };

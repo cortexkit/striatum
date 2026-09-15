@@ -334,6 +334,18 @@ pub struct ModelFact {
     /// Continuous output $/Mtok: the cost objective input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_m_tok_out: Option<f64>,
+    /// Catalog-served input $/Mtok. Absence is distinct from an explicit zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_rate: Option<f64>,
+    /// Catalog-served cached-read $/Mtok. Absence is distinct from an explicit zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_rate: Option<f64>,
+    /// Catalog-served cache-write $/Mtok. Absence is distinct from an explicit zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_rate: Option<f64>,
+    /// Optional catalog-served reasoning $/Mtok.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_rate: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

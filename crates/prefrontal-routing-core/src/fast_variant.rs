@@ -266,6 +266,10 @@ mod tests {
             max_output_tokens: None,
             cost_tier: Some(0.0),
             cost_per_m_tok_out: Some(0.0),
+            input_rate: None,
+            cache_read_rate: None,
+            cache_write_rate: None,
+            reasoning_rate: None,
             supports_vision: Some(true),
             supports_tool_use: Some(true),
             prompt_defaults: Some(ModelPromptDefaults {

@@ -120,6 +120,10 @@ const MIGRATION_034: &str = include_str!("../migrations/034_fusiform_catalog.sql
 const MIGRATION_035: &str = include_str!("../migrations/035_model_family_vocabulary.sql");
 /// Migration 36: per-message token profile, attribution, and class/time lookup.
 const MIGRATION_036: &str = include_str!("../migrations/036_usage_profile.sql");
+/// Migration 37: the remaining catalog rate card fields. Renumbered from 36 at
+/// settle under CR-Q4: two slices legitimately claimed the next free number, which
+/// is a merge concern rather than a design one.
+const MIGRATION_037: &str = include_str!("../migrations/037_catalog_rates.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -158,7 +162,7 @@ struct ObservedSpeedAggregate {
     duration_ms: i64,
 }
 
-fn route_state_migrations() -> [Migration; 36] {
+fn route_state_migrations() -> [Migration; 37] {
     [
         Migration {
             version: 1,
@@ -304,6 +308,10 @@ fn route_state_migrations() -> [Migration; 36] {
             version: 36,
             statements: MIGRATION_036,
         },
+        Migration {
+            version: 37,
+            statements: MIGRATION_037,
+        },
     ]
 }
 
@@ -389,6 +397,10 @@ pub struct FusiformFactUpdate {
     pub max_output_tokens: Option<u64>,
     pub cost_tier: Option<f64>,
     pub cost_per_mtok_out: Option<f64>,
+    pub input_rate: Option<f64>,
+    pub cache_read_rate: Option<f64>,
+    pub cache_write_rate: Option<f64>,
+    pub reasoning_rate: Option<f64>,
     pub supports_vision: Option<bool>,
     pub supports_tool_use: Option<bool>,
 }
@@ -408,6 +420,10 @@ struct CatalogFingerprintRow {
     max_output_tokens: Option<u64>,
     cost_tier: Option<f64>,
     cost_per_mtok_out: Option<f64>,
+    input_rate: Option<f64>,
+    cache_read_rate: Option<f64>,
+    cache_write_rate: Option<f64>,
+    reasoning_rate: Option<f64>,
     supports_vision: Option<bool>,
     supports_tool_use: Option<bool>,
     prompt_defaults_json: Option<String>,
@@ -435,6 +451,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 json_extract(scores_json, '$.eq') AS eq,
                 json_extract(scores_json, '$.speed') AS speed,
                 context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
+                input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
                 speed_multiplier, excluded, fusiform_present
          FROM model_facts
@@ -455,13 +472,17 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             max_output_tokens: row.get(10)?,
             cost_tier: row.get(11)?,
             cost_per_mtok_out: row.get(12)?,
-            supports_vision: row.get::<_, Option<i64>>(13)?.map(|value| value != 0),
-            supports_tool_use: row.get::<_, Option<i64>>(14)?.map(|value| value != 0),
-            prompt_defaults_json: row.get(15)?,
-            confidence: row.get(16)?,
-            speed_multiplier: row.get(17)?,
-            excluded: row.get::<_, i64>(18)? != 0,
-            fusiform_present: row.get::<_, Option<i64>>(19)?.map(|value| value != 0),
+            input_rate: row.get(13)?,
+            cache_read_rate: row.get(14)?,
+            cache_write_rate: row.get(15)?,
+            reasoning_rate: row.get(16)?,
+            supports_vision: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
+            supports_tool_use: row.get::<_, Option<i64>>(18)?.map(|value| value != 0),
+            prompt_defaults_json: row.get(19)?,
+            confidence: row.get(20)?,
+            speed_multiplier: row.get(21)?,
+            excluded: row.get::<_, i64>(22)? != 0,
+            fusiform_present: row.get::<_, Option<i64>>(23)?.map(|value| value != 0),
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -744,19 +765,21 @@ impl SqliteRouteStateStore {
                             "INSERT INTO model_facts (
                                route_key, capacity_key, provider_id, model_id, variant, family,
                                scores_json, context_window, max_output_tokens, cost_tier,
-                               cost_per_mtok_out, supports_vision, supports_tool_use,
-                               prompt_defaults_json, confidence, notes, speed_multiplier,
-                               excluded, source, updated_at, aa_index, review_by_ms, eq_source,
-                               facts_source, fusiform_version, fusiform_present,
-                               context_window_source, max_output_tokens_source, cost_tier_source,
+                               cost_per_mtok_out, input_rate, cache_read_rate,
+                               cache_write_rate, reasoning_rate, supports_vision,
+                               supports_tool_use, prompt_defaults_json, confidence, notes,
+                               speed_multiplier, excluded, source, updated_at, aa_index,
+                               review_by_ms, eq_source, facts_source, fusiform_version,
+                               fusiform_present, context_window_source,
+                               max_output_tokens_source, cost_tier_source,
                                cost_per_mtok_out_source, supports_vision_source,
                                supports_tool_use_source
                              ) VALUES (
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
-                               ?8, ?9, ?10, NULL, 'unknown',
+                               ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
                                'discovered by Fusiform; awaiting operator score placement',
-                               NULL, 0, 'unscored', ?11, NULL, NULL, NULL,
-                               'fusiform', ?12, ?13,
+                               NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
+                               'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
                                'fusiform', 'fusiform'
                              )",
@@ -769,6 +792,10 @@ impl SqliteRouteStateStore {
                                 fact.max_output_tokens,
                                 fact.cost_tier,
                                 fact.cost_per_mtok_out,
+                                fact.input_rate,
+                                fact.cache_read_rate,
+                                fact.cache_write_rate,
+                                fact.reasoning_rate,
                                 bool_to_int(fact.supports_vision),
                                 bool_to_int(fact.supports_tool_use),
                                 now_ms(),
@@ -815,10 +842,14 @@ impl SqliteRouteStateStore {
                                  THEN cost_tier ELSE ?3 END,
                                cost_per_mtok_out = CASE WHEN cost_per_mtok_out_source = 'override'
                                  THEN cost_per_mtok_out ELSE ?4 END,
+                               input_rate = ?5,
+                               cache_read_rate = ?6,
+                               cache_write_rate = ?7,
+                               reasoning_rate = ?8,
                                supports_vision = CASE WHEN supports_vision_source = 'override'
-                                 THEN supports_vision ELSE ?5 END,
+                                 THEN supports_vision ELSE ?9 END,
                                supports_tool_use = CASE WHEN supports_tool_use_source = 'override'
-                                 THEN supports_tool_use ELSE ?6 END,
+                                 THEN supports_tool_use ELSE ?10 END,
                                context_window_source = CASE WHEN context_window_source = 'override'
                                  THEN context_window_source ELSE 'fusiform' END,
                                max_output_tokens_source = CASE WHEN max_output_tokens_source = 'override'
@@ -831,14 +862,18 @@ impl SqliteRouteStateStore {
                                  THEN supports_vision_source ELSE 'fusiform' END,
                                supports_tool_use_source = CASE WHEN supports_tool_use_source = 'override'
                                  THEN supports_tool_use_source ELSE 'fusiform' END,
-                               facts_source = 'fusiform', fusiform_version = ?7,
-                               fusiform_present = ?8, updated_at = ?9
-                             WHERE provider_id = ?10 AND model_id = ?11",
+                               facts_source = 'fusiform', fusiform_version = ?11,
+                               fusiform_present = ?12, updated_at = ?13
+                             WHERE provider_id = ?14 AND model_id = ?15",
                             params![
                                 fact.context_window,
                                 fact.max_output_tokens,
                                 fact.cost_tier,
                                 fact.cost_per_mtok_out,
+                                fact.input_rate,
+                                fact.cache_read_rate,
+                                fact.cache_write_rate,
+                                fact.reasoning_rate,
                                 bool_to_int(fact.supports_vision),
                                 bool_to_int(fact.supports_tool_use),
                                 cursor.catalog_version,
@@ -1239,6 +1274,10 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         max_output_tokens: row.get::<_, Option<u64>>("max_output_tokens")?,
         cost_tier: row.get::<_, Option<f64>>("cost_tier")?,
         cost_per_m_tok_out: row.get::<_, Option<f64>>("cost_per_mtok_out")?,
+        input_rate: row.get::<_, Option<f64>>("input_rate")?,
+        cache_read_rate: row.get::<_, Option<f64>>("cache_read_rate")?,
+        cache_write_rate: row.get::<_, Option<f64>>("cache_write_rate")?,
+        reasoning_rate: row.get::<_, Option<f64>>("reasoning_rate")?,
         supports_vision: row
             .get::<_, Option<i64>>("supports_vision")?
             .map(|v| v != 0),
@@ -1335,9 +1374,10 @@ impl RouteStateStore for SqliteRouteStateStore {
                      "INSERT INTO model_facts (
                        route_key, capacity_key, provider_id, model_id, variant, family, family_source,
                        scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
+                         input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                          supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
                          source, updated_at, aa_index, review_by_ms, eq_source
-                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
+                        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
                       ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,
@@ -1348,6 +1388,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                        scores_json=excluded.scores_json, context_window=excluded.context_window,
                        max_output_tokens=excluded.max_output_tokens, cost_tier=excluded.cost_tier,
                        cost_per_mtok_out=excluded.cost_per_mtok_out,
+                       input_rate=excluded.input_rate, cache_read_rate=excluded.cache_read_rate,
+                       cache_write_rate=excluded.cache_write_rate,
+                       reasoning_rate=excluded.reasoning_rate,
                        supports_vision=excluded.supports_vision, supports_tool_use=excluded.supports_tool_use,
                        prompt_defaults_json=excluded.prompt_defaults_json, confidence=excluded.confidence,
                         notes=excluded.notes, speed_multiplier=excluded.speed_multiplier,
@@ -1371,6 +1414,10 @@ impl RouteStateStore for SqliteRouteStateStore {
                         fact.max_output_tokens,
                         fact.cost_tier,
                         fact.cost_per_m_tok_out,
+                        fact.input_rate,
+                        fact.cache_read_rate,
+                        fact.cache_write_rate,
+                        fact.reasoning_rate,
                         bool_to_int(fact.supports_vision),
                         bool_to_int(fact.supports_tool_use),
                         prompt_defaults_json,
