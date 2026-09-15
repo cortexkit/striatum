@@ -403,8 +403,11 @@ fn cheapness_cannot_select_below_the_quality_bar() {
     assert_eq!(r.model.model_id, "strong");
 }
 
+/// A subscription route with no pressure reading says so: the quota term below
+/// turns both "measured as idle" and "nothing measured" into the same 0.0, so
+/// the explanation is the only place a reader can tell them apart.
 #[test]
-fn subscription_route_no_fresh_quota_window_explains_stale_signal() {
+fn a_subscription_route_without_a_pressure_reading_says_the_signal_is_absent() {
     let sub = fact(FactBuilder {
         provider_id: "opencode-go".into(),
         model_id: "qwen3.7-max".into(),
@@ -422,10 +425,60 @@ fn subscription_route_no_fresh_quota_window_explains_stale_signal() {
         ..Default::default()
     };
     let r = select_model_route(input(vec![sub], req(80.0, 20.0), extra)).unwrap();
-    assert!(r
-        .explanation
-        .iter()
-        .any(|e| e == "quota signal: none (source stale/down)"));
+    assert!(
+        r.explanation
+            .iter()
+            .any(|e| e == "quota signal: none (no reading)"),
+        "explanation was {:?}",
+        r.explanation
+    );
+}
+
+/// The arm the old predicate could never reach. It keyed on a `governing_window`
+/// that nothing in production wrote, so the absent-signal line printed on EVERY
+/// subscription route - 411 of 411 decisions in 24h, including routes carrying a
+/// real pressure value from the same snapshot. A route whose pressure IS known
+/// must not claim its signal is missing.
+#[test]
+fn a_subscription_route_with_a_pressure_reading_does_not_claim_the_signal_is_absent() {
+    let sub = fact(FactBuilder {
+        provider_id: "opencode-go".into(),
+        model_id: "qwen3.7-max".into(),
+        scores: scores(60.0, 1800.0, 90.0),
+        ..Default::default()
+    });
+    let mut by_capacity = std::collections::HashMap::new();
+    by_capacity.insert(
+        make_capacity_key("opencode-go", "qwen3.7-max"),
+        RouteRuntimeState {
+            quota_pressure: Some(0.4),
+            ..Default::default()
+        },
+    );
+    let extra = Extra {
+        is_subscription_route: Some(Box::new(|route: &ModelRoute| {
+            route.provider_id == "opencode-go"
+        })),
+        runtime_snapshot: Some(ModelRouteStateSnapshot {
+            now: 1_000_000.0,
+            by_capacity,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let r = select_model_route(input(vec![sub], req(80.0, 20.0), extra)).unwrap();
+    assert!(
+        !r.explanation
+            .iter()
+            .any(|e| e.starts_with("quota signal: none")),
+        "a known pressure must not read as an absent signal: {:?}",
+        r.explanation
+    );
+    assert!(
+        r.explanation.iter().any(|e| e.starts_with("quota +")),
+        "the pressure must reach the objective: {:?}",
+        r.explanation
+    );
 }
 
 // ── anchored (not min/max) normalization ────────────────────────────────────

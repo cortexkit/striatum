@@ -57,7 +57,6 @@ fn effective_runtime(
             .quota_window_model
             .or(by_capacity.quota_window_model),
         latency_ema_ms: by_route.latency_ema_ms.or(by_capacity.latency_ema_ms),
-        governing_window: by_route.governing_window.or(by_capacity.governing_window),
     }
 }
 

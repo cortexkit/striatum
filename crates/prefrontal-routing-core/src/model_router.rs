@@ -43,15 +43,6 @@ pub const REASON_EXCLUDED_BY_OPERATOR: &str = "excluded_by_operator";
 pub const REASON_EXCLUDED: &str = "excluded";
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct GoverningWindow {
-    pub window_key: String,
-    pub source: String,
-    pub observed_at: f64,
-    pub resets_at: f64,
-    pub utilization: f64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteRuntimeState {
     /// Confirmed cooldown/retry-after; route inadmissible until this time (ms epoch).
     pub cooldown_until: Option<f64>,
@@ -68,9 +59,6 @@ pub struct RouteRuntimeState {
     /// The pace model that produced `quota_pressure`, retained for decision audit.
     pub quota_window_model: Option<crate::quota_pace::PaceWindowModel>,
     pub latency_ema_ms: Option<f64>,
-    /// Provenance for the window that drove quota signals (audit + break-glass).
-    /// The pure scorer IGNORES this; only the integration seam reads it.
-    pub governing_window: Option<GoverningWindow>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -382,9 +370,6 @@ fn merged_runtime_state(
         if route_state.latency_ema_ms.is_some() {
             merged.latency_ema_ms = route_state.latency_ema_ms;
         }
-        if route_state.governing_window.is_some() {
-            merged.governing_window = route_state.governing_window.clone();
-        }
     }
     merged
 }
@@ -606,10 +591,19 @@ pub(crate) fn compute_objective(
     };
     notes.push(format!("cost +{cost:.2} ({detail})"));
 
-    // A subscription route with no governing window has a stale/down quota source;
-    // surface that honestly rather than implying pressure is known to be zero.
-    if is_subscription && runtime.governing_window.is_none() {
-        notes.push("quota signal: none (source stale/down)".to_string());
+    // A subscription route with NO pressure reading must say so, or a decision
+    // reader cannot tell "known to be idle" from "nothing was measured" - and
+    // both land on the same 0.0 in the term below.
+    //
+    // This used to key on a `governing_window` that nothing in production ever
+    // wrote, so it fired on every subscription route including the ones whose
+    // pressure was known: 411 of 411 decisions in 24h printed it, several while
+    // carrying a real pressure value from the same signal. It also named a cause
+    // ("source stale/down") that absence cannot establish - never instrumented,
+    // a gapped feed, and a refused projection are three different reasons and
+    // this side sees none of them. Say only what the reading shows.
+    if is_subscription && runtime.quota_pressure.is_none() {
+        notes.push("quota signal: none (no reading)".to_string());
     }
 
     let quota = runtime.quota_pressure.unwrap_or(0.0) * OBJECTIVE_WEIGHT_QUOTA;
