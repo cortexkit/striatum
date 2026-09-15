@@ -58,6 +58,10 @@ pub struct RouteRuntimeState {
     pub quota_pressure: Option<f64>,
     /// The pace model that produced `quota_pressure`, retained for decision audit.
     pub quota_window_model: Option<crate::quota_pace::PaceWindowModel>,
+    /// Perishable quota headroom relative to time remaining. None is neutral.
+    pub quota_abundance: Option<f64>,
+    /// Window identity that produced `quota_abundance`.
+    pub quota_abundance_window: Option<String>,
     pub latency_ema_ms: Option<f64>,
 }
 
@@ -133,7 +137,7 @@ pub struct SelectModelRouteInput<'a> {
     pub providers_without_prompt_cache: HashSet<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectiveBreakdown {
     /// Continuous cost component (output $/Mtok ÷ reference, clamped 0..1).
@@ -144,6 +148,14 @@ pub struct ObjectiveBreakdown {
     pub speed_score: f64,
     /// cost + quota (purely economic); lower is a better pick. Speed breaks ties.
     pub selection_cost: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_abundance: Option<f64>,
+    /// Owned audit identity carried into the decision record. This allocates once
+    /// per scored candidate; shortlists are normally tens of routes. If they grow
+    /// by an order of magnitude, sharing provider window keys with `Arc<str>` is
+    /// preferable to repeating these short strings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_abundance_window: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -611,6 +623,12 @@ pub(crate) fn compute_objective(
         notes.push(format!("quota +{:.2}", quota));
     }
 
+    let quota_abundance = runtime.quota_abundance;
+    let quota_abundance_window = runtime.quota_abundance_window.clone();
+    if let (Some(abundance), Some(window)) = (quota_abundance, quota_abundance_window.as_deref()) {
+        notes.push(format!("quota abundance {abundance:.4} (window {window})"));
+    }
+
     let speed_score = normalized_speed(route.fact.scores.speed);
 
     let selection_cost = cost + quota;
@@ -634,6 +652,8 @@ pub(crate) fn compute_objective(
             quota,
             speed_score,
             selection_cost,
+            quota_abundance,
+            quota_abundance_window,
         },
         notes,
     )
@@ -851,11 +871,31 @@ pub fn select_model_route_with_config(
         if a_free && b_free && b.adequacy.adequacy != a.adequacy.adequacy {
             return cmp_f64(b.adequacy.adequacy, a.adequacy.adequacy);
         }
-        // 5. fastest among equal-cost (speed tie-break).
+        // 5. Inside the free bucket, spend headroom that expires sooner is used
+        // first. Quantized integer keys preserve a total order; an absent sample is
+        // neutral rather than favourable or fatal.
+        if a_free && b_free {
+            let a_abundance = a
+                .runtime
+                .quota_abundance
+                .filter(|value| value.is_finite())
+                .unwrap_or(1.0);
+            let b_abundance = b
+                .runtime
+                .quota_abundance
+                .filter(|value| value.is_finite())
+                .unwrap_or(1.0);
+            let a_quantum = (a_abundance * 1000.0).round() as i64;
+            let b_quantum = (b_abundance * 1000.0).round() as i64;
+            if a_quantum != b_quantum {
+                return b_quantum.cmp(&a_quantum);
+            }
+        }
+        // 6. fastest among equal-cost (speed tie-break).
         if sb.objective.speed_score != sa.objective.speed_score {
             return cmp_f64(sb.objective.speed_score, sa.objective.speed_score);
         }
-        // 6. cheaper-if-metered proxy, then capability, then routeKey.
+        // 7. cheaper-if-metered proxy, then capability, then routeKey.
         let a_cost = normalized_metered_cost(&a.route.fact);
         let b_cost = normalized_metered_cost(&b.route.fact);
         if a_cost != b_cost {
@@ -938,7 +978,7 @@ pub fn select_model_route_with_config(
             raw_adequacy: winner_admissible.adequacy.raw_adequacy,
             selection_cost: winner.objective.selection_cost,
             metrics: winner_admissible.adequacy.metrics.clone(),
-            objective: winner.objective,
+            objective: winner.objective.clone(),
         },
         prompt_params: PromptParams {
             provider_id: fact.provider_id.clone(),
@@ -1018,5 +1058,149 @@ fn fmt_num(n: f64) -> String {
         format!("{}", n as i64)
     } else {
         format!("{}", n)
+    }
+}
+
+#[cfg(test)]
+mod abundance_tests {
+    use super::*;
+    use crate::model_facts::{Confidence, ModelScores};
+
+    fn fact(provider: &str, model: &str, speed: f64) -> ModelFact {
+        ModelFact {
+            speed_is_fleet_median: false,
+            provider_id: provider.into(),
+            model_id: model.into(),
+            variant: None,
+            family: None,
+            scores: ModelScores {
+                elo: 1_800.0,
+                eq: 1_800.0,
+                speed,
+            },
+            context_window: None,
+            max_output_tokens: None,
+            cost_tier: None,
+            cost_per_m_tok_out: Some(0.0),
+            supports_vision: None,
+            supports_tool_use: None,
+            prompt_defaults: None,
+            confidence: Confidence::Curated,
+            notes: None,
+            speed_multiplier: None,
+            subscription_multiplier: None,
+            score_provenance: ScoreProvenance::Curated,
+            aa_index: None,
+            review_by_ms: None,
+            eq_source: None,
+        }
+    }
+
+    fn select(
+        facts: Vec<ModelFact>,
+        states: &[(&str, Option<f64>, Option<&str>)],
+    ) -> SelectedModelRoute {
+        let available_models = facts
+            .iter()
+            .map(|fact| make_capacity_key(&fact.provider_id, &fact.model_id))
+            .collect();
+        let by_capacity = states
+            .iter()
+            .map(|(capacity, abundance, window)| {
+                (
+                    (*capacity).to_string(),
+                    RouteRuntimeState {
+                        quota_abundance: *abundance,
+                        quota_abundance_window: window.map(|value| value.to_string()),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        select_model_route(SelectModelRouteInput {
+            target_agent: "mason".into(),
+            requirements: ModelRequirements { iq: 20.0, eq: 20.0 },
+            available_models,
+            facts,
+            runtime_snapshot: Some(ModelRouteStateSnapshot {
+                now: 1_000.0,
+                by_route: HashMap::new(),
+                by_capacity,
+            }),
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            prefer_fast_specs: Vec::new(),
+            required_capabilities: None,
+            is_subscription_route: None,
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: HashSet::new(),
+        })
+        .expect("fixture has an admissible route")
+    }
+
+    #[test]
+    fn objective_without_abundance_is_byte_identical_to_the_previous_shape() {
+        let objective = ObjectiveBreakdown {
+            cost: 0.25,
+            quota: 0.125,
+            speed_score: 0.75,
+            selection_cost: 0.375,
+            quota_abundance: None,
+            quota_abundance_window: None,
+        };
+
+        assert_eq!(
+            serde_json::to_string(&objective).expect("serialize objective"),
+            r#"{"cost":0.25,"quota":0.125,"speedScore":0.75,"selectionCost":0.375}"#
+        );
+    }
+
+    #[test]
+    fn decision_record_carries_abundance_value_and_window_identity() {
+        let decision = select(
+            vec![fact("openai", "gpt", 50.0)],
+            &[("openai/gpt", Some(4.0), Some("codexbar:codex:primary"))],
+        );
+        let objective = &decision.score.objective;
+        assert_eq!(objective.quota_abundance, Some(4.0));
+        assert_eq!(
+            objective.quota_abundance_window.as_deref(),
+            Some("codexbar:codex:primary")
+        );
+        let json = serde_json::to_value(&decision).expect("serialize decision");
+        assert_eq!(json["score"]["objective"]["quotaAbundance"], 4.0);
+        assert_eq!(
+            json["score"]["objective"]["quotaAbundanceWindow"],
+            "codexbar:codex:primary"
+        );
+        assert!(decision
+            .explanation
+            .iter()
+            .any(|line| line == "quota abundance 4.0000 (window codexbar:codex:primary)"));
+    }
+
+    #[test]
+    fn runtime_abundance_orders_the_free_bucket_before_speed_and_none_is_neutral() {
+        let abundant_over_neutral = select(
+            vec![
+                fact("abundant", "slow", 10.0),
+                fact("neutral", "fast", 100.0),
+            ],
+            &[("abundant/slow", Some(4.0), Some("abundant-window"))],
+        );
+        assert_eq!(
+            abundant_over_neutral.route_key, "abundant/slow",
+            "runtime abundance must be read before the faster neutral route wins"
+        );
+
+        let neutral_over_scarce = select(
+            vec![fact("neutral", "slow", 10.0), fact("scarce", "fast", 100.0)],
+            &[("scarce/fast", Some(0.25), Some("scarce-window"))],
+        );
+        assert_eq!(
+            neutral_over_scarce.route_key, "neutral/slow",
+            "an absent abundance sample is neutral 1.0, not zero"
+        );
     }
 }

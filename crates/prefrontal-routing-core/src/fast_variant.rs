@@ -41,6 +41,16 @@ fn effective_runtime(
         .get(route_key)
         .cloned()
         .unwrap_or_default();
+    // Abundance and its audit identity are one fact. Choose their scope once so a
+    // route-local number can never be labelled with a capacity window.
+    let (quota_abundance, quota_abundance_window) = if by_route.quota_abundance.is_some() {
+        (by_route.quota_abundance, by_route.quota_abundance_window)
+    } else {
+        (
+            by_capacity.quota_abundance,
+            by_capacity.quota_abundance_window,
+        )
+    };
     RouteRuntimeState {
         // Hard blocks compose across scopes; soft route telemetry replaces shared
         // telemetry only when the route has a value.
@@ -56,6 +66,8 @@ fn effective_runtime(
         quota_window_model: by_route
             .quota_window_model
             .or(by_capacity.quota_window_model),
+        quota_abundance,
+        quota_abundance_window,
         latency_ema_ms: by_route.latency_ema_ms.or(by_capacity.latency_ema_ms),
     }
 }
@@ -304,6 +316,8 @@ mod tests {
                     quota: 0.0,
                     speed_score: 0.5,
                     selection_cost: 0.0,
+                    quota_abundance: None,
+                    quota_abundance_window: None,
                 },
             },
             prompt_params: PromptParams {
@@ -343,6 +357,50 @@ mod tests {
             by_route: HashMap::new(),
             by_capacity,
         }
+    }
+
+    #[test]
+    fn effective_runtime_keeps_abundance_and_window_in_one_scope() {
+        let route_key = "provider/model@fast";
+        let capacity_key = "provider/model";
+        let mut snapshot = ModelRouteStateSnapshot {
+            now: 1_000.0,
+            by_route: HashMap::from([(
+                route_key.to_string(),
+                RouteRuntimeState {
+                    quota_abundance: Some(2.0),
+                    quota_abundance_window: Some("route-window".into()),
+                    ..Default::default()
+                },
+            )]),
+            by_capacity: HashMap::from([(
+                capacity_key.to_string(),
+                RouteRuntimeState {
+                    quota_abundance: Some(4.0),
+                    quota_abundance_window: Some("capacity-window".into()),
+                    ..Default::default()
+                },
+            )]),
+        };
+
+        let route_pair = effective_runtime(&snapshot, route_key, capacity_key);
+        assert_eq!(route_pair.quota_abundance, Some(2.0));
+        assert_eq!(
+            route_pair.quota_abundance_window.as_deref(),
+            Some("route-window")
+        );
+
+        snapshot
+            .by_route
+            .get_mut(route_key)
+            .expect("route state")
+            .quota_abundance_window = None;
+        let incomplete_route_pair = effective_runtime(&snapshot, route_key, capacity_key);
+        assert_eq!(incomplete_route_pair.quota_abundance, Some(2.0));
+        assert_eq!(
+            incomplete_route_pair.quota_abundance_window, None,
+            "an incomplete route pair must not borrow the capacity window identity"
+        );
     }
 
     #[test]
