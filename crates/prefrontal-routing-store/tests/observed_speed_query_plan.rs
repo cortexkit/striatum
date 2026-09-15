@@ -4,7 +4,10 @@ use prefrontal_routing_core::{
     OBSERVED_SPEED_SAMPLE_LIMIT, OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS,
     USAGE_MIN_OUTPUT_TOKENS,
 };
-use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore, OBSERVED_SPEED_SAMPLES_SQL};
+use prefrontal_routing_store::{
+    dev_descriptor, SqliteRouteStateStore, OBSERVED_SPEED_SAMPLES_SQL,
+    WORKLOAD_CLASS_USAGE_SAMPLES_SQL,
+};
 use rusqlite::{params, Connection};
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
@@ -65,6 +68,59 @@ fn observed_speed_sample_query_searches_the_route_time_index_without_a_temp_btre
             "expected no temporary sort for {route_key}, got {details:?}"
         );
     }
+
+    drop(connection);
+    drop(store);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn workload_class_usage_query_uses_the_workload_class_observed_index() {
+    let id = NEXT_DATABASE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "prefrontal-routing-workload-class-plan-{}-{timestamp}-{id}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let database = directory.join("store.db");
+    let descriptor = dev_descriptor(
+        &format!("prefrontal-routing-workload-class-plan-{id}"),
+        database.to_string_lossy(),
+    );
+    let store = SqliteRouteStateStore::open(&descriptor).expect("open applies migrations");
+    let connection = Connection::open(&database).expect("open migrated database for explain");
+    let explain_sql = format!("EXPLAIN QUERY PLAN {WORKLOAD_CLASS_USAGE_SAMPLES_SQL}");
+    let details = connection
+        .prepare(&explain_sql)
+        .unwrap()
+        .query_map(params!["ephemeral", 1_000_i64, 2_000_i64], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains(
+                "SEARCH model_route_usage USING INDEX \
+                 model_route_usage_workload_class_observed_idx",
+            ) && detail.contains("workload_class=?")
+                && detail.contains("observed_at>?")
+                && detail.contains("observed_at<?")
+        }),
+        "expected a bounded workload-class/time index search, got {details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .all(|detail| !detail.contains("USE TEMP B-TREE")),
+        "expected no temporary sort, got {details:?}"
+    );
 
     drop(connection);
     drop(store);
