@@ -731,3 +731,88 @@ fn derived_pool_remainder_can_pace_but_never_walls() {
         "derived balance data must never create a hard exhaustion wall"
     );
 }
+
+/// An idle account is a FREE account, and the across-account fold walls a
+/// capacity only when every account holding a signal for it is walled. An
+/// account that contributes no signal holds none, so an idle sibling used to
+/// vanish and one exhausted account walled the whole provider - the selector
+/// then returned a healthy but more expensive route, with no error anywhere
+/// (Loop R138). The two controls run first: the same shape with a 5%-used
+/// sibling, and with an exactly-idle sibling that reports a reset, both of
+/// which always kept their account represented.
+#[test]
+fn an_idle_account_keeps_its_provider_off_the_all_accounts_wall() {
+    let facts = vec![
+        fact("anthropic", "claude-opus-5", 1.0),
+        fact("xai", "grok-4.3", 100.0),
+    ];
+    let selected_provider = |free_window: serde_json::Value| -> (String, Option<f64>) {
+        let windows = vec![
+            usage_from_json(serde_json::json!({
+                "provider": "claude", "apiProvider": "anthropic", "account": "walled",
+                "usage": {"primary": {"usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z"}}
+            })),
+            usage_from_json(serde_json::json!({
+                "provider": "claude", "apiProvider": "anthropic", "account": "free",
+                "usage": {"primary": free_window}
+            })),
+        ];
+        assert!(
+            windows.iter().all(ProviderUsage::is_healthy),
+            "both accounts must be healthy, or the specimen is about health rather than membership"
+        );
+        let snap = overlay(&windows, &facts, &HashMap::new());
+        let wall = snap
+            .by_capacity
+            .get("anthropic/claude-opus-5")
+            .and_then(|s| s.quota_exhausted_until);
+        let available = facts
+            .iter()
+            .map(|f| make_capacity_key(&f.provider_id, &f.model_id))
+            .collect();
+        let result = select_model_route(SelectModelRouteInput {
+            target_agent: "mason".into(),
+            requirements: ModelRequirements { iq: 80.0, eq: 20.0 },
+            available_models: available,
+            facts: facts.clone(),
+            runtime_snapshot: Some(snap),
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            prefer_fast_specs: Vec::new(),
+            required_capabilities: None,
+            is_subscription_route: None,
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: Default::default(),
+        })
+        .unwrap();
+        (result.model.provider_id, wall)
+    };
+
+    let (busy_sibling, busy_wall) = selected_provider(serde_json::json!({"usedPercent": 5.0}));
+    assert_eq!(
+        busy_sibling, "anthropic",
+        "a 5%-used sibling keeps the provider available"
+    );
+    assert_eq!(busy_wall, None, "and leaves no wall behind");
+
+    let (reset_sibling, reset_wall) = selected_provider(
+        serde_json::json!({"usedPercent": 0.0, "resetsAt": "2030-01-01T00:00:00Z"}),
+    );
+    assert_eq!(
+        reset_sibling, "anthropic",
+        "an idle sibling reporting a reset keeps it available"
+    );
+    assert_eq!(reset_wall, None);
+
+    // The case that used to disappear: idle, with no reset to report.
+    let (idle_sibling, idle_wall) = selected_provider(serde_json::json!({"usedPercent": 0.0}));
+    assert_eq!(
+        idle_wall, None,
+        "an idle account is unwalled, so the capacity must not be walled by its exhausted sibling"
+    );
+    assert_eq!(
+        idle_sibling, "anthropic",
+        "an idle sibling is no less available than a 5%-used one"
+    );
+}

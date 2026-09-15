@@ -85,12 +85,15 @@ fn rate_window_to_extracted(
         }
         parsed
     });
-    if utilization == 0.0 && resets_at.is_none() {
-        // QTA's `docs/consumer-contract.md` says resetsAt is optional and never
-        // fabricated. None means no recovery time was reported, never "idle";
-        // only a zero-use window with no recovery time is truly idle.
-        return None;
-    }
+    // An idle window used to return None here, on the reasoning that it carries no
+    // pressure worth pacing. It carries something else: THIS ACCOUNT IS FREE. The
+    // across-account fold walls a capacity only when every account holding a signal
+    // for it is walled, and an account with no signal holds none - so beside one
+    // exhausted sibling, a completely idle account vanished and the whole provider
+    // was walled until the exhausted account's reset. The selector then returned a
+    // healthy but more expensive route with no error anywhere (Loop R138). A
+    // zero-use window is emitted instead: zero pressure, unwalled, and PRESENT,
+    // which is what keeps its account in the population.
     Some(ExtractedWindow {
         window_key,
         scope_kind,
@@ -429,8 +432,14 @@ mod tests {
         assert_eq!(out[0].resets_at, None);
     }
 
+    // Renamed from `idle_no_reset_window_stays_skipped`. Its intent was right and
+    // its assertion was one level too strong: an idle window must contribute no
+    // PRESSURE and no wall, which is what the original comment argued for. It
+    // asserted the window was not emitted AT ALL, and that is what lost the
+    // account from the across-account fold, letting one exhausted sibling wall a
+    // provider whose other account was completely free (Loop R138).
     #[test]
-    fn idle_no_reset_window_stays_skipped() {
+    fn idle_no_reset_window_is_emitted_unwalled_rather_than_dropped() {
         let entry = ProviderUsage {
             stale: None,
             fetched_at: None,
@@ -454,7 +463,11 @@ mod tests {
             error_class: None,
         };
 
-        assert!(extract_windows(&entry, "ollama", "ollama", &[]).is_empty());
+        let out = extract_windows(&entry, "ollama", "ollama", &[]);
+        assert_eq!(out.len(), 1, "the account must stay represented");
+        assert_eq!(out[0].utilization, 0.0, "idle is zero pressure");
+        assert_eq!(out[0].resets_at, None, "and no recovery time is fabricated");
+        assert!(!out[0].limit_reached, "an idle window is not a wall");
     }
 
     #[test]
