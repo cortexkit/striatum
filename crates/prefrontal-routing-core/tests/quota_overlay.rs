@@ -816,3 +816,91 @@ fn an_idle_account_keeps_its_provider_off_the_all_accounts_wall() {
         "an idle sibling is no less available than a 5%-used one"
     );
 }
+
+/// A provider can report a window fully used AND declare semantics this router
+/// will not project. Those are different facts: refusing to guess the burn-rate
+/// trajectory of a rolling pool must not discard the measurement that the pool is
+/// spent. Skipping the window outright left no capacity state at all, and absent
+/// state is read as available, so the selector chose the exhausted route with the
+/// cheaper price (Loop R140).
+#[test]
+fn an_exhausted_rolling_window_still_walls_its_route() {
+    let facts = vec![
+        fact("openai", "gpt-5.4", 1.0),
+        fact("anthropic", "claude-opus-4-7", 100.0),
+    ];
+    let chosen = |window_model: Option<&str>, used: f64| -> (String, Option<f64>) {
+        let mut primary = serde_json::json!({ "usedPercent": used });
+        if let Some(model) = window_model {
+            primary["windowModel"] = model.into();
+        }
+        let windows = vec![usage_from_json(serde_json::json!({
+            "provider": "codex", "apiProvider": "openai", "account": "only",
+            "usage": { "primary": primary }
+        }))];
+        assert!(
+            windows.iter().all(ProviderUsage::is_healthy),
+            "the entry must be healthy, or the specimen is about health rather than pacing"
+        );
+        let snap = overlay(&windows, &facts, &HashMap::new());
+        let wall = snap
+            .by_capacity
+            .get("openai/gpt-5.4")
+            .and_then(|state| state.quota_exhausted_until);
+        let available = facts
+            .iter()
+            .map(|f| make_capacity_key(&f.provider_id, &f.model_id))
+            .collect();
+        let result = select_model_route(SelectModelRouteInput {
+            target_agent: "mason".into(),
+            requirements: ModelRequirements { iq: 50.0, eq: 50.0 },
+            available_models: available,
+            facts: facts.clone(),
+            runtime_snapshot: Some(snap),
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            prefer_fast_specs: Vec::new(),
+            required_capabilities: None,
+            is_subscription_route: None,
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: Default::default(),
+        })
+        .unwrap();
+        (result.model.model_id, wall)
+    };
+
+    // Controls: the same exhaustion under semantics the router DOES project.
+    let (absent_marker, absent_wall) = chosen(None, 100.0);
+    assert_eq!(
+        absent_marker, "claude-opus-4-7",
+        "an unmarked exhausted window walls"
+    );
+    assert!(absent_wall.is_some());
+    let (fixed_marker, fixed_wall) = chosen(Some("fixed"), 100.0);
+    assert_eq!(
+        fixed_marker, "claude-opus-4-7",
+        "a fixed exhausted window walls"
+    );
+    assert!(fixed_wall.is_some());
+
+    // An idle rolling window must still leave the cheap route selectable: the rule
+    // is about the measurement, not about distrusting rolling pools.
+    let (idle_rolling, idle_wall) = chosen(Some("rolling"), 0.0);
+    assert_eq!(
+        idle_rolling, "gpt-5.4",
+        "an idle rolling window walls nothing"
+    );
+    assert_eq!(idle_wall, None);
+
+    // The case that used to vanish.
+    let (exhausted_rolling, rolling_wall) = chosen(Some("rolling"), 100.0);
+    assert!(
+        rolling_wall.is_some(),
+        "a reported-spent rolling pool must record its wall even with no projection"
+    );
+    assert_eq!(
+        exhausted_rolling, "claude-opus-4-7",
+        "an exhausted rolling route must not be selected just because its pacing is unprojectable"
+    );
+}

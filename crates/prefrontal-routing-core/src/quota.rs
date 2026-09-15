@@ -270,12 +270,15 @@ struct CapacitySignal {
 
 type AccountSignals = HashMap<(String, String), HashMap<String, CapacitySignal>>;
 
+/// `pressure` is optional because an OBSERVED wall and a PROJECTED burn rate are
+/// different facts: a provider can report a window fully used while declaring
+/// semantics this router will not project (a rolling pool). Refusing to guess the
+/// trajectory must not also discard the measurement (Loop R140).
 fn record_capacity_signal(
     signals: &mut AccountSignals,
     account_key: &(String, String),
     targets: &[String],
-    pressure: f64,
-    window_model: PaceWindowModel,
+    pressure: Option<(f64, PaceWindowModel)>,
     exhausted_until: Option<f64>,
 ) {
     for cap in targets {
@@ -285,9 +288,11 @@ fn record_capacity_signal(
             .entry(cap.clone())
             .or_default();
         // Within one account, the tightest signal governs every capacity it covers.
-        if sig.pressure.is_none_or(|existing| pressure > existing) {
-            sig.pressure = Some(pressure);
-            sig.window_model = Some(window_model);
+        if let Some((pressure, window_model)) = pressure {
+            if sig.pressure.is_none_or(|existing| pressure > existing) {
+                sig.pressure = Some(pressure);
+                sig.window_model = Some(window_model);
+            }
         }
         if let Some(exhausted_until) = exhausted_until {
             sig.exhausted_until = Some(match sig.exhausted_until {
@@ -419,10 +424,14 @@ pub fn merge_quota_overlay_with(
                 },
                 pace_config,
             ) {
-                Ok(pace) => pace,
+                Ok(pace) => Some(pace),
                 // A producer has made the fixed-window premise explicitly false.
                 // Do not turn its rolling reset horizon into a confident projection.
-                Err(PaceError::RollingWindow) => continue,
+                // The UTILIZATION is still a measurement the producer stands behind,
+                // so the window continues below without a projection: skipping it
+                // outright discarded a reported 100%-used window and let the
+                // selector choose the exhausted route (Loop R140).
+                Err(PaceError::RollingWindow) => None,
             };
             let blocked = win.limit_reached || win.utilization >= hard_block_threshold;
 
@@ -439,9 +448,11 @@ pub fn merge_quota_overlay_with(
                 &mut signals,
                 &account_key,
                 &targets,
-                pace.pressure,
-                pace.window_model,
+                pace.map(|pace| (pace.pressure, pace.window_model)),
                 blocked.then(|| {
+                    // A rolling pool reports no fixed boundary, so its recovery time
+                    // is the local reprobe horizon rather than an invented provider
+                    // reset - the same fallback an unreported reset already takes.
                     win.resets_at
                         .unwrap_or(now_ms + NO_RESET_REPROBE_HORIZON_MS)
                 }),
@@ -481,8 +492,7 @@ pub fn merge_quota_overlay_with(
                 &mut signals,
                 &account_key,
                 provider_caps,
-                pressure,
-                window_model,
+                Some((pressure, window_model)),
                 exhausted_until,
             );
         }
