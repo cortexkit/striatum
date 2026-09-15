@@ -16,6 +16,7 @@ use prefrontal_routing_core::model_facts::{
     ModelPromptDefaults, ModelScores,
 };
 use prefrontal_routing_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
+use prefrontal_routing_core::route_state_store::UsageRecordResult;
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, failure_backoff_transition, CatalogFactField,
     DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffState,
@@ -2175,16 +2176,16 @@ impl RouteStateStore for SqliteRouteStateStore {
             .map_err(err)
     }
 
-    fn record_usage_observation(&self, obs: &UsageObservation) -> RouteStateResult<bool> {
+    fn record_usage_delivery(&self, obs: &UsageObservation) -> RouteStateResult<UsageRecordResult> {
         if obs.id.trim().is_empty()
             || obs.route_key.trim().is_empty()
             || obs.capacity_key.trim().is_empty()
             || obs.provider_id.trim().is_empty()
         {
-            return Ok(false);
+            return Ok(UsageRecordResult::default());
         }
         let Some(observed_at) = floored_i64(obs.observed_at) else {
-            return Ok(false);
+            return Ok(UsageRecordResult::default());
         };
 
         let input_tokens = obs.input_tokens.and_then(stored_token_count);
@@ -2211,8 +2212,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         ],
                         |row| row.get::<_, bool>(0),
                     )
-                    .optional()?
-                    .unwrap_or(false);
+                    .optional()?;
 
                 let stored_speed_values = c
                     .query_row(
@@ -2266,7 +2266,10 @@ impl RouteStateStore for SqliteRouteStateStore {
                             .is_some_and(|tokens| tokens >= USAGE_MIN_OUTPUT_TOKENS.floor() as i64)
                             && duration.is_some_and(|ms| ms >= USAGE_MIN_DURATION_MS.floor() as i64)
                     });
-                Ok(!held_speed_observation && holds_speed_observation)
+                Ok(UsageRecordResult {
+                    recorded: !held_speed_observation.unwrap_or(false) && holds_speed_observation,
+                    usage_recorded: held_speed_observation.is_none(),
+                })
             })
             .map_err(err)
     }

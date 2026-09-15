@@ -238,6 +238,15 @@ pub struct UsageObservation {
     pub observed_at: f64,
 }
 
+/// Per-delivery effects of the usage-row upsert.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageRecordResult {
+    /// This delivery newly made the stored row speed-eligible.
+    pub recorded: bool,
+    /// This delivery inserted the message-id row rather than updating it.
+    pub usage_recorded: bool,
+}
+
 // Observed-speed gates: ported VERBATIM from the TS `ModelRouteStore` so the Rust
 // observed TPS matches the plugin's bit-for-bit. A sample is only eligible if it
 // generated >= MIN_OUTPUT_TOKENS over >= MIN_DURATION_MS; an aggregate is only
@@ -379,10 +388,15 @@ pub trait RouteStateStore {
     }
 
     // ── Usage observations (observed TPS) ───────────────────
-    /// Record one completed-message usage delivery. Idempotent by `id`: a later
-    /// delivery only fills measurements that are still NULL. Returns true exactly
-    /// when this delivery newly makes the stored row eligible for observed speed.
-    fn record_usage_observation(&self, obs: &UsageObservation) -> RouteStateResult<bool>;
+    /// Return both effects of one completed-message usage upsert. A later delivery
+    /// only fills measurements that are still NULL.
+    fn record_usage_delivery(&self, obs: &UsageObservation) -> RouteStateResult<UsageRecordResult>;
+
+    /// Compatibility projection for callers that only need to know whether this
+    /// delivery newly made the stored row eligible for observed speed.
+    fn record_usage_observation(&self, obs: &UsageObservation) -> RouteStateResult<bool> {
+        Ok(self.record_usage_delivery(obs)?.recorded)
+    }
 
     /// Aggregate recent eligible usage rows for a route into observed output
     /// tokens/sec, or `None` if there is not enough trusted signal. `now` is the

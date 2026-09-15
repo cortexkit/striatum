@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use prefrontal_routing_core::model_resolution::build_usage_observation;
 use prefrontal_routing_core::{
-    build_model_speed_observation, find_most_specific_fallback_entry, fuzzy_match_model,
-    resolve_compatible_model_settings, resolve_model_capabilities, resolve_model_id_alias,
-    resolve_model_pipeline, resolve_user_model_pin, DesiredModelSettings, FallbackEntry,
-    ModelCapabilitiesInput, ModelCapabilitiesSnapshot, ModelCapabilitiesSnapshotEntry,
-    ModelResolutionRequest, NativeUsageFacts, RouteStateStore, SnapshotLimit, SnapshotModalities,
-    UserModelPinRequest, VariantFact,
+    find_most_specific_fallback_entry, fuzzy_match_model, resolve_compatible_model_settings,
+    resolve_model_capabilities, resolve_model_id_alias, resolve_model_pipeline,
+    resolve_user_model_pin, DesiredModelSettings, FallbackEntry, ModelCapabilitiesInput,
+    ModelCapabilitiesSnapshot, ModelCapabilitiesSnapshotEntry, ModelResolutionRequest,
+    NativeUsageFacts, RouteStateStore, SnapshotLimit, SnapshotModalities, UserModelPinRequest,
+    VariantFact,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -326,7 +327,7 @@ pub(super) fn usage_observation_from_store(
                 .or(entry.fact.variant),
         })
         .collect::<Vec<_>>();
-    Ok(build_model_speed_observation(&params, &variants))
+    Ok(build_usage_observation(&params, &variants))
 }
 
 #[cfg(test)]
