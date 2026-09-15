@@ -548,3 +548,20 @@ pub fn merge_quota_overlay_with(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pace_config_with_skew_ms(skew_ms: f64) -> PaceConfig {
+        let mut config = DEFAULT_PACE_CONFIG;
+        config.skew_ms = skew_ms;
+        config
+    }
+
+    #[test]
+    fn pace_fixture_varies_skew_by_copy_and_assign() {
+        let config = pace_config_with_skew_ms(250.0);
+        assert_eq!(config.skew_ms, 250.0);
+    }
+}
