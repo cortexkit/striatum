@@ -66,6 +66,33 @@ pub struct PaceConfig {
     pub hard_block_threshold: f64,
     pub util_fallback_start: f64,
     pub util_fallback_max: f64,
+    abundance_gain_exponent: f64,
+    scarcity_gain_exponent: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaceConfigError {
+    AbundanceGainExponentOutOfRange,
+    ScarcityGainExponentOutOfRange,
+}
+
+impl PaceConfig {
+    pub fn with_exponents(
+        abundance_gain_exponent: f64,
+        scarcity_gain_exponent: f64,
+    ) -> Result<Self, PaceConfigError> {
+        if !(0.0..=4.0).contains(&abundance_gain_exponent) {
+            return Err(PaceConfigError::AbundanceGainExponentOutOfRange);
+        }
+        if !(0.0..=4.0).contains(&scarcity_gain_exponent) {
+            return Err(PaceConfigError::ScarcityGainExponentOutOfRange);
+        }
+        Ok(Self {
+            abundance_gain_exponent,
+            scarcity_gain_exponent,
+            ..DEFAULT_PACE_CONFIG
+        })
+    }
 }
 
 pub const DEFAULT_PACE_CONFIG: PaceConfig = PaceConfig {
@@ -76,6 +103,8 @@ pub const DEFAULT_PACE_CONFIG: PaceConfig = PaceConfig {
     hard_block_threshold: 0.95,
     util_fallback_start: 0.6,
     util_fallback_max: 0.8,
+    abundance_gain_exponent: 1.0,
+    scarcity_gain_exponent: 1.0,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +153,41 @@ pub fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
     }
     let t = clamp01((x - edge0) / (edge1 - edge0));
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Score perishable quota headroom against the fraction of a fixed window left.
+/// Windows without a trustworthy fixed boundary produce no sample; their absence is
+/// interpreted as neutral by the caller that folds route abundance.
+pub fn project_quota_abundance(input: PaceInput, config: &PaceConfig) -> Option<f64> {
+    if input.provider_window_model == Some(ProviderWindowModel::Rolling) {
+        return None;
+    }
+
+    let resets_at = input.resets_at.filter(|value| value.is_finite())?;
+    let window_ms = input
+        .window_ms
+        .filter(|value| value.is_finite() && *value > 0.0)?;
+    let remaining_ms = resets_at - input.observed_at;
+    if !remaining_ms.is_finite() || remaining_ms <= 0.0 || remaining_ms <= config.skew_ms {
+        return None;
+    }
+
+    let headroom = 1.0 - clamp01(input.utilization);
+    if headroom <= 0.0 {
+        return Some(0.0);
+    }
+
+    let time_fraction = (remaining_ms / window_ms).min(1.0);
+    if !time_fraction.is_finite() || time_fraction <= 0.0 {
+        return None;
+    }
+    let relative_headroom = (headroom / time_fraction).clamp(1.0 / 64.0, 64.0);
+    let exponent = if relative_headroom >= 1.0 {
+        config.abundance_gain_exponent
+    } else {
+        config.scarcity_gain_exponent
+    };
+    Some(relative_headroom.powf(exponent))
 }
 
 /// Project quota pressure for a single window. Pure; every guard-table row is a
@@ -288,6 +352,175 @@ mod tests {
     use super::*;
 
     const C: PaceConfig = DEFAULT_PACE_CONFIG;
+
+    fn abundance(
+        utilization: f64,
+        remaining_ms: f64,
+        window_ms: Option<f64>,
+        config: &PaceConfig,
+    ) -> Option<f64> {
+        project_quota_abundance(
+            PaceInput {
+                utilization,
+                resets_at: Some(remaining_ms),
+                window_ms,
+                observed_at: 0.0,
+                provider_window_model: None,
+            },
+            config,
+        )
+    }
+
+    #[test]
+    fn exponent_constructor_accepts_the_closed_interval_and_rejects_every_other_shape() {
+        for value in [0.0, 0.5, 1.0, 4.0] {
+            assert!(PaceConfig::with_exponents(value, 1.0).is_ok());
+            assert!(PaceConfig::with_exponents(1.0, value).is_ok());
+        }
+
+        for value in [f64::NEG_INFINITY, -0.1, 4.000_001, f64::INFINITY, f64::NAN] {
+            assert_eq!(
+                PaceConfig::with_exponents(value, 1.0),
+                Err(PaceConfigError::AbundanceGainExponentOutOfRange)
+            );
+            assert_eq!(
+                PaceConfig::with_exponents(1.0, value),
+                Err(PaceConfigError::ScarcityGainExponentOutOfRange)
+            );
+        }
+    }
+
+    #[test]
+    fn default_pace_config_passes_exponent_validation() {
+        assert_eq!(
+            PaceConfig::with_exponents(
+                DEFAULT_PACE_CONFIG.abundance_gain_exponent,
+                DEFAULT_PACE_CONFIG.scarcity_gain_exponent,
+            ),
+            Ok(DEFAULT_PACE_CONFIG)
+        );
+    }
+
+    #[test]
+    fn equal_headroom_and_time_score_exactly_one_for_permitted_exponents() {
+        for alpha in [0.0, 0.5, 1.0, 4.0] {
+            for beta in [0.0, 0.5, 1.0, 4.0] {
+                let config = PaceConfig::with_exponents(alpha, beta).unwrap();
+                assert_eq!(
+                    abundance(0.75, 25_000.0, Some(100_000.0), &config),
+                    Some(1.0)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn time_fraction_clamps_at_one_for_an_idle_window() {
+        let score = abundance(0.0, 200_000.0, Some(100_000.0), &C);
+        let route_without_a_reading = None::<f64>.unwrap_or(1.0);
+
+        assert_eq!(score, Some(1.0));
+        assert_eq!(score.unwrap(), route_without_a_reading);
+    }
+
+    #[test]
+    fn exhausted_headroom_stays_zero_when_scarcity_is_flattened() {
+        let config = PaceConfig::with_exponents(1.0, 0.0).unwrap();
+        assert_eq!(
+            abundance(1.0, 50_000.0, Some(100_000.0), &config),
+            Some(0.0)
+        );
+        assert_eq!(
+            abundance(2.0, 50_000.0, Some(100_000.0), &config),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn imminent_reset_contributes_no_sample_to_the_fleet_maximum() {
+        let imminent = abundance(0.99, C.skew_ms, Some(100_000.0), &C);
+        let stable = abundance(0.0, 50_000.0, Some(100_000.0), &C);
+        let fleet_maximum = [imminent, stable]
+            .into_iter()
+            .flatten()
+            .max_by(f64::total_cmp);
+
+        assert_eq!(imminent, None);
+        assert_eq!(fleet_maximum, stable);
+    }
+
+    #[test]
+    fn relative_headroom_clamps_to_finite_bounds() {
+        let below = abundance(127.0 / 128.0, 100_000.0, Some(100_000.0), &C);
+        let above = abundance(0.0, 2_000.0, Some(256_000.0), &C);
+
+        assert_eq!(below, Some(1.0 / 64.0));
+        assert_eq!(above, Some(64.0));
+    }
+
+    #[test]
+    fn zero_exponents_flatten_only_their_half_without_reversing_order() {
+        let default_abundant = [
+            abundance(0.0, 50_000.0, Some(100_000.0), &C).unwrap(),
+            abundance(0.0, 25_000.0, Some(100_000.0), &C).unwrap(),
+        ];
+        let flat_abundant = PaceConfig::with_exponents(0.0, 1.0).unwrap();
+        let flattened_abundant = [
+            abundance(0.0, 50_000.0, Some(100_000.0), &flat_abundant).unwrap(),
+            abundance(0.0, 25_000.0, Some(100_000.0), &flat_abundant).unwrap(),
+        ];
+        assert!(default_abundant[0] < default_abundant[1]);
+        assert_eq!(flattened_abundant, [1.0, 1.0]);
+
+        let default_scarce = [
+            abundance(0.75, 100_000.0, Some(100_000.0), &C).unwrap(),
+            abundance(0.5, 100_000.0, Some(100_000.0), &C).unwrap(),
+        ];
+        let flat_scarce = PaceConfig::with_exponents(1.0, 0.0).unwrap();
+        let flattened_scarce = [
+            abundance(0.75, 100_000.0, Some(100_000.0), &flat_scarce).unwrap(),
+            abundance(0.5, 100_000.0, Some(100_000.0), &flat_scarce).unwrap(),
+        ];
+        assert!(default_scarce[0] < default_scarce[1]);
+        assert_eq!(flattened_scarce, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn unusable_antigravity_shaped_windows_are_neutral() {
+        let no_reset = project_quota_abundance(
+            PaceInput {
+                utilization: 0.1,
+                resets_at: None,
+                window_ms: Some(300_000.0),
+                observed_at: 0.0,
+                provider_window_model: None,
+            },
+            &C,
+        );
+        let no_length = abundance(0.1, 200_000.0, None, &C);
+
+        assert_eq!(no_reset, None);
+        assert_eq!(no_length, None);
+        assert_eq!(no_reset.unwrap_or(1.0), 1.0);
+        assert_eq!(no_length.unwrap_or(1.0), 1.0);
+    }
+
+    #[test]
+    fn rolling_window_has_no_abundance_sample_and_keeps_pressure_refusal() {
+        let input = PaceInput {
+            utilization: 0.25,
+            resets_at: Some(25_000.0),
+            window_ms: Some(100_000.0),
+            observed_at: 0.0,
+            provider_window_model: Some(ProviderWindowModel::Rolling),
+        };
+
+        assert_eq!(project_quota_abundance(input, &C), None);
+        assert_eq!(
+            project_quota_pressure(input, &C),
+            Err(PaceError::RollingWindow)
+        );
+    }
 
     #[test]
     fn clamp01_handles_nan_and_infinities() {
