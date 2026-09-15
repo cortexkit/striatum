@@ -280,8 +280,18 @@ pub struct NativeUsageFacts {
     pub reasoning_tokens: Option<f64>,
     pub created_ms: f64,
     pub completed_ms: f64,
+    /// Wall time the message spent inside tools: the UNION of its call
+    /// intervals, which the producer computes because only it holds them.
+    ///
+    /// Deliberately NOT the older `toolDurationMs`, which carried the SUM of
+    /// per-call durations under a name that read like elapsed time. Subtracting
+    /// a sum overstated speed whenever calls overlapped and discarded the sample
+    /// outright once the sum passed the message's own wall clock (Loop R143).
+    /// The old spelling is not accepted: a pre-rename host sends no exclusion at
+    /// all, so its samples understate speed for one restart window rather than
+    /// overstating it indefinitely.
     #[serde(default)]
-    pub tool_duration_ms: Option<f64>,
+    pub tool_elapsed_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1241,11 +1251,11 @@ pub fn build_model_speed_observation(
         return None;
     }
     let wall_duration = facts.completed_ms - facts.created_ms;
-    let tool_duration = facts.tool_duration_ms.unwrap_or(0.0);
-    let duration_ms = wall_duration - tool_duration;
+    let tool_elapsed = facts.tool_elapsed_ms.unwrap_or(0.0);
+    let duration_ms = wall_duration - tool_elapsed;
     if !wall_duration.is_finite()
-        || !tool_duration.is_finite()
-        || tool_duration < 0.0
+        || !tool_elapsed.is_finite()
+        || tool_elapsed < 0.0
         || !duration_ms.is_finite()
         || duration_ms <= 0.0
     {
@@ -1536,7 +1546,7 @@ mod tests {
                 reasoning_tokens: Some(30.0),
                 created_ms: now,
                 completed_ms: now + 3_000.0,
-                tool_duration_ms: None,
+                tool_elapsed_ms: None,
             },
             &[],
         )
@@ -1555,7 +1565,7 @@ mod tests {
                 reasoning_tokens: None,
                 created_ms: now,
                 completed_ms: now + 2_000.0,
-                tool_duration_ms: None,
+                tool_elapsed_ms: None,
             },
             &[
                 VariantFact {
