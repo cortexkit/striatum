@@ -1067,6 +1067,16 @@ mod abundance_tests {
     use crate::model_facts::{Confidence, ModelScores};
 
     fn fact(provider: &str, model: &str, speed: f64) -> ModelFact {
+        fact_with_cost_and_elo(provider, model, speed, Some(0.0), 1_800.0)
+    }
+
+    fn fact_with_cost_and_elo(
+        provider: &str,
+        model: &str,
+        speed: f64,
+        cost_per_m_tok_out: Option<f64>,
+        elo: f64,
+    ) -> ModelFact {
         ModelFact {
             input_rate: None,
             cache_read_rate: None,
@@ -1078,14 +1088,14 @@ mod abundance_tests {
             variant: None,
             family: None,
             scores: ModelScores {
-                elo: 1_800.0,
+                elo,
                 eq: 1_800.0,
                 speed,
             },
             context_window: None,
             max_output_tokens: None,
             cost_tier: None,
-            cost_per_m_tok_out: Some(0.0),
+            cost_per_m_tok_out,
             supports_vision: None,
             supports_tool_use: None,
             prompt_defaults: None,
@@ -1100,9 +1110,19 @@ mod abundance_tests {
         }
     }
 
-    fn select(
+    #[derive(Default)]
+    struct SelectOptions<'a> {
+        requirements: Option<ModelRequirements>,
+        exclude_route_keys: Vec<String>,
+        is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
+        prefer_prompt_cache: bool,
+        providers_without_prompt_cache: HashSet<String>,
+    }
+
+    fn select_with(
         facts: Vec<ModelFact>,
         states: &[(&str, Option<f64>, Option<&str>)],
+        options: SelectOptions<'_>,
     ) -> SelectedModelRoute {
         let available_models = facts
             .iter()
@@ -1123,7 +1143,9 @@ mod abundance_tests {
             .collect();
         select_model_route(SelectModelRouteInput {
             target_agent: "mason".into(),
-            requirements: ModelRequirements { iq: 20.0, eq: 20.0 },
+            requirements: options
+                .requirements
+                .unwrap_or(ModelRequirements { iq: 20.0, eq: 20.0 }),
             available_models,
             facts,
             runtime_snapshot: Some(ModelRouteStateSnapshot {
@@ -1131,16 +1153,23 @@ mod abundance_tests {
                 by_route: HashMap::new(),
                 by_capacity,
             }),
-            exclude_route_keys: Vec::new(),
+            exclude_route_keys: options.exclude_route_keys,
             operator_exclude_keys: Vec::new(),
             prefer_fast_specs: Vec::new(),
             required_capabilities: None,
-            is_subscription_route: None,
+            is_subscription_route: options.is_subscription_route,
             min_best_effort_adequacy: None,
-            prefer_prompt_cache: false,
-            providers_without_prompt_cache: HashSet::new(),
+            prefer_prompt_cache: options.prefer_prompt_cache,
+            providers_without_prompt_cache: options.providers_without_prompt_cache,
         })
         .expect("fixture has an admissible route")
+    }
+
+    fn select(
+        facts: Vec<ModelFact>,
+        states: &[(&str, Option<f64>, Option<&str>)],
+    ) -> SelectedModelRoute {
+        select_with(facts, states, SelectOptions::default())
     }
 
     #[test]
@@ -1205,6 +1234,264 @@ mod abundance_tests {
         assert_eq!(
             neutral_over_scarce.route_key, "neutral/slow",
             "an absent abundance sample is neutral 1.0, not zero"
+        );
+    }
+
+    #[test]
+    fn two_adequate_routes_whose_abundances_differ_by_at_least_one_quantum_rank_by_abundance() {
+        let decision = select(
+            vec![fact("alpha", "slow", 10.0), fact("beta", "fast", 100.0)],
+            &[
+                ("alpha/slow", Some(1.0020), Some("alpha-window")),
+                ("beta/fast", Some(1.0000), Some("beta-window")),
+            ],
+        );
+        assert_eq!(
+            decision.route_key, "alpha/slow",
+            "more abundant route must outrank the faster route when abundances differ by at least one quantum"
+        );
+        assert_eq!(decision.score.objective.quota_abundance, Some(1.0020));
+        assert_eq!(
+            decision.score.objective.quota_abundance_window.as_deref(),
+            Some("alpha-window")
+        );
+        assert!(
+            decision
+                .explanation
+                .iter()
+                .any(|line| line == "quota abundance 1.0020 (window alpha-window)"),
+            "explanation must state abundance value and window key: {:?}",
+            decision.explanation
+        );
+    }
+
+    #[test]
+    fn abundances_with_descending_speeds_sort_identically_under_every_permutation_with_no_panic_or_cycle(
+    ) {
+        let r1 = fact("p", "r1", 150.0);
+        let r2 = fact("p", "r2", 100.0);
+        let r3 = fact("p", "r3", 50.0);
+
+        let states = [
+            ("p/r1", Some(1.0000), Some("w1")),
+            ("p/r2", Some(1.0020), Some("w2")),
+            ("p/r3", Some(1.0040), Some("w3")),
+        ];
+
+        let permutations = [
+            vec![r1.clone(), r2.clone(), r3.clone()],
+            vec![r1.clone(), r3.clone(), r2.clone()],
+            vec![r2.clone(), r1.clone(), r3.clone()],
+            vec![r2.clone(), r3.clone(), r1.clone()],
+            vec![r3.clone(), r1.clone(), r2.clone()],
+            vec![r3.clone(), r2.clone(), r1],
+        ];
+
+        for perm in permutations {
+            let first = select(perm.clone(), &states);
+            assert_eq!(first.route_key, "p/r3");
+
+            let second = select_with(
+                perm.clone(),
+                &states,
+                SelectOptions {
+                    exclude_route_keys: vec!["p/r3".into()],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(second.route_key, "p/r2");
+
+            let third = select_with(
+                perm,
+                &states,
+                SelectOptions {
+                    exclude_route_keys: vec!["p/r3".into(), "p/r2".into()],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(third.route_key, "p/r1");
+        }
+    }
+
+    #[test]
+    fn abundance_fall_through_to_speed_tie_break() {
+        // 1.0000 and 1.0004 round to the same integer quantum (1000) and fall through to speed.
+        let decision = select(
+            vec![
+                fact("scarce", "fast", 100.0),
+                fact("abundant", "slow", 10.0),
+            ],
+            &[
+                ("scarce/fast", Some(1.0000), Some("w1")),
+                ("abundant/slow", Some(1.0004), Some("w2")),
+            ],
+        );
+        assert_eq!(
+            decision.route_key, "scarce/fast",
+            "equal abundance within quantum must fall through to the speed tie-break"
+        );
+    }
+
+    #[test]
+    fn two_routes_with_unequal_blended_adequacy_order_by_adequacy_regardless_of_abundance() {
+        let higher_adequacy = fact_with_cost_and_elo("p", "adequate", 10.0, Some(0.0), 2_000.0);
+        let lower_adequacy =
+            fact_with_cost_and_elo("p", "less_adequate", 100.0, Some(0.0), 1_800.0);
+
+        let decision = select_with(
+            vec![higher_adequacy, lower_adequacy],
+            &[
+                ("p/adequate", Some(1.0000), Some("w1")),
+                ("p/less_adequate", Some(4.0000), Some("w2")),
+            ],
+            SelectOptions {
+                requirements: Some(ModelRequirements { iq: 100.0, eq: 0.0 }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            decision.route_key, "p/adequate",
+            "unequal blended adequacy must order by adequacy regardless of abundance"
+        );
+    }
+
+    #[test]
+    fn mixed_pair_on_opposite_sides_of_effectively_free_orders_by_cost_and_never_reaches_abundance()
+    {
+        let free_route = fact_with_cost_and_elo("p", "free_scarce", 10.0, Some(0.0), 1_800.0);
+        let costly_route =
+            fact_with_cost_and_elo("p", "costly_abundant", 100.0, Some(3.0), 1_800.0);
+
+        let decision = select(
+            vec![free_route, costly_route],
+            &[
+                ("p/free_scarce", Some(0.5000), Some("w-free")),
+                ("p/costly_abundant", Some(4.0000), Some("w-costly")),
+            ],
+        );
+        assert_eq!(
+            decision.route_key, "p/free_scarce",
+            "routes on opposite sides of effectively-free must order by cost and never reach abundance"
+        );
+    }
+
+    #[test]
+    fn non_free_routes_with_identical_clamped_cost_order_by_speed_and_ignore_abundance() {
+        let fast_route = fact_with_cost_and_elo("p", "fast", 100.0, Some(100.0), 1_800.0);
+        let slow_route = fact_with_cost_and_elo("p", "slow", 10.0, Some(100.0), 1_800.0);
+
+        let decision = select(
+            vec![fast_route, slow_route],
+            &[
+                ("p/fast", Some(1.0000), Some("w-fast")),
+                ("p/slow", Some(2.0000), Some("w-slow")),
+            ],
+        );
+        assert_eq!(
+            decision.route_key, "p/fast",
+            "non-free routes must order by speed tie-break and ignore abundance; removing a_free && b_free guard reddens this"
+        );
+    }
+
+    #[test]
+    fn abundant_metered_route_outranks_scarce_subscription_route_in_free_bucket() {
+        let metered_route = fact_with_cost_and_elo("metered", "model", 10.0, Some(0.0), 1_800.0);
+        let sub_route = fact_with_cost_and_elo("sub", "model", 100.0, None, 1_800.0);
+
+        let decision = select_with(
+            vec![metered_route, sub_route],
+            &[
+                ("metered/model", Some(4.0000), Some("metered-window")),
+                ("sub/model", Some(1.0000), Some("sub-window")),
+            ],
+            SelectOptions {
+                is_subscription_route: Some(Box::new(|r: &ModelRoute| r.fact.provider_id == "sub")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            decision.route_key, "metered/model",
+            "abundant metered route must outrank scarce subscription route in free bucket; restricting step to subscription routes reddens this"
+        );
+    }
+
+    #[test]
+    fn route_with_no_usable_window_scores_neutral_abundance() {
+        let abundant_over_neutral = select(
+            vec![
+                fact("abundant", "slow", 10.0),
+                fact("neutral", "fast", 100.0),
+            ],
+            &[("abundant/slow", Some(1.0020), Some("w1"))],
+        );
+        assert_eq!(
+            abundant_over_neutral.route_key, "abundant/slow",
+            "route with at least one quantum more abundance must be preferred over neutral"
+        );
+
+        let neutral_over_scarce = select(
+            vec![fact("neutral", "slow", 10.0), fact("scarce", "fast", 100.0)],
+            &[("scarce/fast", Some(0.9980), Some("w2"))],
+        );
+        assert_eq!(
+            neutral_over_scarce.route_key, "neutral/slow",
+            "neutral route must never be demoted below a route at least one quantum scarcer"
+        );
+
+        let all_neutral = select(vec![fact("p", "fast", 100.0), fact("p", "slow", 10.0)], &[]);
+        assert_eq!(
+            all_neutral.route_key, "p/fast",
+            "bucket where every route is neutral orders by speed tie-break"
+        );
+    }
+
+    #[test]
+    fn prefer_prompt_cache_partition_survives_and_shows_separate_explanation_lines() {
+        let cached = fact("cached_provider", "model", 50.0);
+        let uncached = fact("uncached_provider", "model", 100.0);
+
+        let decision = select_with(
+            vec![cached, uncached],
+            &[
+                ("cached_provider/model", Some(1.0000), Some("cache-window")),
+                (
+                    "uncached_provider/model",
+                    Some(4.0000),
+                    Some("uncached-window"),
+                ),
+            ],
+            SelectOptions {
+                prefer_prompt_cache: true,
+                providers_without_prompt_cache: HashSet::from(["uncached_provider".into()]),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            decision.route_key, "cached_provider/model",
+            "prompt-cache preference must partition out uncached provider even if uncached has higher abundance"
+        );
+        assert_eq!(
+            decision.score.objective.selection_cost,
+            decision.score.objective.cost + decision.score.objective.quota
+        );
+        assert_eq!(decision.score.objective.selection_cost, 0.0);
+
+        assert!(
+            decision
+                .explanation
+                .iter()
+                .any(|line| line == "quota abundance 1.0000 (window cache-window)"),
+            "explanation must contain abundance line: {:?}",
+            decision.explanation
+        );
+        assert!(
+            decision
+                .explanation
+                .iter()
+                .any(|line| line.contains("(tiebreak)")),
+            "explanation must contain speed line: {:?}",
+            decision.explanation
         );
     }
 }
