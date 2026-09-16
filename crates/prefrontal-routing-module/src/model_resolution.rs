@@ -304,7 +304,11 @@ fn capabilities_reply(store: &SharedStore, params: CapabilitiesParams) -> Result
 /// stated validity and must not be kept; version 0 is a real recorded snapshot
 /// and is not the same thing.
 fn catalog_version(store: &SharedStore) -> Option<i64> {
-    store.fusiform_catalog_cursor().ok().flatten().map(|cursor| cursor.catalog_version)
+    store
+        .fusiform_catalog_cursor()
+        .ok()
+        .flatten()
+        .map(|cursor| cursor.catalog_version)
 }
 
 pub(super) async fn handle_agent_model_requirements(
