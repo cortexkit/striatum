@@ -3058,8 +3058,10 @@ async fn handle_record_usage(
         }
     };
     let Some(observation) = observation else {
-        let body = serde_json::to_vec(&json!({ "result": { "recorded": false } }))
-            .map_err(ModuleError::Json)?;
+        let body = serde_json::to_vec(
+            &json!({ "result": { "recorded": false, "usage_recorded": false } }),
+        )
+        .map_err(ModuleError::Json)?;
         let response = Frame::build_with_version(
             ver,
             FrameType::Response,
@@ -3072,10 +3074,13 @@ async fn handle_record_usage(
         .map_err(|error| ModuleError::Message(error.to_string()))?;
         return send(writer, response).await;
     };
-    match store.record_usage_observation(&observation) {
-        Ok(recorded) => {
-            let body = serde_json::to_vec(&json!({ "result": { "recorded": recorded } }))
-                .map_err(ModuleError::Json)?;
+    match store.record_usage_delivery(&observation) {
+        Ok(result) => {
+            let body = serde_json::to_vec(&json!({ "result": {
+                "recorded": result.recorded,
+                "usage_recorded": result.usage_recorded,
+            }}))
+            .map_err(ModuleError::Json)?;
             let response = Frame::build_with_version(
                 ver,
                 FrameType::Response,
@@ -3902,7 +3907,7 @@ mod tests {
     use prefrontal_routing_core::model_facts::{
         Confidence, ModelFact, ModelPromptDefaults, ModelScores,
     };
-    use prefrontal_routing_core::{FactSource, UsageObservation};
+    use prefrontal_routing_core::{FactSource, NativeUsageFacts, UsageObservation};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -4239,6 +4244,46 @@ mod tests {
         .await
     }
 
+    fn usage_params(id: &str) -> serde_json::Value {
+        json!({
+            "messageID": id,
+            "providerID": "provider",
+            "modelID": "model",
+            "variant": "high",
+            "outputTokens": 100.0,
+            "reasoningTokens": 0.0,
+            "createdMs": 1_000.0,
+            "completedMs": 2_000.0,
+        })
+    }
+
+    async fn run_record_usage(store: &SharedStore, params: serde_json::Value) -> serde_json::Value {
+        let frame = run_route_wire_request(
+            store,
+            json!({ "method": ROUTE_RECORD_USAGE_OP, "params": params }),
+        )
+        .await;
+        serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone()
+    }
+
+    fn usage_row_count(rig: &Rig, id: Option<&str>) -> i64 {
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        match id {
+            Some(id) => connection
+                .query_row(
+                    "SELECT COUNT(*) FROM model_route_usage WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            None => connection
+                .query_row("SELECT COUNT(*) FROM model_route_usage", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+        }
+    }
+
     async fn run_route_wire_request_with_operator_config(
         store: &SharedStore,
         request: serde_json::Value,
@@ -4268,6 +4313,382 @@ mod tests {
         .await
         .unwrap();
         rx.recv().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn route_record_usage_writes_optional_profile_fields_or_null_without_a_producer() {
+        let rig = Rig::new("record-usage-profile");
+        let store = Arc::new(rig.open_store());
+        let mut absent = usage_params("profile-absent");
+        absent["reasoningTokens"] = json!(25.0);
+        absent["completedMs"] = json!(3_000.0);
+        assert_eq!(
+            run_record_usage(&store, absent).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let absent_row = connection
+            .query_row(
+                "SELECT input_tokens, output_tokens, reasoning_tokens,
+                        cached_read_tokens, cache_write_tokens, duration_ms,
+                        workload_class, account_key
+                 FROM model_route_usage WHERE id = 'profile-absent'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            absent_row,
+            (
+                None,
+                Some(125),
+                Some(25),
+                None,
+                None,
+                Some(2_000),
+                None,
+                None
+            )
+        );
+        drop(connection);
+
+        let mut complete = usage_params("profile-complete");
+        complete["inputTokens"] = json!(300.0);
+        complete["reasoningTokens"] = json!(25.0);
+        complete["cachedReadTokens"] = json!(0.0);
+        complete["cacheWriteTokens"] = json!(10.0);
+        complete["workloadClass"] = json!("ephemeral");
+        complete["accountKey"] = json!("provider/primary");
+        complete["completedMs"] = json!(3_000.0);
+        assert_eq!(
+            run_record_usage(&store, complete).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let complete_row = connection
+            .query_row(
+                "SELECT input_tokens, output_tokens, reasoning_tokens,
+                        cached_read_tokens, cache_write_tokens, duration_ms,
+                        workload_class, account_key
+                 FROM model_route_usage WHERE id = 'profile-complete'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            complete_row,
+            (
+                Some(300),
+                Some(125),
+                Some(25),
+                Some(0),
+                Some(10),
+                Some(2_000),
+                Some("ephemeral".into()),
+                Some("provider/primary".into()),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn first_eligible_delivery_reports_both_recording_effects() {
+        let rig = Rig::new("record-usage-first-eligible");
+        let store = Arc::new(rig.open_store());
+
+        assert_eq!(
+            run_record_usage(&store, usage_params("eligible")).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn speed_ineligible_recordable_delivery_reports_only_usage_recorded() {
+        let rig = Rig::new("record-usage-speed-ineligible");
+        let store = Arc::new(rig.open_store());
+        let mut ineligible = usage_params("ineligible");
+        ineligible["outputTokens"] = json!(50.0);
+
+        assert_eq!(
+            run_record_usage(&store, ineligible).await,
+            json!({ "recorded": false, "usage_recorded": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn no_row_refusal_reports_neither_recording_effect() {
+        let rig = Rig::new("record-usage-no-row");
+        let store = Arc::new(rig.open_store());
+
+        assert_eq!(
+            run_record_usage(&store, usage_params("")).await,
+            json!({ "recorded": false, "usage_recorded": false })
+        );
+        assert_eq!(usage_row_count(&rig, None), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_eligible_delivery_reports_neither_effect_and_keeps_one_row() {
+        let rig = Rig::new("record-usage-duplicate");
+        let store = Arc::new(rig.open_store());
+        assert_eq!(
+            run_record_usage(&store, usage_params("eligible")).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        assert_eq!(
+            run_record_usage(&store, usage_params("eligible")).await,
+            json!({ "recorded": false, "usage_recorded": false })
+        );
+        assert_eq!(usage_row_count(&rig, Some("eligible")), 1);
+    }
+
+    #[tokio::test]
+    async fn upgrade_delivery_reports_new_speed_observation_but_no_new_usage_row() {
+        let rig = Rig::new("record-usage-upgrade");
+        let store = Arc::new(rig.open_store());
+        let mut unusable = usage_params("upgrade");
+        unusable["createdMs"] = json!(3_000.0);
+        assert_eq!(
+            run_record_usage(&store, unusable).await,
+            json!({ "recorded": false, "usage_recorded": true })
+        );
+
+        assert_eq!(
+            run_record_usage(&store, usage_params("upgrade")).await,
+            json!({ "recorded": true, "usage_recorded": false })
+        );
+        assert_eq!(usage_row_count(&rig, Some("upgrade")), 1);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_variant_refusal_writes_no_usage_row() {
+        let rig = Rig::new("record-usage-ambiguous");
+        let store = Arc::new(rig.open_store());
+        for variant in ["low", "high"] {
+            let mut variant_fact = fact("provider", "model");
+            variant_fact.variant = Some(variant.into());
+            store
+                .upsert_fact(&variant_fact, FactSource::Override)
+                .unwrap();
+        }
+        let mut params = usage_params("ambiguous");
+        params.as_object_mut().unwrap().remove("variant");
+
+        assert_eq!(
+            run_record_usage(&store, params).await,
+            json!({ "recorded": false, "usage_recorded": false })
+        );
+        assert_eq!(usage_row_count(&rig, None), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_provider_or_model_refusal_writes_no_usage_row() {
+        let rig = Rig::new("record-usage-empty-route-part");
+        let store = Arc::new(rig.open_store());
+        for (id, key) in [("empty-provider", "providerID"), ("empty-model", "modelID")] {
+            let mut params = usage_params(id);
+            params[key] = json!("");
+            assert_eq!(
+                run_record_usage(&store, params).await,
+                json!({ "recorded": false, "usage_recorded": false })
+            );
+        }
+        assert_eq!(usage_row_count(&rig, None), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_message_id_with_constructible_route_writes_no_usage_row() {
+        let rig = Rig::new("record-usage-empty-message");
+        let store = Arc::new(rig.open_store());
+        let params = usage_params("");
+        assert_eq!(params["providerID"], "provider");
+        assert_eq!(params["modelID"], "model");
+
+        assert_eq!(
+            run_record_usage(&store, params).await,
+            json!({ "recorded": false, "usage_recorded": false })
+        );
+        assert_eq!(usage_row_count(&rig, None), 0);
+    }
+
+    #[test]
+    fn every_recordable_speed_refusal_writes_a_row_and_leaves_the_aggregate_unchanged() {
+        let rig = Rig::new("record-usage-speed-refusals");
+        let store = Arc::new(rig.open_store());
+        for index in 0..5 {
+            store
+                .record_usage_observation(&UsageObservation {
+                    id: format!("baseline-{index}"),
+                    route_key: "provider/model/high".into(),
+                    capacity_key: "provider/model".into(),
+                    provider_id: "provider".into(),
+                    input_tokens: None,
+                    output_tokens: 200.0,
+                    reasoning_tokens: None,
+                    cached_read_tokens: None,
+                    cache_write_tokens: None,
+                    duration_ms: 1_000.0,
+                    workload_class: None,
+                    account_key: None,
+                    observed_at: 2_000.0 + index as f64,
+                })
+                .unwrap();
+        }
+        let before = store
+            .get_observed_speed("provider/model/high", 10_000.0)
+            .unwrap()
+            .unwrap();
+
+        let cases = [
+            ("nan-output", f64::NAN, 3_000.0, None),
+            ("infinite-output", f64::INFINITY, 3_000.0, None),
+            ("zero-output", 0.0, 3_000.0, None),
+            ("negative-output", -1.0, 3_000.0, None),
+            ("floor-zero-output", 0.99, 3_000.0, None),
+            ("nan-duration", 100.0, 3_000.0, Some(f64::NAN)),
+            ("infinite-duration", 100.0, 3_000.0, Some(f64::INFINITY)),
+            ("negative-duration", 100.0, 1_000.0, None),
+        ];
+        for (id, output_tokens, completed_ms, tool_elapsed_ms) in cases {
+            let facts = NativeUsageFacts {
+                message_id: id.into(),
+                provider_id: "provider".into(),
+                model_id: "model".into(),
+                variant: Some("high".into()),
+                output_tokens,
+                reasoning_tokens: Some(25.0),
+                created_ms: 2_000.0,
+                completed_ms,
+                tool_elapsed_ms,
+                ..Default::default()
+            };
+            let observation = model_resolution::usage_observation_from_store(facts, &store)
+                .unwrap()
+                .expect("recordable refusal");
+            assert_eq!(
+                store.record_usage_delivery(&observation).unwrap(),
+                prefrontal_routing_core::route_state_store::UsageRecordResult {
+                    recorded: false,
+                    usage_recorded: true,
+                },
+                "{id}"
+            );
+        }
+
+        let after = store
+            .get_observed_speed("provider/model/high", 10_000.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.to_bits(), before.to_bits());
+        assert_eq!(usage_row_count(&rig, None), 13);
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        for id in [
+            "nan-output",
+            "infinite-output",
+            "zero-output",
+            "negative-output",
+            "floor-zero-output",
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT output_tokens FROM model_route_usage WHERE id = ?1",
+                        [id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .unwrap(),
+                None,
+                "{id}"
+            );
+        }
+        for id in ["nan-duration", "infinite-duration", "negative-duration"] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT duration_ms FROM model_route_usage WHERE id = ?1",
+                        [id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .unwrap(),
+                None,
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_heavy_pre_and_post_migration_rows_report_identical_tps_bits() {
+        let rig = Rig::new("record-usage-reasoning-compatibility");
+        let store = Arc::new(rig.open_store());
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        for index in 0..6 {
+            connection
+                .execute(
+                    "INSERT INTO model_route_usage
+                       (id, task_id, route_key, capacity_key, provider_id,
+                        input_tokens, output_tokens, duration_ms, observed_at)
+                     VALUES (?1, NULL, 'provider/legacy/high', 'provider/legacy',
+                             'provider', NULL, 180, 1000, ?2)",
+                    rusqlite::params![format!("legacy-{index}"), 1_000 + index],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO model_route_usage
+                   (id, task_id, route_key, capacity_key, provider_id,
+                    input_tokens, output_tokens, duration_ms, observed_at)
+                 VALUES ('mixed-legacy', NULL, 'provider/model/high', 'provider/model',
+                         'provider', NULL, 180, 1000, 1000)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        for index in 0..5 {
+            let mut params = usage_params(&format!("mixed-new-{index}"));
+            params["outputTokens"] = json!(100.0);
+            params["reasoningTokens"] = json!(80.0);
+            assert_eq!(
+                run_record_usage(&store, params).await,
+                json!({ "recorded": true, "usage_recorded": true })
+            );
+        }
+
+        let legacy = store
+            .get_observed_speed("provider/legacy/high", 10_000.0)
+            .unwrap()
+            .unwrap();
+        let mixed = store
+            .get_observed_speed("provider/model/high", 10_000.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.to_bits(), 180.0_f64.to_bits());
+        assert_eq!(mixed.to_bits(), legacy.to_bits());
     }
 
     async fn run_select_panel_wire_request(

@@ -275,9 +275,19 @@ pub struct NativeUsageFacts {
     pub model_id: String,
     #[serde(default)]
     pub variant: Option<String>,
+    #[serde(default)]
+    pub input_tokens: Option<f64>,
     pub output_tokens: f64,
     #[serde(default)]
     pub reasoning_tokens: Option<f64>,
+    #[serde(default)]
+    pub cached_read_tokens: Option<f64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<f64>,
+    #[serde(default)]
+    pub workload_class: Option<String>,
+    #[serde(default)]
+    pub account_key: Option<String>,
     pub created_ms: f64,
     pub completed_ms: f64,
     /// Wall time the message spent inside tools: the UNION of its call
@@ -1237,36 +1247,17 @@ fn js_number(value: f64) -> String {
     }
 }
 
-pub fn build_model_speed_observation(
+fn resolved_usage_route(
     facts: &NativeUsageFacts,
     variants: &[VariantFact],
-) -> Option<UsageObservation> {
+) -> Option<(String, String, String)> {
     let message_id = facts.message_id.trim();
     let provider_id = facts.provider_id.trim();
     let model_id = facts.model_id.trim();
     if message_id.is_empty() || provider_id.is_empty() || model_id.is_empty() {
         return None;
     }
-    if !facts.output_tokens.is_finite() || facts.output_tokens <= 0.0 {
-        return None;
-    }
-    let wall_duration = facts.completed_ms - facts.created_ms;
-    let tool_elapsed = facts.tool_elapsed_ms.unwrap_or(0.0);
-    let duration_ms = wall_duration - tool_elapsed;
-    if !wall_duration.is_finite()
-        || !tool_elapsed.is_finite()
-        || tool_elapsed < 0.0
-        || !duration_ms.is_finite()
-        || duration_ms <= 0.0
-    {
-        return None;
-    }
-    let output_tokens = facts.output_tokens.floor();
-    let reasoning_tokens = facts.reasoning_tokens.unwrap_or(0.0).floor().max(0.0);
-    let total_output = output_tokens + reasoning_tokens;
-    if output_tokens <= 0.0 || total_output <= 0.0 {
-        return None;
-    }
+
     let capacity_key = make_capacity_key(provider_id, model_id);
     let mut variant = normalized_nonempty(facts.variant.as_deref());
     if variant.is_none() {
@@ -1283,21 +1274,76 @@ pub fn build_model_speed_observation(
             .next()
             .filter(|value| !value.is_empty());
     }
-    Some(UsageObservation {
-        id: message_id.to_string(),
-        route_key: make_route_key(provider_id, model_id, variant.as_deref()),
+
+    Some((
+        message_id.to_string(),
+        make_route_key(provider_id, model_id, variant.as_deref()),
         capacity_key,
-        provider_id: provider_id.to_string(),
-        input_tokens: None,
-        output_tokens: total_output,
+    ))
+}
+
+fn usage_duration_ms(facts: &NativeUsageFacts) -> f64 {
+    let wall_duration = facts.completed_ms - facts.created_ms;
+    let tool_elapsed = facts.tool_elapsed_ms.unwrap_or(0.0);
+    let duration_ms = wall_duration - tool_elapsed;
+    if !wall_duration.is_finite()
+        || !tool_elapsed.is_finite()
+        || tool_elapsed < 0.0
+        || !duration_ms.is_finite()
+    {
+        f64::NAN
+    } else {
+        duration_ms
+    }
+}
+
+fn combined_output_tokens(facts: &NativeUsageFacts) -> f64 {
+    let output_tokens = facts.output_tokens.floor();
+    if !facts.output_tokens.is_finite() || facts.output_tokens <= 0.0 || output_tokens <= 0.0 {
+        return facts.output_tokens;
+    }
+    output_tokens + facts.reasoning_tokens.unwrap_or(0.0).floor().max(0.0)
+}
+
+/// Build the durable row for every storable usage delivery. Speed eligibility is
+/// deliberately separate: invalid measurements remain NULL-able evidence instead
+/// of preventing the rest of the usage profile from being recorded.
+pub fn build_usage_observation(
+    facts: &NativeUsageFacts,
+    variants: &[VariantFact],
+) -> Option<UsageObservation> {
+    let (message_id, route_key, capacity_key) = resolved_usage_route(facts, variants)?;
+    Some(UsageObservation {
+        id: message_id,
+        route_key,
+        capacity_key,
+        provider_id: facts.provider_id.trim().to_string(),
+        input_tokens: facts.input_tokens,
+        output_tokens: combined_output_tokens(facts),
         reasoning_tokens: facts.reasoning_tokens,
-        cached_read_tokens: None,
-        cache_write_tokens: None,
-        duration_ms,
-        workload_class: None,
-        account_key: None,
+        cached_read_tokens: facts.cached_read_tokens,
+        cache_write_tokens: facts.cache_write_tokens,
+        duration_ms: usage_duration_ms(facts),
+        workload_class: facts.workload_class.clone(),
+        account_key: facts.account_key.clone(),
         observed_at: facts.completed_ms,
     })
+}
+
+pub fn build_model_speed_observation(
+    facts: &NativeUsageFacts,
+    variants: &[VariantFact],
+) -> Option<UsageObservation> {
+    let observation = build_usage_observation(facts, variants)?;
+    if !facts.output_tokens.is_finite()
+        || facts.output_tokens <= 0.0
+        || facts.output_tokens.floor() <= 0.0
+        || !observation.duration_ms.is_finite()
+        || observation.duration_ms <= 0.0
+    {
+        return None;
+    }
+    Some(observation)
 }
 
 #[cfg(test)]
@@ -1311,6 +1357,35 @@ mod tests {
             variant: variant.map(str::to_string),
             ..FallbackEntry::default()
         }
+    }
+
+    fn usage_facts(id: &str) -> NativeUsageFacts {
+        NativeUsageFacts {
+            message_id: id.into(),
+            provider_id: "provider".into(),
+            model_id: "model".into(),
+            variant: Some("high".into()),
+            output_tokens: 100.0,
+            reasoning_tokens: Some(25.0),
+            created_ms: 1_780_000_000_000.0,
+            completed_ms: 1_780_000_002_000.0,
+            ..Default::default()
+        }
+    }
+
+    fn ambiguous_variants() -> Vec<VariantFact> {
+        vec![
+            VariantFact {
+                provider_id: "provider".into(),
+                model_id: "model".into(),
+                variant: Some("low".into()),
+            },
+            VariantFact {
+                provider_id: "provider".into(),
+                model_id: "model".into(),
+                variant: Some("high".into()),
+            },
+        ]
     }
 
     #[test]
@@ -1553,6 +1628,7 @@ mod tests {
                 created_ms: now,
                 completed_ms: now + 3_000.0,
                 tool_elapsed_ms: None,
+                ..Default::default()
             },
             &[],
         )
@@ -1572,6 +1648,7 @@ mod tests {
                 created_ms: now,
                 completed_ms: now + 2_000.0,
                 tool_elapsed_ms: None,
+                ..Default::default()
             },
             &[
                 VariantFact {
@@ -1587,5 +1664,91 @@ mod tests {
             ],
         );
         assert!(ambiguous.is_none());
+    }
+
+    #[test]
+    fn usage_builder_carries_every_available_profile_field() {
+        let mut facts = usage_facts("profile");
+        facts.input_tokens = Some(300.0);
+        facts.cached_read_tokens = Some(200.0);
+        facts.cache_write_tokens = Some(10.0);
+        facts.workload_class = Some("ephemeral".into());
+        facts.account_key = Some("provider/primary".into());
+        let observation = build_usage_observation(&facts, &[]).unwrap();
+
+        assert_eq!(observation.input_tokens, Some(300.0));
+        assert_eq!(observation.output_tokens, 125.0);
+        assert_eq!(observation.reasoning_tokens, Some(25.0));
+        assert_eq!(observation.cached_read_tokens, Some(200.0));
+        assert_eq!(observation.cache_write_tokens, Some(10.0));
+        assert_eq!(observation.duration_ms, 2_000.0);
+        assert_eq!(observation.workload_class.as_deref(), Some("ephemeral"));
+        assert_eq!(observation.account_key.as_deref(), Some("provider/primary"));
+    }
+
+    #[test]
+    fn invalid_output_branches_build_usage_but_no_speed_observation() {
+        for output in [f64::NAN, f64::INFINITY, 0.0, -1.0, 0.99] {
+            let mut facts = usage_facts("invalid-output");
+            facts.output_tokens = output;
+            assert!(build_usage_observation(&facts, &[]).is_some());
+            assert!(build_model_speed_observation(&facts, &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn unusable_duration_branches_build_usage_but_no_speed_observation() {
+        for (created_ms, completed_ms, tool_elapsed_ms) in [
+            (0.0, 1_000.0, Some(f64::NAN)),
+            (0.0, 1_000.0, Some(f64::INFINITY)),
+            (2_000.0, 1_000.0, None),
+            (0.0, 1_000.0, Some(-1.0)),
+        ] {
+            let mut facts = usage_facts("invalid-duration");
+            facts.created_ms = created_ms;
+            facts.completed_ms = completed_ms;
+            facts.tool_elapsed_ms = tool_elapsed_ms;
+            assert!(build_usage_observation(&facts, &[]).is_some());
+            assert!(build_model_speed_observation(&facts, &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn ambiguous_variant_builds_no_usage_row() {
+        let mut facts = usage_facts("ambiguous");
+        facts.variant = None;
+        assert!(build_usage_observation(&facts, &ambiguous_variants()).is_none());
+        assert!(build_model_speed_observation(&facts, &ambiguous_variants()).is_none());
+    }
+
+    #[test]
+    fn empty_provider_or_model_builds_no_usage_row() {
+        for (provider_id, model_id) in [("", "model"), ("provider", "")] {
+            let mut facts = usage_facts("missing-route-part");
+            facts.provider_id = provider_id.into();
+            facts.model_id = model_id.into();
+            assert!(build_usage_observation(&facts, &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn empty_message_id_with_constructible_route_builds_no_usage_row() {
+        let facts = usage_facts("");
+        assert_eq!(
+            make_route_key("provider", "model", Some("high")),
+            "provider/model/high"
+        );
+        assert!(build_usage_observation(&facts, &[]).is_none());
+    }
+
+    #[test]
+    fn reasoning_heavy_usage_keeps_the_pre_migration_output_token_meaning() {
+        let mut facts = usage_facts("reasoning-heavy");
+        facts.output_tokens = 100.0;
+        facts.reasoning_tokens = Some(80.0);
+        let observation = build_usage_observation(&facts, &[]).unwrap();
+
+        assert_eq!(observation.output_tokens.to_bits(), 180.0_f64.to_bits());
+        assert_eq!(observation.reasoning_tokens, Some(80.0));
     }
 }
