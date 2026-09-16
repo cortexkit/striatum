@@ -1068,6 +1068,10 @@ mod abundance_tests {
 
     fn fact(provider: &str, model: &str, speed: f64) -> ModelFact {
         ModelFact {
+            input_rate: None,
+            cache_read_rate: None,
+            cache_write_rate: None,
+            reasoning_rate: None,
             speed_is_fleet_median: false,
             provider_id: provider.into(),
             model_id: model.into(),
