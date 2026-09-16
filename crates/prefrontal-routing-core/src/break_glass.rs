@@ -49,6 +49,48 @@ fn candidate_earliest_reset(
     .min_by(f64::total_cmp)
 }
 
+/// The earliest reset the relaxation can actually lift: quota and cooldown only.
+/// `failure_backoff_until` is deliberately not in this set. The relaxation never
+/// clears a failure backoff (that is the operator's `route.clear_failure_backoff`),
+/// so ranking on it chose a route that stayed blocked on retry and spent the
+/// one-shot relaxation for nothing while a sibling with only a quota wall was
+/// relaxable (Loop R153).
+fn candidate_clearable_reset(
+    snapshot: &ModelRouteStateSnapshot,
+    candidate: &BreakGlassCandidate,
+) -> Option<f64> {
+    [
+        snapshot.by_route.get(&candidate.route_key),
+        snapshot.by_capacity.get(&candidate.capacity_key),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|state| {
+        [state.quota_exhausted_until, state.cooldown_until]
+            .into_iter()
+            .flatten()
+            .filter(|reset| *reset > snapshot.now)
+            .min_by(f64::total_cmp)
+    })
+    .min_by(f64::total_cmp)
+}
+
+/// A candidate under a live failure backoff in either scope stays blocked after
+/// the relaxation no matter how it ranks, so it is not a candidate at all.
+fn under_live_backoff(snapshot: &ModelRouteStateSnapshot, candidate: &BreakGlassCandidate) -> bool {
+    [
+        snapshot.by_route.get(&candidate.route_key),
+        snapshot.by_capacity.get(&candidate.capacity_key),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|state| {
+        state
+            .failure_backoff_until
+            .is_some_and(|until| until > snapshot.now)
+    })
+}
+
 /// Earliest future reset across the GIVEN candidates only. This is the single
 /// producer for "when could a blocked route recover": diagnostics must scope
 /// the answer to the request's own rejected candidates, because a reset read
@@ -76,7 +118,10 @@ pub fn relax_earliest_reset(
     let mut earliest: Option<(&BreakGlassCandidate, Option<f64>)> = None;
 
     for candidate in candidates {
-        let resets_at = candidate_earliest_reset(snapshot, candidate);
+        if under_live_backoff(snapshot, candidate) {
+            continue;
+        }
+        let resets_at = candidate_clearable_reset(snapshot, candidate);
         let should_replace = earliest.as_ref().is_none_or(|(current, current_reset)| {
             match (resets_at, *current_reset) {
                 // A stated reset is stronger recovery evidence than an unknown one.
@@ -246,5 +291,63 @@ mod tests {
         assert_eq!(relaxed.route_key, "p/a/high");
         assert_eq!(relaxed.resets_at, Some(4_000.0));
         assert_eq!(relaxed.snapshot.by_capacity["p/a"].cooldown_until, None);
+    }
+
+    /// Loop R153: opus is quota-walled to T+4h AND under a route-local failure
+    /// backoff to T+8min; sonnet is only quota-walled to T+4h. Ranking on the
+    /// all-walls horizon picked opus (its backoff reset is earliest), cleared its
+    /// quota, and the retry rejected it as backoff_active: the one-shot relaxation
+    /// was spent and route.select returned no_route while sonnet was relaxable.
+    #[test]
+    fn a_candidate_under_live_backoff_is_skipped_and_the_clearable_sibling_is_relaxed() {
+        let now = 1_000.0;
+        let opus = RouteRuntimeState {
+            quota_exhausted_until: Some(now + 4.0 * 3_600_000.0),
+            failure_backoff_until: Some(now + 8.0 * 60_000.0),
+            ..Default::default()
+        };
+        let sonnet = exhausted(Some(now + 4.0 * 3_600_000.0), None);
+        let snap = ModelRouteStateSnapshot {
+            now,
+            by_route: HashMap::from([("a/opus".into(), opus), ("a/sonnet".into(), sonnet)]),
+            by_capacity: HashMap::new(),
+        };
+        let relaxed = relax_earliest_reset(
+            &snap,
+            &[
+                candidate("a/opus", "a/opus"),
+                candidate("a/sonnet", "a/sonnet"),
+            ],
+        )
+        .expect("the quota-only sibling is relaxable");
+        assert_eq!(relaxed.route_key, "a/sonnet");
+        assert_eq!(
+            relaxed.snapshot.by_route["a/sonnet"].quota_exhausted_until,
+            None
+        );
+        // The backoff-carrying route keeps every wall: the relaxation never lifts a backoff.
+        assert_eq!(
+            relaxed.snapshot.by_route["a/opus"].failure_backoff_until,
+            Some(now + 8.0 * 60_000.0)
+        );
+        assert!(relaxed.snapshot.by_route["a/opus"]
+            .quota_exhausted_until
+            .is_some());
+
+        // Every candidate under a live backoff: nothing to relax, and saying so is
+        // honest; the caller's no_route stands.
+        let only_backoff = ModelRouteStateSnapshot {
+            now,
+            by_route: HashMap::from([(
+                "a/opus".into(),
+                RouteRuntimeState {
+                    quota_exhausted_until: Some(now + 60_000.0),
+                    failure_backoff_until: Some(now + 60_000.0),
+                    ..Default::default()
+                },
+            )]),
+            by_capacity: HashMap::new(),
+        };
+        assert!(relax_earliest_reset(&only_backoff, &[candidate("a/opus", "a/opus")]).is_none());
     }
 }
