@@ -15,8 +15,8 @@ use prefrontal_routing_core::model_facts::{
 };
 use prefrontal_routing_core::model_facts_seed::model_facts_seed;
 use prefrontal_routing_core::model_router::{
-    admit_routes, select_model_route, select_model_route_with_config, ModelRouteStateSnapshot,
-    RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
+    admit_routes, price_selection_shortlist, select_model_route, select_model_route_with_config,
+    ModelRouteStateSnapshot, RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
 };
 use prefrontal_routing_core::{ExclusionPolicy, DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY};
 
@@ -2905,4 +2905,390 @@ fn fast_variant_upgrade_prices_in_the_units_the_selection_used() {
         "the sibling is priced in basket units, not on the ladder"
     );
     assert_ne!(upgraded.score.selection_cost, 10.0 / 30.0);
+}
+
+// ── Pinned catalog-and-readings replay (reference calibration) ───────────────
+//
+// Host: pinned fixture (not live traffic). Window: trailing 7-day ephemeral
+// mean, sample_count 50. Readings query: planted complete-case mason averages
+// 3552 fresh / 223 output / 140387 cached-read / 50 cache-write. Catalog query:
+// the eight routes below. Median population for the rate card: the four
+// complete-rate routes.
+
+use prefrontal_routing_core::routing_config::{
+    BASKET_REFERENCE_COST_PER_MESSAGE, EFFECTIVELY_FREE_SELECTION_COST,
+};
+use prefrontal_routing_core::{ACCOUNT_PRODUCER, CLASS_PRODUCER, COUNTERS_PRODUCER};
+
+struct PinnedDecision {
+    id: &'static str,
+    available: &'static [&'static str],
+}
+
+fn pinned_ephemeral_vector() -> prefrontal_routing_core::ClassVector {
+    make_ephemeral_vector(3552.0, 223.0, 0.0, 140387.0, 50.0, 50)
+}
+
+fn overlay_ephemeral(mut fact: ModelFact) -> ModelFact {
+    fact.class_vector = Some(pinned_ephemeral_vector());
+    fact.class_vector_is_overlay = true;
+    fact
+}
+
+fn pinned_catalog_fact(
+    provider: &str,
+    model: &str,
+    elo: f64,
+    speed: f64,
+    cost_per_m_tok_out: Option<f64>,
+    input_rate: Option<f64>,
+    cache_read_rate: Option<f64>,
+    cache_write_rate: Option<f64>,
+    subscription_multiplier: Option<f64>,
+) -> ModelFact {
+    let mut f = fact(FactBuilder {
+        provider_id: provider.into(),
+        model_id: model.into(),
+        scores: scores(elo, 1600.0, speed),
+        cost_per_m_tok_out,
+        ..Default::default()
+    });
+    f.input_rate = input_rate;
+    f.cache_read_rate = cache_read_rate;
+    f.cache_write_rate = cache_write_rate;
+    f.subscription_multiplier = subscription_multiplier;
+    overlay_ephemeral(f)
+}
+
+fn pinned_catalog() -> Vec<ModelFact> {
+    vec![
+        pinned_catalog_fact(
+            "openai",
+            "sol",
+            1838.0,
+            55.0,
+            Some(30.0),
+            Some(2.5),
+            Some(0.25),
+            Some(3.125),
+            Some(40.0),
+        ),
+        pinned_catalog_fact(
+            "openai",
+            "terra",
+            1685.0,
+            100.0,
+            Some(15.0),
+            Some(1.25),
+            Some(0.25),
+            Some(1.875),
+            Some(40.0),
+        ),
+        pinned_catalog_fact(
+            "groq",
+            "kimi-nocache",
+            1700.0,
+            150.0,
+            Some(3.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(40.0),
+        ),
+        pinned_catalog_fact(
+            "together",
+            "glm-nocache",
+            1650.0,
+            120.0,
+            Some(2.0),
+            Some(1.25),
+            Some(1.25),
+            Some(1.25),
+            Some(40.0),
+        ),
+        pinned_catalog_fact(
+            "anthropic",
+            "opus",
+            1635.0,
+            61.0,
+            Some(25.0),
+            None,
+            None,
+            None,
+            Some(40.0),
+        ),
+        pinned_catalog_fact(
+            "ollama-cloud",
+            "glm",
+            1600.0,
+            80.0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+        pinned_catalog_fact(
+            "metered", "unknown", 1600.0, 70.0, None, None, None, None, None,
+        ),
+        pinned_catalog_fact(
+            "anthropic",
+            "opus-fast",
+            1635.0,
+            61.0,
+            Some(150.0),
+            None,
+            None,
+            None,
+            None,
+        ),
+    ]
+}
+
+fn pinned_subscription_keys() -> HashSet<String> {
+    [
+        "openai/sol",
+        "openai/terra",
+        "groq/kimi-nocache",
+        "together/glm-nocache",
+        "anthropic/opus",
+        "ollama-cloud/glm",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn pinned_decisions() -> Vec<PinnedDecision> {
+    vec![
+        PinnedDecision {
+            id: "engage-caching-pair",
+            available: &["openai/sol", "openai/terra"],
+        },
+        PinnedDecision {
+            id: "engage-with-nocache-leavers",
+            available: &[
+                "openai/sol",
+                "openai/terra",
+                "groq/kimi-nocache",
+                "together/glm-nocache",
+            ],
+        },
+        PinnedDecision {
+            id: "degraded-by-opus",
+            available: &["openai/sol", "openai/terra", "anthropic/opus"],
+        },
+        PinnedDecision {
+            id: "degraded-by-unpriced-glm",
+            available: &["openai/sol", "ollama-cloud/glm"],
+        },
+    ]
+}
+
+fn facts_for_decision(catalog: &[ModelFact], available: &[&str]) -> Vec<ModelFact> {
+    catalog
+        .iter()
+        .filter(|f| {
+            let key = make_route_key(&f.provider_id, &f.model_id, f.variant.as_deref());
+            available.contains(&key.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+fn replay_decision(
+    catalog: &[ModelFact],
+    decision: &PinnedDecision,
+    counters_producer: bool,
+    class_producer: bool,
+) -> prefrontal_routing_core::model_router::PricedShortlist {
+    let facts = facts_for_decision(catalog, decision.available);
+    let subscription = pinned_subscription_keys();
+    price_selection_shortlist(
+        input(
+            facts,
+            req(50.0, 20.0),
+            Extra {
+                is_subscription_route: Some(Box::new(move |r: &ModelRoute| {
+                    subscription.contains(&r.route_key)
+                })),
+                ..Default::default()
+            },
+        ),
+        &DEFAULT_ROUTING_CONFIG,
+        counters_producer,
+        class_producer,
+    )
+    .unwrap_or_else(|err| panic!("decision {} failed to price: {err:?}", decision.id))
+}
+
+fn is_effectively_free(selection_cost: f64) -> bool {
+    selection_cost <= EFFECTIVELY_FREE_SELECTION_COST
+}
+
+/// Cached-read contribution to the normalized basket cost, in selection units.
+fn cached_read_selection_magnitude(term_usd: f64, multiplier: f64) -> f64 {
+    term_usd / multiplier / BASKET_REFERENCE_COST_PER_MESSAGE
+}
+
+#[test]
+fn pinned_catalog_and_readings_replay_holds_bucket_membership_and_is_non_vacuous() {
+    assert_eq!(BASKET_REFERENCE_COST_PER_MESSAGE, 0.05);
+    assert_eq!(EFFECTIVELY_FREE_SELECTION_COST, 0.05);
+    assert!(COUNTERS_PRODUCER && CLASS_PRODUCER);
+    assert!(
+        !ACCOUNT_PRODUCER,
+        "account_producer is false on this catalog; engagement must still be non-zero"
+    );
+
+    let catalog = pinned_catalog();
+    let decisions = pinned_decisions();
+
+    let mut engaged: Vec<&str> = Vec::new();
+    let mut degraded: Vec<(&str, String)> = Vec::new();
+    let mut delta: Vec<(String, f64)> = Vec::new();
+
+    for decision in &decisions {
+        let before = replay_decision(&catalog, decision, false, true);
+        let after = replay_decision(&catalog, decision, true, true);
+        assert_eq!(
+            before.routes.len(),
+            after.routes.len(),
+            "decision {} shortlist changed with producer flags",
+            decision.id
+        );
+        if after.use_basket {
+            engaged.push(decision.id);
+            assert!(
+                after.degraded_by.is_none(),
+                "decision {} engaged but named a degrader {:?}",
+                decision.id,
+                after.degraded_by
+            );
+        } else if let Some(route) = after.degraded_by.clone() {
+            degraded.push((decision.id, route));
+        }
+
+        let before_free: HashSet<&str> = before
+            .routes
+            .iter()
+            .filter(|r| is_effectively_free(r.selection_cost))
+            .map(|r| r.route_key.as_str())
+            .collect();
+        let after_free: HashSet<&str> = after
+            .routes
+            .iter()
+            .filter(|r| is_effectively_free(r.selection_cost))
+            .map(|r| r.route_key.as_str())
+            .collect();
+        for route in after.routes.iter() {
+            let was_free = before_free.contains(route.route_key.as_str());
+            let is_free = after_free.contains(route.route_key.as_str());
+            if was_free == is_free {
+                continue;
+            }
+            assert!(
+                was_free && !is_free,
+                "decision {} route {} entered the free bucket; calibration may only list exits",
+                decision.id,
+                route.route_key
+            );
+            let term = route.cached_read_term_usd.unwrap_or_else(|| {
+                panic!(
+                    "decision {} route {} left the bucket with no cached-read term",
+                    decision.id, route.route_key
+                )
+            });
+            let fact = catalog
+                .iter()
+                .find(|f| {
+                    make_route_key(&f.provider_id, &f.model_id, f.variant.as_deref())
+                        == route.route_key
+                })
+                .expect("delta route is on the pinned catalog");
+            let multiplier = fact
+                .subscription_multiplier
+                .filter(|m| m.is_finite() && *m > 0.0)
+                .unwrap_or(1.0);
+            let magnitude = cached_read_selection_magnitude(term, multiplier);
+            if !delta.iter().any(|(key, _)| key == &route.route_key) {
+                delta.push((route.route_key.clone(), magnitude));
+            }
+        }
+    }
+
+    assert!(
+        !engaged.is_empty(),
+        "pinned fixture engaged no decision while counters_producer and class_producer both exist"
+    );
+    assert_eq!(
+        engaged,
+        ["engage-caching-pair", "engage-with-nocache-leavers"]
+    );
+    assert_eq!(
+        degraded,
+        [
+            ("degraded-by-opus", "anthropic/opus".to_string()),
+            ("degraded-by-unpriced-glm", "ollama-cloud/glm".to_string()),
+        ]
+    );
+
+    delta.sort_by(|a, b| a.0.cmp(&b.0));
+    // Enumerated membership delta: each leaves because of its cached-read term.
+    // groq/kimi-nocache: $0.140387 cached-read → 0.0701935 selection units.
+    // together/glm-nocache: $0.17548375 cached-read → 0.087741875 selection units.
+    assert_eq!(delta.len(), 2, "delta {delta:?}");
+    assert_eq!(delta[0].0, "groq/kimi-nocache");
+    assert!(
+        (delta[0].1 - 0.0701935).abs() < 1e-9,
+        "groq magnitude {}",
+        delta[0].1
+    );
+    assert_eq!(delta[1].0, "together/glm-nocache");
+    assert!(
+        (delta[1].1 - 0.087741875).abs() < 1e-9,
+        "together magnitude {}",
+        delta[1].1
+    );
+
+    let false_counters: usize = decisions
+        .iter()
+        .filter(|d| replay_decision(&catalog, d, false, true).use_basket)
+        .count();
+    let false_class: usize = decisions
+        .iter()
+        .filter(|d| replay_decision(&catalog, d, true, false).use_basket)
+        .count();
+    assert_eq!(false_counters, 0);
+    assert_eq!(false_class, 0);
+
+    let today_clamp = catalog
+        .iter()
+        .filter(|f| {
+            let key = make_route_key(&f.provider_id, &f.model_id, f.variant.as_deref());
+            let is_sub = pinned_subscription_keys().contains(&key);
+            selection_cost(f, is_sub, false) >= 1.0 - 1e-12
+        })
+        .count();
+    let basket_clamp = catalog
+        .iter()
+        .filter(|f| f.basket_cost().is_some_and(|cost| cost >= 1.0 - 1e-12))
+        .count();
+    // Clamp census: today saturates metered/unknown and anthropic/opus-fast.
+    // Basket saturates none of the complete-rate cards at the chosen constant.
+    assert_eq!(today_clamp, 2);
+    assert_eq!(basket_clamp, 0);
+    assert!(basket_clamp <= today_clamp);
+}
+
+#[test]
+fn absence_of_account_producer_alone_never_forces_basket_engagement_to_zero() {
+    assert!(!ACCOUNT_PRODUCER);
+    assert!(COUNTERS_PRODUCER && CLASS_PRODUCER);
+    let catalog = pinned_catalog();
+    let engaged = pinned_decisions()
+        .iter()
+        .filter(|d| replay_decision(&catalog, d, COUNTERS_PRODUCER, CLASS_PRODUCER).use_basket)
+        .count();
+    assert!(engaged > 0);
 }
