@@ -2413,6 +2413,31 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
         .unwrap();
     assert_eq!(catalog.facts_source.as_deref(), Some("fusiform"));
     assert_eq!(catalog.fusiform_version, Some(2));
+
+    assert_eq!(
+        store
+            .clear_operator_fact_fields(&route_key, &[CatalogFactField::SupportsVision])
+            .unwrap(),
+        vec![CatalogFactField::SupportsVision]
+    );
+    store
+        .apply_fusiform_catalog(
+            &[update(true)],
+            FusiformCatalogCursor {
+                catalog_version: 3,
+                resolved_at_ms: 300,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_fact_by_route_key(&route_key)
+            .unwrap()
+            .unwrap()
+            .supports_vision,
+        Some(true),
+        "Fusiform must resume ownership after the operator stamp is cleared"
+    );
 }
 
 #[test]
