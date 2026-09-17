@@ -33,11 +33,13 @@ use std::{
 
 use cortexkit_store_types::StorageDescriptor;
 use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
+use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::model_router::{
     select_model_route_with_config, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
     RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
 };
+use prefrontal_routing_core::quota::quota_poll::record_reading_log_poll;
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
 use prefrontal_routing_core::route_state_store::FactSource;
 use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
@@ -282,6 +284,58 @@ fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
     }
 }
 
+/// Append every healthy entry of one poll to the quota reading log, the durable
+/// record the consumption estimate reads. Provider resolution is the overlay's:
+/// the published `apiProvider` slug first, the local wire-name map as fallback, an
+/// unmapped entry skipped, and capacity keys from the stored facts so the
+/// antigravity per-model windows carry the same window keys the overlay uses. A
+/// failed append is logged and never blocks the overlay: a missing sample costs
+/// one interval of the estimate, while a stalled overlay costs routing.
+fn record_quota_readings(
+    store: &SqliteRouteStateStore,
+    fresh: &[ProviderUsage],
+    observed_at_ms: u64,
+) {
+    let facts = match store.get_facts() {
+        Ok(facts) => facts,
+        Err(error) => {
+            tracing::warn!(error = %error, "quota reading log: facts unavailable, poll not recorded");
+            return;
+        }
+    };
+    let mut caps_by_provider: HashMap<String, Vec<String>> = HashMap::new();
+    for fact in &facts {
+        caps_by_provider
+            .entry(fact.provider_id.clone())
+            .or_default()
+            .push(make_capacity_key(&fact.provider_id, &fact.model_id));
+    }
+    let name_map = quota_name_map();
+    let Ok(observed_at) = i64::try_from(observed_at_ms) else {
+        return;
+    };
+    let empty: Vec<String> = Vec::new();
+    for entry in fresh {
+        let provider_id = match entry.api_provider.as_deref() {
+            Some(slug) if !slug.is_empty() => slug.to_string(),
+            _ => match name_map.get(&entry.provider) {
+                Some(mapped) => mapped.clone(),
+                None => continue,
+            },
+        };
+        let capacity_keys = caps_by_provider.get(&provider_id).unwrap_or(&empty);
+        if let Err(error) =
+            record_reading_log_poll(store, entry, &provider_id, capacity_keys, observed_at)
+        {
+            tracing::warn!(
+                error = %error,
+                provider = %provider_id,
+                "quota reading log: poll not recorded"
+            );
+        }
+    }
+}
+
 fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observed_at_ms: u64) {
     // Insula extends funding additively. Report unsupported values once per poll,
     // while the core policy treats each corresponding pool as not granted.
@@ -505,8 +559,10 @@ async fn quota_refresh_loop(
             Ok(windows) => {
                 // Replace healthy providers we just heard from, but retain providers absent
                 // from this poll and healthy windows whose fresh replacement degraded.
+                let observed_at_ms = now_ms();
+                record_quota_readings(store.as_ref(), &windows, observed_at_ms);
                 if let Ok(mut guard) = cache.lock() {
-                    apply_quota_refresh(&mut guard, windows, now_ms());
+                    apply_quota_refresh(&mut guard, windows, observed_at_ms);
                 }
                 // `usage_get` sends GOODBYE and shuts down the stream on success;
                 // drop it before beginning the long idle interval as well.
@@ -3996,6 +4052,54 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// The poll loop is the only producer of the quota reading log, and the slice
+    /// that built the log fenced the loop out, so this is the test that the log
+    /// is written at all: one healthy Insula entry through the same call the loop
+    /// makes lands as rows under the overlay's provider id and window keys, and a
+    /// degraded entry (error present) lands nothing.
+    #[test]
+    fn quota_poll_records_healthy_entries_into_the_reading_log() {
+        let rig = Rig::new("reading-log");
+        let store = rig.open_store();
+        let healthy: ProviderUsage = serde_json::from_value(serde_json::json!({
+            "provider": "codex",
+            "apiProvider": "openai",
+            "account": "team-a",
+            "fetchedAt": "2030-01-01T00:00:00Z",
+            "savedResets": { "availableCount": 2 },
+            "usage": {
+                "primary": { "usedPercent": 20.0, "rawUsedPercent": 25.0,
+                             "resetsAt": "2030-01-01T05:00:00Z", "windowMinutes": 300 },
+                "secondary": { "usedPercent": 40.0, "rawUsedPercent": 45.0,
+                               "resetsAt": "2030-01-08T00:00:00Z", "windowMinutes": 10080 }
+            }
+        }))
+        .unwrap();
+        let degraded: ProviderUsage = serde_json::from_value(serde_json::json!({
+            "provider": "claude",
+            "apiProvider": "anthropic",
+            "account": "seat",
+            "error": "upstream failed",
+            "spend": []
+        }))
+        .unwrap();
+
+        record_quota_readings(&store, &[healthy, degraded], 1_893_456_000_000);
+
+        let rows = store.get_quota_readings("openai/team-a").unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "both windows of the healthy entry are recorded"
+        );
+        assert_eq!(rows[0].observed_at, 1_893_456_000_000);
+        assert_eq!(rows[0].raw_used_percent, Some(25.0));
+        assert!(store
+            .get_quota_readings("anthropic/seat")
+            .unwrap()
+            .is_empty());
     }
 
     fn upsert_params(provider: &str, model: &str) -> ModelUpsertParams {
