@@ -20,6 +20,7 @@ use crate::{send, send_route_error, ModuleError, SharedStore};
 pub(crate) const RESOLVE_MODEL_OP: &str = "route.resolve_model";
 pub(crate) const MODEL_CAPABILITIES_OP: &str = "route.model_capabilities";
 pub(crate) const AGENT_MODEL_REQUIREMENTS_OP: &str = "route.agent_model_requirements";
+pub(crate) const ROUTE_WORKLOAD_CLASS_MAP_OP: &str = "route.workload_class_map";
 
 const AGENT_MODEL_REQUIREMENTS_JSON: &str = include_str!("../model/agent_model_requirements.json");
 
@@ -304,6 +305,37 @@ pub(super) async fn handle_agent_model_requirements(
         frame,
         writer,
         json!({ "requirements": agent_model_requirements() }),
+    )
+    .await
+}
+
+pub(super) async fn handle_workload_class_map(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+) -> Result<(), ModuleError> {
+    #[derive(serde::Deserialize)]
+    struct Params {
+        agent: Option<String>,
+    }
+    let params: Option<Params> = serde_json::from_slice::<ParamsBody<Params>>(&frame.body)
+        .map(|b| b.params)
+        .ok();
+    let workload_class = params
+        .and_then(|p| p.agent)
+        .and_then(|a| prefrontal_routing_core::map_agent_to_workload_class(&a));
+    send_result(
+        frame,
+        writer,
+        json!({
+            "workloadClass": workload_class,
+            "classes": {
+                "mason": "ephemeral",
+                "alfonso": "head",
+                "explore": "gather",
+                "librarian": "gather",
+                "sidekick": "gather",
+            }
+        }),
     )
     .await
 }

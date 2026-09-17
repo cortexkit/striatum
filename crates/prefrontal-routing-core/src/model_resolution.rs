@@ -276,7 +276,10 @@ pub struct NativeUsageFacts {
     #[serde(default)]
     pub variant: Option<String>,
     #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
     pub input_tokens: Option<f64>,
+    #[serde(default)]
     pub output_tokens: f64,
     #[serde(default)]
     pub reasoning_tokens: Option<f64>,
@@ -1308,6 +1311,83 @@ fn combined_output_tokens(facts: &NativeUsageFacts) -> f64 {
 /// Build the durable row for every storable usage delivery. Speed eligibility is
 /// deliberately separate: invalid measurements remain NULL-able evidence instead
 /// of preventing the rest of the usage profile from being recorded.
+pub const VALID_WORKLOAD_CLASSES: &[&str] = &["ephemeral", "head", "gather", "hire"];
+
+pub fn parse_workload_class(value: &str) -> Option<&'static str> {
+    let trimmed = value.trim();
+    VALID_WORKLOAD_CLASSES
+        .iter()
+        .copied()
+        .find(|&class| class.eq_ignore_ascii_case(trimmed))
+}
+
+pub const COUNTERS_PRODUCER: bool = true;
+pub const CLASS_PRODUCER: bool = true;
+pub const ACCOUNT_PRODUCER: bool = false;
+
+pub fn map_agent_to_workload_class(agent: &str) -> Option<&'static str> {
+    let trimmed = agent.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    if lower == "mason" {
+        return Some("ephemeral");
+    }
+    if lower == "alfonso" {
+        return Some("head");
+    }
+    if lower == "explore" || lower == "librarian" || lower.starts_with("sidekick") {
+        return Some("gather");
+    }
+    if lower.starts_with("hire_") || lower.starts_with("hire-") || lower == "hire" {
+        return Some("hire");
+    }
+    None
+}
+
+/// use_basket may be true only when counters_producer and class_producer are both true.
+/// account_producer never enters that predicate.
+pub fn use_basket_permitted(counters_producer: bool, class_producer: bool) -> bool {
+    counters_producer && class_producer
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BrocaUsageFacts {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    #[serde(default)]
+    pub retries_used: u64,
+}
+
+impl NativeUsageFacts {
+    /// Copies BrocaUsage into NativeUsageFacts following normative mapping:
+    /// - cached_read = cached_input_tokens
+    /// - cache_write = cache_write_tokens
+    /// - reasoning = reasoning_tokens
+    /// - fresh_input = input_tokens (with no cache subtraction)
+    /// - output_tokens = output_tokens (Broca output taken whole, reasoning not subtracted)
+    /// - absence of Broca usage is whole-object: None clears all five counters
+    pub fn apply_broca_usage(&mut self, usage: Option<&BrocaUsageFacts>) {
+        if let Some(u) = usage {
+            self.cached_read_tokens = Some(u.cached_input_tokens as f64);
+            self.cache_write_tokens = Some(u.cache_write_tokens as f64);
+            self.reasoning_tokens = Some(u.reasoning_tokens as f64);
+            self.input_tokens = Some(u.input_tokens as f64);
+            self.output_tokens = u.output_tokens as f64;
+        } else {
+            self.cached_read_tokens = None;
+            self.cache_write_tokens = None;
+            self.reasoning_tokens = None;
+            self.input_tokens = None;
+            self.output_tokens = 0.0;
+        }
+    }
+}
+
 pub fn build_usage_observation(
     facts: &NativeUsageFacts,
     variants: &[VariantFact],
@@ -1324,7 +1404,12 @@ pub fn build_usage_observation(
         cached_read_tokens: facts.cached_read_tokens,
         cache_write_tokens: facts.cache_write_tokens,
         duration_ms: usage_duration_ms(facts),
-        workload_class: facts.workload_class.clone(),
+        workload_class: facts
+            .workload_class
+            .as_deref()
+            .and_then(parse_workload_class)
+            .or_else(|| facts.agent.as_deref().and_then(map_agent_to_workload_class))
+            .map(str::to_string),
         account_key: facts.account_key.clone(),
         observed_at: facts.completed_ms,
     })
@@ -1750,5 +1835,229 @@ mod tests {
 
         assert_eq!(observation.output_tokens.to_bits(), 180.0_f64.to_bits());
         assert_eq!(observation.reasoning_tokens, Some(80.0));
+    }
+
+    #[test]
+    fn test_producer_flags_and_use_basket_predicate() {
+        // Gated on counters_producer, class_producer, account_producer:
+        // Recorded as three independent booleans in campaign notes at implementation time.
+        // use_basket may be true only when counters_producer and class_producer are both true,
+        // and account_producer never enters that predicate.
+        assert!(COUNTERS_PRODUCER);
+        assert!(CLASS_PRODUCER);
+        assert!(!ACCOUNT_PRODUCER);
+
+        assert!(!use_basket_permitted(false, false));
+        assert!(!use_basket_permitted(true, false));
+        assert!(!use_basket_permitted(false, true));
+        assert!(use_basket_permitted(true, true));
+        assert!(use_basket_permitted(COUNTERS_PRODUCER, CLASS_PRODUCER));
+    }
+
+    #[test]
+    fn class_producer_true_agent_mapping_to_workload_class() {
+        // Gated on class_producer = true
+        assert_eq!(map_agent_to_workload_class("mason"), Some("ephemeral"));
+        assert_eq!(map_agent_to_workload_class("alfonso"), Some("head"));
+        assert_eq!(map_agent_to_workload_class("explore"), Some("gather"));
+        assert_eq!(map_agent_to_workload_class("librarian"), Some("gather"));
+        assert_eq!(map_agent_to_workload_class("sidekick"), Some("gather"));
+        assert_eq!(
+            map_agent_to_workload_class("sidekick.classifier"),
+            Some("gather")
+        );
+        assert_eq!(map_agent_to_workload_class("hire_agent"), Some("hire"));
+        assert_eq!(map_agent_to_workload_class("hire-worker"), Some("hire"));
+        assert_eq!(map_agent_to_workload_class("unknown_agent"), None);
+    }
+
+    #[test]
+    fn counters_producer_true_broca_usage_copy_mapping() {
+        // Gated on counters_producer = true
+        let mut facts = usage_facts("broca-copy-live");
+        let live_usage = BrocaUsageFacts {
+            input_tokens: 500,
+            cached_input_tokens: 250,
+            cache_write_tokens: 15,
+            output_tokens: 120,
+            reasoning_tokens: 45,
+            retries_used: 0,
+        };
+        facts.apply_broca_usage(Some(&live_usage));
+        assert_eq!(facts.cached_read_tokens, Some(250.0));
+        assert_eq!(facts.input_tokens, Some(500.0));
+
+        // Fixture payload: output_tokens = 100 and reasoning_tokens = 80
+        let mut fixture_facts = usage_facts("broca-fixture");
+        let fixture_usage = BrocaUsageFacts {
+            input_tokens: 300,
+            cached_input_tokens: 40,
+            cache_write_tokens: 20,
+            output_tokens: 100,
+            reasoning_tokens: 80,
+            retries_used: 0,
+        };
+        fixture_facts.apply_broca_usage(Some(&fixture_usage));
+        let obs = build_usage_observation(&fixture_facts, &[]).unwrap();
+
+        assert_eq!(obs.cached_read_tokens, Some(40.0));
+        assert_eq!(obs.cache_write_tokens, Some(20.0));
+        assert_eq!(obs.reasoning_tokens, Some(80.0));
+        assert_eq!(obs.input_tokens, Some(300.0));
+        assert_eq!(obs.output_tokens, 180.0);
+        assert_eq!(obs.output_tokens - obs.reasoning_tokens.unwrap(), 100.0);
+    }
+
+    #[test]
+    fn mutation_subtracting_cached_input_tokens_from_fresh_input_reddens() {
+        // Gated on counters_producer = true
+        // Asserts fresh_input does not subtract cached_input_tokens
+        let u = BrocaUsageFacts {
+            input_tokens: 300,
+            cached_input_tokens: 40,
+            cache_write_tokens: 20,
+            output_tokens: 100,
+            reasoning_tokens: 80,
+            retries_used: 0,
+        };
+        let mut facts = usage_facts("fresh-input-no-subtraction");
+        facts.apply_broca_usage(Some(&u));
+        let mutated_fresh_input = (u.input_tokens - u.cached_input_tokens) as f64;
+        assert_eq!(facts.input_tokens, Some(300.0));
+        assert_ne!(facts.input_tokens, Some(mutated_fresh_input));
+    }
+
+    #[test]
+    fn mutation_subtracting_reasoning_from_broca_output_reddens() {
+        // Gated on counters_producer = true
+        // Asserts reasoning is not subtracted from the Broca output field
+        let u = BrocaUsageFacts {
+            input_tokens: 300,
+            cached_input_tokens: 40,
+            cache_write_tokens: 20,
+            output_tokens: 100,
+            reasoning_tokens: 80,
+            retries_used: 0,
+        };
+        let mut facts = usage_facts("output-no-reasoning-subtraction");
+        facts.apply_broca_usage(Some(&u));
+        let mutated_broca_output = (u.output_tokens - u.reasoning_tokens) as f64;
+        assert_eq!(facts.output_tokens, 100.0);
+        assert_ne!(facts.output_tokens, mutated_broca_output);
+    }
+
+    #[test]
+    fn mutation_extending_native_usage_facts_without_copy_reddens() {
+        // Gated on counters_producer = true
+        // Asserts extending NativeUsageFacts without the copy leaves counter fields None
+        let facts_without_copy = usage_facts("without-copy");
+        assert_eq!(facts_without_copy.input_tokens, None);
+        assert_eq!(facts_without_copy.cached_read_tokens, None);
+        assert_eq!(facts_without_copy.cache_write_tokens, None);
+
+        let mut facts_with_copy = usage_facts("with-copy");
+        let u = BrocaUsageFacts {
+            input_tokens: 500,
+            cached_input_tokens: 250,
+            cache_write_tokens: 10,
+            output_tokens: 100,
+            reasoning_tokens: 25,
+            retries_used: 0,
+        };
+        facts_with_copy.apply_broca_usage(Some(&u));
+        assert_eq!(facts_with_copy.input_tokens, Some(500.0));
+        assert_eq!(facts_with_copy.cached_read_tokens, Some(250.0));
+        assert_eq!(facts_with_copy.cache_write_tokens, Some(10.0));
+    }
+
+    #[test]
+    fn mutation_storing_output_without_adding_reasoning_reddens() {
+        // Gated on counters_producer = true
+        // Asserts stored combined output_tokens adds reasoning to output
+        let mut facts = usage_facts("stored-combined-output");
+        facts.output_tokens = 100.0;
+        facts.reasoning_tokens = Some(80.0);
+        let obs = build_usage_observation(&facts, &[]).unwrap();
+        assert_eq!(obs.output_tokens, 180.0);
+        assert_ne!(obs.output_tokens, facts.output_tokens);
+    }
+
+    #[test]
+    fn class_producer_true_workload_class_closed_enum() {
+        // Gated on class_producer = true:
+        // workload_class accepts exactly ephemeral, head, gather and hire.
+        for class in ["ephemeral", "head", "gather", "hire"] {
+            assert_eq!(parse_workload_class(class), Some(class));
+            let mut facts = usage_facts("class-valid");
+            facts.workload_class = Some(class.into());
+            let obs = build_usage_observation(&facts, &[]).unwrap();
+            assert_eq!(obs.workload_class.as_deref(), Some(class));
+        }
+
+        for invalid in ["mason", "task", "unknown", "ephemeral_extra", "", " "] {
+            assert_eq!(parse_workload_class(invalid), None);
+            let mut facts = usage_facts("class-invalid");
+            facts.workload_class = Some(invalid.into());
+            let obs = build_usage_observation(&facts, &[]).unwrap();
+            assert_eq!(obs.workload_class, None);
+        }
+    }
+
+    #[test]
+    fn absence_is_whole_object_at_provider_boundary_and_per_counter_at_param_layer() {
+        // Gated on absence whole-object vs per-counter:
+        // Whole-object absence at provider boundary clears all 5 counter columns
+        let mut facts = usage_facts("whole-object-absence");
+        facts.apply_broca_usage(None);
+        let obs = build_usage_observation(&facts, &[]).unwrap();
+        assert_eq!(obs.input_tokens, None);
+        assert_eq!(obs.output_tokens, 0.0); // 0.0 outputs write NULL to stored output_tokens
+        assert_eq!(obs.reasoning_tokens, None);
+        assert_eq!(obs.cached_read_tokens, None);
+        assert_eq!(obs.cache_write_tokens, None);
+
+        // Authoritative zero cached-read counter writes 0
+        let zero_cached = BrocaUsageFacts {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            cache_write_tokens: 5,
+            output_tokens: 50,
+            reasoning_tokens: 10,
+            retries_used: 0,
+        };
+        let mut facts_zero = usage_facts("zero-cached");
+        facts_zero.apply_broca_usage(Some(&zero_cached));
+        let obs_zero = build_usage_observation(&facts_zero, &[]).unwrap();
+        assert_eq!(obs_zero.cached_read_tokens, Some(0.0));
+    }
+
+    #[test]
+    fn mutation_writing_zero_for_whole_object_absence_reddens() {
+        // Gated on whole-object absence:
+        // Asserts whole-object absence does NOT write 0
+        let mut facts = usage_facts("whole-object-not-zero");
+        facts.apply_broca_usage(None);
+        assert_ne!(facts.cached_read_tokens, Some(0.0));
+        assert_ne!(facts.input_tokens, Some(0.0));
+        assert_eq!(facts.cached_read_tokens, None);
+        assert_eq!(facts.input_tokens, None);
+    }
+
+    #[test]
+    fn mutation_writing_null_for_authoritative_zero_cached_read_reddens() {
+        // Gated on authoritative zero cached-read:
+        // Asserts authoritative zero is Some(0.0), NOT None (NULL)
+        let zero_cached = BrocaUsageFacts {
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            cache_write_tokens: 5,
+            output_tokens: 50,
+            reasoning_tokens: 10,
+            retries_used: 0,
+        };
+        let mut facts = usage_facts("zero-cached-not-null");
+        facts.apply_broca_usage(Some(&zero_cached));
+        assert_eq!(facts.cached_read_tokens, Some(0.0));
+        assert_ne!(facts.cached_read_tokens, None);
     }
 }

@@ -57,13 +57,16 @@ pub use model_facts::{
 pub use model_facts_seed::model_facts_seed;
 pub use model_resolution::{
     build_model_speed_observation, find_most_specific_fallback_entry, fuzzy_match_model,
-    resolve_compatible_model_settings, resolve_model_capabilities, resolve_model_id_alias,
-    resolve_model_pipeline, resolve_user_model_pin, DelegatedModelConfig, DesiredModelSettings,
-    FallbackEntry, ModelAliasResolution, ModelCapabilities, ModelCapabilitiesInput,
-    ModelCapabilitiesSnapshot, ModelCapabilitiesSnapshotEntry, ModelResolutionConstraints,
-    ModelResolutionIntent, ModelResolutionPolicy, ModelResolutionRequest, ModelResolutionResult,
-    ModelSettingsCompatibilityChange, ModelSettingsCompatibilityResult, NativeUsageFacts,
-    SnapshotLimit, SnapshotModalities, UserModelPinRequest, VariantFact,
+    map_agent_to_workload_class, parse_workload_class, resolve_compatible_model_settings,
+    resolve_model_capabilities, resolve_model_id_alias, resolve_model_pipeline,
+    resolve_user_model_pin, use_basket_permitted, BrocaUsageFacts, DelegatedModelConfig,
+    DesiredModelSettings, FallbackEntry, ModelAliasResolution, ModelCapabilities,
+    ModelCapabilitiesInput, ModelCapabilitiesSnapshot, ModelCapabilitiesSnapshotEntry,
+    ModelResolutionConstraints, ModelResolutionIntent, ModelResolutionPolicy,
+    ModelResolutionRequest, ModelResolutionResult, ModelSettingsCompatibilityChange,
+    ModelSettingsCompatibilityResult, NativeUsageFacts, SnapshotLimit, SnapshotModalities,
+    UserModelPinRequest, VariantFact, ACCOUNT_PRODUCER, CLASS_PRODUCER, COUNTERS_PRODUCER,
+    VALID_WORKLOAD_CLASSES,
 };
 pub use model_router::{
     admit_routes, select_model_route, select_model_route_with_config, AdmissionResult,
