@@ -1098,9 +1098,9 @@ fn apply_overrides<S: RouteStateStore>(
     store: &S,
     overrides: &HashMap<String, ModelFactOverride>,
 ) -> Result<OverrideOutcome, String> {
-    // The seed supplies withdrawn score values and withdrawn catalog values whose
-    // prior external value is not retained. Other fields stay on the live row so a
-    // partial override cannot reset unrelated catalog updates.
+    // The seed supplies withdrawn catalog values whose prior external value is not
+    // retained. Other fields stay on the live row so a partial override cannot reset
+    // unrelated catalog updates or operator-placed scores.
     let seed_by_key: HashMap<String, ModelFact> = model_facts_seed()
         .iter()
         .map(|f| {
@@ -1184,20 +1184,9 @@ fn apply_overrides<S: RouteStateStore>(
                 review_by_ms: None,
                 eq_source: None,
             });
-        if let Some(seed) = seed_fact {
-            if ov.elo.is_none() {
-                base.scores.elo = seed.scores.elo;
-            }
-            if ov.eq.is_none() {
-                base.scores.eq = seed.scores.eq;
-            }
-            if ov.speed.is_none() {
-                base.scores.speed = seed.scores.speed;
-            }
-            if ov.speed_multiplier.is_none() {
-                base.speed_multiplier = seed.speed_multiplier;
-            }
-        }
+        // Score provenance does not distinguish config from route.model_upsert.
+        // Preserving absent score fields avoids erasing an upsert placement on restart;
+        // withdrawing a config-authored score remains ambiguous until origin is stored.
         // The store retains Fusiform provenance, but not a shadow copy of the value
         // replaced by an override. Restore only stamps that were actually withdrawn,
         // using the seed when it has the route and otherwise the unknown value.
@@ -1439,26 +1428,22 @@ mod tests {
     }
 
     #[test]
-    fn withdrawing_elo_restores_seed_value_for_present_model_key() {
+    fn upsert_placed_score_survives_config_entry_that_does_not_name_it() {
         let _guard = multiplier_map_guard();
-        let (root, config_path, store) = family_rule_rig("withdraw-elo");
+        let (root, config_path, store) = family_rule_rig("preserve-upsert-score");
         let route_key = "anthropic/claude-opus-4-5";
-        let seed_elo = model_facts_seed()
-            .iter()
-            .find(|fact| {
-                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
-                    == route_key
-            })
-            .unwrap()
-            .scores
-            .elo;
-
+        let mut placed = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        placed.scores.elo = 1900.0;
+        store.upsert_fact(&placed, FactSource::Override).unwrap();
         std::fs::write(
             &config_path,
-            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"elo":1700}}}}"#,
+            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"cost_per_mtok_out":1}}}}"#,
         )
         .unwrap();
+
         apply_overrides_from_config(&store, &config_path).unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+
         assert_eq!(
             store
                 .get_fact_by_route_key(route_key)
@@ -1466,25 +1451,8 @@ mod tests {
                 .unwrap()
                 .scores
                 .elo,
-            1700.0
+            1900.0
         );
-
-        std::fs::write(
-            &config_path,
-            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{}}}}"#,
-        )
-        .unwrap();
-        apply_overrides_from_config(&store, &config_path).unwrap();
-        assert_eq!(
-            store
-                .get_fact_by_route_key(route_key)
-                .unwrap()
-                .unwrap()
-                .scores
-                .elo,
-            seed_elo
-        );
-
         let _ = std::fs::remove_dir_all(root);
     }
 
