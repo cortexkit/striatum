@@ -1417,6 +1417,93 @@ impl RouteStateStore for SqliteRouteStateStore {
             .map_err(err)
     }
 
+    fn clear_operator_fact_fields(
+        &self,
+        route_key: &str,
+        fields: &[CatalogFactField],
+    ) -> RouteStateResult<Vec<CatalogFactField>> {
+        if fields.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.store
+            .with_conn(|connection: &Connection| {
+                let tx = connection.unchecked_transaction()?;
+                let sources = tx
+                    .query_row(
+                        "SELECT context_window_source, max_output_tokens_source,
+                                cost_tier_source, cost_per_mtok_out_source,
+                                supports_vision_source, supports_tool_use_source
+                         FROM model_facts WHERE route_key = ?1",
+                        [route_key],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, Option<String>>(5)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some(sources) = sources else {
+                    tx.commit()?;
+                    return Ok(Vec::new());
+                };
+                let candidates = [
+                    (CatalogFactField::ContextWindow, sources.0),
+                    (CatalogFactField::MaxOutputTokens, sources.1),
+                    (CatalogFactField::CostTier, sources.2),
+                    (CatalogFactField::CostPerMtokOut, sources.3),
+                    (CatalogFactField::SupportsVision, sources.4),
+                    (CatalogFactField::SupportsToolUse, sources.5),
+                ];
+                let cleared = candidates
+                    .into_iter()
+                    .filter_map(|(field, source)| {
+                        (fields.contains(&field) && source.as_deref() == Some("override"))
+                            .then_some(field)
+                    })
+                    .collect::<Vec<_>>();
+                let should_clear = |field| i64::from(cleared.contains(&field));
+                tx.execute(
+                    "UPDATE model_facts SET
+                       context_window_source = CASE
+                         WHEN ?2 = 1 AND context_window_source = 'override' THEN NULL
+                         ELSE context_window_source END,
+                       max_output_tokens_source = CASE
+                         WHEN ?3 = 1 AND max_output_tokens_source = 'override' THEN NULL
+                         ELSE max_output_tokens_source END,
+                       cost_tier_source = CASE
+                         WHEN ?4 = 1 AND cost_tier_source = 'override' THEN NULL
+                         ELSE cost_tier_source END,
+                       cost_per_mtok_out_source = CASE
+                         WHEN ?5 = 1 AND cost_per_mtok_out_source = 'override' THEN NULL
+                         ELSE cost_per_mtok_out_source END,
+                       supports_vision_source = CASE
+                         WHEN ?6 = 1 AND supports_vision_source = 'override' THEN NULL
+                         ELSE supports_vision_source END,
+                       supports_tool_use_source = CASE
+                         WHEN ?7 = 1 AND supports_tool_use_source = 'override' THEN NULL
+                         ELSE supports_tool_use_source END
+                     WHERE route_key = ?1",
+                    params![
+                        route_key,
+                        should_clear(CatalogFactField::ContextWindow),
+                        should_clear(CatalogFactField::MaxOutputTokens),
+                        should_clear(CatalogFactField::CostTier),
+                        should_clear(CatalogFactField::CostPerMtokOut),
+                        should_clear(CatalogFactField::SupportsVision),
+                        should_clear(CatalogFactField::SupportsToolUse),
+                    ],
+                )?;
+                tx.commit()?;
+                Ok(cleared)
+            })
+            .map_err(err)
+    }
+
     fn set_model_family(
         &self,
         route_key: &str,
