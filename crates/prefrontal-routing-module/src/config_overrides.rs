@@ -1456,6 +1456,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The invariant that matters in production: a config entry that names only a
+    /// score must not touch catalog fields the operator never stamped. Fusiform serves
+    /// a context window that differs from the seed; reconciliation on a boot whose
+    /// config does not name the field must leave the served value in place, because
+    /// only a withdrawn operator stamp authorizes a restore.
+    #[test]
+    fn unstamped_catalog_field_keeps_its_served_value_across_reconciliation() {
+        let _guard = multiplier_map_guard();
+        let (root, config_path, store) = family_rule_rig("unstamped-served");
+        let route_key = "anthropic/claude-opus-4-5";
+        let seed_context = model_facts_seed()
+            .iter()
+            .find(|fact| {
+                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
+                    == route_key
+            })
+            .unwrap()
+            .context_window;
+        let served_context = seed_context.map_or(Some(777_777.0), |v| Some(v + 111_111.0));
+        let mut served = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        served.context_window = served_context;
+        store.upsert_fact(&served, FactSource::Seed).unwrap();
+
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"eq":1600}}}}"#,
+        )
+        .unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+
+        let fact = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        assert_eq!(fact.context_window, served_context);
+        assert_eq!(
+            store
+                .clear_operator_fact_fields(route_key, &[CatalogFactField::ContextWindow])
+                .unwrap(),
+            Vec::<CatalogFactField>::new(),
+            "an unstamped field reports nothing cleared"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn reconciliation_preserves_a_catalog_field_still_named_by_override() {
         let _guard = multiplier_map_guard();
