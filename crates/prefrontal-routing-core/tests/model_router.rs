@@ -2165,3 +2165,71 @@ fn unscored_zero_score_row_is_unroutable_at_zero_demand_with_typed_rejection() {
     assert_eq!(refusal.rejected.len(), 1);
     assert_eq!(refusal.rejected[0].reason, "unscored_awaiting_placement");
 }
+
+#[test]
+fn use_basket_predicate_requires_both_counters_and_class_producers_and_never_account() {
+    // Gated on counters_producer, class_producer, account_producer:
+    // use_basket may be true only when counters_producer and class_producer are both true,
+    // and account_producer never enters that predicate.
+    use prefrontal_routing_core::{
+        use_basket_permitted, ACCOUNT_PRODUCER, CLASS_PRODUCER, COUNTERS_PRODUCER,
+    };
+
+    assert_eq!(COUNTERS_PRODUCER, true);
+    assert_eq!(CLASS_PRODUCER, true);
+    assert_eq!(ACCOUNT_PRODUCER, false);
+
+    assert!(!use_basket_permitted(false, false));
+    assert!(!use_basket_permitted(true, false));
+    assert!(!use_basket_permitted(false, true));
+    assert!(use_basket_permitted(true, true));
+}
+
+#[test]
+fn counters_producer_false_complete_rate_card_selection_bit_identical() {
+    // Gated on counters_producer = false:
+    // With counters_producer false, use_basket is never true, and selection is bit-identical
+    // to today for every route including routes with a complete rate card.
+    let mut complete_card_route = fact(FactBuilder {
+        provider_id: "complete".into(),
+        model_id: "rate-card-model".into(),
+        scores: scores(80.0, 1800.0, 100.0),
+        cost_per_m_tok_out: Some(10.0),
+        ..Default::default()
+    });
+    complete_card_route.input_rate = Some(2.0);
+    complete_card_route.cache_read_rate = Some(0.5);
+    complete_card_route.cache_write_rate = Some(1.5);
+    complete_card_route.reasoning_rate = Some(10.0);
+
+    let baseline_route = fact(FactBuilder {
+        provider_id: "complete".into(),
+        model_id: "rate-card-model".into(),
+        scores: scores(80.0, 1800.0, 100.0),
+        cost_per_m_tok_out: Some(10.0),
+        ..Default::default()
+    });
+
+    let selected_card = select_model_route(input(
+        vec![complete_card_route],
+        req(70.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+
+    let selected_baseline = select_model_route(input(
+        vec![baseline_route],
+        req(70.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+
+    assert_eq!(
+        selected_card.score.selection_cost.to_bits(),
+        selected_baseline.score.selection_cost.to_bits()
+    );
+    assert_eq!(
+        selected_card.model.model_id,
+        selected_baseline.model.model_id
+    );
+}

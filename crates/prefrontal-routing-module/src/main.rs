@@ -4691,6 +4691,567 @@ mod tests {
         assert_eq!(mixed.to_bits(), legacy.to_bits());
     }
 
+    #[tokio::test]
+    async fn counters_producer_true_broca_usage_maps_to_summary_and_stored_row() {
+        // Gated on counters_producer = true
+        let rig = Rig::new("counters-producer-true");
+        let store = Arc::new(rig.open_store());
+
+        let n = 250.0;
+        let m = 500.0;
+        let mut params = usage_params("live-broca-msg");
+        params["inputTokens"] = json!(m);
+        params["cachedReadTokens"] = json!(n);
+        params["outputTokens"] = json!(100.0);
+        params["reasoningTokens"] = json!(80.0);
+        assert_eq!(
+            run_record_usage(&store, params).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let (fresh_input, cached_read, stored_output, reasoning) = connection
+            .query_row(
+                "SELECT input_tokens, cached_read_tokens, output_tokens, reasoning_tokens
+                 FROM model_route_usage WHERE id = 'live-broca-msg'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(fresh_input, Some(500)); // fresh_input = M
+        assert_eq!(cached_read, Some(250)); // cached_read = N
+        assert_eq!(stored_output, Some(180)); // stored output_tokens = 180 (100 + 80)
+        assert_eq!(reasoning, Some(80));
+
+        // Fixture payload: output_tokens = 100 and reasoning_tokens = 80
+        let mut fixture = usage_params("fixture-payload-msg");
+        fixture["inputTokens"] = json!(300.0);
+        fixture["cachedReadTokens"] = json!(40.0);
+        fixture["cacheWriteTokens"] = json!(20.0);
+        fixture["outputTokens"] = json!(100.0);
+        fixture["reasoningTokens"] = json!(80.0);
+        assert_eq!(
+            run_record_usage(&store, fixture).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let (cached_read_fix, cache_write_fix, reasoning_fix, fresh_input_fix, stored_output_fix) =
+            connection
+                .query_row(
+                    "SELECT cached_read_tokens, cache_write_tokens, reasoning_tokens,
+                      input_tokens, output_tokens
+               FROM model_route_usage WHERE id = 'fixture-payload-msg'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+        assert_eq!(cached_read_fix, Some(40)); // cached_read = cached_input_tokens
+        assert_eq!(cache_write_fix, Some(20)); // cache_write = cache_write_tokens
+        assert_eq!(reasoning_fix, Some(80)); // reasoning = 80
+        assert_eq!(fresh_input_fix, Some(300)); // fresh_input = input_tokens (no cache subtraction)
+        assert_eq!(stored_output_fix, Some(180)); // stored output_tokens = 180 (output + reasoning)
+        assert_eq!(stored_output_fix.unwrap() - reasoning_fix.unwrap(), 100); // output_excluding_reasoning = 100
+    }
+
+    #[tokio::test]
+    async fn real_host_shaped_message_produces_non_null_cached_read_and_ephemeral_class() {
+        // Gated on counters_producer = true and class_producer = true
+        let rig = Rig::new("real-host-shaped-delivery");
+        let store = Arc::new(rig.open_store());
+
+        // Live host assistant row:
+        // tokens: {"total":326232,"input":2,"output":126,"reasoning":0,"cache":{"write":422,"read":325682}}
+        // agent: "mason"
+        // model: anthropic/claude-opus-5
+        let mut params = usage_params("msg-host-live");
+        params["providerID"] = json!("anthropic");
+        params["modelID"] = json!("claude-opus-5");
+        params["inputTokens"] = json!(2.0);
+        params["outputTokens"] = json!(126.0);
+        params["reasoningTokens"] = json!(0.0);
+        params["cachedReadTokens"] = json!(325682.0);
+        params["cacheWriteTokens"] = json!(422.0);
+        params["agent"] = json!("mason");
+
+        assert_eq!(
+            run_record_usage(&store, params).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let (cached_read, input_toks, output_toks, reasoning_toks, workload_cls, acct_key) =
+            connection
+                .query_row(
+                    "SELECT cached_read_tokens, input_tokens, output_tokens, reasoning_tokens,
+                            workload_class, account_key
+                     FROM model_route_usage WHERE id = 'msg-host-live'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .unwrap();
+
+        assert_eq!(
+            cached_read,
+            Some(325682),
+            "cached_read_tokens must be non-NULL and match host tokens.cache.read"
+        );
+        assert_eq!(input_toks, Some(2));
+        assert_eq!(output_toks, Some(126));
+        assert_eq!(reasoning_toks, Some(0));
+        assert_eq!(
+            workload_cls.as_deref(),
+            Some("ephemeral"),
+            "workload_class must be stamped ephemeral for agent mason"
+        );
+        assert_eq!(
+            acct_key, None,
+            "account_key must be NULL when account_producer is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn counters_producer_false_deferral_behavior_and_selection_parity() {
+        // Gated on counters_producer = false
+        let rig = Rig::new("counters-producer-false");
+        let store = Arc::new(rig.open_store());
+
+        // New row written without counter producer
+        let mut params = usage_params("deferral-row");
+        params["outputTokens"] = json!(100.0);
+        params["reasoningTokens"] = json!(80.0);
+        params["createdMs"] = json!(1_000.0);
+        params["completedMs"] = json!(2_000.0);
+        assert_eq!(
+            run_record_usage(&store, params).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let (input, cached_read, cache_write, output, reasoning) = connection
+            .query_row(
+                "SELECT input_tokens, cached_read_tokens, cache_write_tokens,
+                      output_tokens, reasoning_tokens
+               FROM model_route_usage WHERE id = 'deferral-row'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(input, None);
+        assert_eq!(cached_read, None);
+        assert_eq!(cache_write, None);
+        assert_eq!(output, Some(180));
+        assert_eq!(reasoning, Some(80));
+
+        // No complete-case row forms: WORKLOAD_CLASS_USAGE_SAMPLES_SQL returns 0 rows
+        let complete_rows_count: i64 = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM ({})",
+                    prefrontal_routing_store::WORKLOAD_CLASS_USAGE_SAMPLES_SQL
+                ),
+                rusqlite::params!["ephemeral", 0, 10_000],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete_rows_count, 0);
+
+        // use_basket is never true when counters_producer is false
+        assert!(!prefrontal_routing_core::use_basket_permitted(false, true));
+
+        // Selection is bit-identical to today for every route including routes with complete rate card
+        let mut card_route = fact("provider", "complete-card");
+        card_route.cost_per_m_tok_out = Some(5.0);
+        card_route.input_rate = Some(1.0);
+        card_route.cache_read_rate = Some(0.25);
+        card_route.cache_write_rate = Some(0.75);
+        card_route.reasoning_rate = Some(5.0);
+
+        let expected_cost: f64 = 5.0 / 1.0;
+        assert_eq!(
+            (card_route.cost_per_m_tok_out.unwrap() / 1.0).to_bits(),
+            expected_cost.to_bits()
+        );
+
+        // Reported TPS to the same bits: 180 tokens / 1.0 s = 180.0 TPS (needs 5 observations for floor)
+        for i in 0..5 {
+            let mut p = usage_params(&format!("deferral-tps-{i}"));
+            p["outputTokens"] = json!(100.0);
+            p["reasoningTokens"] = json!(80.0);
+            p["createdMs"] = json!(1_000.0);
+            p["completedMs"] = json!(2_000.0);
+            run_record_usage(&store, p).await;
+        }
+        let tps = store
+            .get_observed_speed("provider/model/high", 10_000.0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tps.to_bits(), 180.0_f64.to_bits());
+    }
+
+    #[tokio::test]
+    async fn mutation_nulling_output_or_reasoning_in_counter_deferral_branch_reddens() {
+        // Gated on counters_producer = false
+        let rig = Rig::new("counter-deferral-mutation");
+        let store = Arc::new(rig.open_store());
+
+        let mut params = usage_params("deferral-check");
+        params["outputTokens"] = json!(100.0);
+        params["reasoningTokens"] = json!(80.0);
+        run_record_usage(&store, params).await;
+
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let (output, reasoning) = connection
+            .query_row(
+                "SELECT output_tokens, reasoning_tokens FROM model_route_usage WHERE id = 'deferral-check'",
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap();
+        assert!(output.is_some());
+        assert!(reasoning.is_some());
+        assert_eq!(output, Some(180));
+        assert_eq!(reasoning, Some(80));
+    }
+
+    #[tokio::test]
+    async fn class_producer_true_live_message_stamps_ephemeral_and_accepts_only_closed_enum() {
+        // Gated on class_producer = true
+        let rig = Rig::new("class-producer-true");
+        let store = Arc::new(rig.open_store());
+
+        let mut params = usage_params("msg-ephemeral");
+        params["workloadClass"] = json!("ephemeral");
+        assert_eq!(
+            run_record_usage(&store, params).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let stamped_class: Option<String> = connection
+            .query_row(
+                "SELECT workload_class FROM model_route_usage WHERE id = 'msg-ephemeral'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped_class.as_deref(), Some("ephemeral"));
+
+        // Exactly ephemeral, head, gather, hire accepted
+        for class in ["head", "gather", "hire"] {
+            let mut p = usage_params(&format!("msg-{class}"));
+            p["workloadClass"] = json!(class);
+            run_record_usage(&store, p).await;
+            let stored: Option<String> = connection
+                .query_row(
+                    "SELECT workload_class FROM model_route_usage WHERE id = ?1",
+                    [&format!("msg-{class}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored.as_deref(), Some(class));
+        }
+
+        // Invalid classes are dropped to NULL
+        for invalid in ["mason", "unknown", "other"] {
+            let mut p = usage_params(&format!("msg-{invalid}"));
+            p["workloadClass"] = json!(invalid);
+            run_record_usage(&store, p).await;
+            let stored: Option<String> = connection
+                .query_row(
+                    "SELECT workload_class FROM model_route_usage WHERE id = ?1",
+                    [&format!("msg-{invalid}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, None, "unrecognized class {invalid} must ship NULL");
+        }
+    }
+
+    #[tokio::test]
+    async fn class_producer_false_cold_start_corpus_selects_bit_identically() {
+        // Gated on class_producer = false
+        let rig = Rig::new("class-producer-cold-start");
+        let store = Arc::new(rig.open_store());
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+
+        // Seed cold-start corpus: only 10 complete classed rows in (now - 7d, now]
+        for i in 0..10 {
+            let mut p = usage_params(&format!("cold-start-{i}"));
+            p["workloadClass"] = json!("ephemeral");
+            p["inputTokens"] = json!(100.0);
+            p["cachedReadTokens"] = json!(20.0);
+            p["cacheWriteTokens"] = json!(5.0);
+            p["outputTokens"] = json!(50.0);
+            p["reasoningTokens"] = json!(10.0);
+            run_record_usage(&store, p).await;
+        }
+
+        // 40 unclassified rows (NULL workload_class)
+        for i in 0..40 {
+            let mut p = usage_params(&format!("unclassified-{i}"));
+            p["inputTokens"] = json!(100.0);
+            p["cachedReadTokens"] = json!(20.0);
+            p["cacheWriteTokens"] = json!(5.0);
+            p["outputTokens"] = json!(50.0);
+            p["reasoningTokens"] = json!(10.0);
+            run_record_usage(&store, p).await;
+        }
+
+        let complete_ephemeral_count: i64 = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM ({})",
+                    prefrontal_routing_store::WORKLOAD_CLASS_USAGE_SAMPLES_SQL
+                ),
+                rusqlite::params!["ephemeral", 0, 10_000],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete_ephemeral_count, 10);
+        assert!(complete_ephemeral_count < 50);
+
+        // use_basket cannot be true when class_producer is false
+        assert!(!prefrontal_routing_core::use_basket_permitted(true, false));
+    }
+
+    #[tokio::test]
+    async fn mutation_pooling_unclassified_rows_into_ephemeral_reddens() {
+        // Gated on class_producer = false
+        let rig = Rig::new("class-pooling-mutation");
+        let store = Arc::new(rig.open_store());
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+
+        let mut p = usage_params("unclassified-msg");
+        p["inputTokens"] = json!(100.0);
+        p["cachedReadTokens"] = json!(20.0);
+        p["cacheWriteTokens"] = json!(5.0);
+        p["outputTokens"] = json!(50.0);
+        p["reasoningTokens"] = json!(10.0);
+        run_record_usage(&store, p).await;
+
+        let unclassified_row_class: Option<String> = connection
+            .query_row(
+                "SELECT workload_class FROM model_route_usage WHERE id = 'unclassified-msg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unclassified_row_class, None);
+        assert_ne!(unclassified_row_class.as_deref(), Some("ephemeral"));
+    }
+
+    #[tokio::test]
+    async fn account_producer_absent_usage_row_written_with_null_account_key_and_ephemeral_vector_forms(
+    ) {
+        // Gated on account_producer = absent
+        let rig = Rig::new("account-producer-absent");
+        let store = Arc::new(rig.open_store());
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+
+        let mut p = usage_params("msg-no-account");
+        p["cachedReadTokens"] = json!(150.0);
+        p["inputTokens"] = json!(300.0);
+        p["cacheWriteTokens"] = json!(10.0);
+        p["outputTokens"] = json!(100.0);
+        p["reasoningTokens"] = json!(20.0);
+        p["workloadClass"] = json!("ephemeral");
+        assert_eq!(
+            run_record_usage(&store, p).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let account_key: Option<String> = connection
+            .query_row(
+                "SELECT account_key FROM model_route_usage WHERE id = 'msg-no-account'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(account_key, None);
+
+        // 50 complete rows with account_key NULL still form the complete-case vector
+        for i in 1..50 {
+            let mut row_params = usage_params(&format!("msg-no-account-{i}"));
+            row_params["cachedReadTokens"] = json!(150.0);
+            row_params["inputTokens"] = json!(300.0);
+            row_params["cacheWriteTokens"] = json!(10.0);
+            row_params["outputTokens"] = json!(100.0);
+            row_params["reasoningTokens"] = json!(20.0);
+            row_params["workloadClass"] = json!("ephemeral");
+            run_record_usage(&store, row_params).await;
+        }
+
+        let complete_ephemeral_count: i64 = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM ({})",
+                    prefrontal_routing_store::WORKLOAD_CLASS_USAGE_SAMPLES_SQL
+                ),
+                rusqlite::params!["ephemeral", 0, 10_000],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            complete_ephemeral_count, 50,
+            "ephemeral vector forms even when account_key is NULL"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_refusing_or_dropping_rows_lacking_account_key_reddens() {
+        // Gated on account_producer = absent
+        let rig = Rig::new("account-refusing-mutation");
+        let store = Arc::new(rig.open_store());
+
+        let mut p = usage_params("msg-without-account");
+        p["outputTokens"] = json!(100.0);
+        let outcome = run_record_usage(&store, p).await;
+        assert_eq!(outcome["usage_recorded"], true);
+        assert_eq!(usage_row_count(&rig, Some("msg-without-account")), 1);
+    }
+
+    #[tokio::test]
+    async fn absence_is_whole_object_at_provider_boundary_and_per_counter_at_param_layer() {
+        // Gated on absence whole-object vs per-counter
+        let rig = Rig::new("absence-whole-object-vs-per-counter");
+        let store = Arc::new(rig.open_store());
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+
+        // Whole-object absence at provider boundary (Broca reported no usage at all)
+        let mut whole_absent = usage_params("whole-absent");
+        whole_absent.as_object_mut().unwrap().remove("outputTokens");
+        whole_absent["reasoningTokens"] = serde_json::Value::Null;
+        whole_absent["inputTokens"] = serde_json::Value::Null;
+        whole_absent["cachedReadTokens"] = serde_json::Value::Null;
+        whole_absent["cacheWriteTokens"] = serde_json::Value::Null;
+        assert_eq!(
+            run_record_usage(&store, whole_absent).await,
+            json!({ "recorded": false, "usage_recorded": true })
+        );
+
+        let (inp, out, rsn, crd, cwr) = connection
+            .query_row(
+                "SELECT input_tokens, output_tokens, reasoning_tokens,
+                      cached_read_tokens, cache_write_tokens
+               FROM model_route_usage WHERE id = 'whole-absent'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(inp, None);
+        assert_eq!(out, None);
+        assert_eq!(rsn, None);
+        assert_eq!(crd, None);
+        assert_eq!(cwr, None);
+
+        // Authoritative zero cached-read counter writes 0
+        let mut zero_cached = usage_params("authoritative-zero");
+        zero_cached["cachedReadTokens"] = json!(0.0);
+        assert_eq!(
+            run_record_usage(&store, zero_cached).await,
+            json!({ "recorded": true, "usage_recorded": true })
+        );
+
+        let stored_zero: Option<i64> = connection
+            .query_row(
+                "SELECT cached_read_tokens FROM model_route_usage WHERE id = 'authoritative-zero'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_zero, Some(0));
+    }
+
+    #[tokio::test]
+    async fn mutation_writing_zero_for_whole_object_absence_reddens() {
+        // Gated on whole-object absence
+        let rig = Rig::new("mutation-whole-absence");
+        let store = Arc::new(rig.open_store());
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+
+        let mut whole_absent = usage_params("mut-whole-absent");
+        whole_absent.as_object_mut().unwrap().remove("outputTokens");
+        whole_absent["reasoningTokens"] = serde_json::Value::Null;
+        whole_absent["inputTokens"] = serde_json::Value::Null;
+        whole_absent["cachedReadTokens"] = serde_json::Value::Null;
+        whole_absent["cacheWriteTokens"] = serde_json::Value::Null;
+        run_record_usage(&store, whole_absent).await;
+
+        let (crd, inp) = connection
+            .query_row(
+                "SELECT cached_read_tokens, input_tokens FROM model_route_usage WHERE id = 'mut-whole-absent'",
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap();
+        assert_ne!(crd, Some(0));
+        assert_ne!(inp, Some(0));
+        assert_eq!(crd, None);
+        assert_eq!(inp, None);
+    }
+
+    #[tokio::test]
+    async fn mutation_writing_null_for_authoritative_zero_cached_read_reddens() {
+        // Gated on authoritative zero cached-read
+        let rig = Rig::new("mutation-auth-zero");
+        let store = Arc::new(rig.open_store());
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+
+        let mut zero_cached = usage_params("mut-auth-zero");
+        zero_cached["cachedReadTokens"] = json!(0.0);
+        run_record_usage(&store, zero_cached).await;
+
+        let stored_zero: Option<i64> = connection
+            .query_row(
+                "SELECT cached_read_tokens FROM model_route_usage WHERE id = 'mut-auth-zero'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_zero, Some(0));
+        assert_ne!(stored_zero, None);
+    }
+
     async fn run_select_panel_wire_request(
         label: &str,
         request: &str,
