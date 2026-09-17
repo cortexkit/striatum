@@ -939,16 +939,11 @@ fn admit_and_price_shortlist(
 /// the basket; there is no `account_producer` argument because its absence must
 /// never force the basket off.
 ///
-/// Reference calibration is pinned to the catalog-and-readings fixture in the
-/// router tests, not to live traffic. `BASKET_REFERENCE_COST_PER_MESSAGE` stays
-/// 0.05: free-bucket membership is identical before and after except the two
-/// cached-read exits named in that replay. Clamp census on that fixture catalog
-/// (host: pinned fixture; window: trailing 7-day ephemeral mean, sample_count 50;
-/// query: cost component saturates at 1.0; population: 8 catalog routes) counts
-/// 2 saturations under today's ladder and 0 under the basket. The measured
-/// ephemeral basket at the fixture-median complete rate card is $0.094267 per
-/// message (3552 fresh / 223 output / 140387 cached-read / 50 cache-write at
-/// median input 1.25, output 9, cache-read 0.625, cache-write 1.5625).
+/// Reference calibration is measured off the host stores, not invented.
+/// Live routing `model_facts` is schema v35 and does not persist Fusiform rates.
+/// Joining the scored routable catalog to latest Fusiform eras, every
+/// reconstructed mason shortlist includes a route with no rate card, so the
+/// basket does not engage. See the catalog-and-readings replay test.
 pub fn price_selection_shortlist(
     input: SelectModelRouteInput<'_>,
     config: &RoutingConfig,
