@@ -1130,6 +1130,8 @@ fn apply_overrides<S: RouteStateStore>(
                 aa_index: None,
                 review_by_ms: None,
                 eq_source: None,
+                class_vector: None,
+                class_vector_is_overlay: false,
             });
         if base.max_output_tokens.is_none() {
             base.max_output_tokens = existing_fact.and_then(|fact| fact.max_output_tokens);
@@ -1285,6 +1287,8 @@ mod tests {
             aa_index: None,
             review_by_ms: None,
             eq_source: None,
+            class_vector: None,
+            class_vector_is_overlay: false,
         };
         let ov = ModelFactOverride {
             vision: Some(true),

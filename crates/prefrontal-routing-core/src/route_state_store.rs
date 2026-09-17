@@ -12,7 +12,7 @@
 //! domain. Quota windows are NOT here; they live in `insula` (formerly `ai-provider-quota`) and are
 //! consumed module-to-module (see `crate::quota`).
 
-use crate::model_facts::{FamilySource, GrandFamily, ModelFact};
+use crate::model_facts::{ClassVector, FamilySource, GrandFamily, ModelFact};
 use crate::model_router::ModelRouteStateSnapshot;
 
 /// Provenance of a stored fact. The closed vocabulary the router and listing ops
@@ -410,6 +410,16 @@ pub trait RouteStateStore {
     /// max-effort sibling's observations attach to the right fact. Facts without a
     /// trusted observation keep their seed speed.
     fn get_facts_with_observed_speed(&self, now: f64) -> RouteStateResult<Vec<ModelFact>>;
+
+    /// Compute the complete-case token profile vector for a workload class over the
+    /// trailing 7-day window (now - 7d, now].
+    fn get_class_vector(
+        &self,
+        _workload_class: &str,
+        _now: f64,
+    ) -> RouteStateResult<Option<ClassVector>> {
+        Ok(None)
+    }
 
     // ── Snapshot ────────────────────────────────────────────
     /// Build the ROUTE-STATE-ONLY runtime snapshot the scorer consumes: per-route

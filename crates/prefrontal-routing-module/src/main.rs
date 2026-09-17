@@ -1228,6 +1228,8 @@ fn merge_model_upsert(
                 aa_index: None,
                 review_by_ms: None,
                 eq_source: None,
+                class_vector: None,
+                class_vector_is_overlay: false,
             }
         }
     };
@@ -4131,6 +4133,8 @@ mod tests {
             aa_index: None,
             review_by_ms: None,
             eq_source: None,
+            class_vector: None,
+            class_vector_is_overlay: false,
         }
     }
 

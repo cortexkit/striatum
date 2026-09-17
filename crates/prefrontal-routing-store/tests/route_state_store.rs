@@ -89,6 +89,8 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         aa_index: None,
         review_by_ms: None,
         eq_source: None,
+        class_vector: None,
+        class_vector_is_overlay: false,
     }
 }
 
@@ -2758,4 +2760,792 @@ fn fusiform_cursor_is_committed_with_the_applied_snapshot() {
     };
     store.apply_fusiform_catalog(&[], cursor).unwrap();
     assert_eq!(store.fusiform_catalog_cursor().unwrap(), Some(cursor));
+}
+
+fn class_obs(
+    id: &str,
+    class: Option<&str>,
+    input: Option<f64>,
+    out: Option<f64>,
+    reasoning: Option<f64>,
+    cached_read: Option<f64>,
+    cache_write: Option<f64>,
+    dur: Option<f64>,
+    at: f64,
+) -> UsageObservation {
+    UsageObservation {
+        id: id.into(),
+        route_key: "p/m".into(),
+        capacity_key: "p/m".into(),
+        provider_id: "p".into(),
+        input_tokens: input,
+        output_tokens: out.unwrap_or(0.0),
+        reasoning_tokens: reasoning,
+        cached_read_tokens: cached_read,
+        cache_write_tokens: cache_write,
+        duration_ms: dur.unwrap_or(-1.0),
+        workload_class: class.map(str::to_string),
+        account_key: None,
+        observed_at: at,
+    }
+}
+
+#[test]
+fn get_facts_with_observed_speed_computes_class_vector_arithmetic_mean_over_trailing_window() {
+    let rig = Rig::new("class-vector-mean");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    let mut total_fresh_input = 0.0;
+    let mut total_output_excl = 0.0;
+    let mut total_reasoning = 0.0;
+    let mut total_cached_read = 0.0;
+    let mut total_cache_write = 0.0;
+
+    for i in 0..50 {
+        let input = 1000.0 + (i * 10) as f64;
+        let reasoning = 100.0 + (i * 5) as f64;
+        let output_excl = 500.0 + (i * 20) as f64;
+        let output = output_excl + reasoning;
+        let cached_read = 2000.0 + (i * 50) as f64;
+        let cache_write = 50.0 + i as f64;
+        // Last row has NULL duration, but all 5 token counters non-NULL
+        let dur = if i == 49 { None } else { Some(1000.0) };
+
+        total_fresh_input += input;
+        total_output_excl += output_excl;
+        total_reasoning += reasoning;
+        total_cached_read += cached_read;
+        total_cache_write += cache_write;
+
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("msg-{i}"),
+                Some("ephemeral"),
+                Some(input),
+                Some(output),
+                Some(reasoning),
+                Some(cached_read),
+                Some(cache_write),
+                dur,
+                now - 1000.0 - (i * 10) as f64,
+            ))
+            .unwrap();
+    }
+
+    let facts = store.get_facts_with_observed_speed(now).unwrap();
+    assert!(!facts.is_empty());
+    for fact in &facts {
+        let vec = fact
+            .class_vector
+            .as_ref()
+            .expect("ephemeral vector must be present on overlaid facts");
+        assert_eq!(vec.workload_class, "ephemeral");
+        assert_eq!(vec.sample_count, 50);
+        assert!(vec.is_usable());
+        assert!(fact.class_vector_is_overlay);
+        assert!((vec.fresh_input - total_fresh_input / 50.0).abs() < 1e-9);
+        assert!((vec.output_excluding_reasoning - total_output_excl / 50.0).abs() < 1e-9);
+        assert!((vec.reasoning - total_reasoning / 50.0).abs() < 1e-9);
+        assert!((vec.cached_read - total_cached_read / 50.0).abs() < 1e-9);
+        assert!((vec.cache_write - total_cache_write / 50.0).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn complete_ephemeral_row_trailing_window_boundary_pinned_to_now_argument() {
+    let rig = Rig::new("class-vector-boundary");
+    let store = rig.open();
+    let now = 1_000_000_000.0;
+    let seven_days_ms = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+
+    // now - 7d exactly: NOT in (now - 7d, now]
+    store
+        .record_usage_delivery(&class_obs(
+            "at-boundary-old",
+            Some("ephemeral"),
+            Some(100.0),
+            Some(100.0),
+            Some(0.0),
+            Some(100.0),
+            Some(10.0),
+            Some(1000.0),
+            now - seven_days_ms,
+        ))
+        .unwrap();
+
+    // now - 7d - 1000.0: NOT in
+    store
+        .record_usage_delivery(&class_obs(
+            "older-than-boundary",
+            Some("ephemeral"),
+            Some(100.0),
+            Some(100.0),
+            Some(0.0),
+            Some(100.0),
+            Some(10.0),
+            Some(1000.0),
+            now - seven_days_ms - 1000.0,
+        ))
+        .unwrap();
+
+    // now - 7d + 1.0 (eps): IN
+    store
+        .record_usage_delivery(&class_obs(
+            "inside-lower-eps",
+            Some("ephemeral"),
+            Some(200.0),
+            Some(100.0),
+            Some(0.0),
+            Some(100.0),
+            Some(10.0),
+            Some(1000.0),
+            now - seven_days_ms + 1.0,
+        ))
+        .unwrap();
+
+    // now exactly: IN
+    store
+        .record_usage_delivery(&class_obs(
+            "inside-upper",
+            Some("ephemeral"),
+            Some(300.0),
+            Some(100.0),
+            Some(0.0),
+            Some(100.0),
+            Some(10.0),
+            Some(1000.0),
+            now,
+        ))
+        .unwrap();
+
+    // now + 1.0 (future relative to now): NOT in
+    store
+        .record_usage_delivery(&class_obs(
+            "future",
+            Some("ephemeral"),
+            Some(400.0),
+            Some(100.0),
+            Some(0.0),
+            Some(100.0),
+            Some(10.0),
+            Some(1000.0),
+            now + 1.0,
+        ))
+        .unwrap();
+
+    let vec = store
+        .get_class_vector("ephemeral", now)
+        .unwrap()
+        .expect("vector formed from rows in window");
+    assert_eq!(
+        vec.sample_count, 2,
+        "exactly now-7d+eps and now are in population"
+    );
+    assert!((vec.fresh_input - 250.0).abs() < 1e-9);
+}
+
+#[test]
+fn class_vector_floor_50_requires_complete_rows_and_null_duration_reaches_floor() {
+    let rig = Rig::new("class-vector-floor-50");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    // 49 incomplete rows (NULL cached read)
+    for i in 0..49 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("incomplete-{i}"),
+                Some("ephemeral"),
+                Some(0.0),
+                Some(100.0),
+                Some(0.0),
+                None,
+                Some(0.0),
+                Some(1000.0),
+                now - 1000.0 - i as f64,
+            ))
+            .unwrap();
+    }
+    // 1 complete row with cached_read = 50.0
+    store
+        .record_usage_delivery(&class_obs(
+            "complete-1",
+            Some("ephemeral"),
+            Some(100.0),
+            Some(100.0),
+            Some(0.0),
+            Some(50.0),
+            Some(10.0),
+            Some(1000.0),
+            now - 500.0,
+        ))
+        .unwrap();
+
+    let vec = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(
+        vec.sample_count, 1,
+        "only complete-case rows count toward floor"
+    );
+    assert!(!vec.is_usable(), "1 row is unusable (< 50)");
+    assert!((vec.cached_read - 50.0).abs() < 1e-9);
+
+    // Plant 48 more complete rows (total 49 complete)
+    for i in 2..50 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("complete-{i}"),
+                Some("ephemeral"),
+                Some(100.0),
+                Some(100.0),
+                Some(0.0),
+                Some(50.0),
+                Some(10.0),
+                Some(1000.0),
+                now - 100.0 - i as f64,
+            ))
+            .unwrap();
+    }
+    let vec49 = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(vec49.sample_count, 49);
+    assert!(!vec49.is_usable(), "49 complete rows is unusable");
+
+    // 50th complete row: all five counters present, but duration is NULL
+    store
+        .record_usage_delivery(&class_obs(
+            "complete-50-null-duration",
+            Some("ephemeral"),
+            Some(100.0),
+            Some(100.0),
+            Some(0.0),
+            Some(50.0),
+            Some(10.0),
+            None,
+            now - 10.0,
+        ))
+        .unwrap();
+
+    let vec50 = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(
+        vec50.sample_count, 50,
+        "duration is not part of complete-case predicate"
+    );
+    assert!(vec50.is_usable(), "50 complete rows makes vector usable");
+}
+
+#[test]
+fn planted_rows_of_each_enumerated_class_produce_four_separate_vectors_and_selection_consults_ephemeral(
+) {
+    let rig = Rig::new("class-vectors-four-classes");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    for (class, val) in [
+        ("ephemeral", 100.0),
+        ("head", 200.0),
+        ("gather", 300.0),
+        ("hire", 400.0),
+    ] {
+        for i in 0..50 {
+            store
+                .record_usage_delivery(&class_obs(
+                    &format!("{class}-{i}"),
+                    Some(class),
+                    Some(val),
+                    Some(val),
+                    Some(0.0),
+                    Some(val),
+                    Some(val),
+                    Some(1000.0),
+                    now - 100.0 - i as f64,
+                ))
+                .unwrap();
+        }
+    }
+
+    // Plant 50 unclassified (NULL) and 50 unrecognized class rows
+    for i in 0..50 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("none-class-{i}"),
+                None,
+                Some(999.0),
+                Some(999.0),
+                Some(0.0),
+                Some(999.0),
+                Some(999.0),
+                Some(1000.0),
+                now - 100.0 - i as f64,
+            ))
+            .unwrap();
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("unrec-class-{i}"),
+                Some("unrecognized_class"),
+                Some(888.0),
+                Some(888.0),
+                Some(0.0),
+                Some(888.0),
+                Some(888.0),
+                Some(1000.0),
+                now - 100.0 - i as f64,
+            ))
+            .unwrap();
+    }
+
+    // Four separate vectors
+    let v_eph = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    let v_head = store.get_class_vector("head", now).unwrap().unwrap();
+    let v_gather = store.get_class_vector("gather", now).unwrap().unwrap();
+    let v_hire = store.get_class_vector("hire", now).unwrap().unwrap();
+
+    assert_eq!(v_eph.workload_class, "ephemeral");
+    assert!((v_eph.fresh_input - 100.0).abs() < 1e-9);
+    assert_eq!(
+        v_eph.sample_count, 50,
+        "unrecognized rows never pooled into ephemeral"
+    );
+
+    assert_eq!(v_head.workload_class, "head");
+    assert!((v_head.fresh_input - 200.0).abs() < 1e-9);
+
+    assert_eq!(v_gather.workload_class, "gather");
+    assert!((v_gather.fresh_input - 300.0).abs() < 1e-9);
+
+    assert_eq!(v_hire.workload_class, "hire");
+    assert!((v_hire.fresh_input - 400.0).abs() < 1e-9);
+
+    assert!(store
+        .get_class_vector("unrecognized_class", now)
+        .unwrap()
+        .is_none());
+    assert!(store.get_class_vector("", now).unwrap().is_none());
+
+    let facts = store.get_facts_with_observed_speed(now).unwrap();
+    for fact in facts {
+        let cv = fact.class_vector.as_ref().unwrap();
+        assert_eq!(cv.workload_class, "ephemeral");
+        assert!((cv.fresh_input - 100.0).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn class_vector_lands_as_overlay_value_and_is_never_written_back_to_stored_fact() {
+    let rig = Rig::new("class-vector-overlay-persisted");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    let mut custom = fact("p", "custom-model");
+    custom.cost_per_m_tok_out = Some(10.0);
+    custom.input_rate = Some(2.0);
+    custom.cache_read_rate = Some(0.5);
+    custom.cache_write_rate = Some(1.5);
+    custom.reasoning_rate = Some(10.0);
+    store.upsert_fact(&custom, FactSource::Override).unwrap();
+
+    let base_fact = store
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.provider_id == "p" && f.model_id == "custom-model")
+        .unwrap();
+    assert!(base_fact.class_vector.is_none());
+    assert!(!base_fact.class_vector_is_overlay);
+    let baseline_cost = prefrontal_routing_core::selection_cost(&base_fact, false);
+
+    for i in 0..50 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("msg-{i}"),
+                Some("ephemeral"),
+                Some(1000.0),
+                Some(1200.0),
+                Some(200.0),
+                Some(5000.0),
+                Some(100.0),
+                Some(1000.0),
+                now - 100.0 - i as f64,
+            ))
+            .unwrap();
+    }
+
+    // BEFORE overlay: stored fact has NO vector and selection_cost is UNCHANGED
+    let raw_fact = store
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.provider_id == "p" && f.model_id == "custom-model")
+        .unwrap();
+    assert!(
+        raw_fact.class_vector.is_none(),
+        "stored fact must have no class_vector"
+    );
+    assert!(!raw_fact.class_vector_is_overlay);
+    let pre_overlay_cost = prefrontal_routing_core::selection_cost(&raw_fact, false);
+    assert_eq!(
+        pre_overlay_cost, baseline_cost,
+        "planted usage rows must NOT change selection_cost before overlay runs"
+    );
+
+    // Run overlay: now selection_cost changes
+    let overlaid = store.get_facts_with_observed_speed(now).unwrap();
+    let overlaid_fact = overlaid
+        .into_iter()
+        .find(|f| f.provider_id == "p" && f.model_id == "custom-model")
+        .unwrap();
+    assert!(overlaid_fact.class_vector.is_some());
+    assert!(overlaid_fact.class_vector_is_overlay);
+    let overlaid_cost = prefrontal_routing_core::selection_cost(&overlaid_fact, false);
+    assert_ne!(
+        overlaid_cost, baseline_cost,
+        "planted usage rows must change selection_cost after overlay runs"
+    );
+
+    // Attempt to persist overlaid fact back to store: it must NOT survive into stored fact
+    store
+        .upsert_fact(&overlaid_fact, FactSource::Override)
+        .unwrap();
+    let reloaded = store
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.provider_id == "p" && f.model_id == "custom-model")
+        .unwrap();
+    assert!(
+        reloaded.class_vector.is_none(),
+        "vector must never be persisted on a stored fact"
+    );
+    assert!(!reloaded.class_vector_is_overlay);
+}
+
+fn route_input<'a>(facts: Vec<ModelFact>) -> SelectModelRouteInput<'a> {
+    let mut available_models = std::collections::HashSet::new();
+    for f in &facts {
+        available_models.insert(make_route_key(
+            &f.provider_id,
+            &f.model_id,
+            f.variant.as_deref(),
+        ));
+        available_models.insert(make_capacity_key(&f.provider_id, &f.model_id));
+    }
+    SelectModelRouteInput {
+        target_agent: "mason".to_string(),
+        requirements: ModelRequirements { iq: 50.0, eq: 50.0 },
+        available_models,
+        facts,
+        runtime_snapshot: None,
+        exclude_route_keys: Vec::new(),
+        operator_exclude_keys: Vec::new(),
+        prefer_fast_specs: Vec::new(),
+        required_capabilities: None,
+        is_subscription_route: None,
+        min_best_effort_adequacy: None,
+        prefer_prompt_cache: false,
+        providers_without_prompt_cache: std::collections::HashSet::new(),
+    }
+}
+
+#[test]
+fn vector_absence_is_whole_selection_fallback_never_per_route_degrade() {
+    let mut f1 = fact("p1", "m1");
+    f1.cost_per_m_tok_out = Some(10.0);
+    f1.input_rate = Some(2.0);
+    f1.cache_read_rate = Some(0.5);
+    f1.cache_write_rate = Some(1.5);
+    f1.scores.elo = 1800.0;
+
+    let mut f2 = fact("p2", "m2");
+    f2.cost_per_m_tok_out = Some(15.0);
+    f2.input_rate = Some(3.0);
+    f2.cache_read_rate = Some(0.8);
+    f2.cache_write_rate = Some(2.0);
+    f2.scores.elo = 1800.0;
+
+    let res_none = select_model_route(route_input(vec![f1.clone(), f2.clone()])).unwrap();
+    assert_eq!(res_none.score.objective.cost, 10.0 / 30.0);
+
+    let vec = prefrontal_routing_core::ClassVector {
+        workload_class: "ephemeral".into(),
+        fresh_input: 1000.0,
+        output_excluding_reasoning: 500.0,
+        reasoning: 100.0,
+        cached_read: 2000.0,
+        cache_write: 50.0,
+        sample_count: 50,
+        trailing_window_days: 7.0,
+        statistic: "arithmetic_mean".into(),
+        is_overlay: true,
+    };
+    f1.class_vector = Some(vec.clone());
+    f1.class_vector_is_overlay = true;
+    f2.class_vector = Some(vec);
+    f2.class_vector_is_overlay = true;
+
+    let res_basket = select_model_route(route_input(vec![f1.clone(), f2.clone()])).unwrap();
+    assert_ne!(res_basket.score.objective.cost, 10.0 / 30.0);
+    assert_eq!(res_basket.score.objective.cost, f1.basket_cost().unwrap());
+
+    let mut f2_incomplete = f2.clone();
+    f2_incomplete.input_rate = None;
+    let res_degraded = select_model_route(route_input(vec![f1.clone(), f2_incomplete])).unwrap();
+    assert_eq!(res_degraded.score.objective.cost, 10.0 / 30.0);
+}
+#[test]
+fn mutation_binding_sqlite_or_wall_clock_now_instead_of_argument_reddens() {
+    let rig = Rig::new("mutation-wall-clock-now");
+    let store = rig.open();
+    let now = 1_000_000_000.0;
+    let seven_days_ms = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+
+    store
+        .record_usage_delivery(&class_obs(
+            "inside-relative-to-now",
+            Some("ephemeral"),
+            Some(250.0),
+            Some(100.0),
+            Some(0.0),
+            Some(100.0),
+            Some(10.0),
+            Some(1000.0),
+            now - seven_days_ms + 1.0,
+        ))
+        .unwrap();
+
+    let vec = store
+        .get_class_vector("ephemeral", now)
+        .unwrap()
+        .expect("must form vector at fixed now argument");
+    assert_eq!(vec.sample_count, 1);
+}
+
+#[test]
+fn mutation_counting_null_bearing_rows_toward_floor_reddens() {
+    let rig = Rig::new("mutation-null-bearing-floor");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    for i in 0..49 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("null-read-{i}"),
+                Some("ephemeral"),
+                Some(0.0),
+                Some(100.0),
+                Some(0.0),
+                None,
+                Some(0.0),
+                Some(1000.0),
+                now - 1000.0 - i as f64,
+            ))
+            .unwrap();
+    }
+    store
+        .record_usage_delivery(&class_obs(
+            "complete-single",
+            Some("ephemeral"),
+            Some(100.0),
+            Some(100.0),
+            Some(0.0),
+            Some(50.0),
+            Some(10.0),
+            Some(1000.0),
+            now - 500.0,
+        ))
+        .unwrap();
+
+    let vec = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(
+        vec.sample_count, 1,
+        "floor of 50 must NOT count NULL-bearing rows"
+    );
+    assert!(
+        !vec.is_usable(),
+        "1 complete row must yield an unusable vector"
+    );
+}
+
+#[test]
+fn mutation_charging_null_counter_as_zero_in_mean_reddens() {
+    let rig = Rig::new("mutation-null-as-zero-mean");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    store
+        .record_usage_delivery(&class_obs(
+            "complete-cached",
+            Some("ephemeral"),
+            Some(100.0),
+            Some(100.0),
+            Some(0.0),
+            Some(50.0),
+            Some(10.0),
+            Some(1000.0),
+            now - 500.0,
+        ))
+        .unwrap();
+    for i in 0..49 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("null-cached-{i}"),
+                Some("ephemeral"),
+                Some(100.0),
+                Some(100.0),
+                Some(0.0),
+                None,
+                Some(10.0),
+                Some(1000.0),
+                now - 1000.0 - i as f64,
+            ))
+            .unwrap();
+    }
+
+    let vec = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(vec.cached_read, 50.0);
+    assert_ne!(vec.cached_read, 1.0);
+}
+
+#[test]
+fn mutation_adding_duration_validity_term_to_population_reddens() {
+    let rig = Rig::new("mutation-duration-term");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    for i in 0..49 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("dur-valid-{i}"),
+                Some("ephemeral"),
+                Some(100.0),
+                Some(100.0),
+                Some(0.0),
+                Some(50.0),
+                Some(10.0),
+                Some(1000.0),
+                now - 1000.0 - i as f64,
+            ))
+            .unwrap();
+    }
+    store
+        .record_usage_delivery(&class_obs(
+            "null-dur-complete",
+            Some("ephemeral"),
+            Some(100.0),
+            Some(100.0),
+            Some(0.0),
+            Some(50.0),
+            Some(10.0),
+            None,
+            now - 500.0,
+        ))
+        .unwrap();
+
+    let vec = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(
+        vec.sample_count, 50,
+        "duration validity term must not drop NULL duration row"
+    );
+    assert!(
+        vec.is_usable(),
+        "50 complete rows with 1 NULL duration reaches floor"
+    );
+}
+
+#[test]
+fn mutation_persisting_vector_onto_stored_fact_row_reddens() {
+    let rig = Rig::new("mutation-persisting-vector");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    let mut fact_item = fact("p", "persist-test");
+    fact_item.cost_per_m_tok_out = Some(10.0);
+    fact_item.input_rate = Some(2.0);
+    fact_item.cache_read_rate = Some(0.5);
+    fact_item.cache_write_rate = Some(1.5);
+    store.upsert_fact(&fact_item, FactSource::Override).unwrap();
+
+    for i in 0..50 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("p-msg-{i}"),
+                Some("ephemeral"),
+                Some(1000.0),
+                Some(1200.0),
+                Some(200.0),
+                Some(5000.0),
+                Some(100.0),
+                Some(1000.0),
+                now - 100.0 - i as f64,
+            ))
+            .unwrap();
+    }
+
+    let overlaid = store.get_facts_with_observed_speed(now).unwrap();
+    let overlaid_fact = overlaid
+        .into_iter()
+        .find(|f| f.provider_id == "p" && f.model_id == "persist-test")
+        .unwrap();
+    assert!(overlaid_fact.class_vector.is_some());
+
+    store
+        .upsert_fact(&overlaid_fact, FactSource::Override)
+        .unwrap();
+
+    let reloaded = store
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .find(|f| f.provider_id == "p" && f.model_id == "persist-test")
+        .unwrap();
+    assert!(
+        reloaded.class_vector.is_none(),
+        "vector must never be persisted on stored fact"
+    );
+    assert!(!reloaded.class_vector_is_overlay);
+}
+
+#[test]
+fn mutation_querying_store_from_inside_comparator_reddens() {
+    let rig = Rig::new("mutation-comparator-query");
+    let store = rig.open();
+    let now = 10_000_000.0;
+
+    let mut custom = fact("p", "no-query-model");
+    custom.cost_per_m_tok_out = Some(10.0);
+    custom.input_rate = Some(2.0);
+    custom.cache_read_rate = Some(0.5);
+    custom.cache_write_rate = Some(1.5);
+    store.upsert_fact(&custom, FactSource::Override).unwrap();
+
+    let before_plant_fact = store
+        .get_fact_by_route_key("p/no-query-model")
+        .unwrap()
+        .unwrap();
+    let before_cost = prefrontal_routing_core::selection_cost(&before_plant_fact, false);
+
+    for i in 0..50 {
+        store
+            .record_usage_delivery(&class_obs(
+                &format!("q-msg-{i}"),
+                Some("ephemeral"),
+                Some(1000.0),
+                Some(1200.0),
+                Some(200.0),
+                Some(5000.0),
+                Some(100.0),
+                Some(1000.0),
+                now - 100.0 - i as f64,
+            ))
+            .unwrap();
+    }
+
+    let after_plant_fact = store
+        .get_fact_by_route_key("p/no-query-model")
+        .unwrap()
+        .unwrap();
+    let after_cost = prefrontal_routing_core::selection_cost(&after_plant_fact, false);
+
+    assert_eq!(
+        before_cost, after_cost,
+        "comparator must not query store directly: planted usage rows changed selection_cost before overlay"
+    );
 }

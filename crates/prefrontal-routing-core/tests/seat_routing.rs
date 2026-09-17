@@ -60,6 +60,8 @@ fn fact(provider: &str, model: &str, family: Option<&str>, elo: f64, cost: f64) 
         aa_index: None,
         review_by_ms: None,
         eq_source: None,
+        class_vector: None,
+        class_vector_is_overlay: false,
     }
 }
 
