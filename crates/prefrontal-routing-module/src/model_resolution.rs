@@ -260,10 +260,10 @@ pub(super) async fn handle_model_capabilities(
             .await;
         }
     };
-    let snapshot = match snapshot_from_store(store, &params.provider_id, &params.model_id) {
-        Ok(snapshot) => snapshot,
+    match capabilities_reply(store, params) {
+        Ok(reply) => send_result(frame, writer, reply).await,
         Err(error) => {
-            return send_route_error(
+            send_route_error(
                 writer,
                 frame.header.ver,
                 frame.header.channel,
@@ -272,9 +272,13 @@ pub(super) async fn handle_model_capabilities(
                 "store_error",
                 &error,
             )
-            .await;
+            .await
         }
-    };
+    }
+}
+
+fn capabilities_reply(store: &SharedStore, params: CapabilitiesParams) -> Result<Value, String> {
+    let snapshot = snapshot_from_store(store, &params.provider_id, &params.model_id)?;
     let capabilities = resolve_model_capabilities(&ModelCapabilitiesInput {
         provider_id: params.provider_id,
         model_id: params.model_id.clone(),
@@ -285,15 +289,27 @@ pub(super) async fn handle_model_capabilities(
     let compatible_settings = params.desired.as_ref().map(|desired| {
         resolve_compatible_model_settings(&params.model_id, desired, Some(&capabilities))
     });
-    send_result(
-        frame,
-        writer,
-        json!({
-            "capabilities": capabilities,
-            "compatibleSettings": compatible_settings,
-        }),
-    )
-    .await
+    Ok(json!({
+        "capabilities": capabilities,
+        "compatibleSettings": compatible_settings,
+        "catalogVersion": catalog_version(store),
+    }))
+}
+
+/// The catalog snapshot this answer was computed against. The answer is a pure
+/// function of the request and the catalog, so a caller that keeps replies can
+/// tell from this number alone whether what it kept is still the module's
+/// answer: the same version means the same answer, and a higher one retires
+/// everything computed against the older catalog. Absent when no snapshot has
+/// been recorded yet or the cursor cannot be read, which says the answer has no
+/// stated validity and must not be kept; version 0 is a real recorded snapshot
+/// and is not the same thing.
+fn catalog_version(store: &SharedStore) -> Option<i64> {
+    store
+        .fusiform_catalog_cursor()
+        .ok()
+        .flatten()
+        .map(|cursor| cursor.catalog_version)
 }
 
 pub(super) async fn handle_agent_model_requirements(
@@ -391,5 +407,62 @@ mod tests {
         })
         .unwrap();
         assert_eq!(suggestion["model"]["modelID"], "claude-sonnet-4");
+    }
+
+    /// The capabilities answer is a pure function of the request and the catalog,
+    /// so the reply has to say which catalog it was computed against: that is the
+    /// only thing a caller keeping the reply can check it against.
+    #[test]
+    fn capabilities_reply_states_the_catalog_it_was_computed_against() {
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-capabilities-version-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the Unix epoch")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create capabilities test directory");
+        let store: SharedStore = std::sync::Arc::new(
+            prefrontal_routing_store::SqliteRouteStateStore::open(
+                &prefrontal_routing_store::dev_descriptor(
+                    "prefrontal-routing-capabilities-version",
+                    dir.join("store.db").to_string_lossy().into_owned(),
+                ),
+            )
+            .expect("open capabilities test store"),
+        );
+        let request = || CapabilitiesParams {
+            provider_id: "anthropic".to_string(),
+            model_id: "claude-sonnet-4-5".to_string(),
+            runtime_model: None,
+            desired: None,
+        };
+
+        // No snapshot has been recorded yet, so the module states no validity
+        // rather than a number the caller could mistake for one.
+        let unversioned = capabilities_reply(&store, request()).expect("capabilities project");
+        assert_eq!(unversioned["catalogVersion"], Value::Null);
+        assert!(unversioned["capabilities"]["canonicalModelId"].is_string());
+
+        for version in [0, 9] {
+            store
+                .apply_fusiform_catalog(
+                    &[],
+                    prefrontal_routing_store::FusiformCatalogCursor {
+                        catalog_version: version,
+                        resolved_at_ms: 1_000 + version,
+                    },
+                )
+                .expect("record a catalog snapshot");
+            assert_eq!(
+                capabilities_reply(&store, request()).expect("capabilities project")
+                    ["catalogVersion"],
+                json!(version),
+                "version {version} is a recorded snapshot, not an absent one"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
