@@ -631,6 +631,7 @@ mod tests {
 
     use super::*;
     use crate::model_facts::{Confidence, ModelRequirements, ModelScores, ScoreProvenance};
+    use crate::model_resolution::ACCOUNT_PRODUCER;
     use crate::model_router::{select_model_route, RouteRuntimeState, SelectModelRouteInput};
 
     const NOW_MS: f64 = 1_893_456_000_000.0; // 2030-01-01T00:00:00Z
@@ -733,6 +734,35 @@ mod tests {
     fn pace_fixture_varies_skew_by_copy_and_assign() {
         let config = pace_config_with_skew_ms(250.0);
         assert_eq!(config.skew_ms, 250.0);
+    }
+
+    #[test]
+    fn account_producer_deferral_preserves_operator_multiplier_and_one_fallback_selection() {
+        assert!(!ACCOUNT_PRODUCER);
+
+        let mut operator_route = fact("openai", "operator-priced", 50.0);
+        operator_route.cost_per_m_tok_out = Some(20.0);
+        operator_route.subscription_multiplier = Some(40.0);
+        let mut alternative = fact("anthropic", "alternative", 50.0);
+        alternative.cost_per_m_tok_out = Some(1.0);
+        let operator_facts = vec![operator_route.clone(), alternative.clone()];
+        assert_eq!(
+            select(
+                operator_facts.clone(),
+                overlay(&[], operator_facts.as_slice())
+            ),
+            "openai/operator-priced"
+        );
+
+        operator_route.subscription_multiplier = None;
+        let fallback_facts = vec![operator_route, alternative];
+        assert_eq!(
+            select(
+                fallback_facts.clone(),
+                overlay(&[], fallback_facts.as_slice())
+            ),
+            "anthropic/alternative"
+        );
     }
 
     #[test]
