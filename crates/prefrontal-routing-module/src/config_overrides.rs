@@ -719,14 +719,12 @@ pub fn reload_live_multipliers(path: &Path) -> Result<(), String> {
             serde_json::from_str::<RoutingConfigFile>(&json)
                 .map_err(|error| format!("invalid config in {}: {error}", path.display()))
         });
-    let config = match parsed {
-        Ok(config) => config,
-        Err(error) => {
-            prefrontal_routing_core::model_facts::set_speed_multipliers(HashMap::new());
-            prefrontal_routing_core::model_facts::set_subscription_multipliers(HashMap::new());
-            return Err(error);
-        }
-    };
+    // A document that does not parse is an operator mid-edit, not a decision to
+    // withdraw every multiplier: keep the last good maps for this selection and
+    // report the error. Wiping them here priced every subscription route at list
+    // (openai at 33x) for as long as the file stayed broken. A missing file is the
+    // withdrawal and clears above.
+    let config = parsed?;
 
     let mut speed_multipliers = HashMap::new();
     let mut subscription_multipliers = HashMap::new();
@@ -1253,20 +1251,22 @@ fn apply_overrides<S: RouteStateStore>(
 }
 
 #[cfg(test)]
+/// SUBSCRIPTION_MULTIPLIERS and SPEED_MULTIPLIERS in model_facts are process-global
+/// maps that the setters REPLACE wholesale. Tests that load a config and then read
+/// a map race every other test that writes one, including the select-request tests
+/// in main.rs, whose handler reloads the maps from its routing config path on every
+/// request (a fixture path with no multipliers writes empty maps). Every test that
+/// writes or asserts on the maps holds this guard.
+#[cfg(test)]
+pub(crate) fn multiplier_map_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-
-    /// SUBSCRIPTION_MULTIPLIERS in model_facts is one process-global map that
-    /// set_subscription_multipliers REPLACES wholesale. Tests that load a config
-    /// and then read the map race each other under the parallel test runner:
-    /// another test's load lands between this test's load and its asserts, and
-    /// the assert reads the other test's config. Serialize every such test.
-    fn multiplier_map_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     #[test]
     fn plaintext_aa_api_key_is_refused_with_vault_cutover_guidance() {
@@ -1963,6 +1963,59 @@ mod tests {
             "removing an override must never delete a migration-seeded fact"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The routing config is hand-edited; a save mid-edit must not price every
+    /// subscription route at list until the next save. Only a missing file withdraws.
+    #[test]
+    fn unparseable_routing_config_keeps_the_last_good_multipliers() {
+        let _guard = multiplier_map_guard();
+        let dir = std::env::temp_dir().join(format!(
+            "prefrontal-routing-reload-lastgood-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("alfonso-routing.jsonc");
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"subscription_multipliers":{"openai":33.0},"models":{"openai/gpt-5.5":{"speed_multiplier":0.5}}}}"#,
+        )
+        .unwrap();
+        super::reload_live_multipliers(&config_path).unwrap();
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.5"),
+            Some(33.0)
+        );
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.5"),
+            Some(0.5)
+        );
+
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"subscription_multipliers":{"openai": 33."#,
+        )
+        .unwrap();
+        let error = super::reload_live_multipliers(&config_path).unwrap_err();
+        assert!(error.contains("invalid"), "{error}");
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.5"),
+            Some(33.0),
+            "a parse error keeps the last good subscription multiplier"
+        );
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.5"),
+            Some(0.5)
+        );
+
+        std::fs::remove_file(&config_path).unwrap();
+        super::reload_live_multipliers(&config_path).unwrap();
+        assert_eq!(
+            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.5"),
+            None,
+            "a missing file withdraws"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

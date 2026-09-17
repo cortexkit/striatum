@@ -4397,6 +4397,7 @@ mod tests {
         request: serde_json::Value,
         operator_config_path: &Path,
     ) -> Frame {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
@@ -5905,6 +5906,7 @@ mod tests {
         facts: &[ModelFact],
         operator_config_path: &Path,
     ) -> Frame {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let store = Arc::new(rig.open_store());
         for fact in facts {
             store.upsert_fact(fact, FactSource::Override).unwrap();
@@ -5938,6 +5940,7 @@ mod tests {
 
     #[tokio::test]
     async fn refusal_decision_row_carries_per_candidate_rejections() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = Rig::new("refusal-decision-evidence");
         let store = Arc::new(rig.open_store());
         let mut rejected = fact("p", "missing-vision");
@@ -6003,6 +6006,7 @@ mod tests {
 
     #[tokio::test]
     async fn third_session_error_writes_backoff_active_into_refusal_decision_ledger() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
         const LAST_ERROR: &str =
             "Access to model denied. Please make sure you are eligible for using the model.";
@@ -6850,6 +6854,7 @@ mod tests {
 
     #[tokio::test]
     async fn wire_demand_uses_the_caller_0_to_100_scale_without_rescaling() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         async fn select(demand: f64) -> (Frame, Rig) {
             let rig = Rig::new(&format!("wire-demand-{demand}"));
             let store = Arc::new(rig.open_store());
@@ -6911,6 +6916,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_refresh_retains_pressure_but_revokes_fast_upgrade_freshness() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = Rig::new("empty-refresh-fast-freshness");
         let store = Arc::new(rig.open_store());
         let base = fact("openai", "freshness-base");
@@ -7130,6 +7136,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_panel_serves_full_contract_shape() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let advertised = manifest(DEFAULT_MODULE_ID)
             .provides
             .into_iter()
@@ -7210,6 +7217,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_selection_observes_a_live_elo_override_edit() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         async fn select(
             store: &SharedStore,
             quota_cache: &SharedQuotaCache,
