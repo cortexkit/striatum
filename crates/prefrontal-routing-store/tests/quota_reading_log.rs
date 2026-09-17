@@ -1,9 +1,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prefrontal_routing_core::quota::quota_poll::{
-    admit_reading_intervals, reading_log_retention_cutoff, render_account_key,
-    READING_LOG_RETENTION_DAYS,
+    admit_reading_intervals, reading_log_retention_cutoff, record_reading_log_poll,
+    render_account_key, READING_LOG_RETENTION_DAYS,
 };
+use prefrontal_routing_core::quota::ProviderUsage;
 use prefrontal_routing_core::route_state_store::QuotaReadingLogRow;
 use prefrontal_routing_core::{RouteStateStore, UsageObservation};
 use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
@@ -55,6 +56,34 @@ fn reading(window_key: &str, observed_at: i64, fetched_at: Option<i64>) -> Quota
         fetched_at,
         stale: None,
     }
+}
+
+fn poll_entry(with_secondary: bool) -> ProviderUsage {
+    let secondary = with_secondary.then(|| {
+        serde_json::json!({
+            "usedPercent": 40.0,
+            "rawUsedPercent": 45.0,
+            "resetsAt": "2030-01-08T00:00:00Z",
+            "windowMinutes": 10080
+        })
+    });
+    serde_json::from_value(serde_json::json!({
+        "provider": "codex",
+        "apiProvider": "openai",
+        "account": "team-a",
+        "fetchedAt": "2030-01-01T00:00:00Z",
+        "savedResets": { "availableCount": 2 },
+        "usage": {
+            "primary": {
+                "usedPercent": 20.0,
+                "rawUsedPercent": 25.0,
+                "resetsAt": "2030-01-01T05:00:00Z",
+                "windowMinutes": 300
+            },
+            "secondary": secondary
+        }
+    }))
+    .unwrap()
 }
 
 fn usage_row(account_key: String) -> UsageObservation {
@@ -126,9 +155,7 @@ fn usage_and_reading_rows_share_a_byte_equal_account_key_and_join() {
         .record_usage_delivery(&usage_row(account_key.clone()))
         .unwrap();
     assert_eq!(
-        store
-            .append_quota_readings(&[reading("codexbar:codex:primary", EPOCH_MS, Some(EPOCH_MS))])
-            .unwrap(),
+        record_reading_log_poll(&store, &poll_entry(false), "openai", &[], EPOCH_MS).unwrap(),
         1
     );
 
@@ -153,12 +180,10 @@ fn usage_and_reading_rows_share_a_byte_equal_account_key_and_join() {
 fn primary_and_weekly_windows_at_one_poll_remain_distinct_and_do_not_cross() {
     let rig = Rig::new("window-key");
     let store = rig.open();
-    let rows = vec![
-        reading("codexbar:codex:primary", EPOCH_MS, Some(EPOCH_MS)),
-        reading("codexbar:codex:secondary", EPOCH_MS, Some(EPOCH_MS)),
-    ];
-
-    assert_eq!(store.append_quota_readings(&rows).unwrap(), 2);
+    assert_eq!(
+        record_reading_log_poll(&store, &poll_entry(true), "openai", &[], EPOCH_MS).unwrap(),
+        2
+    );
     let stored = store.get_quota_readings("openai/team-a").unwrap();
     assert_eq!(stored.len(), 2);
     assert_ne!(stored[0].window_key, stored[1].window_key);
@@ -169,17 +194,14 @@ fn primary_and_weekly_windows_at_one_poll_remain_distinct_and_do_not_cross() {
 fn five_polls_of_one_preserved_source_reading_keep_five_poll_clock_rows() {
     let rig = Rig::new("two-clocks");
     let store = rig.open();
-    let rows = (0..5)
-        .map(|minute| {
-            reading(
-                "codexbar:codex:primary",
-                EPOCH_MS + minute * 60_000,
-                Some(EPOCH_MS),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(store.append_quota_readings(&rows).unwrap(), 5);
+    let entry = poll_entry(false);
+    for minute in 0..5 {
+        assert_eq!(
+            record_reading_log_poll(&store, &entry, "openai", &[], EPOCH_MS + minute * 60_000,)
+                .unwrap(),
+            1
+        );
+    }
     let stored = store.get_quota_readings("openai/team-a").unwrap();
     assert_eq!(stored.len(), 5);
     assert_eq!(

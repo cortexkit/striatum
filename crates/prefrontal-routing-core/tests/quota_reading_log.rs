@@ -414,6 +414,36 @@ fn account_producer_false_replay_admits_time_but_never_invents_tokens_or_fit() {
 }
 
 #[test]
+fn enabled_usage_join_scopes_tokens_to_the_burning_account() {
+    let readings = (0..=20)
+        .map(|index| {
+            reading(
+                "openai/team-a",
+                "primary",
+                index * 10,
+                Some(index * 10),
+                Some(10.0 + index as f64),
+                Some(2),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut usage_rows = Vec::new();
+    for index in 1..=20 {
+        let observed_at = EPOCH_MS + index * 10 * 60_000;
+        usage_rows.push(usage("openai/team-a", observed_at, 10_000.0));
+        usage_rows.push(usage("openai/sibling", observed_at, 1_000_000.0));
+    }
+
+    let analysis = analyze_reading_log(&readings, &usage_rows, true);
+
+    assert_eq!(analysis.time_admitted_intervals.len(), 20);
+    assert_eq!(analysis.usage_admitted_intervals.len(), 20);
+    assert_eq!(analysis.token_population, Some(20));
+    let fitted = analysis.fitted_raw_percent_per_token.unwrap();
+    assert!((fitted - 1.0 / 10_001.0).abs() < 1e-12);
+}
+
+#[test]
 fn account_key_has_one_rendering_including_the_empty_account_segment() {
     assert_eq!(
         render_account_key("openai", Some("team-a")),

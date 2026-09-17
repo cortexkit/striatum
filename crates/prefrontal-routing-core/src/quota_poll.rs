@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::quota::ProviderUsage;
 use crate::quota_extract::{extract_windows, fetched_at_ms};
 use crate::route_state_store::{
-    QuotaReadingLogRow, QuotaStaleDisclosure, UsageObservation,
+    QuotaReadingLogRow, QuotaStaleDisclosure, RouteStateResult, RouteStateStore, UsageObservation,
 };
 
 pub const READING_LOG_RETENTION_DAYS: i64 = 14;
@@ -59,6 +59,23 @@ pub fn reading_log_rows_for_poll(
             stale: stale.clone(),
         })
         .collect()
+}
+
+/// Persist one local poll and apply age retention at the same poll-clock boundary.
+pub fn record_reading_log_poll(
+    store: &(impl RouteStateStore + ?Sized),
+    entry: &ProviderUsage,
+    provider_id: &str,
+    capacity_keys: &[String],
+    observed_at: i64,
+) -> RouteStateResult<usize> {
+    store.prune_quota_readings(observed_at)?;
+    store.append_quota_readings(&reading_log_rows_for_poll(
+        entry,
+        provider_id,
+        capacity_keys,
+        observed_at,
+    ))
 }
 
 fn finite_i64(value: Option<f64>) -> Option<i64> {
@@ -202,10 +219,17 @@ pub fn analyze_reading_log(
         };
     }
 
+    let burning_accounts = time_admitted_intervals
+        .iter()
+        .map(|interval| interval.account_key.as_str())
+        .collect::<BTreeSet<_>>();
     let token_population = usage
         .iter()
         .filter(|sample| {
-            sample.account_key.is_some()
+            sample
+                .account_key
+                .as_deref()
+                .is_some_and(|account| burning_accounts.contains(account))
                 && total_tokens(sample).is_some_and(|tokens| tokens.is_finite() && tokens > 0.0)
         })
         .count();
@@ -254,10 +278,12 @@ pub fn analyze_reading_log(
 }
 
 fn total_tokens(sample: &UsageObservation) -> Option<f64> {
+    // `output_tokens` already stores output plus reasoning. Requiring the separate
+    // reasoning field keeps this a complete attribution without double-counting it.
+    sample.reasoning_tokens?;
     Some(
         sample.input_tokens?
             + sample.output_tokens
-            + sample.reasoning_tokens?
             + sample.cached_read_tokens?
             + sample.cache_write_tokens?,
     )
