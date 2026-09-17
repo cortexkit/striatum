@@ -464,7 +464,7 @@ impl ModelFact {
     /// Basket price per message normalized against BASKET_REFERENCE_COST_PER_MESSAGE.
     /// Returns None when the vector is unusable or any required rate is absent.
     pub fn basket_cost(&self) -> Option<f64> {
-        let vector = self.class_vector.as_ref().filter(|v| v.is_usable())?;
+        let vector = self.ephemeral_vector().filter(|v| v.is_usable())?;
         let cost_per_m_tok_out = self.cost_per_m_tok_out?;
         let input_rate = self.input_rate?;
         let cache_read_rate = self.cache_read_rate?;
@@ -474,16 +474,16 @@ impl ModelFact {
             .subscription_multiplier
             .filter(|m| m.is_finite() && *m > 0.0)
             .unwrap_or(1.0);
+        let output_excluding_reasoning = vector.output_excluding_reasoning.max(0.0);
         let raw_cost = (vector.fresh_input * input_rate
-            + vector.output_excluding_reasoning * cost_per_m_tok_out
+            + output_excluding_reasoning * cost_per_m_tok_out
             + vector.reasoning * reasoning_rate
             + vector.cached_read * cache_read_rate
             + vector.cache_write * cache_write_rate)
             / 1_000_000.0;
-        Some(
-            (raw_cost / multiplier / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE)
-                .clamp(0.0, 1.0),
-        )
+        let basket_unscaled = raw_cost / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE;
+        let normalized = basket_unscaled / multiplier;
+        Some(normalized.clamp(0.0, 1.0))
     }
 }
 

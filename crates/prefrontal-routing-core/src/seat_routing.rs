@@ -447,7 +447,7 @@ fn order_candidates(pool: Vec<AdmittedRoute>, input: &SeatRouteInput<'_>) -> Vec
                 .map(|predicate| predicate(&admitted.route))
                 .unwrap_or(false);
             let (objective, _) =
-                compute_objective(&admitted.route, &admitted.runtime, is_subscription);
+                compute_objective(&admitted.route, &admitted.runtime, is_subscription, false);
             SeatCandidate {
                 metered_cost: normalized_metered_cost(&admitted.route.fact),
                 admitted,
