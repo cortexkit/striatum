@@ -317,14 +317,15 @@ struct ModelRoutingSection {
     subscription_multipliers: HashMap<String, f64>,
 }
 
-/// One per-model override. Every field optional: a present field overrides the
-/// base fact, an absent one preserves it. Mirrors the TS `ModelFactOverride`.
+/// One per-model override. Every field is optional: a present field is operator-owned,
+/// while a withdrawn field returns to its non-override authority.
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 struct ModelFactOverride {
     /// Outer None means absent; Some(None) means an explicit JSON null clears it.
     #[serde(default, deserialize_with = "deserialize_family_override")]
     family: Option<Option<String>>,
+    elo: Option<f64>,
     eq: Option<f64>,
     speed: Option<f64>,
     cost_per_mtok_out: Option<f64>,
@@ -420,7 +421,7 @@ fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
         fact.family = family.clone();
     }
     fact.scores = ModelScores {
-        elo: base.scores.elo,
+        elo: ov.elo.unwrap_or(base.scores.elo),
         eq: ov.eq.unwrap_or(base.scores.eq),
         speed: ov.speed.unwrap_or(base.scores.speed),
     };
@@ -438,6 +439,53 @@ fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
     }
     fact.confidence = Confidence::Curated;
     fact
+}
+
+const CONFIG_CATALOG_FACT_FIELDS: [CatalogFactField; 3] = [
+    CatalogFactField::ContextWindow,
+    CatalogFactField::CostPerMtokOut,
+    CatalogFactField::SupportsVision,
+];
+
+fn named_catalog_fields(ov: &ModelFactOverride) -> Vec<CatalogFactField> {
+    let mut fields = Vec::new();
+    if ov.context_window.is_some() {
+        fields.push(CatalogFactField::ContextWindow);
+    }
+    if ov.cost_per_mtok_out.is_some() {
+        fields.push(CatalogFactField::CostPerMtokOut);
+    }
+    if ov.vision.is_some() {
+        fields.push(CatalogFactField::SupportsVision);
+    }
+    fields
+}
+
+fn restore_withdrawn_catalog_fields(
+    base: &mut ModelFact,
+    seed: Option<&ModelFact>,
+    withdrawn: &[CatalogFactField],
+) {
+    for field in withdrawn {
+        match field {
+            CatalogFactField::ContextWindow => {
+                base.context_window = seed.and_then(|fact| fact.context_window)
+            }
+            CatalogFactField::MaxOutputTokens => {
+                base.max_output_tokens = seed.and_then(|fact| fact.max_output_tokens)
+            }
+            CatalogFactField::CostTier => base.cost_tier = seed.and_then(|fact| fact.cost_tier),
+            CatalogFactField::CostPerMtokOut => {
+                base.cost_per_m_tok_out = seed.and_then(|fact| fact.cost_per_m_tok_out)
+            }
+            CatalogFactField::SupportsVision => {
+                base.supports_vision = seed.and_then(|fact| fact.supports_vision)
+            }
+            CatalogFactField::SupportsToolUse => {
+                base.supports_tool_use = seed.and_then(|fact| fact.supports_tool_use)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1050,9 +1098,9 @@ fn apply_overrides<S: RouteStateStore>(
     store: &S,
     overrides: &HashMap<String, ModelFactOverride>,
 ) -> Result<OverrideOutcome, String> {
-    // The current seed is the stable base for an override (so a seed-value change
-    // flows through), falling back to the live row, else a fresh skeleton so config
-    // can introduce a brand-new model.
+    // The seed supplies withdrawn catalog values whose prior external value is not
+    // retained. Other fields stay on the live row so a partial override cannot reset
+    // unrelated catalog updates or operator-placed scores.
     let seed_by_key: HashMap<String, ModelFact> = model_facts_seed()
         .iter()
         .map(|f| {
@@ -1101,9 +1149,18 @@ fn apply_overrides<S: RouteStateStore>(
         let existing_fact = store
             .get_fact_by_route_key(&route_key)
             .map_err(|error| format!("reading override base {route_key}: {error}"))?;
+        let seed_fact = seed_by_key.get(&route_key);
+        let named_fact_fields = named_catalog_fields(ov);
+        let omitted_fact_fields = CONFIG_CATALOG_FACT_FIELDS
+            .into_iter()
+            .filter(|field| !named_fact_fields.contains(field))
+            .collect::<Vec<_>>();
+        let withdrawn_fact_fields = store
+            .clear_operator_fact_fields(&route_key, &omitted_fact_fields)
+            .map_err(|e| format!("clear withdrawn override provenance {route_key}: {e}"))?;
         let mut base = existing_fact
             .clone()
-            .or_else(|| seed_by_key.get(&route_key).cloned())
+            .or_else(|| seed_fact.cloned())
             .unwrap_or_else(|| ModelFact {
                 speed_is_fleet_median: false,
                 provider_id,
@@ -1133,24 +1190,18 @@ fn apply_overrides<S: RouteStateStore>(
                 class_vector: None,
                 class_vector_is_overlay: false,
             });
-        if base.max_output_tokens.is_none() {
-            base.max_output_tokens = existing_fact.and_then(|fact| fact.max_output_tokens);
-        }
+        // Score provenance does not distinguish config from route.model_upsert.
+        // Preserving absent score fields avoids erasing an upsert placement on restart;
+        // withdrawing a config-authored score remains ambiguous until origin is stored.
+        // The store retains Fusiform provenance, but not a shadow copy of the value
+        // replaced by an override. Restore only stamps that were actually withdrawn,
+        // using the seed when it has the route and otherwise the unknown value.
+        restore_withdrawn_catalog_fields(&mut base, seed_fact, &withdrawn_fact_fields);
         store
             .upsert_fact(&merge_override(&base, ov), FactSource::Override)
             .map_err(|e| format!("upsert override {route_key}: {e}"))?;
-        let mut fact_fields = Vec::new();
-        if ov.context_window.is_some() {
-            fact_fields.push(CatalogFactField::ContextWindow);
-        }
-        if ov.cost_per_mtok_out.is_some() {
-            fact_fields.push(CatalogFactField::CostPerMtokOut);
-        }
-        if ov.vision.is_some() {
-            fact_fields.push(CatalogFactField::SupportsVision);
-        }
         store
-            .mark_operator_fact_fields(&route_key, &fact_fields)
+            .mark_operator_fact_fields(&route_key, &named_fact_fields)
             .map_err(|e| format!("stamp override provenance {route_key}: {e}"))?;
         next_override_keys.insert(route_key);
         outcome.applied += 1;
@@ -1342,6 +1393,179 @@ mod tests {
     }
 
     #[test]
+    fn withdrawing_vision_restores_seed_and_clears_provenance_while_eq_remains() {
+        let _guard = multiplier_map_guard();
+        let (root, config_path, store) = family_rule_rig("withdraw-vision");
+        let route_key = "anthropic/claude-opus-4-5";
+        let seed = model_facts_seed()
+            .iter()
+            .find(|fact| {
+                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
+                    == route_key
+            })
+            .unwrap();
+        assert_eq!(seed.supports_vision, Some(true));
+
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"vision":false,"eq":1600}}}}"#,
+        )
+        .unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+        let first = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        assert_eq!(first.supports_vision, Some(false));
+        assert_eq!(first.scores.eq, 1600.0);
+
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"eq":1600}}}}"#,
+        )
+        .unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+
+        let second = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        assert_eq!(second.supports_vision, Some(true));
+        assert_eq!(second.scores.eq, 1600.0);
+        let connection = rusqlite::Connection::open(root.join("store.sqlite")).unwrap();
+        let source: Option<String> = connection
+            .query_row(
+                "SELECT supports_vision_source FROM model_facts WHERE route_key = ?1",
+                [route_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(source.as_deref(), Some("override"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upsert_placed_score_survives_config_entry_that_does_not_name_it() {
+        let _guard = multiplier_map_guard();
+        let (root, config_path, store) = family_rule_rig("preserve-upsert-score");
+        let route_key = "anthropic/claude-opus-4-5";
+        let mut placed = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        placed.scores.elo = 1900.0;
+        store.upsert_fact(&placed, FactSource::Override).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"cost_per_mtok_out":1}}}}"#,
+        )
+        .unwrap();
+
+        apply_overrides_from_config(&store, &config_path).unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+
+        assert_eq!(
+            store
+                .get_fact_by_route_key(route_key)
+                .unwrap()
+                .unwrap()
+                .scores
+                .elo,
+            1900.0
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The invariant that matters in production: a config entry that names only a
+    /// score must not touch catalog fields the operator never stamped. Fusiform serves
+    /// a context window that differs from the seed; reconciliation on a boot whose
+    /// config does not name the field must leave the served value in place, because
+    /// only a withdrawn operator stamp authorizes a restore.
+    #[test]
+    fn unstamped_catalog_field_keeps_its_served_value_across_reconciliation() {
+        let _guard = multiplier_map_guard();
+        let (root, config_path, store) = family_rule_rig("unstamped-served");
+        let route_key = "anthropic/claude-opus-4-5";
+        let seed_context = model_facts_seed()
+            .iter()
+            .find(|fact| {
+                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
+                    == route_key
+            })
+            .unwrap()
+            .context_window;
+        let served_context = seed_context.map_or(Some(777_777.0), |v| Some(v + 111_111.0));
+        let mut served = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        served.context_window = served_context;
+        store.upsert_fact(&served, FactSource::Seed).unwrap();
+
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"eq":1600}}}}"#,
+        )
+        .unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+
+        let fact = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        assert_eq!(fact.context_window, served_context);
+        assert_eq!(
+            store
+                .clear_operator_fact_fields(route_key, &[CatalogFactField::ContextWindow])
+                .unwrap(),
+            Vec::<CatalogFactField>::new(),
+            "an unstamped field reports nothing cleared"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciliation_preserves_a_catalog_field_still_named_by_override() {
+        let _guard = multiplier_map_guard();
+        let (root, config_path, store) = family_rule_rig("preserve-named-field");
+        let route_key = "anthropic/claude-opus-4-5";
+        let seed_cost = model_facts_seed()
+            .iter()
+            .find(|fact| {
+                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
+                    == route_key
+            })
+            .unwrap()
+            .cost_per_m_tok_out;
+        let mut unrelated = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        unrelated.supports_tool_use = Some(false);
+        store.upsert_fact(&unrelated, FactSource::Override).unwrap();
+        store
+            .mark_operator_fact_fields(route_key, &[CatalogFactField::SupportsToolUse])
+            .unwrap();
+
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"vision":false,"cost_per_mtok_out":1}}}}"#,
+        )
+        .unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"vision":false}}}}"#,
+        )
+        .unwrap();
+        apply_overrides_from_config(&store, &config_path).unwrap();
+
+        let fact = store.get_fact_by_route_key(route_key).unwrap().unwrap();
+        assert_eq!(fact.supports_vision, Some(false));
+        assert_eq!(fact.cost_per_m_tok_out, seed_cost);
+        assert_eq!(fact.supports_tool_use, Some(false));
+        let connection = rusqlite::Connection::open(root.join("store.sqlite")).unwrap();
+        let sources: (Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT supports_vision_source, cost_per_mtok_out_source,
+                        supports_tool_use_source
+                 FROM model_facts WHERE route_key = ?1",
+                [route_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sources.0.as_deref(), Some("override"));
+        assert_ne!(sources.1.as_deref(), Some("override"));
+        assert_eq!(sources.2.as_deref(), Some("override"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn explicit_family_override_beats_matching_rule() {
         let _guard = multiplier_map_guard();
         let (root, config_path, store) = family_rule_rig("override-wins");
@@ -1505,6 +1729,7 @@ mod tests {
             "openai/gpt-5.5".to_string(),
             ModelFactOverride {
                 family: None,
+                elo: None,
                 eq: None,
                 speed: None,
                 cost_per_mtok_out: None,

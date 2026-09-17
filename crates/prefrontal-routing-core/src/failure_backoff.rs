@@ -111,6 +111,9 @@ pub fn classify_failure_attribution(
                 "without assistant output",
                 "create_failed",
                 "launch_unbound_timeout",
+                // A gather refused before its model send (read-tool catalog absent,
+                // cache or git unreadable, runner unreachable) never reached the route.
+                "pre-dispatch refusal",
             ]
             .iter()
             .any(|signature| error.contains(signature))

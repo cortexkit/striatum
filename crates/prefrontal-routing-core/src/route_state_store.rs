@@ -302,6 +302,18 @@ pub trait RouteStateStore {
         Ok(())
     }
 
+    /// Clear operator provenance only for the named factual fields. The return value
+    /// identifies fields that actually carried an operator stamp before the clear, so
+    /// callers can restore only withdrawn values and leave unrelated catalog facts intact.
+    /// Backends predating per-field provenance may keep the default no-op implementation.
+    fn clear_operator_fact_fields(
+        &self,
+        _route_key: &str,
+        _fields: &[CatalogFactField],
+    ) -> RouteStateResult<Vec<CatalogFactField>> {
+        Ok(Vec::new())
+    }
+
     /// Update only the family fact and its provenance without changing score ownership.
     fn set_model_family(
         &self,
