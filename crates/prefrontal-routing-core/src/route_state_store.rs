@@ -247,6 +247,32 @@ pub struct UsageRecordResult {
     pub usage_recorded: bool,
 }
 
+/// The optional producer disclosure attached to a preserved quota reading.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaStaleDisclosure {
+    pub since: Option<String>,
+    pub class: Option<String>,
+}
+
+/// One immutable quota-poll sample. The composite key deliberately uses the local
+/// poll clock; `fetched_at` is the independent producer-observation clock used for
+/// elapsed-time admission.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaReadingLogRow {
+    pub account_key: String,
+    pub window_key: String,
+    pub observed_at: i64,
+    pub used_percent: f64,
+    pub raw_used_percent: Option<f64>,
+    pub resets_at: Option<i64>,
+    pub window_minutes: Option<i64>,
+    pub banked_credit_count: Option<i64>,
+    pub fetched_at: Option<i64>,
+    pub stale: Option<QuotaStaleDisclosure>,
+}
+
 // Observed-speed gates: ported VERBATIM from the TS `ModelRouteStore` so the Rust
 // observed TPS matches the plugin's bit-for-bit. A sample is only eligible if it
 // generated >= MIN_OUTPUT_TOKENS over >= MIN_DURATION_MS; an aggregate is only
@@ -396,6 +422,22 @@ pub trait RouteStateStore {
     /// delivery newly made the stored row eligible for observed speed.
     fn record_usage_observation(&self, obs: &UsageObservation) -> RouteStateResult<bool> {
         Ok(self.record_usage_delivery(obs)?.recorded)
+    }
+
+    // ── Quota reading log ────────────────────────────────────
+    /// Append poll samples without changing an existing composite-key row.
+    fn append_quota_readings(&self, _rows: &[QuotaReadingLogRow]) -> RouteStateResult<usize> {
+        Ok(0)
+    }
+
+    /// Read one account's immutable samples in window/time order.
+    fn get_quota_readings(&self, _account_key: &str) -> RouteStateResult<Vec<QuotaReadingLogRow>> {
+        Ok(Vec::new())
+    }
+
+    /// Apply the named reading-log retention period relative to the supplied clock.
+    fn prune_quota_readings(&self, _now_ms: i64) -> RouteStateResult<usize> {
+        Ok(0)
     }
 
     /// Aggregate recent eligible usage rows for a route into observed output

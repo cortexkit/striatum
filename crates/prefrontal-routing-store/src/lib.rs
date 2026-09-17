@@ -16,7 +16,10 @@ use prefrontal_routing_core::model_facts::{
     ModelPromptDefaults, ModelScores,
 };
 use prefrontal_routing_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
-use prefrontal_routing_core::route_state_store::UsageRecordResult;
+use prefrontal_routing_core::quota::quota_poll::reading_log_retention_cutoff;
+use prefrontal_routing_core::route_state_store::{
+    QuotaReadingLogRow, QuotaStaleDisclosure, UsageRecordResult,
+};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, failure_backoff_transition, CatalogFactField,
     DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffState,
@@ -125,6 +128,8 @@ const MIGRATION_036: &str = include_str!("../migrations/036_usage_profile.sql");
 /// settle under CR-Q4: two slices legitimately claimed the next free number, which
 /// is a merge concern rather than a design one.
 const MIGRATION_037: &str = include_str!("../migrations/037_catalog_rates.sql");
+/// Migration 38: append-only per-account quota reading history.
+const MIGRATION_038: &str = include_str!("../migrations/038_quota_reading_log.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -163,7 +168,7 @@ struct ObservedSpeedAggregate {
     duration_ms: i64,
 }
 
-fn route_state_migrations() -> [Migration; 37] {
+fn route_state_migrations() -> [Migration; 38] {
     [
         Migration {
             version: 1,
@@ -312,6 +317,10 @@ fn route_state_migrations() -> [Migration; 37] {
         Migration {
             version: 37,
             statements: MIGRATION_037,
+        },
+        Migration {
+            version: 38,
+            statements: MIGRATION_038,
         },
     ]
 }
@@ -2317,6 +2326,109 @@ impl RouteStateStore for SqliteRouteStateStore {
                     recorded: !held_speed_observation.unwrap_or(false) && holds_speed_observation,
                     usage_recorded: held_speed_observation.is_none(),
                 })
+            })
+            .map_err(err)
+    }
+
+    fn append_quota_readings(&self, rows: &[QuotaReadingLogRow]) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                let transaction = connection.unchecked_transaction()?;
+                let mut inserted = 0;
+                {
+                    let mut statement = transaction.prepare(
+                        "INSERT OR IGNORE INTO quota_reading_log
+                           (account_key, window_key, observed_at, used_percent,
+                            raw_used_percent, resets_at, window_minutes,
+                            banked_credit_count, fetched_at, is_stale,
+                            stale_since, stale_class)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    )?;
+                    for row in rows {
+                        if row.account_key.is_empty()
+                            || row.window_key.is_empty()
+                            || row.observed_at < 0
+                            || !row.used_percent.is_finite()
+                            || row.raw_used_percent.is_some_and(|value| !value.is_finite())
+                        {
+                            continue;
+                        }
+                        let (is_stale, stale_since, stale_class) = match row.stale.as_ref() {
+                            Some(stale) => (1_i64, stale.since.as_deref(), stale.class.as_deref()),
+                            None => (0_i64, None, None),
+                        };
+                        inserted += statement.execute(params![
+                            row.account_key,
+                            row.window_key,
+                            row.observed_at,
+                            row.used_percent,
+                            row.raw_used_percent,
+                            row.resets_at,
+                            row.window_minutes,
+                            row.banked_credit_count,
+                            row.fetched_at,
+                            is_stale,
+                            stale_since,
+                            stale_class,
+                        ])?;
+                    }
+                }
+                transaction.commit()?;
+                Ok(inserted)
+            })
+            .map_err(err)
+    }
+
+    fn get_quota_readings(&self, account_key: &str) -> RouteStateResult<Vec<QuotaReadingLogRow>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                let mut statement = connection.prepare(
+                    "SELECT account_key, window_key, observed_at, used_percent,
+                            raw_used_percent, resets_at, window_minutes,
+                            banked_credit_count, fetched_at, is_stale,
+                            stale_since, stale_class
+                     FROM quota_reading_log
+                     WHERE account_key = ?1
+                     ORDER BY window_key, observed_at",
+                )?;
+                let rows = statement
+                    .query_map([account_key], |row| {
+                        let is_stale = row.get::<_, i64>(9)? != 0;
+                        let stale = if is_stale {
+                            Some(QuotaStaleDisclosure {
+                                since: row.get(10)?,
+                                class: row.get(11)?,
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(QuotaReadingLogRow {
+                            account_key: row.get(0)?,
+                            window_key: row.get(1)?,
+                            observed_at: row.get(2)?,
+                            used_percent: row.get(3)?,
+                            raw_used_percent: row.get(4)?,
+                            resets_at: row.get(5)?,
+                            window_minutes: row.get(6)?,
+                            banked_credit_count: row.get(7)?,
+                            fetched_at: row.get(8)?,
+                            stale,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .map_err(err)
+    }
+
+    fn prune_quota_readings(&self, now_ms: i64) -> RouteStateResult<usize> {
+        let cutoff = reading_log_retention_cutoff(now_ms);
+        self.store
+            .with_conn(|connection: &Connection| {
+                connection.execute(
+                    "DELETE FROM quota_reading_log WHERE observed_at < ?1",
+                    [cutoff],
+                )
             })
             .map_err(err)
     }
