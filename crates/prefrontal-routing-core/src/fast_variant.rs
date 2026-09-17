@@ -211,7 +211,15 @@ pub fn maybe_upgrade_to_fast_variant(
     let is_subscription = input
         .is_subscription_route
         .is_some_and(|predicate| predicate(&fast_route));
-    let (objective, _) = compute_objective(&fast_route, &fast_runtime, is_subscription, false);
+    // The fast sibling shares the base model's rate card, so it prices in the
+    // units the selection was made in; recomputing it on the ladder would record
+    // a ladder cost against a basket-priced decision.
+    let (objective, _) = compute_objective(
+        &fast_route,
+        &fast_runtime,
+        is_subscription,
+        input.selected.priced_with_basket,
+    );
 
     let mut upgraded = input.selected.clone();
     upgraded.model = SelectedModel {
@@ -336,6 +344,7 @@ mod tests {
             rejected: Vec::new(),
             explanation: vec!["base pick".into()],
             below_floor: None,
+            priced_with_basket: false,
         }
     }
 

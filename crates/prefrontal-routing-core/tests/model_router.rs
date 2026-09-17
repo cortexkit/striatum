@@ -2831,3 +2831,78 @@ fn decision_explanation_cost_line_states_quantity_and_subscription_quota_proxy()
         "expected subscription-covered in explanation: {exp}"
     );
 }
+
+/// The fast-variant upgrade re-prices the selected route's sibling. When the
+/// selection engaged the basket, the sibling's objective is in basket units too,
+/// so the decision record keeps one unit; a ladder re-pricing would record 10/30
+/// against a basket-priced decision.
+#[test]
+fn fast_variant_upgrade_prices_in_the_units_the_selection_used() {
+    use prefrontal_routing_core::{
+        maybe_upgrade_to_fast_variant, FastVariantUpgradeInput, ModelRequirements,
+        DEFAULT_ROUTING_CONFIG,
+    };
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let base = make_complete_basket_fact("p", "m", 100.0, Some(vec.clone()));
+    let mut fast = make_complete_basket_fact("p", "m-fast", 200.0, Some(vec));
+    fast.scores.elo = base.scores.elo;
+    let facts = vec![base.clone(), fast.clone()];
+    let selected =
+        select_model_route(input(vec![base.clone()], req(50.0, 0.0), Extra::default())).unwrap();
+    assert!(selected.priced_with_basket, "{:?}", selected.explanation);
+    let basket = base.basket_cost().unwrap();
+    assert_eq!(selected.score.selection_cost, basket);
+
+    let available: std::collections::HashSet<String> = facts
+        .iter()
+        .flat_map(|f| {
+            [
+                prefrontal_routing_core::make_route_key(
+                    &f.provider_id,
+                    &f.model_id,
+                    f.variant.as_deref(),
+                ),
+                prefrontal_routing_core::make_capacity_key(&f.provider_id, &f.model_id),
+            ]
+        })
+        .collect();
+    // The upgrade requires a present, relaxed quota reading for the fast sibling.
+    let mut by_capacity = std::collections::HashMap::new();
+    by_capacity.insert(
+        "p/m-fast".to_string(),
+        prefrontal_routing_core::RouteRuntimeState {
+            quota_pressure: Some(0.0),
+            ..Default::default()
+        },
+    );
+    let snapshot = prefrontal_routing_core::ModelRouteStateSnapshot {
+        now: 1000.0,
+        by_route: std::collections::HashMap::new(),
+        by_capacity,
+    };
+    let specs = vec!["p/m".to_string()];
+    let upgraded = maybe_upgrade_to_fast_variant(
+        &FastVariantUpgradeInput {
+            selected: &selected,
+            facts: &facts,
+            snapshot: &snapshot,
+            requirements: &ModelRequirements { iq: 50.0, eq: 0.0 },
+            required_capabilities: None,
+            available_models: &available,
+            prefer_fast_specs: &specs,
+            exclude_route_keys: &[],
+            is_subscription_route: None,
+            now: 0.0,
+            quota_signal_fresh: true,
+        },
+        &DEFAULT_ROUTING_CONFIG,
+    )
+    .expect("fast sibling upgrade applies");
+    assert_eq!(upgraded.model.model_id, "m-fast");
+    assert_eq!(
+        upgraded.score.selection_cost,
+        fast.basket_cost().unwrap(),
+        "the sibling is priced in basket units, not on the ladder"
+    );
+    assert_ne!(upgraded.score.selection_cost, 10.0 / 30.0);
+}

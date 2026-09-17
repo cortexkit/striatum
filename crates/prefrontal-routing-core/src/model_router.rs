@@ -216,6 +216,12 @@ pub struct SelectedModelRoute {
     /// adequacy floor (adequacy in [band, floor)). The caller MUST surface this
     /// warning; it is NOT optional noise.
     pub below_floor: Option<BelowFloorWarning>,
+    /// Whether this selection priced its shortlist by the token basket (the
+    /// whole-selection verdict) rather than today's output-price ladder. Carried
+    /// so a later re-pricing of the same selection, the fast-variant upgrade,
+    /// stays in the units the selection was made in, and so a decision record
+    /// names its unit without re-deriving it from the explanation text.
+    pub priced_with_basket: bool,
 }
 
 /// Carried on a `SelectedModelRoute` when best-effort selection picked a route
@@ -1026,6 +1032,7 @@ pub fn select_model_route_with_config(
         },
         rejected,
         explanation,
+        priced_with_basket: use_basket,
         below_floor: (best_effort && winner_admissible.adequacy.adequacy < ADEQUACY_FLOOR)
             .then_some(BelowFloorWarning {
                 adequacy: winner_admissible.adequacy.adequacy,
