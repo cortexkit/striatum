@@ -2143,9 +2143,6 @@ async fn handle_select_request(
     if envelope.method == model_resolution::AGENT_MODEL_REQUIREMENTS_OP {
         return model_resolution::handle_agent_model_requirements(frame, writer).await;
     }
-    if envelope.method == model_resolution::ROUTE_WORKLOAD_CLASS_MAP_OP {
-        return model_resolution::handle_workload_class_map(frame, writer).await;
-    }
     if envelope.method == available_models_text::OP {
         return available_models_text::handle(frame, writer, store, operator_config_path).await;
     }
@@ -3692,7 +3689,6 @@ fn handles(method: &str) -> bool {
             | model_resolution::RESOLVE_MODEL_OP
             | model_resolution::MODEL_CAPABILITIES_OP
             | model_resolution::AGENT_MODEL_REQUIREMENTS_OP
-            | model_resolution::ROUTE_WORKLOAD_CLASS_MAP_OP
             | available_models_text::OP
             | ROUTE_MODEL_UPSERT_OP
             | ROUTE_MODEL_SEED_AA_OP
@@ -3776,13 +3772,6 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 name: model_resolution::AGENT_MODEL_REQUIREMENTS_OP.to_string(),
                 kind: ManagementOperationKind::Query,
                 description: None,
-            },
-            ManagementOperation {
-                name: model_resolution::ROUTE_WORKLOAD_CLASS_MAP_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: Some(
-                    "Workload class mapping table owned by the routing module".to_string(),
-                ),
             },
             ManagementOperation {
                 name: available_models_text::OP.to_string(),
@@ -4842,34 +4831,6 @@ mod tests {
             acct_key, None,
             "account_key must be NULL when account_producer is absent"
         );
-    }
-
-    #[tokio::test]
-    async fn wire_workload_class_map_answers_agent_mappings_and_table() {
-        let rig = Rig::new("workload-class-map-wire");
-        let store = Arc::new(rig.open_store());
-
-        for (agent, expected) in [
-            ("mason", Some("ephemeral")),
-            ("alfonso", Some("head")),
-            ("explore", Some("gather")),
-            ("librarian", Some("gather")),
-            ("sidekick.classifier", Some("gather")),
-            ("hire_engineer", Some("hire")),
-            ("unknown_bot", None),
-        ] {
-            let response = run_route_wire_request(
-                &store,
-                json!({
-                    "method": model_resolution::ROUTE_WORKLOAD_CLASS_MAP_OP,
-                    "params": { "agent": agent }
-                }),
-            )
-            .await;
-            assert_eq!(response.header.ty, FrameType::Response);
-            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-            assert_eq!(body["result"]["workloadClass"].as_str(), expected);
-        }
     }
 
     #[tokio::test]
@@ -7294,7 +7255,6 @@ mod tests {
         assert!(handles(ROUTE_MODEL_SEED_AA_OP));
         assert!(handles(ROUTE_LIST_INFERRED_OP));
         assert!(handles(ROUTE_LIST_UNSCORED_OP));
-        assert!(handles(model_resolution::ROUTE_WORKLOAD_CLASS_MAP_OP));
         assert!(!handles("route.unknown"));
     }
 
