@@ -158,7 +158,10 @@ pub fn admit_reading_intervals(rows: &[QuotaReadingLogRow]) -> Vec<QuotaReadingI
 
 fn clean_parts(row: &QuotaReadingLogRow) -> Option<(i64, f64, i64)> {
     let fetched_at = row.fetched_at?;
-    let raw_used_percent = row.raw_used_percent?.is_finite().then_some(row.raw_used_percent?)?;
+    let raw_used_percent = row.raw_used_percent?;
+    if !raw_used_percent.is_finite() {
+        return None;
+    }
     let banked_credit_count = row.banked_credit_count?;
     (fetched_at >= 0 && banked_credit_count >= 0)
         .then_some((fetched_at, raw_used_percent, banked_credit_count))
