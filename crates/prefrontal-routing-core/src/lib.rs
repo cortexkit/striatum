@@ -51,9 +51,11 @@ pub use launch_policy::{
 };
 pub use model_facts::{
     derive_provider_key, fact_to_route, is_valid_grand_family_id, make_capacity_key,
-    make_route_key, normalize_grand_family_id, Confidence, FamilySource, GrandFamily, ModelFact,
-    ModelMetric, ModelPromptDefaults, ModelRequirements, ModelRoute, ModelScores, ReasoningEffort,
-    ScoreProvenance, GRAND_FAMILY_NORMALIZATIONS, MODEL_METRICS,
+    make_route_key, normalize_grand_family_id, ClassVector, Confidence, FamilySource, GrandFamily,
+    ModelFact, ModelMetric, ModelPromptDefaults, ModelRequirements, ModelRoute, ModelScores,
+    ReasoningEffort, ScoreProvenance, CLASS_VECTOR_SAMPLE_FLOOR, CLASS_VECTOR_TRAILING_WINDOW_DAYS,
+    CLASS_VECTOR_TRAILING_WINDOW_MS, ENUMERATED_WORKLOAD_CLASSES, GRAND_FAMILY_NORMALIZATIONS,
+    MODEL_METRICS,
 };
 pub use model_facts_seed::model_facts_seed;
 pub use model_resolution::{
@@ -70,11 +72,11 @@ pub use model_resolution::{
     VALID_WORKLOAD_CLASSES,
 };
 pub use model_router::{
-    admit_routes, select_model_route, select_model_route_with_config, AdmissionResult,
-    AdmittedRoute, BelowFloorWarning, ModelRouteStateSnapshot, NoRouteError, ObjectiveBreakdown,
-    PromptParams, RejectedCandidate, RejectedRoute, RequiredCapabilities, RouteFailureReason,
-    RouteRuntimeState, SelectModelRouteInput, SelectedModel, SelectedModelRoute,
-    SelectedRouteScore, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
+    admit_routes, select_model_route, select_model_route_with_config, selection_cost,
+    AdmissionResult, AdmittedRoute, BelowFloorWarning, ModelRouteStateSnapshot, NoRouteError,
+    ObjectiveBreakdown, PromptParams, RejectedCandidate, RejectedRoute, RequiredCapabilities,
+    RouteFailureReason, RouteRuntimeState, SelectModelRouteInput, SelectedModel,
+    SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
 };
 pub use panel::{
     select_panel, select_panel_with_config, validate_panel_spec, InvalidPanelRequest, PanelCause,
@@ -108,9 +110,9 @@ pub use route_state_store::{
 };
 pub use routing_config::{
     demand_bar, fit_ratio, RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, ANCHOR_VERSION,
-    COST_REFERENCE_PER_MTOK, DEFAULT_DEMAND_EXPONENT, DEFAULT_ROUTING_CONFIG,
-    MIN_BEST_EFFORT_ADEQUACY, OBJECTIVE_WEIGHT_QUOTA, RELATIVE_SHORTLIST_DELTA,
-    UNKNOWN_FACT_CONFIDENCE_PENALTY, UNKNOWN_MODEL_SCORES,
+    BASKET_REFERENCE_COST_PER_MESSAGE, COST_REFERENCE_PER_MTOK, DEFAULT_DEMAND_EXPONENT,
+    DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY, OBJECTIVE_WEIGHT_QUOTA,
+    RELATIVE_SHORTLIST_DELTA, UNKNOWN_FACT_CONFIDENCE_PENALTY, UNKNOWN_MODEL_SCORES,
 };
 pub use seat_routing::{
     incumbent_grand_families, select_seat_route, select_seat_route_with_config,

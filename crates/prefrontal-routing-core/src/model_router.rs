@@ -557,7 +557,10 @@ fn normalized_speed(speed: f64) -> f64 {
 /// subscription planes such as ollama-cloud at all. Ranking those routes at the
 /// maximum priced every glm, deepseek, and kimi route on the plan above sol. An
 /// unpublished price under a metered provider still ranks at the maximum.
-pub(crate) fn selection_cost(fact: &ModelFact, is_subscription: bool) -> f64 {
+pub fn selection_cost(fact: &ModelFact, is_subscription: bool) -> f64 {
+    if let Some(basket_cost) = fact.basket_cost() {
+        return basket_cost;
+    }
     if is_subscription && fact.cost_per_m_tok_out.is_none() && fact.cost_tier.is_none() {
         return 0.0;
     }
@@ -578,7 +581,9 @@ pub(crate) fn compute_objective(
     } else {
         "metered"
     };
-    let detail = if let Some(list_price) = route.fact.cost_per_m_tok_out {
+    let detail = if route.fact.basket_cost().is_some() {
+        format!("basket pricing, {coverage}")
+    } else if let Some(list_price) = route.fact.cost_per_m_tok_out {
         let effective = list_price / multiplier;
         let mut detail = format!(
             "effective ${}/Mtok, list ${}/Mtok",
@@ -804,6 +809,15 @@ pub fn select_model_route_with_config(
         .map(|(i, _)| i)
         .collect();
 
+    // Whole-selection basket gate: true exactly when the overlay's ephemeral vector
+    // is present and usable AND every shortlisted candidate serves all required rates.
+    let use_basket = !shortlist.is_empty()
+        && shortlist.iter().all(|&idx| {
+            let fact = &admissible[idx].route.fact;
+            fact.has_required_basket_rates()
+                && fact.class_vector.as_ref().map_or(false, |v| v.is_usable())
+        });
+
     struct Scored {
         idx: usize,
         objective: ObjectiveBreakdown,
@@ -819,7 +833,13 @@ pub fn select_model_route_with_config(
                 .as_ref()
                 .map(|pred| pred(&a.route))
                 .unwrap_or(false);
-            let (breakdown, notes) = compute_objective(&a.route, &a.runtime, is_sub);
+            let (breakdown, notes) = if use_basket {
+                compute_objective(&a.route, &a.runtime, is_sub)
+            } else {
+                let mut fallback_route = a.route.clone();
+                fallback_route.fact.class_vector = None;
+                compute_objective(&fallback_route, &a.runtime, is_sub)
+            };
             Scored {
                 idx,
                 objective: breakdown,
@@ -1107,6 +1127,8 @@ mod abundance_tests {
             aa_index: None,
             review_by_ms: None,
             eq_source: None,
+            class_vector: None,
+            class_vector_is_overlay: false,
         }
     }
 

@@ -12,8 +12,9 @@
 use cortexkit_store::{open_sqlite, Migration, SqliteStore};
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use prefrontal_routing_core::model_facts::{
-    normalize_grand_family_id, Confidence, FamilySource, GrandFamily, ModelFact,
-    ModelPromptDefaults, ModelScores,
+    normalize_grand_family_id, ClassVector, Confidence, FamilySource, GrandFamily, ModelFact,
+    ModelPromptDefaults, ModelScores, CLASS_VECTOR_TRAILING_WINDOW_DAYS,
+    CLASS_VECTOR_TRAILING_WINDOW_MS, ENUMERATED_WORKLOAD_CLASSES,
 };
 use prefrontal_routing_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
 use prefrontal_routing_core::quota::quota_poll::reading_log_retention_cutoff;
@@ -1303,6 +1304,8 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         aa_index: row.get::<_, Option<f64>>("aa_index")?,
         review_by_ms: row.get::<_, Option<i64>>("review_by_ms")?,
         eq_source: row.get::<_, Option<String>>("eq_source")?,
+        class_vector: None,
+        class_vector_is_overlay: false,
     })
 }
 
@@ -2479,8 +2482,78 @@ impl RouteStateStore for SqliteRouteStateStore {
             .map_err(err)
     }
 
+    fn get_class_vector(
+        &self,
+        workload_class: &str,
+        now: f64,
+    ) -> RouteStateResult<Option<ClassVector>> {
+        if !ENUMERATED_WORKLOAD_CLASSES.contains(&workload_class) {
+            return Ok(None);
+        }
+        let window_start = (now - CLASS_VECTOR_TRAILING_WINDOW_MS).floor() as i64;
+        let window_end = now.floor() as i64;
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(WORKLOAD_CLASS_USAGE_SAMPLES_SQL)?;
+                let rows =
+                    stmt.query_map(params![workload_class, window_start, window_end], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    })?;
+
+                let mut sample_count = 0_u64;
+                let mut sum_fresh_input = 0_f64;
+                let mut sum_output_excluding_reasoning = 0_f64;
+                let mut sum_reasoning = 0_f64;
+                let mut sum_cached_read = 0_f64;
+                let mut sum_cache_write = 0_f64;
+
+                for row in rows {
+                    let (
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                        cached_read_tokens,
+                        cache_write_tokens,
+                    ) = row?;
+                    sample_count += 1;
+                    sum_fresh_input += input_tokens as f64;
+                    let output_excl = (output_tokens - reasoning_tokens).max(0) as f64;
+                    sum_output_excluding_reasoning += output_excl;
+                    sum_reasoning += reasoning_tokens as f64;
+                    sum_cached_read += cached_read_tokens as f64;
+                    sum_cache_write += cache_write_tokens as f64;
+                }
+
+                if sample_count == 0 {
+                    return Ok(None);
+                }
+
+                let count = sample_count as f64;
+                Ok(Some(ClassVector {
+                    workload_class: workload_class.to_string(),
+                    fresh_input: sum_fresh_input / count,
+                    output_excluding_reasoning: sum_output_excluding_reasoning / count,
+                    reasoning: sum_reasoning / count,
+                    cached_read: sum_cached_read / count,
+                    cache_write: sum_cache_write / count,
+                    sample_count,
+                    trailing_window_days: CLASS_VECTOR_TRAILING_WINDOW_DAYS,
+                    statistic: "arithmetic_mean".to_string(),
+                    is_overlay: true,
+                }))
+            })
+            .map_err(err)
+    }
+
     fn get_facts_with_observed_speed(&self, now: f64) -> RouteStateResult<Vec<ModelFact>> {
         let facts = self.get_facts()?;
+        let ephemeral_vector = self.get_class_vector("ephemeral", now)?;
         // Multiple catalog facts can resolve to the same prompt-default variant.
         // Deduplicating here prevents repeated seeks without consulting usage for keys.
         let observed_route_keys = facts
@@ -2505,6 +2578,8 @@ impl RouteStateStore for SqliteRouteStateStore {
         let median_observed_speed = median_of(observed_speeds.values().copied());
         let mut overlaid = Vec::with_capacity(facts.len());
         for mut fact in facts {
+            fact.class_vector = ephemeral_vector.clone();
+            fact.class_vector_is_overlay = ephemeral_vector.is_some();
             let observed_route_key = observed_route_key_for_fact(&fact);
             if let Some(speed) = observed_speeds.get(&observed_route_key) {
                 fact.scores.speed = *speed;

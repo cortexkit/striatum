@@ -201,6 +201,8 @@ pub fn seed_aa(
         aa_index: Some(aa_index),
         review_by_ms: Some(review_by_ms),
         eq_source: Some(eq_source.clone()),
+        class_vector: None,
+        class_vector_is_overlay: false,
     });
     fact.scores.elo = elo;
     fact.scores.eq = eq;

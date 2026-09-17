@@ -34,10 +34,12 @@ struct FactBuilder {
     supports_vision: Option<bool>,
     prompt_defaults: Option<ModelPromptDefaults>,
     confidence: Option<Confidence>,
+    class_vector: Option<prefrontal_routing_core::ClassVector>,
 }
 
 /// `fact({ providerID, modelID, scores, ...partial })`: confidence defaults to curated.
 fn fact(b: FactBuilder) -> ModelFact {
+    let has_vector = b.class_vector.is_some();
     ModelFact {
         speed_is_fleet_median: false,
         provider_id: b.provider_id,
@@ -64,6 +66,8 @@ fn fact(b: FactBuilder) -> ModelFact {
         aa_index: None,
         review_by_ms: None,
         eq_source: None,
+        class_vector: b.class_vector,
+        class_vector_is_overlay: has_vector,
     }
 }
 
@@ -2231,5 +2235,103 @@ fn counters_producer_false_complete_rate_card_selection_bit_identical() {
     assert_eq!(
         selected_card.model.model_id,
         selected_baseline.model.model_id
+    );
+}
+
+#[test]
+fn selection_cost_prices_with_basket_only_when_usable_class_vector_and_complete_rates_present() {
+    use prefrontal_routing_core::{selection_cost, ClassVector};
+
+    let mut fact_item = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "m".into(),
+        scores: scores(80.0, 1800.0, 100.0),
+        cost_per_m_tok_out: Some(10.0),
+        ..Default::default()
+    });
+    fact_item.input_rate = Some(2.0);
+    fact_item.cache_read_rate = Some(0.5);
+    fact_item.cache_write_rate = Some(1.5);
+    fact_item.reasoning_rate = Some(10.0);
+
+    // No vector: falls back to normalized_metered_cost (10.0 / 30.0)
+    assert_eq!(selection_cost(&fact_item, false), 10.0 / 30.0);
+
+    // Unusable vector (sample_count 49 < 50): falls back to normalized_metered_cost
+    fact_item.class_vector = Some(ClassVector {
+        workload_class: "ephemeral".into(),
+        fresh_input: 1000.0,
+        output_excluding_reasoning: 500.0,
+        reasoning: 100.0,
+        cached_read: 2000.0,
+        cache_write: 50.0,
+        sample_count: 49,
+        trailing_window_days: 7.0,
+        statistic: "arithmetic_mean".into(),
+        is_overlay: true,
+    });
+    assert_eq!(selection_cost(&fact_item, false), 10.0 / 30.0);
+
+    // Usable vector (sample_count 50 >= 50): prices with basket
+    fact_item.class_vector = Some(ClassVector {
+        workload_class: "ephemeral".into(),
+        fresh_input: 1000.0,
+        output_excluding_reasoning: 500.0,
+        reasoning: 100.0,
+        cached_read: 2000.0,
+        cache_write: 50.0,
+        sample_count: 50,
+        trailing_window_days: 7.0,
+        statistic: "arithmetic_mean".into(),
+        is_overlay: true,
+    });
+    let basket_cost = fact_item.basket_cost().unwrap();
+    assert_ne!(basket_cost, 10.0 / 30.0);
+    assert_eq!(selection_cost(&fact_item, false), basket_cost);
+
+    // Missing reasoning rate: prices reasoning counter at cost_per_m_tok_out
+    fact_item.reasoning_rate = None;
+    assert_eq!(selection_cost(&fact_item, false), basket_cost);
+
+    // Missing input rate: degrades to today's ladder
+    fact_item.input_rate = None;
+    assert_eq!(selection_cost(&fact_item, false), 10.0 / 30.0);
+}
+
+#[test]
+fn select_model_route_consults_ephemeral_vector_and_names_ephemeral() {
+    use prefrontal_routing_core::ClassVector;
+
+    let mut f = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "m".into(),
+        scores: scores(80.0, 1800.0, 100.0),
+        cost_per_m_tok_out: Some(10.0),
+        ..Default::default()
+    });
+    f.input_rate = Some(2.0);
+    f.cache_read_rate = Some(0.5);
+    f.cache_write_rate = Some(1.5);
+    f.class_vector = Some(ClassVector {
+        workload_class: "ephemeral".into(),
+        fresh_input: 1000.0,
+        output_excluding_reasoning: 500.0,
+        reasoning: 100.0,
+        cached_read: 2000.0,
+        cache_write: 50.0,
+        sample_count: 50,
+        trailing_window_days: 7.0,
+        statistic: "arithmetic_mean".into(),
+        is_overlay: true,
+    });
+    f.class_vector_is_overlay = true;
+
+    assert_eq!(f.ephemeral_vector().unwrap().workload_class, "ephemeral");
+
+    let res = select_model_route(input(vec![f], req(50.0, 0.0), Extra::default())).unwrap();
+    assert!(
+        res.explanation.iter().any(|e| e.contains("basket pricing")),
+        "explanation was {:?}",
+        res.explanation
     );
 }

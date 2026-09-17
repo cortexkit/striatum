@@ -382,6 +382,42 @@ pub struct ModelFact {
     /// How EQ was chosen for an `aa_inferred` row (`aa_index` or `neighbor:<route>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eq_source: Option<String>,
+    /// Optional class vector computed at read time by `get_facts_with_observed_speed`.
+    /// Never persisted onto a stored fact row.
+    #[serde(skip)]
+    pub class_vector: Option<ClassVector>,
+    /// Flag indicating that `class_vector` is an overlay value.
+    #[serde(skip)]
+    pub class_vector_is_overlay: bool,
+}
+
+/// The five-counter complete-case token profile for a workload class.
+/// Computed over the trailing 7-day window (now - 7d, now] on rows where
+/// all five counters are non-NULL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassVector {
+    pub workload_class: String,
+    pub fresh_input: f64,
+    pub output_excluding_reasoning: f64,
+    pub reasoning: f64,
+    pub cached_read: f64,
+    pub cache_write: f64,
+    pub sample_count: u64,
+    pub trailing_window_days: f64,
+    pub statistic: String,
+    pub is_overlay: bool,
+}
+
+pub const CLASS_VECTOR_SAMPLE_FLOOR: u64 = 50;
+pub const CLASS_VECTOR_TRAILING_WINDOW_DAYS: f64 = 7.0;
+pub const CLASS_VECTOR_TRAILING_WINDOW_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1_000.0;
+pub const ENUMERATED_WORKLOAD_CLASSES: [&str; 4] = ["ephemeral", "head", "gather", "hire"];
+
+impl ClassVector {
+    pub fn is_usable(&self) -> bool {
+        self.sample_count >= CLASS_VECTOR_SAMPLE_FLOOR
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -408,6 +444,46 @@ impl ModelFact {
             .as_deref()
             .and_then(GrandFamily::from_wire)
             .map(GrandFamily::as_str)
+    }
+
+    /// The ephemeral vector attached by `get_facts_with_observed_speed`.
+    pub fn ephemeral_vector(&self) -> Option<&ClassVector> {
+        self.class_vector
+            .as_ref()
+            .filter(|v| v.workload_class == "ephemeral")
+    }
+
+    /// True when all four rates required for basket pricing are served.
+    pub fn has_required_basket_rates(&self) -> bool {
+        self.cost_per_m_tok_out.is_some()
+            && self.input_rate.is_some()
+            && self.cache_read_rate.is_some()
+            && self.cache_write_rate.is_some()
+    }
+
+    /// Basket price per message normalized against BASKET_REFERENCE_COST_PER_MESSAGE.
+    /// Returns None when the vector is unusable or any required rate is absent.
+    pub fn basket_cost(&self) -> Option<f64> {
+        let vector = self.class_vector.as_ref().filter(|v| v.is_usable())?;
+        let cost_per_m_tok_out = self.cost_per_m_tok_out?;
+        let input_rate = self.input_rate?;
+        let cache_read_rate = self.cache_read_rate?;
+        let cache_write_rate = self.cache_write_rate?;
+        let reasoning_rate = self.reasoning_rate.unwrap_or(cost_per_m_tok_out);
+        let multiplier = self
+            .subscription_multiplier
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .unwrap_or(1.0);
+        let raw_cost = (vector.fresh_input * input_rate
+            + vector.output_excluding_reasoning * cost_per_m_tok_out
+            + vector.reasoning * reasoning_rate
+            + vector.cached_read * cache_read_rate
+            + vector.cache_write * cache_write_rate)
+            / 1_000_000.0;
+        Some(
+            (raw_cost / multiplier / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE)
+                .clamp(0.0, 1.0),
+        )
     }
 }
 

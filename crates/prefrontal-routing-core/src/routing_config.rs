@@ -84,6 +84,8 @@ pub const EFFECTIVELY_FREE_SELECTION_COST: f64 = 0.05;
 pub const OBJECTIVE_WEIGHT_QUOTA: f64 = 0.5;
 /// $/Mtok output treated as fully expensive by normalized metered cost.
 pub const COST_REFERENCE_PER_MTOK: f64 = 30.0;
+/// Reference cost per message in USD used to normalize the token basket cost.
+pub const BASKET_REFERENCE_COST_PER_MESSAGE: f64 = 0.05;
 
 /// Fixed speed range used only for deterministic speed tie-breaking.
 pub const SPEED_FLOOR_TPS: f64 = 50.0;
