@@ -211,7 +211,7 @@ pub fn maybe_upgrade_to_fast_variant(
     let is_subscription = input
         .is_subscription_route
         .is_some_and(|predicate| predicate(&fast_route));
-    let (objective, _) = compute_objective(&fast_route, &fast_runtime, is_subscription);
+    let (objective, _) = compute_objective(&fast_route, &fast_runtime, is_subscription, false);
 
     let mut upgraded = input.selected.clone();
     upgraded.model = SelectedModel {
@@ -550,7 +550,7 @@ mod tests {
         let fast_route = fact_to_route(&facts[1]);
         let fast_runtime =
             effective_runtime(&snap, &fast_route.route_key, &fast_route.capacity_key);
-        let (expected, _) = compute_objective(&fast_route, &fast_runtime, false);
+        let (expected, _) = compute_objective(&fast_route, &fast_runtime, false, false);
 
         assert_eq!(out.score.objective, expected);
         assert_eq!(out.score.selection_cost, expected.selection_cost);

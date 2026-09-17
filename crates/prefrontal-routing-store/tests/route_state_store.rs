@@ -3176,7 +3176,7 @@ fn class_vector_lands_as_overlay_value_and_is_never_written_back_to_stored_fact(
         .unwrap();
     assert!(base_fact.class_vector.is_none());
     assert!(!base_fact.class_vector_is_overlay);
-    let baseline_cost = prefrontal_routing_core::selection_cost(&base_fact, false);
+    let baseline_cost = prefrontal_routing_core::selection_cost(&base_fact, false, true);
 
     for i in 0..50 {
         store
@@ -3206,7 +3206,7 @@ fn class_vector_lands_as_overlay_value_and_is_never_written_back_to_stored_fact(
         "stored fact must have no class_vector"
     );
     assert!(!raw_fact.class_vector_is_overlay);
-    let pre_overlay_cost = prefrontal_routing_core::selection_cost(&raw_fact, false);
+    let pre_overlay_cost = prefrontal_routing_core::selection_cost(&raw_fact, false, true);
     assert_eq!(
         pre_overlay_cost, baseline_cost,
         "planted usage rows must NOT change selection_cost before overlay runs"
@@ -3220,7 +3220,7 @@ fn class_vector_lands_as_overlay_value_and_is_never_written_back_to_stored_fact(
         .unwrap();
     assert!(overlaid_fact.class_vector.is_some());
     assert!(overlaid_fact.class_vector_is_overlay);
-    let overlaid_cost = prefrontal_routing_core::selection_cost(&overlaid_fact, false);
+    let overlaid_cost = prefrontal_routing_core::selection_cost(&overlaid_fact, false, true);
     assert_ne!(
         overlaid_cost, baseline_cost,
         "planted usage rows must change selection_cost after overlay runs"
@@ -3545,7 +3545,7 @@ fn mutation_querying_store_from_inside_comparator_reddens() {
         .get_fact_by_route_key("p/no-query-model")
         .unwrap()
         .unwrap();
-    let before_cost = prefrontal_routing_core::selection_cost(&before_plant_fact, false);
+    let before_cost = prefrontal_routing_core::selection_cost(&before_plant_fact, false, true);
 
     for i in 0..50 {
         store
@@ -3567,7 +3567,7 @@ fn mutation_querying_store_from_inside_comparator_reddens() {
         .get_fact_by_route_key("p/no-query-model")
         .unwrap()
         .unwrap();
-    let after_cost = prefrontal_routing_core::selection_cost(&after_plant_fact, false);
+    let after_cost = prefrontal_routing_core::selection_cost(&after_plant_fact, false, true);
 
     assert_eq!(
         before_cost, after_cost,

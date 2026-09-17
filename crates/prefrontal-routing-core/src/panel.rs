@@ -352,7 +352,8 @@ pub fn select_panel_with_config(
             .as_ref()
             .map(|predicate| predicate(&admitted.route))
             .unwrap_or(false);
-        let (objective, _) = compute_objective(&admitted.route, &admitted.runtime, is_subscription);
+        let (objective, _) =
+            compute_objective(&admitted.route, &admitted.runtime, is_subscription, false);
         candidates.push(Candidate {
             metered_cost: normalized_metered_cost(&admitted.route.fact),
             route: admitted.route,

@@ -2255,7 +2255,7 @@ fn selection_cost_prices_with_basket_only_when_usable_class_vector_and_complete_
     fact_item.reasoning_rate = Some(10.0);
 
     // No vector: falls back to normalized_metered_cost (10.0 / 30.0)
-    assert_eq!(selection_cost(&fact_item, false), 10.0 / 30.0);
+    assert_eq!(selection_cost(&fact_item, false, true), 10.0 / 30.0);
 
     // Unusable vector (sample_count 49 < 50): falls back to normalized_metered_cost
     fact_item.class_vector = Some(ClassVector {
@@ -2270,7 +2270,7 @@ fn selection_cost_prices_with_basket_only_when_usable_class_vector_and_complete_
         statistic: "arithmetic_mean".into(),
         is_overlay: true,
     });
-    assert_eq!(selection_cost(&fact_item, false), 10.0 / 30.0);
+    assert_eq!(selection_cost(&fact_item, false, true), 10.0 / 30.0);
 
     // Usable vector (sample_count 50 >= 50): prices with basket
     fact_item.class_vector = Some(ClassVector {
@@ -2287,15 +2287,15 @@ fn selection_cost_prices_with_basket_only_when_usable_class_vector_and_complete_
     });
     let basket_cost = fact_item.basket_cost().unwrap();
     assert_ne!(basket_cost, 10.0 / 30.0);
-    assert_eq!(selection_cost(&fact_item, false), basket_cost);
+    assert_eq!(selection_cost(&fact_item, false, true), basket_cost);
 
     // Missing reasoning rate: prices reasoning counter at cost_per_m_tok_out
     fact_item.reasoning_rate = None;
-    assert_eq!(selection_cost(&fact_item, false), basket_cost);
+    assert_eq!(selection_cost(&fact_item, false, true), basket_cost);
 
     // Missing input rate: degrades to today's ladder
     fact_item.input_rate = None;
-    assert_eq!(selection_cost(&fact_item, false), 10.0 / 30.0);
+    assert_eq!(selection_cost(&fact_item, false, true), 10.0 / 30.0);
 }
 
 #[test]
@@ -2333,5 +2333,501 @@ fn select_model_route_consults_ephemeral_vector_and_names_ephemeral() {
         res.explanation.iter().any(|e| e.contains("basket pricing")),
         "explanation was {:?}",
         res.explanation
+    );
+}
+
+// ── Basket cost, whole-selection engagement, degrade, and cache separation fixtures ──
+
+use prefrontal_routing_core::selection_cost;
+
+fn make_ephemeral_vector(
+    fresh_input: f64,
+    output_excluding_reasoning: f64,
+    reasoning: f64,
+    cached_read: f64,
+    cache_write: f64,
+    sample_count: u64,
+) -> prefrontal_routing_core::ClassVector {
+    prefrontal_routing_core::ClassVector {
+        workload_class: "ephemeral".into(),
+        fresh_input,
+        output_excluding_reasoning,
+        reasoning,
+        cached_read,
+        cache_write,
+        sample_count,
+        trailing_window_days: 7.0,
+        statistic: "arithmetic_mean".into(),
+        is_overlay: true,
+    }
+}
+
+fn make_complete_basket_fact(
+    provider: &str,
+    model: &str,
+    speed: f64,
+    vector: Option<prefrontal_routing_core::ClassVector>,
+) -> ModelFact {
+    let mut f = fact(FactBuilder {
+        provider_id: provider.into(),
+        model_id: model.into(),
+        scores: scores(80.0, 1800.0, speed),
+        cost_per_m_tok_out: Some(10.0),
+        ..Default::default()
+    });
+    f.input_rate = Some(2.0);
+    f.cache_read_rate = Some(0.5);
+    f.cache_write_rate = Some(1.5);
+    f.reasoning_rate = Some(8.0);
+    f.class_vector = vector;
+    f.class_vector_is_overlay = f.class_vector.is_some();
+    f
+}
+
+#[test]
+fn numeric_fixture_complete_card_prices_to_stated_value() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let fact_mult_1 = make_complete_basket_fact("p", "m", 100.0, Some(vec.clone()));
+
+    // Numerator: 1000*2.0 + 500*10.0 + 100*8.0 + 2000*0.5 + 50*1.5 = 2000 + 5000 + 800 + 1000 + 75 = 8875.0
+    // Raw cost: 8875.0 / 1e6 = 0.008875
+    // Multiplier 1 cost: (0.008875 / 0.05) / 1.0 = 0.1775
+    let stated_value = 0.1775;
+    let cost_1 = fact_mult_1.basket_cost().unwrap();
+    assert!((cost_1 - stated_value).abs() < 1e-9);
+    assert!((selection_cost(&fact_mult_1, false, true) - stated_value).abs() < 1e-9);
+
+    // Multiplier 40 prices at exactly 1/40th of multiplier 1:
+    let mut fact_mult_40 = fact_mult_1.clone();
+    fact_mult_40.subscription_multiplier = Some(40.0);
+    let cost_40 = fact_mult_40.basket_cost().unwrap();
+    assert_eq!(cost_40, cost_1 / 40.0);
+    assert!((cost_40 - stated_value / 40.0).abs() < 1e-9);
+
+    // Explicit zero rate is honoured as zero:
+    let mut fact_zero_cache = fact_mult_1.clone();
+    fact_zero_cache.cache_read_rate = Some(0.0);
+    // Numerator without cached_read (2000 * 0.5 = 1000): 8875 - 1000 = 7875.0
+    // (7875.0 / 1e6 / 0.05) = 0.1575
+    assert!((fact_zero_cache.basket_cost().unwrap() - 0.1575).abs() < 1e-9);
+
+    // Card serving output, input and both cache rates with reasoning_rate Unpriced or omitted
+    // still takes the basket path and prices reasoning at cost_per_m_tok_out:
+    let mut fact_omitted_reasoning = fact_mult_1.clone();
+    fact_omitted_reasoning.reasoning_rate = None;
+    // Reasoning counter prices at cost_per_m_tok_out (10.0 instead of 8.0):
+    // 8875 - 800 + (100 * 10.0) = 9075.0
+    // (9075.0 / 1e6 / 0.05) = 0.1815
+    assert!((fact_omitted_reasoning.basket_cost().unwrap() - 0.1815).abs() < 1e-9);
+    assert!((selection_cost(&fact_omitted_reasoning, false, true) - 0.1815).abs() < 1e-9);
+}
+
+#[test]
+fn mutation_omitted_reasoning_rate_takes_basket_not_today_ladder() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let mut fact_omitted_reasoning = make_complete_basket_fact("p", "m", 100.0, Some(vec));
+    fact_omitted_reasoning.reasoning_rate = None;
+
+    // Must take basket path (0.1815), NOT today's ladder (10.0 / 30.0 = 0.3333333333333333).
+    let basket = fact_omitted_reasoning.basket_cost().unwrap();
+    assert!((basket - 0.1815).abs() < 1e-9);
+    assert!((basket - 10.0 / 30.0).abs() > 0.1);
+    assert!((selection_cost(&fact_omitted_reasoning, false, true) - 0.1815).abs() < 1e-9);
+    assert!((selection_cost(&fact_omitted_reasoning, false, true) - 10.0 / 30.0).abs() > 0.1);
+}
+
+#[test]
+fn mutation_missing_reasoning_rate_prices_at_output_rate_not_zero() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let mut fact_omitted_reasoning = make_complete_basket_fact("p", "m", 100.0, Some(vec));
+    fact_omitted_reasoning.reasoning_rate = None;
+
+    // Pricing reasoning at cost_per_m_tok_out yields 0.1815.
+    // A mutation treating missing reasoning rate as 0 would yield:
+    // (8875 - 800) = 8075 / 1e6 / 0.05 = 0.1615.
+    assert!((fact_omitted_reasoning.basket_cost().unwrap() - 0.1815).abs() < 1e-9);
+    assert!((fact_omitted_reasoning.basket_cost().unwrap() - 0.1615).abs() > 0.01);
+}
+
+#[test]
+fn whole_selection_engagement_all_candidates_complete_prices_in_basket() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let fact_a = make_complete_basket_fact("p", "model_a", 100.0, Some(vec.clone()));
+    let fact_b = make_complete_basket_fact("p", "model_b", 120.0, Some(vec));
+
+    let res = select_model_route(input(
+        vec![fact_a.clone(), fact_b.clone()],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+
+    // Both candidates had complete cards and usable ephemeral vector: basket engages for selection.
+    assert_eq!(res.score.selection_cost, fact_a.basket_cost().unwrap());
+    let exp = res.explanation.join("\n");
+    assert!(exp.contains("basket pricing (list dollars)"), "{exp}");
+}
+
+#[test]
+fn whole_selection_engagement_one_candidate_missing_rate_forces_whole_selection_fallback() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let fact_complete = make_complete_basket_fact("p", "model_complete", 100.0, Some(vec.clone()));
+
+    // Degrade case 1: card missing cache rates
+    let mut fact_missing_cache = fact_complete.clone();
+    fact_missing_cache.model_id = "missing_cache".into();
+    fact_missing_cache.cache_read_rate = None;
+    fact_missing_cache.cache_write_rate = None;
+
+    let res = select_model_route(input(
+        vec![fact_complete.clone(), fact_missing_cache],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    // Complete candidate must degrade to today's ladder bit-identically (10.0 / 30.0), not basket cost!
+    assert_eq!(res.score.selection_cost, 10.0 / 30.0);
+    assert_ne!(
+        res.score.selection_cost,
+        fact_complete.basket_cost().unwrap()
+    );
+    let exp = res.explanation.join("\n");
+    assert!(exp.contains("output $/Mtok"), "{exp}");
+
+    // Degrade case 2: card with no input rate
+    let mut fact_no_input = fact_complete.clone();
+    fact_no_input.model_id = "no_input".into();
+    fact_no_input.input_rate = None;
+
+    let res2 = select_model_route(input(
+        vec![fact_complete.clone(), fact_no_input],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(res2.score.selection_cost, 10.0 / 30.0);
+
+    // Degrade case 3: tier-only fact
+    let mut fact_tier_only = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "tier_only".into(),
+        scores: scores(80.0, 1800.0, 100.0),
+        cost_tier: Some(3.0),
+        ..Default::default()
+    });
+    fact_tier_only.class_vector = Some(vec.clone());
+    fact_tier_only.class_vector_is_overlay = true;
+
+    let res3 = select_model_route(input(
+        vec![fact_complete.clone(), fact_tier_only],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(res3.score.selection_cost, 10.0 / 30.0);
+
+    // Degrade case 4: fact serving input and cache rates but no cost_per_m_tok_out
+    let mut fact_no_output = fact_complete.clone();
+    fact_no_output.model_id = "no_output".into();
+    fact_no_output.cost_per_m_tok_out = None;
+
+    let res4 = select_model_route(input(
+        vec![fact_complete.clone(), fact_no_output],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(res4.score.selection_cost, 10.0 / 30.0);
+}
+
+#[test]
+fn whole_selection_engagement_refused_rate_forces_whole_selection_fallback() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let fact_complete = make_complete_basket_fact("p", "model_complete", 100.0, Some(vec.clone()));
+
+    // A card whose rate was refused by the decoder leaves the rate None on ModelFact
+    let mut fact_refused = fact_complete.clone();
+    fact_refused.model_id = "model_refused".into();
+    fact_refused.cache_read_rate = None;
+
+    let res = select_model_route(input(
+        vec![fact_complete.clone(), fact_refused],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+
+    // Whole selection falls back to today's ladder bit-identically
+    assert_eq!(res.score.selection_cost, 10.0 / 30.0);
+    assert_ne!(
+        res.score.selection_cost,
+        fact_complete.basket_cost().unwrap()
+    );
+    let exp = res.explanation.join("\n");
+    assert!(exp.contains("output $/Mtok"), "{exp}");
+}
+
+#[test]
+fn ladder_asserted_in_order_basket_effective_tier_metered_subscription() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let mut complete_fact = make_complete_basket_fact("p", "m", 100.0, Some(vec));
+    complete_fact.cost_per_m_tok_out = Some(15.0);
+    complete_fact.cost_tier = Some(3.0);
+    let basket = complete_fact.basket_cost().unwrap();
+
+    // 1. Basket (when use_basket = true)
+    assert_eq!(selection_cost(&complete_fact, false, true), basket);
+
+    // 2. Else effective price (when use_basket = false)
+    assert_eq!(selection_cost(&complete_fact, false, false), 15.0 / 30.0);
+
+    // 3. Else cost_tier / 6.0 (when cost_per_m_tok_out is None)
+    let mut tier_only_fact = complete_fact.clone();
+    tier_only_fact.cost_per_m_tok_out = None;
+    assert_eq!(selection_cost(&tier_only_fact, false, false), 3.0 / 6.0);
+
+    // 4. Else 1.0 for metered (when neither cost_per_m_tok_out nor cost_tier is present)
+    let mut unpriced_fact = tier_only_fact.clone();
+    unpriced_fact.cost_tier = None;
+    assert_eq!(selection_cost(&unpriced_fact, false, false), 1.0);
+
+    // 5. Else 0.0 for a subscription route with neither figure
+    assert_eq!(selection_cost(&unpriced_fact, true, false), 0.0);
+}
+
+#[test]
+fn mutation_degrading_only_incomplete_route_reddens() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let fact_complete = make_complete_basket_fact("p", "complete_route", 100.0, Some(vec.clone()));
+    let mut fact_incomplete = fact_complete.clone();
+    fact_incomplete.model_id = "incomplete_route".into();
+    fact_incomplete.cache_read_rate = None;
+
+    let res = select_model_route(input(
+        vec![fact_complete.clone(), fact_incomplete],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+
+    // A mutation that degraded only the incomplete route would price complete_route
+    // with its basket cost (0.1775). In the normative design, it MUST be priced at 10.0 / 30.0.
+    assert_eq!(res.score.selection_cost, 10.0 / 30.0);
+    assert_ne!(
+        res.score.selection_cost,
+        fact_complete.basket_cost().unwrap()
+    );
+}
+
+#[test]
+fn mutation_folding_completeness_check_into_per_route_selection_cost_reddens() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let complete_fact = make_complete_basket_fact("p", "m", 100.0, Some(vec));
+
+    // Calling selection_cost with use_basket = false MUST ignore fact.basket_cost()
+    // and take today's ladder.
+    let cost = selection_cost(&complete_fact, false, false);
+    assert_eq!(cost, 10.0 / 30.0);
+    assert_ne!(cost, complete_fact.basket_cost().unwrap());
+}
+
+#[test]
+fn mutation_pricing_refused_rate_at_zero_reddens() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let mut fact_refused = make_complete_basket_fact("p", "m", 100.0, Some(vec));
+    fact_refused.cache_read_rate = None; // Refused decodes to None
+
+    // A refused rate must not be treated as Some(0.0). It stays None.
+    assert!(!fact_refused.has_required_basket_rates());
+    assert!(fact_refused.basket_cost().is_none());
+}
+
+#[test]
+fn mutation_swapping_basket_reference_and_cost_reference_reddens() {
+    use prefrontal_routing_core::routing_config::{
+        BASKET_REFERENCE_COST_PER_MESSAGE, COST_REFERENCE_PER_MTOK,
+    };
+    assert_eq!(BASKET_REFERENCE_COST_PER_MESSAGE, 0.05);
+    assert_eq!(COST_REFERENCE_PER_MTOK, 30.0);
+
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let complete_fact = make_complete_basket_fact("p", "m", 100.0, Some(vec));
+
+    // Under BASKET_REFERENCE_COST_PER_MESSAGE (0.05), basket_cost is ~0.1775.
+    // If swapped with COST_REFERENCE_PER_MTOK (30.0), basket_cost would be ~0.00029583...
+    let cost = complete_fact.basket_cost().unwrap();
+    assert!((cost - 0.1775).abs() < 1e-9);
+    assert!((cost - (0.008875 / 30.0)).abs() > 0.1);
+}
+
+#[test]
+fn cache_separation_fixture_routes_rank_apart_on_cached_read_term() {
+    use prefrontal_routing_core::routing_config::{
+        BASKET_REFERENCE_COST_PER_MESSAGE, EFFECTIVELY_FREE_SELECTION_COST,
+    };
+
+    let vec = make_ephemeral_vector(1000.0, 200.0, 0.0, 5000.0, 0.0, 50);
+
+    // Route A (prompt caching): cache_read_rate = 0.2
+    let mut route_caching = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "caching".into(),
+        scores: scores(80.0, 1800.0, 100.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    route_caching.input_rate = Some(1.0);
+    route_caching.cache_read_rate = Some(0.2);
+    route_caching.cache_write_rate = Some(1.0);
+    route_caching.class_vector = Some(vec.clone());
+    route_caching.class_vector_is_overlay = true;
+
+    // Route B (no prompt caching): equal cost_per_m_tok_out (5.0), cache_read_rate = input_rate (1.0),
+    // and higher speed (150.0 vs 100.0) so that under today's ladder Route B wins speed tie-break!
+    let mut route_nocache = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "nocache".into(),
+        scores: scores(80.0, 1800.0, 150.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    route_nocache.input_rate = Some(1.0);
+    route_nocache.cache_read_rate = Some(1.0); // Prices cached reads at input rate!
+    route_nocache.cache_write_rate = Some(1.0);
+    route_nocache.class_vector = Some(vec);
+    route_nocache.class_vector_is_overlay = true;
+
+    let cost_caching = route_caching.basket_cost().unwrap();
+    let cost_nocache = route_nocache.basket_cost().unwrap();
+
+    // Both costs strictly above EFFECTIVELY_FREE_SELECTION_COST (0.05) and strictly below clamp ceiling (1.0)
+    assert!(
+        cost_caching > EFFECTIVELY_FREE_SELECTION_COST,
+        "cost_caching {cost_caching} <= {EFFECTIVELY_FREE_SELECTION_COST}"
+    );
+    assert!(
+        cost_caching < 1.0,
+        "cost_caching {cost_caching} reached ceiling"
+    );
+    assert!(
+        cost_nocache > EFFECTIVELY_FREE_SELECTION_COST,
+        "cost_nocache {cost_nocache} <= {EFFECTIVELY_FREE_SELECTION_COST}"
+    );
+    assert!(
+        cost_nocache < 1.0,
+        "cost_nocache {cost_nocache} reached ceiling"
+    );
+    assert!(
+        cost_caching < cost_nocache,
+        "caching {cost_caching} not separated from nocache {cost_nocache}"
+    );
+
+    // Shipped reference constant (0.05):
+    assert_eq!(BASKET_REFERENCE_COST_PER_MESSAGE, 0.05);
+    assert!((cost_caching - 0.06).abs() < 1e-9);
+    assert!((cost_nocache - 0.14).abs() < 1e-9);
+
+    // Under basket pricing, route_caching wins because cost is lower (0.06 < 0.14)
+    let winner = select_model_route(input(
+        vec![route_caching.clone(), route_nocache.clone()],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    assert_eq!(winner.model.model_id, "caching");
+
+    // Explanation names cached-read term and states quantity (list dollars)
+    let exp = winner.explanation.join("\n");
+    assert!(exp.contains("list dollars"), "{exp}");
+    assert!(exp.contains("cached-read term"), "{exp}");
+
+    // With any required rate absent or refused on the served catalog the same pair
+    // ranks exactly as it does today:
+    let mut route_nocache_absent = route_nocache.clone();
+    route_nocache_absent.cache_read_rate = None;
+
+    let winner_fallback = select_model_route(input(
+        vec![route_caching.clone(), route_nocache_absent],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    // In today's ladder, both have cost 5.0 / 30.0 = 0.16666... and tie on cost.
+    // Speed tie-break decides: route_nocache has speed 150.0 vs caching 100.0, so nocache wins!
+    assert_eq!(winner_fallback.model.model_id, "nocache");
+    let exp_fallback = winner_fallback.explanation.join("\n");
+    assert!(exp_fallback.contains("output $/Mtok"), "{exp_fallback}");
+}
+
+#[test]
+fn mutation_raising_reference_constant_until_both_clamp_at_one_reddens() {
+    let vec = make_ephemeral_vector(1000.0, 200.0, 0.0, 5000.0, 0.0, 50);
+
+    let mut route_caching = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "caching".into(),
+        scores: scores(80.0, 1800.0, 100.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    route_caching.input_rate = Some(1.0);
+    route_caching.cache_read_rate = Some(0.2);
+    route_caching.cache_write_rate = Some(1.0);
+    route_caching.class_vector = Some(vec.clone());
+    route_caching.class_vector_is_overlay = true;
+
+    let mut route_nocache = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "nocache".into(),
+        scores: scores(80.0, 1800.0, 150.0),
+        cost_per_m_tok_out: Some(5.0),
+        ..Default::default()
+    });
+    route_nocache.input_rate = Some(1.0);
+    route_nocache.cache_read_rate = Some(1.0);
+    route_nocache.cache_write_rate = Some(1.0);
+    route_nocache.class_vector = Some(vec);
+    route_nocache.class_vector_is_overlay = true;
+
+    let cost_caching = route_caching.basket_cost().unwrap();
+    let cost_nocache = route_nocache.basket_cost().unwrap();
+
+    // A mutation that scaled costs until both clamp at 1.0 would cause cost_caching == cost_nocache == 1.0,
+    // which reddens these assertions:
+    assert!(cost_caching < 1.0);
+    assert!(cost_nocache < 1.0);
+    assert_ne!(cost_caching, cost_nocache);
+    assert!(cost_caching < cost_nocache);
+}
+
+#[test]
+fn decision_explanation_cost_line_states_quantity_and_subscription_quota_proxy() {
+    let vec = make_ephemeral_vector(1000.0, 200.0, 0.0, 5000.0, 0.0, 50);
+    let mut route = make_complete_basket_fact("sub", "model_sub", 100.0, Some(vec));
+    route.cost_per_m_tok_out = Some(5.0);
+    route.subscription_multiplier = Some(2.0);
+
+    let res = select_model_route(input(
+        vec![route],
+        req(50.0, 0.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|r: &ModelRoute| r.provider_id == "sub")),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+
+    let exp = res.explanation.join("\n");
+    assert!(
+        exp.contains("basket-per-message quota proxy"),
+        "expected quota proxy in explanation: {exp}"
+    );
+    assert!(
+        exp.contains("cached-read term"),
+        "expected cached-read term in explanation: {exp}"
+    );
+    assert!(
+        exp.contains("subscription-covered"),
+        "expected subscription-covered in explanation: {exp}"
     );
 }

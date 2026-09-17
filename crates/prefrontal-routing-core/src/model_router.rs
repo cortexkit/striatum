@@ -557,9 +557,11 @@ fn normalized_speed(speed: f64) -> f64 {
 /// subscription planes such as ollama-cloud at all. Ranking those routes at the
 /// maximum priced every glm, deepseek, and kimi route on the plan above sol. An
 /// unpublished price under a metered provider still ranks at the maximum.
-pub fn selection_cost(fact: &ModelFact, is_subscription: bool) -> f64 {
-    if let Some(basket_cost) = fact.basket_cost() {
-        return basket_cost;
+pub fn selection_cost(fact: &ModelFact, is_subscription: bool, use_basket: bool) -> f64 {
+    if use_basket {
+        if let Some(basket_cost) = fact.basket_cost() {
+            return basket_cost;
+        }
     }
     if is_subscription && fact.cost_per_m_tok_out.is_none() && fact.cost_tier.is_none() {
         return 0.0;
@@ -571,22 +573,43 @@ pub(crate) fn compute_objective(
     route: &ModelRoute,
     runtime: &RouteRuntimeState,
     is_subscription: bool,
+    use_basket: bool,
 ) -> (ObjectiveBreakdown, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
 
-    let cost = selection_cost(&route.fact, is_subscription);
+    let cost = selection_cost(&route.fact, is_subscription, use_basket);
     let multiplier = subscription_multiplier(&route.fact);
     let coverage = if is_subscription {
         "subscription-covered"
     } else {
         "metered"
     };
-    let detail = if route.fact.basket_cost().is_some() {
-        format!("basket pricing, {coverage}")
+    let detail = if use_basket {
+        let quantity = if is_subscription {
+            "basket-per-message quota proxy"
+        } else {
+            "list dollars"
+        };
+        let cached_read_term = route.fact.ephemeral_vector().and_then(|v| {
+            route
+                .fact
+                .cache_read_rate
+                .map(|rate| (v.cached_read * rate) / 1_000_000.0)
+        });
+        let mut detail = if let Some(cr) = cached_read_term {
+            format!("basket pricing ({quantity}), cached-read term ${:.4}", cr)
+        } else {
+            format!("basket pricing ({quantity})")
+        };
+        if (multiplier - 1.0).abs() > f64::EPSILON {
+            detail.push_str(&format!(", x{} subsidy", fmt_num(multiplier)));
+        }
+        detail.push_str(&format!(", {coverage}"));
+        detail
     } else if let Some(list_price) = route.fact.cost_per_m_tok_out {
         let effective = list_price / multiplier;
         let mut detail = format!(
-            "effective ${}/Mtok, list ${}/Mtok",
+            "output $/Mtok: effective ${}/Mtok, list ${}/Mtok",
             fmt_num(effective),
             fmt_num(list_price)
         );
@@ -815,7 +838,7 @@ pub fn select_model_route_with_config(
         && shortlist.iter().all(|&idx| {
             let fact = &admissible[idx].route.fact;
             fact.has_required_basket_rates()
-                && fact.class_vector.as_ref().map_or(false, |v| v.is_usable())
+                && fact.ephemeral_vector().is_some_and(|v| v.is_usable())
         });
 
     struct Scored {
@@ -833,13 +856,7 @@ pub fn select_model_route_with_config(
                 .as_ref()
                 .map(|pred| pred(&a.route))
                 .unwrap_or(false);
-            let (breakdown, notes) = if use_basket {
-                compute_objective(&a.route, &a.runtime, is_sub)
-            } else {
-                let mut fallback_route = a.route.clone();
-                fallback_route.fact.class_vector = None;
-                compute_objective(&fallback_route, &a.runtime, is_sub)
-            };
+            let (breakdown, notes) = compute_objective(&a.route, &a.runtime, is_sub, use_basket);
             Scored {
                 idx,
                 objective: breakdown,
