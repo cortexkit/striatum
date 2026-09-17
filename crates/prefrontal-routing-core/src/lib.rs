@@ -24,6 +24,7 @@ pub mod provider_model_spec;
 pub mod quota;
 pub mod quota_extract;
 pub mod quota_pace;
+pub mod quota_poll;
 pub mod route_scoring;
 pub mod route_state_store;
 pub mod routing_config;

@@ -15,8 +15,12 @@ use crate::quota_pace::ProviderWindowModel;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateWindow {
-    /// 0..100 percent of the window's quota consumed.
+    /// Effective 0..100 percent consumed after the producer applies saved resets.
     pub used_percent: f64,
+    /// Provider-reported utilization before saved resets are applied. Consumption
+    /// intervals require this source value; effective utilization is not a substitute.
+    #[serde(default)]
+    pub raw_used_percent: Option<f64>,
     /// ISO 8601 / RFC 3339 timestamp when the window resets. Optional: QTA's
     /// `docs/consumer-contract.md` says the producer never fabricates a recovery
     /// time, so `None` means recovery was not reported, not that the window is idle.
@@ -149,6 +153,14 @@ impl SpendPool {
     }
 }
 
+/// Producer-reported banked quota resets for one account.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedResets {
+    #[serde(default)]
+    pub available_count: Option<i64>,
+}
+
 /// One provider/account's usage entry. The `usage.get` result is an array of
 /// these. A fetch failure becomes an entry carrying `error` (silent-degrade),
 /// never a failure of the whole array: the consumer skips any entry with a
@@ -179,6 +191,10 @@ pub struct ProviderUsage {
     /// never assigns a request to an individual pool.
     #[serde(default)]
     pub spend: Vec<SpendPool>,
+    /// Credits which can reset effective utilization without representing new quota.
+    /// Older producers omit the object, and newer ones may omit the count.
+    #[serde(default)]
+    pub saved_resets: Option<SavedResets>,
     /// Present only on a degraded entry. The consumer skips any entry with `error`.
     #[serde(default)]
     pub error: Option<String>,
@@ -240,6 +256,10 @@ impl ProviderUsage {
                 || !self.spend.is_empty())
     }
 }
+
+/// Quota-poll normalization and interval admission live beside the wire decoder,
+/// while durable storage remains behind `RouteStateStore`.
+pub use crate::quota_poll;
 
 use std::collections::HashMap;
 

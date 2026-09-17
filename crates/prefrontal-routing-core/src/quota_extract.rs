@@ -32,8 +32,11 @@ pub struct ExtractedWindow {
     pub scope_kind: WindowScopeKind,
     /// capacity key when scope is CapacityKey / family key for ModelFamily.
     pub applies_key: Option<String>,
-    /// 0..1
+    /// Effective utilization, normalized to 0..1.
     pub utilization: f64,
+    /// Unadjusted producer utilization in percent. Missing means a burn interval
+    /// cannot be verified; it must never be reconstructed from `utilization`.
+    pub raw_used_percent: Option<f64>,
     /// ms epoch; `None` when the provider did not report a recovery time.
     pub resets_at: Option<f64>,
     /// `None` when the provider does not report a window length.
@@ -99,6 +102,7 @@ fn rate_window_to_extracted(
         scope_kind,
         applies_key,
         utilization,
+        raw_used_percent: w.raw_used_percent,
         resets_at,
         window_ms: w.window_minutes.map(|m| m as f64 * 60_000.0),
         window_model: w.window_model,
@@ -350,6 +354,7 @@ mod tests {
     fn win(used: f64, resets_at: &str, mins: Option<i64>) -> RateWindow {
         RateWindow {
             used_percent: used,
+            raw_used_percent: Some(used),
             resets_at: Some(resets_at.into()),
             window_minutes: mins,
             window_model: None,
@@ -388,6 +393,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
         let out = extract_windows(&entry, "openai", "codex", &[]);
         assert_eq!(out.len(), 2);
@@ -412,6 +418,7 @@ mod tests {
             usage: Some(Usage {
                 primary: Some(RateWindow {
                     used_percent: 100.0,
+                    raw_used_percent: Some(100.0),
                     resets_at: None,
                     window_minutes: Some(10_080),
                     window_model: None,
@@ -423,6 +430,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
 
         let out = extract_windows(&entry, "ollama", "ollama", &[]);
@@ -450,6 +458,7 @@ mod tests {
             usage: Some(Usage {
                 primary: Some(RateWindow {
                     used_percent: 0.0,
+                    raw_used_percent: Some(0.0),
                     resets_at: None,
                     window_minutes: Some(10_080),
                     window_model: None,
@@ -461,6 +470,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
 
         let out = extract_windows(&entry, "ollama", "ollama", &[]);
@@ -488,6 +498,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
 
         let out = extract_windows(&entry, "ollama", "ollama", &[]);
@@ -528,6 +539,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
         let caps = vec![
             "google/antigravity-gemini-3.5-flash".to_string(),
@@ -600,6 +612,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
         let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
         let out = extract_windows(&entry, "google", "antigravity", &caps);
@@ -662,6 +675,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
         let caps = vec![
             "google/antigravity-gemini-3.1-pro".to_string(),
@@ -736,6 +750,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
         let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
         let out = extract_windows(&entry, "google", "antigravity", &caps);
@@ -772,6 +787,7 @@ mod tests {
             spend: Vec::new(),
             error: None,
             error_class: None,
+            saved_resets: None,
         };
         let caps = vec!["google/antigravity-gemini-3.5-flash".to_string()];
         assert!(extract_windows(&entry, "google", "antigravity", &caps).is_empty());
