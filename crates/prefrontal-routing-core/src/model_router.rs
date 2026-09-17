@@ -23,6 +23,7 @@ use crate::model_facts::{
     fact_to_route, make_capacity_key, ModelFact, ModelMetric, ModelRequirements, ModelRoute,
     ScoreProvenance, FAST_SUFFIX,
 };
+use crate::model_resolution::{use_basket_permitted, CLASS_PRODUCER, COUNTERS_PRODUCER};
 use crate::provider_model_spec::{
     parse_spec_list, resolve_spec, ExclusionPolicy, ExclusionSource, ExclusionSpecs,
 };
@@ -222,6 +223,31 @@ pub struct SelectedModelRoute {
     /// stays in the units the selection was made in, and so a decision record
     /// names its unit without re-deriving it from the explanation text.
     pub priced_with_basket: bool,
+}
+
+/// One shortlisted route priced in the selection it actually sat in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PricedShortlistEntry {
+    pub route_key: String,
+    /// Cost component of the objective (clamped 0..1), not including quota.
+    pub cost: f64,
+    /// Economic selection cost (cost + quota) used by the free-bucket gate.
+    pub selection_cost: f64,
+    /// Cached-read term in list dollars: `cached_read * cache_read_rate / 1e6`.
+    pub cached_read_term_usd: Option<f64>,
+}
+
+/// The shortlist `select_model_route` would price, with the whole-selection
+/// basket verdict. A route is effectively free in a replay when its
+/// `selection_cost` here is at or below [`EFFECTIVELY_FREE_SELECTION_COST`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PricedShortlist {
+    pub use_basket: bool,
+    /// First shortlisted route missing a required basket rate or a usable
+    /// ephemeral vector. Independent of the producer flags: when those flags
+    /// forbid the basket, this still names the rate/vector degrader if any.
+    pub degraded_by: Option<String>,
+    pub routes: Vec<PricedShortlistEntry>,
 }
 
 /// Carried on a `SelectedModelRoute` when best-effort selection picked a route
@@ -545,6 +571,14 @@ fn normalized_speed(speed: f64) -> f64 {
     ((speed - SPEED_FLOOR_TPS) / (SPEED_CEILING_TPS - SPEED_FLOOR_TPS)).clamp(0.0, 1.0)
 }
 
+/// Cached-read term in list dollars. None when the ephemeral vector or the
+/// cache-read rate is missing; an explicit zero rate is a present term of $0.
+fn cached_read_term_usd(fact: &ModelFact) -> Option<f64> {
+    let vector = fact.ephemeral_vector()?;
+    let rate = fact.cache_read_rate?;
+    Some((vector.cached_read * rate) / 1_000_000.0)
+}
+
 /// Selection cost among models that already clear the quality bar. Lower wins.
 /// COST-PRIMARY: selectionCost is purely economic (continuous effective cost +
 /// soft quota pressure). Speed is NOT blended in: it is a strict tie-break.
@@ -596,12 +630,7 @@ pub(crate) fn compute_objective(
         } else {
             "list dollars"
         };
-        let cached_read_term = route.fact.ephemeral_vector().and_then(|v| {
-            route
-                .fact
-                .cache_read_rate
-                .map(|rate| (v.cached_read * rate) / 1_000_000.0)
-        });
+        let cached_read_term = cached_read_term_usd(&route.fact);
         let mut detail = if let Some(cr) = cached_read_term {
             format!("basket pricing ({quantity}), cached-read term ${:.4}", cr)
         } else {
@@ -709,10 +738,28 @@ pub fn select_model_route(
     select_model_route_with_config(input, &DEFAULT_ROUTING_CONFIG)
 }
 
-pub fn select_model_route_with_config(
-    input: SelectModelRouteInput<'_>,
+struct Scored {
+    idx: usize,
+    objective: ObjectiveBreakdown,
+    objective_notes: Vec<String>,
+}
+
+struct PricedAdmission {
+    admissible: Vec<AdmittedRoute>,
+    rejected: Vec<RejectedRoute>,
+    scored: Vec<Scored>,
+    use_basket: bool,
+    degraded_by: Option<String>,
+    best_effort: bool,
+    cleared_count: usize,
+}
+
+fn admit_and_price_shortlist(
+    input: &SelectModelRouteInput<'_>,
     config: &RoutingConfig,
-) -> Result<SelectedModelRoute, NoRouteError> {
+    counters_producer: bool,
+    class_producer: bool,
+) -> Result<PricedAdmission, NoRouteError> {
     let requirements = input.requirements;
 
     if !requirements_are_valid(&requirements)
@@ -838,22 +885,24 @@ pub fn select_model_route_with_config(
         .map(|(i, _)| i)
         .collect();
 
-    // Whole-selection basket gate: true exactly when the overlay's ephemeral vector
-    // is present and usable AND every shortlisted candidate serves all required rates.
-    let use_basket = !shortlist.is_empty()
-        && shortlist.iter().all(|&idx| {
-            let fact = &admissible[idx].route.fact;
-            fact.has_required_basket_rates()
-                && fact.ephemeral_vector().is_some_and(|v| v.is_usable())
-        });
+    // Whole-selection basket gate: producers must both exist, the overlay's
+    // ephemeral vector must be usable, and every shortlisted candidate must
+    // serve the required rates. account_producer is not in this predicate.
+    let degraded_by = shortlist.iter().find_map(|&idx| {
+        let fact = &admissible[idx].route.fact;
+        if fact.has_required_basket_rates()
+            && fact.ephemeral_vector().is_some_and(|v| v.is_usable())
+        {
+            None
+        } else {
+            Some(admissible[idx].route.route_key.clone())
+        }
+    });
+    let use_basket = use_basket_permitted(counters_producer, class_producer)
+        && !shortlist.is_empty()
+        && degraded_by.is_none();
 
-    struct Scored {
-        idx: usize,
-        objective: ObjectiveBreakdown,
-        objective_notes: Vec<String>,
-    }
-
-    let mut scored: Vec<Scored> = shortlist
+    let scored: Vec<Scored> = shortlist
         .into_iter()
         .map(|idx| {
             let a = &admissible[idx];
@@ -870,6 +919,70 @@ pub fn select_model_route_with_config(
             }
         })
         .collect();
+
+    Ok(PricedAdmission {
+        admissible,
+        rejected,
+        scored,
+        use_basket,
+        degraded_by,
+        best_effort,
+        cleared_count,
+    })
+}
+
+/// Prices every shortlisted route the way [`select_model_route`] would, including
+/// the whole-selection basket verdict. The bucket-membership replay uses this so
+/// a route is judged free in the selection it was actually priced in.
+///
+/// `counters_producer` and `class_producer` are the two flags that may engage
+/// the basket; there is no `account_producer` argument because its absence must
+/// never force the basket off.
+///
+/// Reference calibration is measured off the host stores, not invented.
+/// Live routing `model_facts` is schema v35 and does not persist Fusiform rates.
+/// Joining the scored routable catalog to latest Fusiform eras, every
+/// reconstructed mason shortlist includes a route with no rate card, so the
+/// basket does not engage. See the catalog-and-readings replay test.
+pub fn price_selection_shortlist(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    counters_producer: bool,
+    class_producer: bool,
+) -> Result<PricedShortlist, NoRouteError> {
+    let priced = admit_and_price_shortlist(&input, config, counters_producer, class_producer)?;
+    Ok(PricedShortlist {
+        use_basket: priced.use_basket,
+        degraded_by: priced.degraded_by,
+        routes: priced
+            .scored
+            .iter()
+            .map(|s| {
+                let admitted = &priced.admissible[s.idx];
+                PricedShortlistEntry {
+                    route_key: admitted.route.route_key.clone(),
+                    cost: s.objective.cost,
+                    selection_cost: s.objective.selection_cost,
+                    cached_read_term_usd: cached_read_term_usd(&admitted.route.fact),
+                }
+            })
+            .collect(),
+    })
+}
+
+pub fn select_model_route_with_config(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+) -> Result<SelectedModelRoute, NoRouteError> {
+    let PricedAdmission {
+        admissible,
+        rejected,
+        mut scored,
+        use_basket,
+        best_effort,
+        cleared_count,
+        ..
+    } = admit_and_price_shortlist(&input, config, COUNTERS_PRODUCER, CLASS_PRODUCER)?;
 
     // Deterministic ordering. COST-PRIMARY lexicographic among adequate models.
     scored.sort_by(|sa, sb| {
