@@ -79,7 +79,9 @@ pub fn record_reading_log_poll(
 }
 
 fn finite_i64(value: Option<f64>) -> Option<i64> {
-    value.filter(|value| value.is_finite()).map(|value| value as i64)
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| value as i64)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,8 +182,11 @@ fn clean_parts(row: &QuotaReadingLogRow) -> Option<(i64, f64, i64)> {
         return None;
     }
     let banked_credit_count = row.banked_credit_count?;
-    (fetched_at >= 0 && banked_credit_count >= 0)
-        .then_some((fetched_at, raw_used_percent, banked_credit_count))
+    (fetched_at >= 0 && banked_credit_count >= 0).then_some((
+        fetched_at,
+        raw_used_percent,
+        banked_credit_count,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -244,9 +249,7 @@ pub fn analyze_reading_log(
             })
             .filter_map(total_tokens)
             .sum::<f64>();
-        if tokens >= READING_INTERVAL_MIN_ACCOUNT_TOKENS
-            && interval.raw_used_percent_delta > 0.0
-        {
+        if tokens >= READING_INTERVAL_MIN_ACCOUNT_TOKENS && interval.raw_used_percent_delta > 0.0 {
             usage_admitted_intervals.push(QuotaUsageInterval {
                 reading: interval.clone(),
                 tokens,

@@ -259,9 +259,7 @@ impl ProviderUsage {
 
 /// Quota-poll normalization and interval admission live beside the wire decoder,
 /// while durable storage remains behind `RouteStateStore`.
-pub mod quota_poll {
-    include!("quota_poll.rs");
-}
+pub use crate::quota_poll;
 
 use std::collections::HashMap;
 
