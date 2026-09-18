@@ -2774,6 +2774,81 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
     assert_eq!(minted.fact.provider_id, "anthropic");
 }
 
+/// A model the upstream withdrew is served as absent when retired models are
+/// requested; its fact row leaves the routable set on that write, and a model
+/// first seen already withdrawn is not minted at all.
+#[test]
+fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() {
+    let rig = Rig::new("fusiform-withdrawn");
+    let store = rig.open();
+    let route_key = make_route_key("anthropic", "claude-opus-4-5", None);
+    let withdrawn = |provider: &str, model: &str| FusiformFactUpdate {
+        provider_id: provider.to_string(),
+        model_id: model.to_string(),
+        present: false,
+        context_window: Some(200_000.0),
+        max_output_tokens: Some(32_000),
+        cost_tier: Some(3.0),
+        cost_per_mtok_out: Some(12.0),
+        input_rate: None,
+        cache_read_rate: None,
+        cache_write_rate: None,
+        reasoning_rate: None,
+        supports_vision: Some(true),
+        supports_tool_use: Some(true),
+    };
+    let routable_before = store.get_facts().unwrap().len();
+    assert!(store.get_facts().unwrap().iter().any(|fact| make_route_key(
+        &fact.provider_id,
+        &fact.model_id,
+        fact.variant.as_deref()
+    ) == route_key));
+
+    store
+        .apply_fusiform_catalog(
+            &[
+                withdrawn("anthropic", "claude-opus-4-5"),
+                withdrawn("anthropic", "never-seen-before"),
+            ],
+            FusiformCatalogCursor {
+                catalog_version: 5,
+                resolved_at_ms: 500,
+            },
+        )
+        .unwrap();
+
+    let routable = store.get_facts().unwrap();
+    assert!(
+        routable.iter().all(|fact| make_route_key(
+            &fact.provider_id,
+            &fact.model_id,
+            fact.variant.as_deref()
+        ) != route_key),
+        "a withdrawn model is not offered to selection"
+    );
+    assert_eq!(routable.len(), routable_before - 1);
+    let stored = store
+        .get_catalog_facts()
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            make_route_key(
+                &row.fact.provider_id,
+                &row.fact.model_id,
+                row.fact.variant.as_deref(),
+            ) == route_key
+        })
+        .expect("the row survives with its scores and records the absence");
+    assert_eq!(stored.fusiform_present, Some(false));
+    assert!(
+        store
+            .get_fact_by_route_key(&make_route_key("anthropic", "never-seen-before", None))
+            .unwrap()
+            .is_none(),
+        "a model first seen withdrawn mints no row"
+    );
+}
+
 #[test]
 fn fusiform_cursor_is_committed_with_the_applied_snapshot() {
     let rig = Rig::new("fusiform-cursor");

@@ -59,7 +59,15 @@ fn error(message: impl Into<String>) -> FusiformCatalogError {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct CatalogGetArguments {}
+struct CatalogGetArguments {
+    /// Fusiform serves only present models unless asked, and a model it has
+    /// retired is then simply missing from the reply. A missing model updates
+    /// nothing, so a fact row for it stayed present-and-routable after the
+    /// upstream withdrew it: the whole kimi-for-coding provider went absent on
+    /// 2026-09-18 and its scored seat kept being rostered while Broca refused
+    /// every open. Retired models are requested so their absence is written.
+    include_retired: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct CatalogGetRequest {
@@ -68,10 +76,12 @@ struct CatalogGetRequest {
 }
 
 impl CatalogGetRequest {
-    fn all_current() -> Self {
+    fn all_with_retired() -> Self {
         Self {
             name: CATALOG_GET,
-            arguments: CatalogGetArguments::default(),
+            arguments: CatalogGetArguments {
+                include_retired: true,
+            },
         }
     }
 }
@@ -508,7 +518,7 @@ trait CatalogWire {
 
 impl CatalogWire for FusiformCatalogConsumer {
     async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError> {
-        let body = serde_json::to_vec(&CatalogGetRequest::all_current())
+        let body = serde_json::to_vec(&CatalogGetRequest::all_with_retired())
             .map_err(FusiformCatalogError::Json)?;
         let reply = self.call(body).await?;
         decode_catalog_get(&reply)
@@ -763,6 +773,16 @@ mod tests {
                 .unwrap()
                 .catalog_version
         );
+    }
+
+    /// The live request asks Fusiform for retired models too; without that flag a
+    /// withdrawn model is simply missing from the reply and its fact row never
+    /// learns it is gone.
+    #[test]
+    fn catalog_get_request_asks_for_retired_models() {
+        let body: Value = serde_json::to_value(CatalogGetRequest::all_with_retired()).unwrap();
+        assert_eq!(body["name"], json!("catalog.get"));
+        assert_eq!(body["arguments"]["include_retired"], json!(true));
     }
 
     #[test]

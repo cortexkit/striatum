@@ -779,6 +779,12 @@ impl SqliteRouteStateStore {
                         |row| row.get(0),
                     )?;
                     if matching_rows == 0 {
+                        // A model first seen already withdrawn has nothing to route and
+                        // nothing for the operator to place; minting it would only add a
+                        // dead row per retired model under every routed provider.
+                        if !fact.present {
+                            continue;
+                        }
                         // First sight of a model. Fusiform serves ~7,500 models across
                         // ~200 providers; a first-sight row is minted only under a
                         // provider the operator already routes (one that has any fact
