@@ -424,8 +424,28 @@ fn claude_version_dot(model: &str) -> String {
     normalize_model_name(model)
 }
 
+/// Expand a bare Gemini alias to its preview id. An alias already followed by
+/// `-` (its own `-preview`, or a tier suffix) is a canonical id and stays as it
+/// is: the unconditional replace produced `gemini-3.1-pro-preview-preview` for
+/// a caller supplying the canonical id (Loop R183), a name no provider serves.
+/// The TypeScript twin keeps the same rule with `(?!-)`.
+fn expand_gemini_alias(model: &str, alias: &str) -> String {
+    let mut out = String::with_capacity(model.len() + 8);
+    let mut rest = model;
+    while let Some(at) = rest.find(alias) {
+        let after = &rest[at + alias.len()..];
+        out.push_str(&rest[..at + alias.len()]);
+        if !after.starts_with('-') {
+            out.push_str("-preview");
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn gateway_transforms(model: &str) -> String {
-    claude_version_dot(model).replace("gemini-3.1-pro", "gemini-3.1-pro-preview")
+    expand_gemini_alias(&claude_version_dot(model), "gemini-3.1-pro")
 }
 
 pub fn transform_model_for_provider(provider: &str, model: &str) -> String {
@@ -438,12 +458,11 @@ pub fn transform_model_for_provider(provider: &str, model: &str) -> String {
                 .map(|sub_provider| format!("{sub_provider}/{}", gateway_transforms(model)))
                 .unwrap_or_else(|| model.to_string())
         }
-        "github-copilot" => {
-            gateway_transforms(model).replace("gemini-3-flash", "gemini-3-flash-preview")
-        }
-        "google" => model
-            .replace("gemini-3.1-pro", "gemini-3.1-pro-preview")
-            .replace("gemini-3-flash", "gemini-3-flash-preview"),
+        "github-copilot" => expand_gemini_alias(&gateway_transforms(model), "gemini-3-flash"),
+        "google" => expand_gemini_alias(
+            &expand_gemini_alias(model, "gemini-3.1-pro"),
+            "gemini-3-flash",
+        ),
         "anthropic" => claude_version_dot(model),
         _ => model.to_string(),
     }
@@ -1434,6 +1453,48 @@ pub fn build_model_speed_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A canonical preview id keeps its single suffix through every provider
+    /// arm; a bare alias still expands; a tier suffix is left alone (Loop R183).
+    #[test]
+    fn gemini_alias_expansion_is_suffix_aware() {
+        for provider in ["google", "github-copilot"] {
+            assert_eq!(
+                transform_model_for_provider(provider, "gemini-3.1-pro-preview"),
+                "gemini-3.1-pro-preview",
+                "{provider}"
+            );
+            assert_eq!(
+                transform_model_for_provider(provider, "gemini-3.1-pro"),
+                "gemini-3.1-pro-preview",
+                "{provider}"
+            );
+            assert_eq!(
+                transform_model_for_provider(provider, "gemini-3-flash-preview"),
+                "gemini-3-flash-preview",
+                "{provider}"
+            );
+        }
+        assert_eq!(
+            transform_model_for_provider("google", "gemini-3-flash"),
+            "gemini-3-flash-preview"
+        );
+        assert_eq!(
+            transform_model_for_provider("google", "gemini-3.1-pro-high"),
+            "gemini-3.1-pro-high"
+        );
+        assert_eq!(
+            transform_model_for_provider("vercel", "google/gemini-3.1-pro-preview"),
+            "google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            transform_model_for_provider("vercel", "google/gemini-3.1-pro"),
+            "google/gemini-3.1-pro-preview"
+        );
+        // Applying the transform to its own output is a fixed point.
+        let once = transform_model_for_provider("google", "gemini-3.1-pro");
+        assert_eq!(transform_model_for_provider("google", &once), once);
+    }
 
     fn fallback(provider: &str, model: &str, variant: Option<&str>) -> FallbackEntry {
         FallbackEntry {
