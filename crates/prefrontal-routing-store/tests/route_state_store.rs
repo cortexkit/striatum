@@ -3609,7 +3609,10 @@ fn class_vector_is_cached_until_usage_is_recorded() {
     )
     .unwrap();
     let cached = store.get_class_vector("ephemeral", now).unwrap().unwrap();
-    assert_eq!(cached.sample_count, 1, "the cached vector is served without a re-read");
+    assert_eq!(
+        cached.sample_count, 1,
+        "the cached vector is served without a re-read"
+    );
 
     store
         .record_usage_delivery(&class_obs(
@@ -3625,6 +3628,9 @@ fn class_vector_is_cached_until_usage_is_recorded() {
         ))
         .unwrap();
     let recomputed = store.get_class_vector("ephemeral", now).unwrap().unwrap();
-    assert_eq!(recomputed.sample_count, 3, "a write through the store recomputes over everything");
+    assert_eq!(
+        recomputed.sample_count, 3,
+        "a write through the store recomputes over everything"
+    );
     assert_eq!(recomputed.fresh_input, 300.0);
 }
