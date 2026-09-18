@@ -1304,6 +1304,15 @@ fn merge_model_upsert(
     if let Some(eq) = params.eq {
         fact.scores.eq = eq;
     }
+    // A Fusiform-discovered row is minted with unknown confidence because it has
+    // no scores. An operator placing both scores is the confirmation that flag
+    // asks for; left unknown, the row kept the adequacy penalty and lost every
+    // free-bucket comparison to a confirmed route, so a placed model was never
+    // run (glm-5.3 and deepseek-v4.1-flash, 2026-09-18).
+    if params.elo.is_some() && params.eq.is_some() {
+        fact.confidence = Confidence::Curated;
+        fact.score_provenance = ScoreProvenance::Curated;
+    }
     if let Some(speed) = params.speed {
         fact.scores.speed = speed;
     }
@@ -4206,6 +4215,34 @@ mod tests {
         incomplete.elo = Some(1500.0);
         incomplete.eq = Some(1700.0);
         assert!(merge_model_upsert(Some(unscored), &incomplete).is_ok());
+    }
+
+    /// A discovered row is minted with unknown confidence; placing both scores
+    /// on it is the confirmation, so the placed row ranks without the
+    /// unknown-fact adequacy penalty. A score-less field edit on a curated row
+    /// leaves confidence alone.
+    #[test]
+    fn model_upsert_placing_scores_on_a_discovered_row_confirms_it() {
+        let mut discovered = fact("ollama-cloud", "glm-5.3");
+        discovered.confidence = Confidence::Unknown;
+        discovered.score_provenance = ScoreProvenance::Unscored;
+        let mut placement = upsert_params("ollama-cloud", "glm-5.3");
+        placement.elo = Some(1732.0);
+        placement.eq = Some(1579.0);
+        let placed = merge_model_upsert(Some(discovered), &placement).unwrap();
+        assert_eq!(placed.confidence, Confidence::Curated);
+        assert_eq!(placed.score_provenance, ScoreProvenance::Curated);
+
+        let mut curated = fact("openai", "gpt-x");
+        curated.confidence = Confidence::Unknown;
+        let mut edit = upsert_params("openai", "gpt-x");
+        edit.supports_vision = Some(true);
+        let edited = merge_model_upsert(Some(curated), &edit).unwrap();
+        assert_eq!(
+            edited.confidence,
+            Confidence::Unknown,
+            "no placement, no promotion"
+        );
     }
 
     #[test]

@@ -209,6 +209,9 @@ pub fn seed_aa(
     if fact.scores.speed <= 0.0 || !fact.scores.speed.is_finite() {
         fact.scores.speed = AA_INFERRED_DEFAULT_SPEED;
     }
+    // Same confirmation as a fresh AA row gets above: a discovered placeholder
+    // carries unknown confidence only until scores are placed on it.
+    fact.confidence = Confidence::Curated;
     fact.score_provenance = ScoreProvenance::AaInferred;
     fact.aa_index = Some(aa_index);
     fact.review_by_ms = Some(review_by_ms);
