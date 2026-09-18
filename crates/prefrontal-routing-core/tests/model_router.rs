@@ -3324,3 +3324,100 @@ fn reconstructed_mason_shortlists_all_degrade_on_gpt_5_6_sol_pro() {
     }
     assert_eq!(degraded_on_sol_pro, 732);
 }
+
+// Two routes on one subscription plan share one quota pool, so they compare
+// as equal cost whatever the basket says. The 0.05 threshold was calibrated
+// on output-only costs; the morning the token profile filled (2026-09-18
+// 11:28Z) basket pricing engaged, astra priced above the threshold, and every
+// iq-100 selection went to sol on a basket difference the shared pool makes
+// meaningless. Across plans the basket still orders (see the flagship-versus-
+// flash test above), and metered routes never enter the bucket this way.
+#[test]
+fn same_plan_subscription_routes_compare_as_equal_cost_under_basket_pricing() {
+    let catalog = scored_routable_catalog();
+    let pair: Vec<ModelFact> = catalog
+        .into_iter()
+        .filter(|f| f.model_id == "gpt-5.6-sol" || f.model_id == "gpt-6-astra")
+        .collect();
+    assert_eq!(pair.len(), 2, "both openai rows are in the pinned catalog");
+
+    // Anti-vacuity: with the basket engaged both routes price above the
+    // threshold, so only coverage can put them in the bucket.
+    let priced = prefrontal_routing_core::model_router::price_selection_shortlist(
+        input(
+            pair.clone(),
+            req(100.0, 40.0),
+            Extra {
+                is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+                ..Default::default()
+            },
+        ),
+        &DEFAULT_ROUTING_CONFIG,
+        COUNTERS_PRODUCER,
+        CLASS_PRODUCER,
+    )
+    .unwrap();
+    assert!(
+        priced.use_basket,
+        "basket pricing engages on the pinned rows: {:?}",
+        priced.degraded_by
+    );
+    for route in &priced.routes {
+        assert!(
+            route.selection_cost > EFFECTIVELY_FREE_SELECTION_COST,
+            "{} prices above the threshold under the basket ({})",
+            route.route_key,
+            route.selection_cost
+        );
+    }
+
+    let covered = select_model_route(input(
+        pair.clone(),
+        req(100.0, 40.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        covered.model.model_id, "gpt-6-astra",
+        "iq 100 under a subscription buys the stronger model"
+    );
+
+    // Metered, the same pair orders by price: the pool rule is for sunk dollars.
+    let metered = select_model_route(input(
+        pair.clone(),
+        req(100.0, 40.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|_: &ModelRoute| false)),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        metered.model.model_id, "gpt-5.6-sol",
+        "metered routes above the threshold still order by cost"
+    );
+
+    // Two plans, both covered: different pools, so the basket still orders.
+    let mut cross = pair;
+    for f in cross.iter_mut() {
+        if f.model_id == "gpt-6-astra" {
+            f.provider_id = "other-plan".into();
+        }
+    }
+    let across = select_model_route(input(
+        cross,
+        req(100.0, 40.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(
+        across.model.model_id, "gpt-5.6-sol",
+        "across plans the cheaper basket wins"
+    );
+}

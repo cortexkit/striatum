@@ -149,6 +149,12 @@ pub struct ObjectiveBreakdown {
     pub speed_score: f64,
     /// cost + quota (purely economic); lower is a better pick. Speed breaks ties.
     pub selection_cost: f64,
+    /// Whether the route is served under a flat subscription. Marginal dollars
+    /// under a flat plan are sunk, so two such routes compare as equal cost in
+    /// the effectively-free bucket whatever their basket price says; the quota
+    /// the plan actually spends is ordered by abundance there.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subscription_covered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_abundance: Option<f64>,
     /// Owned audit identity carried into the decision record. This allocates once
@@ -715,6 +721,7 @@ pub(crate) fn compute_objective(
             quota,
             speed_score,
             selection_cost,
+            subscription_covered: is_subscription,
             quota_abundance,
             quota_abundance_window,
         },
@@ -1013,8 +1020,22 @@ pub fn select_model_route_with_config(
         // explicitly asked for strength: the caller's iq demand raised the bar,
         // both routes cleared it, and the router then optimized a cent-scale
         // dollar difference the subsidy made meaningless.
-        let a_free = sa.objective.selection_cost <= EFFECTIVELY_FREE_SELECTION_COST;
-        let b_free = sb.objective.selection_cost <= EFFECTIVELY_FREE_SELECTION_COST;
+        // Two routes on the same subscription plan draw on one quota pool, so
+        // no dollar figure can pick between them: the plan is paid for and the
+        // pool is shared, which is exactly the case the bucket was written for.
+        // They compare as equal cost whatever the basket says, and adequacy,
+        // abundance and speed decide. The threshold was calibrated on
+        // output-only costs, and basket pricing (cached reads are three
+        // quarters of a mason message) lifted astra above it the morning the
+        // token profile filled, so iq 100 bought sol over astra on a basket
+        // difference the shared pool makes meaningless. Across plans the
+        // basket still orders, because a cheaper route there spends a
+        // different pool, and a metered route is never in the bucket by pool.
+        let same_pool = sa.objective.subscription_covered
+            && sb.objective.subscription_covered
+            && a.route.provider_id == b.route.provider_id;
+        let a_free = same_pool || sa.objective.selection_cost <= EFFECTIVELY_FREE_SELECTION_COST;
+        let b_free = same_pool || sb.objective.selection_cost <= EFFECTIVELY_FREE_SELECTION_COST;
         if !(a_free && b_free) && sa.objective.selection_cost != sb.objective.selection_cost {
             return cmp_f64(sa.objective.selection_cost, sb.objective.selection_cost);
         }
@@ -1338,6 +1359,7 @@ mod abundance_tests {
             quota: 0.125,
             speed_score: 0.75,
             selection_cost: 0.375,
+            subscription_covered: false,
             quota_abundance: None,
             quota_abundance_window: None,
         };

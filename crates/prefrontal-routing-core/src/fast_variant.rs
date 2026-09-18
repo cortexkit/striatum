@@ -330,6 +330,7 @@ mod tests {
                     quota: 0.0,
                     speed_score: 0.5,
                     selection_cost: 0.0,
+                    subscription_covered: false,
                     quota_abundance: None,
                     quota_abundance_window: None,
                 },
