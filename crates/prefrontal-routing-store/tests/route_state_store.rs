@@ -3574,3 +3574,57 @@ fn mutation_querying_store_from_inside_comparator_reddens() {
         "comparator must not query store directly: planted usage rows changed selection_cost before overlay"
     );
 }
+
+/// A class vector is served from the store's cache until usage is written
+/// through the store: a row that appears behind its back is not seen, a row
+/// recorded through record_usage_delivery is (Loop R184: before the cache
+/// every selection re-read the whole seven-day population).
+#[test]
+fn class_vector_is_cached_until_usage_is_recorded() {
+    let rig = Rig::new("class-vector-cache");
+    let store = rig.open();
+    let now = 1_800_000_000_000.0;
+    store
+        .record_usage_delivery(&class_obs(
+            "cached-1",
+            Some("ephemeral"),
+            Some(100.0),
+            Some(100.0),
+            Some(0.0),
+            Some(50.0),
+            Some(10.0),
+            Some(1000.0),
+            now - 500.0,
+        ))
+        .unwrap();
+    let first = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(first.sample_count, 1);
+
+    // Behind the store's back: a second complete profile in the window.
+    let raw = rusqlite::Connection::open(rig.db_path()).unwrap();
+    raw.execute(
+        "INSERT INTO model_route_usage (id,route_key,capacity_key,provider_id,input_tokens,output_tokens,duration_ms,observed_at,reasoning_tokens,cached_read_tokens,cache_write_tokens,workload_class)
+         VALUES ('behind-back','p/m','p/m','p',300,100,1000,?1,0,50,10,'ephemeral')",
+        rusqlite::params![(now - 400.0) as i64],
+    )
+    .unwrap();
+    let cached = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(cached.sample_count, 1, "the cached vector is served without a re-read");
+
+    store
+        .record_usage_delivery(&class_obs(
+            "cached-2",
+            Some("ephemeral"),
+            Some(500.0),
+            Some(100.0),
+            Some(0.0),
+            Some(50.0),
+            Some(10.0),
+            Some(1000.0),
+            now - 300.0,
+        ))
+        .unwrap();
+    let recomputed = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(recomputed.sample_count, 3, "a write through the store recomputes over everything");
+    assert_eq!(recomputed.fresh_input, 300.0);
+}

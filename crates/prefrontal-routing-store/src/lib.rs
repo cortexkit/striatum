@@ -33,6 +33,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
 
@@ -566,6 +567,22 @@ pub fn dev_descriptor(module_id: &str, sqlite_path: impl Into<String>) -> Storag
 /// and applies the `route_state` migration set (run-once, including the seed).
 pub struct SqliteRouteStateStore {
     store: SqliteStore,
+    /// Class vectors are means over every complete token profile in a seven-day
+    /// window, recomputed from the whole population on every route selection
+    /// before this cache existed (Loop R184: 1.9 million VM steps per selection
+    /// at 100k profiles). A computed vector is reused until usage is written
+    /// (`usage_generation` moves) or the window's minute boundary passes, so
+    /// selection pays the scan at most once a minute per class while usage is
+    /// quiet and never serves a vector that predates a write.
+    class_vectors: Mutex<HashMap<String, CachedClassVector>>,
+    usage_generation: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedClassVector {
+    usage_generation: u64,
+    window_minute: i64,
+    vector: Option<ClassVector>,
 }
 
 /// One durable routing decision rendered for a diagnostic reader. JSON fields stay
@@ -662,7 +679,11 @@ impl SqliteRouteStateStore {
             )));
         }
         validate_family_spellings(&store)?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            class_vectors: Mutex::new(HashMap::new()),
+            usage_generation: AtomicU64::new(0),
+        })
     }
 
     /// The single-writer fence epoch for this open (for diagnostics / future
@@ -1329,6 +1350,76 @@ fn stored_output_tokens(value: f64) -> Option<i64> {
 
 fn stored_workload_class(value: Option<&str>) -> Option<&str> {
     value.filter(|class| matches!(*class, "ephemeral" | "head" | "gather" | "hire"))
+}
+
+impl SqliteRouteStateStore {
+    /// The whole-population mean behind `get_class_vector`; the cache above is
+    /// the only caller.
+    fn compute_class_vector(
+        &self,
+        workload_class: &str,
+        now: f64,
+    ) -> RouteStateResult<Option<ClassVector>> {
+        let window_start = (now - CLASS_VECTOR_TRAILING_WINDOW_MS).floor() as i64;
+        let window_end = now.floor() as i64;
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(WORKLOAD_CLASS_USAGE_SAMPLES_SQL)?;
+                let rows =
+                    stmt.query_map(params![workload_class, window_start, window_end], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    })?;
+
+                let mut sample_count = 0_u64;
+                let mut sum_fresh_input = 0_f64;
+                let mut sum_output_excluding_reasoning = 0_f64;
+                let mut sum_reasoning = 0_f64;
+                let mut sum_cached_read = 0_f64;
+                let mut sum_cache_write = 0_f64;
+
+                for row in rows {
+                    let (
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens,
+                        cached_read_tokens,
+                        cache_write_tokens,
+                    ) = row?;
+                    sample_count += 1;
+                    sum_fresh_input += input_tokens as f64;
+                    let output_excl = (output_tokens - reasoning_tokens).max(0) as f64;
+                    sum_output_excluding_reasoning += output_excl;
+                    sum_reasoning += reasoning_tokens as f64;
+                    sum_cached_read += cached_read_tokens as f64;
+                    sum_cache_write += cache_write_tokens as f64;
+                }
+
+                if sample_count == 0 {
+                    return Ok(None);
+                }
+
+                let count = sample_count as f64;
+                Ok(Some(ClassVector {
+                    workload_class: workload_class.to_string(),
+                    fresh_input: sum_fresh_input / count,
+                    output_excluding_reasoning: sum_output_excluding_reasoning / count,
+                    reasoning: sum_reasoning / count,
+                    cached_read: sum_cached_read / count,
+                    cache_write: sum_cache_write / count,
+                    sample_count,
+                    trailing_window_days: CLASS_VECTOR_TRAILING_WINDOW_DAYS,
+                    statistic: "arithmetic_mean".to_string(),
+                    is_overlay: true,
+                }))
+            })
+            .map_err(err)
+    }
 }
 
 impl RouteStateStore for SqliteRouteStateStore {
@@ -2418,6 +2509,11 @@ impl RouteStateStore for SqliteRouteStateStore {
                 })
             })
             .map_err(err)
+            .inspect(|_| {
+                // Any write here, an insert or the enrichment of an existing row,
+                // can move a class mean; the next selection recomputes.
+                self.usage_generation.fetch_add(1, Ordering::AcqRel);
+            })
     }
 
     fn append_quota_readings(&self, rows: &[QuotaReadingLogRow]) -> RouteStateResult<usize> {
@@ -2577,65 +2673,31 @@ impl RouteStateStore for SqliteRouteStateStore {
         if !ENUMERATED_WORKLOAD_CLASSES.contains(&workload_class) {
             return Ok(None);
         }
-        let window_start = (now - CLASS_VECTOR_TRAILING_WINDOW_MS).floor() as i64;
-        let window_end = now.floor() as i64;
-        self.store
-            .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(WORKLOAD_CLASS_USAGE_SAMPLES_SQL)?;
-                let rows =
-                    stmt.query_map(params![workload_class, window_start, window_end], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
-                    })?;
-
-                let mut sample_count = 0_u64;
-                let mut sum_fresh_input = 0_f64;
-                let mut sum_output_excluding_reasoning = 0_f64;
-                let mut sum_reasoning = 0_f64;
-                let mut sum_cached_read = 0_f64;
-                let mut sum_cache_write = 0_f64;
-
-                for row in rows {
-                    let (
-                        input_tokens,
-                        output_tokens,
-                        reasoning_tokens,
-                        cached_read_tokens,
-                        cache_write_tokens,
-                    ) = row?;
-                    sample_count += 1;
-                    sum_fresh_input += input_tokens as f64;
-                    let output_excl = (output_tokens - reasoning_tokens).max(0) as f64;
-                    sum_output_excluding_reasoning += output_excl;
-                    sum_reasoning += reasoning_tokens as f64;
-                    sum_cached_read += cached_read_tokens as f64;
-                    sum_cache_write += cache_write_tokens as f64;
-                }
-
-                if sample_count == 0 {
-                    return Ok(None);
-                }
-
-                let count = sample_count as f64;
-                Ok(Some(ClassVector {
-                    workload_class: workload_class.to_string(),
-                    fresh_input: sum_fresh_input / count,
-                    output_excluding_reasoning: sum_output_excluding_reasoning / count,
-                    reasoning: sum_reasoning / count,
-                    cached_read: sum_cached_read / count,
-                    cache_write: sum_cache_write / count,
-                    sample_count,
-                    trailing_window_days: CLASS_VECTOR_TRAILING_WINDOW_DAYS,
-                    statistic: "arithmetic_mean".to_string(),
-                    is_overlay: true,
-                }))
-            })
-            .map_err(err)
+        let generation = self.usage_generation.load(Ordering::Acquire);
+        let window_minute = (now / 60_000.0).floor() as i64;
+        if let Some(cached) = self
+            .class_vectors
+            .lock()
+            .expect("class vector cache poisoned")
+            .get(workload_class)
+        {
+            if cached.usage_generation == generation && cached.window_minute == window_minute {
+                return Ok(cached.vector.clone());
+            }
+        }
+        let vector = self.compute_class_vector(workload_class, now)?;
+        self.class_vectors
+            .lock()
+            .expect("class vector cache poisoned")
+            .insert(
+                workload_class.to_string(),
+                CachedClassVector {
+                    usage_generation: generation,
+                    window_minute,
+                    vector: vector.clone(),
+                },
+            );
+        Ok(vector)
     }
 
     fn get_facts_with_observed_speed(&self, now: f64) -> RouteStateResult<Vec<ModelFact>> {
