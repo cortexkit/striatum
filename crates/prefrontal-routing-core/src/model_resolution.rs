@@ -727,11 +727,21 @@ fn to_model_config(model: &str, variant: Option<String>) -> Option<DelegatedMode
 pub fn resolve_user_model_pin(input: &UserModelPinRequest) -> Option<DelegatedModelConfig> {
     if let Some(user_model) = normalized_nonempty(input.user_model.as_deref()) {
         let (base_model, providers, inline_variant) = parsed_model_candidate(&user_model)?;
-        if !providers.is_empty()
-            && (input.available_models.is_empty()
-                || fuzzy_match_model(&base_model, &input.available_models, &providers).is_some())
-        {
-            return to_model_config(&base_model, input.user_variant.clone().or(inline_variant));
+        if !providers.is_empty() {
+            let variant = input.user_variant.clone().or(inline_variant);
+            // An empty catalog is the cold-start path: the explicit pin is trusted
+            // as spelled because nothing can be checked against. A warm catalog
+            // answers with the id the matcher found, the way the fallback loop
+            // below does; answering with the pin as spelled while only a sibling
+            // matched (gpt-5.4 against gpt-5.4-mini) forwarded an id the host
+            // does not serve and skipped the configured fallback.
+            if input.available_models.is_empty() {
+                return to_model_config(&base_model, variant);
+            }
+            if let Some(model) = fuzzy_match_model(&base_model, &input.available_models, &providers)
+            {
+                return to_model_config(&model, variant);
+            }
         }
     }
     if input.available_models.is_empty() {
@@ -1548,6 +1558,29 @@ mod tests {
         assert_eq!(result.model, "openai/gpt-5.3-codex");
         assert_eq!(result.provenance, "override");
         assert!(result.attempted.is_empty());
+    }
+
+    /// A pin whose only catalog match is a sibling must resolve to that sibling
+    /// or fall through, never to the pin as spelled: the host refuses an id it
+    /// does not serve, and the configured fallback was skipped on the way.
+    #[test]
+    fn warm_pin_resolves_to_the_catalog_id_not_the_spelling() {
+        let result = resolve_user_model_pin(&UserModelPinRequest {
+            user_model: Some("openai/gpt-5.4".into()),
+            user_fallback_models: vec!["openai/gpt-5.3-codex".into()],
+            available_models: ["openai/gpt-5.4-mini", "openai/gpt-5.3-codex"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(result.provider_id, "openai");
+        assert!(
+            ["gpt-5.4-mini", "gpt-5.3-codex"].contains(&result.model_id.as_str()),
+            "resolved to an id the catalog does not serve: {}",
+            result.model_id
+        );
     }
 
     #[test]
