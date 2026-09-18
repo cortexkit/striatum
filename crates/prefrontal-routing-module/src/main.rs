@@ -54,7 +54,7 @@ use prefrontal_routing_core::{
 };
 use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subc_protocol::manifest::Concurrency;
 use subc_protocol::{
@@ -462,8 +462,18 @@ fn open_route_state_store(descriptor: &StorageDescriptor) -> Result<SharedStore,
 
 #[tokio::main]
 async fn main() -> Result<(), ModuleError> {
-    let config = ModuleConfig::from_env()?;
+    let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
+        StartupMode::PrintManifest => return print_manifest_operations(),
+        StartupMode::Serve(connection_file_path) => connection_file_path,
+    };
+    let config = ModuleConfig::from_env(connection_file_path)?;
     run(config).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupMode {
+    PrintManifest,
+    Serve(PathBuf),
 }
 
 struct ModuleConfig {
@@ -472,8 +482,7 @@ struct ModuleConfig {
 }
 
 impl ModuleConfig {
-    fn from_env() -> Result<Self, ModuleError> {
-        let connection_file_path = parse_subc_arg(std::env::args_os().skip(1))?;
+    fn from_env(connection_file_path: PathBuf) -> Result<Self, ModuleError> {
         let module_id = std::env::var(SUBC_MODULE_ID_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -3764,6 +3773,154 @@ fn handles(method: &str) -> bool {
     )
 }
 
+/// Operations registered in HELLO and exposed by `--print-manifest`.
+fn served_operations() -> Vec<ManagementOperation> {
+    vec![
+        // route.select is a mutation because it records the decision it returns.
+        ManagementOperation {
+            name: ROUTE_SELECT_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_RESOLVE_POLICY_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_MODEL_FACT_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_MODEL_FACTS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: model_resolution::RESOLVE_MODEL_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: model_resolution::MODEL_CAPABILITIES_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: model_resolution::AGENT_MODEL_REQUIREMENTS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: available_models_text::OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_MODEL_UPSERT_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_MODEL_SEED_AA_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Seed a provisional AA-inferred score for one router key (primary-only)"
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: ROUTE_LIST_INFERRED_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "List aa_inferred scores and unscored catalog rows for hand review".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: ROUTE_LIST_UNSCORED_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "List Fusiform-discovered catalog rows awaiting operator scores".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: ROUTE_SELECT_PANEL_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_SET_DECISION_OUTCOME_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_RECORD_USAGE_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_RECORD_COOLDOWN_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_CLEAR_FAILURE_BACKOFF_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Clear one route's terminal-failure backoff without changing cooldown or quota state"
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_EXPLAIN_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_DECISIONS_LIST_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: QUOTA_STATUS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+    ]
+}
+
+#[derive(Serialize)]
+struct PrintedManifestOperation {
+    name: String,
+    kind: &'static str,
+}
+
+fn print_manifest_operations() -> Result<(), ModuleError> {
+    let mut operations = served_operations()
+        .into_iter()
+        .map(|operation| {
+            let kind = match operation.kind {
+                ManagementOperationKind::Query => "query",
+                ManagementOperationKind::Mutate => "mutate",
+            };
+            PrintedManifestOperation {
+                name: operation.name,
+                kind,
+            }
+        })
+        .collect::<Vec<_>>();
+    operations.sort_by(|left, right| left.name.cmp(&right.name));
+    let output = serde_json::to_string(&operations).map_err(ModuleError::Json)?;
+    println!("{output}");
+    Ok(())
+}
+
 /// The module's capability manifest: a ManagementSurface exposing routing operations.
 ///
 /// The catalog and route-state tables are machine-global, so `identity_scope` is
@@ -3775,8 +3932,8 @@ fn manifest(module_id: &str) -> ModuleManifest {
     // their absent defaults: no capabilities, no self-signals, and no
     // provenance until the deploy script injects CK_BUILD_* facts.
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
-    .trust_tier(Some(TrustTier::FirstParty))
-    .bindings(Some(Bindings {
+        .trust_tier(Some(TrustTier::FirstParty))
+        .bindings(Some(Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -3788,135 +3945,33 @@ fn manifest(module_id: &str) -> ModuleManifest {
                 optional: Vec::new(),
             },
         }))
-    .protocol_ver(PROTOCOL_VERSION)
-    .provides(vec![ProviderRole::ManagementSurface {
-        // Deliberate lane, not a default: routing serves concurrent
-        // selection reads; Serial would put every route decision in
-        // one queue.
-        concurrency: Concurrency::ModuleManaged,
-        operations: vec![
-            // route.select is now a MUTATE: it records the decision it returns.
-            ManagementOperation {
-                name: ROUTE_SELECT_OP.to_string(),
-                kind: ManagementOperationKind::Mutate,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_RESOLVE_POLICY_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_MODEL_FACT_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_MODEL_FACTS_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: model_resolution::RESOLVE_MODEL_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: model_resolution::MODEL_CAPABILITIES_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: model_resolution::AGENT_MODEL_REQUIREMENTS_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: available_models_text::OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_MODEL_UPSERT_OP.to_string(),
-                kind: ManagementOperationKind::Mutate,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_MODEL_SEED_AA_OP.to_string(),
-                kind: ManagementOperationKind::Mutate,
-                description: Some(
-                    "Seed a provisional AA-inferred score for one router key (primary-only)"
-                        .to_string(),
-                ),
-            },
-            ManagementOperation {
-                name: ROUTE_LIST_INFERRED_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: Some(
-                    "List aa_inferred scores and unscored catalog rows for hand review".to_string(),
-                ),
-            },
-            ManagementOperation {
-                name: ROUTE_LIST_UNSCORED_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: Some(
-                    "List Fusiform-discovered catalog rows awaiting operator scores".to_string(),
-                ),
-            },
-            ManagementOperation {
-                name: ROUTE_SELECT_PANEL_OP.to_string(),
-                kind: ManagementOperationKind::Mutate,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_SET_DECISION_OUTCOME_OP.to_string(),
-                kind: ManagementOperationKind::Mutate,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_RECORD_USAGE_OP.to_string(),
-                kind: ManagementOperationKind::Mutate,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_RECORD_COOLDOWN_OP.to_string(),
-                kind: ManagementOperationKind::Mutate,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_CLEAR_FAILURE_BACKOFF_OP.to_string(),
-                kind: ManagementOperationKind::Mutate,
-                description: Some(
-                    "Clear one route's terminal-failure backoff without changing cooldown or quota state"
-                        .to_string(),
-                ),
-            },
-            ManagementOperation {
-                name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_EXPLAIN_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: ROUTE_DECISIONS_LIST_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-            ManagementOperation {
-                name: QUOTA_STATUS_OP.to_string(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            },
-        ],
-        config_schema: json!({ "type": "object" }),
-        observability: Vec::new(),
-        identity_scope: Vec::new(),
-    }])
-    .build()
+        .protocol_ver(PROTOCOL_VERSION)
+        .provides(vec![ProviderRole::ManagementSurface {
+            // Deliberate lane, not a default: routing serves concurrent
+            // selection reads; Serial would put every route decision in
+            // one queue.
+            concurrency: Concurrency::ModuleManaged,
+            operations: served_operations(),
+            config_schema: json!({ "type": "object" }),
+            observability: Vec::new(),
+            identity_scope: Vec::new(),
+        }])
+        .build()
+}
+
+fn parse_startup_mode(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<StartupMode, ModuleError> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    if args.as_slice() == [OsString::from("--print-manifest")] {
+        return Ok(StartupMode::PrintManifest);
+    }
+    if args.iter().any(|arg| arg == "--print-manifest") {
+        return Err(ModuleError::Message(
+            "--print-manifest must be used without other arguments".into(),
+        ));
+    }
+    parse_subc_arg(args).map(StartupMode::Serve)
 }
 
 fn parse_subc_arg(args: impl IntoIterator<Item = OsString>) -> Result<PathBuf, ModuleError> {
