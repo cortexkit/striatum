@@ -1296,6 +1296,7 @@ pub(crate) fn multiplier_map_guard() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -1303,7 +1304,7 @@ mod tests {
 
     #[test]
     fn plaintext_aa_api_key_is_refused_with_vault_cutover_guidance() {
-        let path = std::env::temp_dir().join(format!(
+        let path = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-aa-config-{}.jsonc",
             std::process::id()
         ));
@@ -1410,7 +1411,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-family-rules-{label}-{}-{timestamp}",
             std::process::id()
         ));
@@ -1678,7 +1679,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-overrides-test-{}-{n}",
             std::process::id()
         ));
@@ -1747,7 +1748,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-overrides-nan-test-{}-{n}",
             std::process::id()
         ));
@@ -1791,7 +1792,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-sub-multiplier-test-{}-{n}",
             std::process::id()
         ));
@@ -1849,7 +1850,7 @@ mod tests {
         // The loader replaces the process-global multiplier maps on its early
         // arms too; serialize with the other loader tests.
         let _guard = multiplier_map_guard();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-override-read-fault-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1899,7 +1900,7 @@ mod tests {
         // The loader replaces the process-global multiplier maps on its early
         // arms too; serialize with the other loader tests.
         let _guard = multiplier_map_guard();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-stale-override-read-fault-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1954,7 +1955,7 @@ mod tests {
         // arm erased fable-5/opus-5/opus-5-fast on 2026-08-10 when their stale
         // pre-Elo overrides were cleaned from the live config, and the loss
         // surfaced two layers away as a roster seat failing missing_fact.
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-demote-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2003,7 +2004,7 @@ mod tests {
     #[test]
     fn unparseable_routing_config_keeps_the_last_good_multipliers() {
         let _guard = multiplier_map_guard();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-reload-lastgood-{}",
             std::process::id()
         ));
@@ -2059,7 +2060,7 @@ mod tests {
         // ones that did not exist when the config was written (the per-model
         // repetition let a new model ship unpriced). A per-route entry still
         // overrides its provider's value.
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-provider-mult-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2123,7 +2124,7 @@ mod tests {
 
     #[test]
     fn consecutive_terminal_failure_threshold_is_configurable_and_rejects_zero() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-failure-threshold-test-{}",
             std::process::id()
         ));
@@ -2156,7 +2157,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-min-band-read-test-{}-{n}",
             std::process::id()
         ));
@@ -2205,7 +2206,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-cache-policy-test-{}-{n}",
             std::process::id()
         ));
@@ -2245,7 +2246,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-cache-policy-mtime-test-{}-{n}",
             std::process::id()
         ));
@@ -2331,7 +2332,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-operator-policy-test-{}-{n}",
             std::process::id()
         ));
@@ -2421,7 +2422,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-operator-policy-broken-test-{}-{n}",
             std::process::id()
         ));
@@ -2495,7 +2496,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-elo-live-test-{}-{n}",
             std::process::id()
         ));
@@ -2544,7 +2545,7 @@ mod catalog_poll_tests {
 
     #[test]
     fn catalog_poll_ms_defaults_reads_and_rejects_zero() {
-        let missing = std::env::temp_dir().join(format!(
+        let missing = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-missing-catalog-poll-{}",
             std::process::id()
         ));
@@ -2554,7 +2555,7 @@ mod catalog_poll_tests {
             DEFAULT_CATALOG_POLL_MS
         );
 
-        let path = std::env::temp_dir().join(format!(
+        let path = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-catalog-poll-{}.jsonc",
             std::process::id()
         ));

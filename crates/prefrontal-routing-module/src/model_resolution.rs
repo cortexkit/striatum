@@ -414,7 +414,7 @@ mod tests {
     /// only thing a caller keeping the reply can check it against.
     #[test]
     fn capabilities_reply_states_the_catalog_it_was_computed_against() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-capabilities-version-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

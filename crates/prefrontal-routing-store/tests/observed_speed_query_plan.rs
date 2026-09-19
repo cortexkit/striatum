@@ -19,7 +19,7 @@ fn observed_speed_sample_query_searches_the_route_time_index_without_a_temp_btre
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
+    let directory = prefrontal_test_support::scratch_root().join(format!(
         "prefrontal-routing-observed-speed-plan-{}-{timestamp}-{id}",
         std::process::id()
     ));
@@ -81,7 +81,7 @@ fn workload_class_usage_query_uses_the_workload_class_observed_index() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!(
+    let directory = prefrontal_test_support::scratch_root().join(format!(
         "prefrontal-routing-workload-class-plan-{}-{timestamp}-{id}",
         std::process::id()
     ));

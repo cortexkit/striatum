@@ -716,7 +716,7 @@ mod tests {
 
     impl Rig {
         fn new(label: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
+            let dir = prefrontal_test_support::scratch_root().join(format!(
                 "prefrontal-fusiform-{label}-{}",
                 std::process::id()
             ));

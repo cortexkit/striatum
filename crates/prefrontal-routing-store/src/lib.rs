@@ -2923,7 +2923,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-clear-failure-backoff-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -3003,7 +3003,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-catalog-generation-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -3056,7 +3056,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-aa-inferred-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -3117,7 +3117,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-family-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -3176,7 +3176,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-family-refusal-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -3226,7 +3226,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-observed-speed-{label}-{}-{timestamp}.sqlite",
             std::process::id()
         ));

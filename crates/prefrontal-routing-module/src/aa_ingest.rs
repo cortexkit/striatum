@@ -489,7 +489,7 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .subsec_nanos();
-                let path = std::env::temp_dir().join(format!(
+                let path = prefrontal_test_support::scratch_root().join(format!(
                     "prefrontal-routing-aa-ingest-{}-{nanos}-{n}",
                     std::process::id()
                 ));
