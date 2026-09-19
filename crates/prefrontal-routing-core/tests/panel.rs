@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use prefrontal_routing_core::{
     demand_bar, make_capacity_key, make_route_key, model_facts_seed, select_model_route,
-    select_panel, Confidence, InvalidPanelRequest, ModelFact, ModelPromptDefaults,
-    ModelRequirements, ModelRouteStateSnapshot, ModelScores, PanelCauseReason, PanelClass,
-    PanelDiversity, PanelRosterEntry, PanelSelection, PanelSelectionPolicy, PanelShortfallCode,
-    PanelSpec, RequiredCapabilities, RouteRuntimeState, ScoreProvenance, SeatedSiblingVariant,
-    SelectModelRouteInput, SelectPanelInput, DEFAULT_DEMAND_EXPONENT,
+    select_panel, AvailabilitySubstrate, Confidence, InvalidPanelRequest, ModelFact,
+    ModelPromptDefaults, ModelRequirements, ModelRouteStateSnapshot, ModelScores, PanelCauseReason,
+    PanelClass, PanelDiversity, PanelRosterEntry, PanelSelection, PanelSelectionPolicy,
+    PanelShortfallCode, PanelSpec, RequiredCapabilities, RouteRuntimeState, ScoreProvenance,
+    SeatedSiblingVariant, SelectModelRouteInput, SelectPanelInput, DEFAULT_DEMAND_EXPONENT,
 };
 use serde_json::{json, Map};
 
@@ -80,6 +80,7 @@ fn panel_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput
         pro_member_max_package_tokens: None,
         roster: roster(&facts),
         available_models: availability(&facts),
+        availability_substrate: AvailabilitySubstrate::Host,
         panel_spec,
         facts,
         runtime_snapshot: None,
@@ -102,6 +103,7 @@ fn n_pick_input(
         package_tokens_estimate: Some(package_tokens_estimate),
         pro_member_max_package_tokens: Some(pro_member_max_package_tokens),
         available_models: availability(&facts),
+        availability_substrate: AvailabilitySubstrate::Host,
         panel_spec,
         facts,
         runtime_snapshot: None,
@@ -287,6 +289,7 @@ fn admission_is_shared_not_reimplemented() {
         operator_exclude_keys: vec!["p".into()],
         required_capabilities: capabilities,
         available_models: available,
+        availability_substrate: AvailabilitySubstrate::Host,
         is_subscription_route: None,
     })
     .unwrap();
@@ -343,12 +346,46 @@ fn admission_is_shared_not_reimplemented() {
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
         required_capabilities: None,
+        availability_substrate: AvailabilitySubstrate::Host,
         is_subscription_route: None,
     })
     .unwrap();
     assert!(
         panel.members.is_empty(),
         "panel selection must not break glass"
+    );
+}
+
+/// A rejection that says only "unavailable" cannot be acted on: whether the route
+/// is unreachable for the sender or merely missing from the caller's host list
+/// have different fixes. The cause names the list that was consulted.
+#[test]
+fn an_availability_rejection_names_the_substrate_whose_list_was_consulted() {
+    let detail_for = |substrate: AvailabilitySubstrate| {
+        let facts = vec![fact("absent", 1_700.0, Some("a"))];
+        let mut input = panel_input(facts, spec(1, 0.0, PanelDiversity::None));
+        input.available_models = HashSet::new();
+        input.availability_substrate = substrate;
+        let causes = select_panel(input)
+            .unwrap()
+            .shortfall
+            .expect("an unavailable pin leaves the panel short")
+            .causes;
+        let cause = causes
+            .into_iter()
+            .find(|cause| cause.model == "p/absent")
+            .expect("the unavailable pin is reported");
+        assert_eq!(cause.reason, PanelCauseReason::Unavailable);
+        cause.detail
+    };
+
+    assert_eq!(
+        detail_for(AvailabilitySubstrate::Host),
+        Some("host".to_string())
+    );
+    assert_eq!(
+        detail_for(AvailabilitySubstrate::Broca),
+        Some("broca".to_string())
     );
 }
 
@@ -475,6 +512,7 @@ fn shortfall_precedence_and_empty_success() {
         roster: roster(std::slice::from_ref(&unavailable)),
         facts: vec![unavailable],
         available_models: HashSet::new(),
+        availability_substrate: AvailabilitySubstrate::Host,
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),

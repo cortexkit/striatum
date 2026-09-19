@@ -11,7 +11,7 @@ use crate::model_facts::{
 };
 use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, ModelRouteStateSnapshot,
-    RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
+    RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
 use crate::provider_model_spec::ExclusionPolicy;
 use crate::routing_config::{demand_bar, RoutingConfig, DEFAULT_ROUTING_CONFIG};
@@ -29,6 +29,36 @@ pub enum PanelSelection {
 pub enum PanelDiversity {
     None,
     Family,
+}
+
+/// Whose availability list a panel's seats were judged against.
+///
+/// A seat is only real if the thing that will SEND to it can resolve the route.
+/// Panel legs do not all send through the same place: an Athena or spec consult
+/// sends through Broca, while a host-run worker sends through the caller's own
+/// provider list. Judging a Broca-bound seat against the caller's host list
+/// rejected models Broca resolves perfectly well (the whole Kimi roster sat
+/// `unavailable` for a day after its provider was renamed host-side), so the
+/// substrate that sends picks the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AvailabilitySubstrate {
+    /// The caller's host provider list, which is what a host-run leg can send to.
+    #[default]
+    Host,
+    /// Broca's send surface.
+    Broca,
+}
+
+impl AvailabilitySubstrate {
+    /// The token recorded on an availability rejection so the next reader of a
+    /// decision row does not have to reconstruct which list was consulted.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Broca => "broca",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +107,11 @@ pub struct SelectPanelInput<'a> {
     /// admission only; an explicit roster is a pin and pins bypass exclusion.
     pub operator_exclude_keys: Vec<String>,
     pub required_capabilities: Option<RequiredCapabilities>,
+    /// The routes the sending substrate can reach. Which substrate that is comes
+    /// from `availability_substrate`, which also labels every rejection here.
     pub available_models: HashSet<String>,
+    /// The substrate whose availability `available_models` describes.
+    pub availability_substrate: AvailabilitySubstrate,
     pub is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
 }
 
@@ -301,8 +335,8 @@ pub fn select_panel_with_config(
     );
     let admitted_count = admission.admitted.len();
     let top_routable_elo = admission.top_routable.elo;
+    let availability_substrate = input.availability_substrate;
     causes.extend(admission.rejected.into_iter().map(|rejected| PanelCause {
-        model: rejected.route_key,
         reason: match rejected.reason.as_str() {
             REASON_EXCLUDED => PanelCauseReason::Excluded,
             REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
@@ -311,7 +345,16 @@ pub fn select_panel_with_config(
             "missing_vision" | "context_too_small" => PanelCauseReason::Capability,
             _ => PanelCauseReason::Unavailable,
         },
-        detail: rejected.detail,
+        // An availability rejection names the substrate whose list was consulted.
+        // Without it, a reader of a recorded rejection cannot tell a route the
+        // sender genuinely cannot reach from one that is merely missing from the
+        // caller's host list, and the two have different fixes.
+        detail: if rejected.reason == REASON_NOT_AVAILABLE {
+            Some(availability_substrate.as_str().to_string())
+        } else {
+            rejected.detail
+        },
+        model: rejected.route_key,
     }));
 
     // Zero means no IQ requirement, matching singular route selection. The floor

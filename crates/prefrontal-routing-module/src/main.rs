@@ -46,11 +46,12 @@ use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CO
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, make_route_key, maybe_upgrade_to_fast_variant,
     relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
-    select_panel_with_config, validate_panel_spec, BreakGlassCandidate, CatalogFactField,
-    DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy, ExclusionSpecs, FailureBackoffConfig,
-    FastVariantUpgradeInput, ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput,
-    PanelRosterEntry, PanelSelection, PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy,
-    RouteOutcome, RouteStateStore, SelectPanelInput, SelectedPanel,
+    select_panel_with_config, validate_panel_spec, AvailabilitySubstrate, BreakGlassCandidate,
+    CatalogFactField, DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy, ExclusionSpecs,
+    FailureBackoffConfig, FastVariantUpgradeInput, ModelFact, ModelRequirements, ModelRoute,
+    ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection, PanelSpec,
+    RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
+    SelectPanelInput, SelectedPanel,
 };
 use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
@@ -655,6 +656,9 @@ where
     let override_path = config_overrides::config_path();
     // Selection policy and model-fact overrides share the routing-owned file.
     let operator_config_path = override_path.clone();
+    // Broca owns this file; routing reads only which providers it can
+    // authenticate to, for panels whose legs send through Broca.
+    let broca_vault_handles_path = config_overrides::broca_vault_handles_path();
     match config_overrides::apply_overrides_from_config(store.as_ref(), &override_path) {
         Ok(outcome) => {
             if outcome.applied > 0 || outcome.reverted > 0 || !outcome.skipped.is_empty() {
@@ -721,6 +725,7 @@ where
             &min_band,
             &override_path,
             &operator_config_path,
+            &broca_vault_handles_path,
             &catalog_health,
         )
         .await?
@@ -808,6 +813,7 @@ async fn handle_frame(
     min_band: &SharedMinBand,
     routing_config_path: &Path,
     operator_config_path: &Path,
+    broca_vault_handles_path: &Path,
     catalog_health: &SharedCatalogHealth,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
@@ -849,6 +855,7 @@ async fn handle_frame(
             let min_band = Arc::clone(min_band);
             let routing_config_path = routing_config_path.to_path_buf();
             let operator_config_path = operator_config_path.to_path_buf();
+            let broca_vault_handles_path = broca_vault_handles_path.to_path_buf();
             tokio::spawn(async move {
                 let _ = handle_select_request(
                     frame,
@@ -859,6 +866,7 @@ async fn handle_frame(
                     &min_band,
                     &routing_config_path,
                     &operator_config_path,
+                    &broca_vault_handles_path,
                 )
                 .await;
             });
@@ -1082,6 +1090,11 @@ struct SelectPanelBody {
 #[serde(rename_all = "camelCase")]
 struct SelectPanelParams {
     panel_spec: PanelSpec,
+    /// The substrate this panel's legs will dispatch on, resolved by the caller
+    /// at launch. It decides which availability list the seats are judged
+    /// against; absent or unknown keeps the caller's host provider list.
+    #[serde(default)]
+    substrate: Option<String>,
     #[serde(default)]
     selection: PanelSelection,
     #[serde(default)]
@@ -2109,6 +2122,7 @@ async fn handle_select_request(
     min_band: &SharedMinBand,
     routing_config_path: &Path,
     operator_config_path: &Path,
+    broca_vault_handles_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     frame.header.epoch = route_epoch;
@@ -2242,6 +2256,7 @@ async fn handle_select_request(
             store,
             routing_config_path,
             operator_config_path,
+            broca_vault_handles_path,
         )
         .await;
     }
@@ -2555,6 +2570,64 @@ async fn handle_select_request(
     }
 }
 
+/// Report a Broca-substrate panel that had to fall back to the host list. The
+/// map is read on every such selection, so one line per process is enough; the
+/// recorded rejections keep saying `host` for as long as it lasts.
+fn warn_broca_credentials_unreadable_once(reason: &str) {
+    static WARNED: Once = Once::new();
+    let mut message = None;
+    WARNED.call_once(|| message = Some(reason.to_string()));
+    if let Some(reason) = message {
+        eprintln!(
+            "[prefrontal-routing] cannot read Broca's credential providers ({reason}); Broca-substrate panels keep using the caller's host availability list"
+        );
+    }
+}
+
+/// The availability list a panel's seats are judged against, and the substrate
+/// it belongs to.
+///
+/// A seat only exists if whatever SENDS to it can resolve the route, and panel
+/// legs do not all send through the same place. A host-run leg keeps the
+/// caller's own provider list. A Broca leg is judged against what Broca can
+/// reach instead: Broca's management surface publishes no catalog to ask, so the
+/// honest stand-in is the catalog rows this store still serves (rows the model
+/// catalog reports as withdrawn are already filtered out when facts are read)
+/// restricted to the providers Broca holds a credential for. It is never the
+/// whole fact table: a route Broca cannot authenticate to would seat and then
+/// fail its send on every round.
+fn panel_availability(
+    requested_substrate: Option<&str>,
+    host_available_models: HashSet<String>,
+    facts: &[ModelFact],
+    broca_vault_handles_path: &Path,
+) -> (AvailabilitySubstrate, HashSet<String>) {
+    if requested_substrate.map(str::trim) != Some("broca") {
+        return (AvailabilitySubstrate::Host, host_available_models);
+    }
+    let providers =
+        match config_overrides::read_broca_credential_providers(broca_vault_handles_path) {
+            Ok(providers) if !providers.is_empty() => providers,
+            // Nothing usable to intersect with. Widening to every fact row would seat
+            // routes Broca cannot send, and narrowing to nothing would empty every
+            // panel, so the host list stands and the decision keeps saying `host`.
+            Ok(_) => {
+                warn_broca_credentials_unreadable_once("the handle map names no provider");
+                return (AvailabilitySubstrate::Host, host_available_models);
+            }
+            Err(error) => {
+                warn_broca_credentials_unreadable_once(&error);
+                return (AvailabilitySubstrate::Host, host_available_models);
+            }
+        };
+    let available = facts
+        .iter()
+        .filter(|fact| providers.contains(&fact.provider_id))
+        .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
+        .collect();
+    (AvailabilitySubstrate::Broca, available)
+}
+
 async fn handle_select_panel(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -2562,6 +2635,7 @@ async fn handle_select_panel(
     store: &SharedStore,
     routing_config_path: &Path,
     operator_config_path: &Path,
+    broca_vault_handles_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -2659,7 +2733,12 @@ async fn handle_select_panel(
     );
     let subscription_keys: HashSet<String> =
         resolved_policy.subscription_keys.into_iter().collect();
-    let available_models = resolved_policy.available_models.into_iter().collect();
+    let (availability_substrate, available_models) = panel_availability(
+        params.substrate.as_deref(),
+        resolved_policy.available_models.into_iter().collect(),
+        &prepared.facts,
+        broca_vault_handles_path,
+    );
     let panel = match select_panel_with_config(
         SelectPanelInput {
             panel_spec: params.panel_spec.clone(),
@@ -2673,6 +2752,7 @@ async fn handle_select_panel(
             operator_exclude_keys: operator_policy.exclude.clone(),
             required_capabilities: params.required_capabilities,
             available_models,
+            availability_substrate,
             is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                 subscription_keys.contains(&route.route_key)
                     || subscription_keys.contains(&route.capacity_key)
@@ -4444,6 +4524,10 @@ mod tests {
         .await
     }
 
+    /// No Broca handle map on this path: panels default to the host list, which is
+    /// what every test that does not name a substrate expects.
+    const ABSENT_BROCA_VAULT_HANDLES: &str = "/nonexistent/broca/vault-handles.json";
+
     fn usage_params(id: &str) -> serde_json::Value {
         json!({
             "messageID": id,
@@ -4489,6 +4573,21 @@ mod tests {
         request: serde_json::Value,
         operator_config_path: &Path,
     ) -> Frame {
+        run_route_wire_request_with_paths(
+            store,
+            request,
+            operator_config_path,
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+        )
+        .await
+    }
+
+    async fn run_route_wire_request_with_paths(
+        store: &SharedStore,
+        request: serde_json::Value,
+        operator_config_path: &Path,
+        broca_vault_handles_path: &Path,
+    ) -> Frame {
         let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let frame = Frame::build(
             FrameType::Request,
@@ -4510,6 +4609,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
+            broca_vault_handles_path,
         )
         .await
         .unwrap();
@@ -6024,6 +6124,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
         )
         .await
         .unwrap();
@@ -6067,6 +6168,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
         )
         .await
         .unwrap();
@@ -6161,6 +6263,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
         )
         .await
         .unwrap();
@@ -6432,6 +6535,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
         )
         .await
         .unwrap();
@@ -6982,6 +7086,7 @@ mod tests {
                 &min_band,
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
+                Path::new(ABSENT_BROCA_VAULT_HANDLES),
             )
             .await
             .unwrap();
@@ -7083,6 +7188,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
         )
         .await
         .unwrap();
@@ -7155,6 +7261,125 @@ mod tests {
             .unwrap()
             .replace("$decisionID", decision_id);
         assert_eq!(response.body, expected.as_bytes());
+    }
+
+    /// A roster seat is only real if whatever SENDS to it can resolve the route.
+    /// Kimi moved to a new plane with a new provider id: Broca resolves the new id
+    /// while the caller's host provider list still carries only the retired one, so
+    /// every consult seat for it was rejected `unavailable` even though its legs
+    /// never send through the host. Availability follows the substrate that sends.
+    #[tokio::test]
+    async fn a_roster_pin_absent_from_the_host_list_seats_on_broca_and_is_rejected_on_the_host() {
+        let rig = Rig::new("panel-substrate");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("kimi-code-plan-global", "k3"), FactSource::Override)
+            .expect("the catalog carries the route on its new plane");
+        let vault_handles = rig.dir.join("vault-handles.json");
+        std::fs::write(
+            &vault_handles,
+            r#"{"handles":{"apikey:kimi-code-plan-global":"ckh_fixture"}}"#,
+        )
+        .unwrap();
+        let request = |substrate: &str| {
+            json!({
+                "method": ROUTE_SELECT_PANEL_OP,
+                "params": {
+                    // The caller's host list carries the RETIRED provider id only.
+                    "availableModels": ["kimi-for-coding/k3"],
+                    "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
+                    "roster": [{"model": "kimi-code-plan-global/k3"}],
+                    "substrate": substrate,
+                    "taskId": format!("panel-substrate-{substrate}"),
+                }
+            })
+        };
+        let run = |substrate: &'static str| {
+            let store = Arc::clone(&store);
+            let vault_handles = vault_handles.clone();
+            async move {
+                let response = run_route_wire_request_with_paths(
+                    &store,
+                    request(substrate),
+                    Path::new("/nonexistent/alfonso-routing.jsonc"),
+                    &vault_handles,
+                )
+                .await;
+                assert_eq!(response.header.ty, FrameType::Response);
+                serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"]
+                    .clone()
+            }
+        };
+
+        let broca = run("broca").await;
+        assert_eq!(
+            broca["members"][0]["routeKey"], "kimi-code-plan-global/k3",
+            "Broca holds a credential for the provider and the catalog serves the model, so the pin sits"
+        );
+        assert!(broca.get("shortfall").is_none());
+
+        let host = run("opencode").await;
+        assert_eq!(host["members"], json!([]));
+        let cause = &host["shortfall"]["causes"][0];
+        assert_eq!(cause["model"], "kimi-code-plan-global/k3");
+        assert_eq!(cause["reason"], "unavailable");
+        assert_eq!(
+            cause["detail"], "host",
+            "the rejection names the list that was consulted"
+        );
+        // The recorded decision carries the same cause, so the next reader of
+        // rejected_json does not have to reconstruct which list it was.
+        let recorded = store
+            .get_decision_by_id(host["decisionID"].as_str().unwrap())
+            .unwrap()
+            .expect("the panel decision is recorded");
+        assert!(
+            recorded.rejected_json.contains(r#""detail":"host""#),
+            "{}",
+            recorded.rejected_json
+        );
+    }
+
+    /// Broca publishes no catalog to ask what it can send, so the substrate set is
+    /// the served catalog narrowed to providers Broca can authenticate to. A route
+    /// it has no credential for must not seat: it would fail its send every round.
+    #[tokio::test]
+    async fn a_broca_panel_never_seats_a_provider_broca_holds_no_credential_for() {
+        let rig = Rig::new("panel-substrate-credentials");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("uncredentialed", "m1"), FactSource::Override)
+            .unwrap();
+        let vault_handles = rig.dir.join("vault-handles.json");
+        std::fs::write(
+            &vault_handles,
+            r#"{"handles":{"apikey:kimi-code-plan-global":"ckh_fixture"}}"#,
+        )
+        .unwrap();
+        let response = run_route_wire_request_with_paths(
+            &store,
+            json!({
+                "method": ROUTE_SELECT_PANEL_OP,
+                "params": {
+                    "availableModels": ["uncredentialed/m1"],
+                    "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
+                    "roster": [{"model": "uncredentialed/m1"}],
+                    "substrate": "broca",
+                    "taskId": "panel-substrate-uncredentialed",
+                }
+            }),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            &vault_handles,
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["members"], json!([]));
+        let cause = &body["result"]["shortfall"]["causes"][0];
+        assert_eq!(cause["reason"], "unavailable");
+        assert_eq!(
+            cause["detail"], "broca",
+            "the seat was judged against Broca's reach, and the host list that does carry it is not consulted"
+        );
     }
 
     #[tokio::test]
@@ -7282,6 +7507,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
         )
         .await
         .unwrap();
@@ -7342,6 +7568,7 @@ mod tests {
                 &Arc::new(Mutex::new(None)),
                 config_path,
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
+                Path::new(ABSENT_BROCA_VAULT_HANDLES),
             )
             .await
             .unwrap();
@@ -7519,6 +7746,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             &config_path,
             Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
         )
         .await
         .unwrap();

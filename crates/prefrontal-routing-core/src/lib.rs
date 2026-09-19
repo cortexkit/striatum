@@ -77,13 +77,14 @@ pub use model_router::{
     ObjectiveBreakdown, PromptParams, RejectedCandidate, RejectedRoute, RequiredCapabilities,
     RouteFailureReason, RouteRuntimeState, SelectModelRouteInput, SelectedModel,
     SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
+    REASON_NOT_AVAILABLE,
 };
 pub use panel::{
-    select_panel, select_panel_with_config, validate_panel_spec, InvalidPanelRequest, PanelCause,
-    PanelCauseReason, PanelClass, PanelDiversity, PanelMember, PanelPolicy, PanelRosterEntry,
-    PanelRunnerUp, PanelSelection, PanelSelectionPolicy, PanelShortfall, PanelShortfallCode,
-    PanelSpec, SeatedSiblingVariant, SeatedVariant, SelectPanelInput, SelectedPanel,
-    SiblingCollapse,
+    select_panel, select_panel_with_config, validate_panel_spec, AvailabilitySubstrate,
+    InvalidPanelRequest, PanelCause, PanelCauseReason, PanelClass, PanelDiversity, PanelMember,
+    PanelPolicy, PanelRosterEntry, PanelRunnerUp, PanelSelection, PanelSelectionPolicy,
+    PanelShortfall, PanelShortfallCode, PanelSpec, SeatedSiblingVariant, SeatedVariant,
+    SelectPanelInput, SelectedPanel, SiblingCollapse,
 };
 pub use provider_model_spec::{
     filter_excluded_keys, filter_excluded_keys_with_policy, parse_spec, parse_spec_list,

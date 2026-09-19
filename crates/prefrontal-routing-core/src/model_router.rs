@@ -42,6 +42,10 @@ pub const REASON_EXCLUDED_BY_OPERATOR: &str = "excluded_by_operator";
 /// A route the CALLER excluded for this attempt: the route that just failed on a
 /// reroute, or a consult's `exclude_route_keys`.
 pub const REASON_EXCLUDED: &str = "excluded";
+/// A route missing from the available-model set this selection was given. Which
+/// set that was is a property of the caller, so consumers that can name it
+/// attach it as the rejection's detail.
+pub const REASON_NOT_AVAILABLE: &str = "not_available";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteRuntimeState {
@@ -486,7 +490,7 @@ pub fn admit_routes(
         if !is_route_available(&route, available_models) {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
-                reason: "not_available".to_string(),
+                reason: REASON_NOT_AVAILABLE.to_string(),
                 detail: None,
             });
             continue;
