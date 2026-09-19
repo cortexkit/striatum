@@ -25,5 +25,6 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+prefrontal-test-support = { path = "../prefrontal-test-support" }
 subc-core = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }

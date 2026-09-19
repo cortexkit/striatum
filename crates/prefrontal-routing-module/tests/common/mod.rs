@@ -18,9 +18,9 @@ use serde_json::Value;
 // the daemon binary package and stopped re-exporting them when the library split
 // into subc-daemon (subconscious 74370aee).
 use subc_protocol::Frame;
-use subc_transport::{read_frame, write_frame};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file};
+use subc_transport::{read_frame, write_frame};
 use tokio::{
     net::TcpStream,
     time::{timeout, Instant},
@@ -38,10 +38,10 @@ pub struct TestRoute {
     pub epoch: u32,
 }
 
-/// A process-unique temp path under the OS temp dir (no collision across tests).
+/// A process-unique path under the test scratch root (no collision across tests).
 pub fn unique_temp_dir(label: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("{label}-{}-{n}", process::id()))
+    prefrontal_test_support::scratch_root().join(format!("{label}-{}-{n}", process::id()))
 }
 
 /// Connect to a daemon from its connection file and complete the client HMAC handshake.

@@ -4177,7 +4177,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .subsec_nanos();
-            let dir = std::env::temp_dir().join(format!(
+            let dir = prefrontal_test_support::scratch_root().join(format!(
                 "prefrontal-routing-module-{label}-{}-{nanos}-{n}",
                 std::process::id()
             ));
@@ -4486,7 +4486,7 @@ mod tests {
                 "epoch": epoch,
                 "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
                 "identity": {
-                    "project_root": std::env::temp_dir(),
+                    "project_root": prefrontal_test_support::scratch_root(),
                     "harness": "epoch-rebind-test",
                     "session": "session-1"
                 }
