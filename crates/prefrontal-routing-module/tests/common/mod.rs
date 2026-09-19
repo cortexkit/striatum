@@ -14,7 +14,11 @@ use std::{
 };
 
 use serde_json::Value;
-use subc_core::{read_frame, write_frame, Frame};
+// Wire types come from the protocol and transport crates directly: subc-core is
+// the daemon binary package and stopped re-exporting them when the library split
+// into subc-daemon (subconscious 74370aee).
+use subc_protocol::Frame;
+use subc_transport::{read_frame, write_frame};
 use subc_protocol::{BindIdentity, Flags, FrameType, Priority, RouteTarget};
 use subc_transport::{authenticate_client, connection_file};
 use tokio::{
