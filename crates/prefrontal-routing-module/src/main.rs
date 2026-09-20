@@ -2652,7 +2652,16 @@ async fn handle_select_request(
                 }
             }
         }
-        Err(no_route) => {
+        Err(mut no_route) => {
+            // A head whose provider was withheld after a content-policy refusal can
+            // reach no route at all when its other providers are operator-excluded;
+            // the refusal it reads must name the withholding, or it looks like a
+            // policy misconfiguration rather than the consequence of its own last
+            // launch.
+            if !head_refusals.notes.is_empty() {
+                no_route.message =
+                    format!("{} ({})", no_route.message, head_refusals.notes.join("; "));
+            }
             // Best-effort failed-decision audit row (ignore a store error here: the
             // routing failure is the real result to surface).
             let decision = decision_input_for(
@@ -6666,6 +6675,22 @@ mod tests {
         assert_eq!(
             control_next["result"]["selected"]["model"]["providerID"], "openai",
             "{control_next}"
+        );
+
+        // When the withholding leaves the head no route at all (its other
+        // providers operator-excluded, as on this desk today), the refusal must
+        // say so, or it reads as a policy misconfiguration.
+        let refused_nothing_left = select_with_store(
+            &store,
+            select(refused_head, "refused-nothing-left", &["anthropic/opus"]),
+        )
+        .await;
+        let message = refused_nothing_left["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a no-route error: {refused_nothing_left}"));
+        assert!(
+            message.contains("withheld provider openai from this head"),
+            "{message}"
         );
     }
 
