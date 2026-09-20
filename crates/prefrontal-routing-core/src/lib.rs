@@ -37,9 +37,10 @@ pub use aa_infer::{
 };
 pub use break_glass::{relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot};
 pub use failure_backoff::{
-    failure_backoff_transition, is_terminal_send_failure, FailureBackoffConfig,
-    FailureBackoffTransition, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD,
-    FAILURE_BACKOFF_INITIAL_MS, FAILURE_BACKOFF_MAX_MS,
+    classify_failure_attribution, failure_backoff_transition, is_terminal_send_failure,
+    FailureAttribution, FailureBackoffConfig, FailureBackoffTransition,
+    DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, FAILURE_BACKOFF_INITIAL_MS,
+    FAILURE_BACKOFF_MAX_MS,
 };
 pub use fast_variant::{
     maybe_upgrade_to_fast_variant, FastVariantUpgradeInput, FAST_UPGRADE_MAX_PRESSURE,

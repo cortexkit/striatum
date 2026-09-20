@@ -585,6 +585,16 @@ struct CachedClassVector {
     vector: Option<ClassVector>,
 }
 
+/// One failed decision from a head's recent launches, enough to tell which
+/// provider refused and why without loading the audit payloads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParentFailedDecision {
+    pub route_key: String,
+    pub provider_id: String,
+    pub outcome_error: String,
+    pub outcome_at: i64,
+}
+
 /// One durable routing decision rendered for a diagnostic reader. JSON fields stay
 /// serialized here so the wire layer can return exactly the evidence that was
 /// recorded rather than reconstructing an explanation from today's catalog.
@@ -1015,6 +1025,47 @@ impl SqliteRouteStateStore {
                 let rows = stmt.query_map([], |row| {
                     Ok(UnscoredRow {
                         route_key: row.get(0)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)
+    }
+
+    /// Providers whose workers launched by `parent_session_id` were refused on
+    /// content-policy grounds since `since_ms`, with the route and the refusal
+    /// time of the newest such decision per provider.
+    ///
+    /// A content-policy refusal is a fact about the words the caller sent, not
+    /// about the route, so it charges no strike and leaves route health
+    /// untouched. That is correct for the fleet and exactly wrong for the next
+    /// launch from the same head, which carries the same words and routes to the
+    /// same provider at full adequacy: two seats lost two workers each this way
+    /// in one day, every one on OpenAI, every relaunch back onto OpenAI
+    /// (2026-09-20). The refusal text is the classifier's own, matched by the
+    /// caller against `classify_failure_attribution`; this read only narrows the
+    /// rows to one head's recent failures.
+    pub fn recent_failed_decisions_for_parent(
+        &self,
+        parent_session_id: &str,
+        since_ms: i64,
+    ) -> RouteStateResult<Vec<ParentFailedDecision>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                let mut statement = connection.prepare(
+                    "SELECT selected_route_key, selected_provider_id, outcome_error, outcome_at
+                     FROM model_route_decisions
+                     WHERE parent_session_id = ?1
+                       AND outcome_at >= ?2
+                       AND outcome_error IS NOT NULL
+                     ORDER BY outcome_at DESC, id DESC",
+                )?;
+                let rows = statement.query_map(params![parent_session_id, since_ms], |row| {
+                    Ok(ParentFailedDecision {
+                        route_key: row.get(0)?,
+                        provider_id: row.get(1)?,
+                        outcome_error: row.get(2)?,
+                        outcome_at: row.get(3)?,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()

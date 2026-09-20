@@ -1159,6 +1159,96 @@ fn policy_sources_line(operator: &ModelRoutingPolicyInput) -> String {
     )
 }
 
+/// How long a head's content-policy refusal keeps that provider off its launches.
+/// Long enough to cover a rephrase-and-relaunch cycle, short enough that a head
+/// working on unrelated material afterwards gets the provider back on its own.
+const HEAD_CONTENT_POLICY_EXCLUSION_MS: i64 = 60 * 60 * 1000;
+
+/// Routes withheld from one head's launch because that head's recent worker was
+/// refused by the provider's content policy, plus the explanation lines that say so.
+#[derive(Debug, Default, PartialEq)]
+struct HeadContentPolicyExclusions {
+    route_keys: HashSet<String>,
+    notes: Vec<String>,
+}
+
+/// A content-policy refusal is about the words the head sent, not the route, so it
+/// charges no strike and the route stays at full adequacy for everyone. That is
+/// right for the fleet and wrong for the head that just sent those words: its
+/// relaunch carries the same brief, routes to the same provider, and dies the same
+/// way, and a launch decision is minted before the task exists so nothing keys the
+/// retry to the refusal. Two seats lost two workers each in one day this way, every
+/// one on OpenAI, every relaunch back onto OpenAI (2026-09-20). The head is the
+/// stable key: for a bounded window after such a refusal, every route of the
+/// refusing provider is withheld from that head's launches only.
+fn head_content_policy_exclusions(
+    store: &SqliteRouteStateStore,
+    parent_session_id: Option<&str>,
+    facts: &[ModelFact],
+    now: i64,
+) -> HeadContentPolicyExclusions {
+    let Some(parent_session_id) = parent_session_id.map(str::trim).filter(|id| !id.is_empty())
+    else {
+        return HeadContentPolicyExclusions::default();
+    };
+    let failed = match store.recent_failed_decisions_for_parent(
+        parent_session_id,
+        now - HEAD_CONTENT_POLICY_EXCLUSION_MS,
+    ) {
+        Ok(failed) => failed,
+        Err(error) => {
+            // An unreadable ledger must not silently widen routing: the head keeps
+            // every route and the decision says the read failed.
+            return HeadContentPolicyExclusions {
+                route_keys: HashSet::new(),
+                notes: vec![format!(
+                    "head content-policy history unreadable, no routes withheld: {error}"
+                )],
+            };
+        }
+    };
+    let mut refused_providers: Vec<(String, String, i64)> = Vec::new();
+    for decision in failed {
+        let attribution = prefrontal_routing_core::classify_failure_attribution(
+            RouteOutcome::SessionError,
+            Some(decision.outcome_error.as_str()),
+        );
+        if attribution != prefrontal_routing_core::FailureAttribution::ContentPolicy {
+            continue;
+        }
+        if refused_providers
+            .iter()
+            .any(|(provider, _, _)| provider == &decision.provider_id)
+        {
+            continue;
+        }
+        refused_providers.push((
+            decision.provider_id,
+            decision.route_key,
+            decision.outcome_at,
+        ));
+    }
+    if refused_providers.is_empty() {
+        return HeadContentPolicyExclusions::default();
+    }
+    let mut exclusions = HeadContentPolicyExclusions::default();
+    for (provider_id, route_key, outcome_at) in refused_providers {
+        for fact in facts.iter().filter(|fact| fact.provider_id == provider_id) {
+            exclusions.route_keys.insert(make_route_key(
+                &fact.provider_id,
+                &fact.model_id,
+                fact.variant.as_deref(),
+            ));
+        }
+        let minutes_ago = (now - outcome_at).max(0) / 60_000;
+        exclusions.notes.push(format!(
+            "withheld provider {provider_id} from this head for {} minutes: its worker on {route_key} was refused by the provider's content policy {minutes_ago}m ago; the refusal is about the request, not the route, so no strike was charged",
+            HEAD_CONTENT_POLICY_EXCLUSION_MS / 60_000
+        ));
+    }
+    exclusions
+}
+
 fn claim_ignored_caller_policy_warning(sent: bool, warned: &Once) -> bool {
     if !sent {
         return false;
@@ -2375,7 +2465,14 @@ async fn handle_select_request(
         .iter()
         .cloned()
         .collect();
-    let exclude = params.exclude_route_keys.clone();
+    let mut exclude = params.exclude_route_keys.clone();
+    let head_refusals = head_content_policy_exclusions(
+        store,
+        params.parent_session_id.as_deref(),
+        &facts,
+        now as i64,
+    );
+    exclude.extend(head_refusals.route_keys.iter().cloned());
     let operator_exclude = operator_policy.exclude.clone();
     let prefer_fast = resolved_request.policy.prefer_fast_specs.clone();
     let requirements = resolved_request.requirements;
@@ -2500,6 +2597,9 @@ async fn handle_select_request(
     match selection {
         Ok(mut selected) => {
             selected.explanation.push(policy_sources.clone());
+            selected
+                .explanation
+                .extend(head_refusals.notes.iter().cloned());
             let decision = decision_input_for(
                 &target_agent,
                 &requirements,
@@ -6459,6 +6559,148 @@ mod tests {
             )
             .unwrap();
         assert_eq!(absent_identity, (None, None));
+    }
+
+    // A content-policy refusal charges no strike, so the refusing route stays at
+    // full adequacy and the same head's relaunch went straight back to it: two
+    // seats lost two workers each in one day (2026-09-20). The refusal is keyed on
+    // the head because a launch decision has no task id yet and a relaunch is a
+    // new task anyway. Every route of the refusing PROVIDER is withheld from that
+    // head for a bounded window; another head, and a head whose failure was
+    // transport, keep the routes.
+    #[tokio::test]
+    async fn head_refused_on_content_policy_loses_that_provider_for_its_next_launch() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = Rig::new("head-content-policy-exclusion");
+        let store = Arc::new(rig.open_store());
+        // Both OpenAI routes outrank opus on every axis, so opus wins only when
+        // BOTH are withheld: a route-only exclusion would leave sol to win.
+        let mut sol = fact("openai", "sol");
+        sol.scores.elo = 90.0;
+        sol.scores.speed = 200.0;
+        let mut astra = fact("openai", "astra");
+        astra.scores.elo = 95.0;
+        astra.scores.speed = 200.0;
+        for route in [astra, sol, fact("anthropic", "opus")] {
+            store.upsert_fact(&route, FactSource::Override).unwrap();
+        }
+        let refused_head = "ses_refused_head";
+        let control_head = "ses_control_head";
+        let select = |parent: &str, label: &str, exclude: &[&str]| {
+            json!({
+                "targetAgent": "mason",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["openai/astra", "openai/sol", "anthropic/opus"],
+                "excludeRouteKeys": exclude,
+                "parentSessionID": parent,
+                "taskId": label
+            })
+        };
+        let record_failure = |label: &str, error: &str| {
+            let decision_id = store.get_decisions_for_task(label).unwrap().remove(0).id;
+            store
+                .set_decision_outcome(
+                    &decision_id,
+                    &DecisionOutcomeUpdate {
+                        outcome: RouteOutcome::SessionError,
+                        last_error: Some(error.to_string()),
+                        observed_at_ms: now_ms() as i64,
+                        failure_backoff: FailureBackoffConfig::default(),
+                    },
+                )
+                .unwrap();
+        };
+
+        // Both heads launch on OpenAI first, and both launches fail: one refused
+        // by the provider's content policy, the other on a transport drop.
+        let refused_first = select_with_store(
+            &store,
+            select(refused_head, "refused-first", &["anthropic/opus"]),
+        )
+        .await;
+        assert_eq!(
+            refused_first["result"]["selected"]["model"]["providerID"], "openai",
+            "{refused_first}"
+        );
+        record_failure(
+            "refused-first",
+            "This content was flagged for possible cybersecurity risk. If you believe this is an error, contact us via the Trusted Access for Cyber program.",
+        );
+        let control_first = select_with_store(
+            &store,
+            select(control_head, "control-first", &["anthropic/opus"]),
+        )
+        .await;
+        assert_eq!(
+            control_first["result"]["selected"]["model"]["providerID"], "openai",
+            "{control_first}"
+        );
+        record_failure("control-first", "stream closed with code 1006");
+
+        // The refused head's next launch may not land on any OpenAI route, and the
+        // decision says why. The control head keeps OpenAI: its failure was the
+        // wire, not the words.
+        let refused_next =
+            select_with_store(&store, select(refused_head, "refused-next", &[])).await;
+        assert_eq!(
+            refused_next["result"]["selected"]["model"]["providerID"], "anthropic",
+            "{refused_next}"
+        );
+        let explanation = refused_next["result"]["selected"]["explanation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            explanation.contains("withheld provider openai from this head")
+                && explanation.contains("refused by the provider's content policy"),
+            "{explanation}"
+        );
+        let control_next = select_with_store(
+            &store,
+            select(control_head, "control-next", &["anthropic/opus"]),
+        )
+        .await;
+        assert_eq!(
+            control_next["result"]["selected"]["model"]["providerID"], "openai",
+            "{control_next}"
+        );
+    }
+
+    /// Drive one `route.select` through the wire handler against an already-open
+    /// store, for tests that must read and write decisions between selections.
+    async fn select_with_store(
+        store: &Arc<SqliteRouteStateStore>,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let request = json!({ "method": ROUTE_SELECT_OP, "params": params });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &Arc::new(Mutex::new(QuotaCache::default())),
+            store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+        )
+        .await
+        .unwrap();
+        let response = rx.recv().await.unwrap();
+        serde_json::from_slice(&response.body).unwrap()
     }
 
     #[tokio::test]
