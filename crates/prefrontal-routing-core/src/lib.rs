@@ -35,7 +35,9 @@ pub use aa_infer::{
     inherit_eq_from_curated_neighbors, interpolate_elo, EqSource, AA_INFERRED_DEFAULT_SPEED,
     AA_INFERRED_PENALTY,
 };
-pub use break_glass::{relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot};
+pub use break_glass::{
+    live_billing_wall_error, relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot,
+};
 pub use failure_backoff::{
     classify_failure_attribution, failure_backoff_transition, is_terminal_send_failure,
     FailureAttribution, FailureBackoffConfig, FailureBackoffTransition,
@@ -106,9 +108,9 @@ pub use route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 pub use route_state_store::{
     CatalogFactField, DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource,
     FailureBackoffState, ProviderCooldownState, RouteOutcome, RouteStateResult, RouteStateStore,
-    RouteStateStoreError, RouteStateUpdate, UsageObservation, OBSERVED_SPEED_MIN_OUTPUT_TOKENS,
-    OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT, OBSERVED_SPEED_WINDOW_MS,
-    USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
+    RouteStateStoreError, RouteStateUpdate, RouteWallClass, UsageObservation,
+    OBSERVED_SPEED_MIN_OUTPUT_TOKENS, OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT,
+    OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
 };
 pub use routing_config::{
     demand_bar, fit_ratio, RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, ANCHOR_VERSION,

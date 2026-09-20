@@ -51,6 +51,17 @@ fn effective_runtime(
             by_capacity.quota_abundance_window,
         )
     };
+    let (wall_class, last_error) = if by_route.wall_class
+        == Some(crate::route_state_store::RouteWallClass::Billing)
+    {
+        (by_route.wall_class, by_route.last_error)
+    } else if by_capacity.wall_class == Some(crate::route_state_store::RouteWallClass::Billing) {
+        (by_capacity.wall_class, by_capacity.last_error)
+    } else if by_route.wall_class.is_some() {
+        (by_route.wall_class, by_route.last_error)
+    } else {
+        (by_capacity.wall_class, by_capacity.last_error)
+    };
     RouteRuntimeState {
         // Hard blocks compose across scopes; soft route telemetry replaces shared
         // telemetry only when the route has a value.
@@ -59,6 +70,8 @@ fn effective_runtime(
             by_route.quota_exhausted_until,
             by_capacity.quota_exhausted_until,
         ),
+        wall_class,
+        last_error,
         failure_backoff_until: by_route.failure_backoff_until,
         failure_backoff_reason: by_route.failure_backoff_reason,
         success_ema: by_route.success_ema.or(by_capacity.success_ema),

@@ -5,6 +5,7 @@
 //! future reset; a real provider rejection will immediately restore the block.
 
 use crate::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
+use crate::route_state_store::RouteWallClass;
 
 /// One route rejected by hard quota or cooldown admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +92,41 @@ fn under_live_backoff(snapshot: &ModelRouteStateSnapshot, candidate: &BreakGlass
     })
 }
 
+/// The 2026-09-20 xai/grok-4.6 specimen showed that clearing an empty-account
+/// wall only repeats a payment refusal. Unlike quota windows, a live billing wall
+/// cannot become successful because break-glass retried it early.
+fn under_live_billing_wall(
+    snapshot: &ModelRouteStateSnapshot,
+    candidate: &BreakGlassCandidate,
+) -> bool {
+    live_billing_wall_error(snapshot, candidate).is_some()
+}
+
+/// Return the provider error attached to a live billing wall. Legacy rows have no
+/// class and remain relaxable; a classified row without error text still returns a
+/// stable diagnostic phrase.
+pub fn live_billing_wall_error<'a>(
+    snapshot: &'a ModelRouteStateSnapshot,
+    candidate: &BreakGlassCandidate,
+) -> Option<&'a str> {
+    [
+        snapshot.by_route.get(&candidate.route_key),
+        snapshot.by_capacity.get(&candidate.capacity_key),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|state| {
+        state.wall_class == Some(RouteWallClass::Billing)
+            && (state
+                .cooldown_until
+                .is_some_and(|until| until > snapshot.now)
+                || state
+                    .quota_exhausted_until
+                    .is_some_and(|until| until > snapshot.now))
+    })
+    .map(|state| state.last_error.as_deref().unwrap_or("billing wall"))
+}
+
 /// Earliest future reset across the GIVEN candidates only. This is the single
 /// producer for "when could a blocked route recover": diagnostics must scope
 /// the answer to the request's own rejected candidates, because a reset read
@@ -119,6 +155,9 @@ pub fn relax_earliest_reset(
 
     for candidate in candidates {
         if under_live_backoff(snapshot, candidate) {
+            continue;
+        }
+        if under_live_billing_wall(snapshot, candidate) {
             continue;
         }
         let resets_at = candidate_clearable_reset(snapshot, candidate);
@@ -175,6 +214,7 @@ mod tests {
         RouteRuntimeState {
             quota_exhausted_until: quota_until,
             cooldown_until,
+            wall_class: Some(RouteWallClass::Quota),
             ..Default::default()
         }
     }
@@ -191,6 +231,29 @@ mod tests {
         assert_eq!(relaxed.route_key, "p/a");
         assert_eq!(relaxed.resets_at, None);
         assert_eq!(relaxed.snapshot.by_route["p/a"].quota_exhausted_until, None);
+    }
+
+    #[test]
+    fn billing_wall_candidate_is_not_relaxed() {
+        let snap = ModelRouteStateSnapshot {
+            now: 1_000.0,
+            by_route: HashMap::from([(
+                "xai/grok-4.6".into(),
+                RouteRuntimeState {
+                    quota_exhausted_until: Some(31_000.0),
+                    wall_class: Some(RouteWallClass::Billing),
+                    last_error: Some("spending-limit: out of credits".into()),
+                    ..Default::default()
+                },
+            )]),
+            by_capacity: HashMap::new(),
+        };
+        let candidate = candidate("xai/grok-4.6", "xai/grok-4.6");
+        assert_eq!(
+            live_billing_wall_error(&snap, &candidate),
+            Some("spending-limit: out of credits")
+        );
+        assert_eq!(relax_earliest_reset(&snap, &[candidate]), None);
     }
 
     #[test]

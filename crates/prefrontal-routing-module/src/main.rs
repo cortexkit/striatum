@@ -44,14 +44,14 @@ use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
 use prefrontal_routing_core::route_state_store::FactSource;
 use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
 use prefrontal_routing_core::{
-    derive_provider_key, fact_to_route, make_route_key, maybe_upgrade_to_fast_variant,
-    relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
-    select_panel_with_config, validate_panel_spec, AvailabilitySubstrate, BreakGlassCandidate,
-    CatalogFactField, DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy, ExclusionSpecs,
-    FailureBackoffConfig, FastVariantUpgradeInput, ModelFact, ModelRequirements, ModelRoute,
-    ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection, PanelSpec,
+    derive_provider_key, fact_to_route, live_billing_wall_error, make_route_key,
+    maybe_upgrade_to_fast_variant, relax_earliest_reset, resolve_launch_requirements,
+    resolve_routing_policy, select_panel_with_config, validate_panel_spec, AvailabilitySubstrate,
+    BreakGlassCandidate, CatalogFactField, DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy,
+    ExclusionSpecs, FailureBackoffConfig, FastVariantUpgradeInput, ModelFact, ModelRequirements,
+    ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection, PanelSpec,
     RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
-    SelectPanelInput, SelectedPanel,
+    RouteWallClass, SelectPanelInput, SelectedPanel,
 };
 use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
@@ -391,6 +391,7 @@ fn record_cooldown_update(
     let update = prefrontal_routing_core::RouteStateUpdate {
         cooldown_until: params.cooldown_until,
         quota_exhausted_until: params.quota_exhausted_until,
+        wall_class: params.wall_class,
         quota_pressure: params.quota_pressure,
         last_error: params.last_error.clone(),
         increment_quota_error: params.increment_quota_error,
@@ -2653,14 +2654,39 @@ async fn handle_select_request(
             }
         }
         Err(mut no_route) => {
-            // A head whose provider was withheld after a content-policy refusal can
-            // reach no route at all when its other providers are operator-excluded;
-            // the refusal it reads must name the withholding, or it looks like a
-            // policy misconfiguration rather than the consequence of its own last
-            // launch.
-            if !head_refusals.notes.is_empty() {
-                no_route.message =
-                    format!("{} ({})", no_route.message, head_refusals.notes.join("; "));
+            // Head-specific exclusions and non-relaxable billing walls explain the
+            // same no-route result. Keep them on one message path so callers receive
+            // the full reason rather than a second, competing error surface.
+            let rejected_keys: HashSet<&str> = no_route
+                .rejected
+                .iter()
+                .filter(|rejected| {
+                    matches!(
+                        rejected.reason.as_str(),
+                        "quota_exhausted" | "cooldown_active"
+                    )
+                })
+                .map(|rejected| rejected.route_key.as_str())
+                .collect();
+            let mut no_route_notes = head_refusals.notes.clone();
+            no_route_notes.extend(facts.iter().filter_map(|fact| {
+                let route = fact_to_route(fact);
+                if !rejected_keys.contains(route.route_key.as_str()) {
+                    return None;
+                }
+                let candidate = BreakGlassCandidate {
+                    route_key: route.route_key.clone(),
+                    capacity_key: route.capacity_key,
+                };
+                live_billing_wall_error(&snapshot, &candidate).map(|error| {
+                    format!(
+                        "billing wall on route {} (provider {}): {}",
+                        route.route_key, fact.provider_id, error
+                    )
+                })
+            }));
+            if !no_route_notes.is_empty() {
+                no_route.message = format!("{} ({})", no_route.message, no_route_notes.join("; "));
             }
             // Best-effort failed-decision audit row (ignore a store error here: the
             // routing failure is the real result to surface).
@@ -3160,6 +3186,8 @@ struct RecordCooldownParams {
     quota_exhausted_until: Option<f64>,
     #[serde(default)]
     quota_pressure: Option<f64>,
+    #[serde(default)]
+    wall_class: Option<RouteWallClass>,
     #[serde(default)]
     provider_wide: bool,
     #[serde(default)]
@@ -4221,6 +4249,51 @@ mod tests {
     use prefrontal_routing_core::{FactSource, NativeUsageFacts, UsageObservation};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn record_cooldown_persists_typed_billing_and_quota_wall_classes() {
+        let rig = Rig::new("record-cooldown-wall-class");
+        let store = rig.open_store();
+        for (route_key, wall_class, last_error) in [
+            (
+                "xai/grok-4.6",
+                RouteWallClass::Billing,
+                "personal-team-blocked:spending-limit: You have run out of credits or need a Grok subscription",
+            ),
+            (
+                "p/plain-quota",
+                RouteWallClass::Quota,
+                "you have reached your usage limit",
+            ),
+        ] {
+            record_cooldown_update(
+                &store,
+                &RecordCooldownParams {
+                    route_key: route_key.into(),
+                    capacity_key: route_key.into(),
+                    cooldown_until: Some(5_000.0),
+                    quota_exhausted_until: Some(5_000.0),
+                    quota_pressure: None,
+                    wall_class: Some(wall_class),
+                    provider_wide: true,
+                    increment_quota_error: true,
+                    increment_failure: true,
+                    last_error: Some(last_error.into()),
+                },
+            )
+            .unwrap();
+        }
+
+        let snapshot = store.build_snapshot(1_000.0).unwrap();
+        assert_eq!(
+            snapshot.by_route["xai/grok-4.6"].wall_class,
+            Some(RouteWallClass::Billing)
+        );
+        assert_eq!(
+            snapshot.by_route["p/plain-quota"].wall_class,
+            Some(RouteWallClass::Quota)
+        );
+    }
 
     #[test]
     fn ignored_caller_policy_warning_is_claimed_once_per_boot() {
@@ -5823,6 +5896,7 @@ mod tests {
             cooldown_until: Some(7_000.0),
             quota_exhausted_until: Some(9_000.0),
             quota_pressure: None,
+            wall_class: None,
             provider_wide: true,
             increment_quota_error: true,
             increment_failure: true,
@@ -6568,6 +6642,150 @@ mod tests {
             )
             .unwrap();
         assert_eq!(absent_identity, (None, None));
+    }
+
+    #[tokio::test]
+    async fn only_billing_walled_route_returns_no_route_and_quota_control_relaxes() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = Rig::new("billing-wall-break-glass");
+        let store = Arc::new(rig.open_store());
+        let grok = fact("xai", "grok-4.6");
+        store.upsert_fact(&grok, FactSource::Override).unwrap();
+        let billing_error = "personal-team-blocked:spending-limit: You have run out of credits or need a Grok subscription";
+        let wall_until = now_ms() as f64 + 30.0 * 60_000.0;
+        store
+            .update_route_state(
+                "xai/grok-4.6",
+                "xai/grok-4.6",
+                &prefrontal_routing_core::RouteStateUpdate {
+                    cooldown_until: Some(wall_until),
+                    quota_exhausted_until: Some(wall_until),
+                    wall_class: Some(RouteWallClass::Billing),
+                    last_error: Some(billing_error.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let request = |task_id: &str| {
+            json!({
+                "targetAgent": "mason",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["xai/grok-4.6"],
+                "taskId": task_id
+            })
+        };
+
+        let blocked = select_with_store(&store, request("billing-wall-blocked")).await;
+        let message = blocked["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("billing wall must return no_route: {blocked}"));
+        assert!(message.contains("xai/grok-4.6"), "{message}");
+        assert!(message.contains("provider xai"), "{message}");
+        assert!(message.contains("billing wall"), "{message}");
+        assert!(message.contains(billing_error), "{message}");
+
+        store
+            .update_route_state(
+                "xai/grok-4.6",
+                "xai/grok-4.6",
+                &prefrontal_routing_core::RouteStateUpdate {
+                    wall_class: Some(RouteWallClass::Quota),
+                    last_error: Some("you have reached your usage limit".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let relaxed = select_with_store(&store, request("plain-quota-relaxed")).await;
+        assert_eq!(
+            relaxed["result"]["selected"]["routeKey"], "xai/grok-4.6",
+            "{relaxed}"
+        );
+        assert!(relaxed["result"]["selected"]["explanation"][0]
+            .as_str()
+            .is_some_and(|line| line.contains("break-glass")));
+    }
+
+    /// Replay the 2026-09-20 17:09:27 xai/grok-4.6 handout: OpenAI is
+    /// withheld from the same head and the only remaining route has the stored
+    /// billing refusal. The corrected selector must explain both facts.
+    #[tokio::test]
+    async fn specimen_billing_grok_plus_head_withheld_openai_returns_no_route() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = Rig::new("billing-wall-specimen");
+        let store = Arc::new(rig.open_store());
+        for route in [fact("openai", "gpt-5.6-sol"), fact("xai", "grok-4.6")] {
+            store.upsert_fact(&route, FactSource::Override).unwrap();
+        }
+        let parent = "ses_313660571ffeZTsf4koSJwk50Q";
+        let first = select_with_store(
+            &store,
+            json!({
+                "targetAgent": "mason",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["openai/gpt-5.6-sol", "xai/grok-4.6"],
+                "excludeRouteKeys": ["xai/grok-4.6"],
+                "parentSessionID": parent,
+                "taskId": "specimen-openai-refusal"
+            }),
+        )
+        .await;
+        assert_eq!(
+            first["result"]["selected"]["routeKey"], "openai/gpt-5.6-sol",
+            "{first}"
+        );
+        let decision_id = store
+            .get_decisions_for_task("specimen-openai-refusal")
+            .unwrap()
+            .remove(0)
+            .id;
+        store
+            .set_decision_outcome(
+                &decision_id,
+                &DecisionOutcomeUpdate {
+                    outcome: RouteOutcome::SessionError,
+                    last_error: Some("This content was flagged for possible cybersecurity risk. If you believe this is an error, contact us via the Trusted Access for Cyber program.".into()),
+                    observed_at_ms: now_ms() as i64,
+                    failure_backoff: FailureBackoffConfig::default(),
+                },
+            )
+            .unwrap();
+
+        let billing_error = "personal-team-blocked:spending-limit: You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok.";
+        let now = now_ms() as f64;
+        store
+            .update_route_state(
+                "xai/grok-4.6",
+                "xai/grok-4.6",
+                &prefrontal_routing_core::RouteStateUpdate {
+                    cooldown_until: Some(now + 30.0 * 60_000.0),
+                    quota_exhausted_until: Some(now + 30.0 * 60_000.0),
+                    wall_class: Some(RouteWallClass::Billing),
+                    last_error: Some(billing_error.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let replay = select_with_store(
+            &store,
+            json!({
+                "targetAgent": "mason",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["openai/gpt-5.6-sol", "xai/grok-4.6"],
+                "parentSessionID": parent,
+                "taskId": "specimen-replay"
+            }),
+        )
+        .await;
+        let message = replay["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("specimen must return no_route: {replay}"));
+        assert!(
+            message.contains("withheld provider openai from this head"),
+            "{message}"
+        );
+        assert!(message.contains("xai/grok-4.6"), "{message}");
+        assert!(message.contains("provider xai"), "{message}");
+        assert!(message.contains(billing_error), "{message}");
     }
 
     // A content-policy refusal charges no strike, so the refusing route stays at

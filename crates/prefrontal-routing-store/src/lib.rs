@@ -25,9 +25,9 @@ use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, failure_backoff_transition, CatalogFactField,
     DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffState,
     FailureBackoffTransition, ProviderCooldownState, RouteStateResult, RouteStateStore,
-    RouteStateStoreError, RouteStateUpdate, UsageObservation, OBSERVED_SPEED_MIN_OUTPUT_TOKENS,
-    OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT, OBSERVED_SPEED_WINDOW_MS,
-    USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
+    RouteStateStoreError, RouteStateUpdate, RouteWallClass, UsageObservation,
+    OBSERVED_SPEED_MIN_OUTPUT_TOKENS, OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT,
+    OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
@@ -132,6 +132,8 @@ const MIGRATION_036: &str = include_str!("../migrations/036_usage_profile.sql");
 const MIGRATION_037: &str = include_str!("../migrations/037_catalog_rates.sql");
 /// Migration 38: append-only per-account quota reading history.
 const MIGRATION_038: &str = include_str!("../migrations/038_quota_reading_log.sql");
+/// Migration 39: typed hard-wall cause for route state and provider inheritance.
+const MIGRATION_039: &str = include_str!("../migrations/039_route_wall_class.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -170,7 +172,7 @@ struct ObservedSpeedAggregate {
     duration_ms: i64,
 }
 
-fn route_state_migrations() -> [Migration; 38] {
+fn route_state_migrations() -> [Migration; 39] {
     [
         Migration {
             version: 1,
@@ -323,6 +325,10 @@ fn route_state_migrations() -> [Migration; 38] {
         Migration {
             version: 38,
             statements: MIGRATION_038,
+        },
+        Migration {
+            version: 39,
+            statements: MIGRATION_039,
         },
     ]
 }
@@ -1387,6 +1393,20 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
     })
 }
 
+fn row_wall_class(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<RouteWallClass>> {
+    row.get::<_, Option<String>>(index)?
+        .map(|value| {
+            RouteWallClass::parse(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn bool_to_int(v: Option<bool>) -> Option<i64> {
     v.map(|b| if b { 1 } else { 0 })
 }
@@ -1883,7 +1903,8 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 c.query_row(
-                    "SELECT provider_key, cooldown_until, quota_exhausted_until, quota_pressure
+                    "SELECT provider_key, cooldown_until, quota_exhausted_until, quota_pressure,
+                            wall_class
                      FROM provider_cooldown_state WHERE provider_key = ?1",
                     [&provider_key],
                     |row| {
@@ -1892,6 +1913,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                             cooldown_until: row.get(1)?,
                             quota_exhausted_until: row.get(2)?,
                             quota_pressure: row.get(3)?,
+                            wall_class: row_wall_class(row, 4)?,
                         })
                     },
                 )
@@ -1929,7 +1951,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let existing = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
-                                last_error, last_error_at
+                                last_error, last_error_at, wall_class
                          FROM provider_cooldown_state WHERE provider_key = ?1",
                         [&provider_key],
                         |row| {
@@ -1939,6 +1961,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                                 quota_pressure: row.get(2)?,
                                 last_error: row.get(3)?,
                                 last_error_at: row.get(4)?,
+                                wall_class: row_wall_class(row, 5)?,
                             })
                         },
                     )
@@ -1948,6 +1971,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let quota_exhausted_until =
                     max_defined(existing.quota_exhausted_until, update.quota_exhausted_until);
                 let quota_pressure = update.quota_pressure.or(existing.quota_pressure);
+                let wall_class = update.wall_class.or(existing.wall_class);
                 let (last_error, last_error_at) = match &update.last_error {
                     Some(error) => (Some(error.clone()), Some(now_ms())),
                     None => (existing.last_error, existing.last_error_at),
@@ -1957,15 +1981,16 @@ impl RouteStateStore for SqliteRouteStateStore {
                 tx.execute(
                     "INSERT INTO provider_cooldown_state (
                        provider_key, cooldown_until, quota_exhausted_until, quota_pressure,
-                       last_error, last_error_at, updated_at
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7)
+                       last_error, last_error_at, updated_at, wall_class
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
                      ON CONFLICT(provider_key) DO UPDATE SET
                        cooldown_until=excluded.cooldown_until,
                        quota_exhausted_until=excluded.quota_exhausted_until,
                        quota_pressure=excluded.quota_pressure,
                        last_error=excluded.last_error,
                        last_error_at=excluded.last_error_at,
-                       updated_at=excluded.updated_at",
+                       updated_at=excluded.updated_at,
+                       wall_class=excluded.wall_class",
                     params![
                         provider_key,
                         cooldown_until,
@@ -1974,6 +1999,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         last_error,
                         last_error_at,
                         updated_at,
+                        wall_class.map(RouteWallClass::as_str),
                     ],
                 )?;
 
@@ -1985,8 +2011,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                        route_key, capacity_key, provider_id, model_id, variant,
                        cooldown_until, quota_exhausted_until, quota_pressure,
                        latency_ema_ms, success_ema, failure_count, quota_error_count,
-                       last_error, last_error_at, updated_at
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL,0,0,?9,?10,?11)",
+                       last_error, last_error_at, updated_at, wall_class
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL,0,0,?9,?10,?11,?12)",
                     params![
                         route_key,
                         capacity_key,
@@ -1999,6 +2025,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         last_error,
                         last_error_at,
                         updated_at,
+                        wall_class.map(RouteWallClass::as_str),
                     ],
                 )?;
 
@@ -2016,16 +2043,18 @@ impl RouteStateStore for SqliteRouteStateStore {
                          WHEN quota_exhausted_until IS NULL OR quota_exhausted_until < ?2 THEN ?2
                          ELSE quota_exhausted_until END,
                        quota_pressure = COALESCE(?3, quota_pressure),
-                       failure_count = failure_count + ?4,
-                       quota_error_count = quota_error_count + ?5,
-                       last_error = COALESCE(?6, last_error),
-                       last_error_at = CASE WHEN ?6 IS NULL THEN last_error_at ELSE ?7 END,
-                       updated_at = ?7
-                     WHERE provider_id = ?8",
+                       wall_class = COALESCE(?4, wall_class),
+                       failure_count = failure_count + ?5,
+                       quota_error_count = quota_error_count + ?6,
+                       last_error = COALESCE(?7, last_error),
+                       last_error_at = CASE WHEN ?7 IS NULL THEN last_error_at ELSE ?8 END,
+                       updated_at = ?8
+                     WHERE provider_id = ?9",
                     params![
                         cooldown_until,
                         quota_exhausted_until,
                         update.quota_pressure,
+                        update.wall_class.map(RouteWallClass::as_str),
                         if update.increment_failure { 1 } else { 0 },
                         if update.increment_quota_error { 1 } else { 0 },
                         last_error,
@@ -2057,13 +2086,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
                                 latency_ema_ms, success_ema, failure_count, quota_error_count,
-                                last_error, last_error_at
+                                last_error, last_error_at, wall_class
                          FROM model_route_state WHERE route_key = ?1",
                         [route_key],
                         |r| {
                             Ok(ExistingState {
                                 cooldown_until: r.get(0)?,
                                 quota_exhausted_until: r.get(1)?,
+                                wall_class: row_wall_class(r, 9)?,
                                 quota_pressure: r.get(2)?,
                                 latency_ema_ms: r.get(3)?,
                                 success_ema: r.get(4)?,
@@ -2079,7 +2109,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let provider = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
-                                last_error, last_error_at
+                                last_error, last_error_at, wall_class
                          FROM provider_cooldown_state WHERE provider_key = ?1",
                         [&provider_key],
                         |r| {
@@ -2089,6 +2119,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                                 quota_pressure: r.get(2)?,
                                 last_error: r.get(3)?,
                                 last_error_at: r.get(4)?,
+                                wall_class: row_wall_class(r, 5)?,
                             })
                         },
                     )
@@ -2107,6 +2138,10 @@ impl RouteStateStore for SqliteRouteStateStore {
                     .quota_pressure
                     .or(ex.quota_pressure)
                     .or(provider.quota_pressure);
+                let wall_class = update
+                    .wall_class
+                    .or(ex.wall_class)
+                    .or(provider.wall_class);
                 let latency_ema_ms = update.latency_ema_ms.or(ex.latency_ema_ms);
                 let success_ema = update.success_ema.or(ex.success_ema);
                 let failure_count = ex.failure_count + if update.increment_failure { 1 } else { 0 };
@@ -2125,8 +2160,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                        route_key, capacity_key, provider_id, model_id, variant,
                        cooldown_until, quota_exhausted_until, quota_pressure,
                        latency_ema_ms, success_ema, failure_count, quota_error_count,
-                       last_error, last_error_at, updated_at
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                       last_error, last_error_at, updated_at, wall_class
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
                      ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant,
@@ -2136,7 +2171,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                        latency_ema_ms=excluded.latency_ema_ms, success_ema=excluded.success_ema,
                        failure_count=excluded.failure_count, quota_error_count=excluded.quota_error_count,
                        last_error=excluded.last_error, last_error_at=excluded.last_error_at,
-                       updated_at=excluded.updated_at",
+                       updated_at=excluded.updated_at, wall_class=excluded.wall_class",
                     params![
                         route_key,
                         capacity_key,
@@ -2153,6 +2188,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         last_error,
                         last_error_at,
                         now_ms(),
+                        wall_class.map(RouteWallClass::as_str),
                     ],
                 )?;
                 tx.commit()
@@ -2828,7 +2864,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let mut stmt = c.prepare(
                     "SELECT route_key, capacity_key, cooldown_until, quota_exhausted_until,
                             quota_pressure, latency_ema_ms, success_ema,
-                            failure_backoff_until, failure_backoff_reason
+                            failure_backoff_until, failure_backoff_reason, last_error, wall_class
                      FROM model_route_state",
                 )?;
                 let rows = stmt.query_map([], |r| {
@@ -2842,6 +2878,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                         success_ema: r.get(6)?,
                         failure_backoff_until: r.get(7)?,
                         failure_backoff_reason: r.get(8)?,
+                        last_error: r.get(9)?,
+                        wall_class: row_wall_class(r, 10)?,
                     })
                 })?;
                 for row in rows {
@@ -2849,6 +2887,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                     let state = RouteRuntimeState {
                         cooldown_until: row.cooldown_until,
                         quota_exhausted_until: row.quota_exhausted_until,
+                        wall_class: row.wall_class,
+                        last_error: row.last_error.clone(),
                         latency_ema_ms: row.latency_ema_ms,
                         success_ema: row.success_ema,
                         failure_backoff_until: row.failure_backoff_until,
@@ -2863,6 +2903,15 @@ impl RouteStateStore for SqliteRouteStateStore {
                     cap.cooldown_until = max_defined(cap.cooldown_until, state.cooldown_until);
                     cap.quota_exhausted_until =
                         max_defined(cap.quota_exhausted_until, state.quota_exhausted_until);
+                    let row_wall_is_live = state.cooldown_until.is_some_and(|until| until > now)
+                        || state.quota_exhausted_until.is_some_and(|until| until > now);
+                    if row_wall_is_live
+                        && (cap.wall_class.is_none()
+                            || state.wall_class == Some(RouteWallClass::Billing))
+                    {
+                        cap.wall_class = state.wall_class;
+                        cap.last_error = state.last_error.clone();
+                    }
                     if let Some(pressure) = row.quota_pressure {
                         cap.quota_pressure = Some(match cap.quota_pressure {
                             Some(existing) => existing.max(pressure),
@@ -2887,6 +2936,7 @@ struct ExistingProviderState {
     cooldown_until: Option<f64>,
     quota_exhausted_until: Option<f64>,
     quota_pressure: Option<f64>,
+    wall_class: Option<RouteWallClass>,
     last_error: Option<String>,
     last_error_at: Option<i64>,
 }
@@ -2895,6 +2945,7 @@ struct ExistingProviderState {
 struct ExistingState {
     cooldown_until: Option<f64>,
     quota_exhausted_until: Option<f64>,
+    wall_class: Option<RouteWallClass>,
     quota_pressure: Option<f64>,
     latency_ema_ms: Option<f64>,
     success_ema: Option<f64>,
@@ -2909,6 +2960,8 @@ struct StateRow {
     capacity_key: String,
     cooldown_until: Option<f64>,
     quota_exhausted_until: Option<f64>,
+    wall_class: Option<RouteWallClass>,
+    last_error: Option<String>,
     quota_pressure: Option<f64>,
     latency_ema_ms: Option<f64>,
     success_ema: Option<f64>,

@@ -12,8 +12,8 @@ use prefrontal_routing_core::{
     admit_routes, derive_provider_key, make_capacity_key, make_route_key, relax_earliest_reset,
     select_model_route, BreakGlassCandidate, CatalogFactField, DecisionInput,
     DecisionOutcomeUpdate, ExclusionPolicy, FactSource, FailureBackoffConfig, ModelRequirements,
-    RouteFailureReason, RouteOutcome, RouteStateStore, RouteStateUpdate, RoutingConfig,
-    SelectModelRouteInput, UsageObservation, FAILURE_BACKOFF_INITIAL_MS,
+    RouteFailureReason, RouteOutcome, RouteStateStore, RouteStateUpdate, RouteWallClass,
+    RoutingConfig, SelectModelRouteInput, UsageObservation, FAILURE_BACKOFF_INITIAL_MS,
 };
 use prefrontal_routing_store::{
     dev_descriptor, DecisionListFilter, FusiformCatalogCursor, FusiformFactUpdate,
@@ -1168,6 +1168,87 @@ fn build_snapshot_propagates_capacity_shared_signals() {
             .get("p/m/high")
             .and_then(|s| s.quota_exhausted_until),
         Some(9000.0)
+    );
+}
+
+#[test]
+fn wall_classes_round_trip_and_a_null_legacy_class_keeps_break_glass_behavior() {
+    let rig = Rig::new("wall-class-round-trip");
+    let store = rig.open();
+    let billing_error = "personal-team-blocked:spending-limit: You have run out of credits or need a Grok subscription";
+    store
+        .record_provider_cooldown(
+            "xai",
+            "xai/grok-4.6",
+            "xai/grok-4.6",
+            &RouteStateUpdate {
+                cooldown_until: Some(5_000.0),
+                quota_exhausted_until: Some(5_000.0),
+                wall_class: Some(RouteWallClass::Billing),
+                last_error: Some(billing_error.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .update_route_state(
+            "p/quota",
+            "p/quota",
+            &RouteStateUpdate {
+                quota_exhausted_until: Some(6_000.0),
+                wall_class: Some(RouteWallClass::Quota),
+                last_error: Some("you have reached your usage limit".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .update_route_state(
+            "legacy/pre-migration",
+            "legacy/pre-migration",
+            &RouteStateUpdate {
+                quota_exhausted_until: Some(7_000.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let snapshot = store.build_snapshot(1_000.0).unwrap();
+    assert_eq!(
+        snapshot.by_route["xai/grok-4.6"].wall_class,
+        Some(RouteWallClass::Billing)
+    );
+    assert_eq!(
+        snapshot.by_route["xai/grok-4.6"].last_error.as_deref(),
+        Some(billing_error)
+    );
+    assert_eq!(
+        snapshot.by_route["p/quota"].wall_class,
+        Some(RouteWallClass::Quota)
+    );
+    assert_eq!(snapshot.by_route["legacy/pre-migration"].wall_class, None);
+
+    assert!(
+        relax_earliest_reset(
+            &snapshot,
+            &[BreakGlassCandidate {
+                route_key: "xai/grok-4.6".into(),
+                capacity_key: "xai/grok-4.6".into(),
+            }]
+        )
+        .is_none(),
+        "a live billing wall is not relaxable"
+    );
+    assert!(
+        relax_earliest_reset(
+            &snapshot,
+            &[BreakGlassCandidate {
+                route_key: "legacy/pre-migration".into(),
+                capacity_key: "legacy/pre-migration".into(),
+            }]
+        )
+        .is_some(),
+        "a NULL class preserves the pre-migration break-glass rule"
     );
 }
 

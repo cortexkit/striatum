@@ -89,6 +89,32 @@ impl std::error::Error for RouteStateStoreError {}
 
 pub type RouteStateResult<T> = Result<T, RouteStateStoreError>;
 
+/// Cause of a live quota/cooldown wall. NULL in storage remains unknown so rows
+/// written before the typed cause was introduced retain their prior behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteWallClass {
+    Quota,
+    Billing,
+}
+
+impl RouteWallClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            Self::Billing => "billing",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "quota" => Ok(Self::Quota),
+            "billing" => Ok(Self::Billing),
+            other => Err(format!("unknown route wall class {other:?}")),
+        }
+    }
+}
+
 /// A partial update to a route's runtime telemetry. `None` fields are left as-is
 /// (the existing stored value survives); `Some(value)` overwrites. The two
 /// increment flags add to the persisted counters. Mirrors the TS `RouteStateUpdate`.
@@ -96,6 +122,7 @@ pub type RouteStateResult<T> = Result<T, RouteStateStoreError>;
 pub struct RouteStateUpdate {
     pub cooldown_until: Option<f64>,
     pub quota_exhausted_until: Option<f64>,
+    pub wall_class: Option<RouteWallClass>,
     pub quota_pressure: Option<f64>,
     pub latency_ema_ms: Option<f64>,
     pub success_ema: Option<f64>,
@@ -113,6 +140,7 @@ pub struct ProviderCooldownState {
     pub cooldown_until: Option<f64>,
     pub quota_exhausted_until: Option<f64>,
     pub quota_pressure: Option<f64>,
+    pub wall_class: Option<RouteWallClass>,
 }
 
 /// Terminal outcome recorded against a route decision (audit + routing learning).
