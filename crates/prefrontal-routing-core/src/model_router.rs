@@ -400,11 +400,6 @@ fn wall_detail(until: f64, now: f64) -> String {
     format!("wall for {remaining_s}s more (until_ms={until:.0}, now_ms={now:.0})")
 }
 
-fn has_live_hard_wall(state: &RouteRuntimeState, now: f64) -> bool {
-    state.cooldown_until.is_some_and(|until| until > now)
-        || state.quota_exhausted_until.is_some_and(|until| until > now)
-}
-
 fn merged_runtime_state(
     route: &ModelRoute,
     snapshot: Option<&ModelRouteStateSnapshot>,
@@ -412,30 +407,16 @@ fn merged_runtime_state(
     let by_route = snapshot.and_then(|s| s.by_route.get(&route.route_key));
     let by_capacity = snapshot.and_then(|s| s.by_capacity.get(&route.capacity_key));
     let mut merged = by_capacity.cloned().unwrap_or_default();
-    let now = snapshot.map_or(0.0, |snapshot| snapshot.now);
-    if !by_capacity.is_some_and(|state| has_live_hard_wall(state, now)) {
-        merged.wall_class = None;
-        merged.last_error = None;
-    }
     if let Some(route_state) = by_route {
         // Hard blocks compose across both scopes: a stale route deadline cannot
-        // shorten a live capacity-wide block.
+        // shorten a live capacity-wide block. The wall's typed cause and error text
+        // are not merged here: break-glass reads them per scope from the snapshot
+        // (live_billing_wall_error), and no selection arm reads the merged copy.
         merged.cooldown_until = latest_deadline(merged.cooldown_until, route_state.cooldown_until);
         merged.quota_exhausted_until = latest_deadline(
             merged.quota_exhausted_until,
             route_state.quota_exhausted_until,
         );
-        if has_live_hard_wall(route_state, now)
-            && (merged.wall_class.is_none()
-                || route_state.wall_class
-                    == Some(crate::route_state_store::RouteWallClass::Billing))
-        {
-            merged.wall_class = route_state.wall_class;
-            merged.last_error = route_state
-                .last_error
-                .clone()
-                .or_else(|| merged.last_error.clone());
-        }
         merged.failure_backoff_until = route_state.failure_backoff_until;
         merged.failure_backoff_reason = route_state.failure_backoff_reason.clone();
         // Soft telemetry remains route-specific when present.

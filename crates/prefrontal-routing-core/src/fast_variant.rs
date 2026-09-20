@@ -51,13 +51,10 @@ fn effective_runtime(
             by_capacity.quota_abundance_window,
         )
     };
-    let (wall_class, last_error) = if by_route.wall_class
-        == Some(crate::route_state_store::RouteWallClass::Billing)
-    {
-        (by_route.wall_class, by_route.last_error)
-    } else if by_capacity.wall_class == Some(crate::route_state_store::RouteWallClass::Billing) {
-        (by_capacity.wall_class, by_capacity.last_error)
-    } else if by_route.wall_class.is_some() {
+    // The wall's typed cause is carried, not chosen: break-glass reads it per
+    // scope from the snapshot, and nothing downstream of the fast-variant merge
+    // consults the merged copy.
+    let (wall_class, last_error) = if by_route.wall_class.is_some() {
         (by_route.wall_class, by_route.last_error)
     } else {
         (by_capacity.wall_class, by_capacity.last_error)
