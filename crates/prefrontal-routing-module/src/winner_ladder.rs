@@ -500,6 +500,20 @@ mod tests {
         }
     }
 
+    /// The health sentinel relays notices by matching this prefix; a rename on
+    /// either side would silently stop the relay.
+    #[test]
+    fn the_sentinel_relays_the_same_notice_prefix() {
+        let sentinel = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../script/health-sentinel.ts"
+        ))
+        .unwrap();
+        assert!(sentinel.contains(&format!(
+            "ROUTE_WINNER_NOTICE_PREFIX = \"{NOTICE_PREFIX}\""
+        )));
+    }
+
     #[test]
     fn identical_ladders_produce_no_notice() {
         let same = ladder(["a", "a", "b", "b", "c", "c", "c"]);
