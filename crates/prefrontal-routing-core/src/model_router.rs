@@ -1916,7 +1916,11 @@ mod route_order_tests {
                         keys[i].route_key,
                         keys[j].route_key
                     );
-                    assert_eq!(forward, backward.reverse(), "trial {trial}: not antisymmetric");
+                    assert_eq!(
+                        forward,
+                        backward.reverse(),
+                        "trial {trial}: not antisymmetric"
+                    );
                 }
             }
         }

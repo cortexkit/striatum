@@ -3451,7 +3451,11 @@ fn generated_shortlists_select_one_winner_in_any_arrival_order() {
     let elos = [1_300.0, 1_350.0, 1_400.0, 1_450.0, 1_500.0];
     let mut rng = Rng(0xD1B5_4A32_D192_ED03);
     for trial in 0..400 {
-        let len = if trial % 20 == 0 { 40 } else { 3 + rng.below(4) as usize };
+        let len = if trial % 20 == 0 {
+            40
+        } else {
+            3 + rng.below(4) as usize
+        };
         let covered: HashSet<String> = providers
             .iter()
             .filter(|_| rng.below(2) == 0)
