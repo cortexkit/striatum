@@ -72,7 +72,13 @@ pub const UNKNOWN_FACT_CONFIDENCE_PENALTY: f64 = 0.1;
 
 /// A model is in the near-bar adequacy band at this fit ratio. Exact bar
 /// clearance is tracked separately; this ratio remains the warning boundary.
-pub const ADEQUACY_FLOOR: f64 = 0.9;
+/// Operator ruling 2026-09-23: 0.95, raised from 0.9. At 0.9 a model 153 elo
+/// short of the iq-80 bar (deepseek-v4.1-flash, fit 0.92) counted as adequate
+/// and took iq-80 masons whenever stronger subscription capacity was walled;
+/// one such worker finished its edits and then looped for minutes on a long
+/// verification step. At 0.95 a shortage falls through to best effort, which
+/// ranks the most capable admissible model first.
+pub const ADEQUACY_FLOOR: f64 = 0.95;
 /// Best effort below this fit ratio is refused instead of silently dispatching a
 /// dangerously weak route.
 pub const MIN_BEST_EFFORT_ADEQUACY: f64 = 0.6;

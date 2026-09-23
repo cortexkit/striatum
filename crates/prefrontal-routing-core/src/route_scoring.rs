@@ -172,13 +172,14 @@ mod floor_tests {
         }
     }
 
-    /// The live specimen: elo fit 0.899 (1710 against an iq-100 bar of 1902) and
-    /// eq fit 1.0 blend to 0.92, above the floor; the elo shortfall alone must
-    /// refuse the route.
+    /// One metric just under the floor, the other comfortably above it, blend
+    /// to an adequacy above the floor; the shortfall on the one metric alone
+    /// must refuse the route. Fits are written relative to the floor so the
+    /// specimen stays on the boundary it tests if the floor moves again.
     #[test]
     fn a_metric_below_the_floor_is_not_papered_over_by_the_blend() {
         let specimen = score(&[
-            (ModelMetric::Elo, 100.0, 0.899),
+            (ModelMetric::Elo, 100.0, ADEQUACY_FLOOR - 0.01),
             (ModelMetric::Eq, 30.0, 1.0),
         ]);
         assert!(
@@ -188,9 +189,27 @@ mod floor_tests {
         assert!(!specimen.clears_adequacy_floor());
 
         let both_clear = score(&[
-            (ModelMetric::Elo, 100.0, 0.95),
+            (ModelMetric::Elo, 100.0, ADEQUACY_FLOOR),
             (ModelMetric::Eq, 30.0, 1.0),
         ]);
         assert!(both_clear.clears_adequacy_floor());
+    }
+
+    /// The floor's reason as behaviour: a model whose fit against the bar is
+    /// 0.92 (deepseek-v4.1-flash at elo 1660 against the iq-80 bar of 1813)
+    /// is not adequate, however well its other metrics fit, and a model at
+    /// 0.96 is. Lowering the floor back to 0.9 turns the first assertion red.
+    #[test]
+    fn a_model_eight_percent_short_of_the_bar_is_not_adequate() {
+        let short = score(&[
+            (ModelMetric::Elo, 100.0, 0.92),
+            (ModelMetric::Eq, 30.0, 1.0),
+        ]);
+        assert!(!short.clears_adequacy_floor());
+        let near = score(&[
+            (ModelMetric::Elo, 100.0, 0.96),
+            (ModelMetric::Eq, 30.0, 1.0),
+        ]);
+        assert!(near.clears_adequacy_floor());
     }
 }
