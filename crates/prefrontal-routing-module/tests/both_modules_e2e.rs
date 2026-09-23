@@ -33,7 +33,6 @@ use common::{
     wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
 };
 
-const SUBCONSCIOUS_REL: &str = "../../../subconscious";
 const QUOTA_REPO_REL: &str = "../../../insula";
 const QUOTA_MODULE_ID: &str = "insula";
 
@@ -111,7 +110,7 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
 
 /// Stand up a real subc-core daemon supervising BOTH modules from one subc.jsonc.
 async fn start_both_modules_daemon() -> RealDaemon {
-    let subc_core = build_bin(&sibling(SUBCONSCIOUS_REL), "ck-subc");
+    let subc_core = prefrontal_test_support::SubcDaemonBinary::build();
     let quota_module = build_bin(&sibling(QUOTA_REPO_REL), "ck-insula");
     let routing_module = PathBuf::from(env!("CARGO_BIN_EXE_ck-prefrontal-routing"));
     assert!(routing_module.exists());
@@ -141,8 +140,7 @@ async fn start_both_modules_daemon() -> RealDaemon {
     )
     .unwrap();
 
-    let child = Command::new(&subc_core)
-        .envs(prefrontal_test_support::fenced_subc_daemon_env(&rig))
+    let child = Command::from(subc_core.command(&rig))
         .env("SUBC_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

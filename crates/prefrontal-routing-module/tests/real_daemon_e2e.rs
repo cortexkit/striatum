@@ -16,11 +16,7 @@
 
 mod common;
 
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-    time::Duration,
-};
+use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use tokio::process::{Child, Command};
 
@@ -28,8 +24,6 @@ use common::{
     connect_consumer, control_rpc, raw_route_frame, route_close, route_open, route_select,
     unique_temp_dir, wait_for_catalog, MODULE_ID, SETUP_TIMEOUT,
 };
-
-const SUBCONSCIOUS_REL: &str = "../../../subconscious";
 
 /// A real `subc-core` daemon process plus its isolated rig dir; killed on drop.
 struct RealDaemon {
@@ -60,39 +54,8 @@ impl Drop for RealDaemon {
     }
 }
 
-fn subconscious_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(SUBCONSCIOUS_REL)
-        .canonicalize()
-        .expect("sibling ../subconscious repo must exist for the real-daemon test")
-}
-
-fn build_subc_core() -> PathBuf {
-    let root = subconscious_root();
-    // Build into a prefrontal-owned target dir: building in the sibling's own
-    // target/debug contends with that repo owner's live cargo lock (measured:
-    // a concurrent insula build held both_modules_e2e past its 720s cap).
-    let sibling_target =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sibling-target/subconscious");
-    std::fs::create_dir_all(&sibling_target).unwrap();
-    let status = std::process::Command::new(env!("CARGO"))
-        .current_dir(&root)
-        .args(["build", "--bin", "ck-subc"])
-        .env("CARGO_TARGET_DIR", &sibling_target)
-        .status()
-        .expect("run cargo build for subc-core");
-    assert!(status.success(), "building ck-subc failed");
-    let bin = sibling_target.join("debug/ck-subc");
-    assert!(
-        bin.exists(),
-        "subc-core binary missing at {}",
-        bin.display()
-    );
-    bin
-}
-
 async fn start_real_daemon() -> RealDaemon {
-    let subc_core = build_subc_core();
+    let subc_core = prefrontal_test_support::SubcDaemonBinary::build();
     let module_bin = PathBuf::from(env!("CARGO_BIN_EXE_ck-prefrontal-routing"));
     // Warm-exec the freshly built module binary too (same assessment stall).
     let _ = std::process::Command::new(&module_bin)
@@ -126,8 +89,7 @@ async fn start_real_daemon() -> RealDaemon {
     )
     .unwrap();
 
-    let child = Command::new(&subc_core)
-        .envs(prefrontal_test_support::fenced_subc_daemon_env(&rig))
+    let child = Command::from(subc_core.command(&rig))
         .env("SUBC_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
