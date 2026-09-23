@@ -174,7 +174,8 @@ pub(crate) fn compute_ladder(
             .flatten();
     let operator = config_overrides::read_operator_routing_policy(&sources.operator_config);
 
-    let auth_types = config_overrides::read_provider_auth_types(&sources.host_auth).unwrap_or_default();
+    let auth_types =
+        config_overrides::read_provider_auth_types(&sources.host_auth).unwrap_or_default();
     let host_providers: HashSet<String> = auth_types.keys().cloned().collect();
     let broca_providers =
         config_overrides::read_broca_credential_providers(&sources.broca_vault_handles)
@@ -218,28 +219,37 @@ pub(crate) fn compute_ladder(
         .map_err(|error| error.message)?;
         ladder_eq = resolved.requirements.eq;
         let subscription = subscription_keys.clone();
-        let selected = select_model_route_with_config(
-            SelectModelRouteInput {
-                target_agent: LADDER_TARGET_AGENT.to_string(),
-                requirements: resolved.requirements,
-                available_models: available.clone(),
-                facts: facts.clone(),
-                runtime_snapshot: None,
-                exclude_route_keys: Vec::new(),
-                operator_exclude_keys: operator.exclude.clone(),
-                prefer_fast_specs: Vec::new(),
-                required_capabilities: resolved.required_capabilities,
-                is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                    subscription.contains(&route.route_key)
-                        || subscription.contains(&route.capacity_key)
-                })),
-                min_best_effort_adequacy,
-                prefer_prompt_cache: false,
-                providers_without_prompt_cache: HashSet::new(),
-            },
-            &routing_config,
-        );
-        let winner = selected.ok().map(|selected| {
+        // The ladder runs inside placement handlers and background loops. If the
+        // router panics on this availability set (its ordering has panicked with
+        // "comparison function does not correctly implement a total order" on
+        // mixed subscription catalogs), the placement must still complete: the
+        // ladder is reported unavailable and no notice is emitted for the change.
+        let selected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            select_model_route_with_config(
+                SelectModelRouteInput {
+                    target_agent: LADDER_TARGET_AGENT.to_string(),
+                    requirements: resolved.requirements,
+                    available_models: available.clone(),
+                    facts: facts.clone(),
+                    runtime_snapshot: None,
+                    exclude_route_keys: Vec::new(),
+                    operator_exclude_keys: operator.exclude.clone(),
+                    prefer_fast_specs: Vec::new(),
+                    required_capabilities: resolved.required_capabilities,
+                    is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
+                        subscription.contains(&route.route_key)
+                            || subscription.contains(&route.capacity_key)
+                    })),
+                    min_best_effort_adequacy,
+                    prefer_prompt_cache: false,
+                    providers_without_prompt_cache: HashSet::new(),
+                },
+                &routing_config,
+            )
+            .ok()
+        }))
+        .map_err(|_| format!("route selection panicked at iq {tier}"))?;
+        let winner = selected.map(|selected| {
             let provider = provider_by_route
                 .get(&selected.route_key)
                 .cloned()
@@ -436,12 +446,18 @@ impl ConfigReloadWatch {
         }
         let mut changed = Vec::new();
         if current.routing_config != self.last.routing_config {
-            changed.push(format!("routing config {}", sources.routing_config.display()));
+            changed.push(format!(
+                "routing config {}",
+                sources.routing_config.display()
+            ));
         }
         if current.operator_config != self.last.operator_config
             && sources.operator_config != sources.routing_config
         {
-            changed.push(format!("operator config {}", sources.operator_config.display()));
+            changed.push(format!(
+                "operator config {}",
+                sources.operator_config.display()
+            ));
         }
         if current.host_providers != self.last.host_providers {
             changed.push("host provider credentials".to_string());
@@ -509,9 +525,7 @@ mod tests {
             "/../../script/health-sentinel.ts"
         ))
         .unwrap();
-        assert!(sentinel.contains(&format!(
-            "ROUTE_WINNER_NOTICE_PREFIX = \"{NOTICE_PREFIX}\""
-        )));
+        assert!(sentinel.contains(&format!("ROUTE_WINNER_NOTICE_PREFIX = \"{NOTICE_PREFIX}\"")));
     }
 
     #[test]
@@ -524,7 +538,13 @@ mod tests {
     fn a_substrate_change_under_the_same_winner_is_not_a_move() {
         let before = ladder(["a", "a", "b", "b", "c", "c", "c"]);
         let mut after = before.clone();
-        after.winners.get_mut(&100).unwrap().as_mut().unwrap().substrates = vec![];
+        after
+            .winners
+            .get_mut(&100)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .substrates = vec![];
         assert_eq!(diff_ladders(&before, &after, "t"), None);
     }
 

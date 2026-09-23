@@ -621,7 +621,7 @@ fn apply_catalog_snapshot(
 ) -> Result<(), FusiformCatalogError> {
     let ladder_before = ladder.and_then(|sources| winner_ladder::ladder_before(store, sources));
     store
-        .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor.clone())
+        .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
         .map_err(|reason| error(format!("apply {context}: {reason}")))?;
     if let Some(path) = family_config_path {
         crate::config_overrides::apply_family_rules_from_config(store, path)
@@ -674,7 +674,13 @@ async fn poll_cycle<C: CatalogWire>(
         .unwrap_or(true);
     let get_calls = if should_get {
         let snapshot = client.catalog_get().await?;
-        apply_catalog_snapshot(store, &snapshot, family_config_path, ladder, "catalog replay")?;
+        apply_catalog_snapshot(
+            store,
+            &snapshot,
+            family_config_path,
+            ladder,
+            "catalog replay",
+        )?;
         1
     } else {
         0

@@ -8508,7 +8508,11 @@ mod tests {
         );
 
         let notices = rig.notices();
-        assert_eq!(notices.len(), 1, "exactly one notice per placement: {notices:?}");
+        assert_eq!(
+            notices.len(),
+            1,
+            "exactly one notice per placement: {notices:?}"
+        );
         let notice = &notices[0];
         assert_eq!(
             notice["trigger"],
