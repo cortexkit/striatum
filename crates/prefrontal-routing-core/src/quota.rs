@@ -285,9 +285,58 @@ pub const NO_RESET_REPROBE_HORIZON_MS: f64 = 6.0 * 60.0 * 60.0 * 1000.0;
 struct CapacitySignal {
     pressure: Option<f64>,
     window_model: Option<PaceWindowModel>,
+    /// Every window's abundance reading, kept raw until all of the account's
+    /// windows for this capacity are in: the fold rule (scarcity wins, else the
+    /// longest window) compares windows against each other, so it cannot be
+    /// applied incrementally as each window arrives.
+    abundance_samples: Vec<AbundanceSample>,
     abundance: Option<f64>,
     abundance_window: Option<String>,
     exhausted_until: Option<f64>,
+}
+
+/// One window's abundance reading with the identity and length the fold needs.
+#[derive(Debug, Clone, PartialEq)]
+struct AbundanceSample {
+    abundance: f64,
+    window_key: String,
+    window_ms: Option<f64>,
+}
+
+/// Fold one account's window abundances for one capacity into the account's
+/// single abundance. Scarcity always wins: if any window's abundance is below
+/// 1.0 (that window runs out before its reset at the current pace), the account
+/// reads the LOWEST value. Otherwise every window has surplus, and the account
+/// reads the LONGEST window's value, because that surplus is what perishes
+/// unused at reset while shorter windows only pace how fast it can be spent.
+/// (Not the highest value: a window exactly on pace at 1.0 must not be lifted
+/// by a shorter window's 3.0.) Ties on window length take the lower value;
+/// ties on value take the lexicographically smaller window key, matching the
+/// tie-break the previous incremental fold used.
+fn fold_account_abundance(samples: &[AbundanceSample]) -> Option<(f64, String)> {
+    if samples.iter().any(|sample| sample.abundance < 1.0) {
+        return samples
+            .iter()
+            .min_by(|a, b| {
+                a.abundance
+                    .total_cmp(&b.abundance)
+                    .then_with(|| a.window_key.cmp(&b.window_key))
+            })
+            .map(|sample| (sample.abundance, sample.window_key.clone()));
+    }
+    samples
+        .iter()
+        .max_by(|a, b| {
+            // A missing length (no fixed boundary) sorts as the shortest window.
+            a.window_ms
+                .unwrap_or(0.0)
+                .total_cmp(&b.window_ms.unwrap_or(0.0))
+                // Reversed so that, at equal length, the LOWER value wins ...
+                .then_with(|| b.abundance.total_cmp(&a.abundance))
+                // ... and at equal value the smaller window key wins.
+                .then_with(|| b.window_key.cmp(&a.window_key))
+        })
+        .map(|sample| (sample.abundance, sample.window_key.clone()))
 }
 
 type AccountSignals = HashMap<(String, String), HashMap<String, CapacitySignal>>;
@@ -301,7 +350,7 @@ fn record_capacity_signal(
     account_key: &(String, String),
     targets: &[String],
     pressure: Option<(f64, PaceWindowModel)>,
-    abundance: Option<(f64, &str)>,
+    abundance: Option<(f64, &str, Option<f64>)>,
     exhausted_until: Option<f64>,
 ) {
     for cap in targets {
@@ -310,26 +359,22 @@ fn record_capacity_signal(
             .or_default()
             .entry(cap.clone())
             .or_default();
-        // Pressure is worst-window, while abundance is the minimum remaining pace
-        // among only the windows that target this capacity.
+        // Pressure is worst-window. Abundance readings are COLLECTED, not
+        // folded here: a later window can still be the scarce one that wins
+        // over an earlier long one (or vice versa), so the fold runs once all
+        // of the account's windows are in (fold_account_abundance below).
         if let Some((pressure, window_model)) = pressure {
             if sig.pressure.is_none_or(|existing| pressure > existing) {
                 sig.pressure = Some(pressure);
                 sig.window_model = Some(window_model);
             }
         }
-        if let Some((abundance, window_key)) = abundance {
-            let replace = match (sig.abundance, sig.abundance_window.as_deref()) {
-                (None, _) => true,
-                (Some(existing), Some(existing_window)) => {
-                    abundance < existing || (abundance == existing && window_key < existing_window)
-                }
-                (Some(_), None) => true,
-            };
-            if replace {
-                sig.abundance = Some(abundance);
-                sig.abundance_window = Some(window_key.to_owned());
-            }
+        if let Some((abundance, window_key, window_ms)) = abundance {
+            sig.abundance_samples.push(AbundanceSample {
+                abundance,
+                window_key: window_key.to_owned(),
+                window_ms,
+            });
         }
         if let Some(exhausted_until) = exhausted_until {
             sig.exhausted_until = Some(match sig.exhausted_until {
@@ -485,7 +530,7 @@ pub fn merge_quota_overlay_with(
                 &account_key,
                 &targets,
                 pace.map(|pace| (pace.pressure, pace.window_model)),
-                abundance.map(|abundance| (abundance, win.window_key.as_str())),
+                abundance.map(|abundance| (abundance, win.window_key.as_str(), win.window_ms)),
                 blocked.then(|| {
                     // A rolling pool reports no fixed boundary, so its recovery time
                     // is the local reprobe horizon rather than an invented provider
@@ -543,7 +588,13 @@ pub fn merge_quota_overlay_with(
     // can serve; a higher-pressure sibling is never used as a fallback.
     let mut accounts_by_capacity: HashMap<String, Vec<CapacitySignal>> = HashMap::new();
     for caps in signals.into_values() {
-        for (cap, signal) in caps {
+        for (cap, mut signal) in caps {
+            // All of this account's windows for this capacity are in: fold its
+            // abundance once (scarcity wins, otherwise the longest window).
+            if let Some((value, window_key)) = fold_account_abundance(&signal.abundance_samples) {
+                signal.abundance = Some(value);
+                signal.abundance_window = Some(window_key);
+            }
             accounts_by_capacity.entry(cap).or_default().push(signal);
         }
     }
@@ -979,6 +1030,159 @@ mod tests {
         assert!(
             state.quota_abundance.expect("tied account maximum") > 1.0,
             "three 5%-used serving accounts must not be demoted by the 95%-used sibling"
+        );
+    }
+
+    /// One account with a weekly (primary, 10080 min) and a 5-hour (secondary,
+    /// 300 min) window, shaped like the live kimi-for-coding readings.
+    fn weekly_and_five_hour(
+        weekly_used_percent: f64,
+        weekly_resets_at: &str,
+        five_hour_used_percent: f64,
+        five_hour_resets_at: &str,
+    ) -> ModelRouteStateSnapshot {
+        let kimi_fact = fact("kimi", "kimi-k2-thinking", 50.0);
+        let windows = usage(serde_json::json!({
+            "provider": "kimi-for-coding",
+            "apiProvider": "kimi",
+            "account": "plan-global",
+            "usage": {
+                "primary": {
+                    "usedPercent": weekly_used_percent,
+                    "resetsAt": weekly_resets_at,
+                    "windowMinutes": 10080
+                },
+                "secondary": {
+                    "usedPercent": five_hour_used_percent,
+                    "resetsAt": five_hour_resets_at,
+                    "windowMinutes": 300
+                }
+            }
+        }));
+        overlay(&[windows], std::slice::from_ref(&kimi_fact))
+    }
+
+    #[test]
+    fn abundance_fold_picks_longest_window_when_both_windows_have_surplus() {
+        // Live 2026-09-23 08:54Z shape: 5-hour 65% used with 74 min left
+        // (0.35 / (74/300) = 1.4189), weekly 47% used with 1992 min left
+        // (0.53 / (1992/10080) = 2.6819). Both above 1.0, so the account reads
+        // the LONGEST window: the weekly surplus is what perishes at reset.
+        let snapshot =
+            weekly_and_five_hour(47.0, "2030-01-02T09:12:00Z", 65.0, "2030-01-01T01:14:00Z");
+        let state = &snapshot.by_capacity["kimi/kimi-k2-thinking"];
+        assert_near(state.quota_abundance, 2.681_927_710_843_373_5);
+        assert_eq!(
+            state.quota_abundance_window.as_deref(),
+            Some("codexbar:kimi-for-coding:primary"),
+            "the weekly, not the 5-hour value of 1.4189, must gate the capacity"
+        );
+    }
+
+    #[test]
+    fn abundance_fold_picks_weekly_when_five_hour_just_reset() {
+        // A freshly reset 5-hour slice reads exactly 1.0 (idle window, time
+        // fraction clamps to 1) while the weekly sits at 0.99 / 0.3 = 3.3.
+        // The 5-hour only paces the weekly's spend, so the account reads 3.3.
+        let snapshot =
+            weekly_and_five_hour(1.0, "2030-01-03T02:24:00Z", 0.0, "2030-01-01T05:00:00Z");
+        let state = &snapshot.by_capacity["kimi/kimi-k2-thinking"];
+        assert_near(state.quota_abundance, 3.3);
+        assert_eq!(
+            state.quota_abundance_window.as_deref(),
+            Some("codexbar:kimi-for-coding:primary")
+        );
+    }
+
+    #[test]
+    fn abundance_fold_scarcity_wins_when_five_hour_is_nearly_spent() {
+        // 5-hour 90% used with 240 min left: 0.1 / 0.8 = 0.125, below 1.0, so
+        // scarcity wins over the weekly's 3.3 surplus.
+        let snapshot =
+            weekly_and_five_hour(1.0, "2030-01-03T02:24:00Z", 90.0, "2030-01-01T04:00:00Z");
+        let state = &snapshot.by_capacity["kimi/kimi-k2-thinking"];
+        assert_near(state.quota_abundance, 0.125);
+        assert_eq!(
+            state.quota_abundance_window.as_deref(),
+            Some("codexbar:kimi-for-coding:secondary"),
+            "the scarce 5-hour, not the abundant weekly, must gate the capacity"
+        );
+    }
+
+    #[test]
+    fn abundance_fold_weekly_on_pace_is_not_lifted_by_five_hour_surplus() {
+        // Weekly exactly on pace reads 1.0 (0.5 / 0.5); the 5-hour reads 3.0
+        // (0.75 / 0.25). No window is scarce, and the LONGEST window's value is
+        // 1.0 — the fold must not take the highest value.
+        let snapshot =
+            weekly_and_five_hour(50.0, "2030-01-04T12:00:00Z", 25.0, "2030-01-01T01:15:00Z");
+        let state = &snapshot.by_capacity["kimi/kimi-k2-thinking"];
+        assert_near(state.quota_abundance, 1.0);
+        assert_eq!(
+            state.quota_abundance_window.as_deref(),
+            Some("codexbar:kimi-for-coding:primary")
+        );
+    }
+
+    /// Claude-shaped account: primary is the 5-hour (300 min), secondary the
+    /// weekly (10080 min) — the reverse slot assignment of kimi-for-coding.
+    fn claude_five_hour_and_weekly(
+        five_hour_used_percent: f64,
+        five_hour_resets_at: &str,
+        weekly_used_percent: f64,
+        weekly_resets_at: &str,
+    ) -> ModelRouteStateSnapshot {
+        let claude_fact = fact("anthropic", "claude", 50.0);
+        let windows = usage(serde_json::json!({
+            "provider": "claude",
+            "apiProvider": "anthropic",
+            "account": "seat-one",
+            "usage": {
+                "primary": {
+                    "usedPercent": five_hour_used_percent,
+                    "resetsAt": five_hour_resets_at,
+                    "windowMinutes": 300
+                },
+                "secondary": {
+                    "usedPercent": weekly_used_percent,
+                    "resetsAt": weekly_resets_at,
+                    "windowMinutes": 10080
+                }
+            }
+        }));
+        overlay(&[windows], std::slice::from_ref(&claude_fact))
+    }
+
+    #[test]
+    fn abundance_fold_longest_window_branch_is_provider_agnostic() {
+        // Live 2026-09-23 08:54Z anthropic readings, verbatim: 5-hour 2% used
+        // resetting in 96 min (0.98 / 0.32 = 3.0625), weekly 91% used resetting
+        // in 306 min (0.09 / (306/10080) = 2.9647). The weekly is 91% used but
+        // resets the same afternoon, so its leftover would perish at reset:
+        // this is SURPLUS, not scarcity, and the fold takes the longest-window
+        // branch on a non-Kimi account.
+        let snapshot =
+            claude_five_hour_and_weekly(2.0, "2030-01-01T01:36:00Z", 91.0, "2030-01-01T05:06:00Z");
+        let state = &snapshot.by_capacity["anthropic/claude"];
+        assert_near(state.quota_abundance, 2.964_705_882_352_941_1);
+        assert_eq!(
+            state.quota_abundance_window.as_deref(),
+            Some("codexbar:claude:secondary")
+        );
+    }
+
+    #[test]
+    fn abundance_fold_scarcity_branch_is_provider_agnostic() {
+        // Same Claude shape, but the weekly resets the next afternoon (1746 min
+        // left): 0.09 / (1746/10080) = 0.5196, below 1.0, so scarcity wins over
+        // the 5-hour's 3.0625 surplus on a non-Kimi account.
+        let snapshot =
+            claude_five_hour_and_weekly(2.0, "2030-01-01T01:36:00Z", 91.0, "2030-01-02T05:06:00Z");
+        let state = &snapshot.by_capacity["anthropic/claude"];
+        assert_near(state.quota_abundance, 0.519_587_628_865_979_4);
+        assert_eq!(
+            state.quota_abundance_window.as_deref(),
+            Some("codexbar:claude:secondary")
         );
     }
 }
