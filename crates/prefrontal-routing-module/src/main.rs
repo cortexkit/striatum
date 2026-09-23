@@ -20,6 +20,7 @@ mod config_overrides;
 mod fusiform_catalog;
 mod model_resolution;
 mod quota_consumer;
+mod winner_ladder;
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -643,10 +644,18 @@ where
             })?,
             DEFAULT_MODULE_ID,
         ));
+    // Every placement and config reload compares the winner ladder over the same
+    // files a selection reads; the operator policy lives in the routing file.
+    let ladder_sources = winner_ladder::LadderSources::live(
+        &config_overrides::config_path(),
+        &config_overrides::config_path(),
+        &config_overrides::broca_vault_handles_path(),
+    );
     tokio::spawn(aa_ingest::aa_ingest_loop(
         Arc::clone(&store),
         config_overrides::config_path(),
         aa_credential_resolver,
+        ladder_sources.clone(),
     ));
 
     // Merge the user's model-fact overrides (model_routing.models) from the module's
@@ -691,6 +700,13 @@ where
         Arc::clone(&store),
         Arc::clone(&catalog_health),
         catalog_poll_ms,
+        ladder_sources.clone(),
+    ));
+    // Seeds the latest ladder after boot-time overrides, then compares a ladder
+    // only when a config file the ladder reads actually changed.
+    tokio::spawn(winner_ladder::config_reload_watch_loop(
+        Arc::clone(&store),
+        ladder_sources,
     ));
 
     let min_band: SharedMinBand = Arc::new(std::sync::Mutex::new(
@@ -1457,6 +1473,7 @@ async fn handle_model_upsert(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
+    ladder_sources: &winner_ladder::LadderSources,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -1552,6 +1569,9 @@ async fn handle_model_upsert(
             .await;
         }
     };
+    // A placement can make this route the winner at some demand tier (or unseat
+    // one), so compare the winner ladder around the write and announce a move.
+    let ladder_before = winner_ladder::ladder_before(store.as_ref(), ladder_sources);
     if let Err(error) = store.upsert_fact(&fact, FactSource::Override) {
         return send_route_error(
             writer,
@@ -1564,6 +1584,13 @@ async fn handle_model_upsert(
         )
         .await;
     }
+    winner_ladder::announce_after(
+        store.as_ref(),
+        ladder_sources,
+        ladder_before,
+        &format!("route.model_upsert {route_key}"),
+        winner_ladder::latest_ladder(),
+    );
     let mut fact_fields = Vec::new();
     if params.context_window.is_some() {
         fact_fields.push(CatalogFactField::ContextWindow);
@@ -1617,6 +1644,7 @@ async fn handle_model_seed_aa(
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
     routing_config_path: &Path,
+    ladder_sources: &winner_ladder::LadderSources,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -1667,8 +1695,23 @@ async fn handle_model_seed_aa(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+    let ladder_before = winner_ladder::ladder_before(store.as_ref(), ladder_sources);
     match aa_ingest::seed_aa(store, &params, &aa_config, now) {
         Ok(ok) => {
+            winner_ladder::announce_after(
+                store.as_ref(),
+                ladder_sources,
+                ladder_before,
+                &format!(
+                    "route.model_seed_aa {}",
+                    make_route_key(
+                        &params.provider_id,
+                        &params.model_id,
+                        params.variant.as_deref()
+                    )
+                ),
+                winner_ladder::latest_ladder(),
+            );
             let body =
                 serde_json::to_vec(&json!({ "result": aa_ingest::seed_aa_result_json(&ok) }))
                     .map_err(ModuleError::Json)?;
@@ -2328,10 +2371,21 @@ async fn handle_select_request(
         return available_models_text::handle(frame, writer, store, operator_config_path).await;
     }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
-        return handle_model_upsert(frame, writer, store).await;
+        let ladder_sources = winner_ladder::LadderSources::live(
+            routing_config_path,
+            operator_config_path,
+            broca_vault_handles_path,
+        );
+        return handle_model_upsert(frame, writer, store, &ladder_sources).await;
     }
     if envelope.method == ROUTE_MODEL_SEED_AA_OP {
-        return handle_model_seed_aa(frame, writer, store, routing_config_path).await;
+        let ladder_sources = winner_ladder::LadderSources::live(
+            routing_config_path,
+            operator_config_path,
+            broca_vault_handles_path,
+        );
+        return handle_model_seed_aa(frame, writer, store, routing_config_path, &ladder_sources)
+            .await;
     }
     if envelope.method == ROUTE_LIST_INFERRED_OP {
         return handle_list_inferred(frame, writer, store).await;
@@ -8326,5 +8380,237 @@ mod tests {
         )
         .await;
         assert_eq!(unscored_only.header.ty, FrameType::Error);
+    }
+
+    /// A store holding two routes of one test-only provider, and ladder sources
+    /// under which only that provider is reachable, so the seed catalog never
+    /// competes. `incumbent` wins the top tier; `small` is cheap and weak.
+    struct LadderRig {
+        /// Held only so the scratch directory outlives the test.
+        _rig: Rig,
+        store: SharedStore,
+        sources: winner_ladder::LadderSources,
+        provider: String,
+    }
+
+    impl LadderRig {
+        fn new(label: &str) -> Self {
+            let rig = Rig::new(label);
+            let store: SharedStore = Arc::new(rig.open_store());
+            let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let provider = format!("ladder-{label}-{}-{n}", std::process::id());
+            let host_auth = rig.dir.join("auth.json");
+            let mut auth = serde_json::Map::new();
+            auth.insert(provider.clone(), json!({ "type": "api" }));
+            std::fs::write(&host_auth, serde_json::to_vec(&auth).unwrap()).unwrap();
+            let mut incumbent = fact(&provider, "incumbent");
+            incumbent.scores.elo = 1_500.0;
+            incumbent.scores.eq = 1_500.0;
+            incumbent.cost_per_m_tok_out = Some(10.0);
+            let mut small = fact(&provider, "small");
+            small.scores.elo = 1_200.0;
+            small.scores.eq = 1_500.0;
+            small.cost_per_m_tok_out = Some(0.5);
+            for row in [&incumbent, &small] {
+                store.upsert_fact(row, FactSource::Override).unwrap();
+            }
+            let sources = winner_ladder::LadderSources {
+                routing_config: rig.dir.join("alfonso-routing.jsonc"),
+                operator_config: rig.dir.join("alfonso-routing.jsonc"),
+                host_auth,
+                broca_vault_handles: PathBuf::from(ABSENT_BROCA_VAULT_HANDLES),
+            };
+            Self {
+                _rig: rig,
+                store,
+                sources,
+                provider,
+            }
+        }
+
+        fn route(&self, model: &str) -> String {
+            make_route_key(&self.provider, model, None)
+        }
+
+        fn ladder(&self) -> winner_ladder::WinnerLadder {
+            winner_ladder::compute_ladder(self.store.as_ref(), &self.sources).unwrap()
+        }
+
+        /// Notice lines this rig's provider appears in, in emission order.
+        fn notices(&self) -> Vec<serde_json::Value> {
+            winner_ladder::emitted_lines()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains(&self.provider))
+                .map(|line| {
+                    let body = line
+                        .strip_prefix(winner_ladder::NOTICE_PREFIX)
+                        .expect("notice line carries the fixed prefix");
+                    serde_json::from_str(body).unwrap()
+                })
+                .collect()
+        }
+
+        async fn upsert(&self, params: serde_json::Value) -> Frame {
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(&json!({
+                    "method": ROUTE_MODEL_UPSERT_OP,
+                    "params": params,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            handle_model_upsert(frame, &tx, &self.store, &self.sources)
+                .await
+                .unwrap();
+            rx.recv().await.unwrap()
+        }
+    }
+
+    fn tier_winner(ladder: &winner_ladder::WinnerLadder, tier: u8) -> Option<String> {
+        ladder.winners[&tier]
+            .as_ref()
+            .map(|winner| winner.route_key.clone())
+    }
+
+    #[tokio::test]
+    async fn placement_raising_a_new_route_above_the_incumbent_at_iq_100_emits_one_notice() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = LadderRig::new("raise");
+        let before = rig.ladder();
+        assert_eq!(
+            tier_winner(&before, 100),
+            Some(rig.route("incumbent")),
+            "precondition: the incumbent holds iq 100"
+        );
+
+        let response = rig
+            .upsert(json!({
+                "providerID": rig.provider,
+                "modelID": "challenger",
+                "elo": 2_000.0,
+                "eq": 1_500.0,
+                "costPerMTokOut": 30.0,
+            }))
+            .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        assert_eq!(
+            tier_winner(&rig.ladder(), 100),
+            Some(rig.route("challenger")),
+            "the placement must actually move iq 100 for this test to mean anything"
+        );
+
+        let notices = rig.notices();
+        assert_eq!(notices.len(), 1, "exactly one notice per placement: {notices:?}");
+        let notice = &notices[0];
+        assert_eq!(
+            notice["trigger"],
+            format!("route.model_upsert {}", rig.route("challenger"))
+        );
+        let changes = notice["changes"].as_array().unwrap();
+        let top = changes
+            .iter()
+            .find(|change| change["tiers"].as_array().unwrap().contains(&json!(100)))
+            .expect("a change naming iq 100");
+        assert_eq!(top["oldRoute"], json!(rig.route("incumbent")));
+        assert_eq!(top["newRoute"], json!(rig.route("challenger")));
+        assert_eq!(top["newRouteSubstrates"], json!(["opencode-host"]));
+    }
+
+    #[tokio::test]
+    async fn placement_that_changes_a_score_but_no_winner_emits_no_notice() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = LadderRig::new("twin");
+        let before = rig.ladder();
+
+        let response = rig
+            .upsert(json!({
+                "providerID": rig.provider,
+                "modelID": "small",
+                "elo": 1_201.0,
+            }))
+            .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let stored = rig
+            .store
+            .get_fact_by_route_key(&rig.route("small"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.scores.elo, 1_201.0, "the placement must land");
+        assert_eq!(rig.ladder(), before, "precondition: no tier's winner moved");
+
+        assert_eq!(rig.notices(), Vec::<serde_json::Value>::new());
+    }
+
+    #[tokio::test]
+    async fn quota_and_cooldown_changes_alone_move_no_ladder_winner() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = LadderRig::new("quota");
+        let before = rig.ladder();
+        let incumbent = rig.route("incumbent");
+        assert_eq!(tier_winner(&before, 100), Some(incumbent.clone()));
+
+        // Wall the iq-100 winner hard: live selection would route around it.
+        let far_future = now_ms() as f64 + 3_600_000.0;
+        record_cooldown_update(
+            rig.store.as_ref(),
+            &RecordCooldownParams {
+                route_key: incumbent.clone(),
+                capacity_key: incumbent.clone(),
+                cooldown_until: Some(far_future),
+                quota_exhausted_until: Some(far_future),
+                quota_pressure: Some(1.0),
+                wall_class: Some(RouteWallClass::Quota),
+                provider_wide: false,
+                increment_quota_error: true,
+                increment_failure: false,
+                last_error: Some("usage limit".into()),
+            },
+        )
+        .unwrap();
+        assert!(
+            rig.store.build_snapshot(now_ms() as f64).unwrap().by_route[&incumbent]
+                .quota_exhausted_until
+                .is_some(),
+            "precondition: the wall is recorded"
+        );
+
+        let after = rig.ladder();
+        assert_eq!(winner_ladder::diff_ladders(&before, &after, "quota"), None);
+        assert_eq!(rig.notices(), Vec::<serde_json::Value>::new());
+    }
+
+    #[test]
+    fn config_reload_excluding_the_winner_announces_once_and_an_unchanged_config_is_silent() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = LadderRig::new("reload");
+        let latest = Mutex::new(Some(rig.ladder()));
+        let mut watch = winner_ladder::ConfigReloadWatch::new(&rig.sources);
+        assert_eq!(watch.check(rig.store.as_ref(), &rig.sources, &latest), None);
+
+        std::fs::write(
+            &rig.sources.routing_config,
+            serde_json::to_vec(&json!({
+                "model_routing": { "exclude": [rig.route("incumbent")] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let notice = watch
+            .check(rig.store.as_ref(), &rig.sources, &latest)
+            .expect("excluding the iq-100 winner moves it");
+        assert!(notice.trigger.starts_with("config reload (routing config "));
+        assert!(notice.changes.iter().any(|change| {
+            change.old_route.as_deref() == Some(rig.route("incumbent").as_str())
+                && change.tiers.contains(&100)
+        }));
+        assert_eq!(watch.check(rig.store.as_ref(), &rig.sources, &latest), None);
     }
 }

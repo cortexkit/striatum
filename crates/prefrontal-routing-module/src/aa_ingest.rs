@@ -380,9 +380,13 @@ pub async fn aa_ingest_loop(
     store: std::sync::Arc<SqliteRouteStateStore>,
     config_path: PathBuf,
     resolver: std::sync::Arc<dyn CredentialResolver>,
+    ladder_sources: crate::winner_ladder::LadderSources,
 ) {
     let mut credential_log_state = AaCredentialLogState::default();
     loop {
+        // A refreshed AA index can re-infer provisional scores, so the ingest is
+        // one of the changes that gets a winner-ladder comparison.
+        let ladder_before = crate::winner_ladder::ladder_before(store.as_ref(), &ladder_sources);
         run_aa_ingest_cycle(
             store.as_ref(),
             &config_path,
@@ -390,6 +394,13 @@ pub async fn aa_ingest_loop(
             &mut credential_log_state,
         )
         .await;
+        crate::winner_ladder::announce_after(
+            store.as_ref(),
+            &ladder_sources,
+            ladder_before,
+            "AA ingest",
+            crate::winner_ladder::latest_ladder(),
+        );
         tokio::time::sleep(AA_INGEST_INTERVAL).await;
     }
 }

@@ -30,6 +30,8 @@ use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
+use crate::winner_ladder::{self, LadderSources};
+
 const FUSIFORM_MODULE_ID: &str = "fusiform";
 const CATALOG_GET: &str = "catalog.get";
 const CATALOG_STATUS: &str = "catalog.status";
@@ -607,20 +609,45 @@ struct CycleOutcome {
     get_calls: usize,
 }
 
+/// Apply one fetched catalog snapshot plus the family rules that follow it. A
+/// catalog apply can add, withdraw, or re-price a route, so when `ladder` is
+/// given the winner ladder is compared around it and a move is announced.
+fn apply_catalog_snapshot(
+    store: &SqliteRouteStateStore,
+    snapshot: &CatalogSnapshot,
+    family_config_path: Option<&Path>,
+    ladder: Option<&LadderSources>,
+    context: &str,
+) -> Result<(), FusiformCatalogError> {
+    let ladder_before = ladder.and_then(|sources| winner_ladder::ladder_before(store, sources));
+    store
+        .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor.clone())
+        .map_err(|reason| error(format!("apply {context}: {reason}")))?;
+    if let Some(path) = family_config_path {
+        crate::config_overrides::apply_family_rules_from_config(store, path)
+            .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
+    }
+    if let Some(sources) = ladder {
+        winner_ladder::announce_after(
+            store,
+            sources,
+            ladder_before,
+            &format!("Fusiform catalog apply ({context})"),
+            winner_ladder::latest_ladder(),
+        );
+    }
+    Ok(())
+}
+
 async fn bootstrap_cycle<C: CatalogWire>(
     client: &mut C,
     store: &SqliteRouteStateStore,
     health: &SharedCatalogHealth,
     family_config_path: Option<&Path>,
+    ladder: Option<&LadderSources>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let snapshot = client.catalog_get().await?;
-    store
-        .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
-        .map_err(|reason| error(format!("apply catalog.get: {reason}")))?;
-    if let Some(path) = family_config_path {
-        crate::config_overrides::apply_family_rules_from_config(store, path)
-            .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
-    }
+    apply_catalog_snapshot(store, &snapshot, family_config_path, ladder, "catalog.get")?;
     if let Ok(mut health) = health.lock() {
         health.note_reached(now_ms());
     }
@@ -633,6 +660,7 @@ async fn poll_cycle<C: CatalogWire>(
     store: &SqliteRouteStateStore,
     health: &SharedCatalogHealth,
     family_config_path: Option<&Path>,
+    ladder: Option<&LadderSources>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let status = client.catalog_status().await?;
     if let Ok(mut health) = health.lock() {
@@ -646,13 +674,7 @@ async fn poll_cycle<C: CatalogWire>(
         .unwrap_or(true);
     let get_calls = if should_get {
         let snapshot = client.catalog_get().await?;
-        store
-            .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
-            .map_err(|reason| error(format!("apply catalog replay: {reason}")))?;
-        if let Some(path) = family_config_path {
-            crate::config_overrides::apply_family_rules_from_config(store, path)
-                .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
-        }
+        apply_catalog_snapshot(store, &snapshot, family_config_path, ladder, "catalog replay")?;
         1
     } else {
         0
@@ -666,6 +688,7 @@ pub async fn catalog_refresh_loop(
     store: Arc<SqliteRouteStateStore>,
     health: SharedCatalogHealth,
     poll_ms: u64,
+    ladder_sources: LadderSources,
 ) {
     let project_root = std::env::temp_dir().join("prefrontal-routing-fusiform-consumer");
     let _ = std::fs::create_dir_all(&project_root);
@@ -676,10 +699,24 @@ pub async fn catalog_refresh_loop(
         let result =
             match FusiformCatalogConsumer::connect(&connection_file_path, &project_root).await {
                 Ok(mut consumer) if bootstrapped => {
-                    poll_cycle(&mut consumer, &store, &health, Some(&family_config_path)).await
+                    poll_cycle(
+                        &mut consumer,
+                        &store,
+                        &health,
+                        Some(&family_config_path),
+                        Some(&ladder_sources),
+                    )
+                    .await
                 }
                 Ok(mut consumer) => {
-                    bootstrap_cycle(&mut consumer, &store, &health, Some(&family_config_path)).await
+                    bootstrap_cycle(
+                        &mut consumer,
+                        &store,
+                        &health,
+                        Some(&family_config_path),
+                        Some(&ladder_sources),
+                    )
+                    .await
                 }
                 Err(reason) => Err(reason),
             };
@@ -1053,7 +1090,7 @@ mod tests {
             get_calls: 0,
             closed: false,
         };
-        let outcome = poll_cycle(&mut unchanged, &store, &health, None)
+        let outcome = poll_cycle(&mut unchanged, &store, &health, None, None)
             .await
             .unwrap();
         assert_eq!(outcome.get_calls, 0);
@@ -1068,7 +1105,7 @@ mod tests {
             get_calls: 0,
             closed: false,
         };
-        let outcome = poll_cycle(&mut advanced, &store, &health, None)
+        let outcome = poll_cycle(&mut advanced, &store, &health, None, None)
             .await
             .unwrap();
         assert_eq!(outcome.get_calls, 1);
@@ -1100,7 +1137,7 @@ mod tests {
             get_calls: 0,
             closed: false,
         };
-        bootstrap_cycle(&mut wire, &store, &health, None)
+        bootstrap_cycle(&mut wire, &store, &health, None, None)
             .await
             .unwrap();
         assert_eq!(
