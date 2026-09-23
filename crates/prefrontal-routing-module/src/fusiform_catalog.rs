@@ -619,7 +619,6 @@ fn apply_catalog_snapshot(
     ladder: Option<&LadderSources>,
     context: &str,
 ) -> Result<(), FusiformCatalogError> {
-    let ladder_before = ladder.and_then(|sources| winner_ladder::ladder_before(store, sources));
     store
         .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
         .map_err(|reason| error(format!("apply {context}: {reason}")))?;
@@ -628,12 +627,10 @@ fn apply_catalog_snapshot(
             .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
     }
     if let Some(sources) = ladder {
-        winner_ladder::announce_after(
+        winner_ladder::announce(
             store,
             sources,
-            ladder_before,
             &format!("Fusiform catalog apply ({context})"),
-            winner_ladder::latest_ladder(),
         );
     }
     Ok(())

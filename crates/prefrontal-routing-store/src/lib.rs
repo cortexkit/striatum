@@ -134,6 +134,8 @@ const MIGRATION_037: &str = include_str!("../migrations/037_catalog_rates.sql");
 const MIGRATION_038: &str = include_str!("../migrations/038_quota_reading_log.sql");
 /// Migration 39: typed hard-wall cause for route state and provider inheritance.
 const MIGRATION_039: &str = include_str!("../migrations/039_route_wall_class.sql");
+/// Migration 40: the last announced route-winner ladder, kept across restarts.
+const MIGRATION_040: &str = include_str!("../migrations/040_route_winner_baseline.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -172,7 +174,7 @@ struct ObservedSpeedAggregate {
     duration_ms: i64,
 }
 
-fn route_state_migrations() -> [Migration; 39] {
+fn route_state_migrations() -> [Migration; 40] {
     [
         Migration {
             version: 1,
@@ -329,6 +331,10 @@ fn route_state_migrations() -> [Migration; 39] {
         Migration {
             version: 39,
             statements: MIGRATION_039,
+        },
+        Migration {
+            version: 40,
+            statements: MIGRATION_040,
         },
     ]
 }
@@ -973,6 +979,45 @@ impl SqliteRouteStateStore {
                     )?;
                 }
                 tx.commit()
+            })
+            .map_err(err)
+    }
+
+    /// The last announced route-winner ladder as the routing module serialized
+    /// it, or `None` before the first ladder was ever recorded.
+    pub fn route_winner_baseline(&self) -> RouteStateResult<Option<String>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT ladder_json FROM route_winner_baseline WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Replace the stored route-winner ladder with `ladder_json`, recording the
+    /// change that produced it.
+    pub fn put_route_winner_baseline(
+        &self,
+        ladder_json: &str,
+        trigger: &str,
+        recorded_at: i64,
+    ) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "INSERT INTO route_winner_baseline (singleton, ladder_json, trigger, recorded_at)
+                     VALUES (1, ?1, ?2, ?3)
+                     ON CONFLICT(singleton) DO UPDATE SET
+                       ladder_json = excluded.ladder_json,
+                       trigger = excluded.trigger,
+                       recorded_at = excluded.recorded_at",
+                    params![ladder_json, trigger, recorded_at],
+                )
+                .map(|_| ())
             })
             .map_err(err)
     }
