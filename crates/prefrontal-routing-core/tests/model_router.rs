@@ -3421,3 +3421,82 @@ fn same_plan_subscription_routes_compare_as_equal_cost_under_basket_pricing() {
         "across plans the cheaper basket wins"
     );
 }
+
+// Route ordering must be a total order whatever mix of providers, plans and
+// prices arrives. When the same-plan rule was applied pairwise inside the
+// comparator it was not transitive (two routes on one plan compared as equal
+// cost, a third route on another provider compared on its own cost against
+// each), so the winner depended on the order candidates arrived in and large
+// shortlists could make Rust's sort panic. Every generated shortlist here
+// must select without panicking and select the same route in any arrival
+// order.
+#[test]
+fn generated_shortlists_select_one_winner_in_any_arrival_order() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+    let providers = ["p0", "p1", "p2"];
+    // Normalized selection costs (the reference is 30 $/Mtok); 0.05 is the
+    // effectively-free threshold, so both sides of it appear.
+    let costs = [0.03, 0.05, 0.10, 0.20, 0.40, 0.80];
+    let elos = [1_300.0, 1_350.0, 1_400.0, 1_450.0, 1_500.0];
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    for trial in 0..400 {
+        let len = if trial % 20 == 0 { 40 } else { 3 + rng.below(4) as usize };
+        let covered: HashSet<String> = providers
+            .iter()
+            .filter(|_| rng.below(2) == 0)
+            .map(|p| p.to_string())
+            .collect();
+        let facts: Vec<ModelFact> = (0..len)
+            .map(|i| {
+                fact(FactBuilder {
+                    provider_id: providers[rng.below(3) as usize].to_string(),
+                    model_id: format!("m{i}"),
+                    scores: scores(elos[rng.below(5) as usize], 1_500.0, 100.0),
+                    cost_per_m_tok_out: Some(costs[rng.below(6) as usize] * 30.0),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let mut winner: Option<String> = None;
+        for rotation in 0..facts.len().min(8) {
+            for reversed in [false, true] {
+                let mut arrival = facts.clone();
+                arrival.rotate_left(rotation);
+                if reversed {
+                    arrival.reverse();
+                }
+                let covered = covered.clone();
+                let selected = select_model_route(input(
+                    arrival,
+                    req(80.0, 0.0),
+                    Extra {
+                        is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
+                            covered.contains(&route.provider_id)
+                        })),
+                        ..Default::default()
+                    },
+                ));
+                let Ok(selected) = selected else { continue };
+                let key = selected.route_key.clone();
+                match &winner {
+                    None => winner = Some(key),
+                    Some(first) => assert_eq!(
+                        first, &key,
+                        "trial {trial}: winner depends on arrival order"
+                    ),
+                }
+            }
+        }
+    }
+}

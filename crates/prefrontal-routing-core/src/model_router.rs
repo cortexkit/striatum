@@ -994,7 +994,7 @@ pub fn select_model_route_with_config(
     let PricedAdmission {
         admissible,
         rejected,
-        mut scored,
+        scored,
         use_basket,
         best_effort,
         cleared_count,
@@ -1002,103 +1002,33 @@ pub fn select_model_route_with_config(
     } = admit_and_price_shortlist(&input, config, COUNTERS_PRODUCER, CLASS_PRODUCER)?;
 
     // Deterministic ordering. COST-PRIMARY lexicographic among adequate models.
-    scored.sort_by(|sa, sb| {
-        use std::cmp::Ordering;
-        let a = &admissible[sa.idx];
-        let b = &admissible[sb.idx];
-        // 1. (best-effort only) most-capable first.
-        if best_effort && b.adequacy.adequacy != a.adequacy.adequacy {
-            return cmp_f64(b.adequacy.adequacy, a.adequacy.adequacy);
-        }
-        // 2. Prompt-cache preference partitions otherwise eligible candidates.
-        // It never lets a cache-capable route bypass the normal adequacy gate.
-        if input.prefer_prompt_cache {
-            let a_uncached = input
-                .providers_without_prompt_cache
-                .contains(&a.route.fact.provider_id);
-            let b_uncached = input
-                .providers_without_prompt_cache
-                .contains(&b.route.fact.provider_id);
-            if a_uncached != b_uncached {
-                return a_uncached.cmp(&b_uncached);
+    // Every key is a property of one route, computed once here, so the order is
+    // total by construction (see `route_order_keys` for why that matters).
+    let facts: Vec<RouteOrderFacts<'_>> = scored
+        .iter()
+        .map(|s| {
+            let a = &admissible[s.idx];
+            RouteOrderFacts {
+                provider_id: &a.route.provider_id,
+                route_key: &a.route.route_key,
+                subscription_covered: s.objective.subscription_covered,
+                selection_cost: s.objective.selection_cost,
+                uncached: input.prefer_prompt_cache
+                    && input
+                        .providers_without_prompt_cache
+                        .contains(&a.route.fact.provider_id),
+                adequacy: a.adequacy.adequacy,
+                raw_adequacy: a.adequacy.raw_adequacy,
+                quota_abundance: a.runtime.quota_abundance,
+                speed_score: s.objective.speed_score,
+                metered_cost: normalized_metered_cost(&a.route.fact),
             }
-        }
-        // 3. lowest economic selectionCost - EXCEPT inside the effectively-free
-        // bucket, where two subsidized routes compare as equal cost and the
-        // demand's own quality metric decides. Without the bucket, cost-primary
-        // ordering lets a deeper subsidy outrank a stronger model on work that
-        // explicitly asked for strength: the caller's iq demand raised the bar,
-        // both routes cleared it, and the router then optimized a cent-scale
-        // dollar difference the subsidy made meaningless.
-        // Two routes on the same subscription plan draw on one quota pool, so
-        // no dollar figure can pick between them: the plan is paid for and the
-        // pool is shared, which is exactly the case the bucket was written for.
-        // They compare as equal cost whatever the basket says, and adequacy,
-        // abundance and speed decide. The threshold was calibrated on
-        // output-only costs, and basket pricing (cached reads are three
-        // quarters of a mason message) lifted astra above it the morning the
-        // token profile filled, so iq 100 bought sol over astra on a basket
-        // difference the shared pool makes meaningless. Across plans the
-        // basket still orders, because a cheaper route there spends a
-        // different pool, and a metered route is never in the bucket by pool.
-        let same_pool = sa.objective.subscription_covered
-            && sb.objective.subscription_covered
-            && a.route.provider_id == b.route.provider_id;
-        let a_free = same_pool || sa.objective.selection_cost <= EFFECTIVELY_FREE_SELECTION_COST;
-        let b_free = same_pool || sb.objective.selection_cost <= EFFECTIVELY_FREE_SELECTION_COST;
-        if !(a_free && b_free) && sa.objective.selection_cost != sb.objective.selection_cost {
-            return cmp_f64(sa.objective.selection_cost, sb.objective.selection_cost);
-        }
-        // 4. (free bucket) highest adequacy first: the saturating blend, not raw,
-        // so the DEMAND still shapes the pick. At iq 95 sol (1.00) outranks luna
-        // (0.96) and edges terra (0.999); at iq 30 all three saturate to 1.00 and
-        // speed decides, keeping cheap-band work on the fast small model instead
-        // of promoting everything to the flagship. Raw adequacy here would crown
-        // the strongest model at every band regardless of what was asked.
-        if a_free && b_free && b.adequacy.adequacy != a.adequacy.adequacy {
-            return cmp_f64(b.adequacy.adequacy, a.adequacy.adequacy);
-        }
-        // 5. Inside the free bucket, spend headroom that expires sooner is used
-        // first. Quantized integer keys preserve a total order; an absent sample is
-        // neutral rather than favourable or fatal.
-        if a_free && b_free {
-            let a_abundance = a
-                .runtime
-                .quota_abundance
-                .filter(|value| value.is_finite())
-                .unwrap_or(1.0);
-            let b_abundance = b
-                .runtime
-                .quota_abundance
-                .filter(|value| value.is_finite())
-                .unwrap_or(1.0);
-            let a_quantum = (a_abundance * 1000.0).round() as i64;
-            let b_quantum = (b_abundance * 1000.0).round() as i64;
-            if a_quantum != b_quantum {
-                return b_quantum.cmp(&a_quantum);
-            }
-        }
-        // 6. fastest among equal-cost (speed tie-break).
-        if sb.objective.speed_score != sa.objective.speed_score {
-            return cmp_f64(sb.objective.speed_score, sa.objective.speed_score);
-        }
-        // 7. cheaper-if-metered proxy, then capability, then routeKey.
-        let a_cost = normalized_metered_cost(&a.route.fact);
-        let b_cost = normalized_metered_cost(&b.route.fact);
-        if a_cost != b_cost {
-            return cmp_f64(a_cost, b_cost);
-        }
-        if b.adequacy.adequacy != a.adequacy.adequacy {
-            return cmp_f64(b.adequacy.adequacy, a.adequacy.adequacy);
-        }
-        if b.adequacy.raw_adequacy != a.adequacy.raw_adequacy {
-            return cmp_f64(b.adequacy.raw_adequacy, a.adequacy.raw_adequacy);
-        }
-        a.route
-            .route_key
-            .cmp(&b.route.route_key)
-            .then(Ordering::Equal)
-    });
+        })
+        .collect();
+    let keys = route_order_keys(&facts);
+    let mut keyed: Vec<(RouteOrderKey<'_>, Scored)> = keys.into_iter().zip(scored).collect();
+    keyed.sort_by(|(ka, _), (kb, _)| compare_route_order_keys(ka, kb, best_effort));
+    let scored: Vec<Scored> = keyed.into_iter().map(|(_, s)| s).collect();
 
     let winner = &scored[0];
     let winner_admissible = &admissible[winner.idx];
@@ -1235,9 +1165,171 @@ fn classify_empty_admission(rejected: &[RejectedRoute]) -> RouteFailureReason {
     RouteFailureReason::NoAvailableModel
 }
 
-/// Compare two finite f64 in ascending order, matching the sign of JS `a - b`.
-fn cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
-    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+/// What the route ordering needs to know about one priced, admissible route.
+#[derive(Debug, Clone)]
+pub(crate) struct RouteOrderFacts<'r> {
+    pub provider_id: &'r str,
+    pub route_key: &'r str,
+    pub subscription_covered: bool,
+    pub selection_cost: f64,
+    /// True only when the caller prefers prompt caching and this route's
+    /// provider does not cache prompts.
+    pub uncached: bool,
+    pub adequacy: f64,
+    pub raw_adequacy: f64,
+    pub quota_abundance: Option<f64>,
+    pub speed_score: f64,
+    pub metered_cost: f64,
+}
+
+/// Sort keys for one route. Every field is a property of that route alone, so
+/// comparing keys lexicographically is a total order.
+#[derive(Debug, Clone)]
+pub(crate) struct RouteOrderKey<'r> {
+    pub route_key: &'r str,
+    pub uncached: bool,
+    /// The cost this route is compared on: 0 inside the effectively-free
+    /// bucket; above it, the pool's cost for a subscription-covered route
+    /// and the route's own selection cost otherwise.
+    pub cost_key: f64,
+    /// Whether adequacy and abundance decide among routes of equal
+    /// `cost_key`: true inside the effectively-free bucket and for a member of
+    /// a subscription pool with at least two routes. A route outside both
+    /// orders on speed at equal cost, as metered routes always have.
+    pub in_bucket: bool,
+    pub adequacy: f64,
+    pub raw_adequacy: f64,
+    pub abundance_quantum: i64,
+    pub speed_score: f64,
+    pub metered_cost: f64,
+}
+
+/// Computes the per-route sort keys.
+///
+/// Two routes on the same subscription plan draw on one quota pool, so no
+/// dollar figure can pick between them: the plan is paid for and the pool is
+/// shared. Basket pricing (cached reads are three quarters of a mason message)
+/// can lift such a route above the effectively-free threshold, and without
+/// this rule iq 100 bought sol over astra on a basket difference the shared
+/// pool makes meaningless. Across plans the basket still orders, because a
+/// cheaper route there spends a different pool.
+///
+/// That rule used to be applied pairwise inside the comparator ("both covered
+/// and same provider, so both count as free"). Membership then depended on
+/// which route a route was compared with, the relation was not transitive,
+/// and Rust's sort panics on such comparators. Here the rule is a property of
+/// each route instead: a covered route is priced at the cheapest covered
+/// route of its own provider (its pool), so every member of one pool carries
+/// the same cost key, compares as equal cost, and adequacy decides.
+///
+/// Inside the effectively-free bucket two subsidized routes also compare as
+/// equal cost, so the demand's own quality metric decides. Without the bucket,
+/// cost-primary ordering lets a deeper subsidy outrank a stronger model on work
+/// that explicitly asked for strength: the caller's iq demand raised the bar,
+/// both routes cleared it, and the router then optimized a cent-scale dollar
+/// difference the subsidy made meaningless.
+pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteOrderKey<'r>> {
+    // Per provider: the cheapest covered route's cost and how many covered
+    // routes share the pool.
+    let mut pools: HashMap<&str, (f64, usize)> = HashMap::new();
+    for route in routes.iter().filter(|r| r.subscription_covered) {
+        pools
+            .entry(route.provider_id)
+            .and_modify(|(min, members)| {
+                *min = min.min(route.selection_cost);
+                *members += 1;
+            })
+            .or_insert((route.selection_cost, 1));
+    }
+    routes
+        .iter()
+        .map(|route| {
+            let (pool_cost, shared_pool) = if route.subscription_covered {
+                let (min, members) = pools[route.provider_id];
+                (min, members >= 2)
+            } else {
+                (route.selection_cost, false)
+            };
+            let free = pool_cost <= EFFECTIVELY_FREE_SELECTION_COST;
+            // An absent or non-finite abundance sample is neutral rather than
+            // favourable or fatal; quantizing keeps tiny float noise from
+            // outranking the speed tie-break.
+            let abundance = route
+                .quota_abundance
+                .filter(|value| value.is_finite())
+                .unwrap_or(1.0);
+            RouteOrderKey {
+                route_key: route.route_key,
+                uncached: route.uncached,
+                cost_key: if free { 0.0 } else { pool_cost },
+                in_bucket: free || shared_pool,
+                adequacy: route.adequacy,
+                raw_adequacy: route.raw_adequacy,
+                abundance_quantum: (abundance * 1000.0).round() as i64,
+                speed_score: route.speed_score,
+                metered_cost: route.metered_cost,
+            }
+        })
+        .collect()
+}
+
+/// Lexicographic comparison of two routes' sort keys; the first sorts first.
+pub(crate) fn compare_route_order_keys(
+    a: &RouteOrderKey<'_>,
+    b: &RouteOrderKey<'_>,
+    best_effort: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // Adequacy and abundance only decide for bucket routes; every route
+    // outside the bucket carries the same neutral value, so speed decides.
+    let bucket_adequacy = |k: &RouteOrderKey<'_>| if k.in_bucket { k.adequacy } else { 0.0 };
+    let bucket_abundance = |k: &RouteOrderKey<'_>| {
+        if k.in_bucket {
+            k.abundance_quantum
+        } else {
+            0
+        }
+    };
+    // 1. (best-effort only) most-capable first.
+    let best_effort_first = if best_effort {
+        total_f64(b.adequacy, a.adequacy)
+    } else {
+        Ordering::Equal
+    };
+    best_effort_first
+        // 2. Prompt-cache preference partitions otherwise eligible candidates.
+        // It never lets a cache-capable route bypass the normal adequacy gate.
+        .then(a.uncached.cmp(&b.uncached))
+        // 3. Lowest cost, with the free bucket and each subscription pool
+        // collapsed to one cost (see `route_order_keys`).
+        .then(total_f64(a.cost_key, b.cost_key))
+        // At one cost above the free threshold, pool members sort before
+        // routes outside any pool. Equal costs there are exact float ties,
+        // rare in practice; the partition only keeps the order total.
+        .then(b.in_bucket.cmp(&a.in_bucket))
+        // 4. (bucket) highest adequacy first: the saturating blend, not raw,
+        // so the DEMAND still shapes the pick. At iq 95 sol (1.00) outranks
+        // luna (0.96) and edges terra (0.999); at iq 30 all three saturate to
+        // 1.00 and speed decides, keeping cheap-band work on the fast small
+        // model instead of promoting everything to the flagship.
+        .then(total_f64(bucket_adequacy(b), bucket_adequacy(a)))
+        // 5. (bucket) spend headroom that expires sooner first.
+        .then(bucket_abundance(b).cmp(&bucket_abundance(a)))
+        // 6. Fastest among equal cost.
+        .then(total_f64(b.speed_score, a.speed_score))
+        // 7. Cheaper-if-metered proxy, then capability, then routeKey.
+        .then(total_f64(a.metered_cost, b.metered_cost))
+        .then(total_f64(b.adequacy, a.adequacy))
+        .then(total_f64(b.raw_adequacy, a.raw_adequacy))
+        .then(a.route_key.cmp(b.route_key))
+}
+
+/// Ascending total order on f64 for sort keys. `-0.0` and `0.0` compare equal
+/// as they do under `partial_cmp`; NaN ranks above every number instead of
+/// comparing equal to everything, which would break transitivity.
+fn total_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    let canon = |x: f64| if x.is_nan() { f64::NAN } else { x + 0.0 };
+    canon(a).total_cmp(&canon(b))
 }
 
 /// Format a number like JS `${n}`: whole numbers without a decimal point.
@@ -1684,5 +1776,149 @@ mod abundance_tests {
             "explanation must contain speed line: {:?}",
             decision.explanation
         );
+    }
+}
+
+#[cfg(test)]
+mod route_order_tests {
+    use super::*;
+
+    fn route<'r>(
+        provider_id: &'r str,
+        route_key: &'r str,
+        subscription_covered: bool,
+        selection_cost: f64,
+        adequacy: f64,
+    ) -> RouteOrderFacts<'r> {
+        RouteOrderFacts {
+            provider_id,
+            route_key,
+            subscription_covered,
+            selection_cost,
+            uncached: false,
+            adequacy,
+            raw_adequacy: adequacy,
+            quota_abundance: None,
+            speed_score: 0.5,
+            metered_cost: selection_cost,
+        }
+    }
+
+    fn sorted_keys<'r>(routes: &[RouteOrderFacts<'r>], best_effort: bool) -> Vec<&'r str> {
+        let mut keys = route_order_keys(routes);
+        keys.sort_by(|a, b| compare_route_order_keys(a, b, best_effort));
+        keys.into_iter().map(|k| k.route_key).collect()
+    }
+
+    // A and B are subscription routes on one provider; C is metered elsewhere.
+    // Compared pairwise the old rule made A < B (same pool, so adequacy
+    // decides), B < C (not a pool pair and neither free, so cost decides) and
+    // C < A (cost again): a cycle, which Rust's sort may answer with a panic.
+    // With per-route keys A and B both carry their pool's cheapest cost, 0.10,
+    // and C carries its own 0.20. All three sit above the 0.05 free threshold,
+    // so the cost keys are A=0.10, B=0.10, C=0.20: the pool sorts before C,
+    // and inside the pool A's higher adequacy puts it first. Order: A, B, C,
+    // whatever order the routes arrive in.
+    #[test]
+    fn same_pool_cycle_sorts_to_one_order() {
+        let a = route("plan", "plan/a", true, 0.40, 1.00);
+        let b = route("plan", "plan/b", true, 0.10, 0.90);
+        let c = route("metered", "metered/c", false, 0.20, 0.95);
+        let arrivals = [
+            vec![a.clone(), b.clone(), c.clone()],
+            vec![a.clone(), c.clone(), b.clone()],
+            vec![b.clone(), a.clone(), c.clone()],
+            vec![b.clone(), c.clone(), a.clone()],
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![c.clone(), b.clone(), a.clone()],
+        ];
+        for routes in arrivals {
+            assert_eq!(
+                sorted_keys(&routes, false),
+                vec!["plan/a", "plan/b", "metered/c"]
+            );
+        }
+    }
+
+    // Same pool: the pool's cheapest route sets the cost every member is
+    // compared on, so the cheaper sibling's price pulls the dearer, stronger
+    // route ahead of a metered route that is cheaper than the dearer route
+    // alone. Pricing each covered route at its own cost puts the metered route
+    // first; this pins the pool minimum.
+    #[test]
+    fn pool_members_carry_the_pool_minimum_cost() {
+        let routes = vec![
+            route("plan", "plan/strong", true, 0.40, 1.00),
+            route("plan", "plan/cheap", true, 0.10, 0.90),
+            route("metered", "metered/mid", false, 0.20, 1.00),
+        ];
+        assert_eq!(sorted_keys(&routes, false)[0], "plan/strong");
+    }
+
+    /// xorshift64: a tiny deterministic generator so failures replay exactly.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        /// One of a few coarse values, so ties (the interesting case) are common.
+        fn pick(&mut self, values: &[f64]) -> f64 {
+            values[self.below(values.len() as u64) as usize]
+        }
+    }
+
+    // Generated route sets over a few providers with random costs, adequacies
+    // and subscription flags: sorting never panics, and the sorted order is
+    // consistent under a pairwise check (no later route compares strictly
+    // before an earlier one, and the comparison is antisymmetric).
+    #[test]
+    fn generated_route_sets_sort_to_a_pairwise_consistent_order() {
+        let providers = ["p0", "p1", "p2"];
+        let costs = [0.0, 0.03, 0.05, 0.06, 0.10, 0.20, 0.40, 1.0];
+        let adequacies = [0.80, 0.90, 0.95, 1.00];
+        let abundances = [None, Some(0.2), Some(0.9), Some(f64::NAN)];
+        let names: Vec<String> = (0..40).map(|i| format!("r{i}")).collect();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for trial in 0..2_000 {
+            let len = 2 + rng.below(if trial % 10 == 0 { 38 } else { 6 }) as usize;
+            let best_effort = rng.below(4) == 0;
+            let routes: Vec<RouteOrderFacts<'_>> = (0..len)
+                .map(|i| {
+                    let mut r = route(
+                        providers[rng.below(3) as usize],
+                        &names[i],
+                        rng.below(2) == 0,
+                        rng.pick(&costs),
+                        rng.pick(&adequacies),
+                    );
+                    r.uncached = rng.below(5) == 0;
+                    r.quota_abundance = abundances[rng.below(4) as usize];
+                    r.speed_score = rng.pick(&[0.3, 0.5, 0.8]);
+                    r
+                })
+                .collect();
+            let mut keys = route_order_keys(&routes);
+            keys.sort_by(|a, b| compare_route_order_keys(a, b, best_effort));
+            for i in 0..keys.len() {
+                for j in (i + 1)..keys.len() {
+                    let forward = compare_route_order_keys(&keys[i], &keys[j], best_effort);
+                    let backward = compare_route_order_keys(&keys[j], &keys[i], best_effort);
+                    assert_ne!(
+                        forward,
+                        std::cmp::Ordering::Greater,
+                        "trial {trial}: {} sorted before {} but compares after it",
+                        keys[i].route_key,
+                        keys[j].route_key
+                    );
+                    assert_eq!(forward, backward.reverse(), "trial {trial}: not antisymmetric");
+                }
+            }
+        }
     }
 }
