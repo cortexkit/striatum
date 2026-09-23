@@ -127,8 +127,7 @@ async fn start_real_daemon() -> RealDaemon {
     .unwrap();
 
     let child = Command::new(&subc_core)
-        .env("XDG_CONFIG_HOME", rig.join("config"))
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .envs(prefrontal_test_support::fenced_subc_daemon_env(&rig))
         .env("SUBC_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
