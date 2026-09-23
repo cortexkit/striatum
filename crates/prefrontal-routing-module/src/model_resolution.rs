@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn model_resolution_module_table_matches_the_deleted_typescript_rows() {
         let requirements = agent_model_requirements();
-        assert_eq!(requirements.as_object().map(|value| value.len()), Some(5));
+        assert_eq!(requirements.as_object().map(|value| value.len()), Some(4));
         assert_eq!(
             requirements["alfonso"]["fallbackChain"][0],
             json!({
