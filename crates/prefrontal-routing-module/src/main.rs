@@ -1009,6 +1009,12 @@ struct SelectParams {
     task_id: Option<String>,
     #[serde(default, alias = "parentSessionID")]
     parent_session_id: Option<String>,
+    /// The substrate that will send to the selected route. `broca` judges the
+    /// selection against what Broca can reach (see [`select_availability`])
+    /// instead of `availableModels`, which is a host's provider list; absent or
+    /// any other value keeps the caller's list.
+    #[serde(default)]
+    substrate: Option<String>,
     /// The caller's harness, used to match the decision with recorded spend facts when provided.
     #[serde(default)]
     harness: Option<String>,
@@ -2407,7 +2413,7 @@ async fn handle_select_request(
         .await;
     }
 
-    let params: SelectParams = match serde_json::from_slice::<SelectBody>(&frame.body) {
+    let mut params: SelectParams = match serde_json::from_slice::<SelectBody>(&frame.body) {
         Ok(b) => b.params,
         Err(e) => {
             return send_route_error(
@@ -2429,9 +2435,37 @@ async fn handle_select_request(
     );
     // The operator fence is read HERE, on the module side, for every selection.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
+    let availability = if is_broca_substrate(params.substrate.as_deref()) {
+        match store.get_facts() {
+            Ok(facts) => select_availability(
+                params.substrate.as_deref(),
+                std::mem::take(&mut params.available_models),
+                &facts,
+                broca_vault_handles_path,
+            ),
+            Err(e) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &format!("reading facts from route-state store: {e}"),
+                )
+                .await;
+            }
+        }
+    } else {
+        SelectAvailability::host(std::mem::take(&mut params.available_models))
+    };
+    params.available_models = availability.models.clone();
     let resolved_request = match resolve_select_request(&params, &operator_policy) {
         Ok(resolved) => resolved,
-        Err(no_route) => {
+        Err(mut no_route) => {
+            if let Some(note) = &availability.note {
+                no_route.message = format!("{} ({note})", no_route.message);
+            }
             let requirements = no_route
                 .requirements
                 .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
@@ -2508,13 +2542,12 @@ async fn handle_select_request(
         .iter()
         .cloned()
         .collect();
-    // The winner ladder replays what this caller class was handed. Keyed by the
-    // target agent because callers hand one substrate different lists (the
-    // plugin's live list versus core's seed-catalog fallback for sidekick
-    // classify, wake authoring, and comment review), and a single slot flipped
+    // The winner ladder replays what this caller class was handed on the
+    // substrate that sends. Keyed by the target agent as well because callers
+    // of one substrate can hand it different lists, and a single slot flipped
     // between them on every alternation.
     winner_ladder::observed_selections().record(
-        winner_ladder::LadderKey::new(winner_ladder::SUBSTRATE_HOST, &params.target_agent),
+        winner_ladder::LadderKey::new(availability.ladder_substrate, &params.target_agent),
         available.iter().cloned(),
         subscription_keys.iter().cloned(),
         snapshot.clone(),
@@ -2651,6 +2684,9 @@ async fn handle_select_request(
     match selection {
         Ok(mut selected) => {
             selected.explanation.push(policy_sources.clone());
+            if let Some(note) = &availability.note {
+                selected.explanation.push(note.clone());
+            }
             selected
                 .explanation
                 .extend(head_refusals.notes.iter().cloned());
@@ -2722,6 +2758,7 @@ async fn handle_select_request(
                 .map(|rejected| rejected.route_key.as_str())
                 .collect();
             let mut no_route_notes = head_refusals.notes.clone();
+            no_route_notes.extend(availability.note.iter().cloned());
             no_route_notes.extend(facts.iter().filter_map(|fact| {
                 let route = fact_to_route(fact);
                 if !rejected_keys.contains(route.route_key.as_str()) {
@@ -2790,30 +2827,112 @@ fn panel_availability(
     facts: &[ModelFact],
     broca_vault_handles_path: &Path,
 ) -> (AvailabilitySubstrate, HashSet<String>) {
-    if requested_substrate.map(str::trim) != Some("broca") {
+    if !is_broca_substrate(requested_substrate) {
         return (AvailabilitySubstrate::Host, host_available_models);
     }
-    let providers =
-        match config_overrides::read_broca_credential_providers(broca_vault_handles_path) {
-            Ok(providers) if !providers.is_empty() => providers,
-            // Nothing usable to intersect with. Widening to every fact row would seat
-            // routes Broca cannot send, and narrowing to nothing would empty every
-            // panel, so the host list stands and the decision keeps saying `host`.
-            Ok(_) => {
-                warn_broca_credentials_unreadable_once("the handle map names no provider");
-                return (AvailabilitySubstrate::Host, host_available_models);
-            }
-            Err(error) => {
-                warn_broca_credentials_unreadable_once(&error);
-                return (AvailabilitySubstrate::Host, host_available_models);
-            }
-        };
-    let available = facts
+    match broca_served_routes(facts, broca_vault_handles_path) {
+        Ok(available) => (
+            AvailabilitySubstrate::Broca,
+            available.into_iter().collect(),
+        ),
+        // Nothing usable to intersect with. Widening to every fact row would seat
+        // routes Broca cannot send, and narrowing to nothing would empty every
+        // panel, so the host list stands and the decision keeps saying `host`.
+        Err(error) => {
+            warn_broca_credentials_unreadable_once(&error);
+            (AvailabilitySubstrate::Host, host_available_models)
+        }
+    }
+}
+
+fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
+    requested_substrate.map(str::trim) == Some("broca")
+}
+
+/// The routes Broca can send today: the catalog rows this store still serves
+/// (withdrawn rows are filtered out when facts are read) restricted to the
+/// providers Broca holds a credential for. `Err` carries why Broca's credential
+/// map could not be read or named no provider, so the reach is unknown.
+fn broca_served_routes(
+    facts: &[ModelFact],
+    broca_vault_handles_path: &Path,
+) -> Result<Vec<String>, String> {
+    let providers = config_overrides::read_broca_credential_providers(broca_vault_handles_path)?;
+    if providers.is_empty() {
+        return Err("the handle map names no provider".to_string());
+    }
+    Ok(facts
         .iter()
         .filter(|fact| providers.contains(&fact.provider_id))
         .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
-        .collect();
-    (AvailabilitySubstrate::Broca, available)
+        .collect())
+}
+
+/// The list a single-route selection is judged against, the winner-ladder
+/// substrate it is recorded under, and a note for the decision's explanation
+/// when the list is not the caller's own.
+struct SelectAvailability {
+    models: Vec<String>,
+    ladder_substrate: &'static str,
+    note: Option<String>,
+}
+
+impl SelectAvailability {
+    fn host(models: Vec<String>) -> Self {
+        Self {
+            models,
+            ladder_substrate: winner_ladder::SUBSTRATE_HOST,
+            note: None,
+        }
+    }
+}
+
+/// Availability for a `route.select` whose caller names the substrate that
+/// will send.
+///
+/// A Broca send is judged against what Broca can reach now, never against a
+/// list the caller carries: callers without a host (core's own classifier,
+/// wake author, and comment reviewer) have no list of their own, and a host's
+/// list describes a different substrate. When Broca's credential map cannot be
+/// read, the reach is unknown: selection proceeds over every route the catalog
+/// still serves and the decision says so. It stays closed to routes known to be
+/// unserved, because withdrawn catalog rows never reach `facts`, and operator
+/// exclusions, cooldowns, and failure backoff still apply downstream.
+fn select_availability(
+    requested_substrate: Option<&str>,
+    host_available_models: Vec<String>,
+    facts: &[ModelFact],
+    broca_vault_handles_path: &Path,
+) -> SelectAvailability {
+    if !is_broca_substrate(requested_substrate) {
+        return SelectAvailability::host(host_available_models);
+    }
+    match broca_served_routes(facts, broca_vault_handles_path) {
+        Ok(models) => SelectAvailability {
+            note: Some(format!(
+                "availability: broca ({} served catalog routes on providers Broca holds a credential for)",
+                models.len()
+            )),
+            models,
+            ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
+        },
+        Err(reason) => {
+            let models: Vec<String> = facts
+                .iter()
+                .map(|fact| {
+                    make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
+                })
+                .collect();
+            SelectAvailability {
+                note: Some(format!(
+                    "availability unknown: Broca's credential providers are unreadable ({reason}); routed over all {} served catalog routes",
+                    models.len()
+                )),
+                models,
+                ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
+            }
+        }
+    }
 }
 
 async fn handle_select_panel(
@@ -7934,6 +8053,134 @@ mod tests {
             cause["detail"], "broca",
             "the seat was judged against Broca's reach, and the host list that does carry it is not consulted"
         );
+    }
+
+    fn broca_select_request(
+        available_models: &[&str],
+        substrate: Option<&str>,
+    ) -> serde_json::Value {
+        let mut params = json!({
+            "targetAgent": "explore",
+            "requirements": {"iq": 30, "eq": 0},
+            "availableModels": available_models,
+        });
+        if let Some(substrate) = substrate {
+            params["substrate"] = json!(substrate);
+        }
+        json!({ "method": ROUTE_SELECT_OP, "params": params })
+    }
+
+    fn decision_explanation(store: &SharedStore, result: &serde_json::Value) -> String {
+        store
+            .get_decision_by_id(result["decisionID"].as_str().unwrap())
+            .unwrap()
+            .expect("the selection is recorded")
+            .explanation_json
+            .unwrap_or_default()
+    }
+
+    /// Core's own classifier, wake author, and comment reviewer send through
+    /// Broca and carry no host list. Naming substrate `broca` judges the
+    /// selection against what Broca reaches now: a catalog route on a provider
+    /// Broca holds a credential for wins although no caller list names it, and a
+    /// route only the caller's list names (here, one Broca has no credential
+    /// for) cannot. The same request without the substrate keeps the caller's
+    /// list, so the substrate field is the only difference between the halves.
+    #[tokio::test]
+    async fn a_broca_route_select_reads_brocas_reach_not_the_callers_list() {
+        let rig = Rig::new("select-substrate-broca");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("livebroca", "m-new"), FactSource::Override)
+            .unwrap();
+        store
+            .upsert_fact(&fact("hostonly", "m-old"), FactSource::Override)
+            .unwrap();
+        let vault_handles = rig.dir.join("vault-handles.json");
+        std::fs::write(
+            &vault_handles,
+            r#"{"handles":{"apikey:livebroca":"ckh_fixture"}}"#,
+        )
+        .unwrap();
+        let run = |substrate: Option<&'static str>| {
+            let store = Arc::clone(&store);
+            let vault_handles = vault_handles.clone();
+            async move {
+                let response = run_route_wire_request_with_paths(
+                    &store,
+                    broca_select_request(&["hostonly/m-old"], substrate),
+                    Path::new("/nonexistent/alfonso-routing.jsonc"),
+                    &vault_handles,
+                )
+                .await;
+                assert_eq!(response.header.ty, FrameType::Response);
+                serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"]
+                    .clone()
+            }
+        };
+
+        let broca = run(Some("broca")).await;
+        assert_eq!(broca["selected"]["routeKey"], "livebroca/m-new");
+        assert_eq!(
+            broca["resolvedInput"]["availableModels"],
+            json!(["livebroca/m-new"]),
+            "the caller's host list is not consulted for a Broca send"
+        );
+        assert!(decision_explanation(&store, &broca).contains("availability: broca"));
+
+        let host = run(None).await;
+        assert_eq!(host["selected"]["routeKey"], "hostonly/m-old");
+        assert_eq!(
+            host["resolvedInput"]["availableModels"],
+            json!(["hostonly/m-old"])
+        );
+    }
+
+    /// With Broca's credential map unreadable the reach is unknown. The
+    /// selection still routes, over every route the catalog serves, and the
+    /// recorded decision says the availability was unknown; a route the catalog
+    /// has withdrawn stays out, because nothing serves it.
+    #[tokio::test]
+    async fn a_broca_route_select_with_unknown_reach_routes_over_served_rows_and_says_so() {
+        let rig = Rig::new("select-substrate-unknown");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("livebroca", "m-new"), FactSource::Override)
+            .unwrap();
+        store
+            .upsert_fact(&fact("retired", "m-gone"), FactSource::Override)
+            .unwrap();
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute(
+                "UPDATE model_facts SET fusiform_present = 0 WHERE route_key = 'retired/m-gone'",
+                [],
+            )
+            .unwrap();
+
+        let response = run_route_wire_request_with_paths(
+            &store,
+            broca_select_request(&[], Some("broca")),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let result =
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"].clone();
+        let available: Vec<&str> = result["resolvedInput"]["availableModels"]
+            .as_array()
+            .expect("an unknown reach still routes")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(available.contains(&"livebroca/m-new"), "{available:?}");
+        assert!(
+            !available.contains(&"retired/m-gone"),
+            "a withdrawn route is never available: {available:?}"
+        );
+        assert_ne!(result["selected"]["routeKey"], "retired/m-gone");
+        assert!(decision_explanation(&store, &result).contains("availability unknown"));
     }
 
     #[tokio::test]

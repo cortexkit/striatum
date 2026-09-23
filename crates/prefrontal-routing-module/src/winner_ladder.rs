@@ -10,21 +10,22 @@
 //! The ladder is a dry run of the router's own selection function
 //! ([`select_model_route_with_config`]) over exactly what live selection last
 //! used on each substrate: the availability set, subscription classification,
-//! and runtime snapshot that `route.select` (host) and `route.select_panel`
-//! (Broca legs) were handed most recently. Nothing is guessed from credential
+//! and runtime snapshot that `route.select` (host lists, or Broca's reach when
+//! the caller names substrate `broca`) and `route.select_panel` (Broca legs)
+//! were handed most recently. Nothing is guessed from credential
 //! files. Until a real selection has arrived since boot there is no ladder at
 //! all, and nothing is compared or announced.
 //!
 //! Availability is recorded, and the ladder computed, compared, and stored, per
 //! [`LadderKey`]: the substrate plus the caller class, which is the target agent
 //! `route.select` was asked to route for (panels use [`CALLER_CLASS_PANEL`]).
-//! Different callers hand the same substrate different lists: the OpenCode
-//! plugin sends its live provider list, while core's sidekick classifier, wake
-//! author, and comment review route `explore` over a frozen seed catalog when
-//! their caller sent no list. Keyed by substrate alone, the recorded list
-//! alternated between the two, every alternation read as an availability change,
-//! and a notice fired each time. Callers of one class can still disagree (plugin
-//! explore launches and core's seed-catalog explore selections both occur), so a
+//! Different callers can hand the same substrate different lists. Core's
+//! sidekick classifier, wake author, and comment review once routed `explore`
+//! over a frozen seed catalog while the OpenCode plugin sent its live provider
+//! list, and keyed by substrate alone the recorded list alternated between the
+//! two, every alternation read as an availability change, and a notice fired
+//! each time. Those core callers now select on substrate `broca`, but callers of
+//! one class can still disagree (two hosts with different providers), so a
 //! key's availability is the union of every list recorded for it within
 //! [`AVAILABILITY_UNION_WINDOW`].
 //!
@@ -81,9 +82,10 @@ pub(crate) const LADDER_IQ_TIERS: [u8; 7] = [30, 50, 60, 70, 80, 90, 100];
 /// the plain default rather than a specialist fallback.
 const LADDER_TARGET_AGENT: &str = "mason";
 
-/// Selections arriving through `route.select`: the OpenCode host's own list.
+/// Selections arriving through `route.select` on the caller's own host list.
 pub(crate) const SUBSTRATE_HOST: &str = "opencode-host";
-/// Panel legs that send through Broca (`route.select_panel` with substrate broca).
+/// Selections that send through Broca: `route.select_panel` and `route.select`
+/// called with substrate broca.
 pub(crate) const SUBSTRATE_BROCA: &str = "broca";
 /// Caller class of `route.select_panel` recordings: panels carry no target agent.
 pub(crate) const CALLER_CLASS_PANEL: &str = "panel";
