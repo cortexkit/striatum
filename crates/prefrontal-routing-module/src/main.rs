@@ -2508,9 +2508,13 @@ async fn handle_select_request(
         .iter()
         .cloned()
         .collect();
-    // The winner ladder replays exactly what the latest selection was handed.
+    // The winner ladder replays what this caller class was handed. Keyed by the
+    // target agent because callers hand one substrate different lists (the
+    // plugin's live list versus core's seed-catalog fallback for sidekick
+    // classify, wake authoring, and comment review), and a single slot flipped
+    // between them on every alternation.
     winner_ladder::observed_selections().record(
-        winner_ladder::SUBSTRATE_HOST,
+        winner_ladder::LadderKey::new(winner_ladder::SUBSTRATE_HOST, &params.target_agent),
         available.iter().cloned(),
         subscription_keys.iter().cloned(),
         snapshot.clone(),
@@ -2930,7 +2934,10 @@ async fn handle_select_panel(
     // would read as an availability change on every other request.
     if availability_substrate == AvailabilitySubstrate::Broca {
         winner_ladder::observed_selections().record(
-            winner_ladder::SUBSTRATE_BROCA,
+            winner_ladder::LadderKey::new(
+                winner_ladder::SUBSTRATE_BROCA,
+                winner_ladder::CALLER_CLASS_PANEL,
+            ),
             available_models.iter().cloned(),
             subscription_keys.iter().cloned(),
             prepared.snapshot.clone(),
@@ -8438,8 +8445,13 @@ mod tests {
         /// Stand in for a host route.select: record the availability it was handed
         /// and the runtime snapshot as the store holds it now.
         fn observe(&self, models: &[&str]) {
+            self.observe_as("mason", models);
+        }
+
+        /// A host route.select for `target_agent`, which is the caller class.
+        fn observe_as(&self, target_agent: &str, models: &[&str]) {
             self.sources.observed.record(
-                winner_ladder::SUBSTRATE_HOST,
+                winner_ladder::LadderKey::new(winner_ladder::SUBSTRATE_HOST, target_agent),
                 models.iter().map(|model| self.route(model)),
                 Vec::new(),
                 self.store.build_snapshot(now_ms() as f64).unwrap(),
@@ -8539,14 +8551,18 @@ mod tests {
     }
 
     fn host_tier(ladder: &winner_ladder::WinnerLadder, tier: u8) -> winner_ladder::TierWinners {
-        ladder.substrates[winner_ladder::SUBSTRATE_HOST].tiers[&tier].clone()
+        ladder.ladders[&host_mason().label()].tiers[&tier].clone()
+    }
+
+    fn host_mason() -> winner_ladder::LadderKey {
+        winner_ladder::LadderKey::new(winner_ladder::SUBSTRATE_HOST, "mason")
     }
 
     /// What the router itself returns at `tier` for the recorded host selection,
     /// computed directly rather than through the ladder.
     fn direct_live_selection(rig: &LadderRig, tier: u8) -> Option<String> {
         let observed = rig.sources.observed.current();
-        let observation = &observed[winner_ladder::SUBSTRATE_HOST];
+        let observation = &observed[&host_mason()];
         let resolved = resolve_launch_requirements(
             "mason",
             Some(&RequestedModelRequirements {
@@ -8684,10 +8700,7 @@ mod tests {
             "the challenger is not in what live selection can reach"
         );
         let ladder = rig.ladder();
-        for winners in ladder.substrates[winner_ladder::SUBSTRATE_HOST]
-            .tiers
-            .values()
-        {
+        for winners in ladder.ladders[&host_mason().label()].tiers.values() {
             for route in [&winners.neutral, &winners.live].into_iter().flatten() {
                 assert!(
                     [rig.route("incumbent"), rig.route("small")].contains(route),
@@ -8702,7 +8715,9 @@ mod tests {
         let notice = watch
             .check(rig.store.as_ref(), &rig.sources)
             .expect("availability now includes the stronger route");
-        assert!(notice.trigger.contains("opencode-host availability"));
+        assert!(notice
+            .trigger
+            .contains("opencode-host / mason availability"));
         assert!(notice.changes.iter().any(|change| {
             change.new_route.as_deref() == Some(rig.route("challenger").as_str())
                 && change.tiers.contains(&100)
@@ -8844,6 +8859,139 @@ mod tests {
                 && change.tiers.contains(&100)
         }));
         assert_eq!(watch.check(rig.store.as_ref(), &rig.sources), None);
+    }
+
+    /// A baseline row written before ladders were keyed by caller class is
+    /// replaced silently rather than compared against the new keys.
+    #[test]
+    fn a_stored_baseline_of_the_old_shape_is_replaced_without_announcing() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = LadderRig::new("old-shape");
+        let old = json!({
+            "substrates": {
+                winner_ladder::SUBSTRATE_HOST: {
+                    "available": [rig.route("small")],
+                    "tiers": { "100": { "neutral": rig.route("small"), "live": rig.route("small") } }
+                }
+            },
+            "eq": 50.0
+        });
+        rig.store
+            .put_route_winner_baseline(&old.to_string(), "before the upgrade", 1)
+            .unwrap();
+        rig.observe(&["incumbent", "small"]);
+        assert_eq!(rig.announce("first selection after upgrade"), None);
+        assert_eq!(rig.notices(), Vec::<serde_json::Value>::new());
+        let stored: winner_ladder::WinnerLadder =
+            serde_json::from_str(&rig.store.route_winner_baseline().unwrap().unwrap()).unwrap();
+        assert_eq!(stored.version, winner_ladder::LADDER_FORMAT_VERSION);
+        assert_eq!(stored, rig.ladder());
+    }
+
+    /// The live flap: the plugin's mason launches and core's seed-catalog explore
+    /// selections hand the host different lists, whose iq-100 winners differ.
+    /// Once each class has a baseline, their alternation announces nothing, and
+    /// each class's ladder replays its own list rather than a shared one.
+    #[test]
+    fn two_caller_classes_alternating_their_lists_announce_nothing_once_both_have_baselines() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = LadderRig::new("classes");
+        rig.place_challenger_directly();
+        let mut watch = winner_ladder::ConfigReloadWatch::new(&rig.sources);
+        rig.observe_as("mason", &["incumbent", "small", "challenger"]);
+        assert_eq!(watch.check(rig.store.as_ref(), &rig.sources), None);
+        rig.observe_as("explore", &["incumbent", "small"]);
+        assert_eq!(watch.check(rig.store.as_ref(), &rig.sources), None);
+
+        for round in 0..3 {
+            rig.observe_as("mason", &["incumbent", "small", "challenger"]);
+            assert_eq!(
+                watch.check(rig.store.as_ref(), &rig.sources),
+                None,
+                "round {round}: mason's list arriving again is not a change"
+            );
+            assert_eq!(rig.announce("alternation"), None);
+            rig.observe_as("explore", &["incumbent", "small"]);
+            assert_eq!(watch.check(rig.store.as_ref(), &rig.sources), None);
+            assert_eq!(rig.announce("alternation"), None);
+        }
+        assert_eq!(rig.notices(), Vec::<serde_json::Value>::new());
+
+        let ladder = rig.ladder();
+        let explore = winner_ladder::LadderKey::new(winner_ladder::SUBSTRATE_HOST, "explore");
+        assert_eq!(
+            ladder.ladders[&host_mason().label()].tiers[&100].live,
+            Some(rig.route("challenger")),
+            "mason's ladder replays mason's list"
+        );
+        assert_eq!(
+            ladder.ladders[&explore.label()].tiers[&100].live,
+            Some(rig.route("incumbent")),
+            "explore's ladder replays explore's list, not mason's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placement_moving_one_class_winner_announces_for_that_class_only() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = LadderRig::new("one-class");
+        rig.observe_as("mason", &["incumbent", "small", "challenger"]);
+        rig.observe_as("explore", &["incumbent", "small"]);
+        assert_eq!(rig.announce("first selections"), None);
+
+        let response = rig.upsert(rig.challenger_params()).await;
+        assert_eq!(response.header.ty, FrameType::Response);
+
+        let notices = rig.notices();
+        assert_eq!(notices.len(), 1, "one notice: {notices:?}");
+        let changes = notices[0]["changes"].as_array().unwrap();
+        assert!(!changes.is_empty());
+        for change in changes {
+            assert_eq!(change["key"], "opencode-host / mason", "{change}");
+            assert_eq!(change["callerClass"], "mason");
+            assert_eq!(change["substrate"], winner_ladder::SUBSTRATE_HOST);
+        }
+        assert!(changes.iter().any(|change| {
+            change["newRoute"] == json!(rig.route("challenger"))
+                && change["tiers"].as_array().unwrap().contains(&json!(100))
+        }));
+        assert_eq!(rig.announce("again"), None);
+    }
+
+    /// Plugin explore launches and core's seed-catalog explore selections share
+    /// a class but not a list. Within the window the class replays the union, so
+    /// their alternation is not an availability change.
+    #[test]
+    fn one_class_alternating_two_lists_within_the_window_uses_their_union_and_announces_nothing() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = LadderRig::new("union");
+        rig.place_challenger_directly();
+        let mut watch = winner_ladder::ConfigReloadWatch::new(&rig.sources);
+        rig.observe_as("explore", &["incumbent", "small", "challenger"]);
+        assert_eq!(watch.check(rig.store.as_ref(), &rig.sources), None);
+
+        for round in 0..3 {
+            rig.observe_as("explore", &["incumbent", "small"]);
+            assert_eq!(
+                watch.check(rig.store.as_ref(), &rig.sources),
+                None,
+                "round {round}: the narrower list adds nothing to the union"
+            );
+            rig.observe_as("explore", &["incumbent", "small", "challenger"]);
+            assert_eq!(watch.check(rig.store.as_ref(), &rig.sources), None);
+            assert_eq!(rig.announce("alternation"), None);
+        }
+        assert_eq!(rig.notices(), Vec::<serde_json::Value>::new());
+
+        rig.observe_as("explore", &["incumbent", "small"]);
+        let explore = winner_ladder::LadderKey::new(winner_ladder::SUBSTRATE_HOST, "explore");
+        let ladder = rig.ladder();
+        let replayed = &ladder.ladders[&explore.label()];
+        assert!(
+            replayed.available.contains(&rig.route("challenger")),
+            "the union keeps the wider list after the narrower one arrives"
+        );
+        assert_eq!(replayed.tiers[&100].live, Some(rig.route("challenger")));
     }
 
     /// Multipliers are process-wide and priced into facts when they are read. The

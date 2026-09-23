@@ -15,6 +15,19 @@
 //! files. Until a real selection has arrived since boot there is no ladder at
 //! all, and nothing is compared or announced.
 //!
+//! Availability is recorded, and the ladder computed, compared, and stored, per
+//! [`LadderKey`]: the substrate plus the caller class, which is the target agent
+//! `route.select` was asked to route for (panels use [`CALLER_CLASS_PANEL`]).
+//! Different callers hand the same substrate different lists: the OpenCode
+//! plugin sends its live provider list, while core's sidekick classifier, wake
+//! author, and comment review route `explore` over a frozen seed catalog when
+//! their caller sent no list. Keyed by substrate alone, the recorded list
+//! alternated between the two, every alternation read as an availability change,
+//! and a notice fired each time. Callers of one class can still disagree (plugin
+//! explore launches and core's seed-catalog explore selections both occur), so a
+//! key's availability is the union of every list recorded for it within
+//! [`AVAILABILITY_UNION_WINDOW`].
+//!
 //! Each tier carries two winners: one with no runtime snapshot (quota, walls,
 //! cooldowns and backoffs ignored) and one under the recorded live snapshot. A
 //! tier is announced only when BOTH moved since the last announced ladder:
@@ -33,7 +46,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use prefrontal_routing_core::routing_config::DEFAULT_ROUTING_CONFIG;
 use prefrontal_routing_core::{
@@ -58,24 +71,71 @@ pub(crate) const NOTICE_RULE: &str = "a tier is listed only when its winner move
 /// Caller IQ demand tiers the ladder evaluates, on the wire's 0-100 scale.
 pub(crate) const LADDER_IQ_TIERS: [u8; 7] = [30, 50, 60, 70, 80, 90, 100];
 
-/// The target agent the dry run resolves demand for. The scorer does not branch
-/// on target agent (it only names it in the explanation), and the launch policy
-/// only special-cases agents that send NO demand; with an explicit IQ every
-/// routed agent resolves to the same requirements. One ladder therefore stands
-/// for every routed target agent. Mason is used because it is the agent whose
-/// launch policy insists on explicit demand, so the resolved EQ is the plain
-/// default rather than a specialist fallback.
+/// The target agent the dry run resolves demand for, whatever the key's caller
+/// class. The scorer does not branch on target agent (it only names it in the
+/// explanation), and the launch policy only special-cases agents that send NO
+/// demand; with an explicit IQ every routed agent resolves to the same
+/// requirements. The caller class therefore chooses only which recorded inputs
+/// a ladder replays, not how demand is resolved. Mason is used because it is the
+/// agent whose launch policy insists on explicit demand, so the resolved EQ is
+/// the plain default rather than a specialist fallback.
 const LADDER_TARGET_AGENT: &str = "mason";
 
 /// Selections arriving through `route.select`: the OpenCode host's own list.
 pub(crate) const SUBSTRATE_HOST: &str = "opencode-host";
 /// Panel legs that send through Broca (`route.select_panel` with substrate broca).
 pub(crate) const SUBSTRATE_BROCA: &str = "broca";
+/// Caller class of `route.select_panel` recordings: panels carry no target agent.
+pub(crate) const CALLER_CLASS_PANEL: &str = "panel";
+
+/// How long a recorded list keeps contributing to its key's union after it was
+/// last seen. Callers of one class arrive minutes apart (the live flap
+/// interleaved plugin explore launches and seed-catalog explore selections
+/// within five minutes), and a route that any recent caller of the class could
+/// reach can receive that class's traffic, so every list seen in the window
+/// counts. Six hours spans the gaps between sporadic callers such as gathers
+/// and classifier calls while still letting a disconnected provider leave the
+/// ladder within a working session.
+pub(crate) const AVAILABILITY_UNION_WINDOW: Duration = Duration::from_secs(6 * 60 * 60);
+/// Distinct lists kept per key; the least recently seen is dropped first. A
+/// caller-supplied list can differ per request, so the record needs a bound.
+const MAX_LISTS_PER_KEY: usize = 16;
+/// Keys kept in memory; the least recently recorded is dropped first. The
+/// target agent is caller-supplied text, so the key space needs a bound too.
+const MAX_KEYS: usize = 64;
 
 /// How often the watcher checks the config files and the observed availability.
 pub(crate) const CONFIG_WATCH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// What one live selection was handed: the ladder replays exactly this.
+/// Which ladder a recording feeds: the substrate that sends plus the class of
+/// caller that asked for the route.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct LadderKey {
+    pub substrate: &'static str,
+    pub caller_class: String,
+}
+
+impl LadderKey {
+    pub(crate) fn new(substrate: &'static str, caller_class: &str) -> Self {
+        let caller_class = caller_class.trim();
+        Self {
+            substrate,
+            caller_class: if caller_class.is_empty() {
+                "unknown".to_string()
+            } else {
+                caller_class.to_string()
+            },
+        }
+    }
+
+    /// The name a notice and the stored baseline use, e.g. `opencode-host / mason`.
+    pub(crate) fn label(&self) -> String {
+        format!("{} / {}", self.substrate, self.caller_class)
+    }
+}
+
+/// What the ladder replays for one key: the union of the lists recorded within
+/// the window and the most recent runtime snapshot.
 #[derive(Debug, Clone)]
 pub(crate) struct ObservedSelection {
     pub available: BTreeSet<String>,
@@ -83,43 +143,136 @@ pub(crate) struct ObservedSelection {
     pub snapshot: ModelRouteStateSnapshot,
 }
 
-/// The most recent selection inputs per substrate, in memory only. Bounded by
-/// construction: one entry per substrate constant, each replaced on arrival.
+#[derive(Debug, Clone)]
+struct SeenList {
+    available: BTreeSet<String>,
+    subscription_keys: BTreeSet<String>,
+    seen_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct KeyRecord {
+    /// Newest last.
+    lists: Vec<SeenList>,
+    snapshot: ModelRouteStateSnapshot,
+    last_recorded: Instant,
+}
+
+impl KeyRecord {
+    /// Drop lists older than the window, always keeping the newest one so a key
+    /// that has gone quiet still has something to replay.
+    fn prune(&mut self, now: Instant) {
+        let newest = self.lists.len().saturating_sub(1);
+        let mut index = 0;
+        self.lists.retain(|list| {
+            let keep = index == newest
+                || now.saturating_duration_since(list.seen_at) <= AVAILABILITY_UNION_WINDOW;
+            index += 1;
+            keep
+        });
+    }
+
+    fn observation(&self) -> ObservedSelection {
+        ObservedSelection {
+            available: self
+                .lists
+                .iter()
+                .flat_map(|list| list.available.iter().cloned())
+                .collect(),
+            subscription_keys: self
+                .lists
+                .iter()
+                .flat_map(|list| list.subscription_keys.iter().cloned())
+                .collect(),
+            snapshot: self.snapshot.clone(),
+        }
+    }
+}
+
+/// Recent selection inputs per key, in memory only, bounded by [`MAX_KEYS`] and
+/// [`MAX_LISTS_PER_KEY`].
 #[derive(Debug, Default)]
 pub(crate) struct ObservedSelections {
-    by_substrate: Mutex<BTreeMap<&'static str, ObservedSelection>>,
+    by_key: Mutex<BTreeMap<LadderKey, KeyRecord>>,
 }
 
 impl ObservedSelections {
     pub(crate) fn record(
         &self,
-        substrate: &'static str,
+        key: LadderKey,
         available: impl IntoIterator<Item = String>,
         subscription_keys: impl IntoIterator<Item = String>,
         snapshot: ModelRouteStateSnapshot,
     ) {
-        let observation = ObservedSelection {
-            available: available.into_iter().collect(),
-            subscription_keys: subscription_keys.into_iter().collect(),
-            snapshot,
-        };
-        if let Ok(mut guard) = self.by_substrate.lock() {
-            guard.insert(substrate, observation);
-        }
+        self.record_at(key, available, subscription_keys, snapshot, Instant::now());
     }
 
-    pub(crate) fn current(&self) -> BTreeMap<&'static str, ObservedSelection> {
-        self.by_substrate
+    /// [`Self::record`] at a given time, so tests can place a list outside the window.
+    pub(crate) fn record_at(
+        &self,
+        key: LadderKey,
+        available: impl IntoIterator<Item = String>,
+        subscription_keys: impl IntoIterator<Item = String>,
+        snapshot: ModelRouteStateSnapshot,
+        at: Instant,
+    ) {
+        let seen = SeenList {
+            available: available.into_iter().collect(),
+            subscription_keys: subscription_keys.into_iter().collect(),
+            seen_at: at,
+        };
+        let Ok(mut guard) = self.by_key.lock() else {
+            return;
+        };
+        if !guard.contains_key(&key) && guard.len() >= MAX_KEYS {
+            let stalest = guard
+                .iter()
+                .min_by_key(|(_, record)| record.last_recorded)
+                .map(|(key, _)| key.clone());
+            if let Some(stalest) = stalest {
+                guard.remove(&stalest);
+            }
+        }
+        let record = guard.entry(key).or_insert_with(|| KeyRecord {
+            lists: Vec::new(),
+            snapshot: snapshot.clone(),
+            last_recorded: at,
+        });
+        // The same list seen again moves to the newest position rather than
+        // being stored twice.
+        record.lists.retain(|list| {
+            list.available != seen.available || list.subscription_keys != seen.subscription_keys
+        });
+        record.lists.push(seen);
+        if record.lists.len() > MAX_LISTS_PER_KEY {
+            let excess = record.lists.len() - MAX_LISTS_PER_KEY;
+            record.lists.drain(..excess);
+        }
+        record.snapshot = snapshot;
+        record.last_recorded = at;
+    }
+
+    pub(crate) fn current(&self) -> BTreeMap<LadderKey, ObservedSelection> {
+        let now = Instant::now();
+        self.by_key
             .lock()
-            .map(|guard| guard.clone())
+            .map(|mut guard| {
+                guard
+                    .iter_mut()
+                    .map(|(key, record)| {
+                        record.prune(now);
+                        (key.clone(), record.observation())
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
     /// Availability sets only: the watcher's trigger must not fire on quota drift.
-    fn availability(&self) -> BTreeMap<&'static str, BTreeSet<String>> {
+    fn availability(&self) -> BTreeMap<LadderKey, BTreeSet<String>> {
         self.current()
             .into_iter()
-            .map(|(substrate, observation)| (substrate, observation.available))
+            .map(|(key, observation)| (key, observation.available))
             .collect()
     }
 }
@@ -158,24 +311,36 @@ pub(crate) struct TierWinners {
     pub live: Option<String>,
 }
 
-/// One substrate's ladder and the availability set it was computed over.
+/// One key's ladder and the availability set it was computed over.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SubstrateLadder {
+pub(crate) struct KeyLadder {
+    pub substrate: String,
+    pub caller_class: String,
     pub available: Vec<String>,
     pub tiers: BTreeMap<u8, TierWinners>,
 }
 
-/// Winners per substrate and IQ tier at the default EQ.
+/// Format version of the stored ladder. Version 1 (no `version` field) keyed
+/// ladders by substrate alone; a stored row of any other version is treated as
+/// no baseline and replaced silently, since its keys cannot be compared.
+pub(crate) const LADDER_FORMAT_VERSION: u32 = 2;
+
+/// Winners per key and IQ tier at the default EQ. `ladders` is keyed by
+/// [`LadderKey::label`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct WinnerLadder {
-    pub substrates: BTreeMap<String, SubstrateLadder>,
+    pub version: u32,
+    pub ladders: BTreeMap<String, KeyLadder>,
     pub eq: f64,
 }
 
-/// One move on one substrate and every tier it happened at.
+/// One move on one key and every tier it happened at.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WinnerChange {
+    /// [`LadderKey::label`] of the ladder that moved.
+    pub key: String,
     pub substrate: String,
+    pub caller_class: String,
     pub old_route: Option<String>,
     pub new_route: Option<String>,
     pub quota_neutral_old_route: Option<String>,
@@ -198,7 +363,9 @@ impl WinnerChangeNotice {
             .iter()
             .map(|change| {
                 json!({
+                    "key": change.key,
                     "substrate": change.substrate,
+                    "callerClass": change.caller_class,
                     "oldRoute": change.old_route,
                     "newRoute": change.new_route,
                     "quotaNeutralOldRoute": change.quota_neutral_old_route,
@@ -214,7 +381,7 @@ impl WinnerChangeNotice {
             "atMs": at_ms,
             "trigger": self.trigger,
             "eq": self.eq,
-            "agents": "every routed target agent (selection does not branch on target agent)",
+            "agents": "each change names its key: the substrate and the caller class (the target agent route.select routed for, or panel) whose recorded availability the ladder replayed",
             "rule": NOTICE_RULE,
             "changes": changes,
         });
@@ -229,8 +396,8 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Compute both winners at every tier for every substrate a live selection has
-/// been observed on. `Ok(None)` means no selection has arrived since boot: there
+/// Compute both winners at every tier for every key a live selection has been
+/// observed on. `Ok(None)` means no selection has arrived since boot: there
 /// is nothing to replay, and an empty ladder must not be mistaken for one.
 ///
 /// Live multipliers, Elo overrides, the demand exponent, the best-effort band,
@@ -264,9 +431,10 @@ pub(crate) fn compute_ladder(
             .flatten();
     let operator = config_overrides::read_operator_routing_policy(&sources.operator_config);
 
-    let mut substrates = BTreeMap::new();
+    let mut ladders = BTreeMap::new();
     let mut ladder_eq = 0.0;
-    for (substrate, observation) in observed {
+    for (key, observation) in observed {
+        let label = key.label();
         let available: HashSet<String> = observation.available.iter().cloned().collect();
         let mut tiers = BTreeMap::new();
         for tier in LADDER_IQ_TIERS {
@@ -313,29 +481,32 @@ pub(crate) fn compute_ladder(
                     .ok()
                     .map(|selected| selected.route_key)
                 }))
-                .map_err(|_| format!("route selection panicked at iq {tier} on {substrate}"))
+                .map_err(|_| format!("route selection panicked at iq {tier} on {label}"))
             };
             let neutral = select(None)?;
             let live = select(Some(observation.snapshot.clone()))?;
             tiers.insert(tier, TierWinners { neutral, live });
         }
-        substrates.insert(
-            substrate.to_string(),
-            SubstrateLadder {
+        ladders.insert(
+            label,
+            KeyLadder {
+                substrate: key.substrate.to_string(),
+                caller_class: key.caller_class.clone(),
                 available: observation.available.into_iter().collect(),
                 tiers,
             },
         );
     }
     Ok(Some(WinnerLadder {
-        substrates,
+        version: LADDER_FORMAT_VERSION,
+        ladders,
         eq: ladder_eq,
     }))
 }
 
 /// Compare a ladder with the last announced one. A tier counts only when both
-/// its quota-neutral and its live winner differ; a substrate the baseline has
-/// never seen is not a move. Moves group by substrate and route pairs.
+/// its quota-neutral and its live winner differ; a key the baseline has never
+/// seen is not a move. Moves group by key and route pairs.
 pub(crate) fn diff_ladders(
     baseline: &WinnerLadder,
     current: &WinnerLadder,
@@ -349,8 +520,8 @@ pub(crate) fn diff_ladders(
         Option<String>,
     );
     let mut grouped: BTreeMap<Key, Vec<u8>> = BTreeMap::new();
-    for (substrate, ladder) in &current.substrates {
-        let Some(before) = baseline.substrates.get(substrate) else {
+    for (label, ladder) in &current.ladders {
+        let Some(before) = baseline.ladders.get(label) else {
             continue;
         };
         for (tier, now) in &ladder.tiers {
@@ -360,7 +531,7 @@ pub(crate) fn diff_ladders(
             }
             grouped
                 .entry((
-                    substrate.clone(),
+                    label.clone(),
                     then.live,
                     now.live.clone(),
                     then.neutral,
@@ -379,9 +550,12 @@ pub(crate) fn diff_ladders(
         changes: grouped
             .into_iter()
             .map(
-                |((substrate, old_route, new_route, neutral_old, neutral_new), tiers)| {
+                |((key, old_route, new_route, neutral_old, neutral_new), tiers)| {
+                    let ladder = &current.ladders[&key];
                     WinnerChange {
-                        substrate,
+                        substrate: ladder.substrate.clone(),
+                        caller_class: ladder.caller_class.clone(),
+                        key,
                         old_route,
                         new_route,
                         quota_neutral_old_route: neutral_old,
@@ -412,8 +586,10 @@ fn store_baseline(store: &SqliteRouteStateStore, ladder: &WinnerLadder, trigger:
 /// - No selection observed since boot: nothing is computed, compared, or saved.
 /// - No stored baseline (the first run ever): the ladder is saved silently.
 /// - A move: one notice is emitted and the new ladder becomes the baseline.
-/// - No move: the baseline stays, except that a substrate it has never seen is
-///   added to it silently.
+/// - No move: the baseline stays, except that a key it has never seen is added
+///   to it silently.
+/// - A stored baseline of another format version (written before ladders were
+///   keyed by caller class): treated as no baseline and replaced silently.
 ///
 /// Returns the notice for callers that test it. A failure never blocks the
 /// change that triggered it.
@@ -431,11 +607,11 @@ pub(crate) fn announce(
         }
     };
     let baseline = match store.route_winner_baseline() {
-        Ok(Some(json)) => match serde_json::from_str::<WinnerLadder>(&json) {
+        Ok(Some(json)) => match parse_baseline(&json) {
             Ok(ladder) => Some(ladder),
-            Err(error) => {
+            Err(reason) => {
                 eprintln!(
-                    "[prefrontal-routing] stored winner ladder unreadable ({error}); replacing it without announcing"
+                    "[prefrontal-routing] stored winner ladder {reason}; replacing it without announcing"
                 );
                 None
             }
@@ -454,9 +630,9 @@ pub(crate) fn announce(
     };
     let notice = diff_ladders(&baseline, &current, trigger);
     let mut changed = false;
-    for (substrate, ladder) in current.substrates {
-        if notice.is_some() || !baseline.substrates.contains_key(&substrate) {
-            baseline.substrates.insert(substrate, ladder);
+    for (label, ladder) in current.ladders {
+        if notice.is_some() || !baseline.ladders.contains_key(&label) {
+            baseline.ladders.insert(label, ladder);
             changed = true;
         }
     }
@@ -468,6 +644,20 @@ pub(crate) fn announce(
         emit(notice);
     }
     notice
+}
+
+/// Read a stored baseline, refusing any format version but the current one.
+fn parse_baseline(json: &str) -> Result<WinnerLadder, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| format!("unreadable ({error})"))?;
+    let version = value.get("version").and_then(serde_json::Value::as_u64);
+    if version != Some(u64::from(LADDER_FORMAT_VERSION)) {
+        return Err(format!(
+            "has format version {} but {LADDER_FORMAT_VERSION} is current (older ladders were keyed by substrate only)",
+            version.map_or_else(|| "1".to_string(), |version| version.to_string())
+        ));
+    }
+    serde_json::from_value(value).map_err(|error| format!("unreadable ({error})"))
 }
 
 fn emit(notice: &WinnerChangeNotice) {
@@ -495,7 +685,7 @@ pub(crate) fn emitted_lines() -> &'static Mutex<Vec<String>> {
 struct ConfigFingerprint {
     routing_config: String,
     operator_config: String,
-    availability: BTreeMap<&'static str, BTreeSet<String>>,
+    availability: BTreeMap<LadderKey, BTreeSet<String>>,
 }
 
 fn file_digest(path: &Path) -> String {
@@ -554,14 +744,14 @@ impl ConfigReloadWatch {
                 sources.operator_config.display()
             ));
         }
-        let substrates: BTreeSet<&&str> = current
+        let keys: BTreeSet<&LadderKey> = current
             .availability
             .keys()
             .chain(self.last.availability.keys())
             .collect();
-        for substrate in substrates {
-            if current.availability.get(*substrate) != self.last.availability.get(*substrate) {
-                changed.push(format!("{substrate} availability"));
+        for key in keys {
+            if current.availability.get(key) != self.last.availability.get(key) {
+                changed.push(format!("{} availability", key.label()));
             }
         }
         self.last = current;
@@ -593,9 +783,12 @@ mod tests {
 
     fn ladder(substrate: &str, routes: [(&str, &str); 7]) -> WinnerLadder {
         WinnerLadder {
-            substrates: BTreeMap::from([(
-                substrate.to_string(),
-                SubstrateLadder {
+            version: LADDER_FORMAT_VERSION,
+            ladders: BTreeMap::from([(
+                format!("{substrate} / mason"),
+                KeyLadder {
+                    substrate: substrate.to_string(),
+                    caller_class: "mason".to_string(),
                     available: Vec::new(),
                     tiers: LADDER_IQ_TIERS
                         .iter()
@@ -693,15 +886,88 @@ mod tests {
         assert_eq!(body["rule"], NOTICE_RULE);
         assert_eq!(body["changes"][0]["tiers"], json!([90, 100]));
         assert_eq!(body["changes"][0]["newRouteSubstrates"], json!(["h"]));
+        assert_eq!(body["changes"][0]["key"], "h / mason");
+        assert_eq!(body["changes"][0]["callerClass"], "mason");
     }
 
     #[test]
     fn a_ladder_round_trips_through_its_stored_form() {
         let original = ladder("h", [("a", "b"); 7]);
         let json = serde_json::to_string(&original).unwrap();
-        assert_eq!(
-            serde_json::from_str::<WinnerLadder>(&json).unwrap(),
-            original
+        assert_eq!(parse_baseline(&json).unwrap(), original);
+    }
+
+    /// A row written before ladders were keyed by caller class has no version
+    /// and substrate-only keys; it must read as "no baseline", not as a ladder
+    /// whose every key is new or whose tiers compare against the wrong caller.
+    #[test]
+    fn a_stored_ladder_of_the_old_shape_is_not_a_baseline() {
+        let old = r#"{"substrates":{"opencode-host":{"available":["a/x"],"tiers":{"30":{"neutral":"a/x","live":"a/x"}}}},"eq":50.0}"#;
+        let error = parse_baseline(old).unwrap_err();
+        assert!(error.contains("format version 1"), "{error}");
+    }
+
+    fn snapshot() -> ModelRouteStateSnapshot {
+        ModelRouteStateSnapshot::default()
+    }
+
+    fn list(models: &[&str]) -> Vec<String> {
+        models.iter().map(|model| model.to_string()).collect()
+    }
+
+    #[test]
+    fn one_class_unions_its_lists_within_the_window_and_drops_older_ones() {
+        let observed = ObservedSelections::default();
+        let key = LadderKey::new(SUBSTRATE_HOST, "explore");
+        let long_ago = Instant::now()
+            .checked_sub(AVAILABILITY_UNION_WINDOW + Duration::from_secs(60))
+            .expect("the monotonic clock reaches back past the window");
+        observed.record_at(
+            key.clone(),
+            list(&["old/x"]),
+            Vec::new(),
+            snapshot(),
+            long_ago,
         );
+        observed.record(key.clone(), list(&["a/x", "a/y"]), Vec::new(), snapshot());
+        observed.record(key.clone(), list(&["b/z"]), Vec::new(), snapshot());
+        let current = observed.current();
+        assert_eq!(
+            current[&key].available,
+            BTreeSet::from(["a/x".to_string(), "a/y".to_string(), "b/z".to_string()]),
+            "both recent lists count and the one outside the window does not"
+        );
+        // A class that has gone quiet still replays its newest list.
+        let quiet = LadderKey::new(SUBSTRATE_HOST, "oracle");
+        observed.record_at(
+            quiet.clone(),
+            list(&["q/q"]),
+            Vec::new(),
+            snapshot(),
+            long_ago,
+        );
+        assert_eq!(
+            observed.current()[&quiet].available,
+            BTreeSet::from(["q/q".to_string()])
+        );
+    }
+
+    #[test]
+    fn different_classes_on_one_substrate_are_recorded_apart() {
+        let observed = ObservedSelections::default();
+        let mason = LadderKey::new(SUBSTRATE_HOST, "mason");
+        let explore = LadderKey::new(SUBSTRATE_HOST, "explore");
+        observed.record(mason.clone(), list(&["live/x"]), Vec::new(), snapshot());
+        observed.record(explore.clone(), list(&["seed/y"]), Vec::new(), snapshot());
+        let current = observed.current();
+        assert_eq!(
+            current[&mason].available,
+            BTreeSet::from(["live/x".to_string()])
+        );
+        assert_eq!(
+            current[&explore].available,
+            BTreeSet::from(["seed/y".to_string()])
+        );
+        assert_eq!(mason.label(), "opencode-host / mason");
     }
 }
