@@ -128,15 +128,6 @@ impl SpendPool {
         self.spendable != Some(false)
     }
 
-    /// A pool can serve routing only when its producer flag, supported funding,
-    /// and reported remaining balance all agree. This must not be used to suppress
-    /// an exhausted-pool wall: an empty allowed pool is intentionally unspendable.
-    pub fn is_routing_spendable(&self) -> bool {
-        self.producer_allows_spend()
-            && self.has_supported_funding()
-            && !self.remaining.is_non_positive()
-    }
-
     fn can_inform_pacing(&self) -> bool {
         self.producer_allows_spend() && self.has_supported_funding()
     }
