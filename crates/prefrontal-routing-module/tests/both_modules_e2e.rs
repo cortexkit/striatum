@@ -96,6 +96,7 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
     assert!(status.success(), "building {bin} failed");
     let path = sibling_target.join(format!("debug/{bin}"));
     assert!(path.exists(), "{bin} binary missing at {}", path.display());
+    prefrontal_test_support::sign_test_binary(&path);
     // A freshly built binary stalls in macOS Gatekeeper/syspolicyd assessment
     // on first exec (measured 14-33s under load), which lands inside this
     // test's supervisor setup deadline and reads as a module that never came
@@ -114,6 +115,7 @@ async fn start_both_modules_daemon() -> RealDaemon {
     let quota_module = build_bin(&sibling(QUOTA_REPO_REL), "ck-insula");
     let routing_module = PathBuf::from(env!("CARGO_BIN_EXE_ck-prefrontal-routing"));
     assert!(routing_module.exists());
+    prefrontal_test_support::sign_test_binary(&routing_module);
 
     let rig = unique_temp_dir("both-modules-real-daemon");
     let config_dir = rig.join("config/cortexkit");

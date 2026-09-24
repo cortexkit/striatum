@@ -57,6 +57,7 @@ impl Drop for RealDaemon {
 async fn start_real_daemon() -> RealDaemon {
     let subc_core = prefrontal_test_support::SubcDaemonBinary::build();
     let module_bin = PathBuf::from(env!("CARGO_BIN_EXE_ck-prefrontal-routing"));
+    prefrontal_test_support::sign_test_binary(&module_bin);
     // Warm-exec the freshly built module binary too (same assessment stall).
     let _ = std::process::Command::new(&module_bin)
         .arg("--version")
