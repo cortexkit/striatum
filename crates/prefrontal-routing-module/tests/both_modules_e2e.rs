@@ -87,10 +87,7 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
         .join("../../target/sibling-target")
         .join(repo_name);
     std::fs::create_dir_all(&sibling_target).unwrap();
-    let status = std::process::Command::new(env!("CARGO"))
-        .current_dir(repo)
-        .env("CARGO_TARGET_DIR", &sibling_target)
-        .args(["build", "--bin", bin])
+    let status = prefrontal_test_support::sibling_cargo_build(repo, &sibling_target, bin)
         .status()
         .unwrap_or_else(|_| panic!("run cargo build --bin {bin} in {}", repo.display()));
     assert!(status.success(), "building {bin} failed");
