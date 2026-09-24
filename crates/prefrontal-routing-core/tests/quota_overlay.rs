@@ -576,15 +576,15 @@ fn spend_pools_decode_additively_and_unknown_funding_cannot_spend() {
     assert_eq!(entry.spend[0].funding, "issuer_credit_v2");
     assert_eq!(entry.spend[0].basis, "reported");
     assert!(
-        !entry.spend[0].is_routing_spendable(),
+        !entry.spend[0].has_supported_funding(),
         "unknown funding must remain not-granted-do-not-spend"
     );
     assert_eq!(entry.spend[1].funding, "unknown");
     assert!(
-        !entry.spend[1].is_routing_spendable(),
+        !entry.spend[1].has_supported_funding(),
         "the literal \"unknown\" (codex banked credits) must be not-spendable through the same path"
     );
-    assert!(entry.spend[2].is_routing_spendable());
+    assert!(entry.spend[2].has_supported_funding());
 }
 
 #[test]
