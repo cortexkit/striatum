@@ -101,11 +101,7 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
     // on first exec (measured 14-33s under load), which lands inside this
     // test's supervisor setup deadline and reads as a module that never came
     // up. One warm exec eats the assessment before the daemon spawns it.
-    let _ = std::process::Command::new(&path)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    prefrontal_test_support::warm_exec_fenced(&path);
     path
 }
 
