@@ -668,6 +668,8 @@ where
     // Broca owns this file; routing reads only which providers it can
     // authenticate to, for panels whose legs send through Broca.
     let broca_vault_handles_path = config_overrides::broca_vault_handles_path();
+    // OpenCode owns this file; routing reads only each provider's auth kind.
+    let opencode_auth_path = config_overrides::auth_json_path();
     match config_overrides::apply_overrides_from_config(store.as_ref(), &override_path) {
         Ok(outcome) => {
             if outcome.applied > 0 || outcome.reverted > 0 || !outcome.skipped.is_empty() {
@@ -743,6 +745,7 @@ where
             &override_path,
             &operator_config_path,
             &broca_vault_handles_path,
+            &opencode_auth_path,
             &catalog_health,
         )
         .await?
@@ -831,6 +834,7 @@ async fn handle_frame(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_vault_handles_path: &Path,
+    opencode_auth_path: &Path,
     catalog_health: &SharedCatalogHealth,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
@@ -873,6 +877,7 @@ async fn handle_frame(
             let routing_config_path = routing_config_path.to_path_buf();
             let operator_config_path = operator_config_path.to_path_buf();
             let broca_vault_handles_path = broca_vault_handles_path.to_path_buf();
+            let opencode_auth_path = opencode_auth_path.to_path_buf();
             tokio::spawn(async move {
                 let _ = handle_select_request(
                     frame,
@@ -884,6 +889,7 @@ async fn handle_frame(
                     &routing_config_path,
                     &operator_config_path,
                     &broca_vault_handles_path,
+                    &opencode_auth_path,
                 )
                 .await;
             });
@@ -1156,12 +1162,27 @@ struct ResolvedSelectRequest {
     policy: ResolvedRoutingPolicy,
 }
 
-fn provider_auth_types(raw: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+/// Provider auth kinds from the request, else read from OpenCode's `auth.json`
+/// at `opencode_auth_path`. The path is passed in rather than resolved here so
+/// unit tests hand in a scratch file; resolving it from HOME would read the
+/// operator's live credentials file.
+fn provider_auth_types(
+    raw: Option<&HashMap<String, String>>,
+    opencode_auth_path: &Path,
+) -> HashMap<String, String> {
     if let Some(raw) = raw {
         return raw.clone();
     }
-    let path = config_overrides::auth_json_path();
-    match config_overrides::read_provider_auth_types(&path) {
+    // A unit test must never read the operator's real auth.json (it holds API
+    // keys and OAuth tokens, and the test would then depend on which providers
+    // the operator has configured).
+    #[cfg(test)]
+    assert!(
+        opencode_auth_path.starts_with(prefrontal_test_support::scratch_root()),
+        "routing unit test read OpenCode auth from {} instead of a scratch file",
+        opencode_auth_path.display()
+    );
+    match config_overrides::read_provider_auth_types(opencode_auth_path) {
         Ok(types) => types,
         Err(error) => {
             eprintln!(
@@ -1308,6 +1329,7 @@ fn no_route_error(
 fn resolve_select_request(
     params: &SelectParams,
     operator_policy: &ModelRoutingPolicyInput,
+    opencode_auth_path: &Path,
 ) -> Result<ResolvedSelectRequest, NoRouteError> {
     let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
         (requirements, params.required_capabilities)
@@ -1331,7 +1353,7 @@ fn resolve_select_request(
         params.available_models.iter().cloned(),
         operator_policy,
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(params.provider_auth_types.as_ref()),
+        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
         params.suppress_fast_variant,
     );
     if policy.connected_model_count == 0 {
@@ -2025,6 +2047,7 @@ async fn handle_resolve_policy(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     operator_config_path: &Path,
+    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -2052,7 +2075,7 @@ async fn handle_resolve_policy(
         params.available_models,
         &operator_policy,
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(params.provider_auth_types.as_ref()),
+        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
         params.suppress_fast_variant,
     );
     let body = serde_json::to_vec(&json!({ "result": resolved })).map_err(ModuleError::Json)?;
@@ -2257,6 +2280,7 @@ async fn handle_select_request(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_vault_handles_path: &Path,
+    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     frame.header.epoch = route_epoch;
@@ -2350,7 +2374,8 @@ async fn handle_select_request(
         return handle_route_decisions_list(frame, writer, store).await;
     }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
-        return handle_resolve_policy(frame, writer, operator_config_path).await;
+        return handle_resolve_policy(frame, writer, operator_config_path, opencode_auth_path)
+            .await;
     }
     if envelope.method == ROUTE_MODEL_FACT_OP {
         return handle_model_fact(frame, writer, store).await;
@@ -2368,7 +2393,14 @@ async fn handle_select_request(
         return model_resolution::handle_agent_model_requirements(frame, writer).await;
     }
     if envelope.method == available_models_text::OP {
-        return available_models_text::handle(frame, writer, store, operator_config_path).await;
+        return available_models_text::handle(
+            frame,
+            writer,
+            store,
+            operator_config_path,
+            opencode_auth_path,
+        )
+        .await;
     }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         let ladder_sources =
@@ -2396,6 +2428,7 @@ async fn handle_select_request(
             routing_config_path,
             operator_config_path,
             broca_vault_handles_path,
+            opencode_auth_path,
         )
         .await;
     }
@@ -2460,28 +2493,29 @@ async fn handle_select_request(
         SelectAvailability::host(std::mem::take(&mut params.available_models))
     };
     params.available_models = availability.models.clone();
-    let resolved_request = match resolve_select_request(&params, &operator_policy) {
-        Ok(resolved) => resolved,
-        Err(mut no_route) => {
-            if let Some(note) = &availability.note {
-                no_route.message = format!("{} ({note})", no_route.message);
+    let resolved_request =
+        match resolve_select_request(&params, &operator_policy, opencode_auth_path) {
+            Ok(resolved) => resolved,
+            Err(mut no_route) => {
+                if let Some(note) = &availability.note {
+                    no_route.message = format!("{} ({note})", no_route.message);
+                }
+                let requirements = no_route
+                    .requirements
+                    .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
+                let decision = decision_input_for(
+                    &params.target_agent,
+                    &requirements,
+                    None,
+                    Some(&no_route),
+                    &params,
+                    None,
+                    Some(&policy_sources_line(&operator_policy)),
+                );
+                let _ = store.record_decision(&decision);
+                return send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
             }
-            let requirements = no_route
-                .requirements
-                .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
-            let decision = decision_input_for(
-                &params.target_agent,
-                &requirements,
-                None,
-                Some(&no_route),
-                &params,
-                None,
-                Some(&policy_sources_line(&operator_policy)),
-            );
-            let _ = store.record_decision(&decision);
-            return send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
-        }
-    };
+        };
     let providers_without_prompt_cache = match config_overrides::read_providers_without_prompt_cache(
         routing_config_path,
     ) {
@@ -2943,6 +2977,7 @@ async fn handle_select_panel(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_vault_handles_path: &Path,
+    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -3035,7 +3070,7 @@ async fn handle_select_panel(
             ..ModelRoutingPolicyInput::default()
         },
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(None),
+        &provider_auth_types(None, opencode_auth_path),
         false,
     );
     let subscription_keys: HashSet<String> =
@@ -4898,6 +4933,21 @@ mod tests {
     /// what every test that does not name a substrate expects.
     const ABSENT_BROCA_VAULT_HANDLES: &str = "/nonexistent/broca/vault-handles.json";
 
+    /// An OpenCode `auth.json` with no providers, under the scratch root, for
+    /// requests that carry no provider auth types (see `provider_auth_types`).
+    fn empty_opencode_auth() -> PathBuf {
+        static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            let path = prefrontal_test_support::scratch_root().join(format!(
+                "prefrontal-routing-empty-opencode-auth-{}.json",
+                std::process::id()
+            ));
+            std::fs::write(&path, "{}").unwrap();
+            path
+        })
+        .clone()
+    }
+
     fn usage_params(id: &str) -> serde_json::Value {
         json!({
             "messageID": id,
@@ -4980,6 +5030,7 @@ mod tests {
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
             broca_vault_handles_path,
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -6496,6 +6547,7 @@ mod tests {
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
             Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -6540,6 +6592,7 @@ mod tests {
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -6635,6 +6688,7 @@ mod tests {
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -7127,6 +7181,7 @@ mod tests {
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -7209,6 +7264,7 @@ mod tests {
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -7760,6 +7816,7 @@ mod tests {
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
                 Path::new(ABSENT_BROCA_VAULT_HANDLES),
+                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -7862,6 +7919,7 @@ mod tests {
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -8309,6 +8367,7 @@ mod tests {
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -8370,6 +8429,7 @@ mod tests {
                 config_path,
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
                 Path::new(ABSENT_BROCA_VAULT_HANDLES),
+                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -8548,6 +8608,7 @@ mod tests {
             &config_path,
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
         )
         .await
         .unwrap();
