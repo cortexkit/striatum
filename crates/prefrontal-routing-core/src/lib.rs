@@ -102,7 +102,7 @@ pub use quota_pace::{
 };
 pub use route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 pub use route_state_store::{
-    CatalogFactField, DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource,
+    CatalogFactField, CooldownState, DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource,
     FailureBackoffState, ProviderCooldownState, RouteOutcome, RouteStateResult, RouteStateStore,
     RouteStateStoreError, RouteStateUpdate, RouteWallClass, UsageObservation,
     OBSERVED_SPEED_MIN_OUTPUT_TOKENS, OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT,

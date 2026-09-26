@@ -192,6 +192,13 @@ pub struct FailureBackoffState {
     pub failure_backoff_reason: Option<String>,
 }
 
+/// Route-local wall horizons before an operator clears them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CooldownState {
+    pub cooldown_until: Option<f64>,
+    pub quota_exhausted_until: Option<f64>,
+}
+
 /// What `record_decision` persists: the selection (or none) + its audit context.
 /// `score_json`/`rejected_json`/`explanation_json` are pre-serialized by the
 /// caller (the module serializes the scorer's `SelectedModelRoute`), keeping this
@@ -441,6 +448,12 @@ pub trait RouteStateStore {
         &self,
         _route_key: &str,
     ) -> RouteStateResult<Option<FailureBackoffState>> {
+        Ok(None)
+    }
+
+    /// Clear only route-local cooldown and quota walls for an exact catalog key.
+    /// `None` means the route is unknown; known routes without state return empty horizons.
+    fn clear_cooldown(&self, _route_key: &str) -> RouteStateResult<Option<CooldownState>> {
         Ok(None)
     }
 

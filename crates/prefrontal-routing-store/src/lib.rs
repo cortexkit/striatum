@@ -23,9 +23,9 @@ use prefrontal_routing_core::route_state_store::{
 };
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, failure_backoff_transition, CatalogFactField,
-    DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource, FailureBackoffState,
-    FailureBackoffTransition, ProviderCooldownState, RouteStateResult, RouteStateStore,
-    RouteStateStoreError, RouteStateUpdate, RouteWallClass, UsageObservation,
+    CooldownState, DecisionInput, DecisionOutcomeUpdate, DecisionRow, FactSource,
+    FailureBackoffState, FailureBackoffTransition, ProviderCooldownState, RouteStateResult,
+    RouteStateStore, RouteStateStoreError, RouteStateUpdate, RouteWallClass, UsageObservation,
     OBSERVED_SPEED_MIN_OUTPUT_TOKENS, OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT,
     OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
 };
@@ -2514,6 +2514,48 @@ impl RouteStateStore for SqliteRouteStateStore {
                 }
                 tx.commit()?;
                 Ok(prior)
+            })
+            .map_err(err)
+    }
+
+    fn clear_cooldown(&self, route_key: &str) -> RouteStateResult<Option<CooldownState>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let tx = c.unchecked_transaction()?;
+                let known = tx
+                    .query_row(
+                        "SELECT 1 FROM model_facts WHERE route_key = ?1",
+                        [route_key],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?
+                    .is_some();
+                if !known {
+                    return Ok(None);
+                }
+                let prior = tx
+                    .query_row(
+                        "SELECT cooldown_until, quota_exhausted_until
+                     FROM model_route_state WHERE route_key = ?1",
+                        [route_key],
+                        |row| {
+                            Ok(CooldownState {
+                                cooldown_until: row.get(0)?,
+                                quota_exhausted_until: row.get(1)?,
+                            })
+                        },
+                    )
+                    .optional()?
+                    .unwrap_or_default();
+                tx.execute(
+                    "UPDATE model_route_state
+                     SET cooldown_until = NULL, quota_exhausted_until = NULL,
+                         wall_class = NULL, updated_at = ?1
+                     WHERE route_key = ?2",
+                    params![now_ms(), route_key],
+                )?;
+                tx.commit()?;
+                Ok(Some(prior))
             })
             .map_err(err)
     }

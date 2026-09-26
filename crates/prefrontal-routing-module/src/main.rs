@@ -103,6 +103,8 @@ const ROUTE_COOLDOWN_STATUS_OP: &str = "route.cooldown_status";
 /// Clear an operator-identified route-local terminal-failure backoff without changing
 /// provider cooldown or quota state.
 const ROUTE_CLEAR_FAILURE_BACKOFF_OP: &str = "route.clear_failure_backoff";
+/// Lift a route-local cooldown and quota wall without resetting failure backoff.
+const ROUTE_CLEAR_COOLDOWN_OP: &str = "route.clear_cooldown";
 /// Observability op: reports whether the outbound quota-consumer connection is
 /// live and how fresh its windows are. Lets a consumer (and the e2e) confirm the
 /// module->module quota path actually round-tripped, not just that it didn't hang.
@@ -2302,6 +2304,9 @@ async fn handle_select_request(
     if envelope.method == ROUTE_CLEAR_FAILURE_BACKOFF_OP {
         return handle_clear_failure_backoff(frame, writer, store).await;
     }
+    if envelope.method == ROUTE_CLEAR_COOLDOWN_OP {
+        return handle_clear_cooldown(frame, writer, store).await;
+    }
     if envelope.method == ROUTE_COOLDOWN_STATUS_OP {
         return handle_cooldown_status(frame, writer, store).await;
     }
@@ -3303,6 +3308,12 @@ struct ClearFailureBackoffParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ClearCooldownParams {
+    route_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RecordCooldownParams {
     route_key: String,
     capacity_key: String,
@@ -3943,6 +3954,93 @@ async fn handle_clear_failure_backoff(
     send(writer, response).await
 }
 
+async fn handle_clear_cooldown(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let params: ClearCooldownParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(body) => body.params,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("route.clear_cooldown params not decodable: {error}"),
+                )
+                .await;
+            }
+        };
+    if params.route_key.trim().is_empty() {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "route.clear_cooldown routeKey must not be empty",
+        )
+        .await;
+    }
+    let prior = match store.clear_cooldown(&params.route_key) {
+        Ok(Some(prior)) => prior,
+        Ok(None) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "unknown_route",
+                &format!("unknown route key {:?}", params.route_key),
+            )
+            .await;
+        }
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("route.clear_cooldown: {error}"),
+            )
+            .await;
+        }
+    };
+    eprintln!("[prefrontal-routing] route.clear_cooldown {}: previous cooldown_until={:?}, quota_exhausted_until={:?}",
+        params.route_key, prior.cooldown_until, prior.quota_exhausted_until);
+    let body = serde_json::to_vec(&json!({ "result": {
+        "routeKey": params.route_key,
+        "clearedCooldownUntil": prior.cooldown_until,
+        "clearedQuotaExhaustedUntil": prior.quota_exhausted_until,
+    } }))
+    .map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
 async fn handle_record_cooldown(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -4118,6 +4216,7 @@ fn handles(method: &str) -> bool {
             | ROUTE_RECORD_USAGE_OP
             | ROUTE_RECORD_COOLDOWN_OP
             | ROUTE_CLEAR_FAILURE_BACKOFF_OP
+            | ROUTE_CLEAR_COOLDOWN_OP
             | ROUTE_COOLDOWN_STATUS_OP
             | ROUTE_EXPLAIN_OP
             | ROUTE_DECISIONS_LIST_OP
@@ -4223,6 +4322,11 @@ fn served_operations() -> Vec<ManagementOperation> {
                 "Clear one route's terminal-failure backoff without changing cooldown or quota state"
                     .to_string(),
             ),
+        },
+        ManagementOperation {
+            name: ROUTE_CLEAR_COOLDOWN_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("Clear one route's cooldown and quota wall without changing failure backoff".to_string()),
         },
         ManagementOperation {
             name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
@@ -6635,6 +6739,107 @@ mod tests {
         assert_eq!(response.header.ty, FrameType::Response);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["result"]["selected"]["routeKey"], ROUTE);
+    }
+
+    #[tokio::test]
+    async fn route_clear_cooldown_readmits_walled_route_without_resetting_backoff() {
+        const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
+        let rig = Rig::new("clear-cooldown");
+        let store = Arc::new(rig.open_store());
+        let until = now_ms() as f64 + 4.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+        store
+            .update_route_state(
+                ROUTE,
+                ROUTE,
+                &prefrontal_routing_core::RouteStateUpdate {
+                    cooldown_until: Some(until),
+                    quota_exhausted_until: Some(until),
+                    wall_class: Some(RouteWallClass::Quota),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let decision_id = store
+            .record_decision(&DecisionInput {
+                selected_route_key: Some(ROUTE.into()),
+                selected_provider_id: Some("alibaba-token-plan".into()),
+                selected_model_id: Some("qwen3.8-max-preview".into()),
+                target_agent: "mason".into(),
+                requirements_json: "{}".into(),
+                score_json: "{}".into(),
+                rejected_json: "[]".into(),
+                anchor_version: ANCHOR_VERSION,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .set_decision_outcome(
+                &decision_id,
+                &DecisionOutcomeUpdate {
+                    outcome: RouteOutcome::Error,
+                    last_error: Some("provider HTTP 503".into()),
+                    observed_at_ms: now_ms() as i64,
+                    failure_backoff: FailureBackoffConfig::default(),
+                },
+            )
+            .unwrap();
+        let before = store.build_snapshot(now_ms() as f64).unwrap().by_route[ROUTE].clone();
+        let select = |task: &str| {
+            json!({
+                "method": ROUTE_SELECT_OP,
+                "params": { "targetAgent": "mason", "requirements": { "iq": 80, "eq": 20 },
+                    "availableModels": [ROUTE], "taskId": task },
+            })
+        };
+        let before_select = run_route_wire_request(&store, select("before-clear")).await;
+        assert_eq!(before_select.header.ty, FrameType::Response);
+        let before_body: serde_json::Value = serde_json::from_slice(&before_select.body).unwrap();
+        assert!(before_body["result"]["selected"]["explanation"]
+            .to_string()
+            .contains("break-glass"));
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_CLEAR_COOLDOWN_OP, "params": { "routeKey": ROUTE },
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["routeKey"], ROUTE);
+        assert_eq!(body["result"]["clearedCooldownUntil"], until);
+        assert_eq!(body["result"]["clearedQuotaExhaustedUntil"], until);
+        let after = store.build_snapshot(now_ms() as f64).unwrap().by_route[ROUTE].clone();
+        assert_eq!(after.cooldown_until, None);
+        assert_eq!(after.quota_exhausted_until, None);
+        assert_eq!(after.wall_class, None);
+        assert_eq!(after.failure_backoff_until, before.failure_backoff_until);
+        assert_eq!(after.failure_backoff_reason, before.failure_backoff_reason);
+        let response = run_route_wire_request(&store, select("after-clear")).await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["selected"]["routeKey"], ROUTE);
+        assert!(!body["result"]["selected"]["explanation"]
+            .to_string()
+            .contains("break-glass"));
+    }
+
+    #[tokio::test]
+    async fn route_clear_cooldown_refuses_unknown_route_key() {
+        let rig = Rig::new("clear-cooldown-unknown");
+        let store = Arc::new(rig.open_store());
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_CLEAR_COOLDOWN_OP,
+                "params": { "routeKey": "unknown/model" },
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Error);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "unknown_route");
+        assert!(body["message"].as_str().unwrap().contains("unknown/model"));
     }
 
     #[tokio::test]
