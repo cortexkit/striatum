@@ -711,46 +711,10 @@ fn routes_with_the_same_capacity_key_collapse_without_static_metadata() {
 }
 
 #[test]
-fn every_seed_base_fast_pair_is_contained_before_sibling_collapse() {
-    let seed = model_facts_seed();
-    let pairs: Vec<_> = seed
+fn curated_seed_contains_no_fast_model_ids() {
+    assert!(model_facts_seed()
         .iter()
-        .filter_map(|fast| {
-            let base_model = fast.model_id.strip_suffix("-fast")?;
-            seed.iter()
-                .find(|base| base.provider_id == fast.provider_id && base.model_id == base_model)
-                .map(|base| (base.clone(), fast.clone()))
-        })
-        .collect();
-    assert!(pairs
-        .iter()
-        .any(|(base, _)| base.model_id == "claude-opus-4-6"));
-    assert!(pairs
-        .iter()
-        .any(|(base, _)| base.model_id == "claude-opus-4-8"));
-
-    for (base, fast) in pairs {
-        let base_route_key = make_route_key(&base.provider_id, &base.model_id, None);
-        let mut panel_spec = spec(2, 0.0, PanelDiversity::None);
-        panel_spec.class = PanelClass::Diagnose;
-        let selected =
-            select_panel(n_pick_input(vec![fast, base], panel_spec, 100, 8_000)).unwrap();
-
-        assert_eq!(
-            selected
-                .members
-                .iter()
-                .map(|member| member.route_key.as_str())
-                .collect::<Vec<_>>(),
-            [base_route_key.as_str()]
-        );
-        assert!(selected
-            .policy
-            .as_ref()
-            .unwrap()
-            .sibling_collapses
-            .is_empty());
-    }
+        .all(|fact| !fact.model_id.ends_with("-fast")));
 }
 
 #[test]

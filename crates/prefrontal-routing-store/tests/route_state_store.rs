@@ -104,7 +104,8 @@ fn fact(provider: &str, model: &str) -> ModelFact {
 // ollama-cloud; an unseeded route made a roster seat silently unseatable)
 // + grok-4.6 (026) + gemini 3.7 flash (027, succession seed carrying
 // 3.6-flash scores; 3.6 retires via the config exclude, not the store).
-const CATALOG_LEN: usize = 57;
+// Migration 041 removes eleven model IDs ending in "-fast" because the request service rejects them at admission.
+const CATALOG_LEN: usize = 46;
 
 #[test]
 fn migration_seeds_the_curated_catalog_on_first_open() {
@@ -2493,7 +2494,6 @@ fn migration_022_renames_every_capability_key_and_applies_resolved_elos() {
     for (route_key, expected) in resolved {
         assert_eq!(elo(route_key), expected, "resolved Elo for {route_key}");
     }
-    assert_eq!(elo("openai/gpt-5.6-sol-fast"), 1_838.0);
     assert_eq!(elo("openai/gpt-5.6-sol-pro"), 1_838.0);
     assert_eq!(elo("xai/grok-build-0.1"), 40.0 * 33.0);
     drop(store);
@@ -2836,6 +2836,7 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
             &[
                 fact("302ai", "MiniMax-M2.7"),
                 fact("anthropic", "claude-never-seen"),
+                fact("anthropic", "claude-opus-5-fast"),
             ],
             FusiformCatalogCursor {
                 catalog_version: 9,
@@ -2853,6 +2854,12 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
         .find(|row| row.fact.model_id == "claude-never-seen")
         .expect("a known provider's new model is minted");
     assert_eq!(minted.fact.provider_id, "anthropic");
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.fact.model_id == "claude-opus-5-fast"),
+        "Fusiform -fast IDs must never be added to routing"
+    );
 }
 
 /// A model the upstream withdrew is served as absent when retired models are
@@ -3789,4 +3796,62 @@ fn class_vector_is_cached_until_usage_is_recorded() {
         "a write through the store recomputes over everything"
     );
     assert_eq!(recomputed.fresh_input, 300.0);
+}
+
+#[test]
+fn migration_041_removes_fast_facts_and_route_state_without_touching_history() {
+    use rusqlite::Connection;
+
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE model_facts(route_key TEXT PRIMARY KEY);
+         CREATE TABLE model_route_state(route_key TEXT PRIMARY KEY);
+         CREATE TABLE model_route_decisions(selected_route_key TEXT);
+         CREATE TABLE model_route_usage(route_key TEXT);",
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO model_facts VALUES ('openai/gpt-5.5-fast'), ('openai/gpt-5.5');
+         INSERT INTO model_route_state VALUES ('openai/gpt-5.5-fast');
+         INSERT INTO model_route_decisions VALUES ('openai/gpt-5.5-fast');
+         INSERT INTO model_route_usage VALUES ('openai/gpt-5.5-fast');",
+        )
+        .unwrap();
+    connection
+        .execute_batch(include_str!("../migrations/041_retire_fast_routes.sql"))
+        .unwrap();
+    let facts: Vec<String> = connection
+        .prepare("SELECT route_key FROM model_facts ORDER BY route_key")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(facts, ["openai/gpt-5.5"]);
+    let states: i64 = connection
+        .query_row("SELECT COUNT(*) FROM model_route_state", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(states, 0);
+    let decisions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM model_route_decisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let usage: i64 = connection
+        .query_row("SELECT COUNT(*) FROM model_route_usage", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!((decisions, usage), (1, 1));
+    let violations = connection
+        .prepare("PRAGMA foreign_key_check")
+        .unwrap()
+        .query_map([], |_| Ok(()))
+        .unwrap()
+        .count();
+    assert_eq!(violations, 0);
 }

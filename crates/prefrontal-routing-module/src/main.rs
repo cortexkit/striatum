@@ -1561,6 +1561,18 @@ async fn handle_model_upsert(
             }
         }
     }
+    if params.model_id.ends_with("-fast") {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "model_upsert does not accept -fast model IDs; use service_tier for speed",
+        )
+        .await;
+    }
     let route_key = make_route_key(
         &params.provider_id,
         &params.model_id,

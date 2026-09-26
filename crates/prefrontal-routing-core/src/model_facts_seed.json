@@ -37,25 +37,6 @@
   },
   {
     "providerID": "anthropic",
-    "modelID": "claude-opus-4-6-fast",
-    "scores": {
-      "elo": 1130,
-      "eq": 1751.7,
-      "speed": 61
-    },
-    "contextWindow": 1000000,
-    "costTier": 6,
-    "costPerMTokOut": 150,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier); speed bump pending TPS observation"
-  },
-  {
-    "providerID": "anthropic",
     "modelID": "claude-opus-4-7",
     "scores": {
       "elo": 1635,
@@ -74,25 +55,6 @@
   },
   {
     "providerID": "anthropic",
-    "modelID": "claude-opus-4-7-fast",
-    "scores": {
-      "elo": 1635,
-      "eq": 1949.8,
-      "speed": 61
-    },
-    "contextWindow": 1000000,
-    "costTier": 6,
-    "costPerMTokOut": 150,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier); speed bump pending TPS observation"
-  },
-  {
-    "providerID": "anthropic",
     "modelID": "claude-opus-4-8",
     "scores": {
       "elo": 1728,
@@ -108,25 +70,6 @@
       "variant": "xhigh"
     },
     "confidence": "curated"
-  },
-  {
-    "providerID": "anthropic",
-    "modelID": "claude-opus-4-8-fast",
-    "scores": {
-      "elo": 1728,
-      "eq": 2115.5,
-      "speed": 72
-    },
-    "contextWindow": 1000000,
-    "costTier": 5,
-    "costPerMTokOut": 50,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier); speed bump pending TPS observation"
   },
   {
     "providerID": "anthropic",
@@ -232,25 +175,6 @@
   },
   {
     "providerID": "openai",
-    "modelID": "gpt-5.4-fast",
-    "scores": {
-      "elo": 1589,
-      "eq": 1585.7,
-      "speed": 161
-    },
-    "contextWindow": 1050000,
-    "costTier": 4,
-    "costPerMTokOut": 30,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier); speed bump pending TPS observation"
-  },
-  {
-    "providerID": "openai",
     "modelID": "gpt-5.4-mini",
     "scores": {
       "elo": 956,
@@ -269,25 +193,6 @@
   },
   {
     "providerID": "openai",
-    "modelID": "gpt-5.4-mini-fast",
-    "scores": {
-      "elo": 956,
-      "eq": 1430,
-      "speed": 194
-    },
-    "contextWindow": 400000,
-    "costTier": 3,
-    "costPerMTokOut": 9,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier); speed bump pending TPS observation"
-  },
-  {
-    "providerID": "openai",
     "modelID": "gpt-5.5",
     "scores": {
       "elo": 1690,
@@ -303,25 +208,6 @@
       "variant": "xhigh"
     },
     "confidence": "curated"
-  },
-  {
-    "providerID": "openai",
-    "modelID": "gpt-5.5-fast",
-    "scores": {
-      "elo": 1690,
-      "eq": 1596.5,
-      "speed": 63
-    },
-    "contextWindow": 1050000,
-    "costTier": 5,
-    "costPerMTokOut": 75,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier); speed bump pending TPS observation"
   },
   {
     "providerID": "opencode-go",
@@ -544,18 +430,6 @@
     "confidence": "curated"
   },
   {
-    "providerID": "xai",
-    "modelID": "grok-composer-2.5-fast",
-    "scores": {
-      "elo": 1452,
-      "eq": 1604,
-      "speed": 184
-    },
-    "supportsToolUse": true,
-    "confidence": "curated",
-    "notes": "xai subscription-only (Cursor composer-2.5); still absent from AA, so Elo/speed/eq are user-curated. Elo=44 set ~1 above kimi-k2.6 (42.8) on the rescaled AA scale; ADJUST if you have a better estimate."
-  },
-  {
     "providerID": "openai",
     "modelID": "gpt-5.6-sol",
     "scores": {
@@ -573,25 +447,6 @@
     },
     "confidence": "curated",
     "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline"
-  },
-  {
-    "providerID": "openai",
-    "modelID": "gpt-5.6-sol-fast",
-    "scores": {
-      "elo": 1838,
-      "eq": 1610,
-      "speed": 55
-    },
-    "contextWindow": 1050000,
-    "costTier": 5,
-    "costPerMTokOut": 60,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier, 2x cost); speed bump pending TPS observation"
   },
   {
     "providerID": "openai",
@@ -633,25 +488,6 @@
   },
   {
     "providerID": "openai",
-    "modelID": "gpt-5.6-terra-fast",
-    "scores": {
-      "elo": 1685,
-      "eq": 1590,
-      "speed": 95
-    },
-    "contextWindow": 1050000,
-    "costTier": 4,
-    "costPerMTokOut": 30,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier, 2x cost); speed bump pending TPS observation"
-  },
-  {
-    "providerID": "openai",
     "modelID": "gpt-5.6-terra-pro",
     "scores": {
       "elo": 1685,
@@ -687,25 +523,6 @@
     },
     "confidence": "curated",
     "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline"
-  },
-  {
-    "providerID": "openai",
-    "modelID": "gpt-5.6-luna-fast",
-    "scores": {
-      "elo": 1621,
-      "eq": 1555,
-      "speed": 160
-    },
-    "contextWindow": 1050000,
-    "costTier": 3,
-    "costPerMTokOut": 12,
-    "supportsVision": true,
-    "supportsToolUse": true,
-    "promptDefaults": {
-      "variant": "xhigh"
-    },
-    "confidence": "curated",
-    "notes": "fast-mode route (priority tier, 2x cost); speed bump pending TPS observation"
   },
   {
     "providerID": "openai",

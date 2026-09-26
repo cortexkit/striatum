@@ -136,6 +136,7 @@ const MIGRATION_038: &str = include_str!("../migrations/038_quota_reading_log.sq
 const MIGRATION_039: &str = include_str!("../migrations/039_route_wall_class.sql");
 /// Migration 40: the last announced route-winner ladder, kept across restarts.
 const MIGRATION_040: &str = include_str!("../migrations/040_route_winner_baseline.sql");
+const MIGRATION_041: &str = include_str!("../migrations/041_retire_fast_routes.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -174,7 +175,7 @@ struct ObservedSpeedAggregate {
     duration_ms: i64,
 }
 
-fn route_state_migrations() -> [Migration; 40] {
+fn route_state_migrations() -> [Migration; 41] {
     [
         Migration {
             version: 1,
@@ -335,6 +336,10 @@ fn route_state_migrations() -> [Migration; 40] {
         Migration {
             version: 40,
             statements: MIGRATION_040,
+        },
+        Migration {
+            version: 41,
+            statements: MIGRATION_041,
         },
     ]
 }
@@ -784,6 +789,10 @@ impl SqliteRouteStateStore {
             .with_conn(|connection: &Connection| {
                 let tx = connection.unchecked_transaction()?;
                 for fact in facts {
+                    if fact.model_id.ends_with("-fast") {
+                        // The request service rejects -fast IDs at admission, so routing must not retain them.
+                        continue;
+                    }
                     if fact.provider_id.trim().is_empty() || fact.model_id.trim().is_empty() {
                         return Err(rusqlite::Error::InvalidParameterName(
                             "Fusiform provider/model identity must be non-empty".to_string(),

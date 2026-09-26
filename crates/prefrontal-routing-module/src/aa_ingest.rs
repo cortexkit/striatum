@@ -126,6 +126,9 @@ pub fn seed_aa(
     aa_config: &AaConfig,
     now_ms: i64,
 ) -> Result<SeedAaOk, SeedAaRefusal> {
+    if params.model_id.ends_with("-fast") {
+        return Err(SeedAaRefusal::NoAaMapping);
+    }
     let route_key = make_route_key(
         &params.provider_id,
         &params.model_id,
