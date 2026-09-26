@@ -2495,18 +2495,12 @@ impl RouteStateStore for SqliteRouteStateStore {
                         },
                     )
                     .optional()?;
-                // The operator's one clear verb lifts every route-level wall, not only
-                // the failure streak: a cooldown or quota horizon written from a
-                // misread error (a stack-frame offset read as a status code, a Bun
-                // chunk hash read as hours) has no other exit before it expires.
                 if prior.is_some() {
                     tx.execute(
                         "UPDATE model_route_state
                          SET consecutive_terminal_failures = 0,
                              failure_backoff_until = NULL,
                              failure_backoff_reason = NULL,
-                             cooldown_until = NULL,
-                             quota_exhausted_until = NULL,
                              updated_at = ?1
                          WHERE route_key = ?2",
                         params![now_ms(), route_key],
@@ -3118,7 +3112,7 @@ mod tests {
     use prefrontal_routing_core::ScoreProvenance;
 
     #[test]
-    fn clear_failure_backoff_returns_prior_state_and_zeroes_route_fields() {
+    fn clear_failure_backoff_preserves_cooldown_and_quota_walls() {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3188,7 +3182,16 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(after, (0, None, None, None, None));
+        assert_eq!(
+            after,
+            (
+                0,
+                None,
+                None,
+                Some(1_500_000_000_000.0),
+                Some(1_500_000_000_000.0)
+            )
+        );
         drop(store);
 
         let _ = std::fs::remove_file(&path);
