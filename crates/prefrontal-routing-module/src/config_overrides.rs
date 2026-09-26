@@ -283,9 +283,6 @@ struct ModelRoutingSection {
     /// Providers and models priced as subscription-backed in addition to auth facts.
     #[serde(default)]
     subscription: Vec<String>,
-    /// Routes eligible for a fast sibling while subscription quota is relaxed.
-    #[serde(default, alias = "preferFastWhenRelaxed")]
-    prefer_fast_when_relaxed: Vec<String>,
     /// Keyed by "provider/model" or "provider/model/variant".
     #[serde(default)]
     models: HashMap<String, ModelFactOverride>,
@@ -1091,7 +1088,6 @@ fn parse_operator_routing_policy(
     Ok(ModelRoutingPolicyInput {
         exclude: clean_spec_entries(section.exclude),
         subscription: clean_spec_entries(section.subscription),
-        prefer_fast_when_relaxed: clean_spec_entries(section.prefer_fast_when_relaxed),
     })
 }
 
@@ -1112,7 +1108,6 @@ pub fn operator_policy_revision(policy: &ModelRoutingPolicyInput) -> String {
     for (label, entries) in [
         ("exclude", &policy.exclude),
         ("subscription", &policy.subscription),
-        ("prefer_fast_when_relaxed", &policy.prefer_fast_when_relaxed),
     ] {
         hasher.update(label.as_bytes());
         hasher.update([0u8]);
@@ -2367,7 +2362,6 @@ mod tests {
               "model_routing": {
                 "exclude": ["anthropic", " ollama-cloud/glm-5.1 ", ""],
                 "subscription": ["kimi-for-coding"],
-                "prefer_fast_when_relaxed": ["openai"],
               },
             }"#,
         )
@@ -2376,7 +2370,6 @@ mod tests {
         let first = read_operator_routing_policy_with_reader(&path, read_file);
         assert_eq!(first.exclude, vec!["anthropic", "ollama-cloud/glm-5.1"]);
         assert_eq!(first.subscription, vec!["kimi-for-coding"]);
-        assert_eq!(first.prefer_fast_when_relaxed, vec!["openai"]);
         assert_eq!(
             read_operator_routing_policy_with_reader(&path, read_file),
             first

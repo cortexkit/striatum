@@ -20,13 +20,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model_facts::{
-    fact_to_route, make_capacity_key, ModelFact, ModelMetric, ModelRequirements, ModelRoute,
-    ScoreProvenance, FAST_SUFFIX,
+    fact_to_route, ModelFact, ModelMetric, ModelRequirements, ModelRoute, ScoreProvenance,
 };
 use crate::model_resolution::{use_basket_permitted, CLASS_PRODUCER, COUNTERS_PRODUCER};
-use crate::provider_model_spec::{
-    parse_spec_list, resolve_spec, ExclusionPolicy, ExclusionSource, ExclusionSpecs,
-};
+use crate::provider_model_spec::{ExclusionPolicy, ExclusionSource, ExclusionSpecs};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 use crate::routing_config::{
     RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, COST_REFERENCE_PER_MTOK,
@@ -128,8 +125,6 @@ pub struct SelectModelRouteInput<'a> {
     /// The operator's standing exclude list, applied as the baseline under the
     /// caller's. Union only: see [`ExclusionPolicy`].
     pub operator_exclude_keys: Vec<String>,
-    /// Base-model specs that deliberately admit matching priority-tier siblings.
-    pub prefer_fast_specs: Vec<String>,
     pub required_capabilities: Option<RequiredCapabilities>,
     pub is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
     /// Sanity band for best-effort selection. When no route clears the adequacy
@@ -455,8 +450,6 @@ pub fn admit_routes(
     facts: &[ModelFact],
     runtime_snapshot: Option<&ModelRouteStateSnapshot>,
     exclusions: ExclusionPolicy<'_>,
-    prefer_fast_specs: &[String],
-    exact_model_pins: &[String],
     required_capabilities: Option<RequiredCapabilities>,
     available_models: &HashSet<String>,
     requirements: &ModelRequirements,
@@ -464,7 +457,6 @@ pub fn admit_routes(
 ) -> AdmissionResult {
     let now = runtime_snapshot.map(|s| s.now).unwrap_or_else(now_millis);
     let exclusion_specs = ExclusionSpecs::parse(exclusions);
-    let prefer_fast_specs = parse_spec_list(prefer_fast_specs);
     let mut static_candidates = Vec::new();
     let mut top_routable = TopRoutableScores::default();
     let mut rejected = Vec::new();
@@ -508,27 +500,6 @@ pub fn admit_routes(
                 detail: None,
             });
             continue;
-        }
-        if let Some(base_model_id) = fact.model_id.strip_suffix(FAST_SUFFIX) {
-            let base_exists = facts.iter().any(|candidate| {
-                candidate.provider_id == fact.provider_id && candidate.model_id == base_model_id
-            });
-            let base_key = make_capacity_key(&fact.provider_id, base_model_id);
-            let is_exact_pin = exact_model_pins.iter().any(|pin| {
-                let pin = pin.trim();
-                pin.eq_ignore_ascii_case(&route.capacity_key)
-                    || pin.eq_ignore_ascii_case(&route.route_key)
-            });
-            let opted_in = resolve_spec(&prefer_fast_specs, &base_key, false)
-                && resolve_spec(&prefer_fast_specs, &route.capacity_key, true);
-            if base_exists && !is_exact_pin && !opted_in {
-                rejected.push(RejectedRoute {
-                    route_key: route.route_key,
-                    reason: "fast_variant_not_opted_in".to_string(),
-                    detail: None,
-                });
-                continue;
-            }
         }
         top_routable.include(fact.scores);
         static_candidates.push((fact, route));
@@ -820,8 +791,6 @@ fn admit_and_price_shortlist(
             operator: &input.operator_exclude_keys,
             caller: &input.exclude_route_keys,
         },
-        &input.prefer_fast_specs,
-        &[],
         caps,
         &input.available_models,
         &requirements,
@@ -1344,7 +1313,7 @@ fn fmt_num(n: f64) -> String {
 #[cfg(test)]
 mod abundance_tests {
     use super::*;
-    use crate::model_facts::{Confidence, ModelScores};
+    use crate::model_facts::{make_capacity_key, Confidence, ModelScores};
 
     fn fact(provider: &str, model: &str, speed: f64) -> ModelFact {
         fact_with_cost_and_elo(provider, model, speed, Some(0.0), 1_800.0)
@@ -1437,7 +1406,7 @@ mod abundance_tests {
             }),
             exclude_route_keys: options.exclude_route_keys,
             operator_exclude_keys: Vec::new(),
-            prefer_fast_specs: Vec::new(),
+
             required_capabilities: None,
             is_subscription_route: options.is_subscription_route,
             min_best_effort_adequacy: None,

@@ -312,22 +312,12 @@ pub fn select_panel_with_config(
             caller: &input.exclude_route_keys,
         },
     };
-    let exact_model_pins: Vec<String> = match input.selection {
-        PanelSelection::Roster => input
-            .roster
-            .iter()
-            .map(|entry| entry.model.clone())
-            .collect(),
-        PanelSelection::NPick => Vec::new(),
-    };
     // Panel selection has no adequacy fallback. The zero requirements are only an
     // unused scoring input to the shared hard-admission implementation.
     let admission = admit_routes(
         &considered_facts,
         input.runtime_snapshot.as_ref(),
         effective_exclusions,
-        &[],
-        &exact_model_pins,
         input.required_capabilities,
         &input.available_models,
         &ModelRequirements { iq: 0.0, eq: 0.0 },

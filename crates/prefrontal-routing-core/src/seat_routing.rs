@@ -231,7 +231,6 @@ pub fn select_seat_route_with_config(
         }
     }
 
-    let exact_model_pins: Vec<String> = input.model_pin.iter().cloned().collect();
     // Seat routing takes the operator fence through its available-model set, which
     // the caller resolves against the operator policy before it gets here, so only
     // the per-request exclusions are applied at admission.
@@ -239,8 +238,6 @@ pub fn select_seat_route_with_config(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy::caller_only(&input.exclude_route_keys),
-        &[],
-        &exact_model_pins,
         input.required_capabilities,
         &input.available_models,
         &input.requirements,

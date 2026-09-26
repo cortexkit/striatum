@@ -468,7 +468,6 @@ pub(crate) fn compute_ladder(
                             runtime_snapshot,
                             exclude_route_keys: Vec::new(),
                             operator_exclude_keys: operator.exclude.clone(),
-                            prefer_fast_specs: Vec::new(),
                             required_capabilities: resolved.required_capabilities,
                             is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                                 subscription.contains(&route.route_key)

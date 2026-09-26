@@ -13,7 +13,6 @@
 pub mod aa_infer;
 pub mod break_glass;
 pub mod failure_backoff;
-pub mod fast_variant;
 pub mod launch_policy;
 pub mod model_facts;
 pub mod model_facts_seed;
@@ -43,9 +42,6 @@ pub use failure_backoff::{
     FailureAttribution, FailureBackoffConfig, FailureBackoffTransition,
     DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, FAILURE_BACKOFF_INITIAL_MS,
     FAILURE_BACKOFF_MAX_MS,
-};
-pub use fast_variant::{
-    maybe_upgrade_to_fast_variant, FastVariantUpgradeInput, FAST_UPGRADE_MAX_PRESSURE,
 };
 pub use launch_policy::{
     resolve_launch_requirements, resolve_routing_policy, LaunchRequirementsError,

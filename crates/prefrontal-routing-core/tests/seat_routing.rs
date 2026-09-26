@@ -632,19 +632,6 @@ fn selection_reports_grand_family_for_prompt_variant_consumers() {
 }
 
 #[test]
-fn automatic_seat_routing_contains_fast_variant_with_catalogued_base() {
-    let mut base = fact("openai", "gpt-5.6-sol", Some("gpt"), 60.0, 10.0);
-    base.scores.speed = 50.0;
-    let mut fast = fact("openai", "gpt-5.6-sol-fast", Some("gpt"), 60.0, 10.0);
-    fast.scores.speed = 200.0;
-
-    let selected = select_seat_route(InputBuilder::new(vec![base, fast]).build()).unwrap();
-
-    assert_eq!(selected.route_key, "openai/gpt-5.6-sol");
-    assert!(!selected.pinned);
-}
-
-#[test]
 fn exact_fast_variant_seat_pin_bypasses_automatic_containment() {
     let base = fact("openai", "gpt-5.6-sol", Some("gpt"), 60.0, 10.0);
     let fast = fact("openai", "gpt-5.6-sol-fast", Some("gpt"), 60.0, 20.0);

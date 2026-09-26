@@ -602,6 +602,32 @@ mod tests {
     }
 
     #[test]
+    fn seed_aa_refuses_fast_id_even_when_it_is_mapped_and_indexed() {
+        let (_dir, store) = open_store();
+        store
+            .replace_aa_index_table(&[("fast-model-slug".into(), 60.0)], 1)
+            .unwrap();
+        let params = SeedAaParams {
+            provider_id: "openai".into(),
+            model_id: "gpt-5.5-fast".into(),
+            variant: None,
+        };
+        let mut config = AaConfig::default();
+        config
+            .model_map
+            .insert("openai/gpt-5.5-fast".into(), "fast-model-slug".into());
+
+        assert_eq!(
+            seed_aa(&store, &params, &config, 1).unwrap_err(),
+            SeedAaRefusal::NoAaMapping
+        );
+        assert!(store
+            .get_fact_by_route_key("openai/gpt-5.5-fast")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn seed_aa_refuses_unmapped_and_absent_index() {
         let (_dir, store) = open_store();
         let params = SeedAaParams {

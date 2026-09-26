@@ -115,8 +115,6 @@ pub struct ModelRoutingPolicyInput {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub subscription: Vec<String>,
-    #[serde(default)]
-    pub prefer_fast_when_relaxed: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -124,7 +122,6 @@ pub struct ModelRoutingPolicyInput {
 pub struct ResolvedRoutingPolicy {
     pub available_models: Vec<String>,
     pub subscription_keys: Vec<String>,
-    pub prefer_fast_specs: Vec<String>,
     pub connected_model_count: usize,
 }
 
@@ -142,7 +139,6 @@ pub fn resolve_routing_policy(
     operator: &ModelRoutingPolicyInput,
     caller: &ModelRoutingPolicyInput,
     provider_auth_types: &HashMap<String, String>,
-    suppress_fast_variant: bool,
 ) -> ResolvedRoutingPolicy {
     let connected: HashSet<String> = available_models.into_iter().collect();
     let connected_model_count = connected.len();
@@ -154,8 +150,8 @@ pub fn resolve_routing_policy(
         },
     );
 
-    // Subscription and fast-variant specs are additive lists rather than a fence,
-    // so the caller's entries follow the operator's and refine them for this call.
+    // Subscription specs are additive rather than a fence, so caller entries
+    // follow the operator's and refine them for this call.
     let mut subscription_specs = CURATED_SUBSCRIPTION_PROVIDERS
         .iter()
         .map(|provider| (*provider).to_string())
@@ -181,16 +177,6 @@ pub fn resolve_routing_policy(
     ResolvedRoutingPolicy {
         available_models,
         subscription_keys,
-        prefer_fast_specs: if suppress_fast_variant {
-            Vec::new()
-        } else {
-            operator
-                .prefer_fast_when_relaxed
-                .iter()
-                .chain(caller.prefer_fast_when_relaxed.iter())
-                .cloned()
-                .collect()
-        },
         connected_model_count,
     }
 }
@@ -220,7 +206,6 @@ mod tests {
             &ModelRoutingPolicyInput::default(),
             &policy,
             &auth_types(),
-            false,
         )
     }
 
@@ -234,7 +219,6 @@ mod tests {
             &operator,
             &caller,
             &auth_types(),
-            false,
         )
     }
 
@@ -271,7 +255,6 @@ mod tests {
             &ModelRoutingPolicyInput::default(),
             &ModelRoutingPolicyInput::default(),
             &HashMap::new(),
-            false,
         );
         assert_eq!(resolved.subscription_keys, vec!["opencode-go/qwen3.7-max"]);
     }
@@ -314,7 +297,7 @@ mod tests {
                     "opencode-go".into(),
                     "-opencode-go/deepseek-v4-flash".into(),
                 ],
-                prefer_fast_when_relaxed: vec!["openai".into()],
+                ..ModelRoutingPolicyInput::default()
             },
         );
         assert_eq!(
@@ -322,20 +305,7 @@ mod tests {
             vec!["opencode-go/deepseek-v4-flash", "opencode-go/minimax-m2.5"]
         );
         assert_eq!(resolved.subscription_keys, vec!["opencode-go/minimax-m2.5"]);
-        assert_eq!(resolved.prefer_fast_specs, vec!["openai"]);
         assert_eq!(resolved.connected_model_count, 3);
-
-        let suppressed = resolve_routing_policy(
-            ["openai/gpt-5.5".to_string()],
-            &ModelRoutingPolicyInput::default(),
-            &ModelRoutingPolicyInput {
-                prefer_fast_when_relaxed: vec!["openai".into()],
-                ..ModelRoutingPolicyInput::default()
-            },
-            &HashMap::new(),
-            true,
-        );
-        assert!(suppressed.prefer_fast_specs.is_empty());
     }
 
     #[test]
@@ -382,23 +352,20 @@ mod tests {
         assert!(widened.available_models.is_empty());
         assert_eq!(widened.connected_model_count, 2);
 
-        // Subscription and fast-variant specs merge from both sources.
+        // Operator and caller subscription specs are merged.
         let merged = resolve_with_operator(
             &["fireworks-ai/llama", "openai/gpt-5.5"],
             ModelRoutingPolicyInput {
                 subscription: vec!["fireworks-ai".into()],
-                prefer_fast_when_relaxed: vec!["openai".into()],
                 ..ModelRoutingPolicyInput::default()
             },
             ModelRoutingPolicyInput {
-                prefer_fast_when_relaxed: vec!["fireworks-ai".into()],
                 ..ModelRoutingPolicyInput::default()
             },
         );
         assert!(merged
             .subscription_keys
             .contains(&"fireworks-ai/llama".to_string()));
-        assert_eq!(merged.prefer_fast_specs, vec!["openai", "fireworks-ai"]);
     }
 
     #[test]

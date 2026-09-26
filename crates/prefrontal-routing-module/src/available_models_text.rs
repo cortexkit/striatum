@@ -113,7 +113,6 @@ fn render_from_store(
     let caller_policy = ModelRoutingPolicyInput {
         exclude: Vec::new(),
         subscription: params.subscription_entries.clone(),
-        prefer_fast_when_relaxed: Vec::new(),
     };
     let capacity_keys = params
         .available_models
@@ -125,7 +124,6 @@ fn render_from_store(
         operator_policy,
         &caller_policy,
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
-        false,
     );
     let subscription_keys = resolved_policy
         .subscription_keys

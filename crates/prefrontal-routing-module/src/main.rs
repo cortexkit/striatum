@@ -46,13 +46,12 @@ use prefrontal_routing_core::route_state_store::FactSource;
 use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, live_billing_wall_error, make_route_key,
-    maybe_upgrade_to_fast_variant, relax_earliest_reset, resolve_launch_requirements,
-    resolve_routing_policy, select_panel_with_config, validate_panel_spec, AvailabilitySubstrate,
-    BreakGlassCandidate, CatalogFactField, DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy,
-    ExclusionSpecs, FailureBackoffConfig, FastVariantUpgradeInput, ModelFact, ModelRequirements,
-    ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry, PanelSelection, PanelSpec,
-    RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome, RouteStateStore,
-    RouteWallClass, SelectPanelInput, SelectedPanel,
+    relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
+    select_panel_with_config, validate_panel_spec, AvailabilitySubstrate, BreakGlassCandidate,
+    CatalogFactField, DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy, ExclusionSpecs,
+    FailureBackoffConfig, ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput,
+    PanelRosterEntry, PanelSelection, PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy,
+    RouteOutcome, RouteStateStore, RouteWallClass, SelectPanelInput, SelectedPanel,
 };
 use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
@@ -127,10 +126,6 @@ const QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Decision audit rows are retained for one month before the existing refresh
 /// cycle deletes them.
 const DECISION_RETENTION_MS: u64 = 30 * 24 * 60 * 60_000;
-/// How recently a provider must have supplied a live quota entry for its
-/// low-pressure reading to permit an optimistic fast-variant upgrade. Retained
-/// windows still constrain normal selection but never authorize an upgrade.
-const QUOTA_FRESH_FOR_UPGRADE_MS: u64 = 3 * 60_000;
 
 /// Latest quota snapshot, shared between the background refresh task (writer) and
 /// `route.select` handlers (readers). The lock is NEVER held across an `.await`:
@@ -140,9 +135,6 @@ const QUOTA_FRESH_FOR_UPGRADE_MS: u64 = 3 * 60_000;
 struct QuotaCache {
     windows: Vec<ProviderUsage>,
     refreshed_at_ms: u64,
-    /// Observation time for providers that supplied a live entry in the latest
-    /// successful poll. Replacing this map makes absent and degraded providers stale.
-    provider_observed_at_ms: HashMap<String, u64>,
     available: bool,
     /// Last connect/fetch error (observability: surfaced via route.quota_status).
     last_error: Option<String>,
@@ -342,37 +334,6 @@ fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observ
     // Insula extends funding additively. Report unsupported values once per poll,
     // while the core policy treats each corresponding pool as not granted.
     log_unknown_spend_funding(&fresh);
-    // Freshness keys on the same resolved id the overlay keys on: the published
-    // canonical slug first, wire name as fallback. Keying this map on the wire
-    // name alone while the overlay resolves via apiProvider would mark a
-    // provider's windows live under one name and stale under the other.
-    cache.provider_observed_at_ms = fresh
-        .iter()
-        .filter(|entry| entry.is_healthy())
-        // A preserved reading (stale disclosure present) carries usage and no
-        // error, so it passes is_healthy - but it is a reading QTA has been
-        // UNABLE to refresh, not a fresh success. The fast-variant upgrade
-        // demands positive fresh evidence, and before the disclosure existed a
-        // preserved entry was wire-identical to a fresh one and silently
-        // qualified. Overlay pressure still uses the preserved windows
-        // (correct: last-known beats nothing); only upgrade freshness excludes
-        // them.
-        .filter(|entry| entry.stale.is_none())
-        .map(|entry| {
-            let key = entry
-                .api_provider
-                .clone()
-                .filter(|slug| !slug.is_empty())
-                .unwrap_or_else(|| entry.provider.clone());
-            // The source's own observation time bounds freshness when it is
-            // published; a producer that omits it keeps the poll time. Never
-            // later than the poll: a source clock ahead of ours cannot mint
-            // freshness we did not observe.
-            let observed = prefrontal_routing_core::fetched_at_ms(entry)
-                .map_or(observed_at_ms, |fetched| fetched.min(observed_at_ms));
-            (key, observed)
-        })
-        .collect();
     merge_quota_windows(&mut cache.windows, fresh, &mut cache.retained_degraded_keys);
     cache.refreshed_at_ms = observed_at_ms;
     cache.available = true;
@@ -381,7 +342,6 @@ fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observ
 
 fn record_quota_refresh_failure(cache: &mut QuotaCache, phase: &str, error: impl fmt::Display) {
     cache.available = false;
-    cache.provider_observed_at_ms.clear();
     cache.last_error = Some(format!("{phase}: {error}"));
 }
 
@@ -998,13 +958,9 @@ struct SelectParams {
     #[serde(default)]
     subscription_keys: Vec<String>,
     #[serde(default)]
-    prefer_fast_specs: Vec<String>,
-    #[serde(default)]
     routing_policy: Option<ModelRoutingPolicyInput>,
     #[serde(default)]
     provider_auth_types: Option<HashMap<String, String>>,
-    #[serde(default)]
-    suppress_fast_variant: bool,
     /// Gather seats can request cache-capable providers without changing the
     /// normal quality and cost ordering for other route selections.
     #[serde(default)]
@@ -1106,8 +1062,6 @@ struct ResolvePolicyParams {
     routing_policy: Option<ModelRoutingPolicyInput>,
     #[serde(default)]
     provider_auth_types: Option<HashMap<String, String>>,
-    #[serde(default)]
-    suppress_fast_variant: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1354,7 +1308,6 @@ fn resolve_select_request(
         operator_policy,
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
-        params.suppress_fast_variant,
     );
     if policy.connected_model_count == 0 {
         return Err(no_route_error(
@@ -2088,7 +2041,6 @@ async fn handle_resolve_policy(
         &operator_policy,
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
-        params.suppress_fast_variant,
     );
     let body = serde_json::to_vec(&json!({ "result": resolved })).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
@@ -2133,7 +2085,6 @@ struct PreparedSelectionInputs {
     now: f64,
     facts: Vec<ModelFact>,
     snapshot: ModelRouteStateSnapshot,
-    fresh_quota_provider_ids: HashSet<String>,
     quota_signal_json: String,
 }
 
@@ -2224,7 +2175,6 @@ fn prepare_selection_inputs(
     // last-known pressure would make a transient outage look optimistically free.
     let (
         quota_windows,
-        provider_observed_at_ms,
         quota_available,
         quota_refreshed_at_ms,
         retained_degraded_count,
@@ -2232,39 +2182,16 @@ fn prepare_selection_inputs(
     ) = match quota_cache.lock() {
         Ok(guard) => (
             (!guard.windows.is_empty()).then(|| guard.windows.clone()),
-            guard.provider_observed_at_ms.clone(),
             guard.available,
             guard.refreshed_at_ms,
             guard.retained_degraded_keys.len(),
             guard.last_error.clone(),
         ),
-        Err(_) => (
-            None,
-            HashMap::new(),
-            false,
-            0,
-            0,
-            Some("cache poisoned".into()),
-        ),
+        Err(_) => (None, false, 0, 0, Some("cache poisoned".into())),
     };
     if let Some(windows) = &quota_windows {
         merge_quota_overlay(&mut snapshot, windows, &facts, quota_name_map());
     }
-    let current_ms = now_ms();
-    let fresh_quota_provider_ids = provider_observed_at_ms
-        .into_iter()
-        .filter(|(_, observed_at_ms)| {
-            *observed_at_ms != 0
-                && current_ms.saturating_sub(*observed_at_ms) <= QUOTA_FRESH_FOR_UPGRADE_MS
-        })
-        .filter_map(|(key, _)| {
-            // The freshness map's key is the published canonical slug when QTA
-            // serves one (already a routing providerID), else the wire name that
-            // still needs the local map. Try the map first so legacy wire names
-            // resolve; a miss means the key is already canonical.
-            quota_name_map().get(&key).cloned().or(Some(key))
-        })
-        .collect();
     let quota_signal_json = quota_signal_json(
         &snapshot,
         quota_windows.as_deref().unwrap_or_default(),
@@ -2277,7 +2204,6 @@ fn prepare_selection_inputs(
         now,
         facts,
         snapshot,
-        fresh_quota_provider_ids,
         quota_signal_json,
     })
 }
@@ -2474,9 +2400,7 @@ async fn handle_select_request(
         }
     };
     warn_ignored_caller_policy_once(
-        params.routing_policy.is_some()
-            || !params.subscription_keys.is_empty()
-            || !params.prefer_fast_specs.is_empty(),
+        params.routing_policy.is_some() || !params.subscription_keys.is_empty(),
     );
     // The operator fence is read HERE, on the module side, for every selection.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
@@ -2548,7 +2472,6 @@ async fn handle_select_request(
         now,
         mut facts,
         snapshot,
-        fresh_quota_provider_ids,
         quota_signal_json,
     } = match prepare_selection_inputs(quota_cache, store) {
         Ok(prepared) => prepared,
@@ -2607,7 +2530,6 @@ async fn handle_select_request(
     );
     exclude.extend(head_refusals.route_keys.iter().cloned());
     let operator_exclude = operator_policy.exclude.clone();
-    let prefer_fast = resolved_request.policy.prefer_fast_specs.clone();
     let requirements = resolved_request.requirements;
     let required_capabilities = resolved_request.required_capabilities;
     let target_agent = params.target_agent.clone();
@@ -2626,7 +2548,6 @@ async fn handle_select_request(
                 runtime_snapshot: Some(snap),
                 exclude_route_keys: exclude.clone(),
                 operator_exclude_keys: operator_exclude.clone(),
-                prefer_fast_specs: prefer_fast.clone(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                     sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
@@ -2644,35 +2565,7 @@ async fn handle_select_request(
 
     // First attempt against the live snapshot.
     let selection = match attempt(snapshot.clone()) {
-        Ok(mut selected) => {
-            // Post-selection fast-variant upgrade (no-op if not opted in / not relaxed).
-            if !prefer_fast.is_empty() {
-                let is_subscription_route = |route: &ModelRoute| {
-                    subscription_keys.contains(&route.route_key)
-                        || subscription_keys.contains(&route.capacity_key)
-                };
-                if let Some(upgraded) = maybe_upgrade_to_fast_variant(
-                    &FastVariantUpgradeInput {
-                        selected: &selected,
-                        facts: &facts,
-                        snapshot: &snapshot,
-                        requirements: &requirements,
-                        required_capabilities,
-                        available_models: &available,
-                        prefer_fast_specs: &prefer_fast,
-                        exclude_route_keys: &exclude,
-                        is_subscription_route: Some(&is_subscription_route),
-                        now,
-                        quota_signal_fresh: fresh_quota_provider_ids
-                            .contains(&selected.model.provider_id),
-                    },
-                    &routing_config,
-                ) {
-                    selected = upgraded;
-                }
-            }
-            Ok(selected)
-        }
+        Ok(selected) => Ok(selected),
         Err(no_route) if no_route.reason == RouteFailureReason::QuotaOrCooldownExhausted => {
             // Break-glass: in a subscription environment "all routes exhausted" is a
             // common steady state and stalls the orchestrator. Retry ONCE against a
@@ -2751,7 +2644,6 @@ async fn handle_select_request(
                         "requirements": requirements,
                         "availableModels": &resolved_request.policy.available_models,
                         "subscriptionKeys": &resolved_request.policy.subscription_keys,
-                        "preferFastSpecs": &resolved_request.policy.prefer_fast_specs,
                     });
                     if let Some(required_capabilities) = required_capabilities {
                         resolved_input["requiredCapabilities"] = json!(required_capabilities);
@@ -3083,7 +2975,6 @@ async fn handle_select_panel(
         },
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(None, opencode_auth_path),
-        false,
     );
     let subscription_keys: HashSet<String> =
         resolved_policy.subscription_keys.into_iter().collect();
@@ -6417,55 +6308,9 @@ mod tests {
         apply_quota_refresh(&mut cache, vec![pool_only], 10);
 
         assert_eq!(cache.windows.len(), 1);
-        assert_eq!(cache.windows[0].provider, "balance-wire");
         assert_eq!(
-            cache.provider_observed_at_ms.get("balance-provider"),
-            Some(&10),
-            "pool-only entries are successful quota observations, not degraded usage={{}}"
-        );
-    }
-
-    /// The upgrade gate reads this map against QUOTA_FRESH_FOR_UPGRADE_MS. A
-    /// cache-served reading whose source time lags the poll by more than the
-    /// horizon must not be admitted as fresh; an entry without fetchedAt keeps
-    /// the poll time (older producers).
-    #[test]
-    fn quota_freshness_is_bounded_by_the_sources_fetched_at() {
-        let mut cache = QuotaCache::default();
-        // Poll at 2026-09-11T15:00:00Z plus 194 s; the source observed at 15:00:00Z.
-        let poll_ms: u64 = 1_789_138_800_000 + 194_000;
-        let lagging = usage(serde_json::json!({
-            "provider": "antigravity",
-            "fetchedAt": "2026-09-11T15:00:00Z",
-            "usage": { "primary": { "usedPercent": 6.0, "resetsAt": "2030-01-01T00:00:00Z" } }
-        }));
-        let unstamped = usage(serde_json::json!({
-            "provider": "codex",
-            "usage": { "primary": { "usedPercent": 24.0, "resetsAt": "2030-01-01T00:00:00Z" } }
-        }));
-        let ahead = usage(serde_json::json!({
-            "provider": "gemini",
-            "fetchedAt": "2026-09-11T15:10:00Z",
-            "usage": { "primary": { "usedPercent": 1.0, "resetsAt": "2030-01-01T00:00:00Z" } }
-        }));
-
-        apply_quota_refresh(&mut cache, vec![lagging, unstamped, ahead], poll_ms);
-
-        let observed = |name: &str| *cache.provider_observed_at_ms.get(name).unwrap();
-        assert_eq!(observed("antigravity"), 1_789_138_800_000);
-        assert!(
-            poll_ms - observed("antigravity") > QUOTA_FRESH_FOR_UPGRADE_MS,
-            "a reading 194 s old at the source is outside the 180 s upgrade horizon"
-        );
-        assert_eq!(
-            observed("codex"),
-            poll_ms,
-            "no fetchedAt keeps the poll time"
-        );
-        assert_eq!(
-            observed("gemini"),
-            poll_ms,
-            "a source clock ahead of ours cannot mint freshness"
+            cache.windows[0].provider, "balance-wire",
+            "pool-only entries are retained as live quota observations"
         );
     }
 
@@ -6478,13 +6323,11 @@ mod tests {
         }));
         apply_quota_refresh(&mut cache, vec![healthy], 10);
         let retained = cache.windows.clone();
-        cache.provider_observed_at_ms.insert("codex".into(), 10);
 
         record_quota_refresh_failure(&mut cache, "usage.get", "daemon restarted");
 
         assert_eq!(cache.windows, retained);
         assert!(!cache.available);
-        assert!(cache.provider_observed_at_ms.is_empty());
         assert_eq!(
             cache.last_error.as_deref(),
             Some("usage.get: daemon restarted")
@@ -7497,8 +7340,7 @@ mod tests {
                 "excludeRouteKeys": [],
                 "routingPolicy": {
                     "exclude": ["openai/gpt-5.5"],
-                    "subscription": ["opencode-go", "-opencode-go/deepseek-v4-flash"],
-                    "preferFastWhenRelaxed": ["openai", "opencode-go/minimax-m2.5"]
+                    "subscription": ["opencode-go", "-opencode-go/deepseek-v4-flash"]
                 },
                 "providerAuthTypes": { "openai": "oauth", "opencode-go": "api" }
             }),
@@ -7522,8 +7364,7 @@ mod tests {
                     "openai/gpt-5.5",
                     "opencode-go/deepseek-v4-flash",
                     "opencode-go/minimax-m2.5"
-                ],
-                "preferFastSpecs": []
+                ]
             })
         );
     }
@@ -7742,7 +7583,6 @@ mod tests {
                 "routingPolicy": {
                     "exclude": ["fixture/a"],
                     "subscription": ["fixture"],
-                    "preferFastWhenRelaxed": ["fixture"]
                 },
                 "providerAuthTypes": { "fixture": "api" }
             }
@@ -7759,7 +7599,6 @@ mod tests {
             json!({
                 "availableModels": ["fixture/a", "fixture/b"],
                 "subscriptionKeys": [],
-                "preferFastSpecs": [],
                 "connectedModelCount": 2,
             })
         );
@@ -7851,134 +7690,6 @@ mod tests {
             .unwrap()
             .iter()
             .any(|line| line.as_str().unwrap().contains("need 80/100")));
-    }
-
-    #[tokio::test]
-    async fn empty_refresh_retains_pressure_but_revokes_fast_upgrade_freshness() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
-        let rig = Rig::new("empty-refresh-fast-freshness");
-        let store = Arc::new(rig.open_store());
-        let base = fact("openai", "freshness-base");
-        let mut fast = fact("openai", "freshness-base-fast");
-        fast.cost_per_m_tok_out = Some(30.0);
-        store.upsert_fact(&base, FactSource::Override).unwrap();
-        store.upsert_fact(&fast, FactSource::Override).unwrap();
-
-        let observed_at_ms = now_ms();
-        let mut cache = QuotaCache::default();
-        apply_quota_refresh(
-            &mut cache,
-            vec![usage(json!({
-                "provider": "codex",
-                "usage": {
-                    "primary": {
-                        "usedPercent": 1.0,
-                        "resetsAt": "2099-01-01T00:00:00Z"
-                    }
-                }
-            }))],
-            observed_at_ms,
-        );
-        apply_quota_refresh(&mut cache, Vec::new(), observed_at_ms.saturating_add(1));
-        assert_eq!(
-            cache.windows.len(),
-            1,
-            "the low-pressure window is retained"
-        );
-        assert!(cache.provider_observed_at_ms.is_empty());
-        let quota_cache = Arc::new(Mutex::new(cache));
-        let prepared = prepare_selection_inputs(&quota_cache, &store).unwrap();
-        assert!(
-            prepared.snapshot.by_capacity["openai/freshness-base-fast"]
-                .quota_pressure
-                .is_some_and(
-                    |pressure| pressure <= prefrontal_routing_core::FAST_UPGRADE_MAX_PRESSURE
-                )
-        );
-        assert!(!prepared.fresh_quota_provider_ids.contains("openai"));
-
-        let request = json!({
-            "method": ROUTE_SELECT_OP,
-            "params": {
-                "targetAgent": "mason",
-                "requirements": { "iq": 50, "eq": 0 },
-                "availableModels": [
-                    "openai/freshness-base",
-                    "openai/freshness-base-fast"
-                ],
-                "subscriptionKeys": ["openai/freshness-base"],
-                "preferFastSpecs": ["openai/freshness-base"],
-                "taskId": "empty-refresh-fast-freshness"
-            }
-        });
-        let frame = Frame::build(
-            FrameType::Request,
-            Flags::new(false, Priority::Interactive, false),
-            7,
-            1,
-            99,
-            serde_json::to_vec(&request).unwrap(),
-        )
-        .unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
-        handle_select_request(
-            frame,
-            1,
-            &tx,
-            &quota_cache,
-            &store,
-            &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
-            &empty_opencode_auth(),
-        )
-        .await
-        .unwrap();
-        let response = rx.recv().await.unwrap();
-        assert_eq!(response.header.ty, FrameType::Response);
-        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(
-            body["result"]["selected"]["model"]["modelID"],
-            "freshness-base"
-        );
-    }
-
-    /// A preserved reading (QTA's `stale` disclosure) carries usage and no
-    /// error, so it is wire-identical to a fresh success everywhere EXCEPT the
-    /// disclosure - and the fast-upgrade freshness map must treat it as
-    /// not-fresh: the upgrade demands positive evidence of a relaxed window,
-    /// and a reading the producer has been unable to refresh is not that.
-    /// Overlay pressure keeps using the preserved windows.
-    #[test]
-    fn preserved_stale_reading_keeps_windows_but_is_not_upgrade_fresh() {
-        let observed_at_ms = now_ms();
-        let mut cache = QuotaCache::default();
-        apply_quota_refresh(
-            &mut cache,
-            vec![
-                usage(json!({
-                    "provider": "codex",
-                    "usage": { "primary": { "usedPercent": 1.0 } },
-                    "fetchedAt": "2026-08-13T16:03:50Z",
-                    "stale": { "since": "2026-08-13T16:04:50Z", "class": "upstream_failed" }
-                })),
-                usage(json!({
-                    "provider": "gemini",
-                    "usage": { "primary": { "usedPercent": 2.0 } }
-                })),
-            ],
-            observed_at_ms,
-        );
-        assert_eq!(cache.windows.len(), 2, "preserved windows still serve");
-        assert!(
-            !cache.provider_observed_at_ms.contains_key("codex"),
-            "a preserved reading must not qualify its provider as upgrade-fresh"
-        );
-        assert!(
-            cache.provider_observed_at_ms.contains_key("gemini"),
-            "a fresh reading (no disclosure) stays upgrade-fresh"
-        );
     }
 
     #[tokio::test]
@@ -8904,7 +8615,6 @@ mod tests {
                 runtime_snapshot: Some(observation.snapshot.clone()),
                 exclude_route_keys: Vec::new(),
                 operator_exclude_keys: Vec::new(),
-                prefer_fast_specs: Vec::new(),
                 required_capabilities: resolved.required_capabilities,
                 is_subscription_route: None,
                 min_best_effort_adequacy: None,
@@ -9356,5 +9066,31 @@ mod tests {
             rig.ladder(),
             "identical inputs give identical ladders"
         );
+    }
+    #[tokio::test]
+    async fn route_model_upsert_refuses_fast_id_without_writing_a_row() {
+        let rig = Rig::new("route-model-upsert-fast-refusal");
+        let store = Arc::new(rig.open_store());
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_MODEL_UPSERT_OP,
+                "params": {
+                    "providerID": "openai",
+                    "modelID": "gpt-5.5-fast",
+                    "elo": 1500.0,
+                    "eq": 1000.0,
+                    "speed": 100.0
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Error);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "invalid_request");
+        assert!(store
+            .get_fact_by_route_key("openai/gpt-5.5-fast")
+            .unwrap()
+            .is_none());
     }
 }

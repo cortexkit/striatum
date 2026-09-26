@@ -1,5 +1,5 @@
 //! Provider/model spec matcher for the routing config lists (exclude,
-//! subscription, prefer_fast_when_relaxed). Ported VERBATIM from the TS
+//! subscription). Ported VERBATIM from the TS
 //! `provider-model-spec.ts` so config resolution matches the plugin exactly.
 //!
 //! Grammar: a list of entries, each one of:

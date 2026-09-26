@@ -755,7 +755,6 @@ mod tests {
             runtime_snapshot: Some(snapshot),
             exclude_route_keys: Vec::new(),
             operator_exclude_keys: Vec::new(),
-            prefer_fast_specs: Vec::new(),
             required_capabilities: None,
             is_subscription_route: None,
             min_best_effort_adequacy: None,

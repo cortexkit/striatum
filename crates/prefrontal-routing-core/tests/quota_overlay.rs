@@ -409,7 +409,7 @@ fn exhausted_provider_loses_selection_to_unpressured_peer_end_to_end() {
         runtime_snapshot: Some(snap),
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
-        prefer_fast_specs: Vec::new(),
+
         required_capabilities: None,
         is_subscription_route: None,
         min_best_effort_adequacy: None,
@@ -698,7 +698,7 @@ fn balance_only_positive_pool_keeps_provider_servable() {
         runtime_snapshot: Some(snap),
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
-        prefer_fast_specs: Vec::new(),
+
         required_capabilities: None,
         is_subscription_route: None,
         min_best_effort_adequacy: None,
@@ -785,7 +785,7 @@ fn an_idle_account_keeps_its_provider_off_the_all_accounts_wall() {
             runtime_snapshot: Some(snap),
             exclude_route_keys: Vec::new(),
             operator_exclude_keys: Vec::new(),
-            prefer_fast_specs: Vec::new(),
+
             required_capabilities: None,
             is_subscription_route: None,
             min_best_effort_adequacy: None,
@@ -866,7 +866,7 @@ fn an_exhausted_rolling_window_still_walls_its_route() {
             runtime_snapshot: Some(snap),
             exclude_route_keys: Vec::new(),
             operator_exclude_keys: Vec::new(),
-            prefer_fast_specs: Vec::new(),
+
             required_capabilities: None,
             is_subscription_route: None,
             min_best_effort_adequacy: None,
