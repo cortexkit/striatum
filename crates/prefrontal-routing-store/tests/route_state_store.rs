@@ -1626,7 +1626,7 @@ fn non_finite_and_negative_duration_are_stored_as_null() {
 }
 
 #[test]
-fn observed_speed_needs_min_samples_then_aggregates_tokens_over_duration() {
+fn observed_speed_needs_min_samples_then_takes_the_median_sample_speed() {
     let rig = Rig::new("usage-speed");
     let store = rig.open();
     // 4 eligible samples < MIN_SAMPLES (5) → not enough trusted signal.
@@ -1642,7 +1642,8 @@ fn observed_speed_needs_min_samples_then_aggregates_tokens_over_duration() {
             .unwrap();
     }
     assert_eq!(store.get_observed_speed("p/m", 10_000.0).unwrap(), None);
-    // 5th sample crosses MIN_SAMPLES: 5 * 1000 tok over 5 * 1000 ms = 1000 tok/s.
+    // 5th sample crosses MIN_SAMPLES: every sample runs 1000 tok over 1000 ms,
+    // so the median sample speed is 1000 tok/s.
     store
         .record_usage_observation(&obs("m4", "p/m", 1000.0, 1000.0, 1005.0))
         .unwrap();
@@ -1806,6 +1807,51 @@ fn facts_with_observed_speed_overlays_only_routes_with_trusted_signal() {
         "overlaid speed got {}",
         pm_after.scores.speed
     );
+}
+
+/// One runaway generation that ran to the output-token limit must not set a
+/// route's observed speed. Nineteen ordinary samples at about 40 tok/s sit
+/// beside one 128,000-token / 2,305,748 ms sample (about 55.5 tok/s). Dividing
+/// the window's total tokens by its total duration lets that one sample carry
+/// most of the weight and reports about 52.9 tok/s; the median per-sample speed
+/// stays with the nineteen. Both the singular lookup and the batched catalog
+/// overlay must agree.
+#[test]
+fn one_runaway_sample_does_not_set_the_observed_speed() {
+    let rig = Rig::new("usage-speed-runaway");
+    let store = rig.open();
+    store
+        .upsert_fact(&fact("p", "m"), FactSource::Override)
+        .unwrap();
+    // Ordinary samples: 1000 tokens over 24,700..25,240 ms, i.e. 39.6..40.5 tok/s.
+    for i in 0..19 {
+        store
+            .record_usage_observation(&obs(
+                &format!("ordinary-{i}"),
+                "p/m",
+                1_000.0,
+                24_700.0 + (i * 30) as f64,
+                1_000.0 + i as f64,
+            ))
+            .unwrap();
+    }
+    store
+        .record_usage_observation(&obs("runaway", "p/m", 128_000.0, 2_305_748.0, 1_100.0))
+        .unwrap();
+
+    let now = 10_000.0;
+    let speed = store.get_observed_speed("p/m", now).unwrap().unwrap();
+    assert!(
+        (39.5..=40.6).contains(&speed),
+        "observed speed should follow the ordinary samples, got {speed}"
+    );
+    let overlaid = store
+        .get_facts_with_observed_speed(now)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.provider_id == "p" && f.model_id == "m")
+        .unwrap();
+    assert_eq!(overlaid.scores.speed, speed);
 }
 
 /// A route with no observation of its own must enter at the fleet MEDIAN, not at

@@ -7574,6 +7574,96 @@ mod tests {
         );
     }
 
+    /// Live-shaped head-to-head between two routes on one subscription. Both are
+    /// measured below the 50 tok/s speed floor, so both speed scores are 0 and the
+    /// cheaper luna must win on metered cost. The sol window also holds one
+    /// runaway generation (128,000 tokens over 2,305,748 ms, run to the output
+    /// limit); if that one sample set sol's observed speed above the floor, sol
+    /// would win the speed tie-break instead.
+    #[tokio::test]
+    async fn explore_head_to_head_is_not_flipped_by_one_runaway_sample() {
+        let mut luna = fact("openai", "gpt-6-luna");
+        luna.scores.elo = 1641.0;
+        luna.cost_per_m_tok_out = Some(0.5);
+        let mut sol = fact("openai", "gpt-6-sol");
+        sol.scores.elo = 1851.0;
+        sol.cost_per_m_tok_out = Some(10.0);
+
+        let rig = Rig::new("explore-runaway-sample");
+        {
+            let store = rig.open_store();
+            let observed_at = now_ms().saturating_sub(600_000) as f64;
+            let record = |id: String, route_key: &str, output: f64, duration: f64, at: f64| {
+                store
+                    .record_usage_observation(&UsageObservation {
+                        id,
+                        route_key: route_key.into(),
+                        capacity_key: route_key.into(),
+                        provider_id: "openai".into(),
+                        input_tokens: None,
+                        output_tokens: output,
+                        reasoning_tokens: None,
+                        cached_read_tokens: None,
+                        cache_write_tokens: None,
+                        duration_ms: duration,
+                        workload_class: None,
+                        account_key: None,
+                        observed_at: at,
+                    })
+                    .unwrap();
+            };
+            // Luna: about 40.9 tok/s on every sample.
+            for index in 0..20 {
+                record(
+                    format!("luna-{index}"),
+                    "openai/gpt-6-luna",
+                    365.0,
+                    8_930.0,
+                    observed_at + index as f64,
+                );
+            }
+            // Sol: ordinary samples spread over 36..45 tok/s, plus the runaway.
+            for index in 0..19 {
+                let speed = 36.0 + index as f64 * 0.5;
+                record(
+                    format!("sol-{index}"),
+                    "openai/gpt-6-sol",
+                    570.0,
+                    (570.0 / speed * 1000.0).round(),
+                    observed_at + index as f64,
+                );
+            }
+            record(
+                "sol-runaway".into(),
+                "openai/gpt-6-sol",
+                128_000.0,
+                2_305_748.0,
+                observed_at + 100.0,
+            );
+        }
+
+        let response = run_select_against_rig(
+            &rig,
+            json!({
+                "targetAgent": "explore",
+                "requirements": { "iq": 50, "eq": 0 },
+                "availableModels": ["openai/gpt-6-luna", "openai/gpt-6-sol"],
+                "taskId": "explore-runaway-sample",
+                "providerAuthTypes": { "openai": "oauth" }
+            }),
+            &[luna, sol],
+            &PathBuf::from("/nonexistent/alfonso-routing.jsonc"),
+        )
+        .await;
+
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["result"]["selected"]["routeKey"], "openai/gpt-6-luna",
+            "{body:#}"
+        );
+    }
+
     #[tokio::test]
     async fn route_select_applies_specialist_default_and_rejects_implicit_mason_demand() {
         let route = fact("p", "default-vector");

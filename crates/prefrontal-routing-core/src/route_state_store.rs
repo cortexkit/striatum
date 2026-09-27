@@ -493,9 +493,9 @@ pub trait RouteStateStore {
         Ok(0)
     }
 
-    /// Aggregate recent eligible usage rows for a route into observed output
-    /// tokens/sec, or `None` if there is not enough trusted signal. `now` is the
-    /// window anchor. Mirrors the TS `getObservedSpeed`.
+    /// Observed output tokens/sec for a route: the median per-sample speed of its
+    /// most recent eligible usage rows, or `None` if there is not enough trusted
+    /// signal. `now` is the window anchor.
     fn get_observed_speed(&self, route_key: &str, now: f64) -> RouteStateResult<Option<f64>>;
 
     /// All facts with their `speed` score overlaid by the observed TPS where a

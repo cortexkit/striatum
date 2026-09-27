@@ -167,12 +167,15 @@ pub const WORKLOAD_CLASS_USAGE_SAMPLES_SQL: &str = "SELECT input_tokens, output_
        AND cached_read_tokens IS NOT NULL
        AND cache_write_tokens IS NOT NULL";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ObservedSpeedAggregate {
     route_key: String,
     sample_count: i64,
     output_tokens: i64,
     duration_ms: i64,
+    /// Trusted speed for the window, or `None` when the trust gates reject it.
+    /// See `observed_speed_from_samples`.
+    speed: Option<f64>,
 }
 
 fn route_state_migrations() -> [Migration; 41] {
@@ -1280,32 +1283,26 @@ impl SqliteRouteStateStore {
                 let mut stmt = c.prepare(OBSERVED_SPEED_SAMPLES_SQL)?;
                 let mut aggregates = Vec::with_capacity(observed_route_keys.len());
                 for route_key in observed_route_keys {
-                    let rows = stmt.query_map(
-                        params![
-                            route_key,
-                            (now - OBSERVED_SPEED_WINDOW_MS).floor() as i64,
-                            now.floor() as i64,
-                            USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
-                            USAGE_MIN_DURATION_MS.floor() as i64,
-                            OBSERVED_SPEED_SAMPLE_LIMIT,
-                        ],
-                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                    )?;
-                    let mut sample_count = 0_i64;
-                    let mut output_tokens = 0_i64;
-                    let mut duration_ms = 0_i64;
-                    for row in rows {
-                        let (output, duration) = row?;
-                        sample_count += 1;
-                        output_tokens += output;
-                        duration_ms += duration;
-                    }
-                    if sample_count > 0 {
+                    let samples = stmt
+                        .query_map(
+                            params![
+                                route_key,
+                                (now - OBSERVED_SPEED_WINDOW_MS).floor() as i64,
+                                now.floor() as i64,
+                                USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
+                                USAGE_MIN_DURATION_MS.floor() as i64,
+                                OBSERVED_SPEED_SAMPLE_LIMIT,
+                            ],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        )?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if !samples.is_empty() {
                         aggregates.push(ObservedSpeedAggregate {
                             route_key: route_key.clone(),
-                            sample_count,
-                            output_tokens,
-                            duration_ms,
+                            sample_count: samples.len() as i64,
+                            output_tokens: samples.iter().map(|(output, _)| output).sum(),
+                            duration_ms: samples.iter().map(|(_, duration)| duration).sum(),
+                            speed: observed_speed_from_samples(&samples),
                         });
                     }
                 }
@@ -1321,21 +1318,38 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<HashMap<String, f64>> {
         let mut speeds = HashMap::new();
         for aggregate in self.get_observed_speed_aggregates(observed_route_keys, now)? {
-            // Keep the singular lookup's trust gates unchanged: absent or
-            // untrusted aggregates leave the catalog speed untouched.
-            if aggregate.sample_count < OBSERVED_SPEED_MIN_SAMPLES as i64
-                || (aggregate.output_tokens as f64) < OBSERVED_SPEED_MIN_OUTPUT_TOKENS
-                || aggregate.duration_ms <= 0
-            {
-                continue;
-            }
-            let speed = (aggregate.output_tokens as f64 / aggregate.duration_ms as f64) * 1000.0;
-            if speed.is_finite() && speed > 0.0 {
+            // Absent or untrusted aggregates leave the catalog speed untouched.
+            if let Some(speed) = aggregate.speed {
                 speeds.insert(aggregate.route_key, speed);
             }
         }
         Ok(speeds)
     }
+}
+
+/// Trusted observed speed, in output tokens per second, for one route's bounded
+/// sample window of `(output_tokens, duration_ms)` rows.
+///
+/// The window must hold at least `OBSERVED_SPEED_MIN_SAMPLES` rows and
+/// `OBSERVED_SPEED_MIN_OUTPUT_TOKENS` output tokens in total; otherwise the
+/// signal is untrusted and the result is `None`. The speed is the median of the
+/// per-sample speeds rather than total tokens over total duration: a single very
+/// long generation (for example one that ran to the output-token limit) would
+/// otherwise dominate both sums and set the route's speed on its own.
+fn observed_speed_from_samples(samples: &[(i64, i64)]) -> Option<f64> {
+    if samples.len() < OBSERVED_SPEED_MIN_SAMPLES {
+        return None;
+    }
+    let output_tokens: i64 = samples.iter().map(|(output, _)| output).sum();
+    if (output_tokens as f64) < OBSERVED_SPEED_MIN_OUTPUT_TOKENS {
+        return None;
+    }
+    median_of(
+        samples
+            .iter()
+            .filter(|(_, duration)| *duration > 0)
+            .map(|(output, duration)| (*output as f64 / *duration as f64) * 1000.0),
+    )
 }
 
 /// Median of the measured speeds, used as the stand-in for routes with none.
@@ -2809,7 +2823,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 // The most-recent eligible rows in the trailing window, capped at the
-                // sample limit: same query shape + gates as the TS getObservedSpeed.
+                // sample limit; the batched catalog overlay reads the same rows.
                 let mut stmt = c.prepare(OBSERVED_SPEED_SAMPLES_SQL)?;
                 let rows = stmt.query_map(
                     params![
@@ -2822,28 +2836,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                     ],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
                 )?;
-                let mut output_tokens: i64 = 0;
-                let mut duration_ms: i64 = 0;
-                let mut count: usize = 0;
-                for row in rows {
-                    let (out, dur) = row?;
-                    output_tokens += out;
-                    duration_ms += dur;
-                    count += 1;
-                }
-                // Trust the aggregate only with enough eligible samples + total volume.
-                if count < OBSERVED_SPEED_MIN_SAMPLES {
-                    return Ok(None);
-                }
-                if (output_tokens as f64) < OBSERVED_SPEED_MIN_OUTPUT_TOKENS || duration_ms <= 0 {
-                    return Ok(None);
-                }
-                let speed = (output_tokens as f64 / duration_ms as f64) * 1000.0;
-                Ok(if speed.is_finite() && speed > 0.0 {
-                    Some(speed)
-                } else {
-                    None
-                })
+                let samples = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(observed_speed_from_samples(&samples))
             })
             .map_err(err)
     }
@@ -3485,6 +3479,9 @@ mod tests {
                             sample_count: row.get(1)?,
                             output_tokens: row.get(2)?,
                             duration_ms: row.get(3)?,
+                            // The SQL oracle checks row selection only; the speed is
+                            // compared separately after `without_speed`.
+                            speed: None,
                         })
                     },
                 )?;
@@ -3493,6 +3490,18 @@ mod tests {
             .unwrap();
         aggregates.sort_by(|left, right| left.route_key.cmp(&right.route_key));
         aggregates
+    }
+
+    /// Drop the computed speed so bounded-seek aggregates can be compared with the
+    /// SQL oracle, which reproduces row selection and sums but not the median.
+    fn without_speed(aggregates: &[ObservedSpeedAggregate]) -> Vec<ObservedSpeedAggregate> {
+        aggregates
+            .iter()
+            .map(|aggregate| ObservedSpeedAggregate {
+                speed: None,
+                ..aggregate.clone()
+            })
+            .collect()
     }
 
     fn remove_observed_speed_test_store(path: &std::path::Path) {
@@ -3598,7 +3607,7 @@ mod tests {
         let actual = store
             .get_observed_speed_aggregates(&route_keys, now)
             .unwrap();
-        assert_eq!(actual, expected);
+        assert_eq!(without_speed(&actual), expected);
         let sample_count = |route_key: &str| {
             actual
                 .iter()
@@ -3665,7 +3674,7 @@ mod tests {
             .get_observed_speed_aggregates(&route_keys, now)
             .unwrap();
         let bounded_elapsed = bounded_started.elapsed();
-        assert_eq!(actual, expected);
+        assert_eq!(without_speed(&actual), expected);
         println!(
             "observed_speed_benchmark rows=100000 shipped_ms={:.3} bounded_ms={:.3}",
             shipped_elapsed.as_secs_f64() * 1_000.0,
