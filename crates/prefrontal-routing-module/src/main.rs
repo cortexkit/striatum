@@ -8293,12 +8293,13 @@ mod tests {
         let vectors = select_panel_wire_vectors();
         let request = vectors["nPick"]["request"].as_str().unwrap();
         let mut with_retired: serde_json::Value = serde_json::from_str(request).unwrap();
-        assert!(with_retired["params"].get("packageTokensEstimate").is_none());
+        assert!(with_retired["params"]
+            .get("packageTokensEstimate")
+            .is_none());
         with_retired["params"]["packageTokensEstimate"] = json!(100);
         with_retired["params"]["proMemberMaxPackageTokens"] = json!(8_000);
         let (response, _rig, _store) =
-            run_select_panel_wire_request("n-pick-retired-fields", &with_retired.to_string())
-                .await;
+            run_select_panel_wire_request("n-pick-retired-fields", &with_retired.to_string()).await;
         assert_eq!(response.header.ty, FrameType::Response);
     }
 
