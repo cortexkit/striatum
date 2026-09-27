@@ -76,8 +76,6 @@ fn spec(size: usize, iq_floor: f64, diversity: PanelDiversity) -> PanelSpec {
 fn panel_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput<'static> {
     SelectPanelInput {
         selection: PanelSelection::Roster,
-        package_tokens_estimate: None,
-        pro_member_max_package_tokens: None,
         roster: roster(&facts),
         available_models: availability(&facts),
         availability_substrate: AvailabilitySubstrate::Host,
@@ -91,17 +89,10 @@ fn panel_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput
     }
 }
 
-fn n_pick_input(
-    facts: Vec<ModelFact>,
-    panel_spec: PanelSpec,
-    package_tokens_estimate: u32,
-    pro_member_max_package_tokens: u32,
-) -> SelectPanelInput<'static> {
+fn n_pick_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput<'static> {
     SelectPanelInput {
         selection: PanelSelection::NPick,
         roster: Vec::new(),
-        package_tokens_estimate: Some(package_tokens_estimate),
-        pro_member_max_package_tokens: Some(pro_member_max_package_tokens),
         available_models: availability(&facts),
         availability_substrate: AvailabilitySubstrate::Host,
         panel_spec,
@@ -132,7 +123,7 @@ fn operator_exclusion_fences_automatic_seats_and_names_its_own_cause() {
         fact("kept", 1_700.0, Some("b")),
         fact("rerouted", 1_650.0, Some("c")),
     ];
-    let mut input = n_pick_input(facts, spec(3, 0.0, PanelDiversity::None), 1_000, 100_000);
+    let mut input = n_pick_input(facts, spec(3, 0.0, PanelDiversity::None));
     input.operator_exclude_keys = vec!["p/fenced".into()];
     // The caller's own exclusion of a DIFFERENT route must stay distinguishable
     // from the operator's: one is fixed by editing a config, the other by asking
@@ -174,13 +165,7 @@ fn iq_floor_uses_the_request_elo_frontier() {
         fact("at-boundary", target, Some("a")),
         fact("just-below", target - 0.01, Some("b")),
     ];
-    let selected = select_panel(n_pick_input(
-        facts,
-        spec(3, 70.0, PanelDiversity::None),
-        1_000,
-        8_000,
-    ))
-    .unwrap();
+    let selected = select_panel(n_pick_input(facts, spec(3, 70.0, PanelDiversity::None))).unwrap();
     let routes: HashSet<_> = selected
         .members
         .iter()
@@ -198,8 +183,6 @@ fn iq_floor_uses_the_request_elo_frontier() {
             fact("too-low", top - 0.1, Some("b")),
         ],
         spec(2, 100.0, PanelDiversity::None),
-        1_000,
-        8_000,
     ))
     .unwrap();
     assert_eq!(selected.members.len(), 1);
@@ -276,8 +259,6 @@ fn admission_is_shared_not_reimplemented() {
     });
     let panel = select_panel(SelectPanelInput {
         selection: PanelSelection::Roster,
-        package_tokens_estimate: None,
-        pro_member_max_package_tokens: None,
         panel_spec: spec(5, 0.0, PanelDiversity::None),
         roster: panel_roster,
         facts,
@@ -325,8 +306,6 @@ fn admission_is_shared_not_reimplemented() {
     let exhausted = vec![fact("only", 60.0, Some("a"))];
     let panel = select_panel(SelectPanelInput {
         selection: PanelSelection::Roster,
-        package_tokens_estimate: None,
-        pro_member_max_package_tokens: None,
         panel_spec: spec(1, 0.0, PanelDiversity::None),
         roster: roster(&exhausted),
         available_models: availability(&exhausted),
@@ -400,8 +379,6 @@ fn family_diversity_excludes_unlabeled_everywhere() {
     let family = select_panel(n_pick_input(
         facts.clone(),
         spec(2, 0.0, PanelDiversity::Family),
-        1_000,
-        12_000,
     ))
     .unwrap();
     assert_eq!(family.members.len(), 1);
@@ -432,8 +409,10 @@ fn family_diversity_excludes_unlabeled_everywhere() {
 fn seated_members_and_runner_ups_keep_fact_output_caps() {
     let mut capped = fact("capped", 61.0, Some("a"));
     capped.max_output_tokens = Some(8_000);
+    capped.context_window = Some(500_000.0);
     let mut uncapped = fact("uncapped", 60.0, Some("b"));
     uncapped.max_output_tokens = None;
+    uncapped.context_window = None;
 
     let panel = select_panel(panel_input(
         vec![capped, uncapped],
@@ -446,6 +425,11 @@ fn seated_members_and_runner_ups_keep_fact_output_caps() {
     let serialized = serde_json::to_value(&panel).unwrap();
     assert_eq!(serialized["members"][0]["maxOutputTokens"], json!(8_000));
     assert!(serialized["runnerUp"][0].get("maxOutputTokens").is_none());
+    // The context window rides with the seat so the consult can size its
+    // package from the seated roster without a second catalog lookup.
+    assert_eq!(panel.members[0].context_window, Some(500_000));
+    assert_eq!(serialized["members"][0]["contextWindow"], json!(500_000));
+    assert!(serialized["runnerUp"][0].get("contextWindow").is_none());
 }
 
 #[test]
@@ -505,8 +489,6 @@ fn shortfall_precedence_and_empty_success() {
     let unavailable = fact("unavailable", 60.0, Some("a"));
     let zero_admission = select_panel(SelectPanelInput {
         selection: PanelSelection::Roster,
-        package_tokens_estimate: None,
-        pro_member_max_package_tokens: None,
         panel_spec: spec(1, 100.0, PanelDiversity::Family),
         roster: roster(std::slice::from_ref(&unavailable)),
         facts: vec![unavailable],
@@ -528,8 +510,6 @@ fn shortfall_precedence_and_empty_success() {
     let mut below_input = n_pick_input(
         vec![fact("top", 100.0, Some("top")), fact("below", 40.0, None)],
         spec(2, 100.0, PanelDiversity::Family),
-        1_000,
-        8_000,
     );
     below_input.runtime_snapshot = Some(ModelRouteStateSnapshot {
         now: 1_000.0,
@@ -551,8 +531,6 @@ fn shortfall_precedence_and_empty_success() {
     let diversity = select_panel(n_pick_input(
         vec![fact("one", 60.0, Some("a"))],
         spec(2, 0.0, PanelDiversity::Family),
-        1_000,
-        12_000,
     ))
     .unwrap();
     assert_eq!(
@@ -622,8 +600,6 @@ fn n_pick_reuses_elo_floor_and_fact_prompt_defaults() {
             fact("below", target - 0.01, Some("b")),
         ],
         spec(3, 70.0, PanelDiversity::None),
-        0,
-        8_000,
     ))
     .unwrap();
 
@@ -649,7 +625,7 @@ fn routes_with_the_same_capacity_key_collapse_without_static_metadata() {
     let mut panel_spec = spec(2, 0.0, PanelDiversity::None);
     panel_spec.class = PanelClass::Diagnose;
 
-    let selected = select_panel(n_pick_input(vec![variant, base], panel_spec, 100, 8_000)).unwrap();
+    let selected = select_panel(n_pick_input(vec![variant, base], panel_spec)).unwrap();
 
     assert_eq!(selected.members.len(), 1);
     assert_eq!(selected.members[0].route_key, "p/shared");
@@ -673,7 +649,7 @@ fn audit_diagnose_mixed_and_explain_apply_distinct_rankings() {
     ];
     let mut audit_spec = spec(3, 0.0, PanelDiversity::Family);
     audit_spec.class = PanelClass::Audit;
-    let audit = select_panel(n_pick_input(audit_facts, audit_spec, 100, 8_000)).unwrap();
+    let audit = select_panel(n_pick_input(audit_facts, audit_spec)).unwrap();
     assert_eq!(
         audit
             .members
@@ -695,7 +671,7 @@ fn audit_diagnose_mixed_and_explain_apply_distinct_rankings() {
     let diagnose_facts = vec![economical, expensive, fact("lower", 60.0, Some("b"))];
     let mut diagnose_spec = spec(1, 0.0, PanelDiversity::None);
     diagnose_spec.class = PanelClass::Diagnose;
-    let diagnose = select_panel(n_pick_input(diagnose_facts, diagnose_spec, 100, 8_000)).unwrap();
+    let diagnose = select_panel(n_pick_input(diagnose_facts, diagnose_spec)).unwrap();
     assert_eq!(
         diagnose.members[0].route_key, "p/z-lineage",
         "equal-IQ candidates are ordered by the economic objective before family"
@@ -721,7 +697,7 @@ fn audit_diagnose_mixed_and_explain_apply_distinct_rankings() {
         ];
         let mut mixed_spec = spec(2, 0.0, PanelDiversity::Family);
         mixed_spec.class = class;
-        let mixed = select_panel(n_pick_input(mixed_facts, mixed_spec, 100, 8_000)).unwrap();
+        let mixed = select_panel(n_pick_input(mixed_facts, mixed_spec)).unwrap();
         assert_eq!(
             mixed
                 .members
@@ -740,13 +716,7 @@ fn audit_diagnose_mixed_and_explain_apply_distinct_rankings() {
     cheap.cost_per_m_tok_out = Some(1.0);
     let mut explain_spec = spec(1, 0.0, PanelDiversity::None);
     explain_spec.class = PanelClass::Explain;
-    let explain = select_panel(n_pick_input(
-        vec![expensive, cheap],
-        explain_spec,
-        100,
-        8_000,
-    ))
-    .unwrap();
+    let explain = select_panel(n_pick_input(vec![expensive, cheap], explain_spec)).unwrap();
     assert_eq!(explain.members[0].route_key, "p/cheap");
     assert_eq!(explain.runner_up[0].route_key, "p/expensive");
     assert_eq!(
@@ -756,12 +726,8 @@ fn audit_diagnose_mixed_and_explain_apply_distinct_rankings() {
 }
 
 #[test]
-fn pro_policy_requires_class_floor_and_small_package() {
-    fn select_sol(
-        class: PanelClass,
-        floor: f64,
-        estimate: u32,
-    ) -> prefrontal_routing_core::SelectedPanel {
+fn pro_policy_requires_class_and_floor() {
+    fn select_sol(class: PanelClass, floor: f64) -> prefrontal_routing_core::SelectedPanel {
         let facts = vec![
             openai_sibling("gpt-5.6-sol", 69.5),
             openai_sibling("gpt-5.6-sol-fast", 69.5),
@@ -769,53 +735,32 @@ fn pro_policy_requires_class_floor_and_small_package() {
         ];
         let mut panel_spec = spec(1, floor, PanelDiversity::None);
         panel_spec.class = class;
-        select_panel(n_pick_input(facts, panel_spec, estimate, 8_000)).unwrap()
+        select_panel(n_pick_input(facts, panel_spec)).unwrap()
     }
 
     for class in [PanelClass::Diagnose, PanelClass::Audit] {
-        for estimate in [0, 8_000] {
-            let selected = select_sol(class, 80.0, estimate);
-            assert_eq!(selected.members[0].route_key, "openai/gpt-5.6-sol-pro");
-            let policy = selected.policy.unwrap();
-            assert_eq!(policy.seated_variants[0].slot, 0);
-            assert_eq!(policy.seated_variants[0].variant, SeatedSiblingVariant::Pro);
-            assert!(!policy.pro_downgraded_for_size);
-        }
+        let selected = select_sol(class, 80.0);
+        assert_eq!(selected.members[0].route_key, "openai/gpt-5.6-sol-pro");
+        let policy = selected.policy.unwrap();
+        assert_eq!(policy.seated_variants[0].slot, 0);
+        assert_eq!(policy.seated_variants[0].variant, SeatedSiblingVariant::Pro);
     }
 
     for (class, floor) in [(PanelClass::Evaluate, 80.0), (PanelClass::Diagnose, 70.0)] {
-        let selected = select_sol(class, floor, 100);
+        let selected = select_sol(class, floor);
         assert_eq!(selected.members[0].route_key, "openai/gpt-5.6-sol");
-        assert!(!selected.policy.unwrap().pro_downgraded_for_size);
     }
-
-    let selected = select_sol(PanelClass::Diagnose, 80.0, 8_001);
-    assert_eq!(selected.members[0].route_key, "openai/gpt-5.6-sol");
-    let policy = selected.policy.unwrap();
-    assert_eq!(
-        policy.seated_variants[0].variant,
-        SeatedSiblingVariant::Base
-    );
-    assert!(policy.pro_downgraded_for_size);
 }
 
 #[test]
-fn n_pick_requires_both_pro_gate_inputs() {
+fn n_pick_needs_no_package_size_inputs() {
+    // The package no longer steers seating: the consult sizes its package from
+    // the seated roster instead, so an n_pick request carries no estimate.
     let facts = vec![fact("one", 60.0, Some("a"))];
-    let mut missing_estimate =
-        n_pick_input(facts.clone(), spec(1, 0.0, PanelDiversity::None), 0, 8_000);
-    missing_estimate.package_tokens_estimate = None;
-    assert_eq!(
-        select_panel(missing_estimate).unwrap_err().0,
-        "packageTokensEstimate is required when selection is n_pick"
-    );
-
-    let mut missing_threshold = n_pick_input(facts, spec(1, 0.0, PanelDiversity::None), 0, 8_000);
-    missing_threshold.pro_member_max_package_tokens = None;
-    assert_eq!(
-        select_panel(missing_threshold).unwrap_err().0,
-        "proMemberMaxPackageTokens is required when selection is n_pick"
-    );
+    let selected = select_panel(n_pick_input(facts, spec(1, 0.0, PanelDiversity::None))).unwrap();
+    assert_eq!(selected.members.len(), 1);
+    let serialized = serde_json::to_value(selected.policy.unwrap()).unwrap();
+    assert!(serialized.get("proDowngradedForSize").is_none());
 }
 
 #[test]
@@ -828,7 +773,7 @@ fn n_pick_applies_shared_availability_exclusion_and_capability_admission() {
     let facts = vec![excluded, unavailable, incapable, winner];
     let mut panel_spec = spec(4, 0.0, PanelDiversity::None);
     panel_spec.class = PanelClass::Diagnose;
-    let mut input = n_pick_input(facts, panel_spec, 100, 8_000);
+    let mut input = n_pick_input(facts, panel_spec);
     input.exclude_route_keys = vec!["p/excluded".into()];
     input.available_models.remove("p/unavailable");
     input.required_capabilities = Some(RequiredCapabilities {

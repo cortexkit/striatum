@@ -98,8 +98,6 @@ pub struct SelectPanelInput<'a> {
     pub panel_spec: PanelSpec,
     pub selection: PanelSelection,
     pub roster: Vec<PanelRosterEntry>,
-    pub package_tokens_estimate: Option<u32>,
-    pub pro_member_max_package_tokens: Option<u32>,
     pub facts: Vec<ModelFact>,
     pub runtime_snapshot: Option<ModelRouteStateSnapshot>,
     pub exclude_route_keys: Vec<String>,
@@ -125,6 +123,11 @@ pub struct PanelMember {
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// The route's context window from the catalog fact. The consult sizes its
+    /// evidence package from the smallest window among the seated members, so
+    /// the window travels with the seat instead of being looked up again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -135,6 +138,8 @@ pub struct PanelRunnerUp {
     pub family: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -216,7 +221,6 @@ pub struct SiblingCollapse {
 pub struct PanelPolicy {
     pub selection: PanelSelectionPolicy,
     pub seated_variants: Vec<SeatedVariant>,
-    pub pro_downgraded_for_size: bool,
     pub sibling_collapses: Vec<SiblingCollapse>,
 }
 
@@ -265,22 +269,6 @@ pub fn validate_panel_spec(spec: &PanelSpec) -> Result<(), InvalidPanelRequest> 
     Ok(())
 }
 
-fn validate_selection(input: &SelectPanelInput<'_>) -> Result<(), InvalidPanelRequest> {
-    if input.selection == PanelSelection::NPick {
-        if input.package_tokens_estimate.is_none() {
-            return Err(InvalidPanelRequest(
-                "packageTokensEstimate is required when selection is n_pick".into(),
-            ));
-        }
-        if input.pro_member_max_package_tokens.is_none() {
-            return Err(InvalidPanelRequest(
-                "proMemberMaxPackageTokens is required when selection is n_pick".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub fn select_panel(input: SelectPanelInput<'_>) -> Result<SelectedPanel, InvalidPanelRequest> {
     select_panel_with_config(input, &DEFAULT_ROUTING_CONFIG)
 }
@@ -290,7 +278,6 @@ pub fn select_panel_with_config(
     config: &RoutingConfig,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
     validate_panel_spec(&input.panel_spec)?;
-    validate_selection(&input)?;
 
     let mut prompt_params: HashMap<String, VecDeque<Map<String, Value>>> = HashMap::new();
     let mut causes = Vec::new();
@@ -397,23 +384,16 @@ pub fn select_panel_with_config(
     }
     let iq_eligible_count = candidates.len();
 
-    let (mut candidates, sibling_collapses, size_downgraded_routes) =
-        if input.selection == PanelSelection::NPick {
-            collapse_siblings(
-                candidates,
-                &considered_facts,
-                input.panel_spec.class,
-                input.panel_spec.iq_floor,
-                input
-                    .package_tokens_estimate
-                    .expect("n_pick input validated"),
-                input
-                    .pro_member_max_package_tokens
-                    .expect("n_pick input validated"),
-            )
-        } else {
-            (candidates, Vec::new(), HashSet::new())
-        };
+    let (mut candidates, sibling_collapses) = if input.selection == PanelSelection::NPick {
+        collapse_siblings(
+            candidates,
+            &considered_facts,
+            input.panel_spec.class,
+            input.panel_spec.iq_floor,
+        )
+    } else {
+        (candidates, Vec::new())
+    };
 
     let selection_policy = selection_policy(&input.panel_spec);
     order_candidates(
@@ -470,6 +450,7 @@ pub fn select_panel_with_config(
     let mut members = Vec::new();
     let mut runner_up = Vec::new();
     for (index, candidate) in candidates.into_iter().enumerate() {
+        let context_window = context_window_tokens(&candidate.route.fact);
         if selected.contains(&index) {
             members.push(PanelMember {
                 route_key: candidate.route.route_key,
@@ -477,9 +458,11 @@ pub fn select_panel_with_config(
                 family: candidate.route.fact.family,
                 temperature: None,
                 max_output_tokens: candidate.route.fact.max_output_tokens,
+                context_window,
             });
         } else {
             runner_up.push(PanelRunnerUp {
+                context_window,
                 route_key: candidate.route.route_key,
                 prompt_params: candidate.prompt_params,
                 family: candidate.route.fact.family,
@@ -549,9 +532,6 @@ pub fn select_panel_with_config(
                 variant: sibling_variant(&member.route_key),
             })
             .collect(),
-        pro_downgraded_for_size: members
-            .iter()
-            .any(|member| size_downgraded_routes.contains(&member.route_key)),
         sibling_collapses,
     });
 
@@ -561,6 +541,14 @@ pub fn select_panel_with_config(
         shortfall,
         policy,
     })
+}
+
+/// A catalog context window as whole tokens; absent, non-finite or non-positive
+/// windows read as unknown so the caller applies its own conservative default.
+fn context_window_tokens(fact: &ModelFact) -> Option<u64> {
+    fact.context_window
+        .filter(|window| window.is_finite() && *window >= 1.0)
+        .map(|window| window as u64)
 }
 
 fn roster_facts(
@@ -730,16 +718,11 @@ fn collapse_siblings(
     known_facts: &[ModelFact],
     class: PanelClass,
     floor: f64,
-    package_tokens_estimate: u32,
-    pro_member_max_package_tokens: u32,
-) -> (Vec<Candidate>, Vec<SiblingCollapse>, HashSet<String>) {
-    let pro_policy_eligible = matches!(
+) -> (Vec<Candidate>, Vec<SiblingCollapse>) {
+    let prefer_pro = matches!(
         class,
         PanelClass::Diagnose | PanelClass::Audit | PanelClass::Spec
     ) && floor >= 80.0;
-    let size_blocked =
-        pro_policy_eligible && package_tokens_estimate > pro_member_max_package_tokens;
-    let prefer_pro = pro_policy_eligible && !size_blocked;
     let capacity_keys: HashSet<String> = known_facts
         .iter()
         .map(|fact| make_capacity_key(&fact.provider_id, &fact.model_id))
@@ -757,7 +740,6 @@ fn collapse_siblings(
 
     let mut collapsed_candidates = Vec::new();
     let mut collapses = Vec::new();
-    let mut size_downgraded_routes = HashSet::new();
 
     for (base_key, mut group) in groups {
         let pro_key = format!("{base_key}-pro");
@@ -796,9 +778,6 @@ fn collapse_siblings(
         };
         let retained = group.remove(selected_index);
         let retained_route_key = retained.route.route_key.clone();
-        if size_blocked && has_pro && retained.route.capacity_key == base_key {
-            size_downgraded_routes.insert(retained_route_key.clone());
-        }
         let collapsed_route_keys: Vec<String> = group
             .iter()
             .map(|candidate| candidate.route.route_key.clone())
@@ -813,7 +792,7 @@ fn collapse_siblings(
         collapsed_candidates.push(retained);
     }
 
-    (collapsed_candidates, collapses, size_downgraded_routes)
+    (collapsed_candidates, collapses)
 }
 
 fn sibling_variant(route_key: &str) -> SeatedSiblingVariant {

@@ -1085,10 +1085,6 @@ struct SelectPanelParams {
     #[serde(default)]
     roster: Vec<PanelRosterEntry>,
     #[serde(default)]
-    package_tokens_estimate: Option<u32>,
-    #[serde(default)]
-    pro_member_max_package_tokens: Option<u32>,
-    #[serde(default)]
     available_models: Vec<String>,
     #[serde(default)]
     exclude_route_keys: Vec<String>,
@@ -1969,6 +1965,12 @@ async fn handle_model_fact(
                 // The provider's own output ceiling lets pinned callers size the send for
                 // this exact route instead of inheriting another panel member's limit.
                 "maxOutputTokens": fact.max_output_tokens,
+                // The context window lets a consult size its evidence package for
+                // the roster it would seat before any seat is selected or paid for.
+                "contextWindow": fact
+                    .context_window
+                    .filter(|window| window.is_finite() && *window >= 1.0)
+                    .map(|window| window as u64),
                 "family": family.map(prefrontal_routing_core::GrandFamily::as_str),
                 "familySource": family_source.as_str(),
             })
@@ -1979,6 +1981,7 @@ async fn handle_model_fact(
                 "known": false,
                 "supportsVision": null,
                 "maxOutputTokens": null,
+                "contextWindow": null,
                 "family": null,
                 "familySource": "absent"
             })
@@ -2910,32 +2913,6 @@ async fn handle_select_panel(
     if let Err(e) = validate_panel_spec(&params.panel_spec) {
         return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &e.0).await;
     }
-    if params.selection == PanelSelection::NPick {
-        if params.package_tokens_estimate.is_none() {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "invalid_request",
-                "packageTokensEstimate is required when selection is n_pick",
-            )
-            .await;
-        }
-        if params.pro_member_max_package_tokens.is_none() {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "invalid_request",
-                "proMemberMaxPackageTokens is required when selection is n_pick",
-            )
-            .await;
-        }
-    }
     if let Err(error) = config_overrides::reload_live_multipliers(routing_config_path) {
         eprintln!(
             "[prefrontal-routing] live route multiplier reload failed (using no multipliers): {error}"
@@ -3010,8 +2987,6 @@ async fn handle_select_panel(
             panel_spec: params.panel_spec.clone(),
             selection: params.selection,
             roster: params.roster.clone(),
-            package_tokens_estimate: params.package_tokens_estimate,
-            pro_member_max_package_tokens: params.pro_member_max_package_tokens,
             facts: prepared.facts,
             runtime_snapshot: Some(prepared.snapshot),
             exclude_route_keys: Vec::new(),
@@ -6021,10 +5996,11 @@ mod tests {
                 "known": true,
                 "supportsVision": true,
                 "maxOutputTokens": 64000,
+                "contextWindow": 1000000,
                 "family": "claude",
                 "familySource": "curated"
             }),
-            "the reply carries the catalog's own output ceiling so a caller that pins this route can size its send to it"
+            "the reply carries the catalog's own output ceiling and context window so a caller can size its send and its evidence package to this route"
         );
     }
 
@@ -8291,7 +8267,6 @@ mod tests {
                 route_key: "openai/gpt-5.6-sol-pro".into(),
                 variant: prefrontal_routing_core::SeatedSiblingVariant::Pro,
             }],
-            pro_downgraded_for_size: false,
             sibling_collapses: Vec::new(),
         };
         let panel = SelectedPanel {
@@ -8311,21 +8286,20 @@ mod tests {
         assert_eq!(explanation["policy"]["selection"], "top_iq");
     }
 
+    /// The package no longer steers seating, so an n_pick request needs no package
+    /// size fields; a caller still sending the retired ones is served, not refused.
     #[tokio::test]
-    async fn n_pick_missing_gate_fields_are_typed_fixture_errors() {
+    async fn n_pick_needs_no_package_size_fields_and_tolerates_retired_ones() {
         let vectors = select_panel_wire_vectors();
-        for invalid in vectors["invalidNPick"].as_array().unwrap() {
-            let missing_field = invalid["missingField"].as_str().unwrap();
-            let request = invalid["request"].as_str().unwrap();
-            let (response, _rig, _store) =
-                run_select_panel_wire_request(&format!("invalid-n-pick-{missing_field}"), request)
-                    .await;
-            assert_eq!(response.header.ty, FrameType::Error);
-            assert_eq!(response.body, invalid["reply"].as_str().unwrap().as_bytes());
-            let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
-            assert_eq!(error.code, "invalid_request");
-            assert!(error.message.contains(missing_field));
-        }
+        let request = vectors["nPick"]["request"].as_str().unwrap();
+        let mut with_retired: serde_json::Value = serde_json::from_str(request).unwrap();
+        assert!(with_retired["params"].get("packageTokensEstimate").is_none());
+        with_retired["params"]["packageTokensEstimate"] = json!(100);
+        with_retired["params"]["proMemberMaxPackageTokens"] = json!(8_000);
+        let (response, _rig, _store) =
+            run_select_panel_wire_request("n-pick-retired-fields", &with_retired.to_string())
+                .await;
+        assert_eq!(response.header.ty, FrameType::Response);
     }
 
     #[tokio::test]
