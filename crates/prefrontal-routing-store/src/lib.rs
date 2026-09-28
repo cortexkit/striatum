@@ -140,6 +140,8 @@ const MIGRATION_041: &str = include_str!("../migrations/041_retire_fast_routes.s
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
+/// How many omitted `not_available` route keys the rejection summary names.
+const MAX_OMITTED_NOT_AVAILABLE_KEYS: usize = 200;
 
 /// Fetch one route's bounded observed-speed sample set through the route/time index.
 /// The batched lookup prepares this statement once and reuses it for every
@@ -556,15 +558,32 @@ fn bound_rejected_json(raw: &str) -> String {
             .unwrap_or("unknown");
         *reasons.entry(reason.to_string()).or_default() += 1;
     }
+    // A route the caller's host does not serve is the answer to "why was this
+    // model never considered", and a count alone cannot answer it for a named
+    // model. The omitted unavailable routes keep their keys in the summary, up
+    // to a bound, so a model missing from a host's list reads as unavailable
+    // rather than as absent from the decision.
+    let omitted_not_available = prioritized[MAX_STORED_REJECTIONS..]
+        .iter()
+        .filter(|entry| {
+            entry.get("reason").and_then(serde_json::Value::as_str) == Some("not_available")
+        })
+        .filter_map(|entry| entry.get("routeKey").cloned())
+        .take(MAX_OMITTED_NOT_AVAILABLE_KEYS)
+        .collect::<Vec<_>>();
     let truncated = prioritized.len() - MAX_STORED_REJECTIONS;
     let mut bounded = prioritized[..MAX_STORED_REJECTIONS]
         .iter()
         .map(|entry| (*entry).clone())
         .collect::<Vec<_>>();
-    bounded.push(serde_json::json!({
+    let mut summary = serde_json::json!({
         "truncated": truncated,
         "reasons": reasons,
-    }));
+    });
+    if !omitted_not_available.is_empty() {
+        summary["notAvailable"] = serde_json::Value::Array(omitted_not_available);
+    }
+    bounded.push(summary);
     serde_json::to_string(&bounded).unwrap_or_else(|_| raw.to_string())
 }
 

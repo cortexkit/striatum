@@ -1124,6 +1124,53 @@ fn decision_rejections_keep_twelve_entries_and_summarize_the_rest() {
     );
 }
 
+#[test]
+fn decision_rejections_name_every_omitted_unavailable_route() {
+    use rusqlite::Connection;
+
+    let rig = Rig::new("decision-rejection-not-available");
+    let store = rig.open();
+    // Operator fences fill the inline bound first, exactly as they did when a
+    // host that did not serve openai/gpt-6-luna recorded a decision that never
+    // named the route at all.
+    let mut rejected = (0..12)
+        .map(|i| serde_json::json!({ "routeKey": format!("fenced-{i}"), "reason": "excluded_by_operator" }))
+        .collect::<Vec<_>>();
+    rejected
+        .push(serde_json::json!({ "routeKey": "openai/gpt-6-luna", "reason": "not_available" }));
+    rejected
+        .push(serde_json::json!({ "routeKey": "tail-0", "reason": "unscored_awaiting_placement" }));
+    rejected.push(serde_json::json!({ "routeKey": "openai/gpt-6-sol", "reason": "not_available" }));
+    store
+        .record_decision(&DecisionInput {
+            decision_id: Some("not-available-rejections".into()),
+            target_agent: "mason".into(),
+            requirements_json: "{}".into(),
+            score_json: "{}".into(),
+            rejected_json: serde_json::to_string(&rejected).unwrap(),
+            anchor_version: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    let connection = Connection::open(rig.db_path()).unwrap();
+    let stored: String = connection
+        .query_row(
+            "SELECT rejected_json FROM model_route_decisions WHERE id='not-available-rejections'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: Vec<serde_json::Value> = serde_json::from_str(&stored).unwrap();
+    assert_eq!(
+        stored[12],
+        serde_json::json!({
+            "truncated": 3,
+            "reasons": { "not_available": 2, "unscored_awaiting_placement": 1 },
+            "notAvailable": ["openai/gpt-6-luna", "openai/gpt-6-sol"],
+        })
+    );
+}
+
 // ── build_snapshot capacity propagation ─────────────────────────────────────
 
 #[test]
