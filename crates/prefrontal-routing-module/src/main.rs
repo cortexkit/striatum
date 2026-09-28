@@ -4183,6 +4183,11 @@ async fn send_no_route(
     } else {
         err.message.clone()
     };
+    if err.reason == RouteFailureReason::QuotaOrCooldownExhausted {
+        if let Some(ts) = err.earliest_reset {
+            message.push_str(&format!(" Earliest route wall expiry (until_ms={ts:.0})."));
+        }
+    }
     if !message.starts_with("No models available")
         && !message.contains("requires explicit model_requirements")
     {
