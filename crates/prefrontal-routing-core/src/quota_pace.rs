@@ -27,7 +27,7 @@ pub enum PaceWindowModel {
 /// positive window length are present, because those signals are consistent
 /// with fixed-boundary windows. Without them, the window mechanism is unknown,
 /// so a rolling window must be refused until its pacing math is modeled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderWindowModel {
     Fixed,
