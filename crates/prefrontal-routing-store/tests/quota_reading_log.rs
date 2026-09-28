@@ -270,3 +270,73 @@ fn retention_prunes_only_rows_older_than_fourteen_days() {
     assert!(remaining.iter().any(|row| row.window_key == "boundary"));
     assert!(remaining.iter().any(|row| row.window_key == "new"));
 }
+
+/// The routing module persists its merged quota cache so a restart can select
+/// with the last accepted reading. The snapshot must survive closing and
+/// reopening the database with its observed time, a later write must replace
+/// the earlier one, and every field routing decodes must come back unchanged
+/// after serializing through the store.
+#[test]
+fn quota_snapshot_round_trips_across_reopen_with_its_observed_time() {
+    let rig = Rig::new("quota-snapshot");
+    let windows: Vec<ProviderUsage> = serde_json::from_value(serde_json::json!([
+        {
+            "provider": "codex",
+            "apiProvider": "openai",
+            "account": "team-a",
+            "source": "oauth",
+            "usage": {
+                "primary": {
+                    "usedPercent": 12.5,
+                    "rawUsedPercent": 20.0,
+                    "resetsAt": "2030-01-01T05:00:00Z",
+                    "windowMinutes": 300,
+                    "windowModel": "fixed"
+                },
+                "extraRateWindows": [
+                    { "title": "Gemini X", "id": "x", "window": { "usedPercent": 90.0, "windowType": "rolling" } }
+                ]
+            },
+            "spend": [{
+                "id": "seat",
+                "label": "Seat",
+                "funding": "subscription",
+                "remaining": { "minor": 20, "exponent": 2, "unit": "USD" },
+                "total": { "minor": 100, "exponent": 2, "unit": "USD" },
+                "basis": "reported",
+                "spendable": null
+            }],
+            "savedResets": { "availableCount": 2 },
+            "stale": { "since": "2029-12-31T23:00:00Z", "class": "upstream_failed" },
+            "fetchedAt": "2029-12-31T23:59:00Z"
+        },
+        {
+            "provider": "claude",
+            "error": "credential rejected",
+            "errorClass": "credential_rejected"
+        }
+    ]))
+    .unwrap();
+
+    {
+        let store = rig.open();
+        assert_eq!(store.quota_snapshot().unwrap(), None);
+        store.put_quota_snapshot("[]", EPOCH_MS).unwrap();
+        store
+            .put_quota_snapshot(&serde_json::to_string(&windows).unwrap(), EPOCH_MS + 60_000)
+            .unwrap();
+    }
+
+    let reopened = rig.open();
+    let persisted = reopened
+        .quota_snapshot()
+        .unwrap()
+        .expect("snapshot survives reopen");
+    assert_eq!(
+        persisted.observed_at,
+        EPOCH_MS + 60_000,
+        "the later write replaces the earlier one, observed time included"
+    );
+    let restored: Vec<ProviderUsage> = serde_json::from_str(&persisted.windows_json).unwrap();
+    assert_eq!(restored, windows);
+}

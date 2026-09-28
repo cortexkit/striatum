@@ -142,6 +142,11 @@ struct QuotaCache {
     last_error: Option<String>,
     /// Provider/account keys whose most recent refresh degraded while a healthy window is retained.
     retained_degraded_keys: HashSet<String>,
+    /// Set when `windows` came from the snapshot persisted before the last
+    /// restart rather than from a poll made by this process: the Unix-millisecond
+    /// poll time at which that snapshot was accepted. Cleared by the first
+    /// successful poll, which replaces the restored windows wholesale.
+    restored_from_ms: Option<u64>,
 }
 
 type SharedQuotaCache = Arc<Mutex<QuotaCache>>;
@@ -336,10 +341,73 @@ fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observ
     // Insula extends funding additively. Report unsupported values once per poll,
     // while the core policy treats each corresponding pool as not granted.
     log_unknown_spend_funding(&fresh);
+    // A restored snapshot only bridges the gap between boot and the first poll.
+    // That poll starts from an empty cache, exactly as it did before snapshots
+    // were persisted, so nothing restored outlives the first fresh reading.
+    if cache.restored_from_ms.take().is_some() {
+        cache.windows.clear();
+        cache.retained_degraded_keys.clear();
+    }
     merge_quota_windows(&mut cache.windows, fresh, &mut cache.retained_degraded_keys);
     cache.refreshed_at_ms = observed_at_ms;
     cache.available = true;
     cache.last_error = None;
+}
+
+/// Persist the merged quota windows a selection now reads, so the next process
+/// can select with them from the moment it serves. A failed write is logged and
+/// never blocks the refresh: it costs only the restart window this closes.
+fn persist_quota_snapshot(
+    store: &SqliteRouteStateStore,
+    windows: &[ProviderUsage],
+    observed_at_ms: u64,
+) {
+    let Ok(observed_at) = i64::try_from(observed_at_ms) else {
+        return;
+    };
+    let result = serde_json::to_string(windows)
+        .map_err(|error| error.to_string())
+        .and_then(|json| {
+            store
+                .put_quota_snapshot(&json, observed_at)
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = result {
+        tracing::warn!(error = %error, "quota snapshot not persisted");
+    }
+}
+
+/// Build the boot-time quota cache from the snapshot the previous process
+/// persisted. The restored windows are treated exactly like windows retained
+/// through a live outage: the overlay recomputes pace against the current clock
+/// and ignores any window whose reset has already passed, so no separate age
+/// cutoff applies. `available` stays false because this process has not reached
+/// insula yet. A missing or unreadable snapshot yields an empty cache.
+fn restore_quota_cache(store: &SqliteRouteStateStore) -> QuotaCache {
+    let persisted = match store.quota_snapshot() {
+        Ok(Some(persisted)) => persisted,
+        Ok(None) => return QuotaCache::default(),
+        Err(error) => {
+            tracing::warn!(error = %error, "quota snapshot unreadable; starting with no reading");
+            return QuotaCache::default();
+        }
+    };
+    let windows: Vec<ProviderUsage> = match serde_json::from_str(&persisted.windows_json) {
+        Ok(windows) => windows,
+        Err(error) => {
+            tracing::warn!(error = %error, "quota snapshot undecodable; starting with no reading");
+            return QuotaCache::default();
+        }
+    };
+    let observed_at_ms = u64::try_from(persisted.observed_at).unwrap_or(0);
+    QuotaCache {
+        windows,
+        refreshed_at_ms: observed_at_ms,
+        available: false,
+        last_error: None,
+        retained_degraded_keys: HashSet::new(),
+        restored_from_ms: Some(observed_at_ms),
+    }
 }
 
 fn record_quota_refresh_failure(cache: &mut QuotaCache, phase: &str, error: impl fmt::Display) {
@@ -535,8 +603,16 @@ async fn quota_refresh_loop(
                 // from this poll and healthy windows whose fresh replacement degraded.
                 let observed_at_ms = now_ms();
                 record_quota_readings(store.as_ref(), &windows, observed_at_ms);
-                if let Ok(mut guard) = cache.lock() {
-                    apply_quota_refresh(&mut guard, windows, observed_at_ms);
+                let merged = match cache.lock() {
+                    Ok(mut guard) => {
+                        apply_quota_refresh(&mut guard, windows, observed_at_ms);
+                        Some(guard.windows.clone())
+                    }
+                    Err(_) => None,
+                };
+                // Written outside the cache lock so a slow disk never stalls selection.
+                if let Some(merged) = merged {
+                    persist_quota_snapshot(store.as_ref(), &merged, observed_at_ms);
                 }
                 // `usage_get` sends GOODBYE and shuts down the stream on success;
                 // drop it before beginning the long idle interval as well.
@@ -593,6 +669,12 @@ where
     // 33-fact seed, once). The store backs route.select's facts + runtime snapshot.
     let descriptor = resolve_storage_descriptor(&ack.storage, &config.module_id)?;
     let store = open_route_state_store(&descriptor)?;
+    // Seed the cache from the last persisted snapshot before anything can serve a
+    // selection, so a restart does not select with no quota reading until the
+    // first poll lands.
+    if let Ok(mut guard) = quota_cache.lock() {
+        *guard = restore_quota_cache(store.as_ref());
+    }
     tokio::spawn(quota_refresh_loop(
         config.connection_file_path.clone(),
         Arc::clone(&quota_cache),
@@ -2109,6 +2191,7 @@ fn quota_signal_json(
     refreshed_at_ms: u64,
     retained_degraded_count: usize,
     last_error: Option<&str>,
+    restored_from_ms: Option<u64>,
 ) -> String {
     let mut signals: Vec<serde_json::Value> = snapshot
         .by_capacity
@@ -2132,7 +2215,7 @@ fn quota_signal_json(
     });
 
     let healthy_provider_count = windows.iter().filter(|window| window.is_healthy()).count();
-    let summary = if healthy_provider_count == 0 {
+    let mut summary = if healthy_provider_count == 0 {
         let reason = if windows.is_empty() {
             "quota signal: none (no cached readings)"
         } else if last_error.is_some() {
@@ -2157,6 +2240,12 @@ fn quota_signal_json(
             "signals": signals,
         })
     };
+    // A decision made on windows restored from before a restart says so, with the
+    // time that snapshot was accepted; rows made on this process's own polls keep
+    // the shape they always had.
+    if let (Some(restored_from_ms), Some(object)) = (restored_from_ms, summary.as_object_mut()) {
+        object.insert("restoredFromMs".into(), json!(restored_from_ms));
+    }
     serde_json::to_string(&summary).unwrap_or_else(|_| {
         r#"{"state":"none","reason":"quota signal: serialization failed"}"#.to_string()
     })
@@ -2184,6 +2273,7 @@ fn prepare_selection_inputs(
         quota_refreshed_at_ms,
         retained_degraded_count,
         quota_last_error,
+        quota_restored_from_ms,
     ) = match quota_cache.lock() {
         Ok(guard) => (
             (!guard.windows.is_empty()).then(|| guard.windows.clone()),
@@ -2191,8 +2281,9 @@ fn prepare_selection_inputs(
             guard.refreshed_at_ms,
             guard.retained_degraded_keys.len(),
             guard.last_error.clone(),
+            guard.restored_from_ms,
         ),
-        Err(_) => (None, false, 0, 0, Some("cache poisoned".into())),
+        Err(_) => (None, false, 0, 0, Some("cache poisoned".into()), None),
     };
     if let Some(windows) = &quota_windows {
         merge_quota_overlay(&mut snapshot, windows, &facts, quota_name_map());
@@ -2204,6 +2295,7 @@ fn prepare_selection_inputs(
         quota_refreshed_at_ms,
         retained_degraded_count,
         quota_last_error.as_deref(),
+        quota_restored_from_ms,
     );
     Ok(PreparedSelectionInputs {
         now,
@@ -2263,23 +2355,25 @@ async fn handle_select_request(
     }
 
     if envelope.method == QUOTA_STATUS_OP {
-        let (available, refreshed_at_ms, providers, healthy, last_error) = match quota_cache.lock()
-        {
-            Ok(g) => (
-                g.available,
-                g.refreshed_at_ms,
-                g.windows.len(),
-                g.windows.iter().filter(|w| w.is_healthy()).count(),
-                g.last_error.clone(),
-            ),
-            Err(_) => (false, 0, 0, 0, Some("cache poisoned".to_string())),
-        };
+        let (available, refreshed_at_ms, providers, healthy, last_error, restored_from_ms) =
+            match quota_cache.lock() {
+                Ok(g) => (
+                    g.available,
+                    g.refreshed_at_ms,
+                    g.windows.len(),
+                    g.windows.iter().filter(|w| w.is_healthy()).count(),
+                    g.last_error.clone(),
+                    g.restored_from_ms,
+                ),
+                Err(_) => (false, 0, 0, 0, Some("cache poisoned".to_string()), None),
+            };
         let body = serde_json::to_vec(&json!({ "result": {
             "available": available,
             "refreshedAtMs": refreshed_at_ms,
             "providerCount": providers,
             "healthyCount": healthy,
             "lastError": last_error,
+            "restoredFromMs": restored_from_ms,
         }}))
         .map_err(ModuleError::Json)?;
         let response = Frame::build_with_version(
@@ -4542,9 +4636,10 @@ mod tests {
         }]))
         .unwrap();
 
-        let value: serde_json::Value =
-            serde_json::from_str(&quota_signal_json(&snapshot, &windows, true, 1, 0, None))
-                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&quota_signal_json(
+            &snapshot, &windows, true, 1, 0, None, None,
+        ))
+        .unwrap();
 
         assert_eq!(
             value["signals"][0]["windowModel"],
@@ -7314,6 +7409,209 @@ mod tests {
         assert_eq!(present_signal["state"], "present");
         assert_eq!(present_signal["healthyProviderCount"], 1);
         assert!(present_row.policy_revision.is_some());
+    }
+
+    /// UTC RFC 3339 for a Unix-millisecond instant (civil-from-days), so quota
+    /// fixtures can place resets relative to the clock selection reads.
+    fn rfc3339_utc(ms: u64) -> String {
+        let secs = (ms / 1000) as i64;
+        let days = secs.div_euclid(86_400);
+        let tod = secs.rem_euclid(86_400);
+        let (h, mnt, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02}T{h:02}:{mnt:02}:{s:02}Z")
+    }
+
+    /// Two free routes that differ only in speed: with no quota reading the
+    /// faster anthropic route wins the speed tiebreak, and only a quota reading
+    /// that makes the openai capacity abundant moves the win to openai. A restart
+    /// that loses the quota reading therefore flips the winner to anthropic.
+    fn quota_decides_facts() -> Vec<ModelFact> {
+        let mut luna = fact("openai", "restart-luna");
+        luna.scores.speed = 10.0;
+        let mut opus = fact("anthropic", "restart-opus");
+        opus.scores.speed = 100.0;
+        for route in [&mut luna, &mut opus] {
+            route.cost_tier = None;
+            route.cost_per_m_tok_out = Some(0.0);
+        }
+        vec![luna, opus]
+    }
+
+    /// One codex reading, mapped to openai, whose 5-hour window resets at
+    /// `resets_at_ms` with nothing used.
+    fn codex_window(resets_at_ms: u64) -> ProviderUsage {
+        usage(json!({
+            "provider": "codex",
+            "usage": { "primary": {
+                "usedPercent": 0.0,
+                "resetsAt": rfc3339_utc(resets_at_ms),
+                "windowMinutes": 300
+            }}
+        }))
+    }
+
+    /// Run one `route.select` between the two quota-decides routes and return the
+    /// recorded winner with the decision's quota signal.
+    async fn select_quota_decides(
+        store: &SharedStore,
+        quota_cache: QuotaCache,
+        task_id: &str,
+    ) -> (String, serde_json::Value) {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let request = json!({
+            "method": ROUTE_SELECT_OP,
+            "params": {
+                "targetAgent": "explore",
+                "requirements": { "iq": 30, "eq": 0 },
+                "availableModels": ["openai/restart-luna", "anthropic/restart-opus"],
+                "taskId": task_id
+            }
+        });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &Arc::new(Mutex::new(quota_cache)),
+            store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Response);
+        let row = store.get_decisions_for_task(task_id).unwrap().remove(0);
+        let signal = serde_json::from_str(row.quota_signal_json.as_deref().unwrap()).unwrap();
+        (row.selected_route_key.unwrap(), signal)
+    }
+
+    #[tokio::test]
+    async fn restarted_module_selects_the_same_quota_winner_from_the_persisted_snapshot() {
+        let rig = Rig::new("quota-snapshot-restart");
+        let store: SharedStore = Arc::new(rig.open_store());
+        for route in quota_decides_facts() {
+            store.upsert_fact(&route, FactSource::Override).unwrap();
+        }
+        let fresh_boot = restore_quota_cache(&store);
+        assert!(fresh_boot.windows.is_empty() && fresh_boot.restored_from_ms.is_none());
+
+        // Control: with no reading the speed tiebreak picks anthropic, so the
+        // winners below are decided by the quota reading and nothing else.
+        let (no_reading, _) =
+            select_quota_decides(&store, QuotaCache::default(), "restart-no-reading").await;
+        assert_eq!(no_reading, "anthropic/restart-opus");
+
+        // Before the restart: one accepted poll, persisted as the refresh loop does.
+        let observed_at_ms = now_ms();
+        let mut live = QuotaCache::default();
+        apply_quota_refresh(
+            &mut live,
+            vec![codex_window(observed_at_ms + 75 * 60_000)],
+            observed_at_ms,
+        );
+        persist_quota_snapshot(&store, &live.windows, observed_at_ms);
+        let (before, before_signal) = select_quota_decides(&store, live, "restart-before").await;
+        assert_eq!(before, "openai/restart-luna");
+        assert!(before_signal.get("restoredFromMs").is_none());
+
+        // Restart: a fresh module over the same database, before any poll.
+        drop(store);
+        let store: SharedStore = Arc::new(rig.open_store());
+        let restored = restore_quota_cache(&store);
+        assert_eq!(restored.restored_from_ms, Some(observed_at_ms));
+        assert!(!restored.available, "no poll has reached insula yet");
+        let (after, after_signal) = select_quota_decides(&store, restored, "restart-after").await;
+        assert_eq!(
+            after, before,
+            "a restart must not flip a quota-decided winner"
+        );
+        assert_eq!(after_signal["state"], "present");
+        assert_eq!(after_signal["restoredFromMs"], json!(observed_at_ms));
+    }
+
+    #[tokio::test]
+    async fn restored_snapshot_whose_windows_have_all_reset_selects_as_with_no_reading() {
+        let rig = Rig::new("quota-snapshot-reset");
+        let store: SharedStore = Arc::new(rig.open_store());
+        for route in quota_decides_facts() {
+            store.upsert_fact(&route, FactSource::Override).unwrap();
+        }
+        // Accepted six hours ago; its only window reset an hour ago.
+        let now = now_ms();
+        let observed_at_ms = now - 6 * 60 * 60_000;
+        let windows = vec![codex_window(now - 60 * 60_000)];
+        persist_quota_snapshot(&store, &windows, observed_at_ms);
+
+        let (no_reading, _) =
+            select_quota_decides(&store, QuotaCache::default(), "reset-no-reading").await;
+        // The comparison a restored reading must match: a process that kept the
+        // same windows in memory, as the cache does through an insula outage,
+        // evaluates their resets against the current clock.
+        let mut kept_in_memory = QuotaCache::default();
+        apply_quota_refresh(&mut kept_in_memory, windows, observed_at_ms);
+        let (in_memory, _) = select_quota_decides(&store, kept_in_memory, "reset-in-memory").await;
+
+        drop(store);
+        let store: SharedStore = Arc::new(rig.open_store());
+        let (after, after_signal) =
+            select_quota_decides(&store, restore_quota_cache(&store), "reset-after").await;
+        assert_eq!(no_reading, "anthropic/restart-opus");
+        assert_eq!(
+            after, no_reading,
+            "a window past its reset contributes nothing"
+        );
+        assert_eq!(after, in_memory);
+        assert_eq!(after_signal["signals"], json!([]));
+        assert_eq!(after_signal["restoredFromMs"], json!(observed_at_ms));
+    }
+
+    #[test]
+    fn first_poll_after_restart_replaces_the_restored_snapshot_wholesale() {
+        let rig = Rig::new("quota-snapshot-first-poll");
+        let store = rig.open_store();
+        let observed_at_ms = now_ms();
+        persist_quota_snapshot(
+            &store,
+            &[codex_window(observed_at_ms + 75 * 60_000)],
+            observed_at_ms - 60_000,
+        );
+        let mut cache = restore_quota_cache(&store);
+        assert_eq!(cache.windows.len(), 1);
+
+        let claude = usage(json!({
+            "provider": "claude",
+            "usage": { "primary": { "usedPercent": 10.0 } }
+        }));
+        apply_quota_refresh(&mut cache, vec![claude.clone()], observed_at_ms);
+
+        assert_eq!(
+            cache.windows,
+            vec![claude],
+            "the restored codex window is not retained past the first fresh poll"
+        );
+        assert_eq!(cache.restored_from_ms, None);
+        assert_eq!(cache.refreshed_at_ms, observed_at_ms);
     }
 
     #[tokio::test]

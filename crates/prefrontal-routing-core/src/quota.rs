@@ -4,15 +4,18 @@
 //! These are DESERIALIZE-side mirrors: prefrontal-routing consumes quota windows
 //! module-to-module, so it must decode the exact `ProviderUsage[]` shape the
 //! quota module emits (camelCase keys, silent-degrade entries carrying `error`).
+//! They also serialize back to that same shape so the routing module can persist
+//! its last accepted snapshot and restore it after a restart; only fields routing
+//! decodes survive that round trip.
 //! Kept in -core (not the module binary) because mapping windows into a routing
 //! runtime snapshot is pure logic, testable without the wire.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::quota_pace::ProviderWindowModel;
 
 /// One rate-limit window: how much of a quota pool is spent and when it resets.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateWindow {
     /// Effective 0..100 percent consumed after the producer applies saved resets.
@@ -36,7 +39,7 @@ pub struct RateWindow {
 }
 
 /// A per-model window bundled under one account (e.g. Antigravity's Geminis).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtraWindow {
     #[serde(default)]
@@ -49,7 +52,7 @@ pub struct ExtraWindow {
 
 /// The window topology for one account: up to three account-wide pools plus an
 /// optional list of per-model pools.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     #[serde(default)]
@@ -64,7 +67,7 @@ pub struct Usage {
 
 /// A fixed-precision balance used by a spend pool. `minor` carries the signed
 /// amount in `10^-exponent` units; the sign alone is enough for exhaustion.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpendBalance {
     pub minor: i64,
@@ -97,7 +100,7 @@ impl SpendBalance {
 /// One provider-scoped spend pool. `funding` and `basis` remain Strings because
 /// insula extends both vocabularies additively; unsupported funding is deliberately
 /// retained and treated as not granted rather than rejecting the whole entry.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpendPool {
     pub id: String,
@@ -145,7 +148,7 @@ impl SpendPool {
 }
 
 /// Producer-reported banked quota resets for one account.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedResets {
     #[serde(default)]
@@ -156,7 +159,7 @@ pub struct SavedResets {
 /// these. A fetch failure becomes an entry carrying `error` (silent-degrade),
 /// never a failure of the whole array: the consumer skips any entry with a
 /// truthy `error`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderUsage {
     /// The quota module's provider name (e.g. "codex"); routing maps it to its own id.
@@ -217,7 +220,7 @@ pub struct ProviderUsage {
 /// after the served reading was obtained, `class` reuses the errorClass
 /// vocabulary and is optional (a producer that cannot classify still
 /// discloses the state).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StaleDisclosure {
     #[serde(default)]

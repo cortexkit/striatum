@@ -137,6 +137,8 @@ const MIGRATION_039: &str = include_str!("../migrations/039_route_wall_class.sql
 /// Migration 40: the last announced route-winner ladder, kept across restarts.
 const MIGRATION_040: &str = include_str!("../migrations/040_route_winner_baseline.sql");
 const MIGRATION_041: &str = include_str!("../migrations/041_retire_fast_routes.sql");
+/// Migration 42: the last accepted quota snapshot, kept across restarts.
+const MIGRATION_042: &str = include_str!("../migrations/042_quota_snapshot.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -178,7 +180,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 41] {
+fn route_state_migrations() -> [Migration; 42] {
     [
         Migration {
             version: 1,
@@ -343,6 +345,10 @@ fn route_state_migrations() -> [Migration; 41] {
         Migration {
             version: 41,
             statements: MIGRATION_041,
+        },
+        Migration {
+            version: 42,
+            statements: MIGRATION_042,
         },
     ]
 }
@@ -603,6 +609,15 @@ struct CachedClassVector {
     usage_generation: u64,
     window_minute: i64,
     vector: Option<ClassVector>,
+}
+
+/// The last quota snapshot the routing module accepted, as it serialized it.
+/// `observed_at` is the local poll clock (Unix milliseconds) at acceptance, so a
+/// restarted module can report how old the reading it restored is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedQuotaSnapshot {
+    pub windows_json: String,
+    pub observed_at: i64,
 }
 
 /// One failed decision from a head's recent launches, enough to tell which
@@ -1028,6 +1043,44 @@ impl SqliteRouteStateStore {
                        trigger = excluded.trigger,
                        recorded_at = excluded.recorded_at",
                     params![ladder_json, trigger, recorded_at],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
+    /// The last quota snapshot the routing module persisted, or `None` before the
+    /// first accepted poll was ever recorded.
+    pub fn quota_snapshot(&self) -> RouteStateResult<Option<PersistedQuotaSnapshot>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT windows_json, observed_at FROM quota_snapshot WHERE singleton = 1",
+                    [],
+                    |row| {
+                        Ok(PersistedQuotaSnapshot {
+                            windows_json: row.get(0)?,
+                            observed_at: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Replace the stored quota snapshot with `windows_json`, accepted from a poll
+    /// at `observed_at` (Unix milliseconds on the local poll clock).
+    pub fn put_quota_snapshot(&self, windows_json: &str, observed_at: i64) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "INSERT INTO quota_snapshot (singleton, windows_json, observed_at)
+                     VALUES (1, ?1, ?2)
+                     ON CONFLICT(singleton) DO UPDATE SET
+                       windows_json = excluded.windows_json,
+                       observed_at = excluded.observed_at",
+                    params![windows_json, observed_at],
                 )
                 .map(|_| ())
             })
