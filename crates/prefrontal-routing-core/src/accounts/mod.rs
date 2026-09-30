@@ -22,9 +22,9 @@ pub mod types;
 pub use decide::decide;
 pub use decision::{
     AccountNote, Admission, AdmitReason, AffinityNote, AffinityOutcome, AgeBand, ApplicableWindow,
-    Decision, ExclusionReason, ExclusionTier, Explanation, Hold, ImportNote, InvalidationReason,
-    Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode, RequestedAccountIgnored,
-    RequestedAccountNote, RosterNote, ScopedListState, WindowWeight,
+    Decision, ExclusionReason, ExclusionTier, Explanation, Hold, HoldBasis, ImportNote,
+    InvalidationReason, Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode,
+    RequestedAccountIgnored, RequestedAccountNote, RosterNote, ScopedListState, WindowWeight,
 };
 pub use types::{
     AccountRef, AccountRequest, AccountView, AdmissionDemand, AdmissionState, AllocatorPolicy,

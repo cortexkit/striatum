@@ -135,6 +135,9 @@ pub struct RateLimitEvent {
     pub at_ms: EpochMs,
     /// False for a relay-generated 429.
     pub upstream: bool,
+    /// The upstream Retry-After hint, in seconds. It drives the transient
+    /// retry of an unconfirmed 429 and is never a quota fence's reset.
+    pub retry_after_s: Option<u64>,
 }
 
 /// The observation kinds that can confirm exhaustion.
@@ -201,6 +204,10 @@ pub enum ConfirmationOutcome {
     },
     NotConfirmed {
         reason: NotConfirmedReason,
+        /// For an unconfirmed upstream rate limit: its real Retry-After, kept
+        /// for the transient bounded retry while affinity stays put. It is
+        /// never used as a fence reset.
+        transient_retry_after_s: Option<u64>,
     },
     /// Broca reported a `limit_window` value routing has no mapping for. The
     /// design names `seven_day` and `five_hour` and the absent case only, so
@@ -211,7 +218,10 @@ pub enum ConfirmationOutcome {
 }
 
 fn not_confirmed(reason: NotConfirmedReason) -> ConfirmationOutcome {
-    ConfirmationOutcome::NotConfirmed { reason }
+    ConfirmationOutcome::NotConfirmed {
+        reason,
+        transient_retry_after_s: None,
+    }
 }
 
 fn fence_scope(scope: EvidenceScope) -> FenceScope {
@@ -303,6 +313,13 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
             if !rate_limit.upstream {
                 return not_confirmed(NotConfirmedReason::RelayRateLimit);
             }
+            // An unconfirmed upstream 429 keeps its own Retry-After for the
+            // transient retry; a confirmed fence below takes its reset from
+            // the reading, never from this hint.
+            let not_confirmed = |reason| ConfirmationOutcome::NotConfirmed {
+                reason,
+                transient_retry_after_s: rate_limit.retry_after_s,
+            };
             // Causality uses the original observation time, never the
             // forwarding, ingestion or re-read time.
             if reading.observed_at_ms <= rate_limit.at_ms {

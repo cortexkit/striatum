@@ -330,6 +330,11 @@ pub struct Explanation {
     pub runner_view_digest: Option<String>,
     pub runner_candidates: Option<Vec<CandidateRef>>,
     pub affinity: AffinityNote,
+    /// The conversation's pin before this decision, unchanged. When a move
+    /// fails (a refusal), this stays the conversation's historical identity
+    /// and credential provenance; it is not authorization to serve, and no
+    /// new generation is issued.
+    pub previous_pin: Option<PreviousPin>,
     pub import: Option<ImportNote>,
     pub operator_override: Option<OverrideNote>,
     pub requested_account: Option<RequestedAccountNote>,
@@ -358,6 +363,7 @@ pub enum AdmitReason {
 pub struct PreviousPin {
     pub pin_id: String,
     pub account_id: String,
+    pub credential_id: String,
     pub pin_generation: u64,
 }
 
@@ -401,6 +407,20 @@ pub struct Hold {
     pub base_retry_after_s: u64,
     /// Base plus the conversation's jitter.
     pub retry_after_s: u64,
+    pub basis: HoldBasis,
+}
+
+/// What justified a short hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldBasis {
+    /// A confirmed 5h exhaustion fence on the account (shared state).
+    ConfirmedFence,
+    /// A full-band 5h reading at 100% used (possibly a rounded raw 0.995).
+    /// Soft and local to this conversation: it is not confirmation, creates
+    /// no fence and grants no post-reset probe; each later admission
+    /// re-evaluates it against the newest reading.
+    ProactiveReading,
 }
 
 /// Typed non-success reply codes the allocator can produce.

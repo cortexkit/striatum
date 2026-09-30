@@ -13,9 +13,8 @@ use prefrontal_routing_core::accounts::evidence::{
     ResetSource, WindowEvidence,
 };
 use prefrontal_routing_core::accounts::{
-    decide, eligibility::scope_check, AffinityNote, AllocatorPolicy, ApplicableWindow,
-    ConfirmationSource, FenceScope, GeneralWindow, InvalidationReason, ModelFamily,
-    ObservationSource, ResetTime, ScopedList, ScopedWindow,
+    decide, eligibility::scope_check, AllocatorPolicy, ConfirmationSource, FenceScope,
+    GeneralWindow, HoldBasis, ModelFamily, ObservationSource, ResetTime, ScopedList, ScopedWindow,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -299,6 +298,7 @@ fn after_429(evidence: WindowEvidence) -> ExhaustionObservation {
             rate_limit: RateLimitEvent {
                 at_ms: T_429,
                 upstream: true,
+                retry_after_s: None,
             },
             reading: evidence,
         },
@@ -307,7 +307,7 @@ fn after_429(evidence: WindowEvidence) -> ExhaustionObservation {
 
 fn not_confirmed(outcome: ConfirmationOutcome) -> NotConfirmedReason {
     match outcome {
-        ConfirmationOutcome::NotConfirmed { reason } => reason,
+        ConfirmationOutcome::NotConfirmed { reason, .. } => reason,
         other => panic!("expected no confirmation, got {other:?}"),
     }
 }
@@ -412,6 +412,42 @@ fn source_two_causality_uses_the_original_observation_time() {
         not_confirmed(confirm_exhaustion(&after_429(healthy))),
         NotConfirmedReason::PollNotExhausted
     );
+}
+
+/// The design's raw-429 row: an unconfirmed upstream 429 keeps its real
+/// Retry-After for the transient retry, and that hint never becomes the reset
+/// of a fence confirmed from a post-429 reading.
+#[test]
+fn transient_raw_429_keeps_its_real_retry_after_separately() {
+    let observation = |used_percent| ExhaustionObservation {
+        account_id: "acct-a".into(),
+        bound: true,
+        kind: ObservationKind::PostRateLimit {
+            rate_limit: RateLimitEvent {
+                at_ms: T_429,
+                upstream: true,
+                retry_after_s: Some(30),
+            },
+            reading: WindowEvidence {
+                scope: EvidenceScope::General(GeneralWindow::FiveHour),
+                derivation: Derivation::Poll { used_percent },
+                carrier: Carrier::Insula,
+                observed_at_ms: T_AFTER,
+                received_at_ms: T_FORWARD,
+                reset: ResetTime::At(NOW + 2 * HOUR),
+            },
+        },
+    };
+    assert_eq!(
+        confirm_exhaustion(&observation(99.0)),
+        ConfirmationOutcome::NotConfirmed {
+            reason: NotConfirmedReason::PollNotExhausted,
+            transient_retry_after_s: Some(30),
+        }
+    );
+    let fence = confirmed(confirm_exhaustion(&observation(100.0)));
+    assert_eq!(fence.reset, ResetTime::At(NOW + 2 * HOUR));
+    assert_eq!(fence.retry_hint_ms, None);
 }
 
 #[test]
@@ -543,12 +579,13 @@ fn broca_limit_windows_map_to_scopes_and_retry_after_is_not_a_reset() {
 }
 
 /// The three laundering paths' allocator side: routing holds the rounded-100
-/// reading (raw 0.995) in the full band with no fence. The conversation moves
-/// at its next admission (conversation-local), it is never held even though
-/// the 5h reset is 15 minutes away, and the account is not fenced for cold
-/// work, only zero-weighted.
+/// reading (raw 0.995) in the full band with no fence, and the 5h reset is 14
+/// minutes away. The conversation gets a soft, local proactive hold, as the
+/// reference's pre-send check gives it: the hold's basis is the reading, not a
+/// confirmed fence, and the account is not fenced for cold work, only
+/// zero-weighted.
 #[test]
-fn laundering_paths_allow_only_conversation_local_proactive_migration() {
+fn laundering_paths_give_only_a_soft_local_hold_and_no_shared_fence() {
     // Direct submission and the passive feed both land as header readings;
     // Insula-carried headers keep their Insula source.
     for (path, source) in [
@@ -561,7 +598,7 @@ fn laundering_paths_allow_only_conversation_local_proactive_migration() {
         laundered.five_hour = Some(header_window(
             GeneralWindow::FiveHour,
             0.995,
-            Some((NOW + 15 * MINUTE) as f64 / 1000.0),
+            Some((NOW + 14 * MINUTE) as f64 / 1000.0),
             source,
         ));
         let mut st = state(vec![
@@ -569,21 +606,18 @@ fn laundering_paths_allow_only_conversation_local_proactive_migration() {
             account("acct-b", Some(reading(10.0, 10.0))),
         ]);
         st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
-        let now = NOW + 5000;
-        let decision = decide(&request(), &st, now);
-        let admission = decision
-            .admission()
-            .unwrap_or_else(|| panic!("{path}: moves, never holds"));
-        assert_eq!(admission.account_id, "acct-b");
+        let decision = decide(&request(), &st, NOW);
+        let hold = decision
+            .hold()
+            .unwrap_or_else(|| panic!("{path}: expected a hold, got {:?}", decision.outcome));
+        assert_eq!(hold.account_id, "acct-a", "{path}");
+        assert_eq!(hold.basis, HoldBasis::ProactiveReading, "{path}");
         assert_eq!(
-            decision.explanation.affinity,
-            AffinityNote::Invalidated {
-                account_id: "acct-a".into(),
-                reason: InvalidationReason::FreshFullReading {
-                    window: ApplicableWindow::FiveHour
-                },
-            }
+            (hold.base_retry_after_s, hold.retry_after_s),
+            (840, 846),
+            "{path}"
         );
+        assert!(st.fences.is_empty());
         let note = decision.account_note("acct-a").unwrap();
         assert!(
             !note.exclusions.iter().any(|reason| matches!(

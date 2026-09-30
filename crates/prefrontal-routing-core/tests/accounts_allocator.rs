@@ -94,6 +94,7 @@ fn operator_override_beats_affinity_and_scoring() {
             previous: Some(PreviousPin {
                 pin_id: "pin-acct-a".into(),
                 account_id: "acct-a".into(),
+                credential_id: credential_id("acct-a"),
                 pin_generation: 3,
             }),
             pin_generation: 4,
@@ -390,7 +391,7 @@ fn idle_expiry_invalidates_unless_a_lease_is_active() {
 }
 
 #[test]
-fn fresh_full_band_reading_at_100_moves_but_never_holds() {
+fn fresh_full_band_reading_at_100_on_seven_day_moves_without_a_fence() {
     let mut full = reading(10.0, 100.0);
     full.observed_at_ms = Some(NOW - MINUTE);
     let mut st = state(vec![
@@ -411,15 +412,6 @@ fn fresh_full_band_reading_at_100_moves_but_never_holds() {
         exclusions(&decision, "acct-a"),
         [ExclusionReason::BelowReserve { .. }]
     ));
-
-    // A rounded 100 on the 5h window with a short reset still moves rather
-    // than holds: holds need confirmed exhaustion.
-    let mut five = reading(100.0, 10.0);
-    five.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 10 * MINUTE);
-    st.roster.as_mut().unwrap().accounts[0].quota = Some(five);
-    let decision = decide(&request(), &st, NOW);
-    assert_eq!(admitted(&decision), "acct-b");
-    assert!(decision.hold().is_none());
 }
 
 #[test]
@@ -462,6 +454,143 @@ fn confirmed_short_hold_returns_account_hold_within_the_callers_wait() {
             InvalidationReason::ConfirmedExhaustion {
                 migrate: MigrateReason::FiveHour
             }
+        );
+    }
+}
+
+/// A full-band 5h reading at 100% (not confirmation) holds softly with the
+/// same exact bounds as a confirmed fence; anything else about the reading or
+/// its reset moves the conversation or keeps it, never holds it.
+#[test]
+fn soft_proactive_hold_bounds_and_reevaluation() {
+    let pool = |five: prefrontal_routing_core::accounts::QuotaReading| {
+        let mut st = state(vec![
+            account("acct-a", Some(five)),
+            account("acct-b", Some(reading(10.0, 10.0))),
+        ]);
+        st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
+        st
+    };
+    let full_100 = |reset| {
+        let mut r = reading(100.0, 10.0);
+        r.five_hour.as_mut().unwrap().resets_at = reset;
+        r
+    };
+    // At +15 min the jittered Retry-After is 906 s, so the caller must be
+    // willing to wait that long.
+    let mut patient = request();
+    patient.hold_wait_max_s = 906;
+    let hold = decide(
+        &patient,
+        &pool(full_100(ResetTime::At(NOW + 15 * MINUTE))),
+        NOW,
+    );
+    let hold = hold.hold().expect("+15 min holds");
+    assert_eq!((hold.base_retry_after_s, hold.retry_after_s), (900, 906));
+
+    for reset in [
+        ResetTime::At(NOW + 15 * MINUTE + 1),
+        ResetTime::At(NOW),
+        ResetTime::At(NOW - MINUTE),
+        ResetTime::Unparsable,
+        ResetTime::Missing,
+    ] {
+        // Even a caller willing to wait migrates: the reset rules out a hold.
+        patient.hold_wait_max_s = 3600;
+        let decision = decide(&patient, &pool(full_100(reset)), NOW);
+        assert_eq!(admitted(&decision), "acct-b", "{reset:?}");
+        assert_eq!(
+            invalidated(&decision),
+            InvalidationReason::FreshFullReading {
+                window: ApplicableWindow::FiveHour
+            },
+            "{reset:?}"
+        );
+    }
+
+    // A stale reading never justifies it: the conversation stays.
+    let mut stale = full_100(ResetTime::At(NOW + 14 * MINUTE));
+    stale.observed_at_ms = Some(NOW - 6 * MINUTE);
+    let decision = decide(&request(), &pool(stale), NOW);
+    assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
+
+    // Re-evaluated each admission: a newer reading below 100 removes it.
+    let decision = decide(&request(), &pool(reading(60.0, 10.0)), NOW);
+    assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
+
+    // The caller's wait bounds it like a confirmed hold.
+    let mut req = request();
+    req.hold_wait_max_s = 845;
+    let decision = decide(&req, &pool(full_100(ResetTime::At(NOW + 14 * MINUTE))), NOW);
+    assert_eq!(
+        invalidated(&decision),
+        InvalidationReason::HoldExceedsWait { retry_after_s: 846 }
+    );
+}
+
+/// A full-band family-scope or 7d reading at 100% outranks both a confirmed
+/// and a soft 5h short hold.
+#[test]
+fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
+    let mut fable_full = reading(100.0, 10.0);
+    fable_full.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 14 * MINUTE);
+    fable_full.scoped = ScopedList::Listed(vec![fable_window(100.0)]);
+    let mut seven_full = reading(100.0, 100.0);
+    seven_full.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 14 * MINUTE);
+    for (model, quota, window) in [
+        ("claude-fable-5", fable_full, ApplicableWindow::FamilyScope),
+        ("claude-sonnet-5", seven_full, ApplicableWindow::SevenDay),
+    ] {
+        let mut healthy = reading(10.0, 10.0);
+        healthy.scoped = ScopedList::Listed(vec![fable_window(10.0)]);
+        let mut st = state(vec![
+            account("acct-a", Some(quota)),
+            account("acct-b", Some(healthy)),
+        ]);
+        st.affinity = Some(affinity("acct-a", model, 3));
+        // Soft 5h hold candidate only.
+        let decision = decide(&with_model(request(), model), &st, NOW);
+        assert_eq!(
+            invalidated(&decision),
+            InvalidationReason::FreshFullReading { window }
+        );
+        assert_eq!(admitted(&decision), "acct-b");
+        // Plus a confirmed 5h fence 14 minutes from reset.
+        st.fences
+            .push(five_hour_fence("acct-a", ResetTime::At(NOW + 14 * MINUTE)));
+        let decision = decide(&with_model(request(), model), &st, NOW);
+        assert_eq!(
+            invalidated(&decision),
+            InvalidationReason::FreshFullReading { window }
+        );
+        assert_eq!(admitted(&decision), "acct-b");
+    }
+}
+
+/// A move justified only by a fresh (unconfirmed) 100% reading, with no
+/// sibling to take the conversation, refuses as reserve-limited, not
+/// exhausted, and issues no pin: the old pin stays in the explanation as the
+/// conversation's historical identity, generation unchanged.
+#[test]
+fn fresh_only_move_without_a_sibling_is_reserve_limited_with_no_new_pin() {
+    let mut seven = reading(10.0, 100.0);
+    seven.observed_at_ms = Some(NOW - MINUTE);
+    let mut five_no_reset = reading(100.0, 10.0);
+    five_no_reset.five_hour.as_mut().unwrap().resets_at = ResetTime::Missing;
+    for quota in [seven, five_no_reset] {
+        let mut st = state(vec![account("acct-a", Some(quota))]);
+        st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
+        let decision = decide(&request(), &st, NOW);
+        assert_eq!(refused(&decision), RefusalCode::AccountPoolReserveLimited);
+        assert!(decision.admission().is_none());
+        assert_eq!(
+            decision.explanation.previous_pin,
+            Some(PreviousPin {
+                pin_id: "pin-acct-a".into(),
+                account_id: "acct-a".into(),
+                credential_id: credential_id("acct-a"),
+                pin_generation: 3,
+            })
         );
     }
 }
@@ -1083,6 +1212,21 @@ fn no_candidate_reply_follows_step_six_precedence() {
     assert_eq!(
         refused(&decide(&request(), &st, NOW)),
         RefusalCode::AccountNotAuthorized
+    );
+
+    // Every route blocked on the Fable scope: the retry uses the scoped
+    // reset (96 h) and ignores the much earlier general 5h reset (2 h).
+    let mut blocked = reading(10.0, 10.0);
+    blocked.scoped = ScopedList::Listed(vec![fable_window(100.0)]);
+    let st = state(vec![
+        account("acct-a", Some(blocked.clone())),
+        account("acct-b", Some(blocked)),
+    ]);
+    let decision = decide(&with_model(request(), "claude-fable-5"), &st, NOW);
+    assert_eq!(refused(&decision), RefusalCode::AccountPoolReserveLimited);
+    assert_eq!(
+        decision.refusal().unwrap().retry_after_s,
+        Some(96 * 3600 + 60)
     );
 
     // Every account at or above 99% gives reserve-limited, never a pick.

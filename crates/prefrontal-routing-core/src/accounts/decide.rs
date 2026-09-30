@@ -7,9 +7,9 @@ use std::cmp::Ordering;
 
 use super::decision::{
     AccountNote, Admission, AdmitReason, AffinityNote, AffinityOutcome, ApplicableWindow, Decision,
-    ExclusionReason, ExclusionTier, Explanation, Hold, ImportNote, InvalidationReason, Outcome,
-    OverrideNote, PreviousPin, Refusal, RefusalCode, RequestedAccountIgnored, RequestedAccountNote,
-    RosterNote,
+    ExclusionReason, ExclusionTier, Explanation, Hold, HoldBasis, ImportNote, InvalidationReason,
+    Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode, RequestedAccountIgnored,
+    RequestedAccountNote, RosterNote,
 };
 use super::eligibility::{
     age_band, evaluate_quota, fable_freshly_exhausted, scope_check, QuotaEval,
@@ -32,6 +32,15 @@ fn required_windows(provider: &str) -> Option<&'static [GeneralWindow]> {
         "anthropic" => Some(CLAUDE_WINDOWS),
         "openai" => Some(CHATGPT_WINDOWS),
         _ => None,
+    }
+}
+
+fn previous_pin(affinity: &ConversationAffinity) -> PreviousPin {
+    PreviousPin {
+        pin_id: affinity.pin_id.clone(),
+        account_id: affinity.account_id.clone(),
+        credential_id: affinity.credential_id.clone(),
+        pin_generation: affinity.pin_generation,
     }
 }
 
@@ -75,6 +84,7 @@ pub fn decide(request: &AccountRequest, state: &AllocatorState, now: EpochMs) ->
         runner_view_digest: request.candidates.as_ref().map(|c| c.view_digest.clone()),
         runner_candidates: request.candidates.as_ref().map(|c| c.accounts.clone()),
         affinity: AffinityNote::None,
+        previous_pin: state.affinity.as_ref().map(previous_pin),
         import: None,
         operator_override: None,
         requested_account: None,
@@ -207,11 +217,7 @@ impl<'a> Allocator<'a> {
                         account_id: affinity.account_id.clone(),
                         reason,
                     };
-                    previous = Some(PreviousPin {
-                        pin_id: affinity.pin_id.clone(),
-                        account_id: affinity.account_id.clone(),
-                        pin_generation: affinity.pin_generation,
-                    });
+                    previous = Some(previous_pin(affinity));
                 }
             }
         } else if let Some(preferred) = &self.request.preferred_existing_account {
@@ -511,10 +517,58 @@ impl<'a> Allocator<'a> {
         let confirmed = |migrate| Leave(InvalidationReason::ConfirmedExhaustion { migrate });
         let fresh = |window| Leave(InvalidationReason::FreshFullReading { window });
 
-        // The reference's order: model-scoped exhaustion, then 7d, migrate
-        // first; only a confirmed 5h exhaustion can hold. A full-band reading
-        // at 100% is not confirmation, so it moves the conversation but never
-        // holds it.
+        // The reference's order (anthropic-auth@b504bc84
+        // packages/core/src/sticky-routing.ts:369-413): model-scoped
+        // exhaustion, then 7d, migrate first, whether confirmed by a fence or
+        // shown by a full-band reading at 100%. Only then can a 5h exhaustion
+        // hold: a confirmed 5h fence, or failing that a full-band 5h reading at
+        // 100% (the reference's proactive pre-send check,
+        // packages/opencode/src/index.ts:7500-7535). The reading-based hold is
+        // soft and local to this conversation: it creates no fence, and it is
+        // re-evaluated at every admission, so a newer reading below 100 ends it.
+        let hold_or_leave = |reset: ResetTime, basis: HoldBasis| {
+            // ChatGPT has no 5h window and never holds.
+            let action = if self.provider == "anthropic" {
+                short_hold_rule(
+                    false,
+                    false,
+                    Some(reset),
+                    self.now,
+                    self.policy.short_hold_max_ms,
+                )
+            } else {
+                ExhaustionAction::Migrate {
+                    reason: MigrateReason::FiveHour,
+                }
+            };
+            match action {
+                ExhaustionAction::Hold {
+                    reset_at_ms,
+                    base_retry_after_s,
+                } => {
+                    let retry_after_s = retry_after_with_jitter(
+                        &self.request.conversation_key,
+                        base_retry_after_s as f64,
+                    );
+                    if retry_after_s <= self.request.hold_wait_max_s {
+                        Some(AffinityVerdict::Hold(Hold {
+                            account_id: affinity.account_id.clone(),
+                            credential_id: affinity.credential_id.clone(),
+                            pin_id: affinity.pin_id.clone(),
+                            pin_generation: affinity.pin_generation,
+                            reset_at_ms,
+                            base_retry_after_s,
+                            retry_after_s,
+                            basis,
+                        }))
+                    } else {
+                        Some(Leave(InvalidationReason::HoldExceedsWait { retry_after_s }))
+                    }
+                }
+                // A missing, unparsable, past or distant reset never holds.
+                _ => None,
+            }
+        };
         if has_fence(FenceScope::Family(self.family)) {
             return confirmed(MigrateReason::ModelScoped);
         }
@@ -531,49 +585,15 @@ impl<'a> Allocator<'a> {
             .iter()
             .find(|fence| fence.scope == FenceScope::General(GeneralWindow::FiveHour))
         {
-            // ChatGPT has no 5h window and never holds.
-            let action = if self.provider == "anthropic" {
-                short_hold_rule(
-                    false,
-                    false,
-                    Some(five_hour.reset),
-                    self.now,
-                    self.policy.short_hold_max_ms,
-                )
-            } else {
-                ExhaustionAction::Migrate {
-                    reason: MigrateReason::FiveHour,
-                }
-            };
-            return match action {
-                ExhaustionAction::Hold {
-                    reset_at_ms,
-                    base_retry_after_s,
-                } => {
-                    let retry_after_s = retry_after_with_jitter(
-                        &self.request.conversation_key,
-                        base_retry_after_s as f64,
-                    );
-                    if retry_after_s <= self.request.hold_wait_max_s {
-                        AffinityVerdict::Hold(Hold {
-                            account_id: affinity.account_id.clone(),
-                            credential_id: affinity.credential_id.clone(),
-                            pin_id: affinity.pin_id.clone(),
-                            pin_generation: affinity.pin_generation,
-                            reset_at_ms,
-                            base_retry_after_s,
-                            retry_after_s,
-                        })
-                    } else {
-                        Leave(InvalidationReason::HoldExceedsWait { retry_after_s })
-                    }
-                }
-                ExhaustionAction::Migrate { reason } => confirmed(reason),
-                ExhaustionAction::Retain => unreachable!("a 5h fence is always exhausted"),
-            };
+            return hold_or_leave(five_hour.reset, HoldBasis::ConfirmedFence)
+                .unwrap_or_else(|| confirmed(MigrateReason::FiveHour));
         }
         if fresh_full_used(GeneralWindow::FiveHour) {
-            return fresh(ApplicableWindow::FiveHour);
+            let reset = reading
+                .and_then(|reading| reading.window(GeneralWindow::FiveHour))
+                .map_or(ResetTime::Missing, |w| w.resets_at);
+            return hold_or_leave(reset, HoldBasis::ProactiveReading)
+                .unwrap_or_else(|| fresh(ApplicableWindow::FiveHour));
         }
         // Existing authorized, non-fenced affinity continues under missing or
         // stale quota, with the degraded reason recorded.
@@ -752,11 +772,7 @@ impl<'a> Allocator<'a> {
                     reason: InvalidationReason::OperatorOverride,
                 };
                 AffinityOutcome::New {
-                    previous: Some(PreviousPin {
-                        pin_id: affinity.pin_id.clone(),
-                        account_id: affinity.account_id.clone(),
-                        pin_generation: affinity.pin_generation,
-                    }),
+                    previous: Some(previous_pin(affinity)),
                     pin_generation: affinity.pin_generation + 1,
                 }
             }
