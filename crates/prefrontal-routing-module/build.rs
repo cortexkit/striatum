@@ -43,8 +43,10 @@ fn main() {
         .filter(|revision| {
             revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
         });
+    // Untracked files (local notes, prompt drafts) are not part of the build,
+    // so only changes to tracked files make it dirty.
     let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=no"])
         .output()
         .ok()
         .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
