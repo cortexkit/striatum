@@ -10,9 +10,10 @@ use prefrontal_routing_core::accounts::evidence::MigrateReason;
 use prefrontal_routing_core::accounts::{
     decide, AccountRef, AdmissionState, AdmitReason, AffinityNote, AffinityOutcome, AgeBand,
     ApplicableWindow, CallerKind, CredentialRecord, Decision, ExclusionReason, FenceScope,
-    GeneralWindow, ImportNote, InvalidationReason, ModelFamily, ModelReach, OperatorOverride,
-    OverrideNote, PreviousPin, PrincipalExclusion, RefusalCode, RequestedAccountIgnored,
-    RequestedAccountNote, ResetTime, ScopedList, ScopedListState, ScopedWindow, StaleDisclosure,
+    GeneralWindow, HoldBasis, ImportNote, InvalidationReason, ModelFamily, ModelReach,
+    OperatorOverride, OverrideNote, PreviousPin, PrincipalExclusion, RefusalCode,
+    RequestedAccountIgnored, RequestedAccountNote, ResetTime, ScopedList, ScopedListState,
+    ScopedWindow, StaleDisclosure,
 };
 
 fn admitted(decision: &Decision) -> &str {
@@ -577,10 +578,16 @@ fn fresh_only_move_without_a_sibling_is_reserve_limited_with_no_new_pin() {
     seven.observed_at_ms = Some(NOW - MINUTE);
     let mut five_no_reset = reading(100.0, 10.0);
     five_no_reset.five_hour.as_mut().unwrap().resets_at = ResetTime::Missing;
-    for quota in [seven, five_no_reset] {
+    let mut fable = reading(10.0, 10.0);
+    fable.scoped = ScopedList::Listed(vec![fable_window(100.0)]);
+    for (model, quota) in [
+        ("claude-sonnet-5", seven),
+        ("claude-sonnet-5", five_no_reset),
+        ("claude-fable-5", fable),
+    ] {
         let mut st = state(vec![account("acct-a", Some(quota))]);
-        st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
-        let decision = decide(&request(), &st, NOW);
+        st.affinity = Some(affinity("acct-a", model, 3));
+        let decision = decide(&with_model(request(), model), &st, NOW);
         assert_eq!(refused(&decision), RefusalCode::AccountPoolReserveLimited);
         assert!(decision.admission().is_none());
         assert_eq!(
@@ -593,6 +600,46 @@ fn fresh_only_move_without_a_sibling_is_reserve_limited_with_no_new_pin() {
             })
         );
     }
+}
+
+/// With both a confirmed 5h fence and a fresh 5h 100% reading present and
+/// disagreeing on the reset, the confirmed fence governs the hold decision.
+#[test]
+fn confirmed_five_hour_fence_governs_over_a_conflicting_fresh_reading() {
+    let pool = |fence_reset, reading_reset| {
+        let mut fresh = reading(100.0, 10.0);
+        fresh.five_hour.as_mut().unwrap().resets_at = reading_reset;
+        let mut st = state(vec![
+            account("acct-a", Some(fresh)),
+            account("acct-b", Some(reading(10.0, 10.0))),
+        ]);
+        st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
+        st.fences.push(five_hour_fence("acct-a", fence_reset));
+        st
+    };
+    // Fence resets in 2 h, reading says 14 min: migrate, no soft hold.
+    let st = pool(
+        ResetTime::At(NOW + 2 * HOUR),
+        ResetTime::At(NOW + 14 * MINUTE),
+    );
+    let decision = decide(&request(), &st, NOW);
+    assert_eq!(admitted(&decision), "acct-b");
+    assert_eq!(
+        invalidated(&decision),
+        InvalidationReason::ConfirmedExhaustion {
+            migrate: MigrateReason::FiveHour
+        }
+    );
+    // Fence resets in 14 min, reading says 2 h: a confirmed hold.
+    let st = pool(
+        ResetTime::At(NOW + 14 * MINUTE),
+        ResetTime::At(NOW + 2 * HOUR),
+    );
+    let decision = decide(&request(), &st, NOW);
+    let hold = decision.hold().expect("confirmed hold");
+    assert_eq!(hold.basis, HoldBasis::ConfirmedFence);
+    assert_eq!(hold.reset_at_ms, NOW + 14 * MINUTE);
+    assert_eq!(hold.retry_after_s, 846);
 }
 
 #[test]
