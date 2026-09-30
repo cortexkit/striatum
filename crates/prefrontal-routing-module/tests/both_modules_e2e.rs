@@ -78,28 +78,7 @@ fn sibling(rel: &str) -> PathBuf {
 }
 
 fn build_bin(repo: &Path, bin: &str) -> PathBuf {
-    // Build into a prefrontal-owned target dir: building in the sibling's own
-    // target/debug contends with that repo owner's live cargo lock (measured:
-    // a concurrent insula build held this test past its 720s terminate cap
-    // while cargo silently waited on the sibling's file lock).
-    let repo_name = repo.file_name().expect("sibling repo has a name");
-    let sibling_target = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/sibling-target")
-        .join(repo_name);
-    std::fs::create_dir_all(&sibling_target).unwrap();
-    let status = prefrontal_test_support::sibling_cargo_build(repo, &sibling_target, bin)
-        .status()
-        .unwrap_or_else(|_| panic!("run cargo build --bin {bin} in {}", repo.display()));
-    assert!(status.success(), "building {bin} failed");
-    let path = sibling_target.join(format!("debug/{bin}"));
-    assert!(path.exists(), "{bin} binary missing at {}", path.display());
-    prefrontal_test_support::sign_test_binary(&path);
-    // A freshly built binary stalls in macOS Gatekeeper/syspolicyd assessment
-    // on first exec (measured 14-33s under load), which lands inside this
-    // test's supervisor setup deadline and reads as a module that never came
-    // up. One warm exec eats the assessment before the daemon spawns it.
-    prefrontal_test_support::warm_exec_fenced(&path);
-    path
+    prefrontal_test_support::build_sibling_binary(repo, "insula", bin)
 }
 
 /// Stand up a real subc-core daemon supervising BOTH modules from one subc.jsonc.
