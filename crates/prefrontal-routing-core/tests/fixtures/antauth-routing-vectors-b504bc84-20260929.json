@@ -1,0 +1,285 @@
+{
+  "sourceRef": "b504bc843c561e911bf6e405b7efecf82ec62886",
+  "now": 1790683200000,
+  "scopes": [
+    {
+      "id": "fable51-name",
+      "model": "claude-fable-5-1",
+      "quota": {
+        "scoped": [
+          {
+            "modelName": "Fable",
+            "remainingPercent": 0
+          }
+        ]
+      },
+      "matched": true,
+      "passesScope": false
+    },
+    {
+      "id": "fable-qualified-title",
+      "model": "claude-fable-5-1[1m]",
+      "quota": {
+        "scoped": [
+          {
+            "title": "Weekly Fable limit",
+            "remainingPercent": 0
+          }
+        ]
+      },
+      "matched": true,
+      "passesScope": false
+    },
+    {
+      "id": "mythos-separated",
+      "model": "claude-mythos-5-1",
+      "quota": {
+        "scoped": [
+          {
+            "modelName": "Fable",
+            "remainingPercent": 0
+          }
+        ]
+      },
+      "matched": false,
+      "passesScope": true
+    },
+    {
+      "id": "opus-no-fable-scope",
+      "model": "claude-opus-5-5",
+      "quota": {
+        "scoped": [
+          {
+            "modelName": "Fable",
+            "remainingPercent": 0
+          }
+        ]
+      },
+      "matched": false,
+      "passesScope": true
+    },
+    {
+      "id": "explicit-empty",
+      "model": "claude-fable-5-1",
+      "quota": {
+        "scoped": []
+      },
+      "matched": false,
+      "passesScope": true
+    },
+    {
+      "id": "missing-scoped",
+      "model": "claude-fable-5-1",
+      "quota": {},
+      "matched": false,
+      "passesScope": true
+    },
+    {
+      "id": "finite-positive",
+      "model": "claude-fable-5",
+      "quota": {
+        "scoped": [
+          {
+            "modelName": "Fable",
+            "remainingPercent": 1
+          }
+        ]
+      },
+      "matched": true,
+      "passesScope": true
+    },
+    {
+      "id": "negative-exhausted",
+      "model": "claude-fable-5",
+      "quota": {
+        "scoped": [
+          {
+            "modelName": "Fable",
+            "remainingPercent": -1
+          }
+        ]
+      },
+      "matched": true,
+      "passesScope": false
+    },
+    {
+      "id": "nonfinite",
+      "inputNote": "The evaluated JavaScript input used NaN; JSON serialization represents it as null.",
+      "model": "claude-fable-5",
+      "quota": {
+        "scoped": [
+          {
+            "modelName": "Fable",
+            "remainingPercent": null
+          }
+        ]
+      },
+      "matched": true,
+      "passesScope": true
+    }
+  ],
+  "resets": [
+    {
+      "id": "future14min",
+      "resetsAt": "2026-09-29T12:14:00.000Z",
+      "decision": {
+        "action": "hold",
+        "reason": "five-hour-short-reset",
+        "retryAfterSeconds": 840
+      }
+    },
+    {
+      "id": "future15min",
+      "resetsAt": "2026-09-29T12:15:00.000Z",
+      "decision": {
+        "action": "hold",
+        "reason": "five-hour-short-reset",
+        "retryAfterSeconds": 900
+      }
+    },
+    {
+      "id": "future15min+1ms",
+      "resetsAt": "2026-09-29T12:15:00.001Z",
+      "decision": {
+        "action": "migrate",
+        "reason": "five-hour"
+      }
+    },
+    {
+      "id": "at-now",
+      "resetsAt": "2026-09-29T12:00:00.000Z",
+      "decision": {
+        "action": "migrate",
+        "reason": "five-hour"
+      }
+    },
+    {
+      "id": "past",
+      "resetsAt": "2026-09-29T11:59:59.999Z",
+      "decision": {
+        "action": "migrate",
+        "reason": "five-hour"
+      }
+    },
+    {
+      "id": "invalid",
+      "resetsAt": "not-a-date",
+      "decision": {
+        "action": "migrate",
+        "reason": "five-hour"
+      }
+    },
+    {
+      "id": "missing",
+      "resetsAt": null,
+      "decision": {
+        "action": "migrate",
+        "reason": "five-hour"
+      }
+    }
+  ],
+  "jitter": [
+    {
+      "sessionId": "ses-golden-a",
+      "base": 840,
+      "result": 846
+    },
+    {
+      "sessionId": "ses-golden-b",
+      "base": 840,
+      "result": 856
+    },
+    {
+      "sessionId": "ses-golden-c",
+      "base": 840,
+      "result": 860
+    }
+  ],
+  "headers": [
+    {
+      "utilization": 0.9949,
+      "normalized": {
+        "fallbackAdvised": false,
+        "source": "headers",
+        "checkedAt": 1790683200000,
+        "five_hour": {
+          "usedPercent": 99,
+          "remainingPercent": 1,
+          "resetsAt": "2026-09-29T12:15:00.000Z",
+          "checkedAt": 1790683200000
+        },
+        "fieldSources": {
+          "five_hour": "headers"
+        }
+      }
+    },
+    {
+      "utilization": 0.995,
+      "normalized": {
+        "fallbackAdvised": false,
+        "source": "headers",
+        "checkedAt": 1790683200000,
+        "five_hour": {
+          "usedPercent": 100,
+          "remainingPercent": 0,
+          "resetsAt": "2026-09-29T12:15:00.000Z",
+          "checkedAt": 1790683200000
+        },
+        "fieldSources": {
+          "five_hour": "headers"
+        }
+      }
+    },
+    {
+      "utilization": 0.999,
+      "normalized": {
+        "fallbackAdvised": false,
+        "source": "headers",
+        "checkedAt": 1790683200000,
+        "five_hour": {
+          "usedPercent": 100,
+          "remainingPercent": 0,
+          "resetsAt": "2026-09-29T12:15:00.000Z",
+          "checkedAt": 1790683200000
+        },
+        "fieldSources": {
+          "five_hour": "headers"
+        }
+      }
+    },
+    {
+      "utilization": 1,
+      "normalized": {
+        "fallbackAdvised": false,
+        "source": "headers",
+        "checkedAt": 1790683200000,
+        "five_hour": {
+          "usedPercent": 100,
+          "remainingPercent": 0,
+          "resetsAt": "2026-09-29T12:15:00.000Z",
+          "checkedAt": 1790683200000
+        },
+        "fieldSources": {
+          "five_hour": "headers"
+        }
+      }
+    },
+    {
+      "utilization": 1.01,
+      "normalized": {
+        "fallbackAdvised": false,
+        "source": "headers",
+        "checkedAt": 1790683200000,
+        "five_hour": {
+          "usedPercent": 100,
+          "remainingPercent": 0,
+          "resetsAt": "2026-09-29T12:15:00.000Z",
+          "checkedAt": 1790683200000
+        },
+        "fieldSources": {
+          "five_hour": "headers"
+        }
+      }
+    }
+  ]
+}

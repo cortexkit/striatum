@@ -1,0 +1,36 @@
+//! Account selection: the pure allocator behind `route.account_for`.
+//!
+//! Specification: `docs/designs/account-selection.md` ("New-session rule:
+//! sticky-balanced first", "Exhaustion is evidence, not a status-word
+//! shortcut", "Insula input and conservative degraded behavior"). This module
+//! holds only pure decisions. SQLite transactions and migrations belong to
+//! routing-store; the wire, inventory, polling and observations belong to
+//! routing-module.
+//!
+//! - [`decide`] picks the account for one admission and explains why.
+//! - [`evidence::confirm_exhaustion`] decides whether one observation confirms
+//!   exhaustion (and so may become a shared [`Fence`]).
+//! - [`evidence::short_hold_rule`] and [`evidence::retry_after_with_jitter`]
+//!   port the reference's short hold and jitter exactly.
+
+pub mod decide;
+pub mod decision;
+pub mod eligibility;
+pub mod evidence;
+pub mod types;
+
+pub use decide::decide;
+pub use decision::{
+    AccountNote, Admission, AdmitReason, AffinityNote, AffinityOutcome, AgeBand, ApplicableWindow,
+    Decision, ExclusionReason, ExclusionTier, Explanation, Hold, ImportNote, InvalidationReason,
+    Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode, RequestedAccountIgnored,
+    RequestedAccountNote, RosterNote, ScopedListState, WindowWeight,
+};
+pub use types::{
+    AccountRef, AccountRequest, AccountView, AdmissionDemand, AdmissionState, AllocatorPolicy,
+    AllocatorState, CallerKind, CandidateRef, ConfirmationSource, ConversationAffinity,
+    ConversationKeySource, CredentialRecord, EpochMs, Fence, FenceScope, GeneralWindow,
+    ModelFamily, ModelFamilyMapping, ModelReach, ObservationSource, OperatorOverride,
+    PrincipalExclusion, QuotaReading, QuotaWindow, ResetTime, Roster, RunnerCandidates,
+    ScopeIdMapping, ScopedList, ScopedWindow, StaleDisclosure,
+};

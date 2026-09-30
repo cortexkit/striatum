@@ -11,6 +11,7 @@
 //! port's behavioral parity is provable, not assumed.
 
 pub mod aa_infer;
+pub mod accounts;
 pub mod break_glass;
 pub mod failure_backoff;
 pub mod launch_policy;

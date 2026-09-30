@@ -8,3 +8,6 @@ description = "Pure model-routing core for Alfonso: the saturating-adequacy qual
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# SHA-256 for the account allocator's Retry-After jitter (ported exactly from
+# anthropic-auth) and the golden-vector fixture digest check.
+sha2 = "0.10"
