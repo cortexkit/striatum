@@ -215,7 +215,15 @@ fn compare_and_set_refuses_a_stale_expected_pin() {
     assert!(!stale, "a write naming an older generation must not apply");
     let stale_touch = store
         .account_transaction(|tx| {
-            tx.touch_affinity(PRINCIPAL, CONVERSATION, "anthropic", ("pin-1", 1), 5, 6, Some(7))
+            tx.touch_affinity(
+                PRINCIPAL,
+                CONVERSATION,
+                "anthropic",
+                ("pin-1", 1),
+                5,
+                6,
+                Some(7),
+            )
         })
         .unwrap();
     assert!(!stale_touch);

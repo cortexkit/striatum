@@ -64,6 +64,36 @@ struct RoutingConfigFile {
     aa: Option<AaSection>,
     #[serde(default)]
     catalog: CatalogSection,
+    #[serde(default)]
+    account_selection: AccountSelectionFlags,
+}
+
+/// The account-selection rollout flags (`"account_selection"` in the routing
+/// file). Both are off unless the file turns them on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct AccountSelectionFlags {
+    /// Serve `route.account_for` and accept its reports. Off: every account
+    /// operation refuses with `account_selection_disabled`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Compute account decisions without serving them and record them for
+    /// comparison: the step before `enabled`.
+    #[serde(default)]
+    pub shadow: bool,
+}
+
+/// Read the account-selection flags. A missing file, or one routing cannot
+/// read or parse, leaves both flags off: selection never turns on by accident.
+pub fn account_selection_flags(path: &Path) -> AccountSelectionFlags {
+    match read_routing_config(path) {
+        Ok(config) => config
+            .map(|config| config.account_selection)
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(error = %error, "routing config unreadable; account selection stays off");
+            AccountSelectionFlags::default()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

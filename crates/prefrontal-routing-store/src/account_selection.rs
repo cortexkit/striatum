@@ -225,7 +225,8 @@ fn to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-const DECISION_COLUMNS: &str = "decision_id, mode, trigger, principal, admission_id, request_mode, \
+const DECISION_COLUMNS: &str =
+    "decision_id, mode, trigger, principal, admission_id, request_mode, \
      provider, model, family, outcome, code, account_id, credential_id, policy_version, \
      decision_json, context_json, created_at";
 
@@ -332,7 +333,8 @@ fn fence_from_row(row: &Row<'_>) -> rusqlite::Result<AccountFenceRow> {
     })
 }
 
-const OBSERVATION_COLUMNS: &str = "observation_id, principal, runner, event_id, kind, admission_id, \
+const OBSERVATION_COLUMNS: &str =
+    "observation_id, principal, runner, event_id, kind, admission_id, \
      bound, observation_json, effects_json, received_at";
 
 fn observation_from_row(row: &Row<'_>) -> rusqlite::Result<AccountObservationRow> {
@@ -474,7 +476,11 @@ impl AccountTx<'_> {
 
     /// A reservation nobody started within its window can no longer start.
     /// Returns whether the row changed.
-    pub fn mark_admission_expired(&self, principal: &str, admission_id: &str) -> RouteStateResult<bool> {
+    pub fn mark_admission_expired(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<bool> {
         self.conn
             .execute(
                 "UPDATE account_admission SET state = 'expired' \
@@ -880,6 +886,59 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// Record what an observation changed, once its effects are known.
+    pub fn set_observation_effects(
+        &self,
+        observation_id: &str,
+        bound: bool,
+        effects_json: &str,
+    ) -> RouteStateResult<()> {
+        self.conn
+            .execute(
+                "UPDATE account_observation SET bound = ?2, effects_json = ?3 \
+                 WHERE observation_id = ?1",
+                params![observation_id, i64::from(bound), effects_json],
+            )
+            .map(|_| ())
+            .map_err(err)
+    }
+
+    /// The salt if one was ever created. A read-only caller uses this: with no
+    /// salt no conversation can have affinity yet.
+    pub fn existing_salt(&self) -> RouteStateResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT salt FROM account_selection_salt WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// The newest decision recorded in `mode` for this trigger, provider and
+    /// model family.
+    pub fn latest_decision(
+        &self,
+        mode: &str,
+        trigger: &str,
+        provider: &str,
+        family: &str,
+    ) -> RouteStateResult<Option<AccountDecisionRecord>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {DECISION_COLUMNS} FROM account_decision \
+                     WHERE mode = ?1 AND trigger = ?2 AND provider = ?3 AND family = ?4 \
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1"
+                ),
+                params![mode, trigger, provider, family],
+                decision_from_row,
+            )
+            .optional()
+            .map_err(err)
+    }
+
     pub fn insert_observation(&self, row: &AccountObservationRow) -> RouteStateResult<()> {
         self.conn
             .execute(
@@ -948,11 +1007,16 @@ impl SqliteRouteStateStore {
     }
 
     /// One recorded decision by id.
-    pub fn account_decision(&self, decision_id: &str) -> RouteStateResult<Option<AccountDecisionRecord>> {
+    pub fn account_decision(
+        &self,
+        decision_id: &str,
+    ) -> RouteStateResult<Option<AccountDecisionRecord>> {
         self.store
             .with_conn(|c: &Connection| {
                 c.query_row(
-                    &format!("SELECT {DECISION_COLUMNS} FROM account_decision WHERE decision_id = ?1"),
+                    &format!(
+                        "SELECT {DECISION_COLUMNS} FROM account_decision WHERE decision_id = ?1"
+                    ),
                     params![decision_id],
                     decision_from_row,
                 )
@@ -966,7 +1030,9 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let count = |table: &str| -> rusqlite::Result<i64> {
-                    c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                    c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
                 };
                 Ok(AccountServingCounts {
                     affinity: count("account_affinity")?,

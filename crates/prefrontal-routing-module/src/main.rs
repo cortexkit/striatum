@@ -16,6 +16,7 @@
 
 mod aa_ingest;
 mod account_quota;
+mod account_selection;
 mod available_models_text;
 mod config_overrides;
 mod fusiform_catalog;
@@ -170,6 +171,32 @@ type SharedStore = Arc<SqliteRouteStateStore>;
 /// read on every `route.select`.
 type SharedMinBand = Arc<std::sync::Mutex<Option<f64>>>;
 type RouteEpochs = HashMap<u16, u32>;
+
+/// The caller identity the daemon attested when it bound each route (for
+/// example `reserved:broca` for the supervised Broca module), by channel, with
+/// the epoch it was bound under. The account-selection operations namespace
+/// admissions and affinity by it and accept a report only for an admission
+/// they issued to the same identity; no other operation reads it. It is a
+/// process global so the shared request handler keeps its signature.
+static ROUTE_PRINCIPALS: OnceLock<Mutex<HashMap<u16, (u32, String)>>> = OnceLock::new();
+
+fn route_principals() -> &'static Mutex<HashMap<u16, (u32, String)>> {
+    ROUTE_PRINCIPALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The principal label for a request on `channel` under `epoch`; a route whose
+/// bind carried no attestation is `unattested`.
+fn route_principal(channel: u16, epoch: u32) -> String {
+    route_principals()
+        .lock()
+        .ok()
+        .and_then(|map| {
+            map.get(&channel)
+                .filter(|(bound_epoch, _)| *bound_epoch == epoch)
+                .map(|(_, label)| label.clone())
+        })
+        .unwrap_or_else(|| account_selection::principal_label(None))
+}
 
 fn clear_route_epoch(route_epochs: &mut RouteEpochs, channel: u16, epoch: u32) {
     if route_epochs.get(&channel) == Some(&epoch) {
@@ -765,6 +792,11 @@ where
                 })?,
                 DEFAULT_MODULE_ID,
             ));
+        tokio::spawn(account_selection::shadow_loop(
+            Arc::clone(&store),
+            Arc::clone(&account_state),
+            config_overrides::config_path(),
+        ));
         tokio::spawn(account_quota::account_quota_loop(
             config.connection_file_path.clone(),
             account_state,
@@ -1056,8 +1088,18 @@ async fn handle_control_request(
         ModuleControlRequest::RouteBind {
             route_channel,
             epoch,
+            principal,
             ..
         } => {
+            if let Ok(mut map) = route_principals().lock() {
+                map.insert(
+                    route_channel,
+                    (
+                        epoch,
+                        account_selection::principal_label(principal.as_ref()),
+                    ),
+                );
+            }
             // The catalog is machine-global, but the wire identity is binding-specific.
             // Install it only after the accepted bind ACK is queued.
             let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
@@ -2508,6 +2550,20 @@ async fn handle_select_request(
         )
         .map_err(|e| ModuleError::Message(e.to_string()))?;
         return send(writer, response).await;
+    }
+
+    if account_selection::handles(&envelope.method) {
+        let principal = route_principal(channel, epoch);
+        let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+        let ctx = account_selection::Ctx {
+            store: store.as_ref(),
+            accounts: ACCOUNT_QUOTA.get(),
+            flags: config_overrides::account_selection_flags(routing_config_path),
+            policy: &policy,
+            now_ms: account_selection::now_ms(),
+        };
+        let reply = account_selection::handle(&envelope.method, &frame.body, &principal, &ctx);
+        return send_account_reply(writer, ver, channel, epoch, corr, reply).await;
     }
 
     if envelope.method == ROUTE_SET_DECISION_OUTCOME_OP {
@@ -4380,6 +4436,49 @@ async fn send_route_error(
     send(writer, frame).await
 }
 
+/// Send an account-selection reply: a `{"result": ...}` response, or an error
+/// frame whose code is the typed refusal code and whose detail repeats that
+/// code with the retry time, decision id and per-account exclusions.
+async fn send_account_reply(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    reply: account_selection::OpReply,
+) -> Result<(), ModuleError> {
+    let (frame_type, body) = match reply {
+        account_selection::OpReply::Result(result) => (
+            FrameType::Response,
+            serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?,
+        ),
+        account_selection::OpReply::Error {
+            code,
+            message,
+            detail,
+        } => (
+            FrameType::Error,
+            serde_json::to_vec(&ErrorBody {
+                code,
+                message,
+                detail,
+            })
+            .map_err(ModuleError::Json)?,
+        ),
+    };
+    let frame = Frame::build_with_version(
+        ver,
+        frame_type,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
+}
+
 async fn send(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), ModuleError> {
     writer
         .send(frame)
@@ -4417,6 +4516,10 @@ fn handles(method: &str) -> bool {
             | ROUTE_DECISIONS_LIST_OP
             | QUOTA_STATUS_OP
             | ROUTE_ACCOUNT_QUOTA_STATUS_OP
+            | account_selection::ACCOUNT_FOR_OP
+            | account_selection::ACCOUNT_OBSERVE_OP
+            | account_selection::ACCOUNT_RELEASE_OP
+            | account_selection::ACCOUNT_SHADOW_STATUS_OP
     )
 }
 
@@ -4549,6 +4652,38 @@ fn served_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Query,
             description: Some(
                 "Show each subscription account's quota view, age band, vault join and cold-work eligibility"
+                    .to_string(),
+            ),
+        },
+        // The account-selection operations. Each refuses with
+        // `account_selection_disabled` until routing policy enables serving.
+        ManagementOperation {
+            name: account_selection::ACCOUNT_FOR_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Choose the subscription account for one admission, renewal or reassignment"
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: account_selection::ACCOUNT_OBSERVE_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Report account-bound admission, dispatch and failure evidence".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: account_selection::ACCOUNT_RELEASE_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Release an unstarted admission or end a conversation lease".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: account_selection::ACCOUNT_SHADOW_STATUS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Show the latest shadow account decisions and why they came out as they did"
                     .to_string(),
             ),
         },
