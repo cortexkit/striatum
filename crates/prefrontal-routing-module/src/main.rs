@@ -60,8 +60,9 @@ use serde_json::json;
 use subc_protocol::manifest::Concurrency;
 use subc_protocol::{
     manifest::{
-        Bindings, IdentityBinding, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
+        Bindings, IdentityBinding, LaunchNonceSource, ManagementOperation, ManagementOperationKind,
+        ManifestProvenance, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+        StorageScope, TrustTier,
     },
     session::{
         HealthReport, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -495,6 +496,11 @@ fn open_route_state_store(descriptor: &StorageDescriptor) -> Result<SharedStore,
 
 #[tokio::main]
 async fn main() -> Result<(), ModuleError> {
+    // Read the launch nonce before anything else can spawn a process: until
+    // this first read, the pipe the daemon handed it over on is inheritable,
+    // so a child spawned earlier would receive it. The result is cached for
+    // the process; HELLO and the credential route read that cached answer.
+    let _ = subc_os::launch_nonce();
     let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
         StartupMode::PrintManifest => return print_manifest_operations(),
         StartupMode::Serve(connection_file_path) => connection_file_path,
@@ -835,12 +841,21 @@ async fn send_hello(
         // Advertise health.check: the daemon's prober is capability-gated and only probes
         // modules that DECLARE the op: answering it (handle_control_request) is not enough.
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
-        launch_nonce: std::env::var("SUBC_LAUNCH_NONCE").ok(),
+        launch_nonce: hello_launch_nonce()?,
     })
     .map_err(ModuleError::Json)?;
     let frame = Frame::build(FrameType::Hello, control_flags(), 0, 0, HELLO_CORR, body)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, frame).await
+}
+
+/// The launch nonce HELLO presents, from the process-wide accessor. A
+/// descriptor the daemon named but that cannot be read fails HELLO by name, as
+/// the SDK's HELLO does, rather than connecting without the module's identity.
+fn hello_launch_nonce() -> Result<Option<String>, ModuleError> {
+    subc_os::launch_nonce()
+        .map(|nonce| nonce.map(|nonce| nonce.value().to_owned()))
+        .map_err(|error| ModuleError::Message(format!("read the launch nonce: {error}")))
 }
 
 async fn expect_hello_ack<R>(reader: &mut R) -> Result<ModuleHelloAckBody, ModuleError>
@@ -4459,10 +4474,12 @@ fn print_manifest_operations() -> Result<(), ModuleError> {
 fn manifest(module_id: &str) -> ModuleManifest {
     // ModuleManifest went #[non_exhaustive] with a mandatory builder in
     // subc-protocol (sibling commit 9f3e6faa); optional declarations stay at
-    // their absent defaults: no capabilities, no self-signals, and no
-    // provenance until the deploy script injects CK_BUILD_* facts.
+    // their absent defaults: no capabilities and no self-signals. Provenance
+    // carries only where the launch nonce came from until the deploy script
+    // injects CK_BUILD_* facts.
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
         .trust_tier(Some(TrustTier::FirstParty))
+        .provenance(declared_provenance())
         .bindings(Some(Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
@@ -4487,6 +4504,19 @@ fn manifest(module_id: &str) -> ModuleManifest {
             identity_scope: Vec::new(),
         }])
         .build()
+}
+
+/// The provenance block HELLO declares. It records whether this process read
+/// its launch nonce from the daemon's pipe (`fd`) or from the environment copy
+/// kept while modules move to the pipe (`env`), so the fleet's provenance
+/// report shows which modules have moved. `None` when there is no nonce to
+/// report on, as when printing the manifest.
+fn declared_provenance() -> Option<ManifestProvenance> {
+    let source = subc_os::launch_nonce().ok().flatten()?.source();
+    Some(
+        ManifestProvenance::new()
+            .with_launch_nonce_source(Some(LaunchNonceSource::from_wire_name(source.as_str()))),
+    )
 }
 
 fn parse_startup_mode(
