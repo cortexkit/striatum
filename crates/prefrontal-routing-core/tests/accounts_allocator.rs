@@ -335,6 +335,14 @@ fn affinity_is_retained_despite_better_score_below_reserve_or_stale_reading() {
         degraded[..],
         [ExclusionReason::AgeExcluded { .. }]
     ));
+
+    // In the discounted band a 100% reading is not fresh either: retained.
+    let mut discounted = reading(10.0, 100.0);
+    discounted.observed_at_ms = Some(NOW - 6 * MINUTE);
+    st.roster.as_mut().unwrap().accounts[0].quota = Some(discounted);
+    let decision = decide(&request(), &st, NOW);
+    assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
+    assert_eq!(admitted(&decision), "acct-a");
 }
 
 #[test]
@@ -386,7 +394,7 @@ fn fresh_full_band_reading_at_100_moves_but_never_holds() {
     let mut full = reading(10.0, 100.0);
     full.observed_at_ms = Some(NOW - MINUTE);
     let mut st = state(vec![
-        account("acct-a", Some(full.clone())),
+        account("acct-a", Some(full)),
         account("acct-b", Some(reading(10.0, 10.0))),
     ]);
     st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
@@ -412,12 +420,6 @@ fn fresh_full_band_reading_at_100_moves_but_never_holds() {
     let decision = decide(&request(), &st, NOW);
     assert_eq!(admitted(&decision), "acct-b");
     assert!(decision.hold().is_none());
-
-    // In the discounted band the same reading is not fresh: retained.
-    full.observed_at_ms = Some(NOW - 6 * MINUTE);
-    st.roster.as_mut().unwrap().accounts[0].quota = Some(full);
-    let decision = decide(&request(), &st, NOW);
-    assert_eq!(admitted(&decision), "acct-a");
 }
 
 #[test]
