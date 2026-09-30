@@ -62,9 +62,9 @@ use serde_json::json;
 use subc_protocol::manifest::Concurrency;
 use subc_protocol::{
     manifest::{
-        Bindings, IdentityBinding, LaunchNonceSource, ManagementOperation, ManagementOperationKind,
-        ManifestProvenance, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
-        StorageScope, TrustTier,
+        Bindings, BuildGitShaSource, GitTreeState, IdentityBinding, LaunchNonceSource,
+        ManagementOperation, ManagementOperationKind, ManifestProvenance, ModuleManifest,
+        ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     session::{
         HealthReport, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -4722,11 +4722,9 @@ fn print_manifest_operations() -> Result<(), ModuleError> {
 /// empty and the identity binding requires nothing. The routing module owns this
 /// schema and is the sole writer for its provider and route cooldown state.
 fn manifest(module_id: &str) -> ModuleManifest {
-    // ModuleManifest went #[non_exhaustive] with a mandatory builder in
-    // subc-protocol (sibling commit 9f3e6faa); optional declarations stay at
-    // their absent defaults: no capabilities and no self-signals. Provenance
-    // carries only where the launch nonce came from until the deploy script
-    // injects CK_BUILD_* facts.
+    // `ModuleManifest` is `#[non_exhaustive]`, so this module constructs it
+    // with the builder. This module declares no capabilities or self-signals.
+    // Build provenance comes from the module's build script.
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
         .trust_tier(Some(TrustTier::FirstParty))
         .provenance(declared_provenance())
@@ -4756,17 +4754,35 @@ fn manifest(module_id: &str) -> ModuleManifest {
         .build()
 }
 
-/// The provenance block HELLO declares. It records whether this process read
-/// its launch nonce from the daemon's pipe (`fd`) or from the environment copy
-/// kept while modules move to the pipe (`env`), so the fleet's provenance
-/// report shows which modules have moved. `None` when there is no nonce to
-/// report on, as when printing the manifest.
+/// Records this binary's build revision and, when available, where this process
+/// read its launch nonce from.
 fn declared_provenance() -> Option<ManifestProvenance> {
-    let source = subc_os::launch_nonce().ok().flatten()?.source();
-    Some(
-        ManifestProvenance::new()
-            .with_launch_nonce_source(Some(LaunchNonceSource::from_wire_name(source.as_str()))),
+    let dirty = env!("PREFRONTAL_BUILD_GIT_DIRTY") == "true";
+    let revision = env!("PREFRONTAL_BUILD_GIT_SHA");
+    let source = if revision == "unknown" {
+        BuildGitShaSource::NoGitDir
+    } else {
+        BuildGitShaSource::Git {
+            revision,
+            tree_state: if dirty {
+                GitTreeState::Dirty
+            } else {
+                GitTreeState::Clean
+            },
+        }
+    };
+    let mut provenance = subc_protocol::manifest::build_provenance_from_source(
+        source,
+        Some(env!("PREFRONTAL_BUILD_LOCK_DIGEST")),
+        None,
     )
+    .expect("build script emits a canonical git revision");
+    let launch_nonce_source = subc_os::launch_nonce()
+        .ok()
+        .flatten()
+        .map(|nonce| LaunchNonceSource::from_wire_name(nonce.source().as_str()));
+    provenance = provenance.with_launch_nonce_source(launch_nonce_source);
+    Some(provenance)
 }
 
 fn parse_startup_mode(
@@ -8470,6 +8486,42 @@ mod tests {
                 "subscriptionKeys": [],
                 "connectedModelCount": 2,
             })
+        );
+    }
+
+    #[test]
+    fn manifest_declares_wire_version_and_build_provenance_contract() {
+        let provenance = subc_protocol::manifest::build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: "0123456789abcdef0123456789abcdef01234567",
+                tree_state: GitTreeState::Clean,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            provenance.wire_crate_version.as_deref(),
+            Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
+        );
+        assert_eq!(
+            provenance.build_git_sha.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+
+        let dirty = subc_protocol::manifest::build_provenance_from_source(
+            BuildGitShaSource::Git {
+                revision: "0123456789abcdef0123456789abcdef01234567",
+                tree_state: GitTreeState::Dirty,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(dirty.build_git_sha, None);
+        assert_eq!(
+            dirty.build_git_sha_absence_reason,
+            Some(subc_protocol::manifest::BuildGitShaAbsenceReason::DeclinedDirty)
         );
     }
 
