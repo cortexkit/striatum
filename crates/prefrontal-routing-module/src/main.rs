@@ -4760,7 +4760,7 @@ fn declared_provenance() -> Option<ManifestProvenance> {
     let dirty = env!("PREFRONTAL_BUILD_GIT_DIRTY") == "true";
     let revision = env!("PREFRONTAL_BUILD_GIT_SHA");
     let source = if revision == "unknown" {
-        BuildGitShaSource::NoGitDir
+        BuildGitShaSource::NeverDerived
     } else {
         BuildGitShaSource::Git {
             revision,
@@ -8522,6 +8522,38 @@ mod tests {
         assert_eq!(
             dirty.build_git_sha_absence_reason,
             Some(subc_protocol::manifest::BuildGitShaAbsenceReason::DeclinedDirty)
+        );
+    }
+
+    #[test]
+    fn declared_provenance_follows_build_inputs() {
+        let provenance = declared_provenance().unwrap();
+        use subc_protocol::manifest::BuildGitShaAbsenceReason;
+        if env!("PREFRONTAL_BUILD_GIT_SHA") == "unknown" {
+            assert_eq!(provenance.build_git_sha, None);
+            assert_eq!(
+                provenance.build_git_sha_absence_reason,
+                Some(BuildGitShaAbsenceReason::NeverDerived)
+            );
+        } else if env!("PREFRONTAL_BUILD_GIT_DIRTY") == "true" {
+            assert_eq!(provenance.build_git_sha, None);
+            assert_eq!(
+                provenance.build_git_sha_absence_reason,
+                Some(BuildGitShaAbsenceReason::DeclinedDirty)
+            );
+        } else {
+            assert_eq!(
+                provenance.build_git_sha.as_deref(),
+                Some(env!("PREFRONTAL_BUILD_GIT_SHA"))
+            );
+        }
+        assert_eq!(
+            provenance.wire_crate_version.as_deref(),
+            Some(subc_protocol::SUBC_PROTOCOL_CRATE_VERSION)
+        );
+        assert_eq!(
+            provenance.build_lock_digest.as_deref().map(str::len),
+            Some(64)
         );
     }
 
