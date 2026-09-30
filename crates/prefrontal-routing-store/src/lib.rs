@@ -35,6 +35,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+mod account_selection;
+
+pub use account_selection::{
+    AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
+    AccountExclusionRow, AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow,
+    AccountServingCounts, AccountTx, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
+};
+
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
 
 /// Migration 1: the route-owned schema + the curated 33-fact seed. FROZEN: a
@@ -142,6 +150,10 @@ const MIGRATION_042: &str = include_str!("../migrations/042_quota_snapshot.sql")
 /// Migration 43: per-account quota readings, completeness and the vault roster.
 const MIGRATION_043: &str = include_str!("../migrations/043_account_quota.sql");
 
+/// Migration 44: the account-selection store (decisions, affinity, pins,
+/// admissions, holds, observations, fences and per-admission exclusions).
+const MIGRATION_044: &str = include_str!("../migrations/044_account_selection.sql");
+
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 /// How many omitted `not_available` route keys the rejection summary names.
@@ -184,7 +196,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 43] {
+fn route_state_migrations() -> [Migration; 44] {
     [
         Migration {
             version: 1,
@@ -357,6 +369,10 @@ fn route_state_migrations() -> [Migration; 43] {
         Migration {
             version: 43,
             statements: MIGRATION_043,
+        },
+        Migration {
+            version: 44,
+            statements: MIGRATION_044,
         },
     ]
 }
