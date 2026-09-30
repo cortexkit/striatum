@@ -139,6 +139,8 @@ const MIGRATION_040: &str = include_str!("../migrations/040_route_winner_baselin
 const MIGRATION_041: &str = include_str!("../migrations/041_retire_fast_routes.sql");
 /// Migration 42: the last accepted quota snapshot, kept across restarts.
 const MIGRATION_042: &str = include_str!("../migrations/042_quota_snapshot.sql");
+/// Migration 43: per-account quota readings, completeness and the vault roster.
+const MIGRATION_043: &str = include_str!("../migrations/043_account_quota.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -182,7 +184,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 42] {
+fn route_state_migrations() -> [Migration; 43] {
     [
         Migration {
             version: 1,
@@ -351,6 +353,10 @@ fn route_state_migrations() -> [Migration; 42] {
         Migration {
             version: 42,
             statements: MIGRATION_042,
+        },
+        Migration {
+            version: 43,
+            statements: MIGRATION_043,
         },
     ]
 }
@@ -637,6 +643,37 @@ struct CachedClassVector {
 pub struct PersistedQuotaSnapshot {
     pub windows_json: String,
     pub observed_at: i64,
+}
+
+/// One stored per-account quota reading. `entry_json` is the whole Insula entry
+/// as published; `fetched_at` is that entry's producer date, kept verbatim so a
+/// restart restores the original source time rather than a local stamp.
+/// `received_at` and `tombstoned_at` are local Unix milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedAccountReading {
+    pub provider: String,
+    pub account_id: String,
+    pub entry_json: String,
+    pub fetched_at: Option<String>,
+    pub received_at: i64,
+    pub tombstoned_at: Option<i64>,
+}
+
+/// Per-provider Insula completeness, in local Unix milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedProviderCompleteness {
+    pub provider: String,
+    pub last_polled_at: i64,
+    pub last_poll_complete: bool,
+    pub last_complete_at: Option<i64>,
+}
+
+/// The last vault roster routing listed, serialized by the routing module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedVaultRoster {
+    pub view: String,
+    pub roster_json: String,
+    pub fetched_at: i64,
 }
 
 /// One failed decision from a head's recent launches, enough to tell which
@@ -1100,6 +1137,143 @@ impl SqliteRouteStateStore {
                        windows_json = excluded.windows_json,
                        observed_at = excluded.observed_at",
                     params![windows_json, observed_at],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
+    /// Every stored per-account quota reading, tombstoned ones included.
+    pub fn account_quota_readings(&self) -> RouteStateResult<Vec<PersistedAccountReading>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut statement = c.prepare(
+                    "SELECT provider, account_id, entry_json, fetched_at, received_at, tombstoned_at
+                     FROM account_quota_reading ORDER BY provider, account_id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok(PersistedAccountReading {
+                        provider: row.get(0)?,
+                        account_id: row.get(1)?,
+                        entry_json: row.get(2)?,
+                        fetched_at: row.get(3)?,
+                        received_at: row.get(4)?,
+                        tombstoned_at: row.get(5)?,
+                    })
+                })?;
+                rows.collect()
+            })
+            .map_err(err)
+    }
+
+    /// Every stored provider completeness row.
+    pub fn account_quota_completeness(
+        &self,
+    ) -> RouteStateResult<Vec<PersistedProviderCompleteness>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut statement = c.prepare(
+                    "SELECT provider, last_polled_at, last_poll_complete, last_complete_at
+                     FROM account_quota_completeness ORDER BY provider",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok(PersistedProviderCompleteness {
+                        provider: row.get(0)?,
+                        last_polled_at: row.get(1)?,
+                        last_poll_complete: row.get::<_, i64>(2)? != 0,
+                        last_complete_at: row.get(3)?,
+                    })
+                })?;
+                rows.collect()
+            })
+            .map_err(err)
+    }
+
+    /// Upsert the readings and completeness rows one poll changed, in one
+    /// transaction. Rows the poll did not name are left as they are: this never
+    /// deletes a reading, so a partial poll cannot erase a stored sibling.
+    pub fn put_account_quota_poll(
+        &self,
+        readings: &[PersistedAccountReading],
+        completeness: &[PersistedProviderCompleteness],
+    ) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let tx = c.unchecked_transaction()?;
+                for reading in readings {
+                    tx.execute(
+                        "INSERT INTO account_quota_reading
+                           (provider, account_id, entry_json, fetched_at, received_at, tombstoned_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                         ON CONFLICT(provider, account_id) DO UPDATE SET
+                           entry_json = excluded.entry_json,
+                           fetched_at = excluded.fetched_at,
+                           received_at = excluded.received_at,
+                           tombstoned_at = excluded.tombstoned_at",
+                        params![
+                            reading.provider,
+                            reading.account_id,
+                            reading.entry_json,
+                            reading.fetched_at,
+                            reading.received_at,
+                            reading.tombstoned_at,
+                        ],
+                    )?;
+                }
+                for row in completeness {
+                    tx.execute(
+                        "INSERT INTO account_quota_completeness
+                           (provider, last_polled_at, last_poll_complete, last_complete_at)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(provider) DO UPDATE SET
+                           last_polled_at = excluded.last_polled_at,
+                           last_poll_complete = excluded.last_poll_complete,
+                           last_complete_at = excluded.last_complete_at",
+                        params![
+                            row.provider,
+                            row.last_polled_at,
+                            i64::from(row.last_poll_complete),
+                            row.last_complete_at,
+                        ],
+                    )?;
+                }
+                tx.commit()
+            })
+            .map_err(err)
+    }
+
+    /// The last vault roster routing persisted, or `None` before the first listing.
+    pub fn account_vault_roster(&self) -> RouteStateResult<Option<PersistedVaultRoster>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT view, roster_json, fetched_at FROM account_vault_roster WHERE singleton = 1",
+                    [],
+                    |row| {
+                        Ok(PersistedVaultRoster {
+                            view: row.get(0)?,
+                            roster_json: row.get(1)?,
+                            fetched_at: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Replace the stored vault roster.
+    pub fn put_account_vault_roster(&self, roster: &PersistedVaultRoster) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "INSERT INTO account_vault_roster (singleton, view, roster_json, fetched_at)
+                     VALUES (1, ?1, ?2, ?3)
+                     ON CONFLICT(singleton) DO UPDATE SET
+                       view = excluded.view,
+                       roster_json = excluded.roster_json,
+                       fetched_at = excluded.fetched_at",
+                    params![roster.view, roster.roster_json, roster.fetched_at],
                 )
                 .map(|_| ())
             })

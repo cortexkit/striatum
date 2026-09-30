@@ -15,6 +15,7 @@
 //! module runs the pure `prefrontal-routing-core` scorer and returns the selection.
 
 mod aa_ingest;
+mod account_quota;
 mod available_models_text;
 mod config_overrides;
 mod fusiform_catalog;
@@ -109,6 +110,10 @@ const ROUTE_CLEAR_COOLDOWN_OP: &str = "route.clear_cooldown";
 /// live and how fresh its windows are. Lets a consumer (and the e2e) confirm the
 /// module->module quota path actually round-tripped, not just that it didn't hang.
 const QUOTA_STATUS_OP: &str = "route.quota_status";
+/// Observability op: each subscription account's current quota view, its age
+/// band, its vault join and why its reading can or cannot be used for cold work,
+/// plus roster gaps. Read-only; nothing selects an account from it yet.
+const ROUTE_ACCOUNT_QUOTA_STATUS_OP: &str = "route.account_quota_status";
 /// Seed a provisional AA-inferred score for one router key (management, primary-only).
 const ROUTE_MODEL_SEED_AA_OP: &str = "route.model_seed_aa";
 /// Operator worklist: every `aa_inferred` row plus unscored catalog rows.
@@ -150,6 +155,12 @@ struct QuotaCache {
 }
 
 type SharedQuotaCache = Arc<Mutex<QuotaCache>>;
+
+/// The per-account quota state, set once when the store opens. It is a process
+/// global rather than a handler argument because only the read-only
+/// `route.account_quota_status` operation reads it; `None` until boot restores it.
+static ACCOUNT_QUOTA: std::sync::OnceLock<account_quota::SharedAccountQuota> =
+    std::sync::OnceLock::new();
 
 /// The route-state store, shared by the select handler (reader). Single-writer:
 /// this module holds the store's lease for its lifetime.
@@ -497,6 +508,10 @@ fn open_route_state_store(descriptor: &StorageDescriptor) -> Result<SharedStore,
 async fn main() -> Result<(), ModuleError> {
     let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
         StartupMode::PrintManifest => return print_manifest_operations(),
+        StartupMode::AccountQuotaDryRun {
+            connection_file_path,
+            capture_dir,
+        } => return account_quota_dry_run(connection_file_path, capture_dir).await,
         StartupMode::Serve(connection_file_path) => connection_file_path,
     };
     let config = ModuleConfig::from_env(connection_file_path)?;
@@ -506,7 +521,56 @@ async fn main() -> Result<(), ModuleError> {
 #[derive(Debug, PartialEq, Eq)]
 enum StartupMode {
     PrintManifest,
+    /// Read Insula once as an ordinary consumer and print the account views it
+    /// would produce. Writes no store and consults no vault.
+    AccountQuotaDryRun {
+        connection_file_path: PathBuf,
+        capture_dir: Option<PathBuf>,
+    },
     Serve(PathBuf),
+}
+
+/// `--account-quota-dry-run --subc <file> [--capture <dir>]`: fetch each tracked
+/// provider's `usage.get` reply, optionally save the exact reply bytes under
+/// `<dir>/usage-get-<provider>.json`, and print the account report as JSON.
+async fn account_quota_dry_run(
+    connection_file_path: PathBuf,
+    capture_dir: Option<PathBuf>,
+) -> Result<(), ModuleError> {
+    let project_root = std::env::temp_dir().join("prefrontal-routing-account-quota-dry-run");
+    let _ = std::fs::create_dir_all(&project_root);
+    let mut consumer = QuotaConsumer::connect(&connection_file_path, &project_root)
+        .await
+        .map_err(|error| ModuleError::Message(format!("connect to insula: {error}")))?;
+    let replies = consumer
+        .usage_get_providers_raw(&account_quota::account_provider_names())
+        .await
+        .map_err(|error| ModuleError::Message(format!("usage.get: {error}")))?;
+    let mut state = account_quota::AccountQuotaState {
+        roster_poll: account_quota::RosterPoll::NotConsulted {
+            reason: "the dry run does not consult the vault: it runs without routing's reserved principal"
+                .into(),
+        },
+        ..Default::default()
+    };
+    let received_at_ms = now_ms() as i64;
+    for (provider, body) in replies {
+        if let Some(dir) = &capture_dir {
+            std::fs::create_dir_all(dir)
+                .and_then(|()| {
+                    std::fs::write(dir.join(format!("usage-get-{provider}.json")), &body)
+                })
+                .map_err(|error| ModuleError::Message(format!("capture {provider}: {error}")))?;
+        }
+        account_quota::apply_provider_reply(&mut state, &provider, &body, received_at_ms)
+            .map_err(|error| ModuleError::Message(format!("{provider}: {error}")))?;
+    }
+    let status = account_quota::status_json(&state, now_ms() as i64);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status).map_err(ModuleError::Json)?
+    );
+    Ok(())
 }
 
 struct ModuleConfig {
@@ -680,6 +744,28 @@ where
         Arc::clone(&quota_cache),
         Arc::clone(&store),
     ));
+    // Per-account quota views: restored with their original source dates before
+    // the first poll, then refreshed on their own loop. Model selection does not
+    // read them.
+    let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
+        account_quota::restore_account_state(store.as_ref()),
+    ));
+    if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
+        let roster_resolver: Arc<dyn prefrontal_ckcred_client::CredentialResolver> =
+            Arc::new(prefrontal_ckcred_client::CkcredCredentialResolver::new(
+                config.connection_file_path.clone(),
+                std::env::current_dir().map_err(|error| {
+                    ModuleError::Message(format!("resolve routing roster project root: {error}"))
+                })?,
+                DEFAULT_MODULE_ID,
+            ));
+        tokio::spawn(account_quota::account_quota_loop(
+            config.connection_file_path.clone(),
+            account_state,
+            Arc::clone(&store),
+            roster_resolver,
+        ));
+    }
     let aa_credential_resolver: Arc<dyn prefrontal_ckcred_client::CredentialResolver> =
         Arc::new(prefrontal_ckcred_client::CkcredCredentialResolver::new(
             config.connection_file_path.clone(),
@@ -2376,6 +2462,26 @@ async fn handle_select_request(
             "restoredFromMs": restored_from_ms,
         }}))
         .map_err(ModuleError::Json)?;
+        let response = Frame::build_with_version(
+            ver,
+            FrameType::Response,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            epoch,
+            corr,
+            body,
+        )
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+        return send(writer, response).await;
+    }
+
+    if envelope.method == ROUTE_ACCOUNT_QUOTA_STATUS_OP {
+        let status = match ACCOUNT_QUOTA.get().map(|state| state.lock()) {
+            Some(Ok(guard)) => account_quota::status_json(&guard, now_ms() as i64),
+            Some(Err(_)) => json!({ "error": "account quota state poisoned" }),
+            None => json!({ "error": "account quota state not initialized yet" }),
+        };
+        let body = serde_json::to_vec(&json!({ "result": status })).map_err(ModuleError::Json)?;
         let response = Frame::build_with_version(
             ver,
             FrameType::Response,
@@ -4295,6 +4401,7 @@ fn handles(method: &str) -> bool {
             | ROUTE_EXPLAIN_OP
             | ROUTE_DECISIONS_LIST_OP
             | QUOTA_STATUS_OP
+            | ROUTE_ACCOUNT_QUOTA_STATUS_OP
     )
 }
 
@@ -4422,6 +4529,14 @@ fn served_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Query,
             description: None,
         },
+        ManagementOperation {
+            name: ROUTE_ACCOUNT_QUOTA_STATUS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Show each subscription account's quota view, age band, vault join and cold-work eligibility"
+                    .to_string(),
+            ),
+        },
     ]
 }
 
@@ -4500,6 +4615,21 @@ fn parse_startup_mode(
         return Err(ModuleError::Message(
             "--print-manifest must be used without other arguments".into(),
         ));
+    }
+    if args.iter().any(|arg| arg == "--account-quota-dry-run") {
+        let capture_dir = args
+            .iter()
+            .position(|arg| arg == "--capture")
+            .map(|index| {
+                args.get(index + 1)
+                    .map(PathBuf::from)
+                    .ok_or_else(|| ModuleError::Message("--capture requires a directory".into()))
+            })
+            .transpose()?;
+        return parse_subc_arg(args).map(|connection_file_path| StartupMode::AccountQuotaDryRun {
+            connection_file_path,
+            capture_dir,
+        });
     }
     parse_subc_arg(args).map(StartupMode::Serve)
 }

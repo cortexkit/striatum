@@ -146,8 +146,44 @@ impl QuotaConsumer {
     pub async fn usage_get(
         &mut self,
     ) -> Result<Vec<prefrontal_routing_core::quota::ProviderUsage>, QuotaConsumerError> {
+        let body = self.usage_get_body(serde_json::json!({})).await?;
+        // The quota module wraps the array as `{ "result": ProviderUsage[] }`.
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(QuotaConsumerError::Json)?;
+        let result = value
+            .get("result")
+            .ok_or_else(|| msg("usage.get response missing 'result'"))?;
+        let windows = serde_json::from_value(result.clone()).map_err(QuotaConsumerError::Json)?;
+        self.goodbye().await?;
+        Ok(windows)
+    }
+
+    /// Call `usage.get {"provider": p}` once per provider on this one connection,
+    /// then close it. Each reply body is returned as the exact bytes Insula sent,
+    /// so the caller decodes the whole envelope itself (`result` and
+    /// `completeProviders`) rather than the `result` array alone.
+    pub async fn usage_get_providers_raw(
+        &mut self,
+        providers: &[&str],
+    ) -> Result<Vec<(String, Vec<u8>)>, QuotaConsumerError> {
+        let mut replies = Vec::with_capacity(providers.len());
+        for provider in providers {
+            let body = self
+                .usage_get_body(serde_json::json!({ "provider": provider }))
+                .await?;
+            replies.push(((*provider).to_string(), body));
+        }
+        self.goodbye().await?;
+        Ok(replies)
+    }
+
+    /// Send one `usage.get` with `params` and return the successful reply body.
+    async fn usage_get_body(
+        &mut self,
+        params: serde_json::Value,
+    ) -> Result<Vec<u8>, QuotaConsumerError> {
         let corr = self.corr();
-        let body = serde_json::json!({ "method": USAGE_GET_OP, "params": {} });
+        let body = serde_json::json!({ "method": USAGE_GET_OP, "params": params });
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
@@ -169,15 +205,7 @@ impl QuotaConsumer {
                 String::from_utf8_lossy(&reply.body)
             )));
         }
-        // The quota module wraps the array as `{ "result": ProviderUsage[] }`.
-        let value: serde_json::Value =
-            serde_json::from_slice(&reply.body).map_err(QuotaConsumerError::Json)?;
-        let result = value
-            .get("result")
-            .ok_or_else(|| msg("usage.get response missing 'result'"))?;
-        let windows = serde_json::from_value(result.clone()).map_err(QuotaConsumerError::Json)?;
-        self.goodbye().await?;
-        Ok(windows)
+        Ok(reply.body)
     }
 
     /// Close the whole daemon connection cleanly after a completed refresh.
