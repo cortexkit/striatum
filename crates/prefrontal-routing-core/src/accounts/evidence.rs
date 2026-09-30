@@ -58,6 +58,8 @@ pub fn raw_confirms_exhaustion(raw_utilization: f64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameOrigin {
+    /// A genuine upstream response reported by Broca, independent of transport.
+    Upstream,
     /// A direct upstream response.
     Direct,
     /// An upstream frame carried by an HTTP relay.

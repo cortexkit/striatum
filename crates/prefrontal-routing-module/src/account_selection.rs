@@ -1323,8 +1323,8 @@ fn refresh_adapter_for(provider: &str) -> String {
 /// verbatim with the observation.
 #[derive(Debug, Clone, Deserialize)]
 struct ObserveParams {
-    /// The runner's own id for this physical attempt or event; a repeat of
-    /// the same id from the same runner is recognized and changes nothing.
+    /// Broca uses `<lineage_id>:<wal_seq>`; a repeat from the same runner
+    /// and principal is recognized and changes nothing.
     event_id: String,
     caller: CallerParams,
     /// `admission_started`, `run_finished`, `attempt`, `scoped_not_found` or
@@ -1339,7 +1339,7 @@ struct ObserveParams {
     served_account_id: Option<String>,
     #[serde(default)]
     credential_id: Option<String>,
-    /// The runner's `list_scoped` view digest (scoped not-found).
+    /// The vault view digest at the attempt's credential read.
     #[serde(default)]
     view_digest: Option<String>,
     /// The original observation time, never a forwarding time.
@@ -1348,7 +1348,8 @@ struct ObserveParams {
     /// Which upstream frame the headers came from.
     #[serde(default)]
     upstream_origin: Option<FrameOrigin>,
-    /// Every `anthropic-ratelimit-unified-*` header exactly as received.
+    /// Lowercase `anthropic-ratelimit-unified-*` names and raw string values,
+    /// including unknown names. Absence means no headers were received.
     #[serde(default)]
     headers: BTreeMap<String, String>,
     #[serde(default)]
@@ -1523,6 +1524,8 @@ fn apply_bound_observation(
         "run_finished" => {
             if tx.mark_admission_finished(principal, id, now)? {
                 effects.push(json!({ "effect": "admission_finished" }));
+                let lease_ended = tx.end_lease(&admission.pin_id, now)?;
+                effects.push(json!({ "effect": "lease_ended", "lease_ended": lease_ended }));
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
             }
@@ -1749,7 +1752,13 @@ fn release(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             let released = tx.mark_admission_released(principal, &row.admission_id, now)?;
             // Release ends the conversation's lease; it never erases affinity
             // and never cancels a request in flight.
-            let lease_ended = tx.end_lease(&row.pin_id, now)?;
+            // A completed or already released admission must not end a lease
+            // that another admission may since have renewed on the same pin.
+            let lease_ended = if matches!(row.state.as_str(), "finished" | "released") {
+                false
+            } else {
+                tx.end_lease(&row.pin_id, now)?
+            };
             let state = tx
                 .admission(principal, &row.admission_id)?
                 .map_or(row.state.clone(), |current| current.state);
@@ -2676,6 +2685,169 @@ mod tests {
         ));
         assert_eq!(after_start["release"]["released"], false);
         assert_eq!(after_start["release"]["state"], "started");
+    }
+
+    #[test]
+    fn broca_raw_headers_preserve_unknowns_and_confirm_only_raw_exhaustion() {
+        let fixture = fixture("raw-headers");
+        let ctx = fixture.ctx(true, false, NOW);
+        result(fixture.call(
+            &ctx,
+            ACCOUNT_FOR_OP,
+            BROCA,
+            admit_params("adm-raw", "broca:raw", "broca"),
+        ));
+        let reading = |event: &str, utilization: &str| {
+            json!({
+                "event_id": event,
+                "caller": { "runner": "broca" },
+                "kind": "attempt",
+                "admission_id": "adm-raw",
+                "upstream_origin": "upstream",
+                "observed_at_ms": NOW,
+                "view_digest": "credential-read-view",
+                "headers": {
+                    "anthropic-ratelimit-unified-5h-utilization": utilization,
+                    "anthropic-ratelimit-unified-5h-reset": ((NOW + 3_600_000) / 1000).to_string(),
+                    "anthropic-ratelimit-unified-fallback-percentage": "0.12345"
+                }
+            })
+        };
+        let below = reading("lineage:1", "0.995");
+        let reply = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, below.clone()));
+        assert_eq!(
+            reply["observation"]["effects"][0]["effect"],
+            "not_confirmed"
+        );
+        assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 0);
+        let stored = fixture
+            .store()
+            .account_transaction(|tx| tx.observation_by_event(BROCA, "broca", "lineage:1"))
+            .unwrap()
+            .unwrap();
+        let stored: Value = serde_json::from_str(&stored.observation_json).unwrap();
+        assert_eq!(stored, below);
+        assert_eq!(
+            stored["headers"]["anthropic-ratelimit-unified-fallback-percentage"],
+            "0.12345"
+        );
+        let full = reading("lineage:2", "1.0");
+        let reply = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, full.clone()));
+        assert_eq!(reply["observation"]["effects"][0]["effect"], "fence");
+        assert_eq!(
+            reply["observation"]["effects"][0]["fence"]["reset"]["at_ms"],
+            json!(NOW + 3_600_000)
+        );
+        let repeat = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, full));
+        assert_eq!(repeat["observation"]["duplicate"], true);
+        assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 1);
+    }
+
+    #[test]
+    fn broca_transport_failure_without_headers_records_no_quota_evidence() {
+        let fixture = fixture("no-headers");
+        let ctx = fixture.ctx(true, false, NOW);
+        result(fixture.call(
+            &ctx,
+            ACCOUNT_FOR_OP,
+            BROCA,
+            admit_params("adm-transport", "broca:transport", "broca"),
+        ));
+        let params = json!({ "event_id": "lineage:3", "caller": { "runner": "broca" },
+            "kind": "attempt", "admission_id": "adm-transport",
+            "upstream_origin": "upstream", "terminal_reason": "transport_failure" });
+        let reply = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, params.clone()));
+        assert_eq!(reply["observation"]["effects"], json!([]));
+        assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 0);
+        let stored = fixture
+            .store()
+            .account_transaction(|tx| tx.observation_by_event(BROCA, "broca", "lineage:3"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored.observation_json).unwrap(),
+            params
+        );
+    }
+
+    #[test]
+    fn broca_run_finished_ends_lease_and_later_release_is_noop() {
+        let fixture = fixture("finish-lease");
+        let ctx = fixture.ctx(true, false, NOW);
+        result(fixture.call(
+            &ctx,
+            ACCOUNT_FOR_OP,
+            BROCA,
+            admit_params("adm-finish", "broca:finish", "broca"),
+        ));
+        result(fixture.call(
+            &ctx,
+            ACCOUNT_OBSERVE_OP,
+            BROCA,
+            json!({
+                "event_id": "lineage:4", "caller": { "runner": "broca" },
+                "kind": "admission_started", "admission_id": "adm-finish", "run_id": "run-finish"
+            }),
+        ));
+        let finish_time = NOW + 10_000;
+        let ctx = fixture.ctx(true, false, finish_time);
+        let finish = json!({ "event_id": "lineage:5", "caller": { "runner": "broca" },
+            "kind": "run_finished", "admission_id": "adm-finish", "run_id": "run-finish",
+            "terminal_reason": "success", "upstream_origin": "upstream", "headers": {
+                "anthropic-ratelimit-unified-7d-utilization": "1.0"
+            } });
+        let reply = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, finish.clone()));
+        assert_eq!(reply["observation"]["effects"][1]["lease_ended"], true);
+        assert_eq!(reply["observation"]["effects"][2]["effect"], "fence");
+        let lease_until = || {
+            fixture
+                .store()
+                .account_transaction(|tx| {
+                    let row = tx.admission(BROCA, "adm-finish")?.unwrap();
+                    Ok(tx
+                        .affinity(BROCA, &row.conversation_hash, &row.provider)?
+                        .unwrap()
+                        .lease_valid_until)
+                })
+                .unwrap()
+        };
+        assert_eq!(lease_until(), Some(finish_time));
+        let reply = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, finish.clone()));
+        assert_eq!(reply["observation"]["duplicate"], true);
+        // A different admission can renew the same affinity after run end.
+        let renewed_until = NOW + 180_000;
+        fixture
+            .store()
+            .account_transaction(|tx| {
+                let row = tx.admission(BROCA, "adm-finish")?.unwrap();
+                let mut affinity = tx
+                    .affinity(BROCA, &row.conversation_hash, &row.provider)?
+                    .unwrap();
+                affinity.lease_valid_until = Some(renewed_until);
+                let expected = (affinity.pin_id.clone(), affinity.pin_generation);
+                assert!(tx.put_affinity(&affinity, Some((&expected.0, expected.1)))?);
+                Ok(())
+            })
+            .unwrap();
+        let later = fixture.ctx(true, false, finish_time + 1000);
+        let mut new_finish = finish;
+        new_finish["event_id"] = json!("lineage:6");
+        new_finish.as_object_mut().unwrap().remove("headers");
+        let reply = result(fixture.call(&later, ACCOUNT_OBSERVE_OP, BROCA, new_finish));
+        assert_eq!(
+            reply["observation"]["effects"],
+            json!([{ "effect": "none", "state": "finished" }])
+        );
+        let reply = result(fixture.call(
+            &later,
+            ACCOUNT_RELEASE_OP,
+            BROCA,
+            json!({ "admission_id": "adm-finish" }),
+        ));
+        assert_eq!(reply["release"]["released"], false);
+        assert_eq!(reply["release"]["lease_ended"], false);
+        assert_eq!(lease_until(), Some(renewed_until));
+        assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 1);
     }
 
     #[test]
