@@ -28,6 +28,7 @@ pub mod quota_poll;
 pub mod route_scoring;
 pub mod route_state_store;
 pub mod routing_config;
+pub mod runner;
 pub mod seat_routing;
 
 pub use aa_infer::{

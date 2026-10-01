@@ -2928,12 +2928,21 @@ async fn handle_select_request(
                     if let Some(required_capabilities) = required_capabilities {
                         resolved_input["requiredCapabilities"] = json!(required_capabilities);
                     }
-                    let body = serde_json::to_vec(&json!({ "result": {
+                    let mut result = json!({
                         "selected": selected,
                         "decisionID": decision_id,
                         "resolvedInput": resolved_input,
-                    }}))
-                    .map_err(ModuleError::Json)?;
+                    });
+                    if is_broca_substrate(params.substrate.as_deref()) {
+                        result["runner"] =
+                            json!(prefrontal_routing_core::runner::RunnerModel::broca(
+                                &selected.model.provider_id,
+                                &selected.model.model_id,
+                                selected.prompt_params.variant.as_deref(),
+                            ));
+                    }
+                    let body = serde_json::to_vec(&json!({ "result": result }))
+                        .map_err(ModuleError::Json)?;
                     let response = Frame::build_with_version(
                         ver,
                         FrameType::Response,
@@ -8803,6 +8812,49 @@ mod tests {
             params["substrate"] = json!(substrate);
         }
         json!({ "method": ROUTE_SELECT_OP, "params": params })
+    }
+
+    #[tokio::test]
+    async fn broca_runner_maps_gateway_and_omitted_availability_matches_explicit() {
+        let rig = Rig::new("broca-runner");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("opencode-go", "m-native-fast"), FactSource::Override)
+            .unwrap();
+        let handles = rig.dir.join("vault-handles.json");
+        std::fs::write(
+            &handles,
+            r#"{"handles":{"apikey:opencode-go":"ckh_fixture"}}"#,
+        )
+        .unwrap();
+        let mut results = Vec::new();
+        for omitted in [false, true] {
+            let mut request = broca_select_request(&["opencode-go/m-native-fast"], Some("broca"));
+            if omitted {
+                request["params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("availableModels");
+            }
+            let response = run_route_wire_request_with_paths(
+                &store,
+                request,
+                Path::new("/nonexistent/alfonso-routing.jsonc"),
+                &handles,
+            )
+            .await;
+            assert_eq!(response.header.ty, FrameType::Response);
+            results.push(
+                serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"]
+                    .clone(),
+            );
+        }
+        assert_eq!(results[0]["selected"], results[1]["selected"]);
+        assert_eq!(results[0]["resolvedInput"], results[1]["resolvedInput"]);
+        assert_eq!(
+            results[1]["runner"],
+            json!({"provider":"opencode", "model":"m-native-fast"})
+        );
     }
 
     fn decision_explanation(store: &SharedStore, result: &serde_json::Value) -> String {
