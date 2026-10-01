@@ -16,8 +16,9 @@
 //!
 //! `#[ignore]` by default: builds subc-core AND insula (the quota module) from sibling
 //! repos and binds real loopback ports. Run:
-//!   cargo test -p prefrontal-routing-module --test both_modules_e2e -- --ignored --nocapture
+//!   cargo test -p prefrontal-routing-module --test it both_modules_e2e:: -- --ignored --nocapture
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::{

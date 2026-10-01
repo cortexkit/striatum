@@ -349,15 +349,15 @@ fn migration_004_preserves_a_preseeded_override() {
             &[
                 Migration {
                     version: 1,
-                    statements: include_str!("../migrations/001_route_state.sql"),
+                    statements: include_str!("../../migrations/001_route_state.sql"),
                 },
                 Migration {
                     version: 2,
-                    statements: include_str!("../migrations/002_usage.sql"),
+                    statements: include_str!("../../migrations/002_usage.sql"),
                 },
                 Migration {
                     version: 3,
-                    statements: include_str!("../migrations/003_drop_reservations.sql"),
+                    statements: include_str!("../../migrations/003_drop_reservations.sql"),
                 },
             ],
         )
@@ -866,7 +866,7 @@ fn migration_030_preserves_real_028_era_decision_rows_without_join_identity() {
         ($version:literal, $file:literal) => {
             Migration {
                 version: $version,
-                statements: include_str!(concat!("../migrations/", $file)),
+                statements: include_str!(concat!("../../migrations/", $file)),
             }
         };
     }
@@ -1989,19 +1989,19 @@ fn panel_decision_kind_and_migration() {
             &[
                 Migration {
                     version: 1,
-                    statements: include_str!("../migrations/001_route_state.sql"),
+                    statements: include_str!("../../migrations/001_route_state.sql"),
                 },
                 Migration {
                     version: 2,
-                    statements: include_str!("../migrations/002_usage.sql"),
+                    statements: include_str!("../../migrations/002_usage.sql"),
                 },
                 Migration {
                     version: 3,
-                    statements: include_str!("../migrations/003_drop_reservations.sql"),
+                    statements: include_str!("../../migrations/003_drop_reservations.sql"),
                 },
                 Migration {
                     version: 4,
-                    statements: include_str!("../migrations/004_gpt56_family.sql"),
+                    statements: include_str!("../../migrations/004_gpt56_family.sql"),
                 },
             ],
         )
@@ -2109,27 +2109,27 @@ fn migration_007_rebases_catalog_and_preserves_overrides() {
             &[
                 Migration {
                     version: 1,
-                    statements: include_str!("../migrations/001_route_state.sql"),
+                    statements: include_str!("../../migrations/001_route_state.sql"),
                 },
                 Migration {
                     version: 2,
-                    statements: include_str!("../migrations/002_usage.sql"),
+                    statements: include_str!("../../migrations/002_usage.sql"),
                 },
                 Migration {
                     version: 3,
-                    statements: include_str!("../migrations/003_drop_reservations.sql"),
+                    statements: include_str!("../../migrations/003_drop_reservations.sql"),
                 },
                 Migration {
                     version: 4,
-                    statements: include_str!("../migrations/004_gpt56_family.sql"),
+                    statements: include_str!("../../migrations/004_gpt56_family.sql"),
                 },
                 Migration {
                     version: 5,
-                    statements: include_str!("../migrations/005_panel_selection.sql"),
+                    statements: include_str!("../../migrations/005_panel_selection.sql"),
                 },
                 Migration {
                     version: 6,
-                    statements: include_str!("../migrations/006_grok_45.sql"),
+                    statements: include_str!("../../migrations/006_grok_45.sql"),
                 },
             ],
         )
@@ -3905,7 +3905,7 @@ fn migration_041_removes_fast_facts_and_route_state_without_touching_history() {
         )
         .unwrap();
     connection
-        .execute_batch(include_str!("../migrations/041_retire_fast_routes.sql"))
+        .execute_batch(include_str!("../../migrations/041_retire_fast_routes.sql"))
         .unwrap();
     let facts: Vec<String> = connection
         .prepare("SELECT route_key FROM model_facts ORDER BY route_key")

@@ -368,7 +368,7 @@ fn account_producer_false_replay_admits_time_but_never_invents_tokens_or_fit() {
         "fixture is the named producer-deferral branch"
     );
     let fixture: ReplayFixture =
-        serde_json::from_str(include_str!("fixtures/quota-reading-log-replay-v1.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/quota-reading-log-replay-v1.json")).unwrap();
     let readings = fixture
         .raw_used_percents
         .iter()

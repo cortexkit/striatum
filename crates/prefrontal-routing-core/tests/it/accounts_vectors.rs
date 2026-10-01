@@ -3,6 +3,7 @@
 //! confirmation rule, and the three 0.995 laundering paths from
 //! `docs/designs/account-selection.md` ("Golden fixtures").
 
+#[path = "../accounts_support/mod.rs"]
 mod accounts_support;
 
 use accounts_support::*;
@@ -19,7 +20,7 @@ use prefrontal_routing_core::accounts::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const VECTORS: &str = include_str!("fixtures/antauth-routing-vectors-b504bc84-20260929.json");
+const VECTORS: &str = include_str!("../fixtures/antauth-routing-vectors-b504bc84-20260929.json");
 /// The digest `docs/designs/account-selection.md` records for the vectors (ref N).
 const VECTORS_SHA256: &str = "82cfd614d8d7de8f1a533debe2a78f2a3639c90d0e14e4eca0ca3919e38478ff";
 

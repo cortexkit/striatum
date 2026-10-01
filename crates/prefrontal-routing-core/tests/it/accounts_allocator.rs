@@ -3,6 +3,7 @@
 //! table), plus the operator's reply-code ruling for pools emptied by model
 //! reach or runner-candidate narrowing.
 
+#[path = "../accounts_support/mod.rs"]
 mod accounts_support;
 
 use accounts_support::*;

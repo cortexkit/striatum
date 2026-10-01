@@ -12,8 +12,9 @@
 //! (this workspace) and `subc-core` (the sibling `../subconscious`). `#[ignore]` by
 //! default because it shells out to `cargo build` in a sibling repo and binds real
 //! loopback ports: run explicitly:
-//!   cargo test -p prefrontal-routing-module --test real_daemon_e2e -- --ignored --nocapture
+//!   cargo test -p prefrontal-routing-module --test it real_daemon_e2e:: -- --ignored --nocapture
 
+#[path = "../common/mod.rs"]
 mod common;
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
