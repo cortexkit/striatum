@@ -570,7 +570,8 @@ async fn account_quota_dry_run(
     connection_file_path: PathBuf,
     capture_dir: Option<PathBuf>,
 ) -> Result<(), ModuleError> {
-    let project_root = std::env::temp_dir().join("prefrontal-routing-account-quota-dry-run");
+    let project_root =
+        prefrontal_core_store::scratch_root().join("prefrontal-routing-account-quota-dry-run");
     let _ = std::fs::create_dir_all(&project_root);
     let mut consumer = QuotaConsumer::connect(&connection_file_path, &project_root)
         .await

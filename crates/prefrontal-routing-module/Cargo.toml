@@ -17,6 +17,7 @@ sha2 = "0.10"
 prefrontal-ckcred-client = { path = "../prefrontal-ckcred-client" }
 prefrontal-routing-core = { path = "../prefrontal-routing-core" }
 prefrontal-routing-store = { path = "../prefrontal-routing-store" }
+prefrontal-core-store = { path = "../prefrontal-core-store" }
 cortexkit-store-types = { workspace = true }
 subc-protocol = { workspace = true }
 subc-transport = { workspace = true }

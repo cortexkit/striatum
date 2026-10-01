@@ -1512,7 +1512,8 @@ pub async fn account_quota_loop(
     store: Arc<SqliteRouteStateStore>,
     resolver: Arc<dyn CredentialResolver>,
 ) {
-    let project_root = std::env::temp_dir().join("prefrontal-routing-account-quota");
+    let project_root =
+        prefrontal_core_store::scratch_root().join("prefrontal-routing-account-quota");
     let _ = std::fs::create_dir_all(&project_root);
     let providers = account_provider_names();
     loop {
