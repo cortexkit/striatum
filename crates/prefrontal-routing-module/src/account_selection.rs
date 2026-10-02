@@ -256,8 +256,70 @@ fn conversation_hash(salt: &str, principal: &str, conversation_key: &str) -> Str
     hex(&hasher.finalize())
 }
 
-fn fingerprint(params: &Value) -> String {
-    hex(&Sha256::digest(params.to_string().as_bytes()))
+/// Hash only admission identity, using a typed struct's fixed-order JSON encoding.
+/// Each accepted request field is classified here:
+/// - `provider`: in; selects the provider (normalized like selection).
+/// - `model`: in; selects the model and its family.
+/// - `affinity_model`: in; selects the affinity family, defaulting to `model`.
+/// - `conversation_key`: in; selects the conversation's affinity.
+/// - `caller.runner`: in as caller kind; Broca and plugins have different pin rules.
+/// - `caller.harness`: out; descriptive runner metadata, not admission identity.
+/// - `admission_id`: out; already the lookup key, namespaced by principal.
+/// - `mode`: in; distinguishes admission, renewal and reassignment.
+/// - `expected_pin`: in; identifies the pin/generation being renewed or reassigned.
+/// - `initial_input_bytes`: out; advisory demand estimate may change on retry.
+/// - `initial_input_estimated`: out; describes that advisory estimate.
+/// - `model_decision_id`: out; provenance of model choice, not the chosen model.
+/// - `candidates` (including `view_digest`, `accounts`, `account_id` and
+///   `credential_id`): out; the runner's vault/roster view may change on retry.
+/// - `requested_account` (`account_id`, `credential_id`): in as the effective
+///   account reference; an explicit operator override changes the admission.
+/// - `preferred_existing_account` (`account_id`, `credential_id`): in as the
+///   effective reference; importing a local pin changes the requested affinity.
+/// - `hold_wait_max_s`: out; advisory wait budget, not admission identity.
+/// Unknown fields are ignored by parsing, so quota hints, digests and timestamps
+/// outside this schema cannot change identity either.
+///
+/// Replay returns the stored decision even if its account vanished from the new
+/// candidates. The runner's credential read handles it like any revoked credential.
+/// This encoding was introduced before production enabled account serving
+/// (`account_selection.enabled`). With that flag off, handlers refuse admissions;
+/// shadow mode records hypothetical decisions but creates no admission rows.
+/// Thus production has no whole-request fingerprints to migrate. This relies on
+/// serving never having been enabled, not on the 60 s reservation start window:
+/// expired admission rows remain stored and would still use their old hash.
+fn fingerprint(params: &AccountForParams) -> String {
+    #[derive(Serialize)]
+    struct AdmissionIdentity<'a> {
+        provider: String,
+        model: String,
+        affinity_model: String,
+        conversation_key: &'a str,
+        caller: CallerKind,
+        mode: RequestMode,
+        expected_pin: &'a Option<PinRef>,
+        requested_account: Option<AccountRef>,
+        preferred_existing_account: Option<AccountRef>,
+    }
+    let identity = AdmissionIdentity {
+        provider: normalize(&params.provider),
+        model: normalize(&params.model),
+        affinity_model: normalize(params.affinity_model()),
+        conversation_key: &params.conversation_key,
+        caller: params.caller_kind(),
+        mode: params.mode,
+        expected_pin: &params.expected_pin,
+        requested_account: params
+            .requested_account
+            .as_ref()
+            .and_then(AccountRefParams::to_ref),
+        preferred_existing_account: params
+            .preferred_existing_account
+            .as_ref()
+            .and_then(AccountRefParams::to_ref),
+    };
+    let encoded = serde_json::to_vec(&identity).expect("admission identity is serializable");
+    hex(&Sha256::digest(&encoded))
 }
 
 fn normalize(value: &str) -> String {
@@ -936,7 +998,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     // The roster is read before the transaction: no lock or fetch happens
     // while the selection transaction is open.
     let roster = roster_for(ctx, &provider);
-    let request_fingerprint = fingerprint(params);
+    let request_fingerprint = fingerprint(&parsed);
     ctx.store
         .account_transaction(|tx| {
             serve(
@@ -1076,9 +1138,9 @@ fn serve(
     }
 }
 
-/// A duplicate admission id: the same parameters get the committed decision
-/// back (marked `expired` once its start window has passed) and charge
-/// nothing; different parameters are a conflict.
+/// A duplicate admission id: the same identity gets the committed decision
+/// back (marked `expired` once its start window has passed) and charges
+/// nothing; different identity fields are a conflict.
 fn replay(
     tx: &AccountTx<'_>,
     principal: &str,
@@ -2503,6 +2565,122 @@ mod tests {
     }
 
     #[test]
+    fn different_candidates_replay_the_stored_decision_without_charging() {
+        let fixture = fixture("replay-candidates");
+        let ctx = fixture.ctx(true, false, NOW);
+        let mut params = admit_params("adm-retry", "broca:retry", "broca");
+        params["candidates"] = json!({
+            "view_digest": "vault-before",
+            "accounts": [{ "account_id": ACCOUNT_A, "credential_id": "oauth:anthropic" }]
+        });
+        let reply = result(fixture.call(&ctx, ACCOUNT_FOR_OP, BROCA, params.clone()));
+        assert_eq!(reply["account"]["account_id"], ACCOUNT_A);
+        let before = fixture
+            .store()
+            .account_transaction(|tx| tx.admission(BROCA, "adm-retry"))
+            .unwrap()
+            .unwrap();
+        assert!(before.charged);
+        let counts = fixture.store().account_serving_counts().unwrap().total();
+        params["candidates"] = json!({
+            "view_digest": "vault-after",
+            "accounts": [{ "account_id": ACCOUNT_B, "credential_id": "oauth:anthropic:ysample" }]
+        });
+        let replayed = result(fixture.call(&ctx, ACCOUNT_FOR_OP, BROCA, params));
+        assert_eq!(
+            replayed, reply,
+            "replay keeps even an account absent from candidates"
+        );
+        let after = fixture
+            .store()
+            .account_transaction(|tx| tx.admission(BROCA, "adm-retry"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before, "replay must not change the charged demand");
+        assert_eq!(
+            fixture.store().account_serving_counts().unwrap().total(),
+            counts
+        );
+        assert_eq!(
+            fixture.serve_rows().len(),
+            1,
+            "replay creates no new decision"
+        );
+    }
+
+    #[test]
+    fn admission_fingerprint_is_independent_of_json_key_order() {
+        let forward: Value = serde_json::from_str(r#"{
+            "provider":"anthropic", "model":"claude-opus-5-5",
+            "conversation_key":"broca:retry", "caller":{"runner":"broca","harness":"test"},
+            "admission_id":"adm-retry", "requested_account":{"account_id":"account-a","credential_id":"cred-a"}
+        }"#).unwrap();
+        let reversed: Value = serde_json::from_str(
+            r#"{
+            "requested_account":{"credential_id":"cred-a","account_id":"account-a"},
+            "admission_id":"adm-retry", "caller":{"harness":"test","runner":"broca"},
+            "conversation_key":"broca:retry", "model":"claude-opus-5-5", "provider":"anthropic"
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fingerprint(&parse_account_for(&forward).unwrap()),
+            fingerprint(&parse_account_for(&reversed).unwrap())
+        );
+    }
+
+    #[test]
+    fn admission_fingerprint_ignores_advisory_inputs_but_covers_identity() {
+        let params = admit_params("adm-identity", "broca:identity", "broca");
+        let baseline = fingerprint(&parse_account_for(&params).unwrap());
+        for (field, value) in [
+            ("initial_input_bytes", json!(99)),
+            ("initial_input_estimated", json!(true)),
+            ("model_decision_id", json!("new-decision")),
+            ("hold_wait_max_s", json!(10)),
+            ("caller", json!({"runner":"BROCA", "harness":"new-harness"})),
+            ("vault_digest", json!("new-view")),
+            ("quota_hint", json!(123)),
+            ("timestamp", json!(NOW + 1)),
+        ] {
+            let mut changed = params.clone();
+            changed[field] = value;
+            assert_eq!(
+                fingerprint(&parse_account_for(&changed).unwrap()),
+                baseline,
+                "{field}"
+            );
+        }
+        for (field, value) in [
+            ("provider", json!("openai")),
+            ("model", json!("claude-fable-5-5")),
+            ("affinity_model", json!("claude-fable-5-5")),
+            ("conversation_key", json!("broca:other")),
+            ("caller", json!({"runner":"plugin"})),
+            ("expected_pin", json!({"id":"pin", "generation":1})),
+            ("requested_account", json!({"account_id":"other"})),
+            (
+                "preferred_existing_account",
+                json!({"credential_id":"other"}),
+            ),
+        ] {
+            let mut changed = params.clone();
+            changed[field] = value;
+            assert_ne!(
+                fingerprint(&parse_account_for(&changed).unwrap()),
+                baseline,
+                "{field}"
+            );
+        }
+        let mut renew = params;
+        renew["mode"] = json!("renew");
+        renew["expected_pin"] = json!({"id":"pin", "generation":1});
+        let renewing = fingerprint(&parse_account_for(&renew).unwrap());
+        renew["mode"] = json!("reassign");
+        assert_ne!(fingerprint(&parse_account_for(&renew).unwrap()), renewing);
+    }
+
+    #[test]
     fn a_served_pin_survives_a_reopen_and_renewal_compare_and_sets_on_it() {
         let mut fixture = fixture("serve");
         let ctx = fixture.ctx(true, false, NOW);
@@ -2531,11 +2709,11 @@ mod tests {
         let account = reply["account"]["account_id"].as_str().unwrap().to_string();
 
         // A transport retry gets the committed decision back; reusing the id
-        // with other parameters is a conflict.
+        // with another model changes admission identity and is a conflict.
         let again = result(fixture.call(&ctx, ACCOUNT_FOR_OP, BROCA, params.clone()));
         assert_eq!(again, reply);
         let mut changed = params.clone();
-        changed["initial_input_bytes"] = json!(99);
+        changed["model"] = json!("claude-fable-5-5");
         let conflict = fixture.call(&ctx, ACCOUNT_FOR_OP, BROCA, changed);
         assert_eq!(conflict.code(), Some("admission_conflict"));
 
