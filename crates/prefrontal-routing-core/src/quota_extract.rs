@@ -8,9 +8,11 @@
 //! under one account: its aggregate `primary`=100% reflects EXHAUSTED external
 //! models (Claude, GPT-OSS), while the Geminis we route to sit in
 //! `extra_rate_windows[]` at low utilization, so the aggregate must be IGNORED and
-//! the per-model windows mapped to specific capacity keys instead.
+//! the scoped windows mapped to specific capacity keys instead. Antigravity's
+//! scoped windows are POOLS (`gemini-5h`, `3p-weekly`, ...) shared by a model
+//! family, mapped through `ANTIGRAVITY_POOL_BY_MODEL_FAMILY`.
 
-use crate::quota::{ProviderUsage, RateWindow};
+use crate::quota::{ExtraWindow, ProviderUsage, RateWindow};
 use crate::quota_pace::ProviderWindowModel;
 
 /// The routing scope a window applies to. `account` pressures every route of the
@@ -23,6 +25,9 @@ pub enum WindowScopeKind {
     ModelFamily,
     CapacityKey,
     RouteKey,
+    /// One Antigravity quota pool (`applies_key` is the pool name, e.g. `gemini`):
+    /// it applies to every routed capacity whose model draws on that pool.
+    AntigravityPool,
 }
 
 /// A normalized window an extractor emits; the overlay runs pace + worst-wins on it.
@@ -30,7 +35,8 @@ pub enum WindowScopeKind {
 pub struct ExtractedWindow {
     pub window_key: String,
     pub scope_kind: WindowScopeKind,
-    /// capacity key when scope is CapacityKey / family key for ModelFamily.
+    /// capacity key when scope is CapacityKey / family key for ModelFamily /
+    /// pool name for AntigravityPool.
     pub applies_key: Option<String>,
     /// Effective utilization, normalized to 0..1.
     pub utilization: f64,
@@ -220,11 +226,116 @@ fn slug(s: &str) -> String {
     }
 }
 
-/// Antigravity (Google AI Ultra): ignore the misleading aggregate windows; map each
-/// per-model window in extra_rate_windows[] to its matching capacity key,
-/// capacity-key-scoped. Unmatched titles (models we don't route to) are skipped. If
-/// extra_rate_windows is absent, emit NOTHING (correct-or-nothing) rather than fall
-/// back to the misleading aggregate.
+/// Insula's provider name for Antigravity. Only its entries carry pooled windows;
+/// the `gemini` product also resolves to the `google` provider id but publishes
+/// per-model windows under different credentials, so it must never be pooled.
+const ANTIGRAVITY_WIRE_PROVIDER: &str = "antigravity";
+
+/// Routing model ids served through Antigravity start with this prefix
+/// (`google/antigravity-gemini-3.8-flash`, `google/antigravity-claude-opus-...`).
+const ANTIGRAVITY_MODEL_PREFIX: &str = "antigravity-";
+
+/// Which Antigravity quota pool each routed model family draws on, keyed by the
+/// family token right after `antigravity-` in the routing model id.
+///
+/// Source: QTA (Insula's owner), read live 2026-10-02. Antigravity publishes no
+/// primary window; every pool is an `extraRateWindows` entry whose id is
+/// `<pool>-<period>`: `gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly`. Gemini
+/// models use the `gemini` pool; third-party models served through Antigravity
+/// (Claude, GPT) use the `3p` pool. A model whose family is not listed here gets
+/// no pool signal rather than a guessed one.
+pub const ANTIGRAVITY_POOL_BY_MODEL_FAMILY: &[(&str, &str)] =
+    &[("gemini", "gemini"), ("claude", "3p"), ("gpt", "3p")];
+
+/// The Antigravity pool a routing capacity key draws on, if it is an
+/// Antigravity-served model of a known family.
+pub fn antigravity_pool_for_capacity(capacity_key: &str) -> Option<&'static str> {
+    let model_id = capacity_key
+        .split_once('/')
+        .map_or(capacity_key, |(_, model)| model);
+    let family = model_id
+        .strip_prefix(ANTIGRAVITY_MODEL_PREFIX)?
+        .split('-')
+        .next()?;
+    ANTIGRAVITY_POOL_BY_MODEL_FAMILY
+        .iter()
+        .find(|(known_family, _)| *known_family == family)
+        .map(|(_, pool)| *pool)
+}
+
+/// The routed capacities that draw on one Antigravity pool.
+pub fn antigravity_pool_capacities(pool: &str, capacity_keys: &[String]) -> Vec<String> {
+    capacity_keys
+        .iter()
+        .filter(|key| antigravity_pool_for_capacity(key) == Some(pool))
+        .cloned()
+        .collect()
+}
+
+/// The period of an Antigravity pool window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolPeriod {
+    FiveHour,
+    Weekly,
+}
+
+impl PoolPeriod {
+    /// Insula's `windowKind` vocabulary.
+    fn from_window_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "five_hour" => Some(Self::FiveHour),
+            "weekly" => Some(Self::Weekly),
+            _ => None,
+        }
+    }
+
+    /// The period suffix the pool ids carry today (`gemini-5h`, `3p-weekly`).
+    fn from_id_suffix(suffix: &str) -> Option<Self> {
+        match suffix {
+            "5h" => Some(Self::FiveHour),
+            "weekly" => Some(Self::Weekly),
+            _ => None,
+        }
+    }
+
+    fn window_ms(self) -> f64 {
+        let minutes = match self {
+            Self::FiveHour => 300.0,
+            Self::Weekly => 10_080.0,
+        };
+        minutes * 60_000.0
+    }
+}
+
+/// Recognize an Antigravity pool window: an id `<pool>-<period>` whose pool is in
+/// `ANTIGRAVITY_POOL_BY_MODEL_FAMILY` and whose period is known. `windowKind`
+/// wins when the producer publishes a value we know; the id suffix is the
+/// fallback. Anything else is not a pool window: an unknown shape is never
+/// guessed into a pool, since one wrong guess merges two independent meters.
+fn antigravity_pool_window(item: &ExtraWindow) -> Option<(&'static str, PoolPeriod)> {
+    let (pool, suffix) = item.id.as_deref()?.rsplit_once('-')?;
+    let pool = ANTIGRAVITY_POOL_BY_MODEL_FAMILY
+        .iter()
+        .map(|(_, known_pool)| *known_pool)
+        .find(|known_pool| *known_pool == pool)?;
+    let window_kind = item.window_kind.as_deref().or_else(|| {
+        item.window
+            .as_ref()
+            .and_then(|window| window.window_kind.as_deref())
+    });
+    let period = window_kind
+        .and_then(PoolPeriod::from_window_kind)
+        .or_else(|| PoolPeriod::from_id_suffix(suffix))?;
+    Some((pool, period))
+}
+
+/// Antigravity (Google AI Ultra): ignore the misleading aggregate windows. Pool
+/// windows in extra_rate_windows[] (`gemini-5h`, `3p-weekly`, ...) are emitted
+/// pool-scoped, so they pressure and wall exactly the routed models that draw on
+/// that pool. Any other window is mapped by title to its matching capacity key,
+/// capacity-key-scoped; unmatched titles (models we don't route to) are skipped.
+/// If extra_rate_windows is absent, emit NOTHING (correct-or-nothing) rather than
+/// fall back to the misleading aggregate.
 fn antigravity_per_model_extractor(
     entry: &ProviderUsage,
     cb_provider_name: &str,
@@ -240,8 +351,29 @@ fn antigravity_per_model_extractor(
     if extra.is_empty() {
         return Vec::new();
     }
+    let pooled_entry = cb_provider_name == ANTIGRAVITY_WIRE_PROVIDER;
     let mut out = Vec::new();
     for item in extra {
+        if pooled_entry {
+            if let (Some((pool, period)), Some(window), Some(id)) = (
+                antigravity_pool_window(item),
+                item.window.as_ref(),
+                item.id.as_deref(),
+            ) {
+                if let Some(mut extracted) = rate_window_to_extracted(
+                    Some(window),
+                    format!("codexbar:{cb_provider_name}:{id}"),
+                    WindowScopeKind::AntigravityPool,
+                    Some(pool.to_string()),
+                ) {
+                    // The period names the window length when the producer did
+                    // not publish `windowMinutes` itself.
+                    extracted.window_ms = extracted.window_ms.or(Some(period.window_ms()));
+                    out.push(extracted);
+                }
+                continue;
+            }
+        }
         let (Some(title), Some(window)) = (item.title.as_ref(), item.window.as_ref()) else {
             continue;
         };
@@ -285,7 +417,7 @@ pub fn extract_windows(
 // Parses "YYYY-MM-DDTHH:MM:SS(.fff)?(Z|+HH:MM|-HH:MM)" to ms epoch. Returns None on
 // any shape it cannot parse (the window is then skipped, matching JS Date.parse →
 // NaN → skip).
-fn chrono_parse_rfc3339(s: &str) -> Option<f64> {
+pub(crate) fn chrono_parse_rfc3339(s: &str) -> Option<f64> {
     let bytes = s.as_bytes();
     if bytes.len() < 19 {
         return None;
@@ -358,6 +490,7 @@ mod tests {
             resets_at: Some(resets_at.into()),
             window_minutes: mins,
             window_model: None,
+            window_kind: None,
         }
     }
 
@@ -422,6 +555,7 @@ mod tests {
                     resets_at: None,
                     window_minutes: Some(10_080),
                     window_model: None,
+                    window_kind: None,
                 }),
                 secondary: None,
                 tertiary: None,
@@ -462,6 +596,7 @@ mod tests {
                     resets_at: None,
                     window_minutes: Some(10_080),
                     window_model: None,
+                    window_kind: None,
                 }),
                 secondary: None,
                 tertiary: None,
@@ -527,12 +662,14 @@ mod tests {
                         title: Some("Gemini 3.5 Flash (High)".into()),
                         id: Some("gemini-flash".into()),
                         window: Some(win(20.0, "2026-01-01T00:00:00Z", None)),
+                        window_kind: None,
                     },
                     // GPT-OSS is not a routed capacity key → skipped.
                     ExtraWindow {
                         title: Some("GPT-OSS 120B".into()),
                         id: None,
                         window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                        window_kind: None,
                     },
                 ]),
             }),
@@ -601,11 +738,13 @@ mod tests {
                         title: Some("Claude and GPT models".into()),
                         id: None,
                         window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                        window_kind: None,
                     },
                     ExtraWindow {
                         title: Some("Gemini 3.6 Flash".into()),
                         id: Some("gemini-flash".into()),
                         window: Some(win(40.0, "2026-01-01T00:00:00Z", None)),
+                        window_kind: None,
                     },
                 ]),
             }),
@@ -664,11 +803,13 @@ mod tests {
                         title: Some("gemini-2.5-flash".into()),
                         id: Some("gemini-2.5-flash".into()),
                         window: Some(win(100.0, "2026-01-01T00:00:00Z", Some(1440))),
+                        window_kind: None,
                     },
                     ExtraWindow {
                         title: Some("gemini-3.1-flash-lite".into()),
                         id: Some("gemini-3.1-flash-lite".into()),
                         window: Some(win(100.0, "2026-01-01T00:00:00Z", Some(1440))),
+                        window_kind: None,
                     },
                 ]),
             }),
@@ -691,16 +832,16 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_local_lane_external_forms_also_never_reach_capacities() {
-        // The LOCAL lane's shapes for the same walled external pool: upstream
-        // bucket ids ("3p-5h") and composed titles ("Claude and GPT models
-        // Five Hour Limit"). "3p-5h" is the dangerous form: it shares no token
-        // with claude, gpt, or gemini, so nothing name-shaped can skip it - it
-        // drops only because POSITIVE matching finds no routed capacity for
-        // it. This vector red-flags any matcher widening that sweeps unmatched
-        // windows in. Cloud and local shapes are pinned in separate vectors
-        // because the serving lane flips with an editor process's lifecycle:
-        // both are live on the same host in the same week.
+    fn antigravity_local_lane_pools_reach_only_their_own_family() {
+        // The LOCAL lane's shapes: upstream bucket ids ("3p-5h") and composed
+        // titles ("Claude and GPT models Five Hour Limit"). Antigravity has
+        // published pooled windows on BOTH lanes since it shipped (QTA), so the
+        // per-model title matcher never extracted anything from an antigravity
+        // entry and routing walked into exhausted pools blind. Pools are now
+        // read by id through ANTIGRAVITY_POOL_BY_MODEL_FAMILY. The hazard this
+        // vector used to pin still holds, in its positive form: the walled
+        // external "3p" pool must reach no Gemini capacity, only models that
+        // draw on "3p" (Claude, GPT through Antigravity).
         let entry = ProviderUsage {
             stale: None,
             fetched_at: None,
@@ -717,33 +858,19 @@ mod tests {
                         title: Some("Claude and GPT models Five Hour Limit".into()),
                         id: Some("3p-5h".into()),
                         window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                        window_kind: None,
                     },
                     ExtraWindow {
                         title: Some("Claude and GPT models Weekly Limit".into()),
                         id: Some("3p-weekly".into()),
                         window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                        window_kind: None,
                     },
-                    // OBSERVED local-lane native pool (QTA has seen this pair
-                    // on the live agy wire; the earlier draft paired an
-                    // invented "g-5h" id with a per-model title the local lane
-                    // CANNOT compose - every local title is <group> <bucket>,
-                    // never a model name, so that vector asserted an
-                    // unreachable shape). CAUSAL RECORD, corrected by QTA from
-                    // their lane's first commit: antigravity has published
-                    // pooled windows on BOTH lanes since the day it shipped -
-                    // the per-model extractor below has never extracted
-                    // anything from an antigravity entry, and zero extractions
-                    // read exactly like a provider with nothing to report. The
-                    // per-model shape this extractor fits lives on the GEMINI
-                    // wire provider (ids like "gemini-2.5-pro"), which resolves
-                    // to the same "google" providerID: two products, one API.
-                    // So antigravity signal, if ever wanted, needs a
-                    // POOL-LEVEL extractor - there was never a lane change to
-                    // hunt for, and this test pins the state that always held.
                     ExtraWindow {
                         title: Some("Gemini Models Five Hour Limit".into()),
                         id: Some("gemini-5h".into()),
                         window: Some(win(25.0, "2026-01-01T00:00:00Z", None)),
+                        window_kind: None,
                     },
                 ]),
             }),
@@ -752,21 +879,78 @@ mod tests {
             error_class: None,
             saved_resets: None,
         };
-        let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
+        let caps = vec![
+            "google/antigravity-gemini-3.6-flash".to_string(),
+            "google/antigravity-claude-opus-4-6-thinking".to_string(),
+            // The Gemini API product shares the provider id; no pool applies.
+            "google/gemini-3.6-flash".to_string(),
+        ];
         let out = extract_windows(&entry, "google", "antigravity", &caps);
-        // The local lane's POOLED titles match no per-model capacity, so the
-        // whole lane extracts nothing - external pools AND the native pool
-        // alike. That is the honest current state (pooled windows cannot
-        // pressure per-model capacities through a title matcher) and the
-        // correct-by-polarity outcome for the external forms. If antigravity
-        // signal is ever wanted from the local lane, it needs a pool-level
-        // extractor, not a looser matcher: loosening is exactly the widening
-        // the comment above forbids.
+        let pools: Vec<(&str, Option<&str>, Option<f64>)> = out
+            .iter()
+            .map(|w| {
+                assert_eq!(w.scope_kind, WindowScopeKind::AntigravityPool);
+                (w.window_key.as_str(), w.applies_key.as_deref(), w.window_ms)
+            })
+            .collect();
         assert_eq!(
-            out.len(),
-            0,
-            "pooled local-lane windows match no per-model capacity; nothing extracts"
+            pools,
+            vec![
+                ("codexbar:antigravity:3p-5h", Some("3p"), Some(300.0 * 60_000.0)),
+                (
+                    "codexbar:antigravity:3p-weekly",
+                    Some("3p"),
+                    Some(10_080.0 * 60_000.0)
+                ),
+                ("codexbar:antigravity:gemini-5h", Some("gemini"), Some(300.0 * 60_000.0)),
+            ],
+            "the id suffix names the period when windowMinutes is absent"
         );
+        assert_eq!(
+            antigravity_pool_capacities("3p", &caps),
+            vec!["google/antigravity-claude-opus-4-6-thinking".to_string()],
+            "the external pool reaches Claude-through-Antigravity only"
+        );
+        assert_eq!(
+            antigravity_pool_capacities("gemini", &caps),
+            vec!["google/antigravity-gemini-3.6-flash".to_string()],
+            "the Gemini pool reaches Antigravity Gemini only, never the Gemini API product"
+        );
+    }
+
+    #[test]
+    fn antigravity_window_kind_wins_over_the_id_suffix() {
+        let mut item = ExtraWindow {
+            title: None,
+            id: Some("gemini-weekly".into()),
+            window: Some(win(10.0, "2026-01-01T00:00:00Z", None)),
+            window_kind: Some("five_hour".into()),
+        };
+        assert_eq!(
+            antigravity_pool_window(&item),
+            Some(("gemini", PoolPeriod::FiveHour))
+        );
+        // An unknown windowKind falls back to the suffix rather than dropping.
+        item.window_kind = Some("fortnightly".into());
+        assert_eq!(
+            antigravity_pool_window(&item),
+            Some(("gemini", PoolPeriod::Weekly))
+        );
+        // windowKind inside the window is honoured too.
+        item.window_kind = None;
+        item.window.as_mut().unwrap().window_kind = Some("five_hour".into());
+        assert_eq!(
+            antigravity_pool_window(&item),
+            Some(("gemini", PoolPeriod::FiveHour))
+        );
+        // A pool-looking id with no known period and no windowKind is not
+        // guessed into a pool.
+        item.window.as_mut().unwrap().window_kind = None;
+        item.id = Some("gemini-flash".into());
+        assert_eq!(antigravity_pool_window(&item), None);
+        // Nor is an unknown pool name.
+        item.id = Some("other-5h".into());
+        assert_eq!(antigravity_pool_window(&item), None);
     }
 
     #[test]

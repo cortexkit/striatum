@@ -36,9 +36,15 @@ pub struct RateWindow {
     /// until routing has a model that can account for a moving recovery horizon.
     #[serde(default, alias = "windowType")]
     pub window_model: Option<ProviderWindowModel>,
+    /// The window's period as Insula names it (`five_hour`, `weekly`). Additive:
+    /// older producers omit it, and readers then fall back to the window id.
+    /// Kept as a String so a new period is an unknown value, not a decode error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_kind: Option<String>,
 }
 
-/// A per-model window bundled under one account (e.g. Antigravity's Geminis).
+/// A scoped window bundled under one account: a per-model window, or one of
+/// Antigravity's pooled windows (`gemini-5h`, `3p-weekly`, ...).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtraWindow {
@@ -48,6 +54,10 @@ pub struct ExtraWindow {
     pub id: Option<String>,
     #[serde(default)]
     pub window: Option<RateWindow>,
+    /// The window's period (`five_hour`, `weekly`), when the producer publishes it
+    /// beside the id rather than inside `window`. See `RateWindow::window_kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_kind: Option<String>,
 }
 
 /// The window topology for one account: up to three account-wide pools plus an
@@ -259,7 +269,7 @@ use std::collections::HashMap;
 
 use crate::model_facts::{make_capacity_key, ModelFact};
 use crate::model_router::ModelRouteStateSnapshot;
-use crate::quota_extract::{extract_windows, WindowScopeKind};
+use crate::quota_extract::{antigravity_pool_capacities, extract_windows, WindowScopeKind};
 use crate::quota_pace::{
     project_quota_abundance, project_quota_pressure, PaceConfig, PaceError, PaceInput,
     PaceWindowModel, DEFAULT_PACE_CONFIG,
@@ -384,7 +394,8 @@ fn record_capacity_signal(
 /// handling, pressure projection, and exhaustion rules below:
 ///   - the wire name is mapped to a routing providerID via `name_map`;
 ///   - each provider's windows are EXTRACTED per its topology (account-wide pools
-///     vs antigravity's per-model `extra_rate_windows` → capacity scope);
+///     vs antigravity's pooled `extra_rate_windows` → the capacities of the
+///     models that draw on that pool);
 ///   - past-reset windows are skipped when a reset is present; each live window's
 ///     soft pressure is the pace PROJECTION (lockout-cost), not raw utilization;
 ///   - a window with `limit_reached` or utilization >= the hard-block threshold
@@ -514,6 +525,13 @@ pub fn merge_quota_overlay_with(
             let targets: Vec<String> = match win.scope_kind {
                 WindowScopeKind::Account => provider_caps.clone(),
                 WindowScopeKind::CapacityKey => win.applies_key.clone().into_iter().collect(),
+                // A pooled window pressures and walls every routed model that
+                // draws on that pool, and no other model of the provider.
+                WindowScopeKind::AntigravityPool => win
+                    .applies_key
+                    .as_deref()
+                    .map(|pool| antigravity_pool_capacities(pool, provider_caps))
+                    .unwrap_or_default(),
                 // ModelFamily/RouteKey are not emitted by the live extractors.
                 WindowScopeKind::ModelFamily | WindowScopeKind::RouteKey => {
                     win.applies_key.clone().into_iter().collect()
@@ -882,6 +900,270 @@ mod tests {
             y.quota_abundance_window.as_deref(),
             Some("codexbar:antigravity:y-window")
         );
+    }
+
+    /// One Antigravity account in the live 2026-10-02 shape: no primary window,
+    /// every pool an `extraRateWindows` entry keyed by `<pool>-<period>`.
+    fn antigravity_account(account: &str, pools: &[(&str, f64, &str)]) -> ProviderUsage {
+        let windows: Vec<serde_json::Value> = pools
+            .iter()
+            .map(|(id, used, resets_at)| {
+                let minutes = if id.ends_with("-5h") { 300 } else { 10_080 };
+                serde_json::json!({
+                    "title": format!("{id} title"),
+                    "id": id,
+                    "window": {
+                        "usedPercent": used,
+                        "resetsAt": resets_at,
+                        "windowMinutes": minutes
+                    }
+                })
+            })
+            .collect();
+        usage(serde_json::json!({
+            "provider": "antigravity",
+            "apiProvider": null,
+            "account": account,
+            "usage": {
+                "primary": null,
+                "secondary": null,
+                "tertiary": null,
+                "extraRateWindows": windows
+            }
+        }))
+    }
+
+    fn antigravity_overlay(
+        windows: &[ProviderUsage],
+        facts: &[ModelFact],
+    ) -> ModelRouteStateSnapshot {
+        // Insula publishes antigravity with a null apiProvider; the routing
+        // module maps the wire name to the google provider id.
+        let name_map = HashMap::from([("antigravity".to_string(), "google".to_string())]);
+        let mut snapshot = ModelRouteStateSnapshot {
+            now: NOW_MS,
+            by_route: HashMap::new(),
+            by_capacity: HashMap::new(),
+        };
+        merge_quota_overlay_with(
+            &mut snapshot,
+            windows,
+            facts,
+            &name_map,
+            NOW_MS,
+            &DEFAULT_PACE_CONFIG,
+            DEFAULT_HARD_BLOCK_THRESHOLD,
+        );
+        snapshot
+    }
+
+    const AG_GEMINI: &str = "google/antigravity-gemini-3.8-flash";
+    const AG_CLAUDE: &str = "google/antigravity-claude-opus-4-6-thinking";
+    const API_GEMINI: &str = "google/gemini-3.8-flash";
+    const ALTERNATIVE: &str = "openai/gpt-alternative";
+
+    /// Antigravity Gemini is the cheapest-looking route; the alternative costs more.
+    fn antigravity_facts() -> Vec<ModelFact> {
+        let mut alternative = fact("openai", "gpt-alternative", 50.0);
+        alternative.cost_per_m_tok_out = Some(5.0);
+        vec![
+            fact("google", "antigravity-gemini-3.8-flash", 100.0),
+            fact("google", "antigravity-claude-opus-4-6-thinking", 10.0),
+            fact("google", "gemini-3.8-flash", 10.0),
+            alternative,
+        ]
+    }
+
+    fn ms(rfc3339: &str) -> f64 {
+        crate::quota_extract::chrono_parse_rfc3339(rfc3339).expect("fixture timestamp")
+    }
+
+    #[test]
+    fn antigravity_gemini_5h_at_100_walls_the_route_until_its_reset() {
+        let facts = antigravity_facts();
+        assert_eq!(
+            select(facts.clone(), antigravity_overlay(&[], &facts)),
+            AG_GEMINI,
+            "without quota, Antigravity Gemini is the route that wins"
+        );
+
+        // Live account heidi: gemini-5h exhausted, gemini-weekly not.
+        let reset = "2030-01-01T01:19:00Z";
+        let entry = antigravity_account(
+            "only",
+            &[
+                ("gemini-weekly", 29.4, "2030-01-05T00:00:00Z"),
+                ("gemini-5h", 100.0, reset),
+                ("3p-weekly", 0.05, "2030-01-04T00:00:00Z"),
+                ("3p-5h", 0.0, "2030-01-01T04:00:00Z"),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[entry], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until,
+            Some(ms(reset)),
+            "walled until the reset of the window at 100%"
+        );
+        assert_eq!(
+            snapshot
+                .by_capacity
+                .get(AG_CLAUDE)
+                .and_then(|state| state.quota_exhausted_until),
+            None,
+            "the 3p pool is free, so Claude through Antigravity is not walled"
+        );
+        assert!(
+            !snapshot.by_capacity.contains_key(API_GEMINI),
+            "the Gemini API product draws on no Antigravity pool"
+        );
+        // Selection between the walled route and the alternative only: Claude
+        // through Antigravity is free here, and its own admission is asserted above.
+        let contest: Vec<ModelFact> = facts
+            .into_iter()
+            .filter(|fact| {
+                let key = make_capacity_key(&fact.provider_id, &fact.model_id);
+                key == AG_GEMINI || key == ALTERNATIVE
+            })
+            .collect();
+        assert_eq!(
+            select(contest, snapshot),
+            ALTERNATIVE,
+            "the walled route loses to the pricier alternative"
+        );
+    }
+
+    #[test]
+    fn antigravity_pool_worst_window_drives_projected_pressure_and_admits() {
+        let facts = antigravity_facts();
+        // 5h window: 40% used one hour in (4h left), a burn that runs out before
+        // reset. Weekly: 29% used three days in, comfortably on pace.
+        let five_hour_reset = "2030-01-01T04:00:00Z";
+        let weekly_reset = "2030-01-05T00:00:00Z";
+        let entry = antigravity_account(
+            "only",
+            &[
+                ("gemini-weekly", 29.0, weekly_reset),
+                ("gemini-5h", 40.0, five_hour_reset),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[entry], &facts);
+        let state = &snapshot.by_capacity[AG_GEMINI];
+        assert_eq!(state.quota_exhausted_until, None, "admitted, not walled");
+
+        let projected = |used: f64, resets_at: &str, minutes: f64| {
+            project_quota_pressure(
+                PaceInput {
+                    utilization: used,
+                    resets_at: Some(ms(resets_at)),
+                    window_ms: Some(minutes * 60_000.0),
+                    observed_at: NOW_MS,
+                    provider_window_model: None,
+                },
+                &DEFAULT_PACE_CONFIG,
+            )
+            .expect("fixed window")
+            .pressure
+        };
+        let five_hour = projected(0.40, five_hour_reset, 300.0);
+        let weekly = projected(0.29, weekly_reset, 10_080.0);
+        assert!(
+            five_hour > weekly,
+            "fixture: the 5h window must be the worse one ({five_hour} vs {weekly})"
+        );
+        assert_eq!(
+            state.quota_pressure,
+            Some(five_hour),
+            "pressure is the pool's worst window, projected like every provider's"
+        );
+        assert_eq!(state.quota_window_model, Some(PaceWindowModel::Fixed));
+    }
+
+    #[test]
+    fn antigravity_third_party_models_read_the_3p_pool_not_the_gemini_pool() {
+        let facts = antigravity_facts();
+        let gemini_walled = antigravity_account(
+            "only",
+            &[
+                ("gemini-5h", 100.0, "2030-01-01T01:00:00Z"),
+                ("3p-5h", 10.0, "2030-01-01T04:00:00Z"),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[gemini_walled], &facts);
+        assert!(snapshot.by_capacity[AG_GEMINI].quota_exhausted_until.is_some());
+        assert_eq!(snapshot.by_capacity[AG_CLAUDE].quota_exhausted_until, None);
+
+        let third_party_walled = antigravity_account(
+            "only",
+            &[
+                ("gemini-5h", 10.0, "2030-01-01T04:00:00Z"),
+                ("3p-weekly", 100.0, "2030-01-03T00:00:00Z"),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[third_party_walled], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_CLAUDE].quota_exhausted_until,
+            Some(ms("2030-01-03T00:00:00Z"))
+        );
+        assert_eq!(snapshot.by_capacity[AG_GEMINI].quota_exhausted_until, None);
+    }
+
+    #[test]
+    fn antigravity_pool_walls_only_when_every_account_is_walled() {
+        let facts = antigravity_facts();
+        // Live 2026-10-02: one account's 5h pool spent, the other's weekly spent.
+        let five_hour_spent = antigravity_account(
+            "heidi",
+            &[
+                ("gemini-weekly", 29.4, "2030-01-05T00:00:00Z"),
+                ("gemini-5h", 100.0, "2030-01-01T01:19:00Z"),
+            ],
+        );
+        let weekly_spent = antigravity_account(
+            "grace",
+            &[("gemini-weekly", 100.0, "2030-01-07T00:00:00Z")],
+        );
+        let free = antigravity_account(
+            "free",
+            &[
+                ("gemini-weekly", 5.0, "2030-01-05T00:00:00Z"),
+                ("gemini-5h", 5.0, "2030-01-01T04:00:00Z"),
+            ],
+        );
+
+        let snapshot = antigravity_overlay(&[five_hour_spent.clone(), weekly_spent.clone(), free], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until,
+            None,
+            "one usable account keeps the route open"
+        );
+
+        let snapshot = antigravity_overlay(&[five_hour_spent, weekly_spent], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until,
+            Some(ms("2030-01-01T01:19:00Z")),
+            "every account walled: the route reopens at the earliest account reset"
+        );
+    }
+
+    #[test]
+    fn antigravity_entry_without_extra_rate_windows_keeps_todays_behaviour() {
+        let facts = antigravity_facts();
+        // The misleading aggregate alone, as before pools were read.
+        let entry = usage(serde_json::json!({
+            "provider": "antigravity",
+            "account": "only",
+            "usage": { "primary": {
+                "usedPercent": 100.0,
+                "resetsAt": "2030-01-01T01:00:00Z",
+                "windowMinutes": 300
+            }}
+        }));
+        let snapshot = antigravity_overlay(&[entry], &facts);
+        assert!(
+            snapshot.by_capacity.is_empty(),
+            "no extraRateWindows: no Antigravity signal at all, as before"
+        );
+        assert_eq!(select(facts, snapshot), AG_GEMINI);
     }
 
     #[test]

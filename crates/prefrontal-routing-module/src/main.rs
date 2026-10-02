@@ -7832,6 +7832,148 @@ mod tests {
         (row.selected_route_key.unwrap(), signal)
     }
 
+    /// One Antigravity account as Insula publishes it (null apiProvider, no
+    /// primary window, every pool an `extraRateWindows` entry).
+    fn antigravity_reading(account: &str, pools: &[(&str, f64, u64)]) -> ProviderUsage {
+        let windows: Vec<serde_json::Value> = pools
+            .iter()
+            .map(|(id, used, resets_at_ms)| {
+                json!({
+                    "title": format!("{id} title"),
+                    "id": id,
+                    "window": {
+                        "usedPercent": used,
+                        "resetsAt": rfc3339_utc(*resets_at_ms),
+                        "windowMinutes": if id.ends_with("-5h") { 300 } else { 10_080 }
+                    }
+                })
+            })
+            .collect();
+        usage(json!({
+            "provider": "antigravity",
+            "apiProvider": null,
+            "account": account,
+            "usage": { "extraRateWindows": windows }
+        }))
+    }
+
+    /// Drive one `route.select` shaped exactly like the spec dispatcher's slice
+    /// worker request (core-module `spec/runtime.rs`: target agent `mason`,
+    /// iq 70 / eq 0, the consult's available and subscription keys).
+    async fn select_spec_slice(
+        store: &SharedStore,
+        quota_cache: QuotaCache,
+        available: &[&str],
+        task_id: &str,
+    ) -> String {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let request = json!({
+            "method": ROUTE_SELECT_OP,
+            "params": {
+                "targetAgent": "mason",
+                "requirements": { "iq": 70, "eq": 0 },
+                "availableModels": available,
+                "excludeRouteKeys": [],
+                "subscriptionKeys": available,
+                "preferPromptCache": false,
+                "taskId": task_id,
+                "parentSessionId": "spec-parent"
+            }
+        });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &Arc::new(Mutex::new(quota_cache)),
+            store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_opencode_auth(),
+        )
+        .await
+        .unwrap();
+        let response = rx.recv().await.unwrap();
+        assert_eq!(
+            response.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        store
+            .get_decisions_for_task(task_id)
+            .unwrap()
+            .remove(0)
+            .selected_route_key
+            .unwrap()
+    }
+
+    /// Live 2026-10-02: every Antigravity account had its Gemini pool spent (one
+    /// on `gemini-5h`, one on `gemini-weekly`), Insula had published both, and
+    /// spec-slice masons still went to `google/antigravity-gemini-3.8-flash` and
+    /// failed at start. The Insula reading alone must wall the route on the
+    /// spec dispatcher's selection path.
+    #[tokio::test]
+    async fn spec_slice_selection_skips_a_walled_antigravity_route() {
+        const ANTIGRAVITY: &str = "google/antigravity-gemini-3.8-flash";
+        const ALTERNATIVE: &str = "openai/spec-alternative";
+        let mut antigravity = fact("google", "antigravity-gemini-3.8-flash");
+        antigravity.cost_per_m_tok_out = Some(0.0);
+        antigravity.cost_tier = None;
+        let mut alternative = fact("openai", "spec-alternative");
+        alternative.cost_per_m_tok_out = Some(10.0);
+        for route in [&mut antigravity, &mut alternative] {
+            route.scores.elo = 1_900.0;
+        }
+        let rig = Rig::new("spec-slice-antigravity-wall");
+        let store: SharedStore = Arc::new(rig.open_store());
+        for route in [&antigravity, &alternative] {
+            store.upsert_fact(route, FactSource::Override).unwrap();
+        }
+        let available = [ANTIGRAVITY, ALTERNATIVE];
+
+        assert_eq!(
+            select_spec_slice(&store, QuotaCache::default(), &available, "spec-baseline").await,
+            ANTIGRAVITY,
+            "fixture: without a quota reading the cheaper Antigravity route wins"
+        );
+
+        let now = now_ms();
+        let five_hour_reset = now + 74 * 60_000;
+        let mut walled = QuotaCache::default();
+        apply_quota_refresh(
+            &mut walled,
+            vec![
+                antigravity_reading(
+                    "heidi",
+                    &[
+                        ("gemini-weekly", 29.4, now + 4 * 86_400_000),
+                        ("gemini-5h", 100.0, five_hour_reset),
+                        ("3p-5h", 0.0, now + 3_600_000),
+                    ],
+                ),
+                antigravity_reading("grace", &[("gemini-weekly", 100.0, now + 6 * 86_400_000)]),
+            ],
+            now,
+        );
+        assert_eq!(
+            select_spec_slice(&store, walled, &available, "spec-walled").await,
+            ALTERNATIVE,
+            "every usable Antigravity account is spent on the gemini pool"
+        );
+    }
+
     #[tokio::test]
     async fn restarted_module_selects_the_same_quota_winner_from_the_persisted_snapshot() {
         let rig = Rig::new("quota-snapshot-restart");
