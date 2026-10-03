@@ -1520,10 +1520,9 @@ pub async fn account_quota_loop(
     loop {
         let listing = resolver.list_scoped().await;
         let at_ms = now_ms();
-        // Reuse the credential listing this loop iteration just fetched instead of
-        // asking the vault again. The Broca reachability cache records which
-        // providers that listing maps and when it arrived; its lock is taken only
-        // after the fetch returns, never across the network call.
+        // Derive which catalog providers Broca has credentials for from each
+        // credential's operator-set provider IDs, reusing this fetched listing.
+        // The cache lock is taken after the fetch, never across the network call.
         if let Ok(mut credentials) = broca_credentials.lock() {
             match &listing {
                 Ok(listing) => {

@@ -9340,10 +9340,9 @@ mod tests {
         );
     }
 
-    /// Health is recomputed from the latest credential listing on every check, so
-    /// once the operator completes the provider mapping the "reachability unknown"
-    /// degradation clears, even if an earlier Broca send had to fall back to the
-    /// whole served catalog.
+    /// Each health check uses the latest credential listing. Completing the
+    /// provider mapping clears the "broca reachability unknown" detail, even if
+    /// an earlier Broca send fell back to the whole served catalog.
     #[tokio::test]
     async fn unknown_broca_reach_degrades_health_until_listing_maps_it() {
         let ModuleControlResponse::HealthCheck { status, detail, .. } =

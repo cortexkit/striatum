@@ -338,9 +338,9 @@ mod tests {
             );
             assert_eq!(available.len(), 2);
 
-            // The operator maps the last unmapped credential: every credential
-            // now has provider ids, so only mapped providers are reachable and
-            // health reports ok.
+            // Operator-set provider IDs determine which catalog providers Broca
+            // has credentials for. Mapping the last credential makes that set
+            // complete, so health reports ok.
             let mut mapped = listing;
             mapped.view = "mapped-view".into();
             mapped.credentials[1].provider_ids = vec!["anthropic".into()];
@@ -386,9 +386,8 @@ mod tests {
         let original = listing(vec![credential("mapped", &["anthropic"])]);
         assert!(cache.apply_listing(&original, 0));
         cache.note_failure("temporary error");
-        // The listing digest decides whether anything changed: with the same
-        // digest the cache keeps its provider set, even if a row in this reply
-        // differs.
+        // The vault's hash of the listing decides whether anything changed. With
+        // the same digest the cache keeps its provider set, even if a reply row differs.
         let mut unchanged = original.clone();
         unchanged.credentials.clear();
         assert!(!cache.apply_listing(&unchanged, MAX_AGE_MS + 1));
