@@ -333,7 +333,7 @@ mod tests {
                 crate::panel_availability(Some("broca"), HashSet::new(), &facts, &shared);
             assert_eq!(
                 substrate,
-                prefrontal_routing_core::AvailabilitySubstrate::Broca
+                prefrontal_routing_core::AvailabilitySubstrate::BrocaServedCatalog
             );
             assert_eq!(available.len(), 2);
 

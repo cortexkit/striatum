@@ -365,6 +365,55 @@ fn an_availability_rejection_names_the_substrate_whose_list_was_consulted() {
         detail_for(AvailabilitySubstrate::Broca),
         Some("broca".to_string())
     );
+    assert_eq!(
+        detail_for(AvailabilitySubstrate::BrocaServedCatalog),
+        Some("broca reachability unknown: judged against served catalog".to_string())
+    );
+}
+
+/// A pinned seat whose send failed on quota in one round is asked about again
+/// in the next with the wall recorded on its route. It must read as a quota
+/// wall carrying the reset it is waiting for, on either substrate's list: a
+/// seat reported `unavailable` sends the reader looking for a missing provider
+/// when the fix is waiting for the window to reset.
+#[test]
+fn a_pinned_seat_walled_by_quota_reads_as_quota_with_its_reset() {
+    for substrate in [
+        AvailabilitySubstrate::Host,
+        AvailabilitySubstrate::BrocaServedCatalog,
+    ] {
+        let walled = vec![fact("walled", 1_700.0, Some("a"))];
+        let mut input = panel_input(walled, spec(1, 0.0, PanelDiversity::None));
+        input.availability_substrate = substrate;
+        input.runtime_snapshot = Some(ModelRouteStateSnapshot {
+            now: 1_000.0,
+            by_route: HashMap::from([(
+                "p/walled".into(),
+                RouteRuntimeState {
+                    cooldown_until: Some(61_000.0),
+                    quota_exhausted_until: Some(61_000.0),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        });
+        let panel = select_panel(input).unwrap();
+        assert!(panel.members.is_empty(), "a walled pin does not sit");
+        let cause = panel
+            .shortfall
+            .expect("the walled pin leaves the panel short")
+            .causes
+            .into_iter()
+            .find(|cause| cause.model == "p/walled")
+            .expect("the walled pin is reported");
+        assert_eq!(
+            cause.reason,
+            PanelCauseReason::QuotaExhausted,
+            "{substrate:?}"
+        );
+        let detail = cause.detail.expect("a wall names its reset");
+        assert!(detail.contains("until_ms=61000"), "{substrate:?}: {detail}");
+    }
 }
 
 #[test]

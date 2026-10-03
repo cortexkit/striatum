@@ -30,6 +30,9 @@ use crate::routing_config::{
     DEFAULT_ROUTING_CONFIG, EFFECTIVELY_FREE_SELECTION_COST, MIN_BEST_EFFORT_ADEQUACY,
     OBJECTIVE_WEIGHT_QUOTA, RELATIVE_SHORTLIST_DELTA, SPEED_CEILING_TPS, SPEED_FLOOR_TPS,
 };
+use crate::slot_saturation::{
+    pick_unsaturated, ConcurrencySlots, SlotSaturation, REASON_PROVIDER_SATURATED,
+};
 
 /// A route the operator's standing policy fences off. Distinct from [`REASON_EXCLUDED`]
 /// so a reader of a rejection can tell "the machine owner said never" from "this
@@ -238,6 +241,12 @@ pub struct SelectedModelRoute {
     /// stays in the units the selection was made in, and so a decision record
     /// names its unit without re-deriving it from the explanation text.
     pub priced_with_basket: bool,
+    /// Present when the caller's concurrency slot counts changed this decision:
+    /// a full slot was passed over, or every adequate candidate was full and
+    /// the normal winner will queue. Absent when no counts were sent or they
+    /// changed nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_saturation: Option<SlotSaturation>,
 }
 
 /// One shortlisted route priced in the selection it actually sat in.
@@ -1025,9 +1034,21 @@ pub fn select_model_route_with_config(
     input: SelectModelRouteInput<'_>,
     config: &RoutingConfig,
 ) -> Result<SelectedModelRoute, NoRouteError> {
+    select_model_route_with_slots(input, config, None)
+}
+
+/// [`select_model_route_with_config`] with the caller's concurrency slot counts.
+/// The shortlist is ordered exactly as without them; then the first candidate
+/// whose slot has room wins (see [`crate::slot_saturation`]). `None` is the
+/// unchanged selection.
+pub fn select_model_route_with_slots(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    slots: Option<&ConcurrencySlots>,
+) -> Result<SelectedModelRoute, NoRouteError> {
     let PricedAdmission {
         admissible,
-        rejected,
+        mut rejected,
         scored,
         use_basket,
         best_effort,
@@ -1096,13 +1117,23 @@ pub fn select_model_route_with_config(
             chosen = without_term;
         }
     }
-    let mut slots: Vec<Option<Scored>> = scored.into_iter().map(Some).collect();
+    let mut taken: Vec<Option<Scored>> = scored.into_iter().map(Some).collect();
     let scored: Vec<Scored> = chosen
         .into_iter()
-        .map(|position| slots[position].take().expect("each position is used once"))
+        .map(|position| taken[position].take().expect("each position is used once"))
         .collect();
 
-    let winner = &scored[0];
+    // Saturation only chooses among the ordered shortlist, so it can pass over a
+    // full route but never admit one the quality gate left out.
+    let ordered: Vec<(&str, &str)> = scored
+        .iter()
+        .map(|s| {
+            let route = &admissible[s.idx].route;
+            (route.route_key.as_str(), route.capacity_key.as_str())
+        })
+        .collect();
+    let (winner_position, slot_saturation) = pick_unsaturated(&ordered, slots);
+    let winner = &scored[winner_position];
     let winner_admissible = &admissible[winner.idx];
     let fact = &winner_admissible.route.fact;
     let mut explanation: Vec<String> = Vec::new();
@@ -1142,6 +1173,14 @@ pub fn select_model_route_with_config(
                 )
             }),
     );
+    if let Some(saturation) = &slot_saturation {
+        explanation.extend(saturation.explanation_lines());
+        rejected.extend(saturation.skipped.iter().map(|skipped| RejectedRoute {
+            route_key: skipped.route_key.clone(),
+            reason: REASON_PROVIDER_SATURATED.to_string(),
+            detail: Some(skipped.slot.describe()),
+        }));
+    }
 
     let prompt_variant = fact
         .prompt_defaults
@@ -1180,6 +1219,7 @@ pub fn select_model_route_with_config(
         rejected,
         explanation,
         priced_with_basket: use_basket,
+        slot_saturation,
         below_floor: (best_effort && winner_admissible.adequacy.adequacy < ADEQUACY_FLOOR)
             .then_some(BelowFloorWarning {
                 adequacy: winner_admissible.adequacy.adequacy,

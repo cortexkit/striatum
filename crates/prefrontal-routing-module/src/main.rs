@@ -41,13 +41,14 @@ use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
 use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::model_router::{
-    select_model_route_with_config, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
+    select_model_route_with_slots, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
     RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::quota::quota_poll::record_reading_log_poll;
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
 use prefrontal_routing_core::route_state_store::FactSource;
 use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
+use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, live_billing_wall_error, make_route_key,
     relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
@@ -68,7 +69,9 @@ use subc_protocol::{
         ManagementOperation, ManagementOperationKind, ManifestProvenance, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
-    session::{ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK},
+    session::{
+        HealthStatus, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
+    },
     ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
@@ -135,6 +138,14 @@ const QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Decision audit rows are retained for one month before the existing refresh
 /// cycle deletes them.
 const DECISION_RETENTION_MS: u64 = 30 * 24 * 60 * 60_000;
+/// Age past which the cached quota snapshot no longer steers selection. The
+/// refresh runs every minute, so a snapshot this old means refreshes have been
+/// failing (or hanging) for many cycles. Quota windows move within that time:
+/// insula spends banked resets, five-hour windows roll over, and a wall read an
+/// hour ago is no evidence of a wall now. Past this bound selection treats quota
+/// as unknown (neutral pressure, no quota walls), each decision says so, and
+/// health reports degraded with the snapshot's age.
+const QUOTA_STALE_AFTER_MS: u64 = 15 * 60_000;
 
 /// Latest quota snapshot, shared between the background refresh task (writer) and
 /// `route.select` handlers (readers). The lock is NEVER held across an `.await`:
@@ -157,6 +168,66 @@ struct QuotaCache {
 }
 
 type SharedQuotaCache = Arc<Mutex<QuotaCache>>;
+
+/// The cached snapshot's age when it is past [`QUOTA_STALE_AFTER_MS`]; `None`
+/// while it is fresh or when there has never been a reading to age.
+fn stale_quota_age_ms(refreshed_at_ms: u64, now_ms: u64) -> Option<u64> {
+    if refreshed_at_ms == 0 {
+        return None;
+    }
+    let age_ms = now_ms.saturating_sub(refreshed_at_ms);
+    (age_ms > QUOTA_STALE_AFTER_MS).then_some(age_ms)
+}
+
+/// Human-readable age for health details and decision notes, e.g. "7h05m".
+fn render_age(age_ms: u64) -> String {
+    let minutes = age_ms / 60_000;
+    if minutes >= 60 {
+        format!("{}h{:02}m", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+/// The explanation line a decision carries when its quota snapshot is stale.
+fn stale_quota_note(age_ms: u64, last_error: Option<&str>) -> String {
+    let mut note = format!(
+        "quota signal: stale (last successful refresh {} ago, bound {}); quota pressure and walls ignored, every provider ranked as quota-unknown",
+        render_age(age_ms),
+        render_age(QUOTA_STALE_AFTER_MS)
+    );
+    if let Some(error) = last_error {
+        note.push_str(&format!("; last refresh error: {error}"));
+    }
+    note
+}
+
+/// The routing module's health from its quota snapshot: degraded, naming the
+/// age and the last refresh error, once the snapshot is stale.
+fn quota_health(cache: &QuotaCache, now_ms: u64) -> (Option<String>, serde_json::Value) {
+    let age_ms = (cache.refreshed_at_ms > 0).then(|| now_ms.saturating_sub(cache.refreshed_at_ms));
+    let stale_age = stale_quota_age_ms(cache.refreshed_at_ms, now_ms);
+    let metrics = json!({
+        "available": cache.available,
+        "refreshedAtMs": cache.refreshed_at_ms,
+        "ageMs": age_ms,
+        "staleAfterMs": QUOTA_STALE_AFTER_MS,
+        "stale": stale_age.is_some(),
+        "lastError": cache.last_error,
+    });
+    let detail = stale_age.map(|age_ms| {
+        let mut detail = format!(
+            "quota snapshot stale: last successful refresh {} ago (bound {}); selection treats quota as unknown",
+            render_age(age_ms),
+            render_age(QUOTA_STALE_AFTER_MS)
+        );
+        if let Some(error) = &cache.last_error {
+            detail.push_str(&format!("; last refresh error: {error}"));
+        }
+        detail
+    });
+    (detail, metrics)
+}
 
 /// The per-account quota state, set once when the store opens. It is a process
 /// global rather than a handler argument because only the read-only
@@ -307,12 +378,17 @@ fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
             .spend
             .iter()
             .filter(|pool| pool.has_supported_funding())
-            .all(|pool| pool.remaining.is_non_positive());
+            .all(|pool| pool.is_known_empty());
         let withheld: Vec<String> = entry
             .spend
             .iter()
-            .filter(|pool| !pool.has_supported_funding() && !pool.remaining.is_non_positive())
-            .map(|pool| format!("{} ({})", pool.remaining.render(), pool.funding))
+            .filter(|pool| !pool.has_supported_funding())
+            .filter_map(|pool| {
+                pool.remaining
+                    .as_ref()
+                    .filter(|remaining| !remaining.is_non_positive())
+                    .map(|remaining| format!("{} ({})", remaining.render(), pool.funding))
+            })
             .collect();
         if all_spendable_empty && !withheld.is_empty() {
             eprintln!(
@@ -451,7 +527,17 @@ fn restore_quota_cache(store: &SqliteRouteStateStore) -> QuotaCache {
 
 fn record_quota_refresh_failure(cache: &mut QuotaCache, phase: &str, error: impl fmt::Display) {
     cache.available = false;
-    cache.last_error = Some(format!("{phase}: {error}"));
+    let error = format!("{phase}: {error}");
+    // The loop retries every few seconds, so print only when the reason
+    // changes. This failure used to go to debug tracing only, which left a
+    // refresh failing on every retry for hours with nothing in the stderr log.
+    if cache.last_error.as_deref() != Some(error.as_str()) {
+        eprintln!(
+            "[prefrontal-routing] quota refresh failed; selection keeps the snapshot from refreshedAtMs {} until a refresh succeeds or it goes stale: {error}",
+            cache.refreshed_at_ms
+        );
+    }
+    cache.last_error = Some(error);
 }
 
 fn record_cooldown_update(
@@ -1041,6 +1127,7 @@ async fn handle_frame(
                 route_epochs,
                 catalog_health,
                 broca_credentials,
+                quota_cache,
             )
             .await?;
             Ok(true)
@@ -1089,6 +1176,7 @@ async fn handle_control_request(
     route_epochs: &mut RouteEpochs,
     catalog_health: &SharedCatalogHealth,
     broca_credentials: &SharedBrocaCredentials,
+    quota_cache: &SharedQuotaCache,
 ) -> Result<(), ModuleError> {
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
@@ -1127,17 +1215,34 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
+            // Broca mapping gaps and stale quota snapshots can coexist. Report
+            // both so repairing one cannot hide the other from the operator.
             let mut report = broca_credentials
                 .lock()
                 .map(|credentials| credentials.health_report(now_ms()))
                 .unwrap_or_else(|_| BrocaCredentials::default().health_report(now_ms()));
             let broca_metrics = report.metrics.take();
+            let (quota_detail, quota_metrics) = match quota_cache.lock() {
+                Ok(cache) => quota_health(&cache, now_ms()),
+                Err(_) => (
+                    Some("quota cache lock poisoned".to_string()),
+                    json!({ "lastError": "cache poisoned" }),
+                ),
+            };
+            if let Some(detail) = quota_detail {
+                report.status = HealthStatus::Degraded;
+                report.detail = Some(match report.detail.take() {
+                    Some(existing) => format!("{existing}; {detail}"),
+                    None => detail,
+                });
+            }
             report.metrics = Some(json!({
                 "brocaReachability": broca_metrics,
                 "fusiformCatalog": catalog_health
                     .lock()
                     .map(|health| health.snapshot(now_ms()))
                     .unwrap_or_else(|_| json!({ "reach": "never-reached", "lastError": "health lock poisoned" })),
+                "quota": quota_metrics,
             }));
             let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(ModuleError::Json)?;
@@ -1224,6 +1329,12 @@ struct SelectParams {
     /// remains null because the router never invents a send correlation.
     #[serde(default, rename = "sendID")]
     send_id: Option<String>,
+    /// The caller's concurrency slot counts at request time, keyed by
+    /// `provider/model`. A candidate whose slot is full is passed over for this
+    /// decision only; absent (older callers, or a caller whose launch is not
+    /// limited by these slots) leaves the selection unchanged.
+    #[serde(default)]
+    concurrency_slots: Option<Vec<ConcurrencySlotState>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2326,6 +2437,9 @@ struct PreparedSelectionInputs {
     facts: Vec<ModelFact>,
     snapshot: ModelRouteStateSnapshot,
     quota_signal_json: String,
+    /// Set when the quota snapshot was too old to use: the explanation line
+    /// saying so, which a selected route carries.
+    quota_note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2334,18 +2448,32 @@ struct DecisionProvenance {
     policy_revision: String,
 }
 
-/// Summarize the cached overlay that the scorer consumed without serializing the
-/// full quota response. A no-signal marker is explicit so it cannot be confused
-/// with old rows written before the provenance columns existed.
-fn quota_signal_json(
-    snapshot: &ModelRouteStateSnapshot,
-    windows: &[ProviderUsage],
+/// The cache facts a decision's quota signal summary is built from.
+struct QuotaSignalView<'a> {
+    windows: &'a [ProviderUsage],
     available: bool,
     refreshed_at_ms: u64,
     retained_degraded_count: usize,
-    last_error: Option<&str>,
+    last_error: Option<&'a str>,
     restored_from_ms: Option<u64>,
-) -> String {
+    /// The snapshot's age when it is past the staleness bound; its windows
+    /// were then NOT merged into the snapshot the scorer read.
+    stale_age_ms: Option<u64>,
+}
+
+/// Summarize the cached overlay that the scorer consumed without serializing the
+/// full quota response. A no-signal marker is explicit so it cannot be confused
+/// with old rows written before the provenance columns existed.
+fn quota_signal_json(snapshot: &ModelRouteStateSnapshot, view: &QuotaSignalView<'_>) -> String {
+    let QuotaSignalView {
+        windows,
+        available,
+        refreshed_at_ms,
+        retained_degraded_count,
+        last_error,
+        restored_from_ms,
+        stale_age_ms,
+    } = *view;
     let mut signals: Vec<serde_json::Value> = snapshot
         .by_capacity
         .iter()
@@ -2368,7 +2496,21 @@ fn quota_signal_json(
     });
 
     let healthy_provider_count = windows.iter().filter(|window| window.is_healthy()).count();
-    let mut summary = if healthy_provider_count == 0 {
+    let mut summary = if let Some(age_ms) = stale_age_ms.filter(|_| healthy_provider_count > 0) {
+        // The cached readings were too old to steer this decision: say so, with
+        // their age, rather than recording them as the signal that was used.
+        json!({
+            "state": "stale",
+            "reason": stale_quota_note(age_ms, None),
+            "available": available,
+            "refreshedAtMs": refreshed_at_ms,
+            "ageMs": age_ms,
+            "staleAfterMs": QUOTA_STALE_AFTER_MS,
+            "lastError": last_error,
+            "healthyProviderCount": healthy_provider_count,
+            "signals": signals,
+        })
+    } else if healthy_provider_count == 0 {
         let reason = if windows.is_empty() {
             "quota signal: none (no cached readings)"
         } else if last_error.is_some() {
@@ -2418,8 +2560,14 @@ fn prepare_selection_inputs(
     let mut snapshot = store
         .build_snapshot(now)
         .map_err(|e| format!("building route-state snapshot: {e}"))?;
-    // Retain cached windows even while the quota source is unavailable. Dropping
-    // last-known pressure would make a transient outage look optimistically free.
+    // Retain cached windows through a transient quota outage: dropping
+    // last-known pressure the moment one refresh fails would make every blip
+    // look optimistically free. Past the staleness bound, though, the windows
+    // are no longer evidence of current quota (resets get spent, windows roll
+    // over), so they are not merged at all and every provider is quota-unknown:
+    // neutral pressure, no quota wall. A provider that really is exhausted
+    // still answers its next request with a 429, and that writes a hard
+    // cooldown into route state, which this does not touch.
     let (
         quota_windows,
         quota_available,
@@ -2438,23 +2586,32 @@ fn prepare_selection_inputs(
         ),
         Err(_) => (None, false, 0, 0, Some("cache poisoned".into()), None),
     };
-    if let Some(windows) = &quota_windows {
+    let stale_age_ms = quota_windows
+        .as_ref()
+        .and_then(|_| stale_quota_age_ms(quota_refreshed_at_ms, now as u64));
+    if let Some(windows) = quota_windows.as_ref().filter(|_| stale_age_ms.is_none()) {
         merge_quota_overlay(&mut snapshot, windows, &facts, quota_name_map());
     }
     let quota_signal_json = quota_signal_json(
         &snapshot,
-        quota_windows.as_deref().unwrap_or_default(),
-        quota_available,
-        quota_refreshed_at_ms,
-        retained_degraded_count,
-        quota_last_error.as_deref(),
-        quota_restored_from_ms,
+        &QuotaSignalView {
+            windows: quota_windows.as_deref().unwrap_or_default(),
+            available: quota_available,
+            refreshed_at_ms: quota_refreshed_at_ms,
+            retained_degraded_count,
+            last_error: quota_last_error.as_deref(),
+            restored_from_ms: quota_restored_from_ms,
+            stale_age_ms,
+        },
     );
+    let quota_note =
+        stale_age_ms.map(|age_ms| stale_quota_note(age_ms, quota_last_error.as_deref()));
     Ok(PreparedSelectionInputs {
         now,
         facts,
         snapshot,
         quota_signal_json,
+        quota_note,
     })
 }
 
@@ -2527,6 +2684,8 @@ async fn handle_select_request(
             "healthyCount": healthy,
             "lastError": last_error,
             "restoredFromMs": restored_from_ms,
+            "staleAfterMs": QUOTA_STALE_AFTER_MS,
+            "staleAgeMs": stale_quota_age_ms(refreshed_at_ms, now_ms()),
         }}))
         .map_err(ModuleError::Json)?;
         let response = Frame::build_with_version(
@@ -2762,6 +2921,7 @@ async fn handle_select_request(
         mut facts,
         snapshot,
         quota_signal_json,
+        quota_note,
     } = match prepare_selection_inputs(quota_cache, store) {
         Ok(prepared) => prepared,
         Err(e) => {
@@ -2825,10 +2985,11 @@ async fn handle_select_request(
     let prefer_prompt_cache = params.prefer_prompt_cache;
 
     let min_best_effort_adequacy = min_band.lock().ok().and_then(|g| *g);
+    let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
 
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
         let sub = subscription_keys.clone();
-        select_model_route_with_config(
+        select_model_route_with_slots(
             SelectModelRouteInput {
                 target_agent: target_agent.clone(),
                 requirements,
@@ -2849,6 +3010,7 @@ async fn handle_select_request(
                     .collect(),
             },
             &routing_config,
+            concurrency_slots.as_ref(),
         )
     };
 
@@ -2912,6 +3074,9 @@ async fn handle_select_request(
     match selection {
         Ok(mut selected) => {
             selected.explanation.push(policy_sources.clone());
+            if let Some(note) = &quota_note {
+                selected.explanation.push(note.clone());
+            }
             if let Some(note) = &availability.note {
                 selected.explanation.push(note.clone());
             }
@@ -3043,11 +3208,13 @@ fn panel_availability(
     if !is_broca_substrate(requested_substrate) {
         return (AvailabilitySubstrate::Host, host_available_models);
     }
-    let (available, _) = broca_served_routes(facts, broca_credentials);
-    (
-        AvailabilitySubstrate::Broca,
-        available.into_iter().collect(),
-    )
+    let (available, fallback) = broca_served_routes(facts, broca_credentials);
+    let substrate = if fallback.is_some() {
+        AvailabilitySubstrate::BrocaServedCatalog
+    } else {
+        AvailabilitySubstrate::Broca
+    };
+    (substrate, available.into_iter().collect())
 }
 
 fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
@@ -3206,7 +3373,7 @@ async fn handle_select_panel(
     // the host's ladder follows route.select, whose list is already fenced by
     // the operator's exclusions, and alternating two differently fenced lists
     // would read as an availability change on every other request.
-    if availability_substrate == AvailabilitySubstrate::Broca {
+    if availability_substrate != AvailabilitySubstrate::Host {
         winner_ladder::observed_selections().record(
             winner_ladder::LadderKey::new(
                 winner_ladder::SUBSTRATE_BROCA,
@@ -3245,6 +3412,7 @@ async fn handle_select_panel(
     let decision = panel_decision_input(
         &params,
         &panel,
+        availability_substrate,
         &provenance,
         &policy_sources_line(&operator_policy),
     );
@@ -3297,6 +3465,7 @@ async fn handle_select_panel(
 fn panel_decision_input(
     params: &SelectPanelParams,
     panel: &SelectedPanel,
+    availability: AvailabilitySubstrate,
     provenance: &DecisionProvenance,
     policy_sources: &str,
 ) -> DecisionInput {
@@ -3317,6 +3486,7 @@ fn panel_decision_input(
             "selection": "n_pick",
             "policy": panel.policy,
             "policySources": policy_sources,
+            "availability": availability.as_str(),
         })
     } else {
         json!({
@@ -3325,6 +3495,9 @@ fn panel_decision_input(
             // Recorded even though roster pins bypass exclusion, so a reader can
             // see WHICH fence was in force when the pinned panel was seated.
             "policySources": policy_sources,
+            // Which list the seats were judged against. A rejection names it too,
+            // but a panel that seated everyone has no rejection to carry it.
+            "availability": availability.as_str(),
         })
     };
     DecisionInput {
@@ -4825,6 +4998,7 @@ mod tests {
     use prefrontal_routing_core::model_facts::{
         Confidence, ModelFact, ModelPromptDefaults, ModelScores,
     };
+    use prefrontal_routing_core::model_router::select_model_route_with_config;
     use prefrontal_routing_core::{FactSource, NativeUsageFacts, UsageObservation};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -4917,7 +5091,16 @@ mod tests {
         .unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&quota_signal_json(
-            &snapshot, &windows, true, 1, 0, None, None,
+            &snapshot,
+            &QuotaSignalView {
+                windows: &windows,
+                available: true,
+                refreshed_at_ms: 1,
+                retained_degraded_count: 0,
+                last_error: None,
+                restored_from_ms: None,
+                stale_age_ms: None,
+            },
         ))
         .unwrap();
 
@@ -5263,6 +5446,7 @@ mod tests {
                 &mut route_epochs,
                 &catalog_health,
                 &empty_broca_credentials(),
+                &Arc::new(Mutex::new(QuotaCache::default())),
             )
             .await
             .unwrap();
@@ -8065,6 +8249,233 @@ mod tests {
         assert_eq!(cache.refreshed_at_ms, observed_at_ms);
     }
 
+    /// A cache whose only reading is a codex window spent to 100% (walling
+    /// openai until its reset three hours out), last refreshed `age_ms` ago and
+    /// failing since, the way the refresh loop leaves it after a failed poll.
+    fn walled_codex_cache_aged(age_ms: u64) -> QuotaCache {
+        let now = now_ms();
+        let observed_at_ms = now - age_ms;
+        let mut cache = QuotaCache::default();
+        apply_quota_refresh(
+            &mut cache,
+            vec![usage(json!({
+                "provider": "codex",
+                "usage": { "primary": {
+                    "usedPercent": 100.0,
+                    "resetsAt": rfc3339_utc(now + 3 * 60 * 60_000),
+                    "windowMinutes": 300
+                }}
+            }))],
+            observed_at_ms,
+        );
+        record_quota_refresh_failure(&mut cache, "usage.get", "json: missing field `remaining`");
+        cache
+    }
+
+    /// Selection must not keep choosing on a snapshot that stopped advancing.
+    /// Within the bound a failed refresh keeps the last reading (a transient
+    /// blip must not read as free quota); past it the reading is ignored, every
+    /// provider is quota-unknown, and the decision says so with the age.
+    #[tokio::test]
+    async fn a_stale_quota_snapshot_neither_walls_nor_steers_and_the_decision_says_so() {
+        let rig = Rig::new("quota-snapshot-stale");
+        let store: SharedStore = Arc::new(rig.open_store());
+        // The quota-decides pair with the speeds swapped: openai wins the speed
+        // tiebreak when quota says nothing, so only a quota wall moves it.
+        for mut route in quota_decides_facts() {
+            route.scores.speed = if route.provider_id == "openai" {
+                100.0
+            } else {
+                10.0
+            };
+            store.upsert_fact(&route, FactSource::Override).unwrap();
+        }
+        let (no_reading, _) =
+            select_quota_decides(&store, QuotaCache::default(), "stale-no-reading").await;
+        assert_eq!(no_reading, "openai/restart-luna");
+
+        // Control: a failing refresh 14 minutes old is inside the bound, so the
+        // wall it last read still holds.
+        let (fresh, fresh_signal) = select_quota_decides(
+            &store,
+            walled_codex_cache_aged(QUOTA_STALE_AFTER_MS - 60_000),
+            "stale-within-bound",
+        )
+        .await;
+        assert_eq!(fresh, "anthropic/restart-opus", "{fresh_signal}");
+        assert_eq!(fresh_signal["state"], "present");
+
+        let (stale, stale_signal) = select_quota_decides(
+            &store,
+            walled_codex_cache_aged(QUOTA_STALE_AFTER_MS + 60_000),
+            "stale-past-bound",
+        )
+        .await;
+        assert_eq!(
+            stale, no_reading,
+            "a wall read from a stale snapshot must not move selection: {stale_signal}"
+        );
+        assert_eq!(stale_signal["state"], "stale");
+        assert!(stale_signal["ageMs"].as_u64().unwrap() > QUOTA_STALE_AFTER_MS);
+        assert_eq!(stale_signal["staleAfterMs"], json!(QUOTA_STALE_AFTER_MS));
+        assert_eq!(
+            stale_signal["lastError"],
+            "usage.get: json: missing field `remaining`"
+        );
+        let explanation = store
+            .get_decisions_for_task("stale-past-bound")
+            .unwrap()
+            .remove(0)
+            .explanation_json
+            .unwrap();
+        assert!(
+            explanation.contains("quota signal: stale (last successful refresh 16m ago")
+                && explanation.contains("missing field `remaining`"),
+            "the decision explanation names the stale snapshot and why: {explanation}"
+        );
+    }
+
+    async fn health_report_for(cache: QuotaCache) -> ModuleControlResponse {
+        health_report_for_with_credentials(cache, &mapped_broca_credentials("anthropic")).await
+    }
+
+    async fn health_report_for_with_credentials(
+        cache: QuotaCache,
+        broca_credentials: &SharedBrocaCredentials,
+    ) -> ModuleControlResponse {
+        let (writer, mut replies) = mpsc::channel(1);
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&json!({ "op": MODULE_CONTROL_OP_HEALTH_CHECK })).unwrap(),
+        )
+        .unwrap();
+        handle_control_request(
+            frame,
+            &writer,
+            &mut RouteEpochs::new(),
+            &Arc::new(Mutex::new(CatalogReachHealth::new(600_000))),
+            broca_credentials,
+            &Arc::new(Mutex::new(cache)),
+        )
+        .await
+        .unwrap();
+        serde_json::from_slice(&replies.recv().await.unwrap().body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_degraded_naming_the_stale_quota_age() {
+        let ModuleControlResponse::HealthCheck { status, detail, .. } =
+            health_report_for(walled_codex_cache_aged(QUOTA_STALE_AFTER_MS - 60_000)).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Ok, "inside the bound: {detail:?}");
+
+        let ModuleControlResponse::HealthCheck {
+            status,
+            detail,
+            metrics,
+        } = health_report_for(walled_codex_cache_aged(7 * 60 * 60_000 + 5 * 60_000)).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Degraded);
+        let detail = detail.expect("a degraded report says why");
+        assert!(
+            detail.contains("quota snapshot stale: last successful refresh 7h05m ago")
+                && detail.contains("missing field `remaining`"),
+            "{detail}"
+        );
+        assert_eq!(metrics.unwrap()["quota"]["stale"], true);
+
+        // No reading yet (boot before the first poll) is not staleness.
+        let ModuleControlResponse::HealthCheck { status, .. } =
+            health_report_for(QuotaCache::default()).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn health_check_joins_unmapped_broca_and_stale_quota_details_and_clears_each_independently(
+    ) {
+        let broca_credentials = empty_broca_credentials();
+        broca_credentials.lock().unwrap().apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: vec![prefrontal_ckcred_client::ListedCredential {
+                    id: "fixture-unmapped".into(),
+                    categories: vec!["llm-provider".into()],
+                    state: "active".into(),
+                    ..Default::default()
+                }],
+                view: "unmapped-view".into(),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        let ModuleControlResponse::HealthCheck {
+            status,
+            detail,
+            metrics,
+        } = health_report_for_with_credentials(
+            walled_codex_cache_aged(QUOTA_STALE_AFTER_MS + 60_000),
+            &broca_credentials,
+        )
+        .await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Degraded);
+        let detail = detail.unwrap();
+        assert!(detail.starts_with("broca reachability: 1 of 1 credentials unmapped; quota snapshot stale: last successful refresh 16m ago"), "{detail}");
+        assert!(detail.contains("missing field `remaining`"), "{detail}");
+        let metrics = metrics.unwrap();
+        assert_eq!(metrics["quota"]["stale"], true);
+        assert_eq!(metrics["brocaReachability"]["unmappedCredentials"], 1);
+
+        // Repairing quota alone leaves the mapping gap visible.
+        let ModuleControlResponse::HealthCheck {
+            status,
+            detail,
+            metrics,
+        } = health_report_for_with_credentials(QuotaCache::default(), &broca_credentials).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(
+            detail.as_deref(),
+            Some("broca reachability: 1 of 1 credentials unmapped")
+        );
+        assert_eq!(metrics.unwrap()["quota"]["stale"], false);
+
+        // Repairing the mapping alone leaves quota's staleness visible.
+        let ModuleControlResponse::HealthCheck { status, detail, .. } =
+            health_report_for_with_credentials(
+                walled_codex_cache_aged(QUOTA_STALE_AFTER_MS + 60_000),
+                &mapped_broca_credentials("anthropic"),
+            )
+            .await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Degraded);
+        assert!(detail.unwrap().starts_with("quota snapshot stale:"));
+
+        let ModuleControlResponse::HealthCheck { status, detail, .. } =
+            health_report_for(QuotaCache::default()).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Ok);
+        assert_eq!(detail, None);
+    }
+
     #[tokio::test]
     async fn route_select_reports_empty_and_ignores_legacy_policy_exclusions() {
         let (empty, _empty_rig) = run_select_wire_request(
@@ -8806,10 +9217,11 @@ mod tests {
     }
 
     /// A roster seat is only real if whatever SENDS to it can resolve the route.
-    /// Kimi moved to a new plane with a new provider id: Broca resolves the new id
-    /// while the caller's host provider list still carries only the retired one, so
-    /// every consult seat for it was rejected `unavailable` even though its legs
-    /// never send through the host. Availability follows the substrate that sends.
+    /// A spec campaign's seats send through Broca, but a campaign started from a
+    /// Pi host carried a provider list without Kimi's plan, so every round
+    /// rejected the pinned K3 seat `unavailable` with detail `host` although
+    /// Broca sends it. Availability follows the substrate that sends: the same
+    /// request seats the pin on Broca and is rejected only on the host.
     #[tokio::test]
     async fn a_roster_pin_absent_from_the_host_list_seats_on_broca_and_is_rejected_on_the_host() {
         let rig = Rig::new("panel-substrate");
@@ -8822,8 +9234,8 @@ mod tests {
             json!({
                 "method": ROUTE_SELECT_PANEL_OP,
                 "params": {
-                    // The caller's host list carries the RETIRED provider id only.
-                    "availableModels": ["kimi-for-coding/k3"],
+                    // The caller's host list lacks Kimi's plan entirely.
+                    "availableModels": ["anthropic/claude-fable-5-1"],
                     "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
                     "roster": [{"model": "kimi-code-plan-global/k3"}],
                     "substrate": substrate,
@@ -8851,7 +9263,7 @@ mod tests {
         let broca = run("broca").await;
         assert_eq!(
             broca["members"][0]["routeKey"], "kimi-code-plan-global/k3",
-            "Broca holds a credential for the provider and the catalog serves the model, so the pin sits"
+            "the catalog serves the pinned route, so it sits on Broca whatever the host lists"
         );
         assert!(broca.get("shortfall").is_none());
 
@@ -8877,9 +9289,82 @@ mod tests {
         );
     }
 
-    /// Broca publishes no catalog to ask what it can send, so the substrate set is
-    /// the served catalog narrowed to providers Broca can authenticate to. A route
-    /// it has no credential for must not seat: it would fail its send every round.
+    /// Before a credential listing arrives, routing knows nothing about which
+    /// providers Broca can authenticate to. A panel seats from the served catalog, never from the
+    /// caller's host list (here empty, which would refuse every seat), and the
+    /// decision row says the reach was unknown even though nothing was refused.
+    /// The gap also turns `health.check` degraded, so it cannot sit unseen.
+    #[tokio::test]
+    async fn a_broca_panel_with_no_reachability_source_seats_a_catalog_route_and_says_so() {
+        let rig = Rig::new("panel-substrate-unknown-reach");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("livebroca", "m-new"), FactSource::Override)
+            .unwrap();
+        let broca_credentials = empty_broca_credentials();
+        let response = run_route_wire_request_with_paths(
+            &store,
+            json!({
+                "method": ROUTE_SELECT_PANEL_OP,
+                "params": {
+                    "availableModels": [],
+                    "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
+                    "roster": [{"model": "livebroca/m-new"}],
+                    "substrate": "broca",
+                    "taskId": "panel-substrate-unknown-reach",
+                }
+            }),
+            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            &broca_credentials,
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let result =
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"].clone();
+        assert_eq!(result["members"][0]["routeKey"], "livebroca/m-new");
+        assert!(result.get("shortfall").is_none(), "{result}");
+        let explanation: serde_json::Value =
+            serde_json::from_str(&decision_explanation(&store, &result)).unwrap();
+        assert_eq!(
+            explanation["availability"],
+            "broca reachability unknown: judged against served catalog"
+        );
+        assert_eq!(
+            broca_credentials
+                .lock()
+                .unwrap()
+                .health_report(now_ms())
+                .detail
+                .as_deref(),
+            Some("broca reachability unknown: credential listing unavailable")
+        );
+    }
+
+    /// Unlike a sticky warning, health follows the current listing: a complete
+    /// mapping repairs the gap even after a Broca send used the fallback.
+    #[tokio::test]
+    async fn unknown_broca_reach_degrades_health_until_listing_maps_it() {
+        let ModuleControlResponse::HealthCheck { status, detail, .. } =
+            health_report_for_with_credentials(QuotaCache::default(), &empty_broca_credentials())
+                .await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(
+            detail.as_deref(),
+            Some("broca reachability unknown: credential listing unavailable")
+        );
+        let ModuleControlResponse::HealthCheck { status, detail, .. } =
+            health_report_for(QuotaCache::default()).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Ok);
+        assert_eq!(detail, None);
+    }
+
+    /// Complete mappings must still refuse a provider with no active credential.
     #[tokio::test]
     async fn a_broca_panel_never_seats_a_provider_broca_holds_no_credential_for() {
         let rig = Rig::new("panel-substrate-credentials");
@@ -8887,7 +9372,6 @@ mod tests {
         store
             .upsert_fact(&fact("uncredentialed", "m1"), FactSource::Override)
             .unwrap();
-        let broca_credentials = mapped_broca_credentials("kimi-code-plan-global");
         let response = run_route_wire_request_with_paths(
             &store,
             json!({
@@ -8897,21 +9381,20 @@ mod tests {
                     "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
                     "roster": [{"model": "uncredentialed/m1"}],
                     "substrate": "broca",
-                    "taskId": "panel-substrate-uncredentialed",
+                    "taskId": "panel-substrate-uncredentialed"
                 }
             }),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            &broca_credentials,
+            &mapped_broca_credentials("kimi-code-plan-global"),
         )
         .await;
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["result"]["members"], json!([]));
-        let cause = &body["result"]["shortfall"]["causes"][0];
-        assert_eq!(cause["reason"], "unavailable");
         assert_eq!(
-            cause["detail"], "broca",
-            "the seat was judged against Broca's reach, and the host list that does carry it is not consulted"
+            body["result"]["shortfall"]["causes"][0]["reason"],
+            "unavailable"
         );
+        assert_eq!(body["result"]["shortfall"]["causes"][0]["detail"], "broca");
     }
 
     fn broca_select_request(
@@ -8978,13 +9461,12 @@ mod tests {
 
     /// Core's own classifier, wake author, and comment reviewer send through
     /// Broca and carry no host list. Naming substrate `broca` judges the
-    /// selection against what Broca reaches now: a catalog route on a provider
-    /// Broca holds a credential for wins although no caller list names it, and a
-    /// route only the caller's list names (here, one Broca has no credential
-    /// for) cannot. The same request without the substrate keeps the caller's
-    /// list, so the substrate field is the only difference between the halves.
+    /// selection against Broca's availability, not the caller's list: a served
+    /// catalog route wins although the caller's list does not name it. The same
+    /// request without the substrate keeps the caller's list, so the substrate
+    /// field is the only difference between the halves.
     #[tokio::test]
-    async fn a_broca_route_select_reads_brocas_reach_not_the_callers_list() {
+    async fn a_broca_route_select_reads_brocas_availability_not_the_callers_list() {
         let rig = Rig::new("select-substrate-broca");
         let store = Arc::new(rig.open_store());
         store
@@ -9012,13 +9494,19 @@ mod tests {
         };
 
         let broca = run(Some("broca")).await;
-        assert_eq!(broca["selected"]["routeKey"], "livebroca/m-new");
-        assert_eq!(
-            broca["resolvedInput"]["availableModels"],
-            json!(["livebroca/m-new"]),
-            "the caller's host list is not consulted for a Broca send"
+        let available: Vec<&str> = broca["resolvedInput"]["availableModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            available.contains(&"livebroca/m-new"),
+            "a served route the caller's list lacks is available to a Broca send: {available:?}"
         );
-        assert!(decision_explanation(&store, &broca).contains("availability: broca"));
+        assert_eq!(available, ["livebroca/m-new"]);
+        assert_eq!(broca["selected"]["routeKey"], "livebroca/m-new");
+        assert!(!decision_explanation(&store, &broca).contains("availability unknown"));
 
         let host = run(None).await;
         assert_eq!(host["selected"]["routeKey"], "hostonly/m-old");
@@ -9028,8 +9516,7 @@ mod tests {
         );
     }
 
-    /// With Broca's credential map unreadable the reach is unknown. The
-    /// selection still routes, over every route the catalog serves, and the
+    /// With Broca's reach unknown the selection still routes, over every route the catalog serves, and the
     /// recorded decision says the availability was unknown; a route the catalog
     /// has withdrawn stays out, because nothing serves it.
     #[tokio::test]
@@ -9072,7 +9559,8 @@ mod tests {
             "a withdrawn route is never available: {available:?}"
         );
         assert_ne!(result["selected"]["routeKey"], "retired/m-gone");
-        assert!(decision_explanation(&store, &result).contains("availability unknown"));
+        assert!(decision_explanation(&store, &result)
+            .contains("broca reachability unknown: credential listing unavailable"));
     }
 
     #[tokio::test]
@@ -9119,7 +9607,13 @@ mod tests {
             quota_signal_json: r#"{"state":"none","reason":"quota signal: none"}"#.into(),
             policy_revision: "test-policy".into(),
         };
-        let decision = panel_decision_input(&params, &panel, &provenance, "policy sources: test");
+        let decision = panel_decision_input(
+            &params,
+            &panel,
+            AvailabilitySubstrate::Host,
+            &provenance,
+            "policy sources: test",
+        );
         let explanation: serde_json::Value =
             serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
         assert_eq!(explanation["selection"], "n_pick");
@@ -9224,6 +9718,186 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].decision_kind, "panel");
         assert_eq!(decisions[0].selected_route_key, None);
+    }
+
+    /// Panel seats run as model calls that core's concurrency slots do not
+    /// admit, and a roster names its members explicitly. Slot counts on a panel
+    /// request must not move a pinned member off its route.
+    #[tokio::test]
+    async fn select_panel_never_skips_a_pinned_roster_member_for_saturation() {
+        let rig = Rig::new("select-panel-pinned-saturated");
+        let store = Arc::new(rig.open_store());
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_SELECT_PANEL_OP,
+                "params": {
+                    "panelSpec": {
+                        "size": 1,
+                        "iqFloor": 0,
+                        "diversity": "none",
+                        "class": "AUDIT",
+                        "temperatureSpread": [0.2]
+                    },
+                    "roster": [
+                        {"model": "openai/gpt-5.6-sol", "promptParams": {"variant": "xhigh"}},
+                        {"model": "openai/gpt-5.5", "promptParams": {"variant": "high"}}
+                    ],
+                    "availableModels": ["openai/gpt-5.6-sol", "openai/gpt-5.5"],
+                    "concurrencySlots": [
+                        {"key": "openai/gpt-5.6-sol", "running": 50, "limit": 40}
+                    ],
+                    "taskId": "panel-pinned-saturated"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let member = &body["result"]["members"][0];
+        assert!(
+            member["routeKey"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("openai/gpt-5.6-sol")),
+            "the pinned first roster member keeps its seat: {body}"
+        );
+        assert_eq!(member["promptParams"]["variant"], "xhigh");
+    }
+
+    fn saturation_fact(provider: &str, model: &str, cost: f64) -> ModelFact {
+        let mut fact = fact(provider, model);
+        fact.cost_per_m_tok_out = Some(cost);
+        fact.cost_tier = None;
+        fact
+    }
+
+    fn saturation_select_params(slots: Option<serde_json::Value>) -> serde_json::Value {
+        let mut params = json!({
+            "targetAgent": "mason",
+            "requirements": { "iq": 30, "eq": 0 },
+            "availableModels": ["anthropic/fixture-cheap", "openai/fixture-dear"],
+            "taskId": "slot-saturation"
+        });
+        if let Some(slots) = slots {
+            params["concurrencySlots"] = slots;
+        }
+        params
+    }
+
+    fn saturation_facts() -> [ModelFact; 2] {
+        [
+            saturation_fact("anthropic", "fixture-cheap", 2.0),
+            saturation_fact("openai", "fixture-dear", 9.0),
+        ]
+    }
+
+    #[tokio::test]
+    async fn route_select_without_slot_state_is_unchanged() {
+        let (response, _rig) = run_select_wire_request(
+            "slot-saturation-absent",
+            saturation_select_params(None),
+            &saturation_facts(),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["result"]["selected"]["routeKey"],
+            "anthropic/fixture-cheap"
+        );
+        assert!(body["result"]["selected"].get("slotSaturation").is_none());
+    }
+
+    #[tokio::test]
+    async fn route_select_skips_a_saturated_provider_for_the_next_adequate_route() {
+        let (response, rig) = run_select_wire_request(
+            "slot-saturation-skip",
+            saturation_select_params(Some(json!([
+                {"key": "anthropic/fixture-cheap", "running": 50, "limit": 40, "queued": 7},
+                {"key": "openai/fixture-dear", "running": 3, "limit": 25}
+            ]))),
+            &saturation_facts(),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let selected = &body["result"]["selected"];
+        assert_eq!(selected["routeKey"], "openai/fixture-dear");
+        assert_eq!(
+            rejection_reason(&body, "anthropic/fixture-cheap").as_deref(),
+            Some("provider_saturated")
+        );
+        assert_eq!(
+            selected["slotSaturation"]["skipped"][0]["slot"],
+            json!({"key": "anthropic/fixture-cheap", "running": 50, "limit": 40, "queued": 7})
+        );
+        assert!(selected["explanation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line
+                == "route anthropic/fixture-cheap skipped: provider_saturated: anthropic/fixture-cheap 50/40, 7 queued"));
+        // The skip is audit, not a wall: the recorded decision carries the
+        // rejection, and no cooldown is stored for the skipped route.
+        let store = rig.open_store();
+        let decisions = store.get_decisions_for_task("slot-saturation").unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0].rejected_json.contains("provider_saturated"));
+        let snapshot = store.build_snapshot(now_ms() as f64).unwrap();
+        let unwalled = |state: Option<&prefrontal_routing_core::RouteRuntimeState>| {
+            state.is_none_or(|state| {
+                state.cooldown_until.is_none()
+                    && state.quota_exhausted_until.is_none()
+                    && state.failure_backoff_until.is_none()
+            })
+        };
+        assert!(unwalled(snapshot.by_route.get("anthropic/fixture-cheap")));
+        assert!(unwalled(
+            snapshot.by_capacity.get("anthropic/fixture-cheap")
+        ));
+        drop(store);
+        // The next decision re-reads the counts: with room again, the skipped
+        // route wins as if it had never been passed over.
+        let next = run_select_against_rig(
+            &rig,
+            saturation_select_params(None),
+            &saturation_facts(),
+            &PathBuf::from("/nonexistent/alfonso-routing.jsonc"),
+        )
+        .await;
+        let next: serde_json::Value = serde_json::from_slice(&next.body).unwrap();
+        assert_eq!(
+            next["result"]["selected"]["routeKey"],
+            "anthropic/fixture-cheap"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_select_with_every_adequate_provider_saturated_keeps_the_winner_and_says_it_queues(
+    ) {
+        let (response, _rig) = run_select_wire_request(
+            "slot-saturation-all",
+            saturation_select_params(Some(json!([
+                {"key": "anthropic/fixture-cheap", "running": 50, "limit": 40},
+                {"key": "openai/fixture-dear", "running": 25, "limit": 25}
+            ]))),
+            &saturation_facts(),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let selected = &body["result"]["selected"];
+        assert_eq!(selected["routeKey"], "anthropic/fixture-cheap");
+        assert_eq!(
+            selected["slotSaturation"]["queuedOn"]["key"],
+            "anthropic/fixture-cheap"
+        );
+        assert!(selected["explanation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line
+                == "all adequate providers saturated; queued on anthropic/fixture-cheap (50/40)"));
     }
 
     #[tokio::test]

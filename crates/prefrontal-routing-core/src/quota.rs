@@ -116,7 +116,14 @@ pub struct SpendPool {
     pub id: String,
     pub label: String,
     pub funding: String,
-    pub remaining: SpendBalance,
+    /// The pool's balance. ABSENT when the producer knows the pool exists but
+    /// the provider stated no amount (insula's `basis: "unstated"`: a Codex
+    /// account whose prepaid-credits pool carries no balance). Requiring it made
+    /// the decoder refuse the whole `usage.get` array over one such pool, so
+    /// every refresh failed and routing kept choosing on its last accepted
+    /// snapshot. An absent balance is unknown: it never walls and never paces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<SpendBalance>,
     #[serde(default)]
     pub total: Option<SpendBalance>,
     pub basis: String,
@@ -141,17 +148,30 @@ impl SpendPool {
         self.spendable != Some(false)
     }
 
+    /// True only when the producer STATED a balance and it is empty. An
+    /// unstated balance is unknown, which is not the same as empty.
+    pub fn is_known_empty(&self) -> bool {
+        self.remaining
+            .as_ref()
+            .is_some_and(SpendBalance::is_non_positive)
+    }
+
     fn can_inform_pacing(&self) -> bool {
-        self.producer_allows_spend() && self.has_supported_funding()
+        self.remaining.is_some() && self.producer_allows_spend() && self.has_supported_funding()
     }
 
     fn utilization(&self) -> f64 {
-        if self.remaining.is_non_positive() {
+        let Some(remaining) = self.remaining.as_ref() else {
+            // Unreachable through `can_inform_pacing`; an unknown balance adds
+            // no pressure rather than inventing one.
+            return 0.0;
+        };
+        if remaining.is_non_positive() {
             return 1.0;
         }
         self.total
             .as_ref()
-            .and_then(|total| self.remaining.ratio_of(total))
+            .and_then(|total| remaining.ratio_of(total))
             .map(|remaining_ratio| 1.0 - remaining_ratio)
             .unwrap_or(0.0)
     }
@@ -559,7 +579,7 @@ pub fn merge_quota_overlay_with(
             }
             // A derived remainder is a ceiling rather than an authoritative account
             // balance. It can raise soft pressure, but must never manufacture a wall.
-            let exhausted_until = (pool.remaining.is_non_positive() && pool.basis != "derived")
+            let exhausted_until = (pool.is_known_empty() && pool.basis != "derived")
                 .then_some(now_ms + NO_RESET_REPROBE_HORIZON_MS);
             if !pool.can_inform_pacing() && exhausted_until.is_none() {
                 continue;
