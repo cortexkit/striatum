@@ -1178,8 +1178,24 @@ async fn handle_control_request(
     broca_credentials: &SharedBrocaCredentials,
     quota_cache: &SharedQuotaCache,
 ) -> Result<(), ModuleError> {
-    let request =
-        serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
+    let request = match serde_json::from_slice::<ModuleControlRequest>(&frame.body) {
+        Ok(request) => request,
+        Err(error) => {
+            // A newer daemon may send a control shape this module cannot read.
+            // Refuse only that request, without losing existing routes or health.
+            tracing::warn!(corr = frame.header.corr, error = %error, "refusing undecodable control request");
+            return send_route_error(
+                writer,
+                frame.header.ver,
+                0,
+                0,
+                frame.header.corr,
+                "invalid_request",
+                &format!("invalid control request: {error}"),
+            )
+            .await;
+        }
+    };
     match request {
         ModuleControlRequest::RouteBind {
             route_channel,
@@ -5416,6 +5432,103 @@ mod tests {
         assert_eq!(actual.len(), 2);
         assert!(actual.iter().all(|fact| fact.scores.speed > 1_000.0));
         assert_eq!(actual[0].scores.speed, actual[1].scores.speed);
+    }
+
+    #[tokio::test]
+    async fn undecodable_control_request_is_refused_without_stopping_serving() {
+        let rig = Rig::new("undecodable-control-request");
+        let store = Arc::new(rig.open_store());
+        let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
+        let catalog_health = Arc::new(Mutex::new(CatalogReachHealth::new(600_000)));
+        let min_band = Arc::new(Mutex::new(None));
+        let broca_credentials = empty_broca_credentials();
+        let bind = json!({
+            "op": "route.bind",
+            "route_channel": 317,
+            "epoch": 42,
+            "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
+            "identity": {
+                "project_root": prefrontal_test_support::scratch_root(),
+                "harness": "control-tolerance-test",
+                "session": "session-1"
+            }
+        });
+        let mut unknown_scope_field = bind.clone();
+        unknown_scope_field["scope"] = json!({
+            "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+            "ref": "head-scope",
+            "scope_epoch": 3,
+            "kind": "head",
+            "owner_authorized": true,
+            "attributes": { "unknown_scope_authority": true }
+        });
+
+        for undecodable_body in [
+            b"{not-json".to_vec(),
+            serde_json::to_vec(&json!({ "op": "unknown.control.operation" })).unwrap(),
+            serde_json::to_vec(&unknown_scope_field).unwrap(),
+        ] {
+            let (writer, mut replies) = mpsc::channel(3);
+            let mut route_epochs = RouteEpochs::from([(317, 41)]);
+            // Exercise the same dispatch and continuation decision as the live
+            // read loop: a refusal, a valid bind, then a health request.
+            for (corr, body) in [
+                (11, undecodable_body),
+                (12, serde_json::to_vec(&bind).unwrap()),
+                (13, br#"{"op":"health.check"}"#.to_vec()),
+            ] {
+                let frame =
+                    Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap();
+                let ver = frame.header.ver;
+                assert!(handle_frame(
+                    frame,
+                    &writer,
+                    &quota_cache,
+                    &store,
+                    &mut route_epochs,
+                    &min_band,
+                    &rig.dir.join("routing.jsonc"),
+                    &rig.dir.join("operator.jsonc"),
+                    &broca_credentials,
+                    &rig.dir.join("auth.json"),
+                    &catalog_health,
+                )
+                .await
+                .expect("an undecodable control request must not end the frame loop"));
+                let reply = replies.try_recv().expect("each request must get a reply");
+                assert_eq!(reply.header.ver, ver);
+                assert_eq!(reply.header.channel, 0);
+                assert_eq!(reply.header.epoch, 0);
+                assert_eq!(reply.header.corr, corr);
+                match corr {
+                    11 => {
+                        assert_eq!(reply.header.ty, FrameType::Error);
+                        let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
+                        assert_eq!(error.code, "invalid_request");
+                        assert!(error.message.starts_with("invalid control request: "));
+                        assert_eq!(route_epochs.get(&317), Some(&41));
+                    }
+                    12 => {
+                        assert_eq!(reply.header.ty, FrameType::Response);
+                        assert_eq!(
+                            serde_json::from_slice::<ModuleControlResponse>(&reply.body).unwrap(),
+                            ModuleControlResponse::RouteBindAck {}
+                        );
+                        assert_eq!(route_epochs.get(&317), Some(&42));
+                    }
+                    13 => {
+                        assert_eq!(reply.header.ty, FrameType::Response);
+                        assert!(matches!(
+                            serde_json::from_slice::<ModuleControlResponse>(&reply.body).unwrap(),
+                            ModuleControlResponse::HealthCheck { .. }
+                        ));
+                        assert_eq!(route_epochs.get(&317), Some(&42));
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(replies.try_recv().is_err(), "only one reply per request");
+            }
+        }
     }
 
     #[tokio::test]
