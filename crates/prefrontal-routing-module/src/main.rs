@@ -8373,6 +8373,63 @@ mod tests {
         serde_json::from_slice(&replies.recv().await.unwrap().body).unwrap()
     }
 
+    /// Replays captured live data through the actual account report and control
+    /// health dispatcher, without deploying a module or changing a live store.
+    #[tokio::test]
+    #[ignore = "requires PREFRONTAL_ROUTING_USAGE_CAPTURE and PREFRONTAL_ROUTING_VAULT_ROSTER_CAPTURE"]
+    async fn captured_insula_feed_reports_unmapped_information_without_degrading_health() {
+        let capture =
+            std::env::var("PREFRONTAL_ROUTING_USAGE_CAPTURE").expect("required usage capture path");
+        let roster_capture = std::env::var("PREFRONTAL_ROUTING_VAULT_ROSTER_CAPTURE")
+            .expect("required roster capture path");
+        let bytes = std::fs::read(capture).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut state = account_quota::AccountQuotaState::default();
+        let roster: account_quota::VaultRoster =
+            serde_json::from_slice(&std::fs::read(roster_capture).unwrap()).unwrap();
+        state.roster_poll = account_quota::RosterPoll::Listed {
+            at_ms: roster.fetched_at_ms,
+        };
+        state.roster = Some(roster);
+        account_quota::apply_usage_reply(&mut state, &bytes, now_ms() as i64).unwrap();
+        let report = account_quota::build_report(
+            &state.readings,
+            state.roster.as_ref(),
+            &state.roster_poll,
+            now_ms() as i64,
+        );
+        let unmapped = report
+            .accounts
+            .iter()
+            .filter(|account| account.routing_provider.is_none())
+            .count();
+        assert!(unmapped > 0, "capture must exercise absent vendor metadata");
+        assert_eq!(report.information.len(), unmapped);
+        assert!(report
+            .alarms
+            .iter()
+            .all(|alarm| !alarm.contains("unmapped entry")));
+        let entries = quota_consumer::decode_usage_result(&raw["result"]).unwrap();
+        let mut cache = QuotaCache::default();
+        apply_quota_refresh(&mut cache, entries, now_ms());
+        let health = health_report_for(cache).await;
+        let ModuleControlResponse::HealthCheck { status, detail, .. } = &health else {
+            panic!("health reply");
+        };
+        assert_eq!(*status, HealthStatus::Ok);
+        assert!(detail.is_none());
+        let summary = json!({
+            "health": health,
+            "accountQuota": {
+                "accounts": report.accounts.len(), "unmappedInformationCount": report.information.len(),
+                "unmappedProviders": report.accounts.iter().filter(|account| account.routing_provider.is_none()).map(|account| account.provider.clone()).collect::<Vec<_>>(),
+                "alarms": report.alarms,
+                "vaultOnlyGapCount": report.gaps.vault_only.len(), "insulaOnlyGapCount": report.gaps.insula_only.len()
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+    }
+
     #[tokio::test]
     async fn health_check_reports_degraded_naming_the_stale_quota_age() {
         let ModuleControlResponse::HealthCheck { status, detail, .. } =

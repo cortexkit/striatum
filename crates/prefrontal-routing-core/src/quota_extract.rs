@@ -263,6 +263,16 @@ pub fn antigravity_pool_for_capacity(capacity_key: &str) -> Option<&'static str>
         .map(|(_, pool)| *pool)
 }
 
+/// A product route requiring pooled account quota, even when routing does not
+/// yet know its model family's pool. Unknown families must not fall back to a
+/// different product's account-wide windows.
+pub fn requires_account_pool(capacity_key: &str) -> bool {
+    capacity_key
+        .split_once('/')
+        .map_or(capacity_key, |(_, model)| model)
+        .starts_with(ANTIGRAVITY_MODEL_PREFIX)
+}
+
 /// The routed capacities that draw on one Antigravity pool.
 pub fn antigravity_pool_capacities(pool: &str, capacity_keys: &[String]) -> Vec<String> {
     capacity_keys
@@ -345,7 +355,9 @@ pub fn account_rate_windows(
             Some((extra, pool, period))
         })
         .collect();
-    if !pools.is_empty() {
+    // A route that draws on a named pool cannot borrow aggregate windows from
+    // another product of the same catalog vendor (for example Gemini CLI).
+    if !pools.is_empty() || capacity_key.is_some_and(requires_account_pool) {
         return pools
             .into_iter()
             .filter(|(_, pool, _)| {

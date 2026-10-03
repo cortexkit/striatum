@@ -484,11 +484,14 @@ fn allocator_roster_for_model(
     let mut vendors: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     if let Some(vault) = &state.roster {
         for reading in state.readings.readings.values() {
-            if let Some(identity) = account_quota::identity_for_reading(vault, reading) {
+            if let (Some(identity), Some(vendor)) = (
+                account_quota::identity_for_reading(vault, reading),
+                reading.routing_provider(),
+            ) {
                 vendors
                     .entry(&identity.refresh_adapter)
                     .or_default()
-                    .insert(reading.routing_provider().unwrap());
+                    .insert(vendor);
             }
         }
     }
@@ -553,21 +556,8 @@ fn allocator_roster_for_model(
                         && account_quota::identity_for_reading(vault, reading) == Some(*identity)
                 })
             })
-            .map(|identity| AccountView {
-                account_id: identity.account_id.clone(),
-                routing_provider: provider.to_string(),
-                refresh_adapter: identity.refresh_adapter.clone(),
-                credentials: identity
-                    .credential_ids
-                    .iter()
-                    .map(|credential_id| CredentialRecord {
-                        credential_id: credential_id.clone(),
-                        default_record: is_default_record(credential_id),
-                        needs_reauth: !identity.active_credential_ids.contains(credential_id),
-                    })
-                    .collect(),
-                model_reach: ModelReach::All,
-                quota: state
+            .map(|identity| {
+                let reading = state
                     .readings
                     .readings
                     .values()
@@ -585,13 +575,58 @@ fn allocator_roster_for_model(
                                 .and_then(account_quota::parse_rfc3339_ms),
                             &reading.provider,
                         )
-                    })
+                    });
+                let capacity_key = model.map(|model| format!("{provider}/{model}"));
+                let usage = reading
                     .and_then(|reading| {
-                        quota_reading_for_model(
-                            &reading.entry,
-                            model.map(|model| format!("{provider}/{model}")).as_deref(),
+                        serde_json::from_value::<AccountEntry>(reading.entry.clone()).ok()
+                    })
+                    .and_then(|entry| entry.usage);
+                let pool_route = capacity_key.as_deref().is_some_and(|key| {
+                    prefrontal_routing_core::quota_extract::requires_account_pool(key)
+                });
+                let pooled_reading = usage
+                    .as_ref()
+                    .and_then(|usage| usage.extra_rate_windows.as_ref())
+                    .into_iter()
+                    .flatten()
+                    .any(prefrontal_routing_core::quota_extract::is_account_pool_window);
+                // Product/pool reach is a hard filter, not merely unknown quota:
+                // sticky affinity and overrides must not bypass it either.
+                let model_reach = if model.is_some() && (pool_route || pooled_reading) {
+                    let reaches = usage.as_ref().is_some_and(|usage| {
+                        !prefrontal_routing_core::quota_extract::account_rate_windows(
+                            usage,
+                            capacity_key.as_deref(),
                         )
+                        .is_empty()
+                    });
+                    ModelReach::Only(if reaches {
+                        vec![model.unwrap().to_string()]
+                    } else {
+                        Vec::new()
+                    })
+                } else {
+                    ModelReach::All
+                };
+                AccountView {
+                    account_id: identity.account_id.clone(),
+                    routing_provider: provider.to_string(),
+                    refresh_adapter: identity.refresh_adapter.clone(),
+                    credentials: identity
+                        .credential_ids
+                        .iter()
+                        .map(|credential_id| CredentialRecord {
+                            credential_id: credential_id.clone(),
+                            default_record: is_default_record(credential_id),
+                            needs_reauth: !identity.active_credential_ids.contains(credential_id),
+                        })
+                        .collect(),
+                    model_reach,
+                    quota: reading.and_then(|reading| {
+                        quota_reading_for_model(&reading.entry, capacity_key.as_deref())
                     }),
+                }
             })
             .collect(),
     });
@@ -2519,6 +2554,8 @@ mod tests {
 
     #[test]
     fn antigravity_vendor_and_model_pool_select_the_joined_account() {
+        // This positive vector requires a published vendor. The live producer
+        // currently omits it; the live-shape vector below pins that refusal.
         let entry = |account: &str, used: f64| {
             json!({
                 "provider": "antigravity", "apiProvider": "google", "account": account,
@@ -2593,9 +2630,10 @@ mod tests {
         assert_eq!(unmapped.routing_provider, None);
         assert!(!unmapped.cold_input_usable);
         assert!(report
-            .alarms
+            .information
             .iter()
             .any(|alarm| alarm.contains("unmapped") && alarm.contains(ACCOUNT_A)));
+        assert!(report.alarms.is_empty());
         let roster = allocator_roster(&state, "openai", NOW).roster.unwrap();
         assert_eq!(roster.accounts.len(), 1);
         assert_eq!(roster.accounts[0].account_id, ACCOUNT_B);
@@ -2691,6 +2729,141 @@ mod tests {
         assert_eq!(a.accounts[0].account_id, ACCOUNT_A);
         assert_eq!(b.accounts.len(), 1);
         assert_eq!(b.accounts[0].account_id, ACCOUNT_B);
+    }
+
+    /// Sanitized from the 2026-10-03 usage.get capture: both Antigravity lanes
+    /// omit apiProvider; the vault lane reports 5h + weekly pools while the
+    /// OAuth lane reports weekly pools only. Identity and dates are test-local.
+    fn live_antigravity_shapes() -> Vec<Value> {
+        vec![
+            json!({
+                "provider": "antigravity", "apiProvider": null, "account": ACCOUNT_A,
+                "source": "vault", "fetchedAt": "2026-09-29T11:59:00Z",
+                "usage": {"extraRateWindows": [
+                    {"id": "gemini-5h", "title": "Gemini Models 5h", "window": {"usedPercent": 3.85, "windowKind": "five_hour", "windowMinutes": 300}},
+                    {"id": "gemini-weekly", "title": "Gemini Models weekly", "window": {"usedPercent": 52.81, "windowKind": "weekly", "windowMinutes": 10080}},
+                    {"id": "3p-5h", "title": "Claude and GPT models 5h", "window": {"usedPercent": 0.0, "windowKind": "five_hour", "windowMinutes": 300}},
+                    {"id": "3p-weekly", "title": "Claude and GPT models weekly", "window": {"usedPercent": 0.0, "windowKind": "weekly", "windowMinutes": 10080}}
+                ]}
+            }),
+            json!({
+                "provider": "antigravity", "apiProvider": null, "account": ACCOUNT_B,
+                "source": "oauth", "fetchedAt": "2026-09-29T11:59:00Z",
+                "usage": {"extraRateWindows": [
+                    {"id": "gemini-weekly", "title": "Gemini Models weekly", "window": {"usedPercent": 100.0, "windowKind": "weekly", "windowMinutes": 10080}},
+                    {"id": "3p-weekly", "title": "Claude and GPT models weekly", "window": {"usedPercent": 0.0, "windowKind": "weekly", "windowMinutes": 10080}}
+                ]}
+            }),
+        ]
+    }
+
+    #[test]
+    fn live_google_shapes_keep_vendorless_antigravity_informational_and_unselectable() {
+        let mut entries = live_antigravity_shapes();
+        // The live Gemini CLI row has a vendor but no account or usage because
+        // its credential is absent. It is not a tracked Google account.
+        entries.push(json!({"provider": "gemini", "apiProvider": "google", "errorClass": "credential_absent", "usage": null}));
+        let rig = provider_fixture("live-google", "antigravity", entries);
+        let state = rig.accounts.lock().unwrap();
+        let report = account_quota::build_report(
+            &state.readings,
+            state.roster.as_ref(),
+            &state.roster_poll,
+            NOW,
+        );
+        assert_eq!(report.accounts.len(), 2);
+        assert!(report
+            .accounts
+            .iter()
+            .all(|account| account.routing_provider.is_none()
+                && account.vault.joined
+                && !account.cold_input_usable));
+        assert_eq!(report.information.len(), 2);
+        assert!(report
+            .information
+            .iter()
+            .all(|information| information.contains("unmapped entry: no apiProvider")));
+        assert!(
+            report.alarms.is_empty(),
+            "a missing producer vendor must not page through a roster gap: {:?}",
+            report.alarms
+        );
+        assert!(report.gaps.insula_only.is_empty());
+        assert!(report.gaps.vault_only.is_empty());
+        drop(state);
+        let mut params = admit_params("live-google", "live-google", "broca");
+        params["provider"] = json!("google");
+        params["model"] = json!("antigravity-gemini-3.8-flash");
+        params["affinity_model"] = params["model"].clone();
+        assert_eq!(
+            rig.call(
+                &rig.ctx(true, false, NOW),
+                "route.account_for",
+                BROCA,
+                params
+            )
+            .code(),
+            Some("account_selection_unsupported")
+        );
+    }
+
+    #[test]
+    fn gemini_cli_account_cannot_serve_antigravity_even_with_sticky_affinity() {
+        let mut entries = live_antigravity_shapes();
+        // The captured Gemini row is credential_absent and unkeyed. Model a
+        // future authorized CLI account with headroom to exercise the vendor
+        // collision, rather than passing only because today's account is absent.
+        let mut gemini =
+            reported_entry("gemini", json!("google"), INSULA_ONLY, "session", 1440, 0.0);
+        gemini["usage"]["extraRateWindows"] = json!([{"id": "gemini-2.5-flash", "title": "gemini-2.5-flash", "window": {"usedPercent": 0.0, "windowMinutes": 1440}}]);
+        entries.push(gemini);
+        let rig = provider_fixture("gemini-cli-collision", "antigravity", entries);
+        let mut vault = listing();
+        vault.credentials.truncate(1);
+        let row = &mut vault.credentials[0];
+        row.account_id = Some(INSULA_ONLY.into());
+        row.refresh_adapter = Some("gemini-cli".into());
+        row.id = "oauth:gemini-cli".into();
+        let gemini_roster = account_quota::build_roster(&vault, None, NOW);
+        rig.accounts
+            .lock()
+            .unwrap()
+            .roster
+            .as_mut()
+            .unwrap()
+            .identities
+            .extend(gemini_roster.identities);
+        let ctx = rig.ctx(true, false, NOW);
+        let mut params = admit_params("gemini-cli-initial", "google-product-collision", "broca");
+        params["provider"] = json!("google");
+        params["model"] = json!("gemini-2.5-flash");
+        params["affinity_model"] = json!("antigravity-gemini-3.8-flash");
+        let initial = result(rig.call(&ctx, "route.account_for", BROCA, params.clone()));
+        assert_eq!(
+            initial["account"]["account_id"], INSULA_ONLY,
+            "the control CLI route can use its own account"
+        );
+        params["admission_id"] = json!("antigravity-sticky");
+        params["model"] = params["affinity_model"].clone();
+        assert_eq!(
+            rig.call(&ctx, "route.account_for", BROCA, params.clone())
+                .code(),
+            Some("account_selection_unsupported")
+        );
+        params["admission_id"] = json!("antigravity-cold");
+        params["conversation_key"] = json!("antigravity-cold");
+        assert_eq!(
+            rig.call(&ctx, "route.account_for", BROCA, params).code(),
+            Some("account_selection_unsupported")
+        );
+        let mut unknown = admit_params("unknown-pool", "unknown-pool", "broca");
+        unknown["provider"] = json!("google");
+        unknown["model"] = json!("antigravity-new-family-model");
+        unknown["affinity_model"] = unknown["model"].clone();
+        assert_eq!(
+            rig.call(&ctx, "route.account_for", BROCA, unknown).code(),
+            Some("account_selection_unsupported")
+        );
     }
 
     #[test]

@@ -541,7 +541,6 @@ pub fn identity_for_reading<'a>(
     roster: &'a VaultRoster,
     reading: &StoredReading,
 ) -> Option<&'a RosterIdentity> {
-    reading.routing_provider()?;
     let mut matches = roster
         .identities
         .iter()
@@ -803,6 +802,9 @@ pub struct AccountQuotaReport {
     pub accounts: Vec<AccountView>,
     pub gaps: RosterGaps,
     pub alarms: Vec<String>,
+    /// Producer facts that explain unavailable selection without indicating an
+    /// operational failure, such as an unpublished catalog vendor.
+    pub information: Vec<String>,
 }
 
 fn window_view(slot: &'static str, window: &RateWindow) -> WindowView {
@@ -996,6 +998,7 @@ fn account_view(
     roster: &RosterForJoin<'_>,
     now_ms: i64,
     alarms: &mut Vec<String>,
+    information: &mut Vec<String>,
 ) -> (AccountView, Option<InsulaOnlyGap>) {
     let entry: Option<AccountEntry> = serde_json::from_value(reading.entry.clone()).ok();
     let usage = entry.as_ref().and_then(|entry| entry.usage.as_ref());
@@ -1073,9 +1076,6 @@ fn account_view(
         .and_then(|roster| identity_for_reading(roster, reading));
     let join_reason = match (identity, roster.roster) {
         (Some(_), _) => None,
-        (None, _) if routing_provider.is_none() => {
-            Some("unmapped entry: no apiProvider vendor field".into())
-        }
         (None, Some(listed))
             if listed
                 .identities
@@ -1097,7 +1097,7 @@ fn account_view(
     if routing_provider.is_none() {
         let reason = "unmapped entry: no apiProvider vendor field";
         reasons.push(reason.into());
-        alarms.push(format!(
+        information.push(format!(
             "{} account {}: {reason}",
             reading.provider, reading.account_id
         ));
@@ -1180,7 +1180,7 @@ fn account_view(
         .and_then(|info| info.email.clone());
     let gap = join_reason
         .as_ref()
-        .filter(|_| reading.tombstoned_at_ms.is_none())
+        .filter(|_| reading.tombstoned_at_ms.is_none() && routing_provider.is_some())
         .map(|reason| InsulaOnlyGap {
             provider: reading.provider.clone(),
             account_id: reading.account_id.clone(),
@@ -1232,10 +1232,11 @@ pub fn build_report(
 ) -> AccountQuotaReport {
     let join = roster_for_join(roster, roster_poll, now_ms);
     let mut alarms = Vec::new();
+    let mut information = Vec::new();
     let mut accounts = Vec::new();
     let mut gaps = RosterGaps::default();
     for reading in readings.readings.values() {
-        let (view, gap) = account_view(reading, &join, now_ms, &mut alarms);
+        let (view, gap) = account_view(reading, &join, now_ms, &mut alarms, &mut information);
         accounts.push(view);
         gaps.insula_only.extend(gap);
     }
@@ -1317,6 +1318,7 @@ pub fn build_report(
         accounts,
         gaps,
         alarms,
+        information,
     }
 }
 
