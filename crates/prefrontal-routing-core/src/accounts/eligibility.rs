@@ -195,7 +195,9 @@ impl QuotaEval {
     }
 }
 
-fn reserve_for(window: ApplicableWindow, policy: &AllocatorPolicy) -> f64 {
+/// Routing's reserve for a quota window. Callers with a producer-reported
+/// window outside the known topology use the seven-day reserve.
+pub fn reserve_for(window: ApplicableWindow, policy: &AllocatorPolicy) -> f64 {
     match window {
         ApplicableWindow::FiveHour => policy.reserve_five_hour,
         ApplicableWindow::SevenDay => policy.reserve_seven_day,
@@ -204,12 +206,10 @@ fn reserve_for(window: ApplicableWindow, policy: &AllocatorPolicy) -> f64 {
     }
 }
 
-/// Steps 3-5 for one account's reading: quota-unknown checks, the family
-/// scope, reserve, Broca floor and weight.
-pub fn evaluate_quota(
+/// Assess the timestamp and degradation disclosures shared by cold placement
+/// and quota-only reads. Window, scope and reserve checks are left to the caller.
+pub fn assess_reading(
     reading: Option<&QuotaReading>,
-    family: ModelFamily,
-    caller: CallerKind,
     now: EpochMs,
     policy: &AllocatorPolicy,
 ) -> QuotaEval {
@@ -228,10 +228,6 @@ pub fn evaluate_quota(
         return eval;
     };
     eval.observed_at_ms = reading.observed_at_ms;
-    let required = reading.required_windows();
-    if required.is_empty() {
-        eval.unknown.push(ExclusionReason::QuotaMissing);
-    }
     if let Some(error_class) = &reading.error_class {
         eval.unknown.push(ExclusionReason::EntryErrorClass {
             error_class: error_class.clone(),
@@ -258,6 +254,26 @@ pub fn evaluate_quota(
             }
         }
         Err(reason) => eval.unknown.push(reason),
+    }
+    eval
+}
+
+/// Steps 3-5 for one account's reading: quota-unknown checks, the family
+/// scope, reserve, Broca floor and weight.
+pub fn evaluate_quota(
+    reading: Option<&QuotaReading>,
+    family: ModelFamily,
+    caller: CallerKind,
+    now: EpochMs,
+    policy: &AllocatorPolicy,
+) -> QuotaEval {
+    let mut eval = assess_reading(reading, now, policy);
+    let Some(reading) = reading else {
+        return eval;
+    };
+    let required = reading.required_windows();
+    if required.is_empty() {
+        eval.unknown.insert(0, ExclusionReason::QuotaMissing);
     }
     let windows: Vec<_> = required
         .iter()
