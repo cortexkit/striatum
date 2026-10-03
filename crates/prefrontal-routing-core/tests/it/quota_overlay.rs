@@ -739,6 +739,73 @@ fn derived_pool_remainder_can_pace_but_never_walls() {
     );
 }
 
+/// The live `usage.get` result that stopped routing's quota refresh on
+/// 2026-10-02 at 16:56Z: insula served one Codex account's prepaid-credits pool
+/// with `basis: "unstated"` and no `remaining` balance (its sibling still
+/// carried 62500 credits). Requiring `remaining` failed the decode of the WHOLE
+/// array, so every refresh errored and selection kept reading the 16:55Z
+/// snapshot for hours. The array must decode, and a pool with no stated balance
+/// is unknown: it neither walls nor paces, even when its funding may spend.
+#[test]
+fn spend_pool_without_a_stated_balance_decodes_and_neither_walls_nor_paces() {
+    let result = serde_json::json!([
+        {
+            "provider": "codex", "apiProvider": "openai",
+            "account": "00000000-0000-4000-8000-0000000000a2",
+            "usage": { "primary": { "usedPercent": 2.0, "windowMinutes": 10080 } },
+            "spend": [{
+                "basis": "reported", "funding": "unknown", "id": "credits",
+                "label": "Prepaid credits",
+                "remaining": { "exponent": 0, "minor": 62500, "unit": "credit" }
+            }]
+        },
+        {
+            "provider": "codex", "apiProvider": "openai",
+            "account": "00000000-0000-4000-8000-0000000000a3",
+            "usage": { "primary": { "usedPercent": 2.0, "windowMinutes": 10080 } },
+            "spend": [{
+                "basis": "unstated", "funding": "unknown", "id": "credits",
+                "label": "Prepaid credits"
+            }]
+        }
+    ]);
+    let windows: Vec<ProviderUsage> = serde_json::from_value(result)
+        .expect("a pool with no stated balance must not fail the whole usage.get array");
+    assert_eq!(windows.len(), 2);
+    assert!(windows.iter().all(ProviderUsage::is_healthy));
+    assert_eq!(windows[1].spend[0].remaining, None);
+    assert!(!windows[1].spend[0].is_known_empty());
+
+    // The same unstated shape on a pool whose funding MAY spend: still unknown,
+    // so it must not wall the provider or add pressure.
+    let facts = vec![fact("balance-provider", "budget-model", 1.0)];
+    let granted_unstated = usage_from_json(serde_json::json!({
+        "provider": "balance-wire",
+        "apiProvider": "balance-provider",
+        "usage": {},
+        "spend": [{
+            "id": "grant", "label": "Grant balance", "funding": "granted",
+            "basis": "unstated", "spendable": true
+        }]
+    }));
+    let snap = overlay(&[granted_unstated], &facts, &HashMap::new());
+    let state = snap
+        .by_capacity
+        .get(&make_capacity_key("balance-provider", "budget-model"));
+    assert!(
+        state.is_none_or(
+            |state| state.quota_exhausted_until.is_none() && state.quota_pressure.is_none()
+        ),
+        "an unstated balance is unknown, never empty: {state:?}"
+    );
+
+    // The persisted snapshot round-trips the absent balance as absent.
+    let encoded = serde_json::to_value(&windows[1]).unwrap();
+    assert!(encoded["spend"][0].get("remaining").is_none());
+    let decoded: ProviderUsage = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, windows[1]);
+}
+
 /// An idle account is a FREE account, and the across-account fold walls a
 /// capacity only when every account holding a signal for it is walled. An
 /// account that contributes no signal holds none, so an idle sibling used to

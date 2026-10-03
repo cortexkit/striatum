@@ -44,6 +44,49 @@ fn msg(s: impl Into<String>) -> QuotaConsumerError {
     QuotaConsumerError::Message(s.into())
 }
 
+/// Decode the `usage.get` result array ENTRY BY ENTRY. Insula extends its
+/// entries additively, and a whole-array decode turned one entry routing could
+/// not read into a failed refresh: the cache then served the last accepted
+/// snapshot indefinitely. An entry that does not decode becomes a degraded
+/// entry of class `decode_failed` for its provider and account instead, so the
+/// rest of the poll still lands and the cache's degraded-entry handling applies
+/// to that one entry. Only a result that is not an array fails the refresh.
+pub(crate) fn decode_usage_result(
+    result: &serde_json::Value,
+) -> Result<Vec<prefrontal_routing_core::quota::ProviderUsage>, QuotaConsumerError> {
+    let entries = result
+        .as_array()
+        .ok_or_else(|| msg("usage.get 'result' is not an array"))?;
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            serde_json::from_value(entry.clone()).unwrap_or_else(|error| {
+                let field = |name: &str| entry.get(name).and_then(serde_json::Value::as_str);
+                let provider = field("provider").unwrap_or("<unnamed>").to_string();
+                let account = field("account").map(str::to_string);
+                let reason = format!("routing could not decode this usage.get entry: {error}");
+                eprintln!(
+                    "[prefrontal-routing] quota refresh: {provider} account {}: {reason}",
+                    account.as_deref().unwrap_or("-")
+                );
+                prefrontal_routing_core::quota::ProviderUsage {
+                    provider,
+                    api_provider: field("apiProvider").map(str::to_string),
+                    account,
+                    source: None,
+                    usage: None,
+                    spend: Vec::new(),
+                    saved_resets: None,
+                    error: Some(reason),
+                    error_class: Some("decode_failed".into()),
+                    stale: None,
+                    fetched_at: None,
+                }
+            })
+        })
+        .collect())
+}
+
 /// An outbound consumer connection to the daemon, used for one quota refresh cycle.
 /// The connection is closed after a successful `usage_get`; callers must create a
 /// new consumer for the next cycle.
@@ -153,7 +196,7 @@ impl QuotaConsumer {
         let result = value
             .get("result")
             .ok_or_else(|| msg("usage.get response missing 'result'"))?;
-        let windows = serde_json::from_value(result.clone()).map_err(QuotaConsumerError::Json)?;
+        let windows = decode_usage_result(result)?;
         self.goodbye().await?;
         Ok(windows)
     }
@@ -343,6 +386,116 @@ mod tests {
             assert!(consumer.usage_get().await.unwrap().is_empty());
         }
         server.await.unwrap();
+    }
+
+    /// Serve one `usage.get` reply carrying `result` and return what the
+    /// consumer decoded from it.
+    async fn usage_get_against(
+        result: serde_json::Value,
+    ) -> Result<Vec<prefrontal_routing_core::quota::ProviderUsage>, QuotaConsumerError> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_frame(&mut stream).await.unwrap().expect("request");
+            let response = Frame::build_with_version(
+                request.header.ver,
+                FrameType::Response,
+                request.header.flags,
+                request.header.channel,
+                request.header.epoch,
+                request.header.corr,
+                serde_json::to_vec(&serde_json::json!({ "result": result })).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &response).await.unwrap();
+            // Drain the goodbye so the client's shutdown completes.
+            let _ = read_frame(&mut stream).await;
+        });
+        let mut consumer = QuotaConsumer {
+            stream: TcpStream::connect(address).await.unwrap(),
+            route_channel: 7,
+            route_epoch: 3,
+            next_corr: 1,
+        };
+        let decoded = consumer.usage_get().await;
+        server.await.unwrap();
+        decoded
+    }
+
+    /// The reply that stalled routing's quota refresh from 2026-10-02 16:56Z:
+    /// one Codex account's prepaid-credits pool arrived with `basis: "unstated"`
+    /// and no `remaining`. The refresh loop then failed `usage.get` on every
+    /// 3-second retry (the daemon log shows routing's insula `route.open` moving
+    /// from a 60 s to a 3 s cadence at 16:56:04Z) while selection kept the
+    /// 16:55:04Z snapshot. Both accounts must decode as healthy readings.
+    #[tokio::test]
+    async fn usage_get_accepts_a_codex_credits_pool_with_no_stated_balance() {
+        let windows = usage_get_against(serde_json::json!([
+            {
+                "provider": "codex", "apiProvider": "openai",
+                "account": "00000000-0000-4000-8000-0000000000a2",
+                "usage": { "primary": { "usedPercent": 2.0, "windowMinutes": 10080 } },
+                "spend": [{
+                    "basis": "reported", "funding": "unknown", "id": "credits",
+                    "label": "Prepaid credits",
+                    "remaining": { "exponent": 0, "minor": 62500, "unit": "credit" }
+                }]
+            },
+            {
+                "provider": "codex", "apiProvider": "openai",
+                "account": "00000000-0000-4000-8000-0000000000a3",
+                "usage": { "primary": { "usedPercent": 2.0, "windowMinutes": 10080 } },
+                "spend": [{
+                    "basis": "unstated", "funding": "unknown", "id": "credits",
+                    "label": "Prepaid credits"
+                }]
+            }
+        ]))
+        .await
+        .expect("the poll must land");
+        assert_eq!(windows.len(), 2);
+        for window in &windows {
+            assert!(
+                window.is_healthy(),
+                "{:?} must be a healthy reading, not a decode failure: {:?}",
+                window.account,
+                window.error
+            );
+        }
+    }
+
+    /// One entry routing cannot read must cost only that entry: the rest of the
+    /// poll lands, and the unreadable one becomes a degraded `decode_failed`
+    /// entry for its provider and account.
+    #[tokio::test]
+    async fn an_undecodable_entry_degrades_alone_instead_of_failing_the_poll() {
+        let windows = usage_get_against(serde_json::json!([
+            {
+                "provider": "claude", "account": "good",
+                "usage": { "primary": { "usedPercent": 10.0 } }
+            },
+            {
+                "provider": "codex", "apiProvider": "openai", "account": "odd",
+                "usage": { "primary": { "usedPercent": "ten" } }
+            }
+        ]))
+        .await
+        .expect("one undecodable entry must not fail the whole poll");
+        assert_eq!(windows.len(), 2);
+        assert!(windows[0].is_healthy());
+        assert_eq!(windows[1].provider, "codex");
+        assert_eq!(windows[1].api_provider.as_deref(), Some("openai"));
+        assert_eq!(windows[1].account.as_deref(), Some("odd"));
+        assert_eq!(windows[1].error_class.as_deref(), Some("decode_failed"));
+        assert!(!windows[1].is_healthy());
+
+        assert!(
+            decode_usage_result(&serde_json::json!({ "not": "an array" })).is_err(),
+            "a result that is not an array is still a failed refresh"
+        );
     }
 
     #[tokio::test]
