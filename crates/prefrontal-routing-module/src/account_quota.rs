@@ -1511,6 +1511,7 @@ pub async fn account_quota_loop(
     state: SharedAccountQuota,
     store: Arc<SqliteRouteStateStore>,
     resolver: Arc<dyn CredentialResolver>,
+    broca_credentials: crate::broca_credentials::SharedBrocaCredentials,
 ) {
     let project_root =
         prefrontal_core_store::scratch_root().join("prefrontal-routing-account-quota");
@@ -1519,6 +1520,16 @@ pub async fn account_quota_loop(
     loop {
         let listing = resolver.list_scoped().await;
         let at_ms = now_ms();
+        // Reuse the reserved-principal listing already fetched on this cadence.
+        // Broca's cache owns its view/freshness and never holds a lock across IO.
+        if let Ok(mut credentials) = broca_credentials.lock() {
+            match &listing {
+                Ok(listing) => {
+                    credentials.apply_listing(listing, at_ms.max(0) as u64);
+                }
+                Err(error) => credentials.note_failure(error),
+            }
+        }
         let roster_row = match state.lock() {
             Ok(mut guard) => match &listing {
                 Ok(listing) => apply_roster_listing(&mut guard, listing, at_ms),
@@ -1658,6 +1669,7 @@ mod tests {
                     operations: vec!["list".into()],
                     account_id: Some((*account).into()),
                     email: Some((*email).into()),
+                    ..Default::default()
                 })
                 .collect(),
             grant_tuples: grants
@@ -1669,6 +1681,7 @@ mod tests {
                 })
                 .collect(),
             view: "view".into(),
+            ..Default::default()
         }
     }
 
@@ -2075,6 +2088,7 @@ mod tests {
                 operation: "read".into(),
             }],
             view: "view".into(),
+            ..Default::default()
         };
         let roster = build_roster(&today, None, NOON_MS);
         let report = build_report(

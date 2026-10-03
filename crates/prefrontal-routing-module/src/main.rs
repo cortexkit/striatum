@@ -18,6 +18,7 @@ mod aa_ingest;
 mod account_quota;
 mod account_selection;
 mod available_models_text;
+mod broca_credentials;
 mod config_overrides;
 mod fusiform_catalog;
 mod model_resolution;
@@ -34,6 +35,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
 use cortexkit_store_types::StorageDescriptor;
 use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
 use prefrontal_routing_core::model_facts::make_capacity_key;
@@ -66,9 +68,7 @@ use subc_protocol::{
         ManagementOperation, ManagementOperationKind, ManifestProvenance, ModuleManifest,
         ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
-    session::{
-        HealthReport, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
-    },
+    session::{ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK},
     ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
@@ -784,6 +784,7 @@ where
     let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
         account_quota::restore_account_state(store.as_ref()),
     ));
+    let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
         let roster_resolver: Arc<dyn prefrontal_ckcred_client::CredentialResolver> =
             Arc::new(prefrontal_ckcred_client::CkcredCredentialResolver::new(
@@ -803,6 +804,7 @@ where
             account_state,
             Arc::clone(&store),
             roster_resolver,
+            Arc::clone(&broca_credentials),
         ));
     }
     let aa_credential_resolver: Arc<dyn prefrontal_ckcred_client::CredentialResolver> =
@@ -834,9 +836,6 @@ where
     let override_path = config_overrides::config_path();
     // Selection policy and model-fact overrides share the routing-owned file.
     let operator_config_path = override_path.clone();
-    // Broca owns this file; routing reads only which providers it can
-    // authenticate to, for panels whose legs send through Broca.
-    let broca_vault_handles_path = config_overrides::broca_vault_handles_path();
     // OpenCode owns this file; routing reads only each provider's auth kind.
     let opencode_auth_path = config_overrides::auth_json_path();
     match config_overrides::apply_overrides_from_config(store.as_ref(), &override_path) {
@@ -913,7 +912,7 @@ where
             &min_band,
             &override_path,
             &operator_config_path,
-            &broca_vault_handles_path,
+            &broca_credentials,
             &opencode_auth_path,
             &catalog_health,
         )
@@ -1011,7 +1010,7 @@ async fn handle_frame(
     min_band: &SharedMinBand,
     routing_config_path: &Path,
     operator_config_path: &Path,
-    broca_vault_handles_path: &Path,
+    broca_credentials: &SharedBrocaCredentials,
     opencode_auth_path: &Path,
     catalog_health: &SharedCatalogHealth,
 ) -> Result<bool, ModuleError> {
@@ -1036,7 +1035,14 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, route_epochs, catalog_health).await?;
+            handle_control_request(
+                frame,
+                writer,
+                route_epochs,
+                catalog_health,
+                broca_credentials,
+            )
+            .await?;
             Ok(true)
         }
         FrameType::Request => {
@@ -1054,7 +1060,7 @@ async fn handle_frame(
             let min_band = Arc::clone(min_band);
             let routing_config_path = routing_config_path.to_path_buf();
             let operator_config_path = operator_config_path.to_path_buf();
-            let broca_vault_handles_path = broca_vault_handles_path.to_path_buf();
+            let broca_credentials = Arc::clone(broca_credentials);
             let opencode_auth_path = opencode_auth_path.to_path_buf();
             tokio::spawn(async move {
                 let _ = handle_select_request(
@@ -1066,7 +1072,7 @@ async fn handle_frame(
                     &min_band,
                     &routing_config_path,
                     &operator_config_path,
-                    &broca_vault_handles_path,
+                    &broca_credentials,
                     &opencode_auth_path,
                 )
                 .await;
@@ -1082,6 +1088,7 @@ async fn handle_control_request(
     writer: &mpsc::Sender<Frame>,
     route_epochs: &mut RouteEpochs,
     catalog_health: &SharedCatalogHealth,
+    broca_credentials: &SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
@@ -1120,11 +1127,13 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
-            // Routing is stateless: the catalog is machine-global and selection depends
-            // only on the request body, so there is no domain state that can wedge: a
-            // reply on this real dispatch path is itself the liveness proof the prober wants.
-            let mut report = HealthReport::ok();
+            let mut report = broca_credentials
+                .lock()
+                .map(|credentials| credentials.health_report(now_ms()))
+                .unwrap_or_else(|_| BrocaCredentials::default().health_report(now_ms()));
+            let broca_metrics = report.metrics.take();
             report.metrics = Some(json!({
+                "brocaReachability": broca_metrics,
                 "fusiformCatalog": catalog_health
                     .lock()
                     .map(|health| health.snapshot(now_ms()))
@@ -2458,7 +2467,7 @@ async fn handle_select_request(
     min_band: &SharedMinBand,
     routing_config_path: &Path,
     operator_config_path: &Path,
-    broca_vault_handles_path: &Path,
+    broca_credentials: &SharedBrocaCredentials,
     opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
@@ -2645,7 +2654,7 @@ async fn handle_select_request(
             store,
             routing_config_path,
             operator_config_path,
-            broca_vault_handles_path,
+            broca_credentials,
             opencode_auth_path,
         )
         .await;
@@ -2690,7 +2699,7 @@ async fn handle_select_request(
                 params.substrate.as_deref(),
                 std::mem::take(&mut params.available_models),
                 &facts,
-                broca_vault_handles_path,
+                broca_credentials,
             ),
             Err(e) => {
                 return send_route_error(
@@ -3022,77 +3031,38 @@ async fn handle_select_request(
     }
 }
 
-/// Report a Broca-substrate panel that had to fall back to the host list. The
-/// map is read on every such selection, so one line per process is enough; the
-/// recorded rejections keep saying `host` for as long as it lasts.
-fn warn_broca_credentials_unreadable_once(reason: &str) {
-    static WARNED: Once = Once::new();
-    let mut message = None;
-    WARNED.call_once(|| message = Some(reason.to_string()));
-    if let Some(reason) = message {
-        eprintln!(
-            "[prefrontal-routing] cannot read Broca's credential providers ({reason}); Broca-substrate panels keep using the caller's host availability list"
-        );
-    }
-}
-
-/// The availability list a panel's seats are judged against, and the substrate
-/// it belongs to.
-///
-/// A seat only exists if whatever SENDS to it can resolve the route, and panel
-/// legs do not all send through the same place. A host-run leg keeps the
-/// caller's own provider list. A Broca leg is judged against what Broca can
-/// reach instead: Broca's management surface publishes no catalog to ask, so the
-/// honest stand-in is the catalog rows this store still serves (rows the model
-/// catalog reports as withdrawn are already filtered out when facts are read)
-/// restricted to the providers Broca holds a credential for. It is never the
-/// whole fact table: a route Broca cannot authenticate to would seat and then
-/// fail its send on every round.
+/// Panel legs use the substrate that sends. Claustrum's complete mappings
+/// restrict Broca to credentialed providers; incomplete/stale listings fall
+/// back to the served catalog, just like single-route Broca selection.
 fn panel_availability(
     requested_substrate: Option<&str>,
     host_available_models: HashSet<String>,
     facts: &[ModelFact],
-    broca_vault_handles_path: &Path,
+    broca_credentials: &SharedBrocaCredentials,
 ) -> (AvailabilitySubstrate, HashSet<String>) {
     if !is_broca_substrate(requested_substrate) {
         return (AvailabilitySubstrate::Host, host_available_models);
     }
-    match broca_served_routes(facts, broca_vault_handles_path) {
-        Ok(available) => (
-            AvailabilitySubstrate::Broca,
-            available.into_iter().collect(),
-        ),
-        // Nothing usable to intersect with. Widening to every fact row would seat
-        // routes Broca cannot send, and narrowing to nothing would empty every
-        // panel, so the host list stands and the decision keeps saying `host`.
-        Err(error) => {
-            warn_broca_credentials_unreadable_once(&error);
-            (AvailabilitySubstrate::Host, host_available_models)
-        }
-    }
+    let (available, _) = broca_served_routes(facts, broca_credentials);
+    (
+        AvailabilitySubstrate::Broca,
+        available.into_iter().collect(),
+    )
 }
 
 fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
     requested_substrate.map(str::trim) == Some("broca")
 }
 
-/// The routes Broca can send today: the catalog rows this store still serves
-/// (withdrawn rows are filtered out when facts are read) restricted to the
-/// providers Broca holds a credential for. `Err` carries why Broca's credential
-/// map could not be read or named no provider, so the reach is unknown.
+/// Read the cached metadata only; selection never waits on the vault.
 fn broca_served_routes(
     facts: &[ModelFact],
-    broca_vault_handles_path: &Path,
-) -> Result<Vec<String>, String> {
-    let providers = config_overrides::read_broca_credential_providers(broca_vault_handles_path)?;
-    if providers.is_empty() {
-        return Err("the handle map names no provider".to_string());
-    }
-    Ok(facts
-        .iter()
-        .filter(|fact| providers.contains(&fact.provider_id))
-        .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
-        .collect())
+    broca_credentials: &SharedBrocaCredentials,
+) -> (Vec<String>, Option<String>) {
+    broca_credentials
+        .lock()
+        .map(|credentials| credentials.served_routes(facts, now_ms()))
+        .unwrap_or_else(|_| BrocaCredentials::default().served_routes(facts, now_ms()))
 }
 
 /// The list a single-route selection is judged against, the winner-ladder
@@ -3120,45 +3090,29 @@ impl SelectAvailability {
 /// A Broca send is judged against what Broca can reach now, never against a
 /// list the caller carries: callers without a host (core's own classifier,
 /// wake author, and comment reviewer) have no list of their own, and a host's
-/// list describes a different substrate. When Broca's credential map cannot be
-/// read, the reach is unknown: selection proceeds over every route the catalog
-/// still serves and the decision says so. It stays closed to routes known to be
+/// list describes a different substrate. When credential mappings are incomplete
+/// or stale, selection proceeds over every route the catalog still serves and
+/// the decision says so. It stays closed to routes known to be
 /// unserved, because withdrawn catalog rows never reach `facts`, and operator
 /// exclusions, cooldowns, and failure backoff still apply downstream.
 fn select_availability(
     requested_substrate: Option<&str>,
     host_available_models: Vec<String>,
     facts: &[ModelFact],
-    broca_vault_handles_path: &Path,
+    broca_credentials: &SharedBrocaCredentials,
 ) -> SelectAvailability {
     if !is_broca_substrate(requested_substrate) {
         return SelectAvailability::host(host_available_models);
     }
-    match broca_served_routes(facts, broca_vault_handles_path) {
-        Ok(models) => SelectAvailability {
-            note: Some(format!(
-                "availability: broca ({} served catalog routes on providers Broca holds a credential for)",
-                models.len()
-            )),
-            models,
-            ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
-        },
-        Err(reason) => {
-            let models: Vec<String> = facts
-                .iter()
-                .map(|fact| {
-                    make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
-                })
-                .collect();
-            SelectAvailability {
-                note: Some(format!(
-                    "availability unknown: Broca's credential providers are unreadable ({reason}); routed over all {} served catalog routes",
-                    models.len()
-                )),
-                models,
-                ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
-            }
-        }
+    let (models, fallback) = broca_served_routes(facts, broca_credentials);
+    let note = match fallback {
+        Some(reason) => format!("availability unknown: {reason}; routed over all {} served catalog routes", models.len()),
+        None => format!("availability: broca ({} served catalog routes on providers Broca holds a credential for)", models.len()),
+    };
+    SelectAvailability {
+        models,
+        note: Some(note),
+        ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
     }
 }
 
@@ -3169,7 +3123,7 @@ async fn handle_select_panel(
     store: &SharedStore,
     routing_config_path: &Path,
     operator_config_path: &Path,
-    broca_vault_handles_path: &Path,
+    broca_credentials: &SharedBrocaCredentials,
     opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
@@ -3245,7 +3199,7 @@ async fn handle_select_panel(
         params.substrate.as_deref(),
         resolved_policy.available_models.into_iter().collect(),
         &prepared.facts,
-        broca_vault_handles_path,
+        broca_credentials,
     );
     // Broca legs have no route.select of their own, so their availability is
     // recorded here for the winner ladder. Host-list panels are not recorded:
@@ -5186,7 +5140,7 @@ mod tests {
             .contains(&"newco/shiny-2".to_string()));
     }
 
-    fn fact(provider: &str, model: &str) -> ModelFact {
+    pub(super) fn fact(provider: &str, model: &str) -> ModelFact {
         ModelFact {
             speed_is_fleet_median: false,
             provider_id: provider.into(),
@@ -5303,9 +5257,15 @@ mod tests {
             let frame =
                 Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap();
 
-            handle_control_request(frame, &writer, &mut route_epochs, &catalog_health)
-                .await
-                .unwrap();
+            handle_control_request(
+                frame,
+                &writer,
+                &mut route_epochs,
+                &catalog_health,
+                &empty_broca_credentials(),
+            )
+            .await
+            .unwrap();
             let ack = replies.recv().await.unwrap();
             assert_eq!(ack.header.channel, 0);
             assert_eq!(ack.header.epoch, 0);
@@ -5332,9 +5292,28 @@ mod tests {
         .await
     }
 
-    /// No Broca handle map on this path: panels default to the host list, which is
-    /// what every test that does not name a substrate expects.
-    const ABSENT_BROCA_VAULT_HANDLES: &str = "/nonexistent/broca/vault-handles.json";
+    fn empty_broca_credentials() -> SharedBrocaCredentials {
+        Arc::new(Mutex::new(BrocaCredentials::default()))
+    }
+
+    fn mapped_broca_credentials(provider: &str) -> SharedBrocaCredentials {
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: vec![prefrontal_ckcred_client::ListedCredential {
+                    id: "fixture".into(),
+                    categories: vec!["llm-provider".into()],
+                    state: "active".into(),
+                    provider_ids: vec![provider.into()],
+                    ..Default::default()
+                }],
+                view: "fixture-view".into(),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        credentials
+    }
 
     /// An OpenCode `auth.json` with no providers, under the scratch root, for
     /// requests that carry no provider auth types (see `provider_auth_types`).
@@ -5400,7 +5379,7 @@ mod tests {
             store,
             request,
             operator_config_path,
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
         )
         .await
     }
@@ -5409,7 +5388,7 @@ mod tests {
         store: &SharedStore,
         request: serde_json::Value,
         operator_config_path: &Path,
-        broca_vault_handles_path: &Path,
+        broca_credentials: &SharedBrocaCredentials,
     ) -> Frame {
         let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let frame = Frame::build(
@@ -5432,7 +5411,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
-            broca_vault_handles_path,
+            broca_credentials,
             &empty_opencode_auth(),
         )
         .await
@@ -6902,7 +6881,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await
@@ -6947,7 +6926,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await
@@ -7043,7 +7022,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await
@@ -7637,7 +7616,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await
@@ -7720,7 +7699,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await
@@ -7825,7 +7804,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await
@@ -7903,7 +7882,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await
@@ -8775,7 +8754,7 @@ mod tests {
                 &min_band,
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
-                Path::new(ABSENT_BROCA_VAULT_HANDLES),
+                &empty_broca_credentials(),
                 &empty_opencode_auth(),
             )
             .await
@@ -8838,12 +8817,7 @@ mod tests {
         store
             .upsert_fact(&fact("kimi-code-plan-global", "k3"), FactSource::Override)
             .expect("the catalog carries the route on its new plane");
-        let vault_handles = rig.dir.join("vault-handles.json");
-        std::fs::write(
-            &vault_handles,
-            r#"{"handles":{"apikey:kimi-code-plan-global":"ckh_fixture"}}"#,
-        )
-        .unwrap();
+        let broca_credentials = mapped_broca_credentials("kimi-code-plan-global");
         let request = |substrate: &str| {
             json!({
                 "method": ROUTE_SELECT_PANEL_OP,
@@ -8859,13 +8833,13 @@ mod tests {
         };
         let run = |substrate: &'static str| {
             let store = Arc::clone(&store);
-            let vault_handles = vault_handles.clone();
+            let broca_credentials = Arc::clone(&broca_credentials);
             async move {
                 let response = run_route_wire_request_with_paths(
                     &store,
                     request(substrate),
                     Path::new("/nonexistent/alfonso-routing.jsonc"),
-                    &vault_handles,
+                    &broca_credentials,
                 )
                 .await;
                 assert_eq!(response.header.ty, FrameType::Response);
@@ -8913,12 +8887,7 @@ mod tests {
         store
             .upsert_fact(&fact("uncredentialed", "m1"), FactSource::Override)
             .unwrap();
-        let vault_handles = rig.dir.join("vault-handles.json");
-        std::fs::write(
-            &vault_handles,
-            r#"{"handles":{"apikey:kimi-code-plan-global":"ckh_fixture"}}"#,
-        )
-        .unwrap();
+        let broca_credentials = mapped_broca_credentials("kimi-code-plan-global");
         let response = run_route_wire_request_with_paths(
             &store,
             json!({
@@ -8932,7 +8901,7 @@ mod tests {
                 }
             }),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            &vault_handles,
+            &broca_credentials,
         )
         .await;
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
@@ -8967,12 +8936,7 @@ mod tests {
         store
             .upsert_fact(&fact("opencode-go", "m-native-fast"), FactSource::Override)
             .unwrap();
-        let handles = rig.dir.join("vault-handles.json");
-        std::fs::write(
-            &handles,
-            r#"{"handles":{"apikey:opencode-go":"ckh_fixture"}}"#,
-        )
-        .unwrap();
+        let broca_credentials = mapped_broca_credentials("opencode-go");
         let mut results = Vec::new();
         for omitted in [false, true] {
             let mut request = broca_select_request(&["opencode-go/m-native-fast"], Some("broca"));
@@ -8986,7 +8950,7 @@ mod tests {
                 &store,
                 request,
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
-                &handles,
+                &broca_credentials,
             )
             .await;
             assert_eq!(response.header.ty, FrameType::Response);
@@ -9029,21 +8993,16 @@ mod tests {
         store
             .upsert_fact(&fact("hostonly", "m-old"), FactSource::Override)
             .unwrap();
-        let vault_handles = rig.dir.join("vault-handles.json");
-        std::fs::write(
-            &vault_handles,
-            r#"{"handles":{"apikey:livebroca":"ckh_fixture"}}"#,
-        )
-        .unwrap();
+        let broca_credentials = mapped_broca_credentials("livebroca");
         let run = |substrate: Option<&'static str>| {
             let store = Arc::clone(&store);
-            let vault_handles = vault_handles.clone();
+            let broca_credentials = Arc::clone(&broca_credentials);
             async move {
                 let response = run_route_wire_request_with_paths(
                     &store,
                     broca_select_request(&["hostonly/m-old"], substrate),
                     Path::new("/nonexistent/alfonso-routing.jsonc"),
-                    &vault_handles,
+                    &broca_credentials,
                 )
                 .await;
                 assert_eq!(response.header.ty, FrameType::Response);
@@ -9095,7 +9054,7 @@ mod tests {
             &store,
             broca_select_request(&[], Some("broca")),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
         )
         .await;
         assert_eq!(response.header.ty, FrameType::Response);
@@ -9240,7 +9199,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await
@@ -9302,7 +9261,7 @@ mod tests {
                 &Arc::new(Mutex::new(None)),
                 config_path,
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
-                Path::new(ABSENT_BROCA_VAULT_HANDLES),
+                &empty_broca_credentials(),
                 &empty_opencode_auth(),
             )
             .await
@@ -9481,7 +9440,7 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             &config_path,
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
+            &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
         .await

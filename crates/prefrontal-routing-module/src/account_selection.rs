@@ -2245,6 +2245,7 @@ mod tests {
             operations: vec!["list".into()],
             account_id: Some(account.into()),
             email: Some(format!("{account}@example.test")),
+            ..Default::default()
         };
         ScopedCredentialListing {
             credentials: vec![
@@ -2258,6 +2259,7 @@ mod tests {
                 operation: "list".into(),
             }],
             view: "vault-view-1".into(),
+            ..Default::default()
         }
     }
 
