@@ -30,6 +30,7 @@ pub mod route_state_store;
 pub mod routing_config;
 pub mod runner;
 pub mod seat_routing;
+pub mod slot_saturation;
 
 pub use aa_infer::{
     aa_elo_curve, elo_floor, infer_elo_from_aa, infer_elo_from_aa_static, inferred_scores,
@@ -73,12 +74,12 @@ pub use model_resolution::{
     VALID_WORKLOAD_CLASSES,
 };
 pub use model_router::{
-    admit_routes, select_model_route, select_model_route_with_config, selection_cost,
-    AdmissionResult, AdmittedRoute, BelowFloorWarning, ModelRouteStateSnapshot, NoRouteError,
-    ObjectiveBreakdown, PromptParams, RejectedCandidate, RejectedRoute, RequiredCapabilities,
-    RouteFailureReason, RouteRuntimeState, SelectModelRouteInput, SelectedModel,
-    SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
-    REASON_NOT_AVAILABLE,
+    admit_routes, select_model_route, select_model_route_with_config,
+    select_model_route_with_slots, selection_cost, AdmissionResult, AdmittedRoute,
+    BelowFloorWarning, ModelRouteStateSnapshot, NoRouteError, ObjectiveBreakdown, PromptParams,
+    RejectedCandidate, RejectedRoute, RequiredCapabilities, RouteFailureReason, RouteRuntimeState,
+    SelectModelRouteInput, SelectedModel, SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED,
+    REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
 pub use panel::{
     select_panel, select_panel_with_config, validate_panel_spec, AvailabilitySubstrate,
@@ -121,4 +122,8 @@ pub use seat_routing::{
     incumbent_grand_families, select_seat_route, select_seat_route_with_config,
     SeatRecommendationMatch, SeatRecommendationTier, SeatRecommendations, SeatRouteError,
     SeatRouteInput, SeatRouteSelection,
+};
+pub use slot_saturation::{
+    ConcurrencySlotState, ConcurrencySlots, SkippedSaturatedRoute, SlotSaturation,
+    REASON_PROVIDER_SATURATED,
 };
