@@ -21,20 +21,6 @@ use super::types::{
     OperatorOverride, QuotaReading, ResetTime,
 };
 
-const CLAUDE_WINDOWS: &[GeneralWindow] = &[GeneralWindow::FiveHour, GeneralWindow::SevenDay];
-/// Codex publishes only its weekly primary window.
-const CHATGPT_WINDOWS: &[GeneralWindow] = &[GeneralWindow::SevenDay];
-
-/// The general windows a provider's entries must carry, or `None` for a
-/// provider routing has no account adapter for.
-fn required_windows(provider: &str) -> Option<&'static [GeneralWindow]> {
-    match provider {
-        "anthropic" => Some(CLAUDE_WINDOWS),
-        "openai" => Some(CHATGPT_WINDOWS),
-        _ => None,
-    }
-}
-
 fn previous_pin(affinity: &ConversationAffinity) -> PreviousPin {
     PreviousPin {
         pin_id: affinity.pin_id.clone(),
@@ -90,25 +76,23 @@ pub fn decide(request: &AccountRequest, state: &AllocatorState, now: EpochMs) ->
         requested_account: None,
         accounts: Vec::new(),
     };
-    let Some(required) = required_windows(&provider) else {
-        return refuse(explanation, RefusalCode::AccountSelectionUnsupported, None);
-    };
-    let views = state
+    let views: Vec<_> = state
         .roster
         .iter()
         .flat_map(|roster| roster.accounts.iter())
-        .filter(|view| view.refresh_adapter == provider)
+        .filter(|view| view.routing_provider == provider)
         .collect();
+    if state.roster.is_some() && views.is_empty() {
+        return refuse(explanation, RefusalCode::AccountSelectionUnsupported, None);
+    }
     Allocator {
         request,
         state,
         policy,
         now,
-        provider,
         model,
         affinity_model,
         family,
-        required,
         request_bytes,
         views,
         explanation,
@@ -176,11 +160,9 @@ struct Allocator<'a> {
     state: &'a AllocatorState,
     policy: &'a AllocatorPolicy,
     now: EpochMs,
-    provider: String,
     model: String,
     affinity_model: String,
     family: ModelFamily,
-    required: &'static [GeneralWindow],
     request_bytes: u64,
     views: Vec<&'a AccountView>,
     explanation: Explanation,
@@ -379,7 +361,6 @@ impl<'a> Allocator<'a> {
         evaluate_quota(
             view.quota.as_ref(),
             self.family,
-            self.required,
             self.request.caller,
             self.now,
             self.policy,
@@ -509,10 +490,9 @@ impl<'a> Allocator<'a> {
             check.matched && !check.passes
         });
         let fresh_full_used = |window: GeneralWindow| {
-            self.required.contains(&window)
-                && reading
-                    .and_then(|reading| reading.window(window))
-                    .is_some_and(|w| w.used_percent.is_finite() && w.used_percent >= 100.0)
+            reading
+                .and_then(|reading| reading.window(window))
+                .is_some_and(|w| w.used_percent.is_finite() && w.used_percent >= 100.0)
         };
         let confirmed = |migrate| Leave(InvalidationReason::ConfirmedExhaustion { migrate });
         let fresh = |window| Leave(InvalidationReason::FreshFullReading { window });
@@ -527,20 +507,13 @@ impl<'a> Allocator<'a> {
         // soft and local to this conversation: it creates no fence, and it is
         // re-evaluated at every admission, so a newer reading below 100 ends it.
         let hold_or_leave = |reset: ResetTime, basis: HoldBasis| {
-            // ChatGPT has no 5h window and never holds.
-            let action = if self.provider == "anthropic" {
-                short_hold_rule(
-                    false,
-                    false,
-                    Some(reset),
-                    self.now,
-                    self.policy.short_hold_max_ms,
-                )
-            } else {
-                ExhaustionAction::Migrate {
-                    reason: MigrateReason::FiveHour,
-                }
-            };
+            let action = short_hold_rule(
+                false,
+                false,
+                Some(reset),
+                self.now,
+                self.policy.short_hold_max_ms,
+            );
             match action {
                 ExhaustionAction::Hold {
                     reset_at_ms,
@@ -580,6 +553,16 @@ impl<'a> Allocator<'a> {
         }
         if fresh_full_used(GeneralWindow::SevenDay) {
             return fresh(ApplicableWindow::SevenDay);
+        }
+        if let Some(window) = reading.and_then(|reading| {
+            reading.required_windows().into_iter().find(|id| {
+                matches!(id, GeneralWindow::Reported(_))
+                    && reading.window(*id).is_some_and(|window| {
+                        window.used_percent.is_finite() && window.used_percent >= 100.0
+                    })
+            })
+        }) {
+            return fresh(window.into());
         }
         if let Some(five_hour) = fences
             .iter()
@@ -1075,9 +1058,10 @@ impl<'a> Allocator<'a> {
                 }
             } else if let Some(reading) = reading {
                 resets.extend(
-                    self.required
-                        .iter()
-                        .filter_map(|window| reading.window(*window))
+                    reading
+                        .required_windows()
+                        .into_iter()
+                        .filter_map(|window| reading.window(window))
                         .filter_map(|w| w.resets_at.at_ms()),
                 );
             }

@@ -11,14 +11,15 @@ use serde::{Deserialize, Serialize};
 /// Milliseconds since the Unix epoch.
 pub type EpochMs = i64;
 
-/// One of the two general subscription windows. Claude publishes both; the
-/// ChatGPT (Codex) feed publishes only the weekly one, which maps to
-/// `SevenDay` (design, "Insula input": Codex primary = 10080 minutes).
+/// A general subscription window. The legacy names also identify header
+/// evidence; other producer periods retain their own weighting horizon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GeneralWindow {
     FiveHour,
     SevenDay,
+    /// A producer-reported duration outside the legacy header vocabulary.
+    Reported(u32),
 }
 
 impl GeneralWindow {
@@ -28,6 +29,7 @@ impl GeneralWindow {
         match self {
             GeneralWindow::FiveHour => 300,
             GeneralWindow::SevenDay => 10_080,
+            GeneralWindow::Reported(minutes) => minutes,
         }
     }
 }
@@ -90,6 +92,8 @@ pub struct QuotaWindow {
     pub raw_utilization: Option<f64>,
     pub resets_at: ResetTime,
     pub window_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_kind: Option<String>,
     pub source: ObservationSource,
 }
 
@@ -141,14 +145,37 @@ pub struct QuotaReading {
     pub stale: Option<StaleDisclosure>,
     pub five_hour: Option<QuotaWindow>,
     pub seven_day: Option<QuotaWindow>,
+    /// Poll topology, including monthly/session windows. `None` preserves the
+    /// two-window contract of older serialized header readings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub general_windows: Option<Vec<QuotaWindow>>,
     pub scoped: ScopedList,
 }
 
 impl QuotaReading {
+    fn window_id(window: &QuotaWindow) -> GeneralWindow {
+        match (window.window_kind.as_deref(), window.window_minutes) {
+            (Some("five_hour"), _) | (None, 300) => GeneralWindow::FiveHour,
+            (Some("weekly"), _) | (None, 10_080) => GeneralWindow::SevenDay,
+            (_, minutes) => GeneralWindow::Reported(minutes),
+        }
+    }
+
+    pub fn required_windows(&self) -> Vec<GeneralWindow> {
+        self.general_windows.as_ref().map_or_else(
+            || vec![GeneralWindow::FiveHour, GeneralWindow::SevenDay],
+            |windows| windows.iter().map(Self::window_id).collect(),
+        )
+    }
+
     pub fn window(&self, window: GeneralWindow) -> Option<&QuotaWindow> {
+        if let Some(windows) = &self.general_windows {
+            return windows.iter().find(|w| Self::window_id(w) == window);
+        }
         match window {
             GeneralWindow::FiveHour => self.five_hour.as_ref(),
             GeneralWindow::SevenDay => self.seven_day.as_ref(),
+            GeneralWindow::Reported(_) => None,
         }
     }
 }
@@ -190,6 +217,7 @@ impl ModelReach {
 pub struct AccountView {
     /// Opaque vault account UUID, compared for equality only.
     pub account_id: String,
+    pub routing_provider: String,
     pub refresh_adapter: String,
     pub credentials: Vec<CredentialRecord>,
     pub model_reach: ModelReach,

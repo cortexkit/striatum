@@ -329,6 +329,52 @@ fn antigravity_pool_window(item: &ExtraWindow) -> Option<(&'static str, PoolPeri
     Some((pool, period))
 }
 
+/// Account pools use the same identities as route walls. With a capacity key,
+/// include only the pools that model draws on; without one, expose all pools
+/// for health. A pooled reading's aggregate slots are not authoritative.
+pub fn account_rate_windows(
+    usage: &crate::quota::Usage,
+    capacity_key: Option<&str>,
+) -> Vec<(&'static str, RateWindow)> {
+    let pools: Vec<_> = usage
+        .extra_rate_windows
+        .iter()
+        .flatten()
+        .filter_map(|extra| {
+            let (pool, period) = antigravity_pool_window(extra)?;
+            Some((extra, pool, period))
+        })
+        .collect();
+    if !pools.is_empty() {
+        return pools
+            .into_iter()
+            .filter(|(_, pool, _)| {
+                capacity_key.is_none_or(|key| antigravity_pool_for_capacity(key) == Some(*pool))
+            })
+            .filter_map(|(extra, _, period)| {
+                let mut window = extra.window.clone()?;
+                window.window_kind = extra.window_kind.clone().or(window.window_kind);
+                window.window_minutes = window
+                    .window_minutes
+                    .or(Some((period.window_ms() / 60_000.0) as i64));
+                Some(("extra", window))
+            })
+            .collect();
+    }
+    [
+        ("primary", &usage.primary),
+        ("secondary", &usage.secondary),
+        ("tertiary", &usage.tertiary),
+    ]
+    .into_iter()
+    .filter_map(|(slot, window)| window.as_ref().map(|window| (slot, window.clone())))
+    .collect()
+}
+
+pub fn is_account_pool_window(extra: &ExtraWindow) -> bool {
+    antigravity_pool_window(extra).is_some()
+}
+
 /// Antigravity (Google AI Ultra): ignore the misleading aggregate windows. Pool
 /// windows in extra_rate_windows[] (`gemini-5h`, `3p-weekly`, ...) are emitted
 /// pool-scoped, so they pressure and wall exactly the routed models that draw on

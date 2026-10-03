@@ -27,6 +27,7 @@ pub enum AgeBand {
 pub enum ApplicableWindow {
     FiveHour,
     SevenDay,
+    Reported(u32),
     /// The requested family's scoped window (Fable).
     FamilyScope,
 }
@@ -36,6 +37,7 @@ impl From<GeneralWindow> for ApplicableWindow {
         match window {
             GeneralWindow::FiveHour => ApplicableWindow::FiveHour,
             GeneralWindow::SevenDay => ApplicableWindow::SevenDay,
+            GeneralWindow::Reported(minutes) => ApplicableWindow::Reported(minutes),
         }
     }
 }

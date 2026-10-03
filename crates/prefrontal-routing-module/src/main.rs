@@ -651,9 +651,9 @@ enum StartupMode {
     Serve(PathBuf),
 }
 
-/// `--account-quota-dry-run --subc <file> [--capture <dir>]`: fetch each tracked
-/// provider's `usage.get` reply, optionally save the exact reply bytes under
-/// `<dir>/usage-get-<provider>.json`, and print the account report as JSON.
+/// `--account-quota-dry-run --subc <file> [--capture <dir>]`: fetch Insula's
+/// unfiltered reply, optionally save its exact bytes under
+/// `<dir>/usage-get-all.json`, and print the account report as JSON.
 async fn account_quota_dry_run(
     connection_file_path: PathBuf,
     capture_dir: Option<PathBuf>,
@@ -664,8 +664,8 @@ async fn account_quota_dry_run(
     let mut consumer = QuotaConsumer::connect(&connection_file_path, &project_root)
         .await
         .map_err(|error| ModuleError::Message(format!("connect to insula: {error}")))?;
-    let replies = consumer
-        .usage_get_providers_raw(&account_quota::account_provider_names())
+    let body = consumer
+        .usage_get_raw()
         .await
         .map_err(|error| ModuleError::Message(format!("usage.get: {error}")))?;
     let mut state = account_quota::AccountQuotaState {
@@ -676,17 +676,13 @@ async fn account_quota_dry_run(
         ..Default::default()
     };
     let received_at_ms = now_ms() as i64;
-    for (provider, body) in replies {
-        if let Some(dir) = &capture_dir {
-            std::fs::create_dir_all(dir)
-                .and_then(|()| {
-                    std::fs::write(dir.join(format!("usage-get-{provider}.json")), &body)
-                })
-                .map_err(|error| ModuleError::Message(format!("capture {provider}: {error}")))?;
-        }
-        account_quota::apply_provider_reply(&mut state, &provider, &body, received_at_ms)
-            .map_err(|error| ModuleError::Message(format!("{provider}: {error}")))?;
+    if let Some(dir) = &capture_dir {
+        std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(dir.join("usage-get-all.json"), &body))
+            .map_err(|error| ModuleError::Message(format!("capture usage: {error}")))?;
     }
+    account_quota::apply_usage_reply(&mut state, &body, received_at_ms)
+        .map_err(ModuleError::Message)?;
     let status = account_quota::status_json(&state, now_ms() as i64);
     println!(
         "{}",

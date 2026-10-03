@@ -43,6 +43,7 @@ pub fn header_window(
         raw_utilization: Some(raw_utilization),
         resets_at,
         window_minutes: window.window_minutes(),
+        window_kind: None,
         source,
     }
 }
