@@ -1089,7 +1089,9 @@ mod tests {
             ],
         );
         let snapshot = antigravity_overlay(&[gemini_walled], &facts);
-        assert!(snapshot.by_capacity[AG_GEMINI].quota_exhausted_until.is_some());
+        assert!(snapshot.by_capacity[AG_GEMINI]
+            .quota_exhausted_until
+            .is_some());
         assert_eq!(snapshot.by_capacity[AG_CLAUDE].quota_exhausted_until, None);
 
         let third_party_walled = antigravity_account(
@@ -1118,10 +1120,8 @@ mod tests {
                 ("gemini-5h", 100.0, "2030-01-01T01:19:00Z"),
             ],
         );
-        let weekly_spent = antigravity_account(
-            "grace",
-            &[("gemini-weekly", 100.0, "2030-01-07T00:00:00Z")],
-        );
+        let weekly_spent =
+            antigravity_account("grace", &[("gemini-weekly", 100.0, "2030-01-07T00:00:00Z")]);
         let free = antigravity_account(
             "free",
             &[
@@ -1130,10 +1130,12 @@ mod tests {
             ],
         );
 
-        let snapshot = antigravity_overlay(&[five_hour_spent.clone(), weekly_spent.clone(), free], &facts);
+        let snapshot = antigravity_overlay(
+            &[five_hour_spent.clone(), weekly_spent.clone(), free],
+            &facts,
+        );
         assert_eq!(
-            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until,
-            None,
+            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until, None,
             "one usable account keeps the route open"
         );
 

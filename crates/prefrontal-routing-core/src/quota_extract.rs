@@ -896,13 +896,21 @@ mod tests {
         assert_eq!(
             pools,
             vec![
-                ("codexbar:antigravity:3p-5h", Some("3p"), Some(300.0 * 60_000.0)),
+                (
+                    "codexbar:antigravity:3p-5h",
+                    Some("3p"),
+                    Some(300.0 * 60_000.0)
+                ),
                 (
                     "codexbar:antigravity:3p-weekly",
                     Some("3p"),
                     Some(10_080.0 * 60_000.0)
                 ),
-                ("codexbar:antigravity:gemini-5h", Some("gemini"), Some(300.0 * 60_000.0)),
+                (
+                    "codexbar:antigravity:gemini-5h",
+                    Some("gemini"),
+                    Some(300.0 * 60_000.0)
+                ),
             ],
             "the id suffix names the period when windowMinutes is absent"
         );
