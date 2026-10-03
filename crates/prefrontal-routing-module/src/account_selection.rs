@@ -1,6 +1,8 @@
 //! Account selection over the wire: `route.account_for`, the runner reports
 //! that follow it (`route.account_observe`, `route.account_release`), shadow
 //! decisions and their readback (`route.account_shadow_status`).
+//! `route.account_status` reads quota headroom for cache warming without
+//! admissions, shadow decisions, store access or polling.
 //!
 //! Specification: `docs/designs/account-selection.md` ("Proposed protocol",
 //! "Affinity, persistence and freeze semantics", "Operator pins and rollout"
@@ -24,13 +26,14 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use prefrontal_routing_core::accounts::eligibility::{assess_reading, reserve_for};
 use prefrontal_routing_core::accounts::evidence::{
     confirm_exhaustion, header_window, Carrier, ConfirmationOutcome, Derivation, EvidenceScope,
     ExhaustionObservation, FrameOrigin, ObservationKind, ResetSource, WindowEvidence,
 };
 use prefrontal_routing_core::accounts::{
     decide, AccountRef, AccountRequest, AccountView, AdmissionDemand, AdmissionState,
-    AffinityOutcome, AllocatorPolicy, AllocatorState, CallerKind, CandidateRef,
+    AffinityOutcome, AllocatorPolicy, AllocatorState, ApplicableWindow, CallerKind, CandidateRef,
     ConversationAffinity, ConversationKeySource, CredentialRecord, Decision, Fence, GeneralWindow,
     ModelFamily, ModelReach, ObservationSource, Outcome, PrincipalExclusion, QuotaReading,
     QuotaWindow, RefusalCode, ResetTime, Roster, RunnerCandidates, ScopedList, ScopedWindow,
@@ -54,6 +57,8 @@ use crate::config_overrides::AccountSelectionFlags;
 
 /// Choose the account for one admission, renewal or reassignment.
 pub const ACCOUNT_FOR_OP: &str = "route.account_for";
+/// Read whether an account's quota has room for prompt-cache warming.
+pub const ACCOUNT_STATUS_OP: &str = "route.account_status";
 /// Report account-bound admission, dispatch and failure evidence.
 pub const ACCOUNT_OBSERVE_OP: &str = "route.account_observe";
 /// Release an admission that never started, or end a conversation's lease.
@@ -138,7 +143,11 @@ fn invalid(message: impl Into<String>) -> OpReply {
 pub fn handles(method: &str) -> bool {
     matches!(
         method,
-        ACCOUNT_FOR_OP | ACCOUNT_OBSERVE_OP | ACCOUNT_RELEASE_OP | ACCOUNT_SHADOW_STATUS_OP
+        ACCOUNT_FOR_OP
+            | ACCOUNT_STATUS_OP
+            | ACCOUNT_OBSERVE_OP
+            | ACCOUNT_RELEASE_OP
+            | ACCOUNT_SHADOW_STATUS_OP
     )
 }
 
@@ -922,6 +931,14 @@ fn parse_account_for(params: &Value) -> Result<AccountForParams, OpReply> {
 /// Handle one account-selection operation. `body` is the whole request
 /// (`{"method", "params"}`); `principal` is the route's attested principal.
 pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpReply {
+    // This query must bypass both serving transactions and disabled-mode shadow
+    // recording. A warming check never reserves or charges quota.
+    if method == ACCOUNT_STATUS_OP {
+        return match decode_params(body) {
+            Ok(params) => account_status(&params, ctx),
+            Err(reply) => reply,
+        };
+    }
     if method == ACCOUNT_SHADOW_STATUS_OP {
         let params = decode_params(body).unwrap_or(Value::Null);
         return shadow_status(&params, principal, ctx);
@@ -954,6 +971,186 @@ pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpRe
         ACCOUNT_RELEASE_OP => release(&params, principal, ctx),
         other => OpReply::error("unknown_method", format!("unknown method '{other}'")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// route.account_status
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AccountStatusParams {
+    provider: String,
+    account_id: String,
+}
+
+/// A closed vocabulary; only reserve refusals carry a window identity.
+#[derive(Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+enum WarmReason {
+    Headroom,
+    WithinReserve { window: String },
+    ReadingStale,
+    ReadingMissing,
+    AccountUnknown,
+    AccountSelectionDisabled,
+}
+
+#[derive(Serialize)]
+struct StatusWindow {
+    kind: String,
+    used_percent: f64,
+    resets_at: Option<String>,
+    window_minutes: Option<i64>,
+    #[serde(skip)]
+    reserve_window: ApplicableWindow,
+}
+
+fn status_window(
+    window: &RateWindow,
+    reported_kind: Option<&str>,
+    reserve_window: Option<ApplicableWindow>,
+) -> StatusWindow {
+    let general = if window.window_minutes
+        == Some(i64::from(GeneralWindow::FiveHour.window_minutes()))
+    {
+        Some(("five_hour", ApplicableWindow::FiveHour))
+    } else if window.window_minutes == Some(i64::from(GeneralWindow::SevenDay.window_minutes())) {
+        Some(("weekly", ApplicableWindow::SevenDay))
+    } else {
+        None
+    };
+    StatusWindow {
+        kind: window
+            .window_kind
+            .as_deref()
+            .or(reported_kind)
+            .or(general.map(|(kind, _)| kind))
+            .unwrap_or("reported")
+            .to_string(),
+        used_percent: window.used_percent,
+        resets_at: window.resets_at.clone(),
+        window_minutes: window.window_minutes,
+        reserve_window: reserve_window
+            .unwrap_or_else(|| general.map_or(ApplicableWindow::SevenDay, |(_, window)| window)),
+    }
+}
+
+fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
+    let parsed: AccountStatusParams = match serde_json::from_value(params.clone()) {
+        Ok(parsed) => parsed,
+        Err(error) => return invalid(format!("invalid route.account_status params: {error}")),
+    };
+    if parsed.provider.trim().is_empty() || parsed.account_id.trim().is_empty() {
+        return invalid("`provider` and `account_id` must not be empty");
+    }
+    let provider = normalize(&parsed.provider);
+    let mut observed_at = None;
+    let mut band = None;
+    let mut windows = Vec::<StatusWindow>::new();
+    let reason = (|| {
+        if !ctx.flags.enabled {
+            return WarmReason::AccountSelectionDisabled;
+        }
+        let Some(adapter) = adapter_for_provider(&provider) else {
+            return WarmReason::AccountUnknown;
+        };
+        let Some(Ok(state)) = ctx.accounts.map(|accounts| accounts.lock()) else {
+            return WarmReason::ReadingMissing;
+        };
+        // Like account placement, identity comes from the vault, not an
+        // Insula-only reading or an email alias.
+        let known = state.roster.as_ref().is_some_and(|roster| {
+            roster.identities.iter().any(|identity| {
+                identity.refresh_adapter == adapter.refresh_adapter
+                    && identity.account_id == parsed.account_id
+            })
+        });
+        if !known {
+            return WarmReason::AccountUnknown;
+        }
+        let Some(stored) = state
+            .readings
+            .readings
+            .get(&(
+                adapter.insula_provider.to_string(),
+                parsed.account_id.clone(),
+            ))
+            .filter(|reading| reading.tombstoned_at_ms.is_none())
+        else {
+            return WarmReason::ReadingMissing;
+        };
+        let Ok(entry) = serde_json::from_value::<AccountEntry>(stored.entry.clone()) else {
+            return WarmReason::ReadingMissing;
+        };
+        observed_at = entry.fetched_at.clone();
+        let Some(reading) = quota_reading(&stored.entry) else {
+            return WarmReason::ReadingMissing;
+        };
+        let freshness = assess_reading(Some(&reading), ctx.now_ms, ctx.policy);
+        band = freshness.age_band;
+        if let Some(usage) = &entry.usage {
+            for window in [&usage.primary, &usage.secondary, &usage.tertiary]
+                .into_iter()
+                .flatten()
+            {
+                windows.push(status_window(window, None, None));
+            }
+            for extra in usage.extra_rate_windows.iter().flatten() {
+                let Some(window) = &extra.window else {
+                    return WarmReason::ReadingMissing;
+                };
+                let reserve_window = if ctx.policy.scope_ids.iter().any(|scope| {
+                    extra.id.as_deref() == Some(scope.scope_id.as_str())
+                        && window.window_minutes == Some(i64::from(scope.window_minutes))
+                }) {
+                    ApplicableWindow::FamilyScope
+                } else {
+                    // A producer-reported pool outside routing's scope mapping
+                    // gets the same conservative fallback as a general unknown.
+                    ApplicableWindow::SevenDay
+                };
+                windows.push(status_window(
+                    window,
+                    extra.window_kind.as_deref().or(extra.id.as_deref()),
+                    Some(reserve_window),
+                ));
+            }
+        }
+        if !freshness.unknown.is_empty() {
+            return WarmReason::ReadingStale;
+        }
+        // Missing or malformed windows cannot be treated as unused quota.
+        if windows.is_empty()
+            || adapter.general_window_minutes.iter().any(|minutes| {
+                !windows.iter().any(|window| {
+                    window.reserve_window != ApplicableWindow::FamilyScope
+                        && window.window_minutes == Some(*minutes)
+                })
+            })
+            || windows.iter().any(|window| {
+                !window.used_percent.is_finite() || !(0.0..=100.0).contains(&window.used_percent)
+            })
+        {
+            return WarmReason::ReadingMissing;
+        }
+        for window in &windows {
+            if 100.0 - window.used_percent <= reserve_for(window.reserve_window, ctx.policy) {
+                return WarmReason::WithinReserve {
+                    window: window.kind.clone(),
+                };
+            }
+        }
+        WarmReason::Headroom
+    })();
+    OpReply::Result(json!({
+        "provider": provider,
+        "account_id": parsed.account_id,
+        "observed_at": observed_at,
+        "age_band": band,
+        "windows": windows,
+        "warm_ok": matches!(reason, WarmReason::Headroom),
+        "reason": reason,
+    }))
 }
 
 /// With serving off and shadow on, a refused operation still feeds shadow:
@@ -2352,6 +2549,299 @@ mod tests {
                 panic!("expected a result, got {code}: {message}")
             }
         }
+    }
+
+    fn status(fixture: &Fixture, ctx: &Ctx<'_>, account: &str) -> Value {
+        result(fixture.call(
+            ctx,
+            ACCOUNT_STATUS_OP,
+            BROCA,
+            json!({ "provider": "anthropic", "account_id": account }),
+        ))
+    }
+
+    fn assert_status_vector(fixture: &Fixture, ctx: &Ctx<'_>, source: &str) {
+        let vector: Value = serde_json::from_str(source).unwrap();
+        let request = &vector["request"];
+        let reply = result(fixture.call(
+            ctx,
+            request["method"].as_str().unwrap(),
+            BROCA,
+            request["params"].clone(),
+        ));
+        assert_eq!(json!({ "result": reply }), vector["reply"]);
+    }
+
+    #[test]
+    fn account_status_fresh_headroom_allows_warming() {
+        let fixture = fixture("status-headroom");
+        assert_status_vector(
+            &fixture,
+            &fixture.ctx(true, false, NOW),
+            include_str!("../../../test-vectors/route-account-status-v1/warm_ok.json"),
+        );
+        let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+        assert_eq!(reply["warm_ok"], true);
+        assert_eq!(reply["reason"], json!({ "code": "headroom" }));
+        assert_eq!(reply["provider"], "anthropic");
+        assert_eq!(reply["account_id"], ACCOUNT_A);
+        assert_eq!(reply["observed_at"], "2026-09-29T11:59:00Z");
+        assert_eq!(reply["age_band"], "full");
+        assert_eq!(
+            reply["windows"],
+            json!([
+                { "kind": "five_hour", "used_percent": 10.0,
+                  "resets_at": "2026-09-29T14:00:00Z", "window_minutes": 300 },
+                { "kind": "weekly", "used_percent": 40.0,
+                  "resets_at": null, "window_minutes": 10080 },
+                { "kind": "Fable", "used_percent": 5.0,
+                  "resets_at": null, "window_minutes": 10080 },
+            ])
+        );
+    }
+
+    #[test]
+    fn account_status_within_reserve_names_the_window() {
+        let mut fixture = fixture("status-reserve");
+        fixture
+            .accounts
+            .lock()
+            .unwrap()
+            .readings
+            .readings
+            .get_mut(&("claude".into(), ACCOUNT_A.into()))
+            .unwrap()
+            .entry["usage"]["primary"]["usedPercent"] = json!(99.5);
+        assert_status_vector(
+            &fixture,
+            &fixture.ctx(true, false, NOW),
+            include_str!("../../../test-vectors/route-account-status-v1/within_reserve.json"),
+        );
+        fixture.policy.reserve_five_hour = 12.0;
+        fixture.policy.reserve_seven_day = 8.0;
+        fixture.policy.reserve_scoped = 3.0;
+        for (slot, kind, used) in [
+            ("primary", "five_hour", 88.0),
+            ("secondary", "weekly", 93.0),
+            ("scoped", "Fable", 97.0),
+            ("reported", "producer_monthly", 93.0),
+            ("reported_extra", "producer_pool", 93.0),
+        ] {
+            let mut entry = claude_entry(ACCOUNT_A);
+            if slot == "scoped" {
+                entry["usage"]["extraRateWindows"][0]["window"]["usedPercent"] = json!(used);
+            } else if slot == "reported" {
+                entry["usage"]["tertiary"] = json!({
+                    "windowKind": kind, "usedPercent": used, "windowMinutes": 43200,
+                });
+            } else if slot == "reported_extra" {
+                entry["usage"]["extraRateWindows"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({
+                        "id": "unknown_scope", "windowKind": kind,
+                        "window": { "usedPercent": used, "windowMinutes": 300 },
+                    }));
+            } else {
+                entry["usage"][slot]["usedPercent"] = json!(used);
+            }
+            fixture
+                .accounts
+                .lock()
+                .unwrap()
+                .readings
+                .readings
+                .get_mut(&("claude".into(), ACCOUNT_A.into()))
+                .unwrap()
+                .entry = entry;
+            let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+            assert_eq!(reply["warm_ok"], false, "{kind}");
+            assert_eq!(
+                reply["reason"],
+                json!({ "code": "within_reserve", "window": kind })
+            );
+        }
+    }
+
+    #[test]
+    fn account_status_preserves_producer_window_identity_not_slot_names() {
+        let fixture = fixture("status-identity");
+        let mut entry = claude_entry(ACCOUNT_A);
+        let five_hour = entry["usage"]["primary"].clone();
+        entry["usage"]["primary"] = entry["usage"]["secondary"].clone();
+        entry["usage"]["secondary"] = five_hour;
+        entry["usage"]["primary"]["windowKind"] = json!("producer_weekly");
+        entry["usage"]["extraRateWindows"][0]["windowKind"] = json!("weekly");
+        fixture
+            .accounts
+            .lock()
+            .unwrap()
+            .readings
+            .readings
+            .get_mut(&("claude".into(), ACCOUNT_A.into()))
+            .unwrap()
+            .entry = entry;
+        let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+        assert_eq!(reply["warm_ok"], true);
+        assert_eq!(reply["windows"][0]["kind"], "producer_weekly");
+        assert_eq!(reply["windows"][1]["kind"], "five_hour");
+        assert_eq!(reply["windows"][2]["kind"], "weekly");
+    }
+
+    #[test]
+    fn account_status_stale_reading_stops_warming() {
+        let fixture = fixture("status-stale");
+        // The reading was observed a minute before NOW: exactly the allocator's
+        // excluded boundary, not a separate warming timeout.
+        let ctx = fixture.ctx(true, false, NOW - 60_000 + fixture.policy.excluded_band_ms);
+        assert_status_vector(
+            &fixture,
+            &ctx,
+            include_str!("../../../test-vectors/route-account-status-v1/reading_stale.json"),
+        );
+        let reply = status(&fixture, &ctx, ACCOUNT_A);
+        assert_eq!(reply["warm_ok"], false);
+        assert_eq!(reply["reason"], json!({ "code": "reading_stale" }));
+        assert_eq!(reply["age_band"], "excluded");
+        assert_eq!(reply["windows"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn account_status_uses_cold_placement_freshness_rules() {
+        let mut fixture = fixture("status-freshness");
+        fixture.policy.full_band_ms = 2 * 60_000;
+        fixture.policy.excluded_band_ms = 10 * 60_000;
+        let discounted = fixture.ctx(true, false, NOW + 60_000);
+        let reply = status(&fixture, &discounted, ACCOUNT_A);
+        assert_eq!(reply["age_band"], "discounted");
+        assert_eq!(reply["warm_ok"], true);
+        for (field, value, expected) in [
+            ("errorClass", json!("upstream_failed"), false),
+            ("error", json!("poll failed"), false),
+            ("stale", json!({ "class": "unknown" }), false),
+            ("stale", json!({ "class": "upstream_failed" }), true),
+            (
+                "fetchedAt",
+                json!(rfc3339(NOW + fixture.policy.future_skew_ms + 1000)),
+                false,
+            ),
+            ("fetchedAt", Value::Null, false),
+        ] {
+            let mut entry = claude_entry(ACCOUNT_A);
+            entry[field] = value;
+            fixture
+                .accounts
+                .lock()
+                .unwrap()
+                .readings
+                .readings
+                .get_mut(&("claude".into(), ACCOUNT_A.into()))
+                .unwrap()
+                .entry = entry;
+            let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+            assert_eq!(reply["warm_ok"], expected, "{field}");
+            assert_eq!(
+                reply["reason"]["code"],
+                if expected {
+                    "headroom"
+                } else {
+                    "reading_stale"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn account_status_unknown_account_is_not_a_warming_target() {
+        let fixture = fixture("status-unknown");
+        for account in ["unknown", INSULA_ONLY] {
+            let reply = status(&fixture, &fixture.ctx(true, false, NOW), account);
+            assert_eq!(reply["warm_ok"], false);
+            assert_eq!(reply["reason"], json!({ "code": "account_unknown" }));
+            assert_eq!(reply["observed_at"], Value::Null);
+            assert_eq!(reply["windows"], json!([]));
+        }
+    }
+
+    #[test]
+    fn account_status_missing_or_invalid_windows_stop_warming() {
+        let fixture = fixture("status-missing");
+        let reply = status(&fixture, &fixture.ctx(true, false, NOW), VAULT_ONLY);
+        assert_eq!(reply["warm_ok"], false);
+        assert_eq!(reply["reason"]["code"], "reading_missing");
+        for usage in [
+            Value::Null,
+            json!({}),
+            json!({ "primary": { "usedPercent": 10.0, "windowMinutes": 300 } }),
+            json!({ "primary": { "usedPercent": -1.0, "windowMinutes": 300 },
+                    "secondary": { "usedPercent": 10.0, "windowMinutes": 10080 } }),
+        ] {
+            let mut entry = claude_entry(ACCOUNT_A);
+            entry["usage"] = usage;
+            fixture
+                .accounts
+                .lock()
+                .unwrap()
+                .readings
+                .readings
+                .get_mut(&("claude".into(), ACCOUNT_A.into()))
+                .unwrap()
+                .entry = entry;
+            let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+            assert_eq!(reply["warm_ok"], false);
+            assert_eq!(reply["reason"]["code"], "reading_missing");
+        }
+        fixture
+            .accounts
+            .lock()
+            .unwrap()
+            .readings
+            .readings
+            .get_mut(&("claude".into(), ACCOUNT_A.into()))
+            .unwrap()
+            .tombstoned_at_ms = Some(NOW);
+        let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+        assert_eq!(reply["warm_ok"], false);
+        assert_eq!(reply["reason"]["code"], "reading_missing");
+    }
+
+    #[test]
+    fn account_status_disabled_never_allows_warming() {
+        let fixture = fixture("status-disabled");
+        let reply = status(&fixture, &fixture.ctx(false, true, NOW), ACCOUNT_A);
+        assert_eq!(reply["warm_ok"], false);
+        assert_eq!(
+            reply["reason"],
+            json!({ "code": "account_selection_disabled" })
+        );
+    }
+
+    #[test]
+    fn account_status_writes_nothing_even_in_shadow_mode() {
+        let fixture = fixture("status-no-writes");
+        // data_version on a separate connection changes for any committed write
+        // on the store connection, including tables outside account serving.
+        let observer = rusqlite::Connection::open(fixture.dir.join("store.db")).unwrap();
+        let version = || {
+            observer
+                .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = version();
+        for (enabled, shadow) in [(true, false), (true, true), (false, true)] {
+            let ctx = fixture.ctx(enabled, shadow, NOW);
+            for account in [ACCOUNT_A, VAULT_ONLY, "unknown"] {
+                status(&fixture, &ctx, account);
+            }
+        }
+        assert_eq!(
+            version(),
+            before,
+            "a quota read must not commit any store writes"
+        );
+        assert_eq!(fixture.store().account_serving_counts().unwrap().total(), 0);
+        assert!(fixture.shadow_rows().is_empty());
+        assert!(fixture.serve_rows().is_empty());
     }
 
     #[test]

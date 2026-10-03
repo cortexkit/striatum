@@ -4654,6 +4654,7 @@ fn handles(method: &str) -> bool {
             | QUOTA_STATUS_OP
             | ROUTE_ACCOUNT_QUOTA_STATUS_OP
             | account_selection::ACCOUNT_FOR_OP
+            | account_selection::ACCOUNT_STATUS_OP
             | account_selection::ACCOUNT_OBSERVE_OP
             | account_selection::ACCOUNT_RELEASE_OP
             | account_selection::ACCOUNT_SHADOW_STATUS_OP
@@ -4807,6 +4808,14 @@ fn served_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Mutate,
             description: Some(
                 "Report account-bound admission, dispatch and failure evidence".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: account_selection::ACCOUNT_STATUS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Read account quota headroom for prompt-cache warming without reserving quota"
+                    .to_string(),
             ),
         },
         ManagementOperation {
@@ -10038,6 +10047,18 @@ mod tests {
             })
             .expect("available models text operation is advertised");
         assert_eq!(operation.kind, ManagementOperationKind::Query);
+    }
+
+    #[test]
+    fn account_status_is_registered_as_a_query() {
+        let operations = served_operations();
+        let operation = operations
+            .iter()
+            .find(|operation| operation.name == account_selection::ACCOUNT_STATUS_OP)
+            .expect("account status must be registered");
+        assert_eq!(operation.kind, ManagementOperationKind::Query);
+        assert!(account_selection::handles(&operation.name));
+        assert!(handles(&operation.name));
     }
 
     #[test]

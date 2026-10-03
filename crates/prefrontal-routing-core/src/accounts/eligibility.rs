@@ -195,7 +195,9 @@ impl QuotaEval {
     }
 }
 
-fn reserve_for(window: ApplicableWindow, policy: &AllocatorPolicy) -> f64 {
+/// Routing's reserve for a quota window. Callers with a producer-reported
+/// window outside the known topology use the seven-day reserve.
+pub fn reserve_for(window: ApplicableWindow, policy: &AllocatorPolicy) -> f64 {
     match window {
         ApplicableWindow::FiveHour => policy.reserve_five_hour,
         ApplicableWindow::SevenDay => policy.reserve_seven_day,
@@ -203,13 +205,10 @@ fn reserve_for(window: ApplicableWindow, policy: &AllocatorPolicy) -> f64 {
     }
 }
 
-/// Steps 3-5 for one account's reading: quota-unknown checks, the family
-/// scope, reserve, Broca floor and weight.
-pub fn evaluate_quota(
+/// Assess the timestamp and degradation disclosures shared by cold placement
+/// and quota-only reads. Window, scope and reserve checks are left to the caller.
+pub fn assess_reading(
     reading: Option<&QuotaReading>,
-    family: ModelFamily,
-    required: &[GeneralWindow],
-    caller: CallerKind,
     now: EpochMs,
     policy: &AllocatorPolicy,
 ) -> QuotaEval {
@@ -255,6 +254,23 @@ pub fn evaluate_quota(
         }
         Err(reason) => eval.unknown.push(reason),
     }
+    eval
+}
+
+/// Steps 3-5 for one account's reading: quota-unknown checks, the family
+/// scope, reserve, Broca floor and weight.
+pub fn evaluate_quota(
+    reading: Option<&QuotaReading>,
+    family: ModelFamily,
+    required: &[GeneralWindow],
+    caller: CallerKind,
+    now: EpochMs,
+    policy: &AllocatorPolicy,
+) -> QuotaEval {
+    let mut eval = assess_reading(reading, now, policy);
+    let Some(reading) = reading else {
+        return eval;
+    };
     for &window in required {
         match reading.window(window) {
             None => eval
