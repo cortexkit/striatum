@@ -8086,7 +8086,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
