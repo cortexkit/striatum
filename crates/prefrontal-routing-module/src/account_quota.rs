@@ -1520,8 +1520,10 @@ pub async fn account_quota_loop(
     loop {
         let listing = resolver.list_scoped().await;
         let at_ms = now_ms();
-        // Reuse the reserved-principal listing already fetched on this cadence.
-        // Broca's cache owns its view/freshness and never holds a lock across IO.
+        // Reuse the credential listing this loop iteration just fetched instead of
+        // asking the vault again. The Broca reachability cache records which
+        // providers that listing maps and when it arrived; its lock is taken only
+        // after the fetch returns, never across the network call.
         if let Ok(mut credentials) = broca_credentials.lock() {
             match &listing {
                 Ok(listing) => {

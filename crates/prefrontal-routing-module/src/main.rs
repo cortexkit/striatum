@@ -9340,8 +9340,10 @@ mod tests {
         );
     }
 
-    /// Unlike a sticky warning, health follows the current listing: a complete
-    /// mapping repairs the gap even after a Broca send used the fallback.
+    /// Health is recomputed from the latest credential listing on every check, so
+    /// once the operator completes the provider mapping the "reachability unknown"
+    /// degradation clears, even if an earlier Broca send had to fall back to the
+    /// whole served catalog.
     #[tokio::test]
     async fn unknown_broca_reach_degrades_health_until_listing_maps_it() {
         let ModuleControlResponse::HealthCheck { status, detail, .. } =
@@ -9364,7 +9366,8 @@ mod tests {
         assert_eq!(detail, None);
     }
 
-    /// Complete mappings must still refuse a provider with no active credential.
+    /// Even with every credential mapped to a provider, a provider that no active
+    /// credential serves must not get a panel seat.
     #[tokio::test]
     async fn a_broca_panel_never_seats_a_provider_broca_holds_no_credential_for() {
         let rig = Rig::new("panel-substrate-credentials");

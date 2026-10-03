@@ -168,7 +168,8 @@ mod tests {
             categories: vec!["llm-provider".into()],
             state: "active".into(),
             provider_ids: providers.iter().map(|s| (*s).into()).collect(),
-            // Vendors deliberately disagree with the provider mapping.
+            // The credential's vendor list names a different provider than its
+            // operator-set provider ids, to prove the join reads only the ids.
             serves: vec!["uncredentialed".into()],
             ..Default::default()
         }
@@ -337,7 +338,9 @@ mod tests {
             );
             assert_eq!(available.len(), 2);
 
-            // The operator fills the last mapping: exclusive join and healthy.
+            // The operator maps the last unmapped credential: every credential
+            // now has provider ids, so only mapped providers are reachable and
+            // health reports ok.
             let mut mapped = listing;
             mapped.view = "mapped-view".into();
             mapped.credentials[1].provider_ids = vec!["anthropic".into()];
@@ -383,7 +386,9 @@ mod tests {
         let original = listing(vec![credential("mapped", &["anthropic"])]);
         assert!(cache.apply_listing(&original, 0));
         cache.note_failure("temporary error");
-        // Unchanged digest is authoritative, even if a redundant row differs.
+        // The listing digest decides whether anything changed: with the same
+        // digest the cache keeps its provider set, even if a row in this reply
+        // differs.
         let mut unchanged = original.clone();
         unchanged.credentials.clear();
         assert!(!cache.apply_listing(&unchanged, MAX_AGE_MS + 1));
