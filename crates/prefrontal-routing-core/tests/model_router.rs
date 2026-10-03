@@ -18,7 +18,31 @@ use prefrontal_routing_core::model_router::{
     admit_routes, price_selection_shortlist, select_model_route, select_model_route_with_config,
     ModelRouteStateSnapshot, RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
 };
-use prefrontal_routing_core::{ExclusionPolicy, DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY};
+use prefrontal_routing_core::{
+    ExclusionPolicy, OverqualificationConfig, RoutingConfig, DEFAULT_OVERQUALIFICATION,
+    DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY,
+};
+
+/// Selection with the over-qualification term switched off, for tests of
+/// pricing and tie-breaks the term is not about. Their fixtures put every
+/// route at the request frontier and ask for iq 40-50, so every route carries
+/// the same term (surplus 50-60), which lifts all of them out of the
+/// effectively-free bucket and adds itself to the selection cost they assert.
+fn select_without_overqualification(
+    input: SelectModelRouteInput<'_>,
+) -> Result<
+    prefrontal_routing_core::model_router::SelectedModelRoute,
+    prefrontal_routing_core::model_router::NoRouteError,
+> {
+    let config = RoutingConfig {
+        overqualification: OverqualificationConfig {
+            base: 0.0,
+            ..DEFAULT_OVERQUALIFICATION
+        },
+        ..DEFAULT_ROUTING_CONFIG
+    };
+    select_model_route_with_config(input, &config)
+}
 
 // ── builders mirroring the TS test helpers ──────────────────────────────────
 
@@ -1180,7 +1204,7 @@ fn unknown_metered_price_does_not_win_cost_proxy_tiebreak_over_known_cheap_sub()
         is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
         ..Default::default()
     };
-    let r = select_model_route(input(
+    let r = select_without_overqualification(input(
         vec![known_cheap, unknown_price],
         req(40.0, 0.0),
         extra,
@@ -2342,7 +2366,7 @@ fn whole_selection_engagement_all_candidates_complete_prices_in_basket() {
     let fact_a = make_complete_basket_fact("p", "model_a", 100.0, Some(vec.clone()));
     let fact_b = make_complete_basket_fact("p", "model_b", 120.0, Some(vec));
 
-    let res = select_model_route(input(
+    let res = select_without_overqualification(input(
         vec![fact_a.clone(), fact_b.clone()],
         req(50.0, 0.0),
         Extra::default(),
@@ -2366,7 +2390,7 @@ fn whole_selection_engagement_one_candidate_missing_rate_forces_whole_selection_
     fact_missing_cache.cache_read_rate = None;
     fact_missing_cache.cache_write_rate = None;
 
-    let res = select_model_route(input(
+    let res = select_without_overqualification(input(
         vec![fact_complete.clone(), fact_missing_cache],
         req(50.0, 0.0),
         Extra::default(),
@@ -2386,7 +2410,7 @@ fn whole_selection_engagement_one_candidate_missing_rate_forces_whole_selection_
     fact_no_input.model_id = "no_input".into();
     fact_no_input.input_rate = None;
 
-    let res2 = select_model_route(input(
+    let res2 = select_without_overqualification(input(
         vec![fact_complete.clone(), fact_no_input],
         req(50.0, 0.0),
         Extra::default(),
@@ -2405,7 +2429,7 @@ fn whole_selection_engagement_one_candidate_missing_rate_forces_whole_selection_
     fact_tier_only.class_vector = Some(vec.clone());
     fact_tier_only.class_vector_is_overlay = true;
 
-    let res3 = select_model_route(input(
+    let res3 = select_without_overqualification(input(
         vec![fact_complete.clone(), fact_tier_only],
         req(50.0, 0.0),
         Extra::default(),
@@ -2418,7 +2442,7 @@ fn whole_selection_engagement_one_candidate_missing_rate_forces_whole_selection_
     fact_no_output.model_id = "no_output".into();
     fact_no_output.cost_per_m_tok_out = None;
 
-    let res4 = select_model_route(input(
+    let res4 = select_without_overqualification(input(
         vec![fact_complete.clone(), fact_no_output],
         req(50.0, 0.0),
         Extra::default(),
@@ -2437,7 +2461,7 @@ fn whole_selection_engagement_refused_rate_forces_whole_selection_fallback() {
     fact_refused.model_id = "model_refused".into();
     fact_refused.cache_read_rate = None;
 
-    let res = select_model_route(input(
+    let res = select_without_overqualification(input(
         vec![fact_complete.clone(), fact_refused],
         req(50.0, 0.0),
         Extra::default(),
@@ -2490,7 +2514,7 @@ fn mutation_degrading_only_incomplete_route_reddens() {
     fact_incomplete.model_id = "incomplete_route".into();
     fact_incomplete.cache_read_rate = None;
 
-    let res = select_model_route(input(
+    let res = select_without_overqualification(input(
         vec![fact_complete.clone(), fact_incomplete],
         req(50.0, 0.0),
         Extra::default(),
@@ -3315,4 +3339,232 @@ fn generated_shortlists_select_one_winner_in_any_arrival_order() {
             }
         }
     }
+}
+
+// ── over-qualification term ─────────────────────────────────────────────────
+//
+// Prices are effective $/Mtok out (list ÷ subscription subsidy) as the live
+// fleet carried them on 2026-10-02: opus 1.11 (cost 0.037), sol 6.1 0.40
+// (0.013), flash 0.25 (0.008), luna 0.02 (0.0007). All four sit inside the
+// effectively-free bucket, where opus used to win low-demand work on speed.
+
+fn priced(provider: &str, model: &str, elo: f64, eq: f64, speed: f64, price: f64) -> ModelFact {
+    fact(FactBuilder {
+        provider_id: provider.into(),
+        model_id: model.into(),
+        scores: scores(elo, eq, speed),
+        cost_per_m_tok_out: Some(price),
+        ..Default::default()
+    })
+}
+
+fn opus() -> ModelFact {
+    priced(
+        "anthropic",
+        "claude-opus-5-5",
+        1_960.0,
+        1_500.0,
+        120.0,
+        1.11,
+    )
+}
+
+fn sol() -> ModelFact {
+    priced("openai", "gpt-6.1-sol", 1_884.0, 1_300.0, 80.0, 0.40)
+}
+
+fn flash() -> ModelFact {
+    priced(
+        "google",
+        "antigravity-gemini-3.8-flash",
+        1_710.0,
+        1_200.0,
+        60.0,
+        0.25,
+    )
+}
+
+/// eq 1060 against opus's 1500 is 37 on the demand scale: just under an eq-40
+/// bar (fit 0.97), so luna clears the adequacy floor without fitting exactly.
+fn luna() -> ModelFact {
+    priced("openai", "gpt-6-luna", 1_641.0, 1_060.0, 55.0, 0.02)
+}
+
+fn covered<'a>() -> Extra<'a> {
+    Extra {
+        is_subscription_route: Some(Box::new(|_: &ModelRoute| true)),
+        ..Default::default()
+    }
+}
+
+fn term_off() -> RoutingConfig {
+    RoutingConfig {
+        overqualification: OverqualificationConfig {
+            base: 0.0,
+            ..DEFAULT_OVERQUALIFICATION
+        },
+        ..DEFAULT_ROUTING_CONFIG
+    }
+}
+
+fn has_term_line(explanation: &[String]) -> bool {
+    explanation
+        .iter()
+        .any(|line| line.starts_with("overqualified"))
+}
+
+#[test]
+fn overqualification_at_demand_30_hands_flash_the_work_opus_won_on_speed() {
+    let facts = vec![flash(), sol(), opus()];
+    let without = select_model_route_with_config(
+        input(facts.clone(), req(30.0, 0.0), covered()),
+        &term_off(),
+    )
+    .unwrap();
+    assert_eq!(
+        without.route_key, "anthropic/claude-opus-5-5",
+        "fixture must reproduce the incident: opus wins the free bucket on speed"
+    );
+
+    let with = select_model_route(input(facts.clone(), req(30.0, 0.0), covered())).unwrap();
+    assert_eq!(with.route_key, "google/antigravity-gemini-3.8-flash");
+    assert_eq!(with.score.objective.overqualification, 0.0);
+    assert!(!has_term_line(&with.explanation), "{:?}", with.explanation);
+
+    let priced = price_selection_shortlist(
+        input(facts, req(30.0, 0.0), covered()),
+        &DEFAULT_ROUTING_CONFIG,
+        false,
+        false,
+    )
+    .unwrap();
+    let term = |key: &str| {
+        priced
+            .routes
+            .iter()
+            .find(|route| route.route_key == key)
+            .unwrap()
+            .overqualification
+    };
+    assert!((term("anthropic/claude-opus-5-5") - 0.35).abs() < 1e-9);
+    assert!((term("openai/gpt-6.1-sol") - 0.141).abs() < 1e-3);
+    assert_eq!(term("google/antigravity-gemini-3.8-flash"), 0.0);
+}
+
+#[test]
+fn overqualification_leaves_opus_at_demand_70_as_it_was() {
+    let facts = vec![flash(), sol(), opus()];
+    let without = select_model_route_with_config(
+        input(facts.clone(), req(70.0, 0.0), covered()),
+        &term_off(),
+    )
+    .unwrap();
+    let with = select_model_route(input(facts, req(70.0, 0.0), covered())).unwrap();
+    assert_eq!(without.route_key, "anthropic/claude-opus-5-5");
+    assert_eq!(with.route_key, without.route_key);
+    assert_eq!(with.score, without.score);
+    assert_eq!(with.explanation, without.explanation);
+}
+
+#[test]
+fn overqualification_is_soft_opus_alone_at_demand_30_still_wins_and_says_why() {
+    let selected = select_model_route(input(vec![opus()], req(30.0, 0.0), covered())).unwrap();
+    assert_eq!(selected.route_key, "anthropic/claude-opus-5-5");
+    assert!((selected.score.objective.overqualification - 0.35).abs() < 1e-9);
+    assert!(
+        (selected.score.selection_cost - (1.11 / 30.0 + 0.35)).abs() < 1e-9,
+        "the term is added to the selection cost"
+    );
+    assert!(
+        selected
+            .explanation
+            .iter()
+            .any(|line| line == "overqualified +0.35 (surplus 70 over 30)"),
+        "{:?}",
+        selected.explanation
+    );
+    let json = serde_json::to_value(&selected.score).unwrap();
+    assert!((json["objective"]["overqualification"].as_f64().unwrap() - 0.35).abs() < 1e-9);
+}
+
+#[test]
+fn overqualification_has_no_term_when_iq_demand_is_zero() {
+    let facts = vec![flash(), sol(), opus()];
+    let priced = price_selection_shortlist(
+        input(facts.clone(), req(0.0, 30.0), covered()),
+        &DEFAULT_ROUTING_CONFIG,
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(!priced.routes.is_empty());
+    assert!(priced
+        .routes
+        .iter()
+        .all(|route| route.overqualification == 0.0));
+    let without = select_model_route_with_config(
+        input(facts.clone(), req(0.0, 30.0), covered()),
+        &term_off(),
+    )
+    .unwrap();
+    let with = select_model_route(input(facts, req(0.0, 30.0), covered())).unwrap();
+    assert_eq!(with.route_key, without.route_key);
+    assert!(!has_term_line(&with.explanation));
+}
+
+#[test]
+fn overqualification_guard_keeps_opus_when_the_term_would_pick_a_route_short_on_eq() {
+    // The recorded iq 55 / eq 40 mason: opus fits exactly, luna is 37 on eq.
+    let facts = vec![opus(), luna()];
+    let without = select_model_route_with_config(
+        input(facts.clone(), req(55.0, 40.0), covered()),
+        &term_off(),
+    )
+    .unwrap();
+    assert_eq!(without.route_key, "anthropic/claude-opus-5-5");
+
+    let priced = price_selection_shortlist(
+        input(facts.clone(), req(55.0, 40.0), covered()),
+        &DEFAULT_ROUTING_CONFIG,
+        false,
+        false,
+    )
+    .unwrap();
+    let opus_entry = priced
+        .routes
+        .iter()
+        .find(|route| route.route_key == "anthropic/claude-opus-5-5")
+        .unwrap();
+    assert!(
+        opus_entry.selection_cost > 0.05,
+        "the term lifts opus out of the free bucket ({})",
+        opus_entry.selection_cost
+    );
+
+    let with = select_model_route(input(facts, req(55.0, 40.0), covered())).unwrap();
+    assert_eq!(with.route_key, "anthropic/claude-opus-5-5");
+    assert!(
+        with.explanation.iter().any(|line| line
+            == "overqualification guard: kept anthropic/claude-opus-5-5 (adequacy 1.00); the term would have picked openai/gpt-6-luna, which fits the demand less well (adequacy 0.99)"),
+        "{:?}",
+        with.explanation
+    );
+}
+
+#[test]
+fn overqualification_guard_lets_the_term_move_work_to_a_route_that_fits_as_well() {
+    // Same request; sol 6.1 fits eq 40 exactly and sits 34 over iq 55 (no term).
+    let facts = vec![opus(), luna(), sol()];
+    let without = select_model_route_with_config(
+        input(facts.clone(), req(55.0, 40.0), covered()),
+        &term_off(),
+    )
+    .unwrap();
+    assert_eq!(without.route_key, "anthropic/claude-opus-5-5");
+    let with = select_model_route(input(facts, req(55.0, 40.0), covered())).unwrap();
+    assert_eq!(with.route_key, "openai/gpt-6.1-sol");
+    assert!(!with
+        .explanation
+        .iter()
+        .any(|line| line.starts_with("overqualification guard")));
 }

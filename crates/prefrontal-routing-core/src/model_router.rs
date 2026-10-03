@@ -26,7 +26,7 @@ use crate::model_resolution::{use_basket_permitted, CLASS_PRODUCER, COUNTERS_PRO
 use crate::provider_model_spec::{ExclusionPolicy, ExclusionSource, ExclusionSpecs};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 use crate::routing_config::{
-    RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, COST_REFERENCE_PER_MTOK,
+    demand_for_score, RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, COST_REFERENCE_PER_MTOK,
     DEFAULT_ROUTING_CONFIG, EFFECTIVELY_FREE_SELECTION_COST, MIN_BEST_EFFORT_ADEQUACY,
     OBJECTIVE_WEIGHT_QUOTA, RELATIVE_SHORTLIST_DELTA, SPEED_CEILING_TPS, SPEED_FLOOR_TPS,
 };
@@ -150,8 +150,14 @@ pub struct ObjectiveBreakdown {
     pub quota: f64,
     /// Normalized speed (0..1, higher = faster). Tie-break only, NOT in selectionCost.
     pub speed_score: f64,
-    /// cost + quota (purely economic); lower is a better pick. Speed breaks ties.
+    /// cost + quota + overqualification; lower is a better pick. Speed breaks ties.
     pub selection_cost: f64,
+    /// Over-qualification term already included in `selection_cost`: how far the
+    /// route sits above the request's iq demand beyond the configured threshold
+    /// (see `OverqualificationConfig`). Zero, and absent from the record, when
+    /// the route is not over-qualified or the request has no iq demand.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub overqualification: f64,
     /// Whether the route is served under a flat subscription. Marginal dollars
     /// under a flat plan are sunk, so two such routes compare as equal cost in
     /// the effectively-free bucket whatever their basket price says; the quota
@@ -240,8 +246,11 @@ pub struct PricedShortlistEntry {
     pub route_key: String,
     /// Cost component of the objective (clamped 0..1), not including quota.
     pub cost: f64,
-    /// Economic selection cost (cost + quota) used by the free-bucket gate.
+    /// Economic selection cost (cost + quota + overqualification) used by the
+    /// free-bucket gate.
     pub selection_cost: f64,
+    /// Over-qualification term included in `selection_cost`.
+    pub overqualification: f64,
     /// Cached-read term in list dollars: `cached_read * cache_read_rate / 1e6`.
     pub cached_read_term_usd: Option<f64>,
 }
@@ -702,6 +711,7 @@ pub(crate) fn compute_objective(
             quota,
             speed_score,
             selection_cost,
+            overqualification: 0.0,
             subscription_covered: is_subscription,
             quota_abundance,
             quota_abundance_window,
@@ -715,6 +725,49 @@ fn now_millis() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as f64)
         .unwrap_or(0.0)
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+/// Adds the over-qualification term to one priced route. The route's iq is its
+/// elo expressed on the request's own 0..100 demand scale: the inverse of the
+/// bar mapping against the same frontier (`top_routable`), so a route at the
+/// frontier is 100. A request with no iq demand has no iq bar to be above, so
+/// it carries no term.
+fn apply_overqualification(
+    objective: &mut ObjectiveBreakdown,
+    notes: &mut Vec<String>,
+    route: &ModelRoute,
+    requirements: &ModelRequirements,
+    top_routable: TopRoutableScores,
+    config: &RoutingConfig,
+) {
+    if requirements.iq <= 0.0 {
+        return;
+    }
+    let model_iq = demand_for_score(
+        top_routable.elo,
+        route.fact.scores.elo,
+        config.demand_exponent,
+    );
+    let surplus = model_iq - requirements.iq;
+    let term = config.overqualification.term(surplus);
+    if term <= 0.0 {
+        return;
+    }
+    objective.overqualification = term;
+    objective.selection_cost += term;
+    // Right after the cost line, the term it adds to.
+    let at = notes.len().min(1);
+    notes.insert(
+        at,
+        format!(
+            "overqualified +{term:.2} (surplus {surplus:.0} over {:.0})",
+            requirements.iq
+        ),
+    );
 }
 
 /// Select the best model route for a task. Pure and deterministic.
@@ -780,10 +833,12 @@ fn admit_and_price_shortlist(
         });
     }
 
+    // `top_routable` is the frontier the demand bar was drawn against; the
+    // over-qualification term maps each route back onto that same scale.
     let AdmissionResult {
         admitted: admissible,
         rejected,
-        ..
+        top_routable,
     } = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),
@@ -897,7 +952,16 @@ fn admit_and_price_shortlist(
                 .as_ref()
                 .map(|pred| pred(&a.route))
                 .unwrap_or(false);
-            let (breakdown, notes) = compute_objective(&a.route, &a.runtime, is_sub, use_basket);
+            let (mut breakdown, mut notes) =
+                compute_objective(&a.route, &a.runtime, is_sub, use_basket);
+            apply_overqualification(
+                &mut breakdown,
+                &mut notes,
+                &a.route,
+                &requirements,
+                top_routable,
+                config,
+            );
             Scored {
                 idx,
                 objective: breakdown,
@@ -949,6 +1013,7 @@ pub fn price_selection_shortlist(
                     route_key: admitted.route.route_key.clone(),
                     cost: s.objective.cost,
                     selection_cost: s.objective.selection_cost,
+                    overqualification: s.objective.overqualification,
                     cached_read_term_usd: cached_read_term_usd(&admitted.route.fact),
                 }
             })
@@ -973,31 +1038,69 @@ pub fn select_model_route_with_config(
     // Deterministic ordering. COST-PRIMARY lexicographic among adequate models.
     // Every key is a property of one route, computed once here, so the order is
     // total by construction (see `route_order_keys` for why that matters).
-    let facts: Vec<RouteOrderFacts<'_>> = scored
-        .iter()
-        .map(|s| {
-            let a = &admissible[s.idx];
-            RouteOrderFacts {
-                provider_id: &a.route.provider_id,
-                route_key: &a.route.route_key,
-                subscription_covered: s.objective.subscription_covered,
-                selection_cost: s.objective.selection_cost,
-                uncached: input.prefer_prompt_cache
-                    && input
-                        .providers_without_prompt_cache
-                        .contains(&a.route.fact.provider_id),
-                adequacy: a.adequacy.adequacy,
-                raw_adequacy: a.adequacy.raw_adequacy,
-                quota_abundance: a.runtime.quota_abundance,
-                speed_score: s.objective.speed_score,
-                metered_cost: normalized_metered_cost(&a.route.fact),
-            }
-        })
+    // `with_term` prices each route with its over-qualification term; without
+    // it, the order is the one the term-free router produced (cost + quota).
+    let order = |with_term: bool| -> Vec<usize> {
+        let facts: Vec<RouteOrderFacts<'_>> = scored
+            .iter()
+            .map(|s| {
+                let a = &admissible[s.idx];
+                RouteOrderFacts {
+                    provider_id: &a.route.provider_id,
+                    route_key: &a.route.route_key,
+                    subscription_covered: s.objective.subscription_covered,
+                    selection_cost: if with_term {
+                        s.objective.selection_cost
+                    } else {
+                        s.objective.cost + s.objective.quota
+                    },
+                    uncached: input.prefer_prompt_cache
+                        && input
+                            .providers_without_prompt_cache
+                            .contains(&a.route.fact.provider_id),
+                    adequacy: a.adequacy.adequacy,
+                    raw_adequacy: a.adequacy.raw_adequacy,
+                    quota_abundance: a.runtime.quota_abundance,
+                    speed_score: s.objective.speed_score,
+                    metered_cost: normalized_metered_cost(&a.route.fact),
+                }
+            })
+            .collect();
+        let keys = route_order_keys(&facts);
+        let mut positions: Vec<usize> = (0..keys.len()).collect();
+        positions.sort_by(|&a, &b| compare_route_order_keys(&keys[a], &keys[b], best_effort));
+        positions
+    };
+    let mut chosen = order(true);
+    let mut guard_note = None;
+    // Fit guard. Cost is compared before adequacy, so once the term pushes a
+    // route out of the effectively-free bucket a cheaper route that only just
+    // clears the adequacy floor beats one that fits exactly: an iq 55 / eq 40
+    // mason went from opus (fit 1.00) to a luna whose eq fit is below one. The
+    // term may move a decision only to a route that fits at least as well as
+    // the term-free winner; otherwise the term-free winner stands.
+    if scored.iter().any(|s| s.objective.overqualification > 0.0) {
+        let without_term = order(false);
+        let with_winner = &admissible[scored[chosen[0]].idx];
+        let without_winner = &admissible[scored[without_term[0]].idx];
+        if chosen[0] != without_term[0]
+            && with_winner.adequacy.adequacy < without_winner.adequacy.adequacy
+        {
+            guard_note = Some(format!(
+                "overqualification guard: kept {} (adequacy {:.2}); the term would have picked {}, which fits the demand less well (adequacy {:.2})",
+                without_winner.route.route_key,
+                without_winner.adequacy.adequacy,
+                with_winner.route.route_key,
+                with_winner.adequacy.adequacy,
+            ));
+            chosen = without_term;
+        }
+    }
+    let mut slots: Vec<Option<Scored>> = scored.into_iter().map(Some).collect();
+    let scored: Vec<Scored> = chosen
+        .into_iter()
+        .map(|position| slots[position].take().expect("each position is used once"))
         .collect();
-    let keys = route_order_keys(&facts);
-    let mut keyed: Vec<(RouteOrderKey<'_>, Scored)> = keys.into_iter().zip(scored).collect();
-    keyed.sort_by(|(ka, _), (kb, _)| compare_route_order_keys(ka, kb, best_effort));
-    let scored: Vec<Scored> = keyed.into_iter().map(|(_, s)| s).collect();
 
     let winner = &scored[0];
     let winner_admissible = &admissible[winner.idx];
@@ -1022,6 +1125,7 @@ pub fn select_model_route_with_config(
         winner.objective.selection_cost,
     ));
     explanation.extend(winner.objective_notes.iter().cloned());
+    explanation.extend(guard_note);
     explanation.extend(
         rejected
             .iter()
@@ -1392,27 +1496,33 @@ mod abundance_tests {
                 )
             })
             .collect();
-        select_model_route(SelectModelRouteInput {
-            target_agent: "mason".into(),
-            requirements: options
-                .requirements
-                .unwrap_or(ModelRequirements { iq: 20.0, eq: 20.0 }),
-            available_models,
-            facts,
-            runtime_snapshot: Some(ModelRouteStateSnapshot {
-                now: 1_000.0,
-                by_route: HashMap::new(),
-                by_capacity,
-            }),
-            exclude_route_keys: options.exclude_route_keys,
-            operator_exclude_keys: Vec::new(),
+        // Every fixture route sits at the frontier and the default demand is
+        // iq 20, so the over-qualification term would be equal for all of
+        // them; it is switched off so the bucket ordering under test is reached.
+        select_model_route_with_config(
+            SelectModelRouteInput {
+                target_agent: "mason".into(),
+                requirements: options
+                    .requirements
+                    .unwrap_or(ModelRequirements { iq: 20.0, eq: 20.0 }),
+                available_models,
+                facts,
+                runtime_snapshot: Some(ModelRouteStateSnapshot {
+                    now: 1_000.0,
+                    by_route: HashMap::new(),
+                    by_capacity,
+                }),
+                exclude_route_keys: options.exclude_route_keys,
+                operator_exclude_keys: Vec::new(),
 
-            required_capabilities: None,
-            is_subscription_route: options.is_subscription_route,
-            min_best_effort_adequacy: None,
-            prefer_prompt_cache: options.prefer_prompt_cache,
-            providers_without_prompt_cache: options.providers_without_prompt_cache,
-        })
+                required_capabilities: None,
+                is_subscription_route: options.is_subscription_route,
+                min_best_effort_adequacy: None,
+                prefer_prompt_cache: options.prefer_prompt_cache,
+                providers_without_prompt_cache: options.providers_without_prompt_cache,
+            },
+            &crate::routing_config::ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION,
+        )
         .expect("fixture has an admissible route")
     }
 
@@ -1430,6 +1540,7 @@ mod abundance_tests {
             quota: 0.125,
             speed_score: 0.75,
             selection_cost: 0.375,
+            overqualification: 0.0,
             subscription_covered: false,
             quota_abundance: None,
             quota_abundance_window: None,
