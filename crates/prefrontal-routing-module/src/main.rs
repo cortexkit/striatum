@@ -39,13 +39,14 @@ use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
 use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::model_router::{
-    select_model_route_with_config, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
+    select_model_route_with_slots, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
     RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::quota::quota_poll::record_reading_log_poll;
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
 use prefrontal_routing_core::route_state_store::FactSource;
 use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
+use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, live_billing_wall_error, make_route_key,
     relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
@@ -1215,6 +1216,12 @@ struct SelectParams {
     /// remains null because the router never invents a send correlation.
     #[serde(default, rename = "sendID")]
     send_id: Option<String>,
+    /// The caller's concurrency slot counts at request time, keyed by
+    /// `provider/model`. A candidate whose slot is full is passed over for this
+    /// decision only; absent (older callers, or a caller whose launch is not
+    /// limited by these slots) leaves the selection unchanged.
+    #[serde(default)]
+    concurrency_slots: Option<Vec<ConcurrencySlotState>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2816,10 +2823,11 @@ async fn handle_select_request(
     let prefer_prompt_cache = params.prefer_prompt_cache;
 
     let min_best_effort_adequacy = min_band.lock().ok().and_then(|g| *g);
+    let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
 
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
         let sub = subscription_keys.clone();
-        select_model_route_with_config(
+        select_model_route_with_slots(
             SelectModelRouteInput {
                 target_agent: target_agent.clone(),
                 requirements,
@@ -2840,6 +2848,7 @@ async fn handle_select_request(
                     .collect(),
             },
             &routing_config,
+            concurrency_slots.as_ref(),
         )
     };
 
@@ -4871,6 +4880,7 @@ mod tests {
     use prefrontal_routing_core::model_facts::{
         Confidence, ModelFact, ModelPromptDefaults, ModelScores,
     };
+    use prefrontal_routing_core::model_router::select_model_route_with_config;
     use prefrontal_routing_core::{FactSource, NativeUsageFacts, UsageObservation};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -9119,6 +9129,186 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].decision_kind, "panel");
         assert_eq!(decisions[0].selected_route_key, None);
+    }
+
+    /// Panel seats run as model calls that core's concurrency slots do not
+    /// admit, and a roster names its members explicitly. Slot counts on a panel
+    /// request must not move a pinned member off its route.
+    #[tokio::test]
+    async fn select_panel_never_skips_a_pinned_roster_member_for_saturation() {
+        let rig = Rig::new("select-panel-pinned-saturated");
+        let store = Arc::new(rig.open_store());
+        let response = run_route_wire_request(
+            &store,
+            json!({
+                "method": ROUTE_SELECT_PANEL_OP,
+                "params": {
+                    "panelSpec": {
+                        "size": 1,
+                        "iqFloor": 0,
+                        "diversity": "none",
+                        "class": "AUDIT",
+                        "temperatureSpread": [0.2]
+                    },
+                    "roster": [
+                        {"model": "openai/gpt-5.6-sol", "promptParams": {"variant": "xhigh"}},
+                        {"model": "openai/gpt-5.5", "promptParams": {"variant": "high"}}
+                    ],
+                    "availableModels": ["openai/gpt-5.6-sol", "openai/gpt-5.5"],
+                    "concurrencySlots": [
+                        {"key": "openai/gpt-5.6-sol", "running": 50, "limit": 40}
+                    ],
+                    "taskId": "panel-pinned-saturated"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let member = &body["result"]["members"][0];
+        assert!(
+            member["routeKey"]
+                .as_str()
+                .is_some_and(|key| key.starts_with("openai/gpt-5.6-sol")),
+            "the pinned first roster member keeps its seat: {body}"
+        );
+        assert_eq!(member["promptParams"]["variant"], "xhigh");
+    }
+
+    fn saturation_fact(provider: &str, model: &str, cost: f64) -> ModelFact {
+        let mut fact = fact(provider, model);
+        fact.cost_per_m_tok_out = Some(cost);
+        fact.cost_tier = None;
+        fact
+    }
+
+    fn saturation_select_params(slots: Option<serde_json::Value>) -> serde_json::Value {
+        let mut params = json!({
+            "targetAgent": "mason",
+            "requirements": { "iq": 30, "eq": 0 },
+            "availableModels": ["anthropic/fixture-cheap", "openai/fixture-dear"],
+            "taskId": "slot-saturation"
+        });
+        if let Some(slots) = slots {
+            params["concurrencySlots"] = slots;
+        }
+        params
+    }
+
+    fn saturation_facts() -> [ModelFact; 2] {
+        [
+            saturation_fact("anthropic", "fixture-cheap", 2.0),
+            saturation_fact("openai", "fixture-dear", 9.0),
+        ]
+    }
+
+    #[tokio::test]
+    async fn route_select_without_slot_state_is_unchanged() {
+        let (response, _rig) = run_select_wire_request(
+            "slot-saturation-absent",
+            saturation_select_params(None),
+            &saturation_facts(),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["result"]["selected"]["routeKey"],
+            "anthropic/fixture-cheap"
+        );
+        assert!(body["result"]["selected"].get("slotSaturation").is_none());
+    }
+
+    #[tokio::test]
+    async fn route_select_skips_a_saturated_provider_for_the_next_adequate_route() {
+        let (response, rig) = run_select_wire_request(
+            "slot-saturation-skip",
+            saturation_select_params(Some(json!([
+                {"key": "anthropic/fixture-cheap", "running": 50, "limit": 40, "queued": 7},
+                {"key": "openai/fixture-dear", "running": 3, "limit": 25}
+            ]))),
+            &saturation_facts(),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let selected = &body["result"]["selected"];
+        assert_eq!(selected["routeKey"], "openai/fixture-dear");
+        assert_eq!(
+            rejection_reason(&body, "anthropic/fixture-cheap").as_deref(),
+            Some("provider_saturated")
+        );
+        assert_eq!(
+            selected["slotSaturation"]["skipped"][0]["slot"],
+            json!({"key": "anthropic/fixture-cheap", "running": 50, "limit": 40, "queued": 7})
+        );
+        assert!(selected["explanation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line
+                == "route anthropic/fixture-cheap skipped: provider_saturated: anthropic/fixture-cheap 50/40, 7 queued"));
+        // The skip is audit, not a wall: the recorded decision carries the
+        // rejection, and no cooldown is stored for the skipped route.
+        let store = rig.open_store();
+        let decisions = store.get_decisions_for_task("slot-saturation").unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0].rejected_json.contains("provider_saturated"));
+        let snapshot = store.build_snapshot(now_ms() as f64).unwrap();
+        let unwalled = |state: Option<&prefrontal_routing_core::RouteRuntimeState>| {
+            state.is_none_or(|state| {
+                state.cooldown_until.is_none()
+                    && state.quota_exhausted_until.is_none()
+                    && state.failure_backoff_until.is_none()
+            })
+        };
+        assert!(unwalled(snapshot.by_route.get("anthropic/fixture-cheap")));
+        assert!(unwalled(
+            snapshot.by_capacity.get("anthropic/fixture-cheap")
+        ));
+        drop(store);
+        // The next decision re-reads the counts: with room again, the skipped
+        // route wins as if it had never been passed over.
+        let next = run_select_against_rig(
+            &rig,
+            saturation_select_params(None),
+            &saturation_facts(),
+            &PathBuf::from("/nonexistent/alfonso-routing.jsonc"),
+        )
+        .await;
+        let next: serde_json::Value = serde_json::from_slice(&next.body).unwrap();
+        assert_eq!(
+            next["result"]["selected"]["routeKey"],
+            "anthropic/fixture-cheap"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_select_with_every_adequate_provider_saturated_keeps_the_winner_and_says_it_queues(
+    ) {
+        let (response, _rig) = run_select_wire_request(
+            "slot-saturation-all",
+            saturation_select_params(Some(json!([
+                {"key": "anthropic/fixture-cheap", "running": 50, "limit": 40},
+                {"key": "openai/fixture-dear", "running": 25, "limit": 25}
+            ]))),
+            &saturation_facts(),
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let selected = &body["result"]["selected"];
+        assert_eq!(selected["routeKey"], "anthropic/fixture-cheap");
+        assert_eq!(
+            selected["slotSaturation"]["queuedOn"]["key"],
+            "anthropic/fixture-cheap"
+        );
+        assert!(selected["explanation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line
+                == "all adequate providers saturated; queued on anthropic/fixture-cheap (50/40)"));
     }
 
     #[tokio::test]

@@ -3316,3 +3316,139 @@ fn generated_shortlists_select_one_winner_in_any_arrival_order() {
         }
     }
 }
+
+// ── caller concurrency slots ────────────────────────────────────────────────
+
+mod slot_saturation {
+    use super::*;
+    use prefrontal_routing_core::model_router::select_model_route_with_slots;
+    use prefrontal_routing_core::{ConcurrencySlotState, ConcurrencySlots};
+
+    /// The cheapest adequate route, so it wins whenever its slot has room.
+    fn opus() -> ModelFact {
+        fact(FactBuilder {
+            provider_id: "anthropic".into(),
+            model_id: "opus".into(),
+            scores: scores(62.0, 1900.0, 60.0),
+            cost_per_m_tok_out: Some(2.0),
+            ..Default::default()
+        })
+    }
+
+    /// Adequate but pricier: the runner-up.
+    fn sol() -> ModelFact {
+        fact(FactBuilder {
+            provider_id: "openai".into(),
+            model_id: "sol".into(),
+            scores: scores(62.0, 1900.0, 60.0),
+            cost_per_m_tok_out: Some(10.0),
+            ..Default::default()
+        })
+    }
+
+    /// Cheapest of all and never full, but below the requirement bar: a full
+    /// provider must never push the decision onto it.
+    fn weak() -> ModelFact {
+        fact(FactBuilder {
+            provider_id: "cheapco".into(),
+            model_id: "weak".into(),
+            scores: scores(34.0, 1450.0, 300.0),
+            cost_per_m_tok_out: Some(0.1),
+            ..Default::default()
+        })
+    }
+
+    fn slot(key: &str, running: u32, limit: u32) -> ConcurrencySlotState {
+        ConcurrencySlotState {
+            key: key.to_string(),
+            running,
+            limit,
+            queued: 0,
+        }
+    }
+
+    fn select(slots: Option<&ConcurrencySlots>) -> prefrontal_routing_core::SelectedModelRoute {
+        select_model_route_with_slots(
+            input(
+                vec![weak(), opus(), sol()],
+                req(80.0, 20.0),
+                Extra::default(),
+            ),
+            &DEFAULT_ROUTING_CONFIG,
+            slots,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_saturated_preferred_provider_yields_to_the_next_adequate_candidate() {
+        let slots = ConcurrencySlots::new([slot("anthropic/opus", 50, 40)]);
+        let selected = select(Some(&slots));
+
+        assert_eq!(selected.route_key, "openai/sol");
+        let skip = selected
+            .rejected
+            .iter()
+            .find(|rejected| rejected.route_key == "anthropic/opus")
+            .expect("the skipped route is in the rejected list");
+        assert_eq!(skip.reason, "provider_saturated");
+        assert_eq!(skip.detail.as_deref(), Some("anthropic/opus 50/40"));
+        assert!(
+            selected.explanation.iter().any(|line| line
+                == "route anthropic/opus skipped: provider_saturated: anthropic/opus 50/40"),
+            "explanation names the skip: {:?}",
+            selected.explanation
+        );
+        let saturation = selected.slot_saturation.expect("the skip is reported");
+        assert_eq!(saturation.skipped.len(), 1);
+        assert_eq!(saturation.queued_on, None);
+    }
+
+    #[test]
+    fn every_adequate_provider_saturated_keeps_the_normal_winner_and_says_it_queues() {
+        let slots =
+            ConcurrencySlots::new([slot("anthropic/opus", 50, 40), slot("openai/sol", 25, 25)]);
+        let selected = select(Some(&slots));
+
+        assert_eq!(
+            selected.route_key, "anthropic/opus",
+            "the normal winner is kept; the inadequate route with room is never chosen"
+        );
+        assert!(
+            selected
+                .explanation
+                .iter()
+                .any(|line| line
+                    == "all adequate providers saturated; queued on anthropic/opus (50/40)"),
+            "explanation says the winner will queue: {:?}",
+            selected.explanation
+        );
+        assert!(selected
+            .rejected
+            .iter()
+            .all(|rejected| rejected.reason != "provider_saturated"));
+        let saturation = selected.slot_saturation.expect("the queue is reported");
+        assert!(saturation.skipped.is_empty());
+        assert_eq!(saturation.queued_on, Some(slot("anthropic/opus", 50, 40)));
+    }
+
+    #[test]
+    fn no_slot_state_or_slots_with_room_leave_the_decision_unchanged() {
+        let baseline = select_model_route_with_config(
+            input(
+                vec![weak(), opus(), sol()],
+                req(80.0, 20.0),
+                Extra::default(),
+            ),
+            &DEFAULT_ROUTING_CONFIG,
+        )
+        .unwrap();
+        assert_eq!(baseline.route_key, "anthropic/opus");
+        assert_eq!(baseline.slot_saturation, None);
+
+        assert_eq!(select(None), baseline);
+        let roomy =
+            ConcurrencySlots::new([slot("anthropic/opus", 39, 40), slot("openai/sol", 50, 0)]);
+        assert_eq!(select(Some(&roomy)), baseline);
+    }
+}
