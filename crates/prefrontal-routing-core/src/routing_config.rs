@@ -12,21 +12,98 @@ pub const ANCHOR_VERSION: u32 = 5;
 
 pub const DEFAULT_DEMAND_EXPONENT: f64 = 0.35;
 
+/// Surplus (model iq minus demanded iq, both on the 0..100 demand scale) that
+/// carries no over-qualification term. 40 keeps every request at demand 60 or
+/// above untouched, because no route can sit more than 40 above it.
+pub const DEFAULT_OVERQUALIFICATION_THRESHOLD: f64 = 40.0;
+/// Surplus points beyond the threshold over which the term (plus `base`) doubles.
+pub const DEFAULT_OVERQUALIFICATION_DOUBLING: f64 = 10.0;
+/// Scale of the term in selection-cost units: at threshold + doubling the term
+/// equals `base`.
+pub const DEFAULT_OVERQUALIFICATION_BASE: f64 = 0.05;
+
+/// Additive selection-cost term that keeps low-demand work off routes far above
+/// the demand. Demand is a floor and cost is primary, so a subsidised flagship
+/// priced inside the effectively-free bucket used to win low-demand work on a
+/// speed tie-break; a multiplier would vanish exactly there because those
+/// routes cost almost nothing, so the term is added instead.
+///
+/// `term = 0` when `surplus <= threshold`, else
+/// `base * (2^((surplus - threshold) / doubling) - 1)`.
+/// The defaults come from a seven-day replay of recorded decisions
+/// (reports/2026-10-02-overqualification-replay.md).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverqualificationConfig {
+    pub threshold: f64,
+    pub doubling: f64,
+    pub base: f64,
+}
+
+pub const DEFAULT_OVERQUALIFICATION: OverqualificationConfig = OverqualificationConfig {
+    threshold: DEFAULT_OVERQUALIFICATION_THRESHOLD,
+    doubling: DEFAULT_OVERQUALIFICATION_DOUBLING,
+    base: DEFAULT_OVERQUALIFICATION_BASE,
+};
+
+impl Default for OverqualificationConfig {
+    fn default() -> Self {
+        DEFAULT_OVERQUALIFICATION
+    }
+}
+
+impl OverqualificationConfig {
+    /// Whether every parameter is usable. `base == 0` is valid and switches the
+    /// term off.
+    pub fn is_valid(&self) -> bool {
+        self.threshold.is_finite()
+            && self.threshold >= 0.0
+            && self.doubling.is_finite()
+            && self.doubling > 0.0
+            && self.base.is_finite()
+            && self.base >= 0.0
+    }
+
+    /// The term for a route `surplus` demand points above the request. Zero for
+    /// an invalid configuration, so a bad value can never inflate every price.
+    pub fn term(&self, surplus: f64) -> f64 {
+        if !self.is_valid() || !surplus.is_finite() || surplus <= self.threshold {
+            return 0.0;
+        }
+        self.base * ((2f64).powf((surplus - self.threshold) / self.doubling) - 1.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RoutingConfig {
     pub demand_exponent: f64,
+    pub overqualification: OverqualificationConfig,
 }
 
 impl Default for RoutingConfig {
     fn default() -> Self {
-        Self {
-            demand_exponent: DEFAULT_DEMAND_EXPONENT,
-        }
+        DEFAULT_ROUTING_CONFIG
     }
 }
 
 pub const DEFAULT_ROUTING_CONFIG: RoutingConfig = RoutingConfig {
     demand_exponent: DEFAULT_DEMAND_EXPONENT,
+    overqualification: DEFAULT_OVERQUALIFICATION,
+};
+
+/// The default configuration with the over-qualification term switched off, for
+/// tests of orderings the term is not about. Their fixtures put every route at
+/// the request frontier and ask for a low demand, so every route carries the
+/// same large term; that term lifts all of them out of the effectively-free
+/// bucket and the bucket-only keys (abundance, adequacy) those tests exercise
+/// would never be reached.
+#[cfg(test)]
+pub(crate) const ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION: RoutingConfig = RoutingConfig {
+    demand_exponent: DEFAULT_DEMAND_EXPONENT,
+    overqualification: OverqualificationConfig {
+        threshold: DEFAULT_OVERQUALIFICATION_THRESHOLD,
+        doubling: DEFAULT_OVERQUALIFICATION_DOUBLING,
+        base: 0.0,
+    },
 };
 
 /// The strongest quality scores among routes that pass request-specific static
@@ -50,6 +127,18 @@ pub fn demand_bar(top_routable_score: f64, demand: f64, demand_exponent: f64) ->
         return 0.0;
     }
     top_routable_score * (demand.clamp(0.0, 100.0) / 100.0).powf(demand_exponent)
+}
+
+/// The inverse of [`demand_bar`]: the demand (0..100) whose bar equals `score`
+/// against the same request frontier. A route at the frontier maps to 100.
+pub fn demand_for_score(top_routable_score: f64, score: f64, demand_exponent: f64) -> f64 {
+    if top_routable_score <= 0.0 || score <= 0.0 || demand_exponent <= 0.0 {
+        return 0.0;
+    }
+    100.0
+        * (score / top_routable_score)
+            .clamp(0.0, 1.0)
+            .powf(1.0 / demand_exponent)
 }
 
 /// A score-to-bar ratio capped at one. A zero bar means the axis is ignored.
@@ -124,6 +213,37 @@ mod tests {
             (entry_demand(1_410.0) - 46.89).abs() < 0.05,
             "gemini-flash calibration moved"
         );
+    }
+
+    #[test]
+    fn demand_for_score_inverts_demand_bar() {
+        let top = 1_960.0;
+        for demand in [10.0, 30.0, 50.0, 70.0, 100.0] {
+            let bar = demand_bar(top, demand, DEFAULT_DEMAND_EXPONENT);
+            assert!((demand_for_score(top, bar, DEFAULT_DEMAND_EXPONENT) - demand).abs() < 1e-9);
+        }
+        assert_eq!(demand_for_score(top, top, DEFAULT_DEMAND_EXPONENT), 100.0);
+        assert!((demand_for_score(top, 1_884.0, DEFAULT_DEMAND_EXPONENT) - 89.3).abs() < 0.05);
+        assert!((demand_for_score(top, 1_710.0, DEFAULT_DEMAND_EXPONENT) - 67.7).abs() < 0.05);
+    }
+
+    #[test]
+    fn overqualification_term_is_zero_to_the_threshold_then_doubles_every_step() {
+        let config = DEFAULT_OVERQUALIFICATION;
+        assert_eq!(config.term(40.0), 0.0);
+        assert!((config.term(50.0) - 0.05).abs() < 1e-12);
+        assert!((config.term(60.0) - 0.15).abs() < 1e-12);
+        assert!((config.term(70.0) - 0.35).abs() < 1e-12);
+        let off = OverqualificationConfig {
+            base: 0.0,
+            ..config
+        };
+        assert_eq!(off.term(70.0), 0.0);
+        let broken = OverqualificationConfig {
+            doubling: 0.0,
+            ..config
+        };
+        assert_eq!(broken.term(70.0), 0.0);
     }
 
     #[test]

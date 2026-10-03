@@ -695,7 +695,7 @@ mod tests {
     use super::*;
     use crate::model_facts::{Confidence, ModelRequirements, ModelScores, ScoreProvenance};
     use crate::model_resolution::ACCOUNT_PRODUCER;
-    use crate::model_router::{select_model_route, RouteRuntimeState, SelectModelRouteInput};
+    use crate::model_router::{RouteRuntimeState, SelectModelRouteInput};
 
     const NOW_MS: f64 = 1_893_456_000_000.0; // 2030-01-01T00:00:00Z
 
@@ -768,20 +768,26 @@ mod tests {
             .iter()
             .map(|fact| make_capacity_key(&fact.provider_id, &fact.model_id))
             .collect();
-        select_model_route(SelectModelRouteInput {
-            target_agent: "mason".into(),
-            requirements: ModelRequirements { iq: 20.0, eq: 20.0 },
-            available_models,
-            facts,
-            runtime_snapshot: Some(snapshot),
-            exclude_route_keys: Vec::new(),
-            operator_exclude_keys: Vec::new(),
-            required_capabilities: None,
-            is_subscription_route: None,
-            min_best_effort_adequacy: None,
-            prefer_prompt_cache: false,
-            providers_without_prompt_cache: HashSet::new(),
-        })
+        // Both fixture routes sit at the frontier and the demand is iq 20, so the
+        // over-qualification term would be equal for both; it is switched off so
+        // the abundance ordering under test is reached.
+        crate::model_router::select_model_route_with_config(
+            SelectModelRouteInput {
+                target_agent: "mason".into(),
+                requirements: ModelRequirements { iq: 20.0, eq: 20.0 },
+                available_models,
+                facts,
+                runtime_snapshot: Some(snapshot),
+                exclude_route_keys: Vec::new(),
+                operator_exclude_keys: Vec::new(),
+                required_capabilities: None,
+                is_subscription_route: None,
+                min_best_effort_adequacy: None,
+                prefer_prompt_cache: false,
+                providers_without_prompt_cache: HashSet::new(),
+            },
+            &crate::routing_config::ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION,
+        )
         .expect("fixture has an admissible route")
         .route_key
     }

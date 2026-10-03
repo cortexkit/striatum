@@ -19,8 +19,10 @@ use std::time::SystemTime;
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
     make_capacity_key, make_route_key, model_facts_seed, CatalogFactField, FactSource,
-    FailureBackoffConfig, FamilySource, GrandFamily, ModelRoutingPolicyInput, RouteStateStore,
-    RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
+    FailureBackoffConfig, FamilySource, GrandFamily, ModelRoutingPolicyInput,
+    OverqualificationConfig, RouteStateStore, RoutingConfig,
+    DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
+    DEFAULT_OVERQUALIFICATION,
 };
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -323,6 +325,10 @@ struct ModelRoutingSection {
     /// Power-curve exponent mapping caller IQ demand to the request frontier.
     #[serde(default)]
     demand_exponent: Option<f64>,
+    /// Over-qualification term added to selection cost for routes far above the
+    /// request's iq demand. Absent fields take the routing-core defaults.
+    #[serde(default)]
+    overqualification: OverqualificationSection,
     /// Minimum adequacy for best-effort selection (sanity band). Default 0.6.
     /// Clamped to [0, 1]; NaN is rejected loudly at parse time.
     #[serde(default)]
@@ -343,6 +349,38 @@ struct ModelRoutingSection {
     /// overrides its provider's value for that route only.
     #[serde(default)]
     subscription_multipliers: HashMap<String, f64>,
+}
+
+/// `model_routing.overqualification`: `term = 0` while a route's surplus over
+/// the iq demand (both on the 0..100 demand scale) is at most `threshold`, else
+/// `base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.
+/// `base: 0` switches the term off.
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[serde(deny_unknown_fields)]
+struct OverqualificationSection {
+    threshold: Option<f64>,
+    doubling: Option<f64>,
+    base: Option<f64>,
+}
+
+impl OverqualificationSection {
+    fn resolve(self) -> Result<OverqualificationConfig, String> {
+        let config = OverqualificationConfig {
+            threshold: self
+                .threshold
+                .unwrap_or(DEFAULT_OVERQUALIFICATION.threshold),
+            doubling: self.doubling.unwrap_or(DEFAULT_OVERQUALIFICATION.doubling),
+            base: self.base.unwrap_or(DEFAULT_OVERQUALIFICATION.base),
+        };
+        if config.is_valid() {
+            Ok(config)
+        } else {
+            Err(format!(
+                "model_routing.overqualification needs finite threshold >= 0, doubling > 0 and base >= 0, got threshold {}, doubling {}, base {}",
+                config.threshold, config.doubling, config.base
+            ))
+        }
+    }
 }
 
 /// One per-model override. Every field is optional: a present field is operator-owned,
@@ -843,7 +881,15 @@ pub struct SelectionOverrideOutcome {
 pub fn default_policy_revision() -> String {
     format!(
         "sha256:{:x}",
-        Sha256::digest(format!("model-routing-default:{DEFAULT_DEMAND_EXPONENT}").as_bytes())
+        Sha256::digest(
+            format!(
+                "model-routing-default:{DEFAULT_DEMAND_EXPONENT}:overqualification:{}:{}:{}",
+                DEFAULT_OVERQUALIFICATION.threshold,
+                DEFAULT_OVERQUALIFICATION.doubling,
+                DEFAULT_OVERQUALIFICATION.base
+            )
+            .as_bytes()
+        )
     )
 }
 
@@ -883,6 +929,7 @@ pub fn apply_live_selection_config(
             "model_routing.demand_exponent must be finite and positive, got {exponent}"
         ));
     }
+    let overqualification = config.model_routing.overqualification.resolve()?;
 
     let mut fact_indices = facts
         .iter()
@@ -918,6 +965,7 @@ pub fn apply_live_selection_config(
     Ok(SelectionOverrideOutcome {
         routing_config: RoutingConfig {
             demand_exponent: exponent,
+            overqualification,
         },
         applied,
         unknown_keys,
@@ -2559,6 +2607,78 @@ mod tests {
         assert_eq!(sol(&facts), 1_750.0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod overqualification_config_tests {
+    use super::*;
+
+    fn apply(document: Option<&str>) -> Result<RoutingConfig, String> {
+        let path = prefrontal_test_support::scratch_root().join(format!(
+            "prefrontal-routing-overqualification-{}-{}.jsonc",
+            std::process::id(),
+            document.map(|d| d.len()).unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        if let Some(document) = document {
+            std::fs::write(&path, document).unwrap();
+        }
+        let mut facts = Vec::new();
+        let result = apply_live_selection_config(&path, &mut facts).map(|o| o.routing_config);
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn overqualification_defaults_apply_when_the_file_or_the_section_is_absent() {
+        assert_eq!(
+            apply(None).unwrap().overqualification,
+            DEFAULT_OVERQUALIFICATION
+        );
+        assert_eq!(
+            apply(Some(r#"{ "model_routing": { "demand_exponent": 0.35 } }"#))
+                .unwrap()
+                .overqualification,
+            DEFAULT_OVERQUALIFICATION
+        );
+        assert_eq!(DEFAULT_OVERQUALIFICATION.threshold, 40.0);
+        assert_eq!(DEFAULT_OVERQUALIFICATION.doubling, 10.0);
+        assert_eq!(DEFAULT_OVERQUALIFICATION.base, 0.05);
+    }
+
+    #[test]
+    fn overqualification_fields_override_one_at_a_time_and_bad_values_are_refused() {
+        let config = apply(Some(
+            r#"{ "model_routing": { "overqualification": { "threshold": 30, "base": 0.1 } } }"#,
+        ))
+        .unwrap();
+        assert_eq!(config.overqualification.threshold, 30.0);
+        assert_eq!(config.overqualification.doubling, 10.0);
+        assert_eq!(config.overqualification.base, 0.1);
+
+        let off = apply(Some(
+            r#"{ "model_routing": { "overqualification": { "base": 0 } } }"#,
+        ))
+        .unwrap();
+        assert_eq!(off.overqualification.term(70.0), 0.0);
+
+        let error = apply(Some(
+            r#"{ "model_routing": { "overqualification": { "doubling": 0 } } }"#,
+        ))
+        .unwrap_err();
+        assert!(error.contains("model_routing.overqualification"), "{error}");
+        assert!(apply(Some(
+            r#"{ "model_routing": { "overqualification": { "base": -1 } } }"#
+        ))
+        .is_err());
+        assert!(
+            apply(Some(
+                r#"{ "model_routing": { "overqualification": { "treshold": 30 } } }"#
+            ))
+            .is_err(),
+            "a misspelt field is refused, not silently ignored"
+        );
     }
 }
 

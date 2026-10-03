@@ -7793,11 +7793,15 @@ mod tests {
         task_id: &str,
     ) -> (String, serde_json::Value) {
         let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        // iq 70, not lower: both fixture routes sit at the request frontier, so
+        // below demand 60 both would carry the same over-qualification term,
+        // which lifts them out of the effectively-free bucket where the quota
+        // abundance this test is about decides.
         let request = json!({
             "method": ROUTE_SELECT_OP,
             "params": {
                 "targetAgent": "explore",
-                "requirements": { "iq": 30, "eq": 0 },
+                "requirements": { "iq": 70, "eq": 0 },
                 "availableModels": ["openai/restart-luna", "anthropic/restart-opus"],
                 "taskId": task_id
             }
