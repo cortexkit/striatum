@@ -41,22 +41,30 @@ pub enum PanelDiversity {
 /// `unavailable` for a day after its provider was renamed host-side), so the
 /// substrate that sends picks the list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum AvailabilitySubstrate {
     /// The caller's host provider list, which is what a host-run leg can send to.
     #[default]
     Host,
-    /// Broca's send surface.
+    /// Broca's send surface, with Broca's reach known for every served route.
     Broca,
+    /// Broca's send surface, judged against every route the model catalog still
+    /// serves because routing does not know Broca's reach for at least one of
+    /// them. Unknown reach is admitted rather than refused: the served catalog
+    /// excludes only routes nobody serves, and a seat Broca then fails to send
+    /// is replaced when it dies, like any other dead seat.
+    BrocaServedCatalog,
 }
 
 impl AvailabilitySubstrate {
-    /// The token recorded on an availability rejection so the next reader of a
-    /// decision row does not have to reconstruct which list was consulted.
+    /// The text recorded on an availability rejection and on the panel decision,
+    /// so the next reader of a decision row does not have to reconstruct which
+    /// list was consulted, or that Broca's own reach was never known.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Host => "host",
             Self::Broca => "broca",
+            Self::BrocaServedCatalog => "broca reachability unknown: judged against served catalog",
         }
     }
 }

@@ -33,7 +33,6 @@ const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
 pub const DEFAULT_AA_API_KEY_REF: &str = "apikey:artificial-analysis";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
-const BROCA_VAULT_HANDLES_RELATIVE_PATH: &str = "cortexkit/broca/vault-handles.json";
 
 #[derive(Debug, Clone)]
 struct PromptCacheProvidersCache {
@@ -452,38 +451,6 @@ pub fn read_provider_auth_types(path: &Path) -> Result<HashMap<String, String>, 
                 .and_then(serde_json::Value::as_str)
                 .map(|kind| (provider, kind.to_string()))
         })
-        .collect())
-}
-
-/// Where Broca keeps the map from credential id to vault handle.
-pub fn broca_vault_handles_path() -> PathBuf {
-    config_home_path(BROCA_VAULT_HANDLES_RELATIVE_PATH)
-}
-
-/// The providers Broca holds a credential for, read from its vault-handle map.
-///
-/// Broca's management surface serves only sends, reads, and run control: it
-/// publishes no catalog of resolvable models, so there is nothing to ask it
-/// which routes it can reach. The nearest honest answer is the intersection of
-/// what the model catalog still serves with the providers Broca can authenticate
-/// to, and this file is the second half. Only the KEYS are read: each is
-/// `method:provider` or `method:provider:account`, and the handle values stay
-/// untouched, exactly as the provider-auth reader treats OpenCode's auth file.
-pub fn read_broca_credential_providers(path: &Path) -> Result<HashSet<String>, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|error| format!("reading {}: {error}", path.display()))?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|error| format!("parsing {}: {error}", path.display()))?;
-    let handles = parsed
-        .get("handles")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| format!("{} has no `handles` object", path.display()))?;
-    Ok(handles
-        .keys()
-        .filter_map(|id| id.split(':').nth(1))
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-        .map(str::to_string)
         .collect())
 }
 

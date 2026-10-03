@@ -30,7 +30,10 @@ use std::{
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, Once, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Once, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -67,7 +70,8 @@ use subc_protocol::{
         ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     session::{
-        HealthReport, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
+        HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
+        MODULE_CONTROL_OP_HEALTH_CHECK,
     },
     ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
@@ -834,9 +838,6 @@ where
     let override_path = config_overrides::config_path();
     // Selection policy and model-fact overrides share the routing-owned file.
     let operator_config_path = override_path.clone();
-    // Broca owns this file; routing reads only which providers it can
-    // authenticate to, for panels whose legs send through Broca.
-    let broca_vault_handles_path = config_overrides::broca_vault_handles_path();
     // OpenCode owns this file; routing reads only each provider's auth kind.
     let opencode_auth_path = config_overrides::auth_json_path();
     match config_overrides::apply_overrides_from_config(store.as_ref(), &override_path) {
@@ -913,7 +914,6 @@ where
             &min_band,
             &override_path,
             &operator_config_path,
-            &broca_vault_handles_path,
             &opencode_auth_path,
             &catalog_health,
         )
@@ -1011,7 +1011,6 @@ async fn handle_frame(
     min_band: &SharedMinBand,
     routing_config_path: &Path,
     operator_config_path: &Path,
-    broca_vault_handles_path: &Path,
     opencode_auth_path: &Path,
     catalog_health: &SharedCatalogHealth,
 ) -> Result<bool, ModuleError> {
@@ -1054,7 +1053,6 @@ async fn handle_frame(
             let min_band = Arc::clone(min_band);
             let routing_config_path = routing_config_path.to_path_buf();
             let operator_config_path = operator_config_path.to_path_buf();
-            let broca_vault_handles_path = broca_vault_handles_path.to_path_buf();
             let opencode_auth_path = opencode_auth_path.to_path_buf();
             tokio::spawn(async move {
                 let _ = handle_select_request(
@@ -1066,7 +1064,6 @@ async fn handle_frame(
                     &min_band,
                     &routing_config_path,
                     &operator_config_path,
-                    &broca_vault_handles_path,
                     &opencode_auth_path,
                 )
                 .await;
@@ -1123,7 +1120,9 @@ async fn handle_control_request(
             // Routing is stateless: the catalog is machine-global and selection depends
             // only on the request body, so there is no domain state that can wedge: a
             // reply on this real dispatch path is itself the liveness proof the prober wants.
-            let mut report = HealthReport::ok();
+            // Degraded never restarts a module; it is how a standing gap in what routing
+            // knows reaches the operator's status view instead of one stderr line.
+            let mut report = health_report(&BROCA_REACH_NOTICE);
             report.metrics = Some(json!({
                 "fusiformCatalog": catalog_health
                     .lock()
@@ -1145,6 +1144,17 @@ async fn handle_control_request(
             send(writer, response).await
         }
     }
+}
+
+/// The health report before metrics: degraded, naming the gap, once a Broca
+/// send has been judged without knowing Broca's reach.
+fn health_report(broca_reach: &BrocaReachNotice) -> HealthReport {
+    let mut report = HealthReport::ok();
+    if let Some(detail) = broca_reach.health_detail() {
+        report.status = HealthStatus::Degraded;
+        report.detail = Some(detail.to_string());
+    }
+    report
 }
 
 /// The method envelope, decoded first so an unknown method reports `unknown_method`
@@ -2458,7 +2468,6 @@ async fn handle_select_request(
     min_band: &SharedMinBand,
     routing_config_path: &Path,
     operator_config_path: &Path,
-    broca_vault_handles_path: &Path,
     opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
@@ -2645,7 +2654,6 @@ async fn handle_select_request(
             store,
             routing_config_path,
             operator_config_path,
-            broca_vault_handles_path,
             opencode_auth_path,
         )
         .await;
@@ -2690,7 +2698,6 @@ async fn handle_select_request(
                 params.substrate.as_deref(),
                 std::mem::take(&mut params.available_models),
                 &facts,
-                broca_vault_handles_path,
             ),
             Err(e) => {
                 return send_route_error(
@@ -3022,18 +3029,93 @@ async fn handle_select_request(
     }
 }
 
-/// Report a Broca-substrate panel that had to fall back to the host list. The
-/// map is read on every such selection, so one line per process is enough; the
-/// recorded rejections keep saying `host` for as long as it lasts.
-fn warn_broca_credentials_unreadable_once(reason: &str) {
-    static WARNED: Once = Once::new();
-    let mut message = None;
-    WARNED.call_once(|| message = Some(reason.to_string()));
-    if let Some(reason) = message {
+/// Routing does not yet know which served routes Broca can authenticate to, so
+/// a Broca send is judged against the served catalog. That is a standing gap
+/// in what routing knows, and it once hid for days behind a single stderr line,
+/// so it is raised twice: one log line per process when it first applies, and
+/// a degraded `health.check` once it has applied.
+struct BrocaReachNotice {
+    noted: AtomicBool,
+}
+
+/// The health detail and log line naming the gap. The same words are recorded
+/// on each Broca panel decision through `AvailabilitySubstrate::as_str`.
+const BROCA_REACH_UNKNOWN: &str = "broca reachability unknown: judged against served catalog";
+
+impl BrocaReachNotice {
+    const fn new() -> Self {
+        Self {
+            noted: AtomicBool::new(false),
+        }
+    }
+
+    /// Record that a Broca send was judged without knowing Broca's reach.
+    /// Returns true only the first time, when the caller logs the warning.
+    fn note(&self) -> bool {
+        !self.noted.swap(true, Ordering::Relaxed)
+    }
+
+    /// The health detail to report once any Broca send has been judged
+    /// without knowing Broca's reach.
+    fn health_detail(&self) -> Option<&'static str> {
+        self.noted
+            .load(Ordering::Relaxed)
+            .then_some(BROCA_REACH_UNKNOWN)
+    }
+}
+
+static BROCA_REACH_NOTICE: BrocaReachNotice = BrocaReachNotice::new();
+
+/// Which served catalog routes Broca can send, split by how sure routing is.
+/// A served route in neither list is one Broca is known not to reach.
+#[derive(Debug, Default)]
+struct BrocaReach {
+    /// Routes on a provider Broca holds a usable credential for.
+    reachable: Vec<String>,
+    /// Routes whose provider routing cannot match to any credential knowledge.
+    unknown: Vec<String>,
+}
+
+/// The one place routing learns what Broca can send.
+///
+/// Nothing tells routing yet: Broca reads its credentials by grant from the
+/// vault and publishes no list, and the vault answers "missing" and "not
+/// granted" alike on purpose. So every route the catalog still serves is
+/// `unknown` (withdrawn rows are filtered out when facts are read). The lasting
+/// source is routing's own `credential.list_scoped` listing joined with the
+/// provider-to-credential mapping the catalog will carry on each row; when that
+/// exists, only this function changes.
+fn broca_reachable_routes(facts: &[ModelFact]) -> BrocaReach {
+    BrocaReach {
+        reachable: Vec::new(),
+        unknown: facts
+            .iter()
+            .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
+            .collect(),
+    }
+}
+
+/// The list a Broca send is judged against and the label it is recorded
+/// under. Routes of unknown reach are admitted, not refused: refusing them
+/// would empty every Broca panel while nothing is known, and a seat Broca then
+/// fails to send is replaced when it dies. Any unknown route makes the label
+/// say so, and raises the warning.
+fn broca_availability(facts: &[ModelFact]) -> (AvailabilitySubstrate, Vec<String>) {
+    let BrocaReach {
+        mut reachable,
+        unknown,
+    } = broca_reachable_routes(facts);
+    if unknown.is_empty() {
+        return (AvailabilitySubstrate::Broca, reachable);
+    }
+    reachable.extend(unknown);
+    if BROCA_REACH_NOTICE.note() {
         eprintln!(
-            "[prefrontal-routing] cannot read Broca's credential providers ({reason}); Broca-substrate panels keep using the caller's host availability list"
+            "[prefrontal-routing] WARN: {BROCA_REACH_UNKNOWN} ({} routes): routing cannot tell which providers Broca can authenticate to, so a route it cannot send may seat and fail its send",
+            reachable.len()
         );
     }
+    (AvailabilitySubstrate::BrocaServedCatalog, reachable)
 }
 
 /// The availability list a panel's seats are judged against, and the substrate
@@ -3041,58 +3123,23 @@ fn warn_broca_credentials_unreadable_once(reason: &str) {
 ///
 /// A seat only exists if whatever SENDS to it can resolve the route, and panel
 /// legs do not all send through the same place. A host-run leg keeps the
-/// caller's own provider list. A Broca leg is judged against what Broca can
-/// reach instead: Broca's management surface publishes no catalog to ask, so the
-/// honest stand-in is the catalog rows this store still serves (rows the model
-/// catalog reports as withdrawn are already filtered out when facts are read)
-/// restricted to the providers Broca holds a credential for. It is never the
-/// whole fact table: a route Broca cannot authenticate to would seat and then
-/// fail its send on every round.
+/// caller's own provider list. A Broca leg is never judged against that list:
+/// it describes a different sender, and a pin the host lacks (Kimi on a Pi
+/// host) was rejected `unavailable` although Broca sends it.
 fn panel_availability(
     requested_substrate: Option<&str>,
     host_available_models: HashSet<String>,
     facts: &[ModelFact],
-    broca_vault_handles_path: &Path,
 ) -> (AvailabilitySubstrate, HashSet<String>) {
     if !is_broca_substrate(requested_substrate) {
         return (AvailabilitySubstrate::Host, host_available_models);
     }
-    match broca_served_routes(facts, broca_vault_handles_path) {
-        Ok(available) => (
-            AvailabilitySubstrate::Broca,
-            available.into_iter().collect(),
-        ),
-        // Nothing usable to intersect with. Widening to every fact row would seat
-        // routes Broca cannot send, and narrowing to nothing would empty every
-        // panel, so the host list stands and the decision keeps saying `host`.
-        Err(error) => {
-            warn_broca_credentials_unreadable_once(&error);
-            (AvailabilitySubstrate::Host, host_available_models)
-        }
-    }
+    let (substrate, models) = broca_availability(facts);
+    (substrate, models.into_iter().collect())
 }
 
 fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
     requested_substrate.map(str::trim) == Some("broca")
-}
-
-/// The routes Broca can send today: the catalog rows this store still serves
-/// (withdrawn rows are filtered out when facts are read) restricted to the
-/// providers Broca holds a credential for. `Err` carries why Broca's credential
-/// map could not be read or named no provider, so the reach is unknown.
-fn broca_served_routes(
-    facts: &[ModelFact],
-    broca_vault_handles_path: &Path,
-) -> Result<Vec<String>, String> {
-    let providers = config_overrides::read_broca_credential_providers(broca_vault_handles_path)?;
-    if providers.is_empty() {
-        return Err("the handle map names no provider".to_string());
-    }
-    Ok(facts
-        .iter()
-        .filter(|fact| providers.contains(&fact.provider_id))
-        .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
-        .collect())
 }
 
 /// The list a single-route selection is judged against, the winner-ladder
@@ -3117,48 +3164,29 @@ impl SelectAvailability {
 /// Availability for a `route.select` whose caller names the substrate that
 /// will send.
 ///
-/// A Broca send is judged against what Broca can reach now, never against a
-/// list the caller carries: callers without a host (core's own classifier,
-/// wake author, and comment reviewer) have no list of their own, and a host's
-/// list describes a different substrate. When Broca's credential map cannot be
-/// read, the reach is unknown: selection proceeds over every route the catalog
-/// still serves and the decision says so. It stays closed to routes known to be
-/// unserved, because withdrawn catalog rows never reach `facts`, and operator
-/// exclusions, cooldowns, and failure backoff still apply downstream.
+/// A Broca send is never judged against a list the caller carries: callers
+/// without a host (core's own classifier, wake author, and comment reviewer)
+/// have no list of their own, and a host's list describes a different
+/// substrate. It is judged against `broca_availability` instead, and the
+/// decision records which list that was. Operator exclusions, cooldowns, and
+/// failure backoff still apply downstream.
 fn select_availability(
     requested_substrate: Option<&str>,
     host_available_models: Vec<String>,
     facts: &[ModelFact],
-    broca_vault_handles_path: &Path,
 ) -> SelectAvailability {
     if !is_broca_substrate(requested_substrate) {
         return SelectAvailability::host(host_available_models);
     }
-    match broca_served_routes(facts, broca_vault_handles_path) {
-        Ok(models) => SelectAvailability {
-            note: Some(format!(
-                "availability: broca ({} served catalog routes on providers Broca holds a credential for)",
-                models.len()
-            )),
-            models,
-            ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
-        },
-        Err(reason) => {
-            let models: Vec<String> = facts
-                .iter()
-                .map(|fact| {
-                    make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
-                })
-                .collect();
-            SelectAvailability {
-                note: Some(format!(
-                    "availability unknown: Broca's credential providers are unreadable ({reason}); routed over all {} served catalog routes",
-                    models.len()
-                )),
-                models,
-                ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
-            }
-        }
+    let (substrate, models) = broca_availability(facts);
+    SelectAvailability {
+        note: Some(format!(
+            "availability: {} ({} routes)",
+            substrate.as_str(),
+            models.len()
+        )),
+        models,
+        ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
     }
 }
 
@@ -3169,7 +3197,6 @@ async fn handle_select_panel(
     store: &SharedStore,
     routing_config_path: &Path,
     operator_config_path: &Path,
-    broca_vault_handles_path: &Path,
     opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
@@ -3245,14 +3272,13 @@ async fn handle_select_panel(
         params.substrate.as_deref(),
         resolved_policy.available_models.into_iter().collect(),
         &prepared.facts,
-        broca_vault_handles_path,
     );
     // Broca legs have no route.select of their own, so their availability is
     // recorded here for the winner ladder. Host-list panels are not recorded:
     // the host's ladder follows route.select, whose list is already fenced by
     // the operator's exclusions, and alternating two differently fenced lists
     // would read as an availability change on every other request.
-    if availability_substrate == AvailabilitySubstrate::Broca {
+    if availability_substrate != AvailabilitySubstrate::Host {
         winner_ladder::observed_selections().record(
             winner_ladder::LadderKey::new(
                 winner_ladder::SUBSTRATE_BROCA,
@@ -3291,6 +3317,7 @@ async fn handle_select_panel(
     let decision = panel_decision_input(
         &params,
         &panel,
+        availability_substrate,
         &provenance,
         &policy_sources_line(&operator_policy),
     );
@@ -3343,6 +3370,7 @@ async fn handle_select_panel(
 fn panel_decision_input(
     params: &SelectPanelParams,
     panel: &SelectedPanel,
+    availability: AvailabilitySubstrate,
     provenance: &DecisionProvenance,
     policy_sources: &str,
 ) -> DecisionInput {
@@ -3363,6 +3391,7 @@ fn panel_decision_input(
             "selection": "n_pick",
             "policy": panel.policy,
             "policySources": policy_sources,
+            "availability": availability.as_str(),
         })
     } else {
         json!({
@@ -3371,6 +3400,9 @@ fn panel_decision_input(
             // Recorded even though roster pins bypass exclusion, so a reader can
             // see WHICH fence was in force when the pinned panel was seated.
             "policySources": policy_sources,
+            // Which list the seats were judged against. A rejection names it too,
+            // but a panel that seated everyone has no rejection to carry it.
+            "availability": availability.as_str(),
         })
     };
     DecisionInput {
@@ -5332,10 +5364,6 @@ mod tests {
         .await
     }
 
-    /// No Broca handle map on this path: panels default to the host list, which is
-    /// what every test that does not name a substrate expects.
-    const ABSENT_BROCA_VAULT_HANDLES: &str = "/nonexistent/broca/vault-handles.json";
-
     /// An OpenCode `auth.json` with no providers, under the scratch root, for
     /// requests that carry no provider auth types (see `provider_auth_types`).
     fn empty_opencode_auth() -> PathBuf {
@@ -5396,21 +5424,6 @@ mod tests {
         request: serde_json::Value,
         operator_config_path: &Path,
     ) -> Frame {
-        run_route_wire_request_with_paths(
-            store,
-            request,
-            operator_config_path,
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
-        )
-        .await
-    }
-
-    async fn run_route_wire_request_with_paths(
-        store: &SharedStore,
-        request: serde_json::Value,
-        operator_config_path: &Path,
-        broca_vault_handles_path: &Path,
-    ) -> Frame {
         let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let frame = Frame::build(
             FrameType::Request,
@@ -5432,7 +5445,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
-            broca_vault_handles_path,
             &empty_opencode_auth(),
         )
         .await
@@ -6902,7 +6914,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             operator_config_path,
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
@@ -6947,7 +6958,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
@@ -7043,7 +7053,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
@@ -7637,7 +7646,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
@@ -7720,7 +7728,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
@@ -7825,7 +7832,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
@@ -8775,7 +8781,6 @@ mod tests {
                 &min_band,
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
-                Path::new(ABSENT_BROCA_VAULT_HANDLES),
                 &empty_opencode_auth(),
             )
             .await
@@ -8827,29 +8832,24 @@ mod tests {
     }
 
     /// A roster seat is only real if whatever SENDS to it can resolve the route.
-    /// Kimi moved to a new plane with a new provider id: Broca resolves the new id
-    /// while the caller's host provider list still carries only the retired one, so
-    /// every consult seat for it was rejected `unavailable` even though its legs
-    /// never send through the host. Availability follows the substrate that sends.
+    /// A spec campaign's seats send through Broca, but a campaign started from a
+    /// Pi host carried a provider list without Kimi's plan, so every round
+    /// rejected the pinned K3 seat `unavailable` with detail `host` although
+    /// Broca sends it. Availability follows the substrate that sends: the same
+    /// request seats the pin on Broca and is rejected only on the host.
     #[tokio::test]
     async fn a_roster_pin_absent_from_the_host_list_seats_on_broca_and_is_rejected_on_the_host() {
         let rig = Rig::new("panel-substrate");
         let store = Arc::new(rig.open_store());
         store
             .upsert_fact(&fact("kimi-code-plan-global", "k3"), FactSource::Override)
-            .expect("the catalog carries the route on its new plane");
-        let vault_handles = rig.dir.join("vault-handles.json");
-        std::fs::write(
-            &vault_handles,
-            r#"{"handles":{"apikey:kimi-code-plan-global":"ckh_fixture"}}"#,
-        )
-        .unwrap();
+            .expect("the catalog serves the route");
         let request = |substrate: &str| {
             json!({
                 "method": ROUTE_SELECT_PANEL_OP,
                 "params": {
-                    // The caller's host list carries the RETIRED provider id only.
-                    "availableModels": ["kimi-for-coding/k3"],
+                    // The caller's host list lacks Kimi's plan entirely.
+                    "availableModels": ["anthropic/claude-fable-5-1"],
                     "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
                     "roster": [{"model": "kimi-code-plan-global/k3"}],
                     "substrate": substrate,
@@ -8859,15 +8859,8 @@ mod tests {
         };
         let run = |substrate: &'static str| {
             let store = Arc::clone(&store);
-            let vault_handles = vault_handles.clone();
             async move {
-                let response = run_route_wire_request_with_paths(
-                    &store,
-                    request(substrate),
-                    Path::new("/nonexistent/alfonso-routing.jsonc"),
-                    &vault_handles,
-                )
-                .await;
+                let response = run_route_wire_request(&store, request(substrate)).await;
                 assert_eq!(response.header.ty, FrameType::Response);
                 serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"]
                     .clone()
@@ -8877,7 +8870,7 @@ mod tests {
         let broca = run("broca").await;
         assert_eq!(
             broca["members"][0]["routeKey"], "kimi-code-plan-global/k3",
-            "Broca holds a credential for the provider and the catalog serves the model, so the pin sits"
+            "the catalog serves the pinned route, so it sits on Broca whatever the host lists"
         );
         assert!(broca.get("shortfall").is_none());
 
@@ -8903,46 +8896,60 @@ mod tests {
         );
     }
 
-    /// Broca publishes no catalog to ask what it can send, so the substrate set is
-    /// the served catalog narrowed to providers Broca can authenticate to. A route
-    /// it has no credential for must not seat: it would fail its send every round.
+    /// Routing knows nothing yet about which providers Broca can authenticate
+    /// to. A Broca panel then seats from the served catalog, never from the
+    /// caller's host list (here empty, which would refuse every seat), and the
+    /// decision row says the reach was unknown even though nothing was refused.
+    /// The gap also turns `health.check` degraded, so it cannot sit unseen.
     #[tokio::test]
-    async fn a_broca_panel_never_seats_a_provider_broca_holds_no_credential_for() {
-        let rig = Rig::new("panel-substrate-credentials");
+    async fn a_broca_panel_with_no_reachability_source_seats_a_catalog_route_and_says_so() {
+        let rig = Rig::new("panel-substrate-unknown-reach");
         let store = Arc::new(rig.open_store());
         store
-            .upsert_fact(&fact("uncredentialed", "m1"), FactSource::Override)
+            .upsert_fact(&fact("livebroca", "m-new"), FactSource::Override)
             .unwrap();
-        let vault_handles = rig.dir.join("vault-handles.json");
-        std::fs::write(
-            &vault_handles,
-            r#"{"handles":{"apikey:kimi-code-plan-global":"ckh_fixture"}}"#,
-        )
-        .unwrap();
-        let response = run_route_wire_request_with_paths(
+        let response = run_route_wire_request(
             &store,
             json!({
                 "method": ROUTE_SELECT_PANEL_OP,
                 "params": {
-                    "availableModels": ["uncredentialed/m1"],
+                    "availableModels": [],
                     "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
-                    "roster": [{"model": "uncredentialed/m1"}],
+                    "roster": [{"model": "livebroca/m-new"}],
                     "substrate": "broca",
-                    "taskId": "panel-substrate-uncredentialed",
+                    "taskId": "panel-substrate-unknown-reach",
                 }
             }),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            &vault_handles,
         )
         .await;
-        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(body["result"]["members"], json!([]));
-        let cause = &body["result"]["shortfall"]["causes"][0];
-        assert_eq!(cause["reason"], "unavailable");
+        assert_eq!(response.header.ty, FrameType::Response);
+        let result =
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"].clone();
+        assert_eq!(result["members"][0]["routeKey"], "livebroca/m-new");
+        assert!(result.get("shortfall").is_none(), "{result}");
+        let explanation: serde_json::Value =
+            serde_json::from_str(&decision_explanation(&store, &result)).unwrap();
         assert_eq!(
-            cause["detail"], "broca",
-            "the seat was judged against Broca's reach, and the host list that does carry it is not consulted"
+            explanation["availability"],
+            "broca reachability unknown: judged against served catalog"
         );
+        assert_eq!(
+            BROCA_REACH_NOTICE.health_detail(),
+            Some(BROCA_REACH_UNKNOWN)
+        );
+    }
+
+    /// The gap is logged once per process and reported by every health check
+    /// after it first applies; before that the module reports healthy.
+    #[test]
+    fn unknown_broca_reach_warns_once_and_degrades_health() {
+        let notice = BrocaReachNotice::new();
+        assert_eq!(health_report(&notice).status, HealthStatus::Ok);
+        assert!(notice.note(), "the first Broca send judged blind logs");
+        assert!(!notice.note(), "later ones do not repeat the line");
+        let report = health_report(&notice);
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert_eq!(report.detail.as_deref(), Some(BROCA_REACH_UNKNOWN));
     }
 
     fn broca_select_request(
@@ -8967,12 +8974,15 @@ mod tests {
         store
             .upsert_fact(&fact("opencode-go", "m-native-fast"), FactSource::Override)
             .unwrap();
-        let handles = rig.dir.join("vault-handles.json");
-        std::fs::write(
-            &handles,
-            r#"{"handles":{"apikey:opencode-go":"ckh_fixture"}}"#,
-        )
-        .unwrap();
+        // A Broca send is judged against the served catalog, so withdraw every
+        // other row: the gateway route is then the only one to select.
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute(
+                "UPDATE model_facts SET fusiform_present = 0 WHERE route_key != 'opencode-go/m-native-fast'",
+                [],
+            )
+            .unwrap();
         let mut results = Vec::new();
         for omitted in [false, true] {
             let mut request = broca_select_request(&["opencode-go/m-native-fast"], Some("broca"));
@@ -8982,13 +8992,7 @@ mod tests {
                     .unwrap()
                     .remove("availableModels");
             }
-            let response = run_route_wire_request_with_paths(
-                &store,
-                request,
-                Path::new("/nonexistent/alfonso-routing.jsonc"),
-                &handles,
-            )
-            .await;
+            let response = run_route_wire_request(&store, request).await;
             assert_eq!(response.header.ty, FrameType::Response);
             results.push(
                 serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"]
@@ -9014,13 +9018,12 @@ mod tests {
 
     /// Core's own classifier, wake author, and comment reviewer send through
     /// Broca and carry no host list. Naming substrate `broca` judges the
-    /// selection against what Broca reaches now: a catalog route on a provider
-    /// Broca holds a credential for wins although no caller list names it, and a
-    /// route only the caller's list names (here, one Broca has no credential
-    /// for) cannot. The same request without the substrate keeps the caller's
-    /// list, so the substrate field is the only difference between the halves.
+    /// selection against Broca's availability, not the caller's list: a served
+    /// catalog route wins although the caller's list does not name it. The same
+    /// request without the substrate keeps the caller's list, so the substrate
+    /// field is the only difference between the halves.
     #[tokio::test]
-    async fn a_broca_route_select_reads_brocas_reach_not_the_callers_list() {
+    async fn a_broca_route_select_reads_brocas_availability_not_the_callers_list() {
         let rig = Rig::new("select-substrate-broca");
         let store = Arc::new(rig.open_store());
         store
@@ -9029,21 +9032,12 @@ mod tests {
         store
             .upsert_fact(&fact("hostonly", "m-old"), FactSource::Override)
             .unwrap();
-        let vault_handles = rig.dir.join("vault-handles.json");
-        std::fs::write(
-            &vault_handles,
-            r#"{"handles":{"apikey:livebroca":"ckh_fixture"}}"#,
-        )
-        .unwrap();
         let run = |substrate: Option<&'static str>| {
             let store = Arc::clone(&store);
-            let vault_handles = vault_handles.clone();
             async move {
-                let response = run_route_wire_request_with_paths(
+                let response = run_route_wire_request(
                     &store,
                     broca_select_request(&["hostonly/m-old"], substrate),
-                    Path::new("/nonexistent/alfonso-routing.jsonc"),
-                    &vault_handles,
                 )
                 .await;
                 assert_eq!(response.header.ty, FrameType::Response);
@@ -9053,13 +9047,17 @@ mod tests {
         };
 
         let broca = run(Some("broca")).await;
-        assert_eq!(broca["selected"]["routeKey"], "livebroca/m-new");
-        assert_eq!(
-            broca["resolvedInput"]["availableModels"],
-            json!(["livebroca/m-new"]),
-            "the caller's host list is not consulted for a Broca send"
+        let available: Vec<&str> = broca["resolvedInput"]["availableModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(
+            available.contains(&"livebroca/m-new"),
+            "a served route the caller's list lacks is available to a Broca send: {available:?}"
         );
-        assert!(decision_explanation(&store, &broca).contains("availability: broca"));
+        assert!(decision_explanation(&store, &broca).contains(BROCA_REACH_UNKNOWN));
 
         let host = run(None).await;
         assert_eq!(host["selected"]["routeKey"], "hostonly/m-old");
@@ -9069,8 +9067,7 @@ mod tests {
         );
     }
 
-    /// With Broca's credential map unreadable the reach is unknown. The
-    /// selection still routes, over every route the catalog serves, and the
+    /// With Broca's reach unknown the selection still routes, over every route the catalog serves, and the
     /// recorded decision says the availability was unknown; a route the catalog
     /// has withdrawn stays out, because nothing serves it.
     #[tokio::test]
@@ -9091,13 +9088,8 @@ mod tests {
             )
             .unwrap();
 
-        let response = run_route_wire_request_with_paths(
-            &store,
-            broca_select_request(&[], Some("broca")),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
-        )
-        .await;
+        let response =
+            run_route_wire_request(&store, broca_select_request(&[], Some("broca"))).await;
         assert_eq!(response.header.ty, FrameType::Response);
         let result =
             serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"].clone();
@@ -9113,7 +9105,7 @@ mod tests {
             "a withdrawn route is never available: {available:?}"
         );
         assert_ne!(result["selected"]["routeKey"], "retired/m-gone");
-        assert!(decision_explanation(&store, &result).contains("availability unknown"));
+        assert!(decision_explanation(&store, &result).contains(BROCA_REACH_UNKNOWN));
     }
 
     #[tokio::test]
@@ -9160,7 +9152,13 @@ mod tests {
             quota_signal_json: r#"{"state":"none","reason":"quota signal: none"}"#.into(),
             policy_revision: "test-policy".into(),
         };
-        let decision = panel_decision_input(&params, &panel, &provenance, "policy sources: test");
+        let decision = panel_decision_input(
+            &params,
+            &panel,
+            AvailabilitySubstrate::Host,
+            &provenance,
+            "policy sources: test",
+        );
         let explanation: serde_json::Value =
             serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
         assert_eq!(explanation["selection"], "n_pick");
@@ -9240,7 +9238,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
@@ -9302,7 +9299,6 @@ mod tests {
                 &Arc::new(Mutex::new(None)),
                 config_path,
                 Path::new("/nonexistent/alfonso-routing.jsonc"),
-                Path::new(ABSENT_BROCA_VAULT_HANDLES),
                 &empty_opencode_auth(),
             )
             .await
@@ -9481,7 +9477,6 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             &config_path,
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new(ABSENT_BROCA_VAULT_HANDLES),
             &empty_opencode_auth(),
         )
         .await
