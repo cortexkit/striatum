@@ -24,6 +24,7 @@ pub struct BrocaCredentials {
     providers: HashSet<String>,
     active: usize,
     unmapped: usize,
+    unmapped_ids: Vec<String>,
     unreadable: usize,
     last_error: Option<String>,
 }
@@ -43,6 +44,7 @@ impl BrocaCredentials {
         self.providers.clear();
         self.active = 0;
         self.unmapped = 0;
+        self.unmapped_ids.clear();
         self.unreadable = listing.undecodable_credentials.len();
         for credential in &listing.credentials {
             if credential.state != "active"
@@ -56,6 +58,7 @@ impl BrocaCredentials {
             self.active += 1;
             if credential.provider_ids.is_empty() {
                 self.unmapped += 1;
+                self.unmapped_ids.push(credential.id.clone());
             }
             self.providers
                 .extend(credential.provider_ids.iter().cloned());
@@ -76,11 +79,10 @@ impl BrocaCredentials {
                 "broca reachability unknown: credential listing stale (over 15 minutes)".into(),
             );
         }
-        if self.unmapped > 0 {
-            return Some(format!(
-                "broca reachability: {} of {} credentials unmapped",
-                self.unmapped, self.active
-            ));
+        if self.providers.is_empty() {
+            return Some(
+                "broca reachability unknown: no credentials map to catalog providers".into(),
+            );
         }
         None
     }
@@ -101,6 +103,7 @@ impl BrocaCredentials {
         report.metrics = Some(serde_json::json!({
             "activeCredentials": self.active,
             "unmappedCredentials": self.unmapped,
+            "unmappedCredentialIds": self.unmapped_ids,
             "unreadableCredentials": self.unreadable,
             "lastReachedAtMs": self.reached_at_ms,
             "lastError": self.last_error,
@@ -297,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unmapped_active_credentials_keep_catalog_fallback_and_specific_degraded_line() {
+    async fn unmapped_active_credentials_are_reported_without_widening_mapped_routes() {
         for missing in [false, true] {
             let mut reply = fixture()["list_only_reply"].clone();
             let mut unmapped = reply["result"]["credentials"][0].clone();
@@ -317,30 +320,27 @@ mod tests {
             let mut cache = BrocaCredentials::default();
             cache.apply_listing(&listing, crate::now_ms());
             let health = cache.health_report(crate::now_ms());
-            assert_eq!(health.status, HealthStatus::Degraded);
+            assert_eq!(health.status, HealthStatus::Ok);
+            assert_eq!(health.detail, None);
             assert_eq!(
-                health.detail.as_deref(),
-                Some("broca reachability: 1 of 2 credentials unmapped")
+                health.metrics.as_ref().unwrap()["unmappedCredentialIds"],
+                json!(["legacy-or-unmapped"])
             );
             let shared = Arc::new(Mutex::new(cache));
             let facts = facts();
             let selection = crate::select_availability(Some("broca"), Vec::new(), &facts, &shared);
-            assert_eq!(selection.models, ["anthropic/m1", "uncredentialed/m2"]);
-            assert!(selection
-                .note
-                .unwrap()
-                .contains("broca reachability: 1 of 2 credentials unmapped"));
+            assert_eq!(selection.models, ["anthropic/m1"]);
+            assert!(!selection.note.unwrap().contains("unmapped"));
             let (substrate, available) =
                 crate::panel_availability(Some("broca"), HashSet::new(), &facts, &shared);
             assert_eq!(
                 substrate,
-                prefrontal_routing_core::AvailabilitySubstrate::BrocaServedCatalog
+                prefrontal_routing_core::AvailabilitySubstrate::Broca
             );
-            assert_eq!(available.len(), 2);
+            assert_eq!(available, HashSet::from(["anthropic/m1".into()]));
 
-            // Operator-set provider IDs determine which catalog providers Broca
-            // has credentials for. Mapping the last credential makes that set
-            // complete, so health reports ok.
+            // The unmapped row remains visible, but it cannot widen the routes
+            // past providers whose IDs are explicitly mapped.
             let mut mapped = listing;
             mapped.view = "mapped-view".into();
             mapped.credentials[1].provider_ids = vec!["anthropic".into()];
@@ -356,6 +356,55 @@ mod tests {
                 ["anthropic/m1"]
             );
         }
+    }
+
+    #[test]
+    fn unmapped_credentials_are_informational_when_other_providers_are_mapped() {
+        let mut credentials = (0..19)
+            .map(|index| credential(&format!("mapped-{index}"), &["anthropic"]))
+            .collect::<Vec<_>>();
+        credentials.push(credential("apikey:typesafe", &[]));
+        credentials.push(credential("oauth:cursor", &[]));
+
+        let mut cache = BrocaCredentials::default();
+        cache.apply_listing(&listing(credentials), crate::now_ms());
+        let report = cache.health_report(crate::now_ms());
+        assert_eq!(report.status, HealthStatus::Ok);
+        assert_eq!(report.detail, None);
+        let metrics = report.metrics.unwrap();
+        assert_eq!(metrics["activeCredentials"], 21);
+        assert_eq!(metrics["unmappedCredentials"], 2);
+        assert_eq!(
+            metrics["unmappedCredentialIds"],
+            serde_json::json!(["apikey:typesafe", "oauth:cursor"])
+        );
+        assert_eq!(
+            cache.served_routes(&facts(), crate::now_ms()).0,
+            ["anthropic/m1"]
+        );
+    }
+
+    #[test]
+    fn no_mapped_credentials_degrades_health_and_falls_back_to_catalog() {
+        let mut cache = BrocaCredentials::default();
+        cache.apply_listing(
+            &listing(vec![
+                credential("apikey:typesafe", &[]),
+                credential("oauth:cursor", &[]),
+            ]),
+            crate::now_ms(),
+        );
+
+        let report = cache.health_report(crate::now_ms());
+        assert_eq!(report.status, HealthStatus::Degraded);
+        assert_eq!(
+            report.detail.as_deref(),
+            Some("broca reachability unknown: no credentials map to catalog providers")
+        );
+        assert_eq!(
+            cache.served_routes(&facts(), crate::now_ms()).0,
+            ["anthropic/m1", "uncredentialed/m2"]
+        );
     }
 
     #[test]
@@ -378,6 +427,10 @@ mod tests {
             cache.health_report(1_001 + MAX_AGE_MS).status,
             HealthStatus::Degraded
         );
+        assert_eq!(
+            cache.health_report(1_001 + MAX_AGE_MS).detail.as_deref(),
+            Some("broca reachability unknown: credential listing stale (over 15 minutes)")
+        );
     }
 
     #[test]
@@ -398,8 +451,14 @@ mod tests {
         assert_eq!(cache.last_error, None);
         unchanged.view = "new-view".into();
         assert!(cache.apply_listing(&unchanged, MAX_AGE_MS + 3));
-        assert!(cache.served_routes(&facts(), MAX_AGE_MS + 4).0.is_empty());
-        assert_eq!(cache.health_report(MAX_AGE_MS + 4).status, HealthStatus::Ok);
+        assert_eq!(
+            cache.served_routes(&facts(), MAX_AGE_MS + 4).0,
+            ["anthropic/m1", "uncredentialed/m2"]
+        );
+        assert_eq!(
+            cache.health_report(MAX_AGE_MS + 4).status,
+            HealthStatus::Degraded
+        );
     }
 
     #[tokio::test]

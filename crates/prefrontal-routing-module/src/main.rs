@@ -1215,8 +1215,8 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
-            // Broca mapping gaps and stale quota snapshots can coexist. Report
-            // both so repairing one cannot hide the other from the operator.
+            // Unknown Broca reachability and stale quota snapshots can coexist.
+            // Unmapped credential IDs remain in metrics without affecting status.
             let mut report = broca_credentials
                 .lock()
                 .map(|credentials| credentials.health_report(now_ms()))
@@ -3257,11 +3257,12 @@ impl SelectAvailability {
 /// A Broca send is judged against what Broca can reach now, never against a
 /// list the caller carries: callers without a host (core's own classifier,
 /// wake author, and comment reviewer) have no list of their own, and a host's
-/// list describes a different substrate. When credential mappings are incomplete
-/// or stale, selection proceeds over every route the catalog still serves and
-/// the decision says so. It stays closed to routes known to be
-/// unserved, because withdrawn catalog rows never reach `facts`, and operator
-/// exclusions, cooldowns, and failure backoff still apply downstream.
+/// list describes a different substrate. If the vault listing is unknown or
+/// no credential has a provider mapping, selection proceeds over every route
+/// the catalog still serves. Otherwise it uses only explicitly mapped providers.
+/// It stays closed to routes known to be unserved, because withdrawn catalog
+/// rows never reach `facts`, and operator exclusions, cooldowns, and failure
+/// backoff still apply downstream.
 fn select_availability(
     requested_substrate: Option<&str>,
     host_available_models: Vec<String>,
@@ -8402,17 +8403,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_check_joins_unmapped_broca_and_stale_quota_details_and_clears_each_independently(
+    async fn health_check_reports_unmapped_credentials_without_degrading_and_joins_stale_quota_details(
     ) {
         let broca_credentials = empty_broca_credentials();
         broca_credentials.lock().unwrap().apply_listing(
             &prefrontal_ckcred_client::ScopedCredentialListing {
-                credentials: vec![prefrontal_ckcred_client::ListedCredential {
-                    id: "fixture-unmapped".into(),
-                    categories: vec!["llm-provider".into()],
-                    state: "active".into(),
-                    ..Default::default()
-                }],
+                credentials: vec![
+                    prefrontal_ckcred_client::ListedCredential {
+                        id: "fixture-mapped".into(),
+                        categories: vec!["llm-provider".into()],
+                        state: "active".into(),
+                        provider_ids: vec!["anthropic".into()],
+                        ..Default::default()
+                    },
+                    prefrontal_ckcred_client::ListedCredential {
+                        id: "fixture-unmapped".into(),
+                        categories: vec!["llm-provider".into()],
+                        state: "active".into(),
+                        ..Default::default()
+                    },
+                ],
                 view: "unmapped-view".into(),
                 ..Default::default()
             },
@@ -8432,13 +8442,20 @@ mod tests {
         };
         assert_eq!(status, HealthStatus::Degraded);
         let detail = detail.unwrap();
-        assert!(detail.starts_with("broca reachability: 1 of 1 credentials unmapped; quota snapshot stale: last successful refresh 16m ago"), "{detail}");
+        assert!(
+            detail.starts_with("quota snapshot stale: last successful refresh 16m ago"),
+            "{detail}"
+        );
         assert!(detail.contains("missing field `remaining`"), "{detail}");
         let metrics = metrics.unwrap();
         assert_eq!(metrics["quota"]["stale"], true);
         assert_eq!(metrics["brocaReachability"]["unmappedCredentials"], 1);
+        assert_eq!(
+            metrics["brocaReachability"]["unmappedCredentialIds"],
+            json!(["fixture-unmapped"])
+        );
 
-        // Repairing quota alone leaves the mapping gap visible.
+        // The unmapped credential remains visible without degrading Broca health.
         let ModuleControlResponse::HealthCheck {
             status,
             detail,
@@ -8447,14 +8464,14 @@ mod tests {
         else {
             panic!("health.check answers with a health report");
         };
-        assert_eq!(status, HealthStatus::Degraded);
+        assert_eq!(status, HealthStatus::Ok);
+        assert_eq!(detail, None);
         assert_eq!(
-            detail.as_deref(),
-            Some("broca reachability: 1 of 1 credentials unmapped")
+            metrics.unwrap()["brocaReachability"]["unmappedCredentialIds"],
+            json!(["fixture-unmapped"])
         );
-        assert_eq!(metrics.unwrap()["quota"]["stale"], false);
 
-        // Repairing the mapping alone leaves quota's staleness visible.
+        // The quota remains stale independently of the informational unmapped row.
         let ModuleControlResponse::HealthCheck { status, detail, .. } =
             health_report_for_with_credentials(
                 walled_codex_cache_aged(QUOTA_STALE_AFTER_MS + 60_000),
