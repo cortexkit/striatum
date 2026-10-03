@@ -1,8 +1,8 @@
 //! Per-account quota views for account selection.
 //!
 //! Routing will choose which subscription account serves new work from these
-//! views. This module only builds them: it polls Insula once per provider with
-//! `usage.get {"provider": ...}`, keeps every account's whole entry with its
+//! views. This module only builds them: it polls Insula's complete feed with
+//! `usage.get {}`, keeps every account's whole entry with its
 //! producer date, joins accounts to vault identities by vault account id, and
 //! says for each account whether its reading is fit to place new (cold) work
 //! on, and why not when it is not: degraded, too old, missing windows, or no
@@ -18,8 +18,8 @@
 //! * Entries are taken whole. One account's windows are never mixed with another
 //!   account's, and a duplicate lane for the same account is resolved to one
 //!   entry deterministically.
-//! * Accounts join the vault by `(refresh_adapter, account_id)`, never by email.
-//! * General windows are identified by `windowMinutes`, never by slot name; a
+//! * Accounts join the vault by account id, never by email or provider aliases.
+//! * General windows come from the reading, never from a provider table; a
 //!   scoped window is identified by producer id plus `windowMinutes`, never by
 //!   its title.
 
@@ -74,42 +74,6 @@ const UNDERSTOOD_STALE_CLASS: &str = "upstream_failed";
 /// it only when Anthropic states a limit, so its absence means "off or no stated
 /// limit", never "unlimited".
 const OVERAGE_POOL_ID: &str = "extra_usage";
-
-/// How one Insula provider maps onto the vault and routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProviderAdapter {
-    /// Insula's provider name, sent as `usage.get {"provider": ...}`.
-    pub insula_provider: &'static str,
-    /// The vault `refresh_adapter` of this provider's subscription credentials.
-    pub refresh_adapter: &'static str,
-    /// Routing's provider id.
-    pub routing_provider: &'static str,
-    /// General windows (by `windowMinutes`) a reading needs for cold work.
-    pub general_window_minutes: &'static [i64],
-}
-
-/// Providers whose accounts routing tracks. Only Claude for now; ChatGPT
-/// (Insula's `codex`) is a later entry here, with a weekly-only window list,
-/// once routing places ChatGPT subscription accounts.
-pub const ACCOUNT_PROVIDERS: &[ProviderAdapter] = &[ProviderAdapter {
-    insula_provider: "claude",
-    refresh_adapter: "anthropic",
-    routing_provider: "anthropic",
-    general_window_minutes: &[FIVE_HOUR_MINUTES, SEVEN_DAY_MINUTES],
-}];
-
-pub fn account_provider_names() -> Vec<&'static str> {
-    ACCOUNT_PROVIDERS
-        .iter()
-        .map(|adapter| adapter.insula_provider)
-        .collect()
-}
-
-fn adapter_for(insula_provider: &str) -> Option<&'static ProviderAdapter> {
-    ACCOUNT_PROVIDERS
-        .iter()
-        .find(|adapter| adapter.insula_provider == insula_provider)
-}
 
 /// A per-model-family scoped quota window, and the API models it governs.
 /// Insula does not publish which models a scoped window applies to; routing
@@ -169,6 +133,8 @@ pub struct AccountInfo {
 #[serde(rename_all = "camelCase")]
 pub struct AccountEntry {
     pub provider: String,
+    #[serde(default)]
+    pub api_provider: Option<String>,
     #[serde(default)]
     pub account: Option<String>,
     #[serde(default)]
@@ -393,6 +359,14 @@ pub struct StoredReading {
 }
 
 impl StoredReading {
+    /// Only the producer's catalog vendor can name a routing provider.
+    pub fn routing_provider(&self) -> Option<&str> {
+        self.entry
+            .get("apiProvider")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    }
+
     fn fetched_at(&self) -> Option<&str> {
         self.entry.get("fetchedAt").and_then(Value::as_str)
     }
@@ -561,6 +535,20 @@ pub struct VaultRoster {
     pub grants: Vec<RosterGrant>,
 }
 
+/// Vault account ids are the join key. Ambiguous ids across adapters are not
+/// selectable: choosing the first would silently bind the wrong credential.
+pub fn identity_for_reading<'a>(
+    roster: &'a VaultRoster,
+    reading: &StoredReading,
+) -> Option<&'a RosterIdentity> {
+    let mut matches = roster
+        .identities
+        .iter()
+        .filter(|identity| identity.account_id == reading.account_id);
+    let identity = matches.next()?;
+    matches.next().is_none().then_some(identity)
+}
+
 fn is_default_record(credential_id: &str) -> bool {
     credential_id.split(':').count() == 2
 }
@@ -667,8 +655,9 @@ pub enum RosterPoll {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WindowView {
-    /// `primary`, `secondary` or `tertiary`, for tracing only.
+    /// `primary`, `secondary`, `tertiary` or `extra`, for tracing only.
     pub slot: &'static str,
+    pub window_kind: Option<String>,
     pub window_minutes: Option<i64>,
     pub used_percent: f64,
     pub raw_used_percent: Option<f64>,
@@ -722,7 +711,7 @@ pub struct FamilyScopeView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct VaultJoinView {
     pub joined: bool,
-    pub refresh_adapter: &'static str,
+    pub refresh_adapter: Option<String>,
     pub credential_ids: Vec<String>,
     pub active_credential_ids: Vec<String>,
 }
@@ -733,7 +722,7 @@ pub struct VaultJoinView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountView {
     pub provider: String,
-    pub routing_provider: &'static str,
+    pub routing_provider: Option<String>,
     pub account_id: String,
     /// Display only; never used to join.
     pub email: Option<String>,
@@ -786,8 +775,9 @@ pub struct RosterGaps {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProviderStatusView {
-    pub provider: &'static str,
-    pub routing_provider: &'static str,
+    pub provider: String,
+    pub routing_provider: Option<String>,
+    pub routing_providers: Vec<String>,
     pub last_polled_at_ms: Option<i64>,
     pub last_poll_complete: bool,
     pub last_complete_at_ms: Option<i64>,
@@ -812,11 +802,15 @@ pub struct AccountQuotaReport {
     pub accounts: Vec<AccountView>,
     pub gaps: RosterGaps,
     pub alarms: Vec<String>,
+    /// Producer facts that explain unavailable selection without indicating an
+    /// operational failure, such as an unpublished catalog vendor.
+    pub information: Vec<String>,
 }
 
 fn window_view(slot: &'static str, window: &RateWindow) -> WindowView {
     WindowView {
         slot,
+        window_kind: window.window_kind.clone(),
         window_minutes: window.window_minutes,
         used_percent: window.used_percent,
         raw_used_percent: window.raw_used_percent,
@@ -828,29 +822,25 @@ fn general_windows(usage: Option<&Usage>) -> Vec<WindowView> {
     let Some(usage) = usage else {
         return Vec::new();
     };
-    [
-        ("primary", usage.primary.as_ref()),
-        ("secondary", usage.secondary.as_ref()),
-        ("tertiary", usage.tertiary.as_ref()),
-    ]
-    .into_iter()
-    .filter_map(|(slot, window)| window.map(|window| window_view(slot, window)))
-    .collect()
+    prefrontal_routing_core::quota_extract::account_rate_windows(usage, None)
+        .into_iter()
+        .map(|(slot, window)| window_view(slot, &window))
+        .collect()
 }
 
 fn valid_general_window(windows: &[WindowView], minutes: i64) -> Option<WindowView> {
     windows
         .iter()
-        .find(|window| window.window_minutes == Some(minutes) && window.used_percent.is_finite())
+        .find(|window| {
+            let matches = match window.window_kind.as_deref() {
+                Some("five_hour") => minutes == FIVE_HOUR_MINUTES,
+                Some("weekly") => minutes == SEVEN_DAY_MINUTES,
+                Some(_) => false,
+                None => window.window_minutes == Some(minutes),
+            };
+            matches && window.used_percent.is_finite()
+        })
         .cloned()
-}
-
-fn window_label(minutes: i64) -> String {
-    match minutes {
-        FIVE_HOUR_MINUTES => "5h".into(),
-        SEVEN_DAY_MINUTES => "7d".into(),
-        other => format!("{other}-minute"),
-    }
 }
 
 fn map_scoped_window(
@@ -1005,10 +995,10 @@ fn adapter_absent_reason(roster: &VaultRoster, adapter: &str) -> String {
 
 fn account_view(
     reading: &StoredReading,
-    adapter: &'static ProviderAdapter,
     roster: &RosterForJoin<'_>,
     now_ms: i64,
     alarms: &mut Vec<String>,
+    information: &mut Vec<String>,
 ) -> (AccountView, Option<InsulaOnlyGap>) {
     let entry: Option<AccountEntry> = serde_json::from_value(reading.entry.clone()).ok();
     let usage = entry.as_ref().and_then(|entry| entry.usage.as_ref());
@@ -1049,7 +1039,17 @@ fn account_view(
         .collect();
     let unmapped: Vec<&ScopedWindowView> = scoped_windows
         .iter()
-        .filter(|window| window.family.is_none())
+        .filter(|window| {
+            window.family.is_none()
+                && !usage
+                    .and_then(|usage| usage.extra_rate_windows.as_ref())
+                    .into_iter()
+                    .flatten()
+                    .any(|extra| {
+                        extra.id == window.id
+                            && prefrontal_routing_core::quota_extract::is_account_pool_window(extra)
+                    })
+        })
         .collect();
     if !unmapped.is_empty() {
         alarms.push(format!(
@@ -1070,19 +1070,38 @@ fn account_view(
     let fetched_at = reading.fetched_at().map(str::to_owned);
     let age = age_band(fetched_at.as_deref().and_then(parse_rfc3339_ms), now_ms);
 
-    let identity = roster.roster.and_then(|roster| {
-        roster.identities.iter().find(|identity| {
-            identity.refresh_adapter == adapter.refresh_adapter
-                && identity.account_id == reading.account_id
-        })
-    });
+    let routing_provider = reading.routing_provider();
+    let identity = roster
+        .roster
+        .and_then(|roster| identity_for_reading(roster, reading));
     let join_reason = match (identity, roster.roster) {
         (Some(_), _) => None,
-        (None, Some(listed)) => Some(adapter_absent_reason(listed, adapter.refresh_adapter)),
+        (None, Some(listed))
+            if listed
+                .identities
+                .iter()
+                .filter(|identity| identity.account_id == reading.account_id)
+                .count()
+                > 1 =>
+        {
+            Some("vault account id is ambiguous across refresh adapters".into())
+        }
+        (None, Some(listed)) => Some(adapter_absent_reason(
+            listed,
+            routing_provider.unwrap_or("unmapped"),
+        )),
         (None, None) => Some(roster.missing_reason.clone()),
     };
 
     let mut reasons = Vec::new();
+    if routing_provider.is_none() {
+        let reason = "unmapped entry: no apiProvider vendor field";
+        reasons.push(reason.into());
+        information.push(format!(
+            "{} account {}: {reason}",
+            reading.provider, reading.account_id
+        ));
+    }
     if let Some(at) = reading.tombstoned_at_ms {
         reasons.push(format!(
             "absent from a complete Insula reply since {at} (tombstoned)"
@@ -1123,12 +1142,15 @@ fn account_view(
             age.age_ms.unwrap_or_default() / 60_000
         )),
     }
-    for minutes in adapter.general_window_minutes {
-        if valid_general_window(&general, *minutes).is_none() {
-            reasons.push(format!(
-                "no valid {} general window (windowMinutes {minutes})",
-                window_label(*minutes)
-            ));
+    if general.is_empty() {
+        reasons.push("no reported general windows".into());
+    }
+    for window in &general {
+        if !window.used_percent.is_finite()
+            || !(0.0..=100.0).contains(&window.used_percent)
+            || !window.window_minutes.is_some_and(|minutes| minutes > 0)
+        {
+            reasons.push("invalid reported general window".into());
         }
     }
     match (identity, &join_reason) {
@@ -1158,7 +1180,7 @@ fn account_view(
         .and_then(|info| info.email.clone());
     let gap = join_reason
         .as_ref()
-        .filter(|_| reading.tombstoned_at_ms.is_none())
+        .filter(|_| reading.tombstoned_at_ms.is_none() && routing_provider.is_some())
         .map(|reason| InsulaOnlyGap {
             provider: reading.provider.clone(),
             account_id: reading.account_id.clone(),
@@ -1167,13 +1189,13 @@ fn account_view(
         });
     let view = AccountView {
         provider: reading.provider.clone(),
-        routing_provider: adapter.routing_provider,
+        routing_provider: routing_provider.map(str::to_owned),
         account_id: reading.account_id.clone(),
         email,
         source: entry.as_ref().and_then(|entry| entry.source.clone()),
         vault: VaultJoinView {
             joined: identity.is_some(),
-            refresh_adapter: adapter.refresh_adapter,
+            refresh_adapter: identity.map(|identity| identity.refresh_adapter.clone()),
             credential_ids: identity
                 .map(|identity| identity.credential_ids.clone())
                 .unwrap_or_default(),
@@ -1210,31 +1232,20 @@ pub fn build_report(
 ) -> AccountQuotaReport {
     let join = roster_for_join(roster, roster_poll, now_ms);
     let mut alarms = Vec::new();
+    let mut information = Vec::new();
     let mut accounts = Vec::new();
     let mut gaps = RosterGaps::default();
     for reading in readings.readings.values() {
-        let Some(adapter) = adapter_for(&reading.provider) else {
-            continue;
-        };
-        let (view, gap) = account_view(reading, adapter, &join, now_ms, &mut alarms);
+        let (view, gap) = account_view(reading, &join, now_ms, &mut alarms, &mut information);
         accounts.push(view);
         gaps.insula_only.extend(gap);
     }
     if let Some(roster) = join.roster {
         for identity in &roster.identities {
-            let Some(adapter) = ACCOUNT_PROVIDERS
-                .iter()
-                .find(|adapter| adapter.refresh_adapter == identity.refresh_adapter)
-            else {
-                continue;
-            };
-            let has_reading = readings
-                .readings
-                .get(&(
-                    adapter.insula_provider.to_string(),
-                    identity.account_id.clone(),
-                ))
-                .is_some_and(|reading| reading.tombstoned_at_ms.is_none());
+            let has_reading = readings.readings.values().any(|reading| {
+                reading.tombstoned_at_ms.is_none()
+                    && identity_for_reading(roster, reading) == Some(identity)
+            });
             if has_reading {
                 continue;
             }
@@ -1262,13 +1273,32 @@ pub fn build_report(
             gaps.insula_only.len()
         ));
     }
-    let providers = ACCOUNT_PROVIDERS
-        .iter()
-        .map(|adapter| {
-            let completeness = readings.completeness.get(adapter.insula_provider);
+    let provider_names: BTreeSet<_> = readings
+        .completeness
+        .keys()
+        .cloned()
+        .chain(
+            readings
+                .readings
+                .values()
+                .map(|reading| reading.provider.clone()),
+        )
+        .collect();
+    let providers = provider_names
+        .into_iter()
+        .map(|provider| {
+            let completeness = readings.completeness.get(&provider);
+            let routing_providers: BTreeSet<_> = readings
+                .readings
+                .values()
+                .filter(|reading| reading.provider == provider)
+                .filter_map(|reading| reading.routing_provider().map(str::to_owned))
+                .collect();
             ProviderStatusView {
-                provider: adapter.insula_provider,
-                routing_provider: adapter.routing_provider,
+                provider,
+                routing_provider: (routing_providers.len() == 1)
+                    .then(|| routing_providers.first().unwrap().clone()),
+                routing_providers: routing_providers.into_iter().collect(),
                 last_polled_at_ms: completeness.map(|row| row.last_polled_at_ms),
                 last_poll_complete: completeness.is_some_and(|row| row.last_poll_complete),
                 last_complete_at_ms: completeness.and_then(|row| row.last_complete_at_ms),
@@ -1288,6 +1318,7 @@ pub fn build_report(
         accounts,
         gaps,
         alarms,
+        information,
     }
 }
 
@@ -1468,6 +1499,7 @@ pub fn apply_roster_listing(
 
 /// Decode one provider's reply and merge it. Returns the rows to persist, or
 /// the decode error (the stored readings are then left untouched).
+#[cfg(test)]
 pub fn apply_provider_reply(
     state: &mut AccountQuotaState,
     provider: &str,
@@ -1495,6 +1527,47 @@ pub fn apply_provider_reply(
     Ok(rows_to_persist(&state.readings, provider, &outcome))
 }
 
+/// An unfiltered Insula reply discovers providers from entries and completeness
+/// declarations, including providers with zero accounts. Partial replies keep
+/// omitted accounts; only Insula's explicit completeness may tombstone them.
+pub fn apply_usage_reply(
+    state: &mut AccountQuotaState,
+    body: &[u8],
+    received_at_ms: i64,
+) -> Result<
+    (
+        Vec<PersistedAccountReading>,
+        Vec<PersistedProviderCompleteness>,
+    ),
+    String,
+> {
+    let envelope = decode_usage_envelope(body)?;
+    let providers: BTreeSet<_> = envelope
+        .entries
+        .iter()
+        .map(|(entry, _)| entry.provider.clone())
+        .chain(envelope.complete_providers.iter().cloned())
+        .chain(state.readings.completeness.keys().cloned())
+        .collect();
+    if !envelope.undecodable_entries.is_empty() {
+        tracing::warn!(errors = ?envelope.undecodable_entries, "account quota: some Insula entries did not decode and were skipped");
+    }
+    let mut rows = Vec::new();
+    let mut completeness = Vec::new();
+    for provider in providers {
+        let outcome =
+            merge_provider_poll(&mut state.readings, &provider, &envelope, received_at_ms);
+        for note in &outcome.duplicate_lanes {
+            tracing::info!(note = %note, "account quota: duplicate Insula lanes");
+        }
+        let (provider_rows, provider_completeness) =
+            rows_to_persist(&state.readings, &provider, &outcome);
+        rows.extend(provider_rows);
+        completeness.extend(provider_completeness);
+    }
+    Ok((rows, completeness))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1503,8 +1576,8 @@ fn now_ms() -> i64 {
 }
 
 /// Background task keeping the account state current: list the vault roster,
-/// then poll Insula once per tracked provider, merging and persisting each
-/// reply. Every await happens without the state lock, and a failure on either
+/// then poll Insula's unfiltered feed, merging and persisting every provider.
+/// Every await happens without the state lock, and a failure on either
 /// side leaves what routing already holds in place.
 pub async fn account_quota_loop(
     connection_file_path: PathBuf,
@@ -1516,7 +1589,6 @@ pub async fn account_quota_loop(
     let project_root =
         prefrontal_core_store::scratch_root().join("prefrontal-routing-account-quota");
     let _ = std::fs::create_dir_all(&project_root);
-    let providers = account_provider_names();
     loop {
         let listing = resolver.list_scoped().await;
         let at_ms = now_ms();
@@ -1548,34 +1620,29 @@ pub async fn account_quota_loop(
         }
 
         let replies = match QuotaConsumer::connect(&connection_file_path, &project_root).await {
-            Ok(mut consumer) => consumer.usage_get_providers_raw(&providers).await,
+            Ok(mut consumer) => consumer.usage_get_raw().await,
             Err(error) => Err(error),
         };
         let delay = match replies {
-            Ok(replies) => {
+            Ok(body) => {
                 let received_at_ms = now_ms();
-                for (provider, body) in replies {
-                    let persisted = match state.lock() {
-                        Ok(mut guard) => {
-                            match apply_provider_reply(&mut guard, &provider, &body, received_at_ms)
-                            {
-                                Ok(rows) => {
-                                    guard.last_insula_error = None;
-                                    Some(rows)
-                                }
-                                Err(error) => {
-                                    guard.last_insula_error =
-                                        Some(format!("{provider} reply rejected: {error}"));
-                                    None
-                                }
-                            }
+                let persisted = match state.lock() {
+                    Ok(mut guard) => match apply_usage_reply(&mut guard, &body, received_at_ms) {
+                        Ok(rows) => {
+                            guard.last_insula_error = None;
+                            Some(rows)
                         }
-                        Err(_) => None,
-                    };
-                    if let Some((rows, completeness)) = persisted {
-                        if let Err(error) = store.put_account_quota_poll(&rows, &completeness) {
-                            tracing::warn!(error = %error, "account quota poll not persisted");
+                        Err(error) => {
+                            guard.last_insula_error =
+                                Some(format!("usage reply rejected: {error}"));
+                            None
                         }
+                    },
+                    Err(_) => None,
+                };
+                if let Some((rows, completeness)) = persisted {
+                    if let Err(error) = store.put_account_quota_poll(&rows, &completeness) {
+                        tracing::warn!(error = %error, "account quota poll not persisted");
                     }
                 }
                 ACCOUNT_REFRESH_INTERVAL
@@ -1634,6 +1701,7 @@ mod tests {
     fn claude_entry(account: &str, fetched_at: &str) -> Value {
         json!({
             "provider": "claude",
+            "apiProvider": "anthropic",
             "account": account,
             "accountInfo": { "email": format!("{account}@example.test") },
             "source": "vault",
@@ -1954,6 +2022,50 @@ mod tests {
         assert_eq!(parse_rfc3339_ms("2026-09-29T07:00:00-05:00"), Some(NOON_MS));
         assert_eq!(parse_rfc3339_ms("2026-09-29T12:00:00"), None);
         assert_eq!(parse_rfc3339_ms("not a date"), None);
+    }
+
+    #[test]
+    fn unfiltered_poll_discovers_providers_and_only_explicit_completeness_tombstones() {
+        let mut state = AccountQuotaState::default();
+        let mut codex = claude_entry("codex-account", "2026-09-29T12:00:00Z");
+        codex["provider"] = serde_json::json!("codex");
+        codex["apiProvider"] = serde_json::json!("openai");
+        let mut ag = codex.clone();
+        ag["provider"] = serde_json::json!("antigravity");
+        ag["apiProvider"] = serde_json::json!("google");
+        let (rows, completeness) = apply_usage_reply(
+            &mut state,
+            &reply(
+                vec![
+                    claude_entry("claude-account", "2026-09-29T12:00:00Z"),
+                    codex,
+                    ag,
+                ],
+                &["claude", "codex", "antigravity", "empty-provider"],
+            ),
+            1,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(completeness.len(), 4);
+        assert!(state.readings.completeness.contains_key("empty-provider"));
+        apply_usage_reply(&mut state, &reply(vec![], &[]), 2).unwrap();
+        assert!(state
+            .readings
+            .readings
+            .values()
+            .all(|reading| reading.tombstoned_at_ms.is_none()));
+        let (rows, _) = apply_usage_reply(&mut state, &reply(vec![], &["codex"]), 3).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            state.readings.readings[&("codex".into(), "codex-account".into())].tombstoned_at_ms,
+            Some(3)
+        );
+        assert!(
+            state.readings.readings[&("claude".into(), "claude-account".into())]
+                .tombstoned_at_ms
+                .is_none()
+        );
     }
 
     #[test]

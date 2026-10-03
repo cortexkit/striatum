@@ -649,9 +649,9 @@ enum StartupMode {
     Serve(PathBuf),
 }
 
-/// `--account-quota-dry-run --subc <file> [--capture <dir>]`: fetch each tracked
-/// provider's `usage.get` reply, optionally save the exact reply bytes under
-/// `<dir>/usage-get-<provider>.json`, and print the account report as JSON.
+/// `--account-quota-dry-run --subc <file> [--capture <dir>]`: fetch Insula's
+/// unfiltered reply, optionally save its exact bytes under
+/// `<dir>/usage-get-all.json`, and print the account report as JSON.
 async fn account_quota_dry_run(
     connection_file_path: PathBuf,
     capture_dir: Option<PathBuf>,
@@ -662,8 +662,8 @@ async fn account_quota_dry_run(
     let mut consumer = QuotaConsumer::connect(&connection_file_path, &project_root)
         .await
         .map_err(|error| ModuleError::Message(format!("connect to insula: {error}")))?;
-    let replies = consumer
-        .usage_get_providers_raw(&account_quota::account_provider_names())
+    let body = consumer
+        .usage_get_raw()
         .await
         .map_err(|error| ModuleError::Message(format!("usage.get: {error}")))?;
     let mut state = account_quota::AccountQuotaState {
@@ -674,17 +674,13 @@ async fn account_quota_dry_run(
         ..Default::default()
     };
     let received_at_ms = now_ms() as i64;
-    for (provider, body) in replies {
-        if let Some(dir) = &capture_dir {
-            std::fs::create_dir_all(dir)
-                .and_then(|()| {
-                    std::fs::write(dir.join(format!("usage-get-{provider}.json")), &body)
-                })
-                .map_err(|error| ModuleError::Message(format!("capture {provider}: {error}")))?;
-        }
-        account_quota::apply_provider_reply(&mut state, &provider, &body, received_at_ms)
-            .map_err(|error| ModuleError::Message(format!("{provider}: {error}")))?;
+    if let Some(dir) = &capture_dir {
+        std::fs::create_dir_all(dir)
+            .and_then(|()| std::fs::write(dir.join("usage-get-all.json"), &body))
+            .map_err(|error| ModuleError::Message(format!("capture usage: {error}")))?;
     }
+    account_quota::apply_usage_reply(&mut state, &body, received_at_ms)
+        .map_err(ModuleError::Message)?;
     let status = account_quota::status_json(&state, now_ms() as i64);
     println!(
         "{}",
@@ -8364,6 +8360,63 @@ mod tests {
         .await
         .unwrap();
         serde_json::from_slice(&replies.recv().await.unwrap().body).unwrap()
+    }
+
+    /// Replays captured live data through the actual account report and control
+    /// health dispatcher, without deploying a module or changing a live store.
+    #[tokio::test]
+    #[ignore = "requires PREFRONTAL_ROUTING_USAGE_CAPTURE and PREFRONTAL_ROUTING_VAULT_ROSTER_CAPTURE"]
+    async fn captured_insula_feed_reports_unmapped_information_without_degrading_health() {
+        let capture =
+            std::env::var("PREFRONTAL_ROUTING_USAGE_CAPTURE").expect("required usage capture path");
+        let roster_capture = std::env::var("PREFRONTAL_ROUTING_VAULT_ROSTER_CAPTURE")
+            .expect("required roster capture path");
+        let bytes = std::fs::read(capture).unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut state = account_quota::AccountQuotaState::default();
+        let roster: account_quota::VaultRoster =
+            serde_json::from_slice(&std::fs::read(roster_capture).unwrap()).unwrap();
+        state.roster_poll = account_quota::RosterPoll::Listed {
+            at_ms: roster.fetched_at_ms,
+        };
+        state.roster = Some(roster);
+        account_quota::apply_usage_reply(&mut state, &bytes, now_ms() as i64).unwrap();
+        let report = account_quota::build_report(
+            &state.readings,
+            state.roster.as_ref(),
+            &state.roster_poll,
+            now_ms() as i64,
+        );
+        let unmapped = report
+            .accounts
+            .iter()
+            .filter(|account| account.routing_provider.is_none())
+            .count();
+        assert!(unmapped > 0, "capture must exercise absent vendor metadata");
+        assert_eq!(report.information.len(), unmapped);
+        assert!(report
+            .alarms
+            .iter()
+            .all(|alarm| !alarm.contains("unmapped entry")));
+        let entries = quota_consumer::decode_usage_result(&raw["result"]).unwrap();
+        let mut cache = QuotaCache::default();
+        apply_quota_refresh(&mut cache, entries, now_ms());
+        let health = health_report_for(cache).await;
+        let ModuleControlResponse::HealthCheck { status, detail, .. } = &health else {
+            panic!("health reply");
+        };
+        assert_eq!(*status, HealthStatus::Ok);
+        assert!(detail.is_none());
+        let summary = json!({
+            "health": health,
+            "accountQuota": {
+                "accounts": report.accounts.len(), "unmappedInformationCount": report.information.len(),
+                "unmappedProviders": report.accounts.iter().filter(|account| account.routing_provider.is_none()).map(|account| account.provider.clone()).collect::<Vec<_>>(),
+                "alarms": report.alarms,
+                "vaultOnlyGapCount": report.gaps.vault_only.len(), "insulaOnlyGapCount": report.gaps.insula_only.len()
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&summary).unwrap());
     }
 
     #[tokio::test]

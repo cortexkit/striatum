@@ -1425,7 +1425,15 @@ fn fable_preservation_never_fails_healthy_siblings_or_applies_to_recovery() {
 fn chatgpt_needs_only_its_weekly_window() {
     let mut view = account("acct-g", Some(reading(10.0, 10.0)));
     view.refresh_adapter = "openai".into();
+    view.routing_provider = "openai".into();
     view.quota.as_mut().unwrap().five_hour = None;
+    view.quota.as_mut().unwrap().general_windows = Some(vec![view
+        .quota
+        .as_ref()
+        .unwrap()
+        .seven_day
+        .clone()
+        .unwrap()]);
     let mut req = request();
     req.provider = "openai".into();
     req.model = "gpt-6".into();
@@ -1435,6 +1443,51 @@ fn chatgpt_needs_only_its_weekly_window() {
     assert_eq!(admitted(&decision), "acct-g");
     // Claude accounts are a different pool.
     assert!(decision.account_note("acct-claude").is_none());
+}
+
+#[test]
+fn reported_topology_checks_every_period_and_window_kind_wins_over_duration() {
+    let mut quota = reading(10.0, 10.0);
+    let mut monthly = window(100.0, ResetTime::Missing, 43200);
+    monthly.window_kind = Some("monthly".into());
+    let mut session = window(0.0, ResetTime::Missing, 300);
+    session.window_kind = Some("session".into());
+    quota.general_windows = Some(vec![monthly, session]);
+    assert!(
+        quota.window(GeneralWindow::FiveHour).is_none(),
+        "a 300-minute session is not a five-hour subscription period"
+    );
+    assert!(quota.window(GeneralWindow::Reported(300)).is_some());
+    let mut view = account("acct-new", Some(quota));
+    view.routing_provider = "new-vendor".into();
+    view.refresh_adapter = "different-adapter".into();
+    let mut req = request();
+    req.provider = "new-vendor".into();
+    req.model = "new-model".into();
+    req.affinity_model = "new-model".into();
+    let mut st = state(vec![view]);
+    assert_eq!(
+        refused(&decide(&req, &st, NOW)),
+        RefusalCode::AccountPoolReserveLimited
+    );
+    st.roster.as_mut().unwrap().accounts[0]
+        .quota
+        .as_mut()
+        .unwrap()
+        .general_windows
+        .as_mut()
+        .unwrap()[0]
+        .used_percent = 0.0;
+    assert_eq!(admitted(&decide(&req, &st, NOW)), "acct-new");
+    st.roster.as_mut().unwrap().accounts[0]
+        .quota
+        .as_mut()
+        .unwrap()
+        .general_windows = Some(vec![]);
+    assert_eq!(
+        refused(&decide(&req, &st, NOW)),
+        RefusalCode::AccountQuotaUnknown
+    );
 }
 
 #[test]

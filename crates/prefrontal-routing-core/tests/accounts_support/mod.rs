@@ -25,6 +25,7 @@ pub fn window(used_percent: f64, resets_at: ResetTime, minutes: u32) -> QuotaWin
         raw_utilization: None,
         resets_at,
         window_minutes: minutes,
+        window_kind: None,
         source: ObservationSource::Poll,
     }
 }
@@ -38,6 +39,7 @@ pub fn reading(five_used: f64, seven_used: f64) -> QuotaReading {
         stale: None,
         five_hour: Some(window(five_used, ResetTime::At(NOW + 2 * HOUR), 300)),
         seven_day: Some(window(seven_used, ResetTime::At(NOW + 72 * HOUR), 10_080)),
+        general_windows: None,
         scoped: ScopedList::Missing,
     }
 }
@@ -54,6 +56,7 @@ pub fn fable_window(used_percent: f64) -> ScopedWindow {
 pub fn account(id: &str, quota: Option<QuotaReading>) -> AccountView {
     AccountView {
         account_id: id.into(),
+        routing_provider: "anthropic".into(),
         refresh_adapter: "anthropic".into(),
         credentials: vec![CredentialRecord {
             credential_id: credential_id(id),

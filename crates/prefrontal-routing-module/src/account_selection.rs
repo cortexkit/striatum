@@ -47,9 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::account_quota::{
-    self, AccountEntry, AccountQuotaState, ProviderAdapter, SharedAccountQuota, ACCOUNT_PROVIDERS,
-};
+use crate::account_quota::{self, AccountEntry, AccountQuotaState, SharedAccountQuota};
 use crate::config_overrides::AccountSelectionFlags;
 
 /// Choose the account for one admission, renewal or reassignment.
@@ -354,12 +352,6 @@ pub struct RosterBuild {
     pub context: Value,
 }
 
-fn adapter_for_provider(provider: &str) -> Option<&'static ProviderAdapter> {
-    ACCOUNT_PROVIDERS
-        .iter()
-        .find(|adapter| adapter.routing_provider == provider)
-}
-
 fn is_default_record(credential_id: &str) -> bool {
     credential_id.split(':').count() == 2
 }
@@ -384,30 +376,44 @@ fn quota_window(window: &RateWindow) -> Option<QuotaWindow> {
         raw_utilization: None,
         resets_at: reset_time(window.resets_at.as_deref()),
         window_minutes: minutes,
+        window_kind: window.window_kind.clone(),
         source: ObservationSource::Poll,
     })
 }
 
-/// One stored Insula entry as the allocator's reading. General windows are
-/// found by `windowMinutes`, never slot name; scoped windows keep their
-/// producer id and length.
-pub fn quota_reading(entry: &Value) -> Option<QuotaReading> {
+/// One stored Insula entry as the allocator's reading. Keep every reported
+/// general period and its duration; scoped windows keep their producer id and
+/// length. Pooled windows are limited to the requested model's pools.
+fn quota_reading_for_model(entry: &Value, capacity_key: Option<&str>) -> Option<QuotaReading> {
     let entry: AccountEntry = serde_json::from_value(entry.clone()).ok()?;
     let usage = entry.usage.as_ref();
-    let general = |minutes: u32| {
-        usage.and_then(|usage| {
-            [&usage.primary, &usage.secondary, &usage.tertiary]
-                .into_iter()
-                .flatten()
-                .filter_map(quota_window)
-                .find(|window| window.window_minutes == minutes)
+    let reported = usage
+        .map(|usage| {
+            prefrontal_routing_core::quota_extract::account_rate_windows(usage, capacity_key)
         })
+        .unwrap_or_default();
+    let general_windows: Vec<_> = reported
+        .iter()
+        .filter_map(|(_, window)| quota_window(window))
+        .collect();
+    let invalid_topology = reported.len() != general_windows.len()
+        || general_windows
+            .iter()
+            .any(|window| window.window_minutes == 0);
+    let general = |minutes: u32| {
+        general_windows
+            .iter()
+            .find(|window| window.window_minutes == minutes)
+            .cloned()
     };
     let scoped = match usage.and_then(|usage| usage.extra_rate_windows.as_ref()) {
         None => ScopedList::Missing,
         Some(windows) => ScopedList::Listed(
             windows
                 .iter()
+                .filter(|extra| {
+                    !prefrontal_routing_core::quota_extract::is_account_pool_window(extra)
+                })
                 .filter_map(|extra| {
                     let window = extra.window.as_ref()?;
                     Some(ScopedWindow {
@@ -429,12 +435,16 @@ pub fn quota_reading(entry: &Value) -> Option<QuotaReading> {
             .as_deref()
             .and_then(account_quota::parse_rfc3339_ms),
         // An error without a class is still a degraded entry.
-        error_class: entry.error_class.clone().or_else(|| {
-            entry
-                .error
-                .as_ref()
-                .map(|_| "unclassified_error".to_string())
-        }),
+        error_class: entry
+            .error_class
+            .clone()
+            .or_else(|| invalid_topology.then(|| "invalid_general_window".into()))
+            .or_else(|| {
+                entry
+                    .error
+                    .as_ref()
+                    .map(|_| "unclassified_error".to_string())
+            }),
         stale: entry.stale.as_ref().map(|stale| StaleDisclosure {
             since_ms: stale
                 .since
@@ -444,6 +454,7 @@ pub fn quota_reading(entry: &Value) -> Option<QuotaReading> {
         }),
         five_hour: general(GeneralWindow::FiveHour.window_minutes()),
         seven_day: general(GeneralWindow::SevenDay.window_minutes()),
+        general_windows: Some(general_windows),
         scoped,
     })
 }
@@ -457,13 +468,38 @@ pub fn quota_reading(entry: &Value) -> Option<QuotaReading> {
 /// needs re-authorization. The 24-hour roster limit is the allocator's: the
 /// roster is passed through with its listing time and the allocator refuses
 /// new cold work once it is too old, while existing affinity continues.
+#[cfg(test)]
 pub fn allocator_roster(state: &AccountQuotaState, provider: &str, now_ms: i64) -> RosterBuild {
-    let Some(adapter) = adapter_for_provider(provider) else {
-        return RosterBuild {
-            roster: None,
-            context: json!({ "provider": provider, "tracked": false }),
-        };
-    };
+    allocator_roster_for_model(state, provider, None, now_ms)
+}
+
+fn allocator_roster_for_model(
+    state: &AccountQuotaState,
+    provider: &str,
+    model: Option<&str>,
+    now_ms: i64,
+) -> RosterBuild {
+    // Learn adapter/vendor relationships only from account-id joins. An adapter
+    // is usable for unread siblings only when all its mapped readings agree.
+    let mut vendors: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    if let Some(vault) = &state.roster {
+        for reading in state.readings.readings.values() {
+            if let (Some(identity), Some(vendor)) = (
+                account_quota::identity_for_reading(vault, reading),
+                reading.routing_provider(),
+            ) {
+                vendors
+                    .entry(&identity.refresh_adapter)
+                    .or_default()
+                    .insert(vendor);
+            }
+        }
+    }
+    let adapters: BTreeSet<_> = vendors
+        .into_iter()
+        .filter(|(_, vendors)| vendors.len() == 1 && vendors.contains(provider))
+        .map(|(adapter, _)| adapter)
+        .collect();
     let report = account_quota::build_report(
         &state.readings,
         state.roster.as_ref(),
@@ -474,14 +510,20 @@ pub fn allocator_roster(state: &AccountQuotaState, provider: &str, now_ms: i64) 
         .gaps
         .insula_only
         .iter()
-        .filter(|gap| gap.provider == adapter.insula_provider)
+        .filter(|gap| {
+            state
+                .readings
+                .readings
+                .get(&(gap.provider.clone(), gap.account_id.clone()))
+                .is_some_and(|reading| reading.routing_provider() == Some(provider))
+        })
         .map(|gap| json!({ "account_id": gap.account_id, "reason": gap.reason }))
         .collect();
     let vault_only: Vec<Value> = report
         .gaps
         .vault_only
         .iter()
-        .filter(|gap| gap.refresh_adapter == adapter.refresh_adapter)
+        .filter(|gap| adapters.contains(gap.refresh_adapter.as_str()))
         .map(|gap| {
             json!({
                 "account_id": gap.account_id,
@@ -497,35 +539,100 @@ pub fn allocator_roster(state: &AccountQuotaState, provider: &str, now_ms: i64) 
         accounts: vault
             .identities
             .iter()
-            .filter(|identity| identity.refresh_adapter == adapter.refresh_adapter)
-            .map(|identity| AccountView {
-                account_id: identity.account_id.clone(),
-                refresh_adapter: identity.refresh_adapter.clone(),
-                credentials: identity
-                    .credential_ids
-                    .iter()
-                    .map(|credential_id| CredentialRecord {
-                        credential_id: credential_id.clone(),
-                        default_record: is_default_record(credential_id),
-                        needs_reauth: !identity.active_credential_ids.contains(credential_id),
+            .filter(|identity| {
+                let matching: Vec<_> = state
+                    .readings
+                    .readings
+                    .values()
+                    .filter(|reading| reading.account_id == identity.account_id)
+                    .collect();
+                if matching.is_empty() {
+                    return adapters.contains(identity.refresh_adapter.as_str());
+                }
+                // A vendorless, ambiguous or conflicting reading cannot borrow
+                // a sibling's vendor, including through sticky affinity.
+                matching.iter().all(|reading| {
+                    reading.routing_provider() == Some(provider)
+                        && account_quota::identity_for_reading(vault, reading) == Some(*identity)
+                })
+            })
+            .map(|identity| {
+                let reading = state
+                    .readings
+                    .readings
+                    .values()
+                    .filter(|reading| {
+                        reading.account_id == identity.account_id
+                            && reading.routing_provider() == Some(provider)
                     })
-                    .collect(),
-                model_reach: ModelReach::All,
-                quota: state
-                    .readings
-                    .readings
-                    .get(&(
-                        adapter.insula_provider.to_string(),
-                        identity.account_id.clone(),
-                    ))
                     .filter(|reading| reading.tombstoned_at_ms.is_none())
-                    .and_then(|reading| quota_reading(&reading.entry)),
+                    .max_by_key(|reading| {
+                        (
+                            reading
+                                .entry
+                                .get("fetchedAt")
+                                .and_then(Value::as_str)
+                                .and_then(account_quota::parse_rfc3339_ms),
+                            &reading.provider,
+                        )
+                    });
+                let capacity_key = model.map(|model| format!("{provider}/{model}"));
+                let usage = reading
+                    .and_then(|reading| {
+                        serde_json::from_value::<AccountEntry>(reading.entry.clone()).ok()
+                    })
+                    .and_then(|entry| entry.usage);
+                let pool_route = capacity_key.as_deref().is_some_and(|key| {
+                    prefrontal_routing_core::quota_extract::requires_account_pool(key)
+                });
+                let pooled_reading = usage
+                    .as_ref()
+                    .and_then(|usage| usage.extra_rate_windows.as_ref())
+                    .into_iter()
+                    .flatten()
+                    .any(prefrontal_routing_core::quota_extract::is_account_pool_window);
+                // Product/pool reach is a hard filter, not merely unknown quota:
+                // sticky affinity and overrides must not bypass it either.
+                let model_reach = if model.is_some() && (pool_route || pooled_reading) {
+                    let reaches = usage.as_ref().is_some_and(|usage| {
+                        !prefrontal_routing_core::quota_extract::account_rate_windows(
+                            usage,
+                            capacity_key.as_deref(),
+                        )
+                        .is_empty()
+                    });
+                    ModelReach::Only(if reaches {
+                        vec![model.unwrap().to_string()]
+                    } else {
+                        Vec::new()
+                    })
+                } else {
+                    ModelReach::All
+                };
+                AccountView {
+                    account_id: identity.account_id.clone(),
+                    routing_provider: provider.to_string(),
+                    refresh_adapter: identity.refresh_adapter.clone(),
+                    credentials: identity
+                        .credential_ids
+                        .iter()
+                        .map(|credential_id| CredentialRecord {
+                            credential_id: credential_id.clone(),
+                            default_record: is_default_record(credential_id),
+                            needs_reauth: !identity.active_credential_ids.contains(credential_id),
+                        })
+                        .collect(),
+                    model_reach,
+                    quota: reading.and_then(|reading| {
+                        quota_reading_for_model(&reading.entry, capacity_key.as_deref())
+                    }),
+                }
             })
             .collect(),
     });
     let context = json!({
         "provider": provider,
-        "tracked": true,
+        "tracked": roster.as_ref().is_some_and(|roster| !roster.accounts.is_empty()),
         "view_digest": state.roster.as_ref().map(|vault| vault.view.clone()),
         "fetched_at_ms": state.roster.as_ref().map(|vault| vault.fetched_at_ms),
         "past_max_age": state.roster.as_ref().is_some_and(|vault| {
@@ -543,8 +650,12 @@ pub fn allocator_roster(state: &AccountQuotaState, provider: &str, now_ms: i64) 
 }
 
 fn roster_for(ctx: &Ctx<'_>, provider: &str) -> RosterBuild {
+    roster_for_model(ctx, provider, None)
+}
+
+fn roster_for_model(ctx: &Ctx<'_>, provider: &str, model: Option<&str>) -> RosterBuild {
     match ctx.accounts.map(|state| state.lock()) {
-        Some(Ok(guard)) => allocator_roster(&guard, provider, ctx.now_ms),
+        Some(Ok(guard)) => allocator_roster_for_model(&guard, provider, model, ctx.now_ms),
         Some(Err(_)) => RosterBuild {
             roster: None,
             context: json!({ "provider": provider, "error": "account state lock poisoned" }),
@@ -983,7 +1094,12 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Err(reply) => return reply,
     };
     let provider = normalize(&parsed.provider);
-    if adapter_for_provider(&provider).is_none() {
+    let roster = roster_for_model(ctx, &provider, Some(&normalize(&parsed.model)));
+    if !roster
+        .roster
+        .as_ref()
+        .is_some_and(|roster| !roster.accounts.is_empty())
+    {
         return OpReply::typed(
             "account_selection_unsupported",
             format!("routing selects no accounts for provider `{provider}`"),
@@ -997,7 +1113,6 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     }
     // The roster is read before the transaction: no lock or fetch happens
     // while the selection transaction is open.
-    let roster = roster_for(ctx, &provider);
     let request_fingerprint = fingerprint(&parsed);
     ctx.store
         .account_transaction(|tx| {
@@ -1081,6 +1196,7 @@ fn serve(
             &decision,
             admission,
             request_fingerprint,
+            roster,
         ),
         Outcome::Hold(hold) => {
             tx.insert_hold(&AccountHoldRow {
@@ -1097,7 +1213,7 @@ fn serve(
                 retry_after_s: hold.retry_after_s,
                 created_at: now,
             })?;
-            let refresh_adapter = refresh_adapter_for(provider);
+            let refresh_adapter = refresh_adapter_for(roster, &hold.account_id);
             Ok(OpReply::typed(
                 "account_hold",
                 format!(
@@ -1210,6 +1326,7 @@ fn commit_admission(
     decision: &Decision,
     admission: &prefrontal_routing_core::accounts::Admission,
     request_fingerprint: &str,
+    roster: &RosterBuild,
 ) -> RouteStateResult<OpReply> {
     let now = ctx.now_ms;
     let pin_mode = match params.caller_kind() {
@@ -1311,7 +1428,7 @@ fn commit_admission(
         RequestMode::Renew => false,
         RequestMode::Reassign => moved,
     };
-    let refresh_adapter = refresh_adapter_for(provider);
+    let refresh_adapter = refresh_adapter_for(roster, &admission.account_id);
     let reply = json!({
         "admission": { "id": params.admission_id, "state": "reserved" },
         "account": {
@@ -1367,14 +1484,30 @@ fn commit_admission(
     Ok(OpReply::Result(reply))
 }
 
-/// The vault `refresh_adapter` of a provider's subscription credentials. The
-/// roster admits only identities with this adapter, so every account routing
-/// returns for the provider carries it.
-fn refresh_adapter_for(provider: &str) -> String {
-    adapter_for_provider(provider).map_or_else(
-        || provider.to_string(),
-        |adapter| adapter.refresh_adapter.to_string(),
-    )
+/// Return the selected identity's actual vault adapter. Catalog vendors and
+/// refresh adapters are different namespaces and must not be interchanged.
+fn refresh_adapter_for(roster: &RosterBuild, account_id: &str) -> Option<String> {
+    roster
+        .roster
+        .as_ref()?
+        .accounts
+        .iter()
+        .find(|view| view.account_id == account_id)
+        .map(|view| view.refresh_adapter.clone())
+}
+
+fn tracked_providers(ctx: &Ctx<'_>) -> BTreeSet<String> {
+    ctx.accounts
+        .and_then(|state| state.lock().ok())
+        .map(|state| {
+            state
+                .readings
+                .readings
+                .values()
+                .filter_map(|reading| reading.routing_provider().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,10 +1572,10 @@ fn observe(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         return invalid("`event_id` must not be empty");
     }
     // The roster digest a scoped not-found is recorded against.
-    let roster_digests: BTreeMap<String, (String, BTreeSet<String>)> = ACCOUNT_PROVIDERS
-        .iter()
-        .map(|adapter| {
-            let roster = roster_for(ctx, adapter.routing_provider).roster;
+    let roster_digests: BTreeMap<String, (String, BTreeSet<String>)> = tracked_providers(ctx)
+        .into_iter()
+        .map(|provider| {
+            let roster = roster_for(ctx, &provider).roster;
             let digest = roster
                 .as_ref()
                 .map(|r| r.view_digest.clone())
@@ -1452,7 +1585,7 @@ fn observe(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 .flat_map(|r| r.accounts.iter())
                 .flat_map(|view| view.credentials.iter().map(|c| c.credential_id.clone()))
                 .collect();
-            (adapter.routing_provider.to_string(), (digest, listed))
+            (provider, (digest, listed))
         })
         .collect();
     ctx.store
@@ -1917,9 +2050,8 @@ fn decision_shape(decision: &Value) -> Value {
 /// observation in the record. Returns the recorded decision ids.
 pub fn shadow_pass(ctx: &Ctx<'_>, trigger: ShadowTrigger<'_>) -> RouteStateResult<Vec<String>> {
     let mut recorded = Vec::new();
-    for adapter in ACCOUNT_PROVIDERS {
-        let provider = adapter.routing_provider;
-        let roster = roster_for(ctx, provider);
+    for provider in tracked_providers(ctx) {
+        let provider = provider.as_str();
         let models: Vec<(ModelFamily, String)> = match &trigger {
             ShadowTrigger::Timer => representative_models(ctx.policy),
             ShadowTrigger::Observation(observation) => {
@@ -1940,6 +2072,7 @@ pub fn shadow_pass(ctx: &Ctx<'_>, trigger: ShadowTrigger<'_>) -> RouteStateResul
             }
         };
         for (family, model) in models {
+            let roster = roster_for_model(ctx, provider, Some(&model));
             let trigger_name = match &trigger {
                 ShadowTrigger::Timer => "timer",
                 ShadowTrigger::Observation(_) => "observation",
@@ -2015,10 +2148,14 @@ fn shadow_request(
     raw: &Value,
 ) -> RouteStateResult<Option<String>> {
     let provider = normalize(&params.provider);
-    if adapter_for_provider(&provider).is_none() {
+    let roster = roster_for_model(ctx, &provider, Some(&normalize(&params.model)));
+    if !roster
+        .roster
+        .as_ref()
+        .is_some_and(|roster| !roster.accounts.is_empty())
+    {
         return Ok(None);
     }
-    let roster = roster_for(ctx, &provider);
     ctx.store.account_transaction(|tx| {
         let affinity_row = match tx.existing_salt()? {
             Some(salt) => tx.affinity(
@@ -2220,6 +2357,7 @@ mod tests {
     fn claude_entry(account: &str) -> Value {
         json!({
             "provider": "claude",
+            "apiProvider": "anthropic",
             "account": account,
             "accountInfo": { "email": format!("{account}@example.test") },
             "source": "vault",
@@ -2352,6 +2490,382 @@ mod tests {
                 panic!("expected a result, got {code}: {message}")
             }
         }
+    }
+
+    fn provider_fixture(label: &str, adapter: &str, entries: Vec<Value>) -> Fixture {
+        let rig = fixture(label);
+        let mut state = AccountQuotaState::default();
+        let mut vault = listing();
+        vault.credentials.truncate(2);
+        for row in &mut vault.credentials {
+            row.refresh_adapter = Some(adapter.into());
+            row.id = format!("oauth:{adapter}:{}", row.account_id.as_deref().unwrap());
+        }
+        apply_roster_listing(&mut state, &vault, NOW);
+        account_quota::apply_usage_reply(
+            &mut state,
+            &serde_json::to_vec(&json!({"result": entries})).unwrap(),
+            NOW,
+        )
+        .unwrap();
+        *rig.accounts.lock().unwrap() = state;
+        rig
+    }
+
+    fn reported_entry(
+        provider: &str,
+        vendor: Value,
+        account: &str,
+        kind: &str,
+        minutes: i64,
+        used: f64,
+    ) -> Value {
+        json!({
+            "provider": provider, "apiProvider": vendor, "account": account,
+            "source": "oauth", "fetchedAt": "2026-09-29T11:59:00Z",
+            "usage": {"primary": {"windowKind": kind, "windowMinutes": minutes, "usedPercent": used}}
+        })
+    }
+
+    #[test]
+    fn codex_vendor_joins_two_openai_accounts_and_selects_headroom() {
+        let rig = provider_fixture(
+            "codex",
+            "openai",
+            vec![
+                reported_entry("codex", json!("openai"), ACCOUNT_A, "weekly", 10080, 100.0),
+                reported_entry("codex", json!("openai"), ACCOUNT_B, "weekly", 10080, 10.0),
+            ],
+        );
+        let built = allocator_roster(&rig.accounts.lock().unwrap(), "openai", NOW);
+        assert_eq!(built.roster.unwrap().accounts.len(), 2);
+        let mut params = admit_params("codex-admit", "codex-conversation", "broca");
+        params["provider"] = json!("openai");
+        params["model"] = json!("gpt-6");
+        params["affinity_model"] = json!("gpt-6");
+        let admitted = result(rig.call(
+            &rig.ctx(true, false, NOW),
+            "route.account_for",
+            BROCA,
+            params,
+        ));
+        assert_eq!(admitted["account"]["account_id"], ACCOUNT_B);
+        assert_eq!(admitted["account"]["provider"], "openai");
+        assert_eq!(admitted["account"]["refresh_adapter"], "openai");
+    }
+
+    #[test]
+    fn antigravity_vendor_and_model_pool_select_the_joined_account() {
+        // This positive vector requires a published vendor. The live producer
+        // currently omits it; the live-shape vector below pins that refusal.
+        let entry = |account: &str, used: f64| {
+            json!({
+                "provider": "antigravity", "apiProvider": "google", "account": account,
+                "source": "oauth", "fetchedAt": "2026-09-29T11:59:00Z",
+                "usage": {"extraRateWindows": [
+                    {"id": "gemini-5h", "windowKind": "five_hour", "window": {"usedPercent": used, "windowMinutes": 300}},
+                    {"id": "3p-weekly", "windowKind": "weekly", "window": {"usedPercent": 100.0, "windowMinutes": 10080}}
+                ]}
+            })
+        };
+        let rig = provider_fixture(
+            "antigravity",
+            "antigravity",
+            vec![entry(ACCOUNT_A, 100.0), entry(ACCOUNT_B, 10.0)],
+        );
+        let state = rig.accounts.lock().unwrap();
+        let report = account_quota::build_report(
+            &state.readings,
+            state.roster.as_ref(),
+            &state.roster_poll,
+            NOW,
+        );
+        assert_eq!(report.accounts.len(), 2);
+        assert_eq!(
+            report.accounts[0].routing_provider.as_deref(),
+            Some("google")
+        );
+        assert!(report
+            .accounts
+            .iter()
+            .all(|account| account.vault.joined && account.cold_input_usable));
+        assert!(report.alarms.is_empty());
+        drop(state);
+        let mut params = admit_params("ag-admit", "ag-conversation", "broca");
+        params["provider"] = json!("google");
+        params["model"] = json!("antigravity-gemini-3.8-flash");
+        params["affinity_model"] = params["model"].clone();
+        let admitted = result(rig.call(
+            &rig.ctx(true, false, NOW),
+            "route.account_for",
+            BROCA,
+            params,
+        ));
+        assert_eq!(admitted["account"]["account_id"], ACCOUNT_B);
+        assert_eq!(admitted["account"]["refresh_adapter"], "antigravity");
+    }
+
+    #[test]
+    fn vendorless_reading_is_unmapped_and_never_borrows_a_siblings_vendor() {
+        let mut missing = reported_entry("codex", Value::Null, ACCOUNT_A, "weekly", 10080, 0.0);
+        missing.as_object_mut().unwrap().remove("apiProvider");
+        let rig = provider_fixture(
+            "vendorless",
+            "openai",
+            vec![
+                missing,
+                reported_entry("codex", json!("openai"), ACCOUNT_B, "weekly", 10080, 10.0),
+            ],
+        );
+        let state = rig.accounts.lock().unwrap();
+        let report = account_quota::build_report(
+            &state.readings,
+            state.roster.as_ref(),
+            &state.roster_poll,
+            NOW,
+        );
+        let unmapped = report
+            .accounts
+            .iter()
+            .find(|account| account.account_id == ACCOUNT_A)
+            .unwrap();
+        assert_eq!(unmapped.routing_provider, None);
+        assert!(!unmapped.cold_input_usable);
+        assert!(report
+            .information
+            .iter()
+            .any(|alarm| alarm.contains("unmapped") && alarm.contains(ACCOUNT_A)));
+        assert!(report.alarms.is_empty());
+        let roster = allocator_roster(&state, "openai", NOW).roster.unwrap();
+        assert_eq!(roster.accounts.len(), 1);
+        assert_eq!(roster.accounts[0].account_id, ACCOUNT_B);
+        drop(state);
+        let mut params = admit_params("vendorless-admit", "vendorless-conversation", "broca");
+        params["provider"] = json!("openai");
+        params["model"] = json!("gpt-6");
+        params["affinity_model"] = json!("gpt-6");
+        assert_eq!(
+            result(rig.call(
+                &rig.ctx(true, false, NOW),
+                "route.account_for",
+                BROCA,
+                params
+            ))["account"]["account_id"],
+            ACCOUNT_B
+        );
+    }
+
+    #[test]
+    fn arbitrary_vendor_uses_monthly_and_session_windows_and_unknown_vendor_is_typed() {
+        let mut spent = reported_entry(
+            "new-feed",
+            json!("new-vendor"),
+            ACCOUNT_A,
+            "monthly",
+            43200,
+            100.0,
+        );
+        spent["usage"]["secondary"] =
+            json!({"windowKind": "session", "windowMinutes": 60, "usedPercent": 0.0});
+        let rig = provider_fixture(
+            "new-vendor",
+            "unrelated-adapter",
+            vec![
+                spent,
+                reported_entry(
+                    "new-feed",
+                    json!("new-vendor"),
+                    ACCOUNT_B,
+                    "session",
+                    60,
+                    10.0,
+                ),
+            ],
+        );
+        let mut params = admit_params("new-admit", "new-conversation", "broca");
+        params["provider"] = json!("new-vendor");
+        params["model"] = json!("new-model");
+        params["affinity_model"] = json!("new-model");
+        let admitted = result(rig.call(
+            &rig.ctx(true, false, NOW),
+            "route.account_for",
+            BROCA,
+            params.clone(),
+        ));
+        assert_eq!(admitted["account"]["account_id"], ACCOUNT_B);
+        assert_eq!(admitted["account"]["refresh_adapter"], "unrelated-adapter");
+        params["provider"] = json!("untracked");
+        assert_eq!(
+            rig.call(
+                &rig.ctx(true, false, NOW),
+                "route.account_for",
+                BROCA,
+                params
+            )
+            .code(),
+            Some("account_selection_unsupported")
+        );
+    }
+
+    #[test]
+    fn account_id_join_does_not_require_one_vendor_per_refresh_adapter() {
+        let rig = provider_fixture(
+            "shared-adapter",
+            "shared-adapter",
+            vec![
+                reported_entry("feed-a", json!("vendor-a"), ACCOUNT_A, "session", 60, 10.0),
+                reported_entry(
+                    "feed-b",
+                    json!("vendor-b"),
+                    ACCOUNT_B,
+                    "monthly",
+                    43200,
+                    10.0,
+                ),
+            ],
+        );
+        let state = rig.accounts.lock().unwrap();
+        let a = allocator_roster(&state, "vendor-a", NOW).roster.unwrap();
+        let b = allocator_roster(&state, "vendor-b", NOW).roster.unwrap();
+        assert_eq!(a.accounts.len(), 1);
+        assert_eq!(a.accounts[0].account_id, ACCOUNT_A);
+        assert_eq!(b.accounts.len(), 1);
+        assert_eq!(b.accounts[0].account_id, ACCOUNT_B);
+    }
+
+    /// Sanitized from the 2026-10-03 usage.get capture: both Antigravity lanes
+    /// omit apiProvider; the vault lane reports 5h + weekly pools while the
+    /// OAuth lane reports weekly pools only. Identity and dates are test-local.
+    fn live_antigravity_shapes() -> Vec<Value> {
+        vec![
+            json!({
+                "provider": "antigravity", "apiProvider": null, "account": ACCOUNT_A,
+                "source": "vault", "fetchedAt": "2026-09-29T11:59:00Z",
+                "usage": {"extraRateWindows": [
+                    {"id": "gemini-5h", "title": "Gemini Models 5h", "window": {"usedPercent": 3.85, "windowKind": "five_hour", "windowMinutes": 300}},
+                    {"id": "gemini-weekly", "title": "Gemini Models weekly", "window": {"usedPercent": 52.81, "windowKind": "weekly", "windowMinutes": 10080}},
+                    {"id": "3p-5h", "title": "Claude and GPT models 5h", "window": {"usedPercent": 0.0, "windowKind": "five_hour", "windowMinutes": 300}},
+                    {"id": "3p-weekly", "title": "Claude and GPT models weekly", "window": {"usedPercent": 0.0, "windowKind": "weekly", "windowMinutes": 10080}}
+                ]}
+            }),
+            json!({
+                "provider": "antigravity", "apiProvider": null, "account": ACCOUNT_B,
+                "source": "oauth", "fetchedAt": "2026-09-29T11:59:00Z",
+                "usage": {"extraRateWindows": [
+                    {"id": "gemini-weekly", "title": "Gemini Models weekly", "window": {"usedPercent": 100.0, "windowKind": "weekly", "windowMinutes": 10080}},
+                    {"id": "3p-weekly", "title": "Claude and GPT models weekly", "window": {"usedPercent": 0.0, "windowKind": "weekly", "windowMinutes": 10080}}
+                ]}
+            }),
+        ]
+    }
+
+    #[test]
+    fn live_google_shapes_keep_vendorless_antigravity_informational_and_unselectable() {
+        let mut entries = live_antigravity_shapes();
+        // The live Gemini CLI row has a vendor but no account or usage because
+        // its credential is absent. It is not a tracked Google account.
+        entries.push(json!({"provider": "gemini", "apiProvider": "google", "errorClass": "credential_absent", "usage": null}));
+        let rig = provider_fixture("live-google", "antigravity", entries);
+        let state = rig.accounts.lock().unwrap();
+        let report = account_quota::build_report(
+            &state.readings,
+            state.roster.as_ref(),
+            &state.roster_poll,
+            NOW,
+        );
+        assert_eq!(report.accounts.len(), 2);
+        assert!(report
+            .accounts
+            .iter()
+            .all(|account| account.routing_provider.is_none()
+                && account.vault.joined
+                && !account.cold_input_usable));
+        assert_eq!(report.information.len(), 2);
+        assert!(report
+            .information
+            .iter()
+            .all(|information| information.contains("unmapped entry: no apiProvider")));
+        assert!(
+            report.alarms.is_empty(),
+            "a missing producer vendor must not page through a roster gap: {:?}",
+            report.alarms
+        );
+        assert!(report.gaps.insula_only.is_empty());
+        assert!(report.gaps.vault_only.is_empty());
+        drop(state);
+        let mut params = admit_params("live-google", "live-google", "broca");
+        params["provider"] = json!("google");
+        params["model"] = json!("antigravity-gemini-3.8-flash");
+        params["affinity_model"] = params["model"].clone();
+        assert_eq!(
+            rig.call(
+                &rig.ctx(true, false, NOW),
+                "route.account_for",
+                BROCA,
+                params
+            )
+            .code(),
+            Some("account_selection_unsupported")
+        );
+    }
+
+    #[test]
+    fn gemini_cli_account_cannot_serve_antigravity_even_with_sticky_affinity() {
+        let mut entries = live_antigravity_shapes();
+        // The captured Gemini row is credential_absent and unkeyed. Model a
+        // future authorized CLI account with headroom to exercise the vendor
+        // collision, rather than passing only because today's account is absent.
+        let mut gemini =
+            reported_entry("gemini", json!("google"), INSULA_ONLY, "session", 1440, 0.0);
+        gemini["usage"]["extraRateWindows"] = json!([{"id": "gemini-2.5-flash", "title": "gemini-2.5-flash", "window": {"usedPercent": 0.0, "windowMinutes": 1440}}]);
+        entries.push(gemini);
+        let rig = provider_fixture("gemini-cli-collision", "antigravity", entries);
+        let mut vault = listing();
+        vault.credentials.truncate(1);
+        let row = &mut vault.credentials[0];
+        row.account_id = Some(INSULA_ONLY.into());
+        row.refresh_adapter = Some("gemini-cli".into());
+        row.id = "oauth:gemini-cli".into();
+        let gemini_roster = account_quota::build_roster(&vault, None, NOW);
+        rig.accounts
+            .lock()
+            .unwrap()
+            .roster
+            .as_mut()
+            .unwrap()
+            .identities
+            .extend(gemini_roster.identities);
+        let ctx = rig.ctx(true, false, NOW);
+        let mut params = admit_params("gemini-cli-initial", "google-product-collision", "broca");
+        params["provider"] = json!("google");
+        params["model"] = json!("gemini-2.5-flash");
+        params["affinity_model"] = json!("antigravity-gemini-3.8-flash");
+        let initial = result(rig.call(&ctx, "route.account_for", BROCA, params.clone()));
+        assert_eq!(
+            initial["account"]["account_id"], INSULA_ONLY,
+            "the control CLI route can use its own account"
+        );
+        params["admission_id"] = json!("antigravity-sticky");
+        params["model"] = params["affinity_model"].clone();
+        assert_eq!(
+            rig.call(&ctx, "route.account_for", BROCA, params.clone())
+                .code(),
+            Some("account_selection_unsupported")
+        );
+        params["admission_id"] = json!("antigravity-cold");
+        params["conversation_key"] = json!("antigravity-cold");
+        assert_eq!(
+            rig.call(&ctx, "route.account_for", BROCA, params).code(),
+            Some("account_selection_unsupported")
+        );
+        let mut unknown = admit_params("unknown-pool", "unknown-pool", "broca");
+        unknown["provider"] = json!("google");
+        unknown["model"] = json!("antigravity-new-family-model");
+        unknown["affinity_model"] = unknown["model"].clone();
+        assert_eq!(
+            rig.call(&ctx, "route.account_for", BROCA, unknown).code(),
+            Some("account_selection_unsupported")
+        );
     }
 
     #[test]

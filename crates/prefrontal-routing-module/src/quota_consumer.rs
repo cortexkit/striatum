@@ -201,23 +201,12 @@ impl QuotaConsumer {
         Ok(windows)
     }
 
-    /// Call `usage.get {"provider": p}` once per provider on this one connection,
-    /// then close it. Each reply body is returned as the exact bytes Insula sent,
-    /// so the caller decodes the whole envelope itself (`result` and
-    /// `completeProviders`) rather than the `result` array alone.
-    pub async fn usage_get_providers_raw(
-        &mut self,
-        providers: &[&str],
-    ) -> Result<Vec<(String, Vec<u8>)>, QuotaConsumerError> {
-        let mut replies = Vec::with_capacity(providers.len());
-        for provider in providers {
-            let body = self
-                .usage_get_body(serde_json::json!({ "provider": provider }))
-                .await?;
-            replies.push(((*provider).to_string(), body));
-        }
+    /// Insula's unfiltered feed returns every served provider. Keep the exact
+    /// envelope bytes so account consumers also see `completeProviders`.
+    pub async fn usage_get_raw(&mut self) -> Result<Vec<u8>, QuotaConsumerError> {
+        let body = self.usage_get_body(serde_json::json!({})).await?;
         self.goodbye().await?;
-        Ok(replies)
+        Ok(body)
     }
 
     /// Send one `usage.get` with `params` and return the successful reply body.

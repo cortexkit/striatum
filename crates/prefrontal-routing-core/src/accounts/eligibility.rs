@@ -5,8 +5,8 @@ use super::decision::{
     AccountNote, AgeBand, ApplicableWindow, ExclusionReason, ScopedListState, WindowWeight,
 };
 use super::types::{
-    AllocatorPolicy, CallerKind, EpochMs, GeneralWindow, ModelFamily, QuotaReading, ResetTime,
-    ScopedList, ScopedWindow,
+    AllocatorPolicy, CallerKind, EpochMs, ModelFamily, QuotaReading, ResetTime, ScopedList,
+    ScopedWindow,
 };
 
 const MS_PER_HOUR: f64 = 3_600_000.0;
@@ -200,6 +200,7 @@ fn reserve_for(window: ApplicableWindow, policy: &AllocatorPolicy) -> f64 {
         ApplicableWindow::FiveHour => policy.reserve_five_hour,
         ApplicableWindow::SevenDay => policy.reserve_seven_day,
         ApplicableWindow::FamilyScope => policy.reserve_scoped,
+        ApplicableWindow::Reported(_) => policy.reserve_seven_day,
     }
 }
 
@@ -208,7 +209,6 @@ fn reserve_for(window: ApplicableWindow, policy: &AllocatorPolicy) -> f64 {
 pub fn evaluate_quota(
     reading: Option<&QuotaReading>,
     family: ModelFamily,
-    required: &[GeneralWindow],
     caller: CallerKind,
     now: EpochMs,
     policy: &AllocatorPolicy,
@@ -228,6 +228,10 @@ pub fn evaluate_quota(
         return eval;
     };
     eval.observed_at_ms = reading.observed_at_ms;
+    let required = reading.required_windows();
+    if required.is_empty() {
+        eval.unknown.push(ExclusionReason::QuotaMissing);
+    }
     if let Some(error_class) = &reading.error_class {
         eval.unknown.push(ExclusionReason::EntryErrorClass {
             error_class: error_class.clone(),
@@ -255,8 +259,22 @@ pub fn evaluate_quota(
         }
         Err(reason) => eval.unknown.push(reason),
     }
-    for &window in required {
-        match reading.window(window) {
+    let windows: Vec<_> = required
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| {
+            (
+                id,
+                reading
+                    .general_windows
+                    .as_ref()
+                    .and_then(|windows| windows.get(index))
+                    .or_else(|| reading.window(id)),
+            )
+        })
+        .collect();
+    for &(window, quota) in &windows {
+        match quota {
             None => eval
                 .unknown
                 .push(ExclusionReason::GeneralWindowMissing { window }),
@@ -290,8 +308,8 @@ pub fn evaluate_quota(
     }
 
     let mut weights = Vec::new();
-    for &window in required {
-        let w = reading.window(window).expect("checked above");
+    for (window, quota) in windows {
+        let w = quota.expect("checked above");
         let applicable = ApplicableWindow::from(window);
         let weight = window_weight(
             applicable,
