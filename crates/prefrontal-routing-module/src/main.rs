@@ -8141,7 +8141,11 @@ mod tests {
         // The quota-decides pair with the speeds swapped: openai wins the speed
         // tiebreak when quota says nothing, so only a quota wall moves it.
         for mut route in quota_decides_facts() {
-            route.scores.speed = if route.provider_id == "openai" { 100.0 } else { 10.0 };
+            route.scores.speed = if route.provider_id == "openai" {
+                100.0
+            } else {
+                10.0
+            };
             store.upsert_fact(&route, FactSource::Override).unwrap();
         }
         let (no_reading, _) =

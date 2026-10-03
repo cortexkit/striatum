@@ -793,8 +793,9 @@ fn spend_pool_without_a_stated_balance_decodes_and_neither_walls_nor_paces() {
         .by_capacity
         .get(&make_capacity_key("balance-provider", "budget-model"));
     assert!(
-        state.is_none_or(|state| state.quota_exhausted_until.is_none()
-            && state.quota_pressure.is_none()),
+        state.is_none_or(
+            |state| state.quota_exhausted_until.is_none() && state.quota_pressure.is_none()
+        ),
         "an unstated balance is unknown, never empty: {state:?}"
     );
 
