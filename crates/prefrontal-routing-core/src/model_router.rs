@@ -1117,10 +1117,10 @@ pub fn select_model_route_with_slots(
             chosen = without_term;
         }
     }
-    let mut slots: Vec<Option<Scored>> = scored.into_iter().map(Some).collect();
+    let mut taken: Vec<Option<Scored>> = scored.into_iter().map(Some).collect();
     let scored: Vec<Scored> = chosen
         .into_iter()
-        .map(|position| slots[position].take().expect("each position is used once"))
+        .map(|position| taken[position].take().expect("each position is used once"))
         .collect();
 
     // Saturation only chooses among the ordered shortlist, so it can pass over a
