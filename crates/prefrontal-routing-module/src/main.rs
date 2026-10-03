@@ -67,7 +67,8 @@ use subc_protocol::{
         ProviderRole, StorageBinding, StorageKind, StorageScope, TrustTier,
     },
     session::{
-        HealthReport, ModuleControlRequest, ModuleControlResponse, MODULE_CONTROL_OP_HEALTH_CHECK,
+        HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
+        MODULE_CONTROL_OP_HEALTH_CHECK,
     },
     ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Priority,
     PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
@@ -135,6 +136,14 @@ const QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Decision audit rows are retained for one month before the existing refresh
 /// cycle deletes them.
 const DECISION_RETENTION_MS: u64 = 30 * 24 * 60 * 60_000;
+/// Age past which the cached quota snapshot no longer steers selection. The
+/// refresh runs every minute, so a snapshot this old means refreshes have been
+/// failing (or hanging) for many cycles. Quota windows move within that time:
+/// insula spends banked resets, five-hour windows roll over, and a wall read an
+/// hour ago is no evidence of a wall now. Past this bound selection treats quota
+/// as unknown (neutral pressure, no quota walls), each decision says so, and
+/// health reports degraded with the snapshot's age.
+const QUOTA_STALE_AFTER_MS: u64 = 15 * 60_000;
 
 /// Latest quota snapshot, shared between the background refresh task (writer) and
 /// `route.select` handlers (readers). The lock is NEVER held across an `.await`:
@@ -157,6 +166,66 @@ struct QuotaCache {
 }
 
 type SharedQuotaCache = Arc<Mutex<QuotaCache>>;
+
+/// The cached snapshot's age when it is past [`QUOTA_STALE_AFTER_MS`]; `None`
+/// while it is fresh or when there has never been a reading to age.
+fn stale_quota_age_ms(refreshed_at_ms: u64, now_ms: u64) -> Option<u64> {
+    if refreshed_at_ms == 0 {
+        return None;
+    }
+    let age_ms = now_ms.saturating_sub(refreshed_at_ms);
+    (age_ms > QUOTA_STALE_AFTER_MS).then_some(age_ms)
+}
+
+/// Human-readable age for health details and decision notes, e.g. "7h05m".
+fn render_age(age_ms: u64) -> String {
+    let minutes = age_ms / 60_000;
+    if minutes >= 60 {
+        format!("{}h{:02}m", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+/// The explanation line a decision carries when its quota snapshot is stale.
+fn stale_quota_note(age_ms: u64, last_error: Option<&str>) -> String {
+    let mut note = format!(
+        "quota signal: stale (last successful refresh {} ago, bound {}); quota pressure and walls ignored, every provider ranked as quota-unknown",
+        render_age(age_ms),
+        render_age(QUOTA_STALE_AFTER_MS)
+    );
+    if let Some(error) = last_error {
+        note.push_str(&format!("; last refresh error: {error}"));
+    }
+    note
+}
+
+/// The routing module's health from its quota snapshot: degraded, naming the
+/// age and the last refresh error, once the snapshot is stale.
+fn quota_health(cache: &QuotaCache, now_ms: u64) -> (Option<String>, serde_json::Value) {
+    let age_ms = (cache.refreshed_at_ms > 0).then(|| now_ms.saturating_sub(cache.refreshed_at_ms));
+    let stale_age = stale_quota_age_ms(cache.refreshed_at_ms, now_ms);
+    let metrics = json!({
+        "available": cache.available,
+        "refreshedAtMs": cache.refreshed_at_ms,
+        "ageMs": age_ms,
+        "staleAfterMs": QUOTA_STALE_AFTER_MS,
+        "stale": stale_age.is_some(),
+        "lastError": cache.last_error,
+    });
+    let detail = stale_age.map(|age_ms| {
+        let mut detail = format!(
+            "quota snapshot stale: last successful refresh {} ago (bound {}); selection treats quota as unknown",
+            render_age(age_ms),
+            render_age(QUOTA_STALE_AFTER_MS)
+        );
+        if let Some(error) = &cache.last_error {
+            detail.push_str(&format!("; last refresh error: {error}"));
+        }
+        detail
+    });
+    (detail, metrics)
+}
 
 /// The per-account quota state, set once when the store opens. It is a process
 /// global rather than a handler argument because only the read-only
@@ -307,12 +376,17 @@ fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
             .spend
             .iter()
             .filter(|pool| pool.has_supported_funding())
-            .all(|pool| pool.remaining.is_non_positive());
+            .all(|pool| pool.is_known_empty());
         let withheld: Vec<String> = entry
             .spend
             .iter()
-            .filter(|pool| !pool.has_supported_funding() && !pool.remaining.is_non_positive())
-            .map(|pool| format!("{} ({})", pool.remaining.render(), pool.funding))
+            .filter(|pool| !pool.has_supported_funding())
+            .filter_map(|pool| {
+                pool.remaining
+                    .as_ref()
+                    .filter(|remaining| !remaining.is_non_positive())
+                    .map(|remaining| format!("{} ({})", remaining.render(), pool.funding))
+            })
             .collect();
         if all_spendable_empty && !withheld.is_empty() {
             eprintln!(
@@ -451,7 +525,17 @@ fn restore_quota_cache(store: &SqliteRouteStateStore) -> QuotaCache {
 
 fn record_quota_refresh_failure(cache: &mut QuotaCache, phase: &str, error: impl fmt::Display) {
     cache.available = false;
-    cache.last_error = Some(format!("{phase}: {error}"));
+    let error = format!("{phase}: {error}");
+    // The loop retries every few seconds, so print only when the reason
+    // changes. This failure used to go to debug tracing only, which left a
+    // refresh failing on every retry for hours with nothing in the stderr log.
+    if cache.last_error.as_deref() != Some(error.as_str()) {
+        eprintln!(
+            "[prefrontal-routing] quota refresh failed; selection keeps the snapshot from refreshedAtMs {} until a refresh succeeds or it goes stale: {error}",
+            cache.refreshed_at_ms
+        );
+    }
+    cache.last_error = Some(error);
 }
 
 fn record_cooldown_update(
@@ -1036,7 +1120,8 @@ async fn handle_frame(
             Ok(true)
         }
         FrameType::Request if frame.header.channel == 0 => {
-            handle_control_request(frame, writer, route_epochs, catalog_health).await?;
+            handle_control_request(frame, writer, route_epochs, catalog_health, quota_cache)
+                .await?;
             Ok(true)
         }
         FrameType::Request => {
@@ -1082,6 +1167,7 @@ async fn handle_control_request(
     writer: &mpsc::Sender<Frame>,
     route_epochs: &mut RouteEpochs,
     catalog_health: &SharedCatalogHealth,
+    quota_cache: &SharedQuotaCache,
 ) -> Result<(), ModuleError> {
     let request =
         serde_json::from_slice::<ModuleControlRequest>(&frame.body).map_err(ModuleError::Json)?;
@@ -1120,15 +1206,29 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
-            // Routing is stateless: the catalog is machine-global and selection depends
-            // only on the request body, so there is no domain state that can wedge: a
-            // reply on this real dispatch path is itself the liveness proof the prober wants.
+            // A reply on this real dispatch path is the liveness proof the prober
+            // wants. Selection still answers on a stale quota snapshot, so that
+            // is reported as degraded rather than failing: routing works, but
+            // without a current quota signal, and the detail names how old the
+            // last good reading is.
             let mut report = HealthReport::ok();
+            let (quota_detail, quota_metrics) = match quota_cache.lock() {
+                Ok(cache) => quota_health(&cache, now_ms()),
+                Err(_) => (
+                    Some("quota cache lock poisoned".to_string()),
+                    json!({ "lastError": "cache poisoned" }),
+                ),
+            };
+            if let Some(detail) = quota_detail {
+                report.status = HealthStatus::Degraded;
+                report.detail = Some(detail);
+            }
             report.metrics = Some(json!({
                 "fusiformCatalog": catalog_health
                     .lock()
                     .map(|health| health.snapshot(now_ms()))
                     .unwrap_or_else(|_| json!({ "reach": "never-reached", "lastError": "health lock poisoned" })),
+                "quota": quota_metrics,
             }));
             let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(ModuleError::Json)?;
@@ -2317,6 +2417,9 @@ struct PreparedSelectionInputs {
     facts: Vec<ModelFact>,
     snapshot: ModelRouteStateSnapshot,
     quota_signal_json: String,
+    /// Set when the quota snapshot was too old to use: the explanation line
+    /// saying so, which a selected route carries.
+    quota_note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2325,18 +2428,32 @@ struct DecisionProvenance {
     policy_revision: String,
 }
 
-/// Summarize the cached overlay that the scorer consumed without serializing the
-/// full quota response. A no-signal marker is explicit so it cannot be confused
-/// with old rows written before the provenance columns existed.
-fn quota_signal_json(
-    snapshot: &ModelRouteStateSnapshot,
-    windows: &[ProviderUsage],
+/// The cache facts a decision's quota signal summary is built from.
+struct QuotaSignalView<'a> {
+    windows: &'a [ProviderUsage],
     available: bool,
     refreshed_at_ms: u64,
     retained_degraded_count: usize,
-    last_error: Option<&str>,
+    last_error: Option<&'a str>,
     restored_from_ms: Option<u64>,
-) -> String {
+    /// The snapshot's age when it is past the staleness bound; its windows
+    /// were then NOT merged into the snapshot the scorer read.
+    stale_age_ms: Option<u64>,
+}
+
+/// Summarize the cached overlay that the scorer consumed without serializing the
+/// full quota response. A no-signal marker is explicit so it cannot be confused
+/// with old rows written before the provenance columns existed.
+fn quota_signal_json(snapshot: &ModelRouteStateSnapshot, view: &QuotaSignalView<'_>) -> String {
+    let QuotaSignalView {
+        windows,
+        available,
+        refreshed_at_ms,
+        retained_degraded_count,
+        last_error,
+        restored_from_ms,
+        stale_age_ms,
+    } = *view;
     let mut signals: Vec<serde_json::Value> = snapshot
         .by_capacity
         .iter()
@@ -2359,7 +2476,21 @@ fn quota_signal_json(
     });
 
     let healthy_provider_count = windows.iter().filter(|window| window.is_healthy()).count();
-    let mut summary = if healthy_provider_count == 0 {
+    let mut summary = if let Some(age_ms) = stale_age_ms.filter(|_| healthy_provider_count > 0) {
+        // The cached readings were too old to steer this decision: say so, with
+        // their age, rather than recording them as the signal that was used.
+        json!({
+            "state": "stale",
+            "reason": stale_quota_note(age_ms, None),
+            "available": available,
+            "refreshedAtMs": refreshed_at_ms,
+            "ageMs": age_ms,
+            "staleAfterMs": QUOTA_STALE_AFTER_MS,
+            "lastError": last_error,
+            "healthyProviderCount": healthy_provider_count,
+            "signals": signals,
+        })
+    } else if healthy_provider_count == 0 {
         let reason = if windows.is_empty() {
             "quota signal: none (no cached readings)"
         } else if last_error.is_some() {
@@ -2409,8 +2540,14 @@ fn prepare_selection_inputs(
     let mut snapshot = store
         .build_snapshot(now)
         .map_err(|e| format!("building route-state snapshot: {e}"))?;
-    // Retain cached windows even while the quota source is unavailable. Dropping
-    // last-known pressure would make a transient outage look optimistically free.
+    // Retain cached windows through a transient quota outage: dropping
+    // last-known pressure the moment one refresh fails would make every blip
+    // look optimistically free. Past the staleness bound, though, the windows
+    // are no longer evidence of current quota (resets get spent, windows roll
+    // over), so they are not merged at all and every provider is quota-unknown:
+    // neutral pressure, no quota wall. A provider that really is exhausted
+    // still answers its next request with a 429, and that writes a hard
+    // cooldown into route state, which this does not touch.
     let (
         quota_windows,
         quota_available,
@@ -2429,23 +2566,32 @@ fn prepare_selection_inputs(
         ),
         Err(_) => (None, false, 0, 0, Some("cache poisoned".into()), None),
     };
-    if let Some(windows) = &quota_windows {
+    let stale_age_ms = quota_windows
+        .as_ref()
+        .and_then(|_| stale_quota_age_ms(quota_refreshed_at_ms, now as u64));
+    if let Some(windows) = quota_windows.as_ref().filter(|_| stale_age_ms.is_none()) {
         merge_quota_overlay(&mut snapshot, windows, &facts, quota_name_map());
     }
     let quota_signal_json = quota_signal_json(
         &snapshot,
-        quota_windows.as_deref().unwrap_or_default(),
-        quota_available,
-        quota_refreshed_at_ms,
-        retained_degraded_count,
-        quota_last_error.as_deref(),
-        quota_restored_from_ms,
+        &QuotaSignalView {
+            windows: quota_windows.as_deref().unwrap_or_default(),
+            available: quota_available,
+            refreshed_at_ms: quota_refreshed_at_ms,
+            retained_degraded_count,
+            last_error: quota_last_error.as_deref(),
+            restored_from_ms: quota_restored_from_ms,
+            stale_age_ms,
+        },
     );
+    let quota_note =
+        stale_age_ms.map(|age_ms| stale_quota_note(age_ms, quota_last_error.as_deref()));
     Ok(PreparedSelectionInputs {
         now,
         facts,
         snapshot,
         quota_signal_json,
+        quota_note,
     })
 }
 
@@ -2518,6 +2664,8 @@ async fn handle_select_request(
             "healthyCount": healthy,
             "lastError": last_error,
             "restoredFromMs": restored_from_ms,
+            "staleAfterMs": QUOTA_STALE_AFTER_MS,
+            "staleAgeMs": stale_quota_age_ms(refreshed_at_ms, now_ms()),
         }}))
         .map_err(ModuleError::Json)?;
         let response = Frame::build_with_version(
@@ -2753,6 +2901,7 @@ async fn handle_select_request(
         mut facts,
         snapshot,
         quota_signal_json,
+        quota_note,
     } = match prepare_selection_inputs(quota_cache, store) {
         Ok(prepared) => prepared,
         Err(e) => {
@@ -2903,6 +3052,9 @@ async fn handle_select_request(
     match selection {
         Ok(mut selected) => {
             selected.explanation.push(policy_sources.clone());
+            if let Some(note) = &quota_note {
+                selected.explanation.push(note.clone());
+            }
             if let Some(note) = &availability.note {
                 selected.explanation.push(note.clone());
             }
@@ -4963,7 +5115,16 @@ mod tests {
         .unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&quota_signal_json(
-            &snapshot, &windows, true, 1, 0, None, None,
+            &snapshot,
+            &QuotaSignalView {
+                windows: &windows,
+                available: true,
+                refreshed_at_ms: 1,
+                retained_degraded_count: 0,
+                last_error: None,
+                restored_from_ms: None,
+                stale_age_ms: None,
+            },
         ))
         .unwrap();
 
@@ -5303,9 +5464,15 @@ mod tests {
             let frame =
                 Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap();
 
-            handle_control_request(frame, &writer, &mut route_epochs, &catalog_health)
-                .await
-                .unwrap();
+            handle_control_request(
+                frame,
+                &writer,
+                &mut route_epochs,
+                &catalog_health,
+                &Arc::new(Mutex::new(QuotaCache::default())),
+            )
+            .await
+            .unwrap();
             let ack = replies.recv().await.unwrap();
             assert_eq!(ack.header.channel, 0);
             assert_eq!(ack.header.epoch, 0);
@@ -7938,6 +8105,146 @@ mod tests {
         );
         assert_eq!(cache.restored_from_ms, None);
         assert_eq!(cache.refreshed_at_ms, observed_at_ms);
+    }
+
+    /// A cache whose only reading is a codex window spent to 100% (walling
+    /// openai until its reset three hours out), last refreshed `age_ms` ago and
+    /// failing since, the way the refresh loop leaves it after a failed poll.
+    fn walled_codex_cache_aged(age_ms: u64) -> QuotaCache {
+        let now = now_ms();
+        let observed_at_ms = now - age_ms;
+        let mut cache = QuotaCache::default();
+        apply_quota_refresh(
+            &mut cache,
+            vec![usage(json!({
+                "provider": "codex",
+                "usage": { "primary": {
+                    "usedPercent": 100.0,
+                    "resetsAt": rfc3339_utc(now + 3 * 60 * 60_000),
+                    "windowMinutes": 300
+                }}
+            }))],
+            observed_at_ms,
+        );
+        record_quota_refresh_failure(&mut cache, "usage.get", "json: missing field `remaining`");
+        cache
+    }
+
+    /// Selection must not keep choosing on a snapshot that stopped advancing.
+    /// Within the bound a failed refresh keeps the last reading (a transient
+    /// blip must not read as free quota); past it the reading is ignored, every
+    /// provider is quota-unknown, and the decision says so with the age.
+    #[tokio::test]
+    async fn a_stale_quota_snapshot_neither_walls_nor_steers_and_the_decision_says_so() {
+        let rig = Rig::new("quota-snapshot-stale");
+        let store: SharedStore = Arc::new(rig.open_store());
+        // The quota-decides pair with the speeds swapped: openai wins the speed
+        // tiebreak when quota says nothing, so only a quota wall moves it.
+        for mut route in quota_decides_facts() {
+            route.scores.speed = if route.provider_id == "openai" { 100.0 } else { 10.0 };
+            store.upsert_fact(&route, FactSource::Override).unwrap();
+        }
+        let (no_reading, _) =
+            select_quota_decides(&store, QuotaCache::default(), "stale-no-reading").await;
+        assert_eq!(no_reading, "openai/restart-luna");
+
+        // Control: a failing refresh 14 minutes old is inside the bound, so the
+        // wall it last read still holds.
+        let (fresh, fresh_signal) = select_quota_decides(
+            &store,
+            walled_codex_cache_aged(QUOTA_STALE_AFTER_MS - 60_000),
+            "stale-within-bound",
+        )
+        .await;
+        assert_eq!(fresh, "anthropic/restart-opus", "{fresh_signal}");
+        assert_eq!(fresh_signal["state"], "present");
+
+        let (stale, stale_signal) = select_quota_decides(
+            &store,
+            walled_codex_cache_aged(QUOTA_STALE_AFTER_MS + 60_000),
+            "stale-past-bound",
+        )
+        .await;
+        assert_eq!(
+            stale, no_reading,
+            "a wall read from a stale snapshot must not move selection: {stale_signal}"
+        );
+        assert_eq!(stale_signal["state"], "stale");
+        assert!(stale_signal["ageMs"].as_u64().unwrap() > QUOTA_STALE_AFTER_MS);
+        assert_eq!(stale_signal["staleAfterMs"], json!(QUOTA_STALE_AFTER_MS));
+        assert_eq!(
+            stale_signal["lastError"],
+            "usage.get: json: missing field `remaining`"
+        );
+        let explanation = store
+            .get_decisions_for_task("stale-past-bound")
+            .unwrap()
+            .remove(0)
+            .explanation_json
+            .unwrap();
+        assert!(
+            explanation.contains("quota signal: stale (last successful refresh 16m ago")
+                && explanation.contains("missing field `remaining`"),
+            "the decision explanation names the stale snapshot and why: {explanation}"
+        );
+    }
+
+    async fn health_report_for(cache: QuotaCache) -> ModuleControlResponse {
+        let (writer, mut replies) = mpsc::channel(1);
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&json!({ "op": MODULE_CONTROL_OP_HEALTH_CHECK })).unwrap(),
+        )
+        .unwrap();
+        handle_control_request(
+            frame,
+            &writer,
+            &mut RouteEpochs::new(),
+            &Arc::new(Mutex::new(CatalogReachHealth::new(600_000))),
+            &Arc::new(Mutex::new(cache)),
+        )
+        .await
+        .unwrap();
+        serde_json::from_slice(&replies.recv().await.unwrap().body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_check_reports_degraded_naming_the_stale_quota_age() {
+        let ModuleControlResponse::HealthCheck { status, detail, .. } =
+            health_report_for(walled_codex_cache_aged(QUOTA_STALE_AFTER_MS - 60_000)).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Ok, "inside the bound: {detail:?}");
+
+        let ModuleControlResponse::HealthCheck {
+            status,
+            detail,
+            metrics,
+        } = health_report_for(walled_codex_cache_aged(7 * 60 * 60_000 + 5 * 60_000)).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Degraded);
+        let detail = detail.expect("a degraded report says why");
+        assert!(
+            detail.contains("quota snapshot stale: last successful refresh 7h05m ago")
+                && detail.contains("missing field `remaining`"),
+            "{detail}"
+        );
+        assert_eq!(metrics.unwrap()["quota"]["stale"], true);
+
+        // No reading yet (boot before the first poll) is not staleness.
+        let ModuleControlResponse::HealthCheck { status, .. } =
+            health_report_for(QuotaCache::default()).await
+        else {
+            panic!("health.check answers with a health report");
+        };
+        assert_eq!(status, HealthStatus::Ok);
     }
 
     #[tokio::test]
