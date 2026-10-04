@@ -3344,11 +3344,11 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
-    warn_ignored_caller_policy_once(
-        !params.exclude_route_keys.is_empty() || !params.subscription_keys.is_empty(),
-    );
-    // Explicit roster pins bypass exclusions; automatic panel seats receive the
-    // operator fence. Subscription classification always comes from routing.
+    warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
+    // Explicit roster pins bypass exclusions; automatic seats and replacements
+    // receive both the operator fence and this request's own exclusions, whether
+    // or not a package size was supplied. Subscription classification is owned by
+    // routing rather than the caller.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
@@ -3391,11 +3391,7 @@ async fn handle_select_panel(
             roster: params.roster.clone(),
             facts: prepared.facts,
             runtime_snapshot: Some(prepared.snapshot),
-            exclude_route_keys: if params.package_tokens.is_some() {
-                params.exclude_route_keys.clone()
-            } else {
-                Vec::new()
-            },
+            exclude_route_keys: params.exclude_route_keys.clone(),
             operator_exclude_keys: operator_policy.exclude.clone(),
             required_capabilities: params.required_capabilities,
             available_models,
@@ -9667,6 +9663,33 @@ mod tests {
 
         let decisions = store.get_decisions_for_task("panel-wire-n-pick").unwrap();
         assert_eq!(decisions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn automatic_panel_requests_obey_caller_exclusions_with_or_without_a_package_size() {
+        let vectors = select_panel_wire_vectors();
+        let original: serde_json::Value =
+            serde_json::from_str(vectors["nPick"]["request"].as_str().unwrap()).unwrap();
+        for package_tokens in [None, Some(227_000)] {
+            let mut request = original.clone();
+            request["params"]["excludeRouteKeys"] = json!(["openai"]);
+            if let Some(tokens) = package_tokens {
+                request["params"]["packageTokens"] = json!(tokens);
+            }
+            let (response, _rig, _store) =
+                run_select_panel_wire_request("caller-exclusion", &request.to_string()).await;
+            assert_eq!(response.header.ty, FrameType::Response);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["result"]["members"], json!([]));
+            assert!(
+                body["result"]["shortfall"]["causes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cause| cause["reason"] == "excluded"),
+                "{body}"
+            );
+        }
     }
 
     #[test]

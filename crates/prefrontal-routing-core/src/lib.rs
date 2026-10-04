@@ -19,6 +19,7 @@ pub mod model_facts;
 pub mod model_facts_seed;
 pub mod model_resolution;
 pub mod model_router;
+pub mod package_ceiling;
 pub mod panel;
 pub mod provider_model_spec;
 pub mod quota;

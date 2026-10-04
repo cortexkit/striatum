@@ -3,7 +3,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use prefrontal_core::consult::seat_package_ceiling;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -14,6 +13,7 @@ use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, ModelRouteStateSnapshot,
     RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
+use crate::package_ceiling::seat_package_ceiling;
 use crate::provider_model_spec::ExclusionPolicy;
 use crate::routing_config::{demand_bar, RoutingConfig, DEFAULT_ROUTING_CONFIG};
 
