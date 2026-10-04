@@ -75,6 +75,7 @@ fn spec(size: usize, iq_floor: f64, diversity: PanelDiversity) -> PanelSpec {
 
 fn panel_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput<'static> {
     SelectPanelInput {
+        package_tokens: None,
         selection: PanelSelection::Roster,
         roster: roster(&facts),
         available_models: availability(&facts),
@@ -91,6 +92,7 @@ fn panel_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput
 
 fn n_pick_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput<'static> {
     SelectPanelInput {
+        package_tokens: None,
         selection: PanelSelection::NPick,
         roster: Vec::new(),
         available_models: availability(&facts),
@@ -103,6 +105,129 @@ fn n_pick_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInpu
         required_capabilities: None,
         is_subscription_route: None,
     }
+}
+
+fn package_facts() -> Vec<ModelFact> {
+    [
+        ("small", 1900.0, "small-lineage", 500_000.0),
+        ("kept", 1880.0, "kept-lineage", 1_000_000.0),
+        ("duplicate", 1870.0, "kept-lineage", 1_000_000.0),
+        ("replacement", 1860.0, "new-lineage", 1_000_000.0),
+    ]
+    .into_iter()
+    .map(|(model, elo, family, window)| {
+        let mut row = fact(model, elo, Some(family));
+        row.context_window = Some(window);
+        row.max_output_tokens = Some(64_000);
+        row
+    })
+    .collect()
+}
+
+#[test]
+fn oversized_roster_pin_is_replaced_using_automatic_lineage_rules() {
+    let facts = package_facts();
+    let mut input = panel_input(facts.clone(), spec(2, 80.0, PanelDiversity::Family));
+    input.roster = roster(&facts[..2]);
+    input.package_tokens = Some(227_000);
+    let panel = select_panel(input).unwrap();
+    assert!(panel.shortfall.is_none());
+    assert_eq!(
+        panel
+            .members
+            .iter()
+            .map(|member| member.route_key.as_str())
+            .collect::<Vec<_>>(),
+        ["p/replacement", "p/kept"]
+    );
+    assert_eq!(panel.members[0].context_window, Some(1_000_000));
+    let policy = panel.policy.unwrap();
+    assert_eq!(policy.replacements.len(), 1);
+    assert_eq!(policy.replacements[0].replaced_route_key, "p/small");
+    assert_eq!(
+        policy.replacements[0].replacement_route_key,
+        "p/replacement"
+    );
+    assert_eq!(
+        policy.replacements[0].reason,
+        "package 227000 tokens exceeds p/small ceiling 210000 tokens"
+    );
+}
+
+#[test]
+fn package_refusal_names_size_largest_ceiling_and_roster_remedy() {
+    let facts = package_facts();
+    let mut input = panel_input(facts.clone(), spec(2, 80.0, PanelDiversity::Family));
+    input.roster = roster(&facts[..2]);
+    input.package_tokens = Some(500_000);
+    let panel = select_panel(input).unwrap();
+    let refusal = panel.shortfall.unwrap();
+    assert_eq!(refusal.code, PanelShortfallCode::PackageUnmeetable);
+    assert!(refusal.detail.contains("package 500000 tokens"));
+    assert!(refusal
+        .detail
+        .contains("largest available adequate ceiling 460000 tokens"));
+    assert!(refusal.detail.contains("Narrow evidence"));
+    assert!(refusal
+        .detail
+        .contains("project athena.members roster setting"));
+    assert!(panel.members.is_empty());
+}
+
+#[test]
+fn package_substitution_obeys_exclusion_quota_and_iq_admission() {
+    for blocker in ["caller", "operator", "quota", "iq"] {
+        let mut facts = package_facts();
+        if blocker == "iq" {
+            facts[3].scores.elo = 100.0;
+        }
+        let mut input = panel_input(facts.clone(), spec(2, 80.0, PanelDiversity::Family));
+        input.roster = roster(&facts[..2]);
+        input.package_tokens = Some(227_000);
+        match blocker {
+            "caller" => input.exclude_route_keys = vec!["p/replacement".into()],
+            "operator" => input.operator_exclude_keys = vec!["p/replacement".into()],
+            "quota" => {
+                input.runtime_snapshot = Some(ModelRouteStateSnapshot {
+                    now: 1.0,
+                    by_route: HashMap::from([(
+                        "p/replacement".into(),
+                        RouteRuntimeState {
+                            quota_exhausted_until: Some(20.0),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                })
+            }
+            _ => {}
+        }
+        assert_eq!(
+            select_panel(input).unwrap().shortfall.unwrap().code,
+            PanelShortfallCode::PackageUnmeetable,
+            "{blocker}"
+        );
+    }
+}
+
+#[test]
+fn a_fitting_package_preserves_pins_and_automatic_runner_ups_fit() {
+    let facts = package_facts();
+    let mut input = panel_input(facts.clone(), spec(2, 80.0, PanelDiversity::Family));
+    input.roster = roster(&facts[..2]);
+    input.package_tokens = Some(210_000);
+    assert_eq!(select_panel(input).unwrap().members[0].route_key, "p/small");
+    let mut automatic = n_pick_input(facts, spec(1, 80.0, PanelDiversity::Family));
+    automatic.package_tokens = Some(227_000);
+    let panel = select_panel(automatic).unwrap();
+    assert!(panel
+        .members
+        .iter()
+        .all(|member| member.route_key != "p/small"));
+    assert!(panel
+        .runner_up
+        .iter()
+        .all(|member| member.route_key != "p/small"));
 }
 
 fn openai_sibling(model: &str, elo: f64) -> ModelFact {
@@ -258,6 +383,7 @@ fn admission_is_shared_not_reimplemented() {
         prompt_params: Map::new(),
     });
     let panel = select_panel(SelectPanelInput {
+        package_tokens: None,
         selection: PanelSelection::Roster,
         panel_spec: spec(5, 0.0, PanelDiversity::None),
         roster: panel_roster,
@@ -305,6 +431,7 @@ fn admission_is_shared_not_reimplemented() {
 
     let exhausted = vec![fact("only", 60.0, Some("a"))];
     let panel = select_panel(SelectPanelInput {
+        package_tokens: None,
         selection: PanelSelection::Roster,
         panel_spec: spec(1, 0.0, PanelDiversity::None),
         roster: roster(&exhausted),
@@ -537,6 +664,7 @@ fn ordering_temperature_and_promotion() {
 fn shortfall_precedence_and_empty_success() {
     let unavailable = fact("unavailable", 60.0, Some("a"));
     let zero_admission = select_panel(SelectPanelInput {
+        package_tokens: None,
         selection: PanelSelection::Roster,
         panel_spec: spec(1, 100.0, PanelDiversity::Family),
         roster: roster(std::slice::from_ref(&unavailable)),
