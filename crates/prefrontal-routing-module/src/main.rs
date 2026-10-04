@@ -1432,6 +1432,8 @@ struct SelectPanelBody {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SelectPanelParams {
+    #[serde(default)]
+    package_tokens: Option<usize>,
     panel_spec: PanelSpec,
     /// The substrate this panel's legs will dispatch on, resolved by the caller
     /// at launch. It decides which availability list the seats are judged
@@ -3358,11 +3360,11 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
-    warn_ignored_caller_policy_once(
-        !params.exclude_route_keys.is_empty() || !params.subscription_keys.is_empty(),
-    );
-    // Explicit roster pins bypass exclusions; automatic panel seats receive the
-    // operator fence. Subscription classification always comes from routing.
+    warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
+    // Explicit roster pins bypass exclusions; automatic seats and replacements
+    // receive both the operator fence and this request's own exclusions, whether
+    // or not a package size was supplied. Subscription classification is owned by
+    // routing rather than the caller.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
@@ -3399,12 +3401,13 @@ async fn handle_select_panel(
     }
     let panel = match select_panel_with_config(
         SelectPanelInput {
+            package_tokens: params.package_tokens,
             panel_spec: params.panel_spec.clone(),
             selection: params.selection,
             roster: params.roster.clone(),
             facts: prepared.facts,
             runtime_snapshot: Some(prepared.snapshot),
-            exclude_route_keys: Vec::new(),
+            exclude_route_keys: params.exclude_route_keys.clone(),
             operator_exclude_keys: operator_policy.exclude.clone(),
             required_capabilities: params.required_capabilities,
             available_models,
@@ -3492,11 +3495,11 @@ fn panel_decision_input(
         .iter()
         .map(|member| member.route_key.as_str())
         .collect();
-    let explanation = if params.selection == PanelSelection::NPick {
+    let explanation = if params.selection == PanelSelection::NPick || panel.policy.is_some() {
         json!({
             "members": member_route_keys,
             "causes": causes,
-            "selection": "n_pick",
+            "selection": params.selection,
             "policy": panel.policy,
             "policySources": policy_sources,
             "availability": availability.as_str(),
@@ -9775,6 +9778,33 @@ mod tests {
         assert_eq!(decisions.len(), 1);
     }
 
+    #[tokio::test]
+    async fn automatic_panel_requests_obey_caller_exclusions_with_or_without_a_package_size() {
+        let vectors = select_panel_wire_vectors();
+        let original: serde_json::Value =
+            serde_json::from_str(vectors["nPick"]["request"].as_str().unwrap()).unwrap();
+        for package_tokens in [None, Some(227_000)] {
+            let mut request = original.clone();
+            request["params"]["excludeRouteKeys"] = json!(["openai"]);
+            if let Some(tokens) = package_tokens {
+                request["params"]["packageTokens"] = json!(tokens);
+            }
+            let (response, _rig, _store) =
+                run_select_panel_wire_request("caller-exclusion", &request.to_string()).await;
+            assert_eq!(response.header.ty, FrameType::Response);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["result"]["members"], json!([]));
+            assert!(
+                body["result"]["shortfall"]["causes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cause| cause["reason"] == "excluded"),
+                "{body}"
+            );
+        }
+    }
+
     #[test]
     fn n_pick_decision_explanation_includes_selection_and_policy() {
         let vectors = select_panel_wire_vectors();
@@ -9783,6 +9813,9 @@ mod tests {
             .unwrap()
             .params;
         let policy = prefrontal_routing_core::PanelPolicy {
+            package_tokens: None,
+            largest_package_ceiling: None,
+            replacements: Vec::new(),
             selection: prefrontal_routing_core::PanelSelectionPolicy::TopIq,
             seated_variants: vec![prefrontal_routing_core::SeatedVariant {
                 slot: 0,
@@ -9812,6 +9845,59 @@ mod tests {
             serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
         assert_eq!(explanation["selection"], "n_pick");
         assert_eq!(explanation["policy"]["selection"], "top_iq");
+    }
+
+    #[test]
+    fn package_tokens_are_typed_and_roster_decisions_retain_replacement_policy() {
+        let mut body: serde_json::Value = serde_json::from_str(
+            select_panel_wire_vectors()["nPick"]["request"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        body["params"]["selection"] = json!("roster");
+        body["params"]["packageTokens"] = json!(227_000);
+        let params = serde_json::from_value::<SelectPanelBody>(body.clone())
+            .unwrap()
+            .params;
+        assert_eq!(params.package_tokens, Some(227_000));
+        body["params"]["packageTokens"] = json!("227000");
+        assert!(serde_json::from_value::<SelectPanelBody>(body).is_err());
+        let panel = SelectedPanel {
+            members: Vec::new(),
+            runner_up: Vec::new(),
+            shortfall: None,
+            policy: Some(prefrontal_routing_core::PanelPolicy {
+                selection: prefrontal_routing_core::PanelSelectionPolicy::DiversityFirst,
+                seated_variants: Vec::new(),
+                sibling_collapses: Vec::new(),
+                package_tokens: Some(227_000),
+                largest_package_ceiling: Some(460_000),
+                replacements: vec![prefrontal_routing_core::panel::PackageSeatReplacement {
+                    slot: 0,
+                    replaced_route_key: "p/small".into(),
+                    replacement_route_key: "p/large".into(),
+                    reason: "package 227000 tokens exceeds p/small ceiling 210000 tokens".into(),
+                }],
+            }),
+        };
+        let decision = panel_decision_input(
+            &params,
+            &panel,
+            AvailabilitySubstrate::Broca,
+            &DecisionProvenance {
+                quota_signal_json: "{}".into(),
+                policy_revision: "test-policy".into(),
+            },
+            "policy sources: test",
+        );
+        let explanation: serde_json::Value =
+            serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
+        assert_eq!(explanation["selection"], "roster");
+        assert_eq!(
+            explanation["policy"]["replacements"][0]["replacementRouteKey"],
+            "p/large"
+        );
     }
 
     /// The package no longer steers seating, so an n_pick request needs no package

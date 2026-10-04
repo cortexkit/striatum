@@ -13,6 +13,7 @@ use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, ModelRouteStateSnapshot,
     RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
+use crate::package_ceiling::seat_package_ceiling;
 use crate::provider_model_spec::ExclusionPolicy;
 use crate::routing_config::{demand_bar, RoutingConfig, DEFAULT_ROUTING_CONFIG};
 
@@ -103,6 +104,9 @@ pub struct PanelRosterEntry {
 }
 
 pub struct SelectPanelInput<'a> {
+    /// Whole evidence package size, estimated by the caller. Never a request to
+    /// truncate evidence or enlarge a model's budget.
+    pub package_tokens: Option<usize>,
     pub panel_spec: PanelSpec,
     pub selection: PanelSelection,
     pub roster: Vec<PanelRosterEntry>,
@@ -153,6 +157,7 @@ pub struct PanelRunnerUp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelCauseReason {
+    PackageTooLarge,
     /// Rejected by a caller-supplied exclusion for this panel request.
     Excluded,
     /// Rejected by the operator's standing exclude list. Separate from `Excluded`
@@ -180,6 +185,7 @@ pub struct PanelCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PanelShortfallCode {
+    PackageUnmeetable,
     IqFloorUnmeetable,
     DiversityUnmeetable,
     SizeReduced,
@@ -230,6 +236,21 @@ pub struct PanelPolicy {
     pub selection: PanelSelectionPolicy,
     pub seated_variants: Vec<SeatedVariant>,
     pub sibling_collapses: Vec<SiblingCollapse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub largest_package_ceiling: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replacements: Vec<PackageSeatReplacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageSeatReplacement {
+    pub slot: usize,
+    pub replaced_route_key: String,
+    pub replacement_route_key: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -285,12 +306,161 @@ pub fn select_panel_with_config(
     input: SelectPanelInput<'_>,
     config: &RoutingConfig,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
+    if input.selection != PanelSelection::Roster || input.package_tokens.is_none() {
+        return select_panel_admitted(&input, config);
+    }
+    let tokens = input.package_tokens.unwrap();
+    let mut panel = select_panel_admitted(&input, config)?;
+    let oversized = panel
+        .members
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, member)| {
+            let ceiling = seat_package_ceiling(
+                &member.route_key,
+                member.context_window,
+                member.max_output_tokens,
+            );
+            (tokens > ceiling.tokens).then_some((slot, ceiling))
+        })
+        .collect::<Vec<_>>();
+    if oversized.is_empty() {
+        return Ok(panel);
+    }
+    // Keep the fitting pins, but replacements are automatic choices: the same
+    // admission, adequacy, sibling ordering and lineage rules as n_pick apply.
+    let automatic = SelectPanelInput {
+        selection: PanelSelection::NPick,
+        roster: Vec::new(),
+        is_subscription_route: input.is_subscription_route,
+        ..input
+    };
+    let spares = select_panel_admitted(&automatic, config)?;
+    let mut policy = spares.policy.expect("automatic selection records policy");
+    let mut candidates = spares
+        .members
+        .into_iter()
+        .chain(spares.runner_up.into_iter().map(|spare| PanelMember {
+            route_key: spare.route_key,
+            prompt_params: spare.prompt_params,
+            family: spare.family,
+            temperature: None,
+            max_output_tokens: spare.max_output_tokens,
+            context_window: spare.context_window,
+        }))
+        .collect::<Vec<_>>();
+    let mut used = panel
+        .members
+        .iter()
+        .map(|member| member.route_key.clone())
+        .collect::<HashSet<_>>();
+    let mut families = panel
+        .members
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| !oversized.iter().any(|(small, _)| small == slot))
+        .filter_map(|(_, member)| member.family.clone())
+        .collect::<HashSet<_>>();
+    let mut unfilled = false;
+    for (slot, ceiling) in oversized {
+        let spare = candidates.iter().position(|candidate| {
+            !used.contains(&candidate.route_key)
+                && (automatic.panel_spec.diversity != PanelDiversity::Family
+                    || candidate
+                        .family
+                        .as_ref()
+                        .is_some_and(|family| !families.contains(family)))
+        });
+        let Some(index) = spare else {
+            unfilled = true;
+            continue;
+        };
+        let mut replacement = candidates.remove(index);
+        replacement.temperature = panel.members[slot].temperature;
+        policy.replacements.push(PackageSeatReplacement {
+            slot,
+            replaced_route_key: panel.members[slot].route_key.clone(),
+            replacement_route_key: replacement.route_key.clone(),
+            reason: format!(
+                "package {tokens} tokens exceeds {} ceiling {} tokens",
+                ceiling.route_key, ceiling.tokens
+            ),
+        });
+        used.insert(replacement.route_key.clone());
+        families.extend(replacement.family.clone());
+        panel.members[slot] = replacement;
+    }
+    panel.runner_up = candidates
+        .into_iter()
+        .filter(|candidate| !used.contains(&candidate.route_key))
+        .map(|candidate| PanelRunnerUp {
+            route_key: candidate.route_key,
+            prompt_params: candidate.prompt_params,
+            family: candidate.family,
+            max_output_tokens: candidate.max_output_tokens,
+            context_window: candidate.context_window,
+        })
+        .collect();
+    if unfilled {
+        let largest = policy.largest_package_ceiling.unwrap_or(0).max(
+            panel
+                .members
+                .iter()
+                .map(|member| {
+                    seat_package_ceiling(
+                        &member.route_key,
+                        member.context_window,
+                        member.max_output_tokens,
+                    )
+                    .tokens
+                })
+                .max()
+                .unwrap_or(0),
+        );
+        panel.shortfall = Some(PanelShortfall {
+            code: PanelShortfallCode::PackageUnmeetable,
+            detail: package_refusal(tokens, largest),
+            causes: vec![],
+        });
+        // No oversized pin is a sendable seat, even on a refused decision.
+        panel.members.retain(|member| {
+            seat_package_ceiling(
+                &member.route_key,
+                member.context_window,
+                member.max_output_tokens,
+            )
+            .tokens
+                >= tokens
+        });
+    }
+    policy.seated_variants = panel
+        .members
+        .iter()
+        .enumerate()
+        .map(|(slot, member)| SeatedVariant {
+            slot,
+            route_key: member.route_key.clone(),
+            variant: sibling_variant(&member.route_key),
+        })
+        .collect();
+    panel.policy = Some(policy);
+    Ok(panel)
+}
+
+fn package_refusal(tokens: usize, largest: usize) -> String {
+    format!("package {tokens} tokens cannot fill the panel; largest available adequate ceiling {largest} tokens. Narrow evidence or change the project athena.members roster setting; evidence was not truncated")
+}
+
+fn select_panel_admitted(
+    input: &SelectPanelInput<'_>,
+    config: &RoutingConfig,
+) -> Result<SelectedPanel, InvalidPanelRequest> {
     validate_panel_spec(&input.panel_spec)?;
 
     let mut prompt_params: HashMap<String, VecDeque<Map<String, Value>>> = HashMap::new();
     let mut causes = Vec::new();
     let considered_facts = match input.selection {
-        PanelSelection::Roster => roster_facts(&input, &mut prompt_params, &mut causes),
+        PanelSelection::Roster => roster_facts(input, &mut prompt_params, &mut causes),
         PanelSelection::NPick => input.facts.clone(),
     };
 
@@ -358,6 +528,7 @@ pub fn select_panel_with_config(
             )
         });
     let mut candidates = Vec::new();
+    let mut largest_package_ceiling = None;
     for admitted in admission.admitted {
         let model = admitted.route.capacity_key.clone();
         if iq_bar.is_some_and(|bar| admitted.route.fact.scores.elo < bar) {
@@ -367,6 +538,30 @@ pub fn select_panel_with_config(
                 detail: None,
             });
             continue;
+        }
+        if input.selection == PanelSelection::NPick && input.package_tokens.is_some() {
+            let ceiling = seat_package_ceiling(
+                &admitted.route.route_key,
+                context_window_tokens(&admitted.route.fact),
+                admitted.route.fact.max_output_tokens,
+            );
+            largest_package_ceiling = Some(
+                largest_package_ceiling
+                    .unwrap_or(0usize)
+                    .max(ceiling.tokens),
+            );
+            if input.package_tokens.unwrap() > ceiling.tokens {
+                causes.push(PanelCause {
+                    model,
+                    reason: PanelCauseReason::PackageTooLarge,
+                    detail: Some(format!(
+                        "package {} tokens exceeds ceiling {} tokens",
+                        input.package_tokens.unwrap(),
+                        ceiling.tokens
+                    )),
+                });
+                continue;
+            }
         }
         let params = match input.selection {
             PanelSelection::Roster => prompt_params
@@ -484,7 +679,14 @@ pub fn select_panel_with_config(
         }
     }
 
-    let shortfall_code = if admitted_count == 0 {
+    let shortfall_code = if input.package_tokens.is_some()
+        && members.len() < input.panel_spec.size
+        && causes
+            .iter()
+            .any(|cause| cause.reason == PanelCauseReason::PackageTooLarge)
+    {
+        Some(PanelShortfallCode::PackageUnmeetable)
+    } else if admitted_count == 0 {
         Some(PanelShortfallCode::SizeReduced)
     } else if iq_eligible_count == 0 {
         Some(PanelShortfallCode::IqFloorUnmeetable)
@@ -505,6 +707,10 @@ pub fn select_panel_with_config(
             });
         }
         let detail = match code {
+            PanelShortfallCode::PackageUnmeetable => package_refusal(
+                input.package_tokens.unwrap(),
+                largest_package_ceiling.unwrap_or(0),
+            ),
             PanelShortfallCode::IqFloorUnmeetable => {
                 format!(
                     "no admitted roster model clears raw iq floor {:.2}",
@@ -530,6 +736,9 @@ pub fn select_panel_with_config(
     });
 
     let policy = (input.selection == PanelSelection::NPick).then(|| PanelPolicy {
+        package_tokens: input.package_tokens,
+        largest_package_ceiling,
+        replacements: Vec::new(),
         selection: selection_policy,
         seated_variants: members
             .iter()
