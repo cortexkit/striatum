@@ -2259,6 +2259,15 @@ impl RouteStateStore for SqliteRouteStateStore {
         capacity_key: &str,
         update: &RouteStateUpdate,
     ) -> RouteStateResult<()> {
+        // Old callers can still send an account failure as a route cooldown.
+        // Keep account evidence in the account allocator, never fan it out to
+        // every model or replace an independent model wall's cause.
+        if prefrontal_routing_core::account_wall::account_scoped_wall(
+            update.last_error.as_deref(),
+            update.wall_class,
+        ) {
+            return Ok(());
+        }
         let provider_key = derive_provider_key(provider_key)
             .ok_or_else(|| err("provider cooldown write has no canonical provider key"))?
             .to_owned();
@@ -2304,6 +2313,15 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let wall_class = update.wall_class.or(existing.wall_class);
                 let (last_error, last_error_at) = match &update.last_error {
                     Some(error) => (Some(error.clone()), Some(now_ms())),
+                    None if (update.cooldown_until.is_some()
+                        || update.quota_exhausted_until.is_some())
+                        && prefrontal_routing_core::account_wall::account_scoped_wall(
+                            existing.last_error.as_deref(),
+                            existing.wall_class,
+                        ) =>
+                    {
+                        (Some("route wall (scope unknown)".into()), Some(now_ms()))
+                    }
                     None => (existing.last_error, existing.last_error_at),
                 };
                 let updated_at = now_ms();
@@ -2403,6 +2421,12 @@ impl RouteStateStore for SqliteRouteStateStore {
         capacity_key: &str,
         update: &RouteStateUpdate,
     ) -> RouteStateResult<()> {
+        if prefrontal_routing_core::account_wall::account_scoped_wall(
+            update.last_error.as_deref(),
+            update.wall_class,
+        ) {
+            return Ok(());
+        }
         let (provider_id, model_id, variant) = split_route_key(route_key);
         let provider_key = derive_provider_key(&provider_id)
             .ok_or_else(|| err("route state update has no canonical provider key"))?
@@ -2479,6 +2503,12 @@ impl RouteStateStore for SqliteRouteStateStore {
                     ex.quota_error_count + if update.increment_quota_error { 1 } else { 0 };
                 let (last_error, last_error_at) = match &update.last_error {
                     Some(error) => (Some(error.clone()), Some(now_ms())),
+                    None if (update.cooldown_until.is_some() || update.quota_exhausted_until.is_some())
+                        && prefrontal_routing_core::account_wall::account_scoped_wall(ex.last_error.as_deref(), ex.wall_class) => {
+                        // A new unscoped wall must not inherit a legacy account
+                        // narrative, which would falsely quarantine the new wall.
+                        (Some("route wall (scope unknown)".into()), Some(now_ms()))
+                    }
                     None => (ex
                         .last_error
                         .clone()
@@ -2578,6 +2608,16 @@ impl RouteStateStore for SqliteRouteStateStore {
         decision_id: &str,
         update: &DecisionOutcomeUpdate,
     ) -> RouteStateResult<()> {
+        // Retain the full error in the audit, but treat an explicitly account-
+        // scoped failure as neutral model-health evidence. This closes both the
+        // quota-horizon writer and the terminal-failure backoff writer.
+        let mut normalized = update.clone();
+        if prefrontal_routing_core::account_wall::account_scoped_error(
+            update.last_error.as_deref().unwrap_or(""),
+        ) {
+            normalized.outcome = prefrontal_routing_core::RouteOutcome::Interrupted;
+        }
+        let update = &normalized;
         self.store
             .with_conn(|c: &Connection| {
                 let tx = c.unchecked_transaction()?;
@@ -3230,7 +3270,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 })?;
                 for row in rows {
                     let row = row?;
-                    let state = RouteRuntimeState {
+                    let mut state = RouteRuntimeState {
                         cooldown_until: row.cooldown_until,
                         quota_exhausted_until: row.quota_exhausted_until,
                         wall_class: row.wall_class,
@@ -3241,6 +3281,17 @@ impl RouteStateStore for SqliteRouteStateStore {
                         failure_backoff_reason: row.failure_backoff_reason,
                         ..Default::default()
                     };
+                    // Read-side quarantine leaves the original row available for
+                    // diagnosis. Its single-account horizon cannot reject another
+                    // credential, including through a sibling capacity key.
+                    if prefrontal_routing_core::account_wall::account_scoped_wall(
+                        state.last_error.as_deref(),
+                        state.wall_class,
+                    ) {
+                        state.cooldown_until = None;
+                        state.quota_exhausted_until = None;
+                        state.wall_class = None;
+                    }
                     // Capacity-shared signals propagate across variants of the same
                     // provider/model. Soft pressure lives ONLY on the capacity key so a
                     // fresh quota reading can replace a stale stored value for every
@@ -3412,6 +3463,163 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn legacy_account_wall_error() -> String {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../prefrontal-routing-core/tests/fixtures/account-wall-scope.json"
+        ))
+        .unwrap();
+        vectors[0]["error"].as_str().unwrap().into()
+    }
+
+    fn insert_legacy_account_wall(store: &SqliteRouteStateStore, route: &str, class: &str) {
+        store.store.with_conn(|conn| conn.execute(
+            "INSERT INTO model_route_state (route_key,capacity_key,provider_id,model_id,cooldown_until,quota_exhausted_until,last_error,wall_class,updated_at)
+             VALUES (?1,'anthropic/opus','anthropic','opus',1791493229401,1791493229401,?2,?3,1791048824539)",
+            params![route,legacy_account_wall_error(),class],
+        )).unwrap();
+    }
+
+    #[test]
+    fn legacy_account_wall_is_quarantined_without_erasing_evidence_or_real_walls() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-wall-quarantine");
+        let store = SqliteRouteStateStore::open(&dev_descriptor(
+            "account-wall-quarantine",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        insert_legacy_account_wall(&store, "anthropic/opus/medium", "quota");
+        insert_legacy_account_wall(&store, "anthropic/billing", "billing");
+        let snapshot = store.build_snapshot(1791214158478.0).unwrap();
+        let scoped = &snapshot.by_route["anthropic/opus/medium"];
+        assert_eq!(scoped.cooldown_until, None);
+        assert_eq!(scoped.quota_exhausted_until, None);
+        assert!(scoped.last_error.as_ref().unwrap().contains("57ce2cb7"));
+        assert_eq!(
+            snapshot.by_route["anthropic/billing"].quota_exhausted_until,
+            Some(1791493229401.0)
+        );
+        store.store.with_conn(|conn| {
+            let stored:(i64,String) = conn.query_row("SELECT quota_exhausted_until,last_error FROM model_route_state WHERE route_key='anthropic/opus/medium'",[],|row| Ok((row.get(0)?,row.get(1)?)))?;
+            assert_eq!(stored,(1791493229401,legacy_account_wall_error()),"quarantine is read-only");
+            Ok::<_,rusqlite::Error>(())
+        }).unwrap();
+        // An independent sibling keeps the capacity closed; quarantining one
+        // account's row never clears a real pool-wide or billing wall.
+        store
+            .update_route_state(
+                "anthropic/opus/high",
+                "anthropic/opus",
+                &RouteStateUpdate {
+                    quota_exhausted_until: Some(1791493229500.0),
+                    wall_class: Some(RouteWallClass::Quota),
+                    last_error: Some("provider pool exhausted".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.build_snapshot(1791214158478.0).unwrap().by_capacity["anthropic/opus"]
+                .quota_exhausted_until,
+            Some(1791493229500.0)
+        );
+        // A new unscoped wall must replace the old account narrative even if
+        // its caller supplies no diagnostic message.
+        store
+            .update_route_state(
+                "anthropic/opus/medium",
+                "anthropic/opus",
+                &RouteStateUpdate {
+                    quota_exhausted_until: Some(1791493229600.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.build_snapshot(1791214158478.0).unwrap().by_route["anthropic/opus/medium"]
+                .quota_exhausted_until,
+            Some(1791493229600.0)
+        );
+    }
+
+    #[test]
+    fn route_state_writers_keep_account_exhaustion_out_of_model_health() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-wall-writers");
+        let store = SqliteRouteStateStore::open(&dev_descriptor(
+            "account-wall-writers",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        for (index, error) in [
+            legacy_account_wall_error(),
+            r#"{"provider_code":"account_limit_exhausted","account_ref":"ysample"}"#.into(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let route = format!("anthropic/writer-{index}");
+            let update = RouteStateUpdate {
+                cooldown_until: Some(1791493229401.0),
+                quota_exhausted_until: Some(1791493229401.0),
+                wall_class: Some(RouteWallClass::Quota),
+                last_error: Some(error.clone()),
+                increment_failure: true,
+                increment_quota_error: true,
+                ..Default::default()
+            };
+            store.update_route_state(&route, &route, &update).unwrap();
+            store
+                .record_provider_cooldown("anthropic", &route, &route, &update)
+                .unwrap();
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_route_key: Some(route.clone()),
+                    selected_provider_id: Some("anthropic".into()),
+                    selected_model_id: Some(format!("writer-{index}")),
+                    target_agent: "mason".into(),
+                    requirements_json: "{}".into(),
+                    score_json: "{}".into(),
+                    rejected_json: "[]".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .set_decision_outcome(
+                    &decision,
+                    &DecisionOutcomeUpdate {
+                        outcome: prefrontal_routing_core::RouteOutcome::QuotaExhausted {
+                            retry_after_secs: 279100,
+                        },
+                        last_error: Some(error),
+                        observed_at_ms: 1791214158478,
+                        failure_backoff: Default::default(),
+                    },
+                )
+                .unwrap();
+            store
+                .store
+                .with_conn(|conn| {
+                    let rows: i64 = conn.query_row(
+                        "SELECT count(*) FROM model_route_state WHERE route_key=?1",
+                        [&route],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(
+                        rows, 0,
+                        "an account error must not write any model-health row"
+                    );
+                    let outcome: String = conn.query_row(
+                        "SELECT outcome FROM model_route_decisions WHERE id=?1",
+                        [&decision],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(outcome, "interrupted");
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .unwrap();
+        }
+        assert!(store.get_provider_cooldown("anthropic").unwrap().is_none());
     }
 
     #[test]
