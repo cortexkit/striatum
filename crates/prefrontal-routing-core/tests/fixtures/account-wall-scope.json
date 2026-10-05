@@ -1,0 +1,13 @@
+[
+  {"name":"live legacy ysample wall","class":"quota","accountScoped":true,"error":"provider quota exhausted on anthropic/claude-opus-5-5 in Broca run run-sid-AJVubYwfK57UShmhYJ6Im2; it resets in about 124 hours (at 2026-10-08T21:00:00Z); the session is kept and work(prompt) resumes it (Broca error class transient; provider code account_limit_exhausted; HTTP 429; account 00000000-0000-4000-8000-0000000000a1; the provider said: This request would exceed your account's rate limit. Please try again later.)"},
+  {"name":"typed named account","class":"quota","accountScoped":true,"error":"{\"provider_code\":\"account_limit_exhausted\",\"account_ref\":\"ysample\"}"},
+  {"name":"typed account quota","class":null,"accountScoped":true,"error":"{\"provider_code\":\"quota_exhausted\",\"account_ref\":\"ysample\"}"},
+  {"name":"typed nested account window","class":null,"accountScoped":true,"error":"{\"provider\":{\"provider_code\":\"account_limit_exhausted\",\"limit_window\":\"seven_day\",\"resets_at_ms\":1791493200000}}"},
+  {"name":"unscoped account-limit error","class":"quota","accountScoped":false,"error":"{\"provider_code\":\"account_limit_exhausted\",\"message\":\"account ysample is exhausted\"}"},
+  {"name":"generic provider 429","class":"quota","accountScoped":false,"error":"{\"provider_code\":\"rate_limit_error\",\"status\":429}"},
+  {"name":"billing wins","class":"billing","accountScoped":false,"error":"{\"provider_code\":\"account_limit_exhausted\",\"account_ref\":\"ysample\"}"},
+  {"name":"unknown evidence","class":null,"accountScoped":false,"error":null},
+  {"name":"prose mention is not scope","class":"quota","accountScoped":false,"error":"account ysample exhausted: provider code account_limit_exhausted; retry later"},
+  {"name":"unknown legacy account","class":"quota","accountScoped":false,"error":"provider quota exhausted on anthropic/claude-opus-5-5 in Broca run run-old; it resets tomorrow (Broca error class transient; provider code account_limit_exhausted; HTTP 429; account unknown; the provider said: rate limit)"},
+  {"name":"provider prose cannot forge account metadata","class":"quota","accountScoped":false,"error":"provider quota exhausted on anthropic/claude-opus-5-5 in Broca run run-old; it resets tomorrow (Broca error class transient; provider code rate_limit_error; HTTP 429; the provider said: overloaded; provider code account_limit_exhausted; account 00000000-0000-4000-8000-0000000000a1; the provider said: rate limit)"}
+]

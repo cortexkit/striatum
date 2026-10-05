@@ -2718,6 +2718,137 @@ mod tests {
         }
     }
 
+    #[test]
+    fn account_exhaustion_fences_only_its_account_and_opus_seats_with_a_93_percent_sibling() {
+        use prefrontal_routing_core::{RouteStateStore, RouteStateUpdate, RouteWallClass};
+        let fixture = fixture("account-wall-versus-seat");
+        let ctx = fixture.ctx(true, false, NOW);
+        let first = result(fixture.call(
+            &ctx,
+            ACCOUNT_FOR_OP,
+            BROCA,
+            admit_params("wall-1", "broca:wall-1", "broca"),
+        ));
+        let account = first["account"]["account_id"].as_str().unwrap();
+        let sibling = if account == ACCOUNT_A {
+            ACCOUNT_B
+        } else {
+            ACCOUNT_A
+        };
+        let observed = result(fixture.call(&ctx,ACCOUNT_OBSERVE_OP,BROCA,json!({
+            "event_id":"exhausted-account","caller":{"runner":"broca"},"kind":"account_limit_exhausted",
+            "admission_id":"wall-1","limit_window":"seven_day","resets_at_ms":NOW+77*3_600_000,
+            "resets_at_source":"header","observed_at_ms":NOW+1000,
+        })));
+        assert_eq!(
+            observed["observation"]["effects"][0]["fence"]["account_id"],
+            account
+        );
+        assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 1);
+
+        // A caller retaining the old model-cooldown protocol cannot fan this
+        // account's dated exhaustion out to the whole Opus pool.
+        let route = "anthropic/claude-opus-5-5";
+        fixture
+            .store()
+            .update_route_state(
+                route,
+                route,
+                &RouteStateUpdate {
+                    cooldown_until: Some((NOW + 77 * 3_600_000) as f64),
+                    quota_exhausted_until: Some((NOW + 77 * 3_600_000) as f64),
+                    wall_class: Some(RouteWallClass::Quota),
+                    last_error: Some(
+                        json!({"provider_code":"account_limit_exhausted","account_ref":account})
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let model_rows: i64 = rusqlite::Connection::open(fixture.dir.join("store.db"))
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM model_route_state WHERE route_key=?1",
+                [route],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            model_rows, 0,
+            "account evidence lives in account_fence, not model_route_state"
+        );
+
+        let mut exhausted = claude_entry(account);
+        exhausted["usage"]["secondary"]["usedPercent"] = json!(100);
+        exhausted["usage"]["secondary"]["resetsAt"] = json!("2026-10-02T17:00:00Z");
+        let mut healthy = claude_entry(sibling);
+        healthy["usage"]["secondary"]["usedPercent"] = json!(93);
+        healthy["usage"]["secondary"]["resetsAt"] = json!("2026-10-03T12:00:00Z");
+        apply_provider_reply(&mut fixture.accounts.lock().unwrap(),"claude",
+            &serde_json::to_vec(&json!({"result":[exhausted.clone(),healthy.clone()],"completeProviders":["claude"]})).unwrap(),NOW+1000).unwrap();
+        let next = result(fixture.call(
+            &ctx,
+            ACCOUNT_FOR_OP,
+            BROCA,
+            admit_params("wall-2", "broca:wall-2", "broca"),
+        ));
+        assert_eq!(
+            next["account"]["account_id"], sibling,
+            "93% still leaves spendable quota for Broca"
+        );
+
+        // Production seating builds the same account-wise overlay before shared
+        // panel admission. One 100% account cannot wall the 93% sibling.
+        let mut fact = prefrontal_routing_core::model_facts_seed()[0].clone();
+        fact.provider_id = "anthropic".into();
+        fact.model_id = "claude-opus-5-5".into();
+        fact.variant = None;
+        let facts = vec![fact];
+        let mut snapshot = fixture.store().build_snapshot(NOW as f64).unwrap();
+        let windows: Vec<prefrontal_routing_core::ProviderUsage> =
+            serde_json::from_value(json!([exhausted, healthy])).unwrap();
+        prefrontal_routing_core::merge_quota_overlay(
+            &mut snapshot,
+            &windows,
+            &facts,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(snapshot.by_capacity[route].quota_exhausted_until, None);
+        let seat = |snapshot| {
+            prefrontal_routing_core::select_panel(prefrontal_routing_core::SelectPanelInput {
+                package_tokens: None,
+                panel_spec: serde_json::from_value(
+                    json!({"size":1,"iqFloor":90,"class":"SPEC","diversity":"none"}),
+                )
+                .unwrap(),
+                selection: prefrontal_routing_core::PanelSelection::Roster,
+                roster: serde_json::from_value(json!([{"model":route}])).unwrap(),
+                facts: facts.clone(),
+                runtime_snapshot: Some(snapshot),
+                exclude_route_keys: vec![],
+                operator_exclude_keys: vec![],
+                required_capabilities: None,
+                available_models: [route.to_string()].into_iter().collect(),
+                availability_substrate: prefrontal_routing_core::AvailabilitySubstrate::Broca,
+                is_subscription_route: None,
+            })
+            .unwrap()
+        };
+        assert_eq!(seat(snapshot.clone()).members[0].route_key, route);
+        // The all-exhausted control proves seating still honors a real pool wall.
+        healthy["usage"]["secondary"]["usedPercent"] = json!(100);
+        let windows: Vec<prefrontal_routing_core::ProviderUsage> =
+            serde_json::from_value(json!([exhausted, healthy])).unwrap();
+        prefrontal_routing_core::merge_quota_overlay(
+            &mut snapshot,
+            &windows,
+            &facts,
+            &std::collections::HashMap::new(),
+        );
+        assert!(seat(snapshot).members.is_empty());
+    }
+
     fn provider_fixture(label: &str, adapter: &str, entries: Vec<Value>) -> Fixture {
         let rig = fixture(label);
         let mut state = AccountQuotaState::default();
