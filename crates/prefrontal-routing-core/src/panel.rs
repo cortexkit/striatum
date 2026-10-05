@@ -158,6 +158,7 @@ pub struct PanelRunnerUp {
 #[serde(rename_all = "snake_case")]
 pub enum PanelCauseReason {
     PackageTooLarge,
+    PackageExceedsCeiling,
     /// Rejected by a caller-supplied exclusion for this panel request.
     Excluded,
     /// Rejected by the operator's standing exclude list. Separate from `Excluded`
@@ -327,6 +328,17 @@ pub fn select_panel_with_config(
     if oversized.is_empty() {
         return Ok(panel);
     }
+    let package_causes = oversized
+        .iter()
+        .map(|(slot, ceiling)| PanelCause {
+            model: panel.members[*slot].route_key.clone(),
+            reason: PanelCauseReason::PackageExceedsCeiling,
+            detail: Some(format!(
+                "package {tokens} tokens exceeds {} ceiling {} tokens",
+                ceiling.route_key, ceiling.tokens
+            )),
+        })
+        .collect::<Vec<_>>();
     // Keep the fitting pins, but replacements are automatic choices: the same
     // admission, adequacy, sibling ordering and lineage rules as n_pick apply.
     let automatic = SelectPanelInput {
@@ -402,6 +414,12 @@ pub fn select_panel_with_config(
         })
         .collect();
     if unfilled {
+        let mut causes = panel
+            .shortfall
+            .take()
+            .map(|shortfall| shortfall.causes)
+            .unwrap_or_default();
+        causes.extend(package_causes);
         let largest = policy.largest_package_ceiling.unwrap_or(0).max(
             panel
                 .members
@@ -420,7 +438,7 @@ pub fn select_panel_with_config(
         panel.shortfall = Some(PanelShortfall {
             code: PanelShortfallCode::PackageUnmeetable,
             detail: package_refusal(tokens, largest),
-            causes: vec![],
+            causes,
         });
         // No oversized pin is a sendable seat, even on a refused decision.
         panel.members.retain(|member| {
@@ -432,6 +450,16 @@ pub fn select_panel_with_config(
             .tokens
                 >= tokens
         });
+    } else {
+        // A replacement fills the slot count but still leaves the pinned model
+        // absent. Freeze that reason alongside ordinary panel shortfalls so
+        // reports can explain which roster seat the package could not fit.
+        let shortfall = panel.shortfall.get_or_insert_with(|| PanelShortfall {
+            code: PanelShortfallCode::SizeReduced,
+            detail: "one or more roster seats were replaced because the package exceeded their context ceiling".into(),
+            causes: Vec::new(),
+        });
+        shortfall.causes.extend(package_causes);
     }
     policy.seated_variants = panel
         .members
