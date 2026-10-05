@@ -450,16 +450,6 @@ pub fn select_panel_with_config(
             .tokens
                 >= tokens
         });
-    } else {
-        // A replacement fills the slot count but still leaves the pinned model
-        // absent. Freeze that reason alongside ordinary panel shortfalls so
-        // reports can explain which roster seat the package could not fit.
-        let shortfall = panel.shortfall.get_or_insert_with(|| PanelShortfall {
-            code: PanelShortfallCode::SizeReduced,
-            detail: "one or more roster seats were replaced because the package exceeded their context ceiling".into(),
-            causes: Vec::new(),
-        });
-        shortfall.causes.extend(package_causes);
     }
     policy.seated_variants = panel
         .members

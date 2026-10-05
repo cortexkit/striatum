@@ -131,6 +131,7 @@ fn oversized_roster_pin_is_replaced_using_automatic_lineage_rules() {
     input.roster = roster(&facts[..2]);
     input.package_tokens = Some(227_000);
     let panel = select_panel(input).unwrap();
+    assert!(panel.shortfall.is_none());
     assert_eq!(
         panel
             .members
@@ -150,19 +151,6 @@ fn oversized_roster_pin_is_replaced_using_automatic_lineage_rules() {
     assert_eq!(
         policy.replacements[0].reason,
         "package 227000 tokens exceeds p/small ceiling 210000 tokens"
-    );
-    let cause = panel
-        .shortfall
-        .as_ref()
-        .unwrap()
-        .causes
-        .iter()
-        .find(|cause| cause.model == "p/small")
-        .unwrap();
-    assert_eq!(cause.reason, PanelCauseReason::PackageExceedsCeiling);
-    assert_eq!(
-        cause.detail.as_deref(),
-        Some("package 227000 tokens exceeds p/small ceiling 210000 tokens")
     );
 }
 
