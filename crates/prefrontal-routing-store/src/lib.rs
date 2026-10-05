@@ -3367,6 +3367,53 @@ mod tests {
     use super::*;
     use prefrontal_routing_core::ScoreProvenance;
 
+    #[cfg(unix)]
+    #[test]
+    fn route_store_state_is_owner_only_under_test_scratch_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = prefrontal_test_support::scratch_root().join(format!(
+            "prefrontal-routing-private-state-{}-{timestamp}",
+            std::process::id()
+        ));
+        let db = root.join("store.db");
+        let descriptor = dev_descriptor("prefrontal-routing-private-state", db.to_string_lossy());
+        let store = SqliteRouteStateStore::open(&descriptor).expect("open scratch routing store");
+
+        let mut pending = vec![root.clone()];
+        while let Some(path) = pending.pop() {
+            let metadata = std::fs::symlink_metadata(&path).expect("stat route-state path");
+            let mode = metadata.permissions().mode() & 0o777;
+            if metadata.is_dir() {
+                assert_eq!(
+                    mode,
+                    0o700,
+                    "routing directory is not owner-only: {}",
+                    path.display()
+                );
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .expect("list route-state directory")
+                        .map(|entry| entry.unwrap().path()),
+                );
+            } else {
+                assert_eq!(
+                    mode,
+                    0o600,
+                    "routing file is not owner-only: {}",
+                    path.display()
+                );
+            }
+        }
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn clear_failure_backoff_preserves_cooldown_and_quota_walls() {
         let timestamp = std::time::SystemTime::now()
