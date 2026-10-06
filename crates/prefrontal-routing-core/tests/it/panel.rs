@@ -141,7 +141,7 @@ fn oversized_roster_pin_is_replaced_using_automatic_lineage_rules() {
         ["p/replacement", "p/kept"]
     );
     assert_eq!(panel.members[0].context_window, Some(1_000_000));
-    let policy = panel.policy.unwrap();
+    let policy = panel.policy.as_ref().unwrap();
     assert_eq!(policy.replacements.len(), 1);
     assert_eq!(policy.replacements[0].replaced_route_key, "p/small");
     assert_eq!(
@@ -172,6 +172,22 @@ fn package_refusal_names_size_largest_ceiling_and_roster_remedy() {
         .detail
         .contains("project athena.members roster setting"));
     assert!(panel.members.is_empty());
+    for (model, detail) in [
+        (
+            "p/small",
+            "package 500000 tokens exceeds p/small ceiling 210000 tokens",
+        ),
+        (
+            "p/kept",
+            "package 500000 tokens exceeds p/kept ceiling 460000 tokens",
+        ),
+    ] {
+        assert!(refusal.causes.iter().any(|cause| {
+            cause.model == model
+                && cause.reason == PanelCauseReason::PackageExceedsCeiling
+                && cause.detail.as_deref() == Some(detail)
+        }));
+    }
 }
 
 #[test]

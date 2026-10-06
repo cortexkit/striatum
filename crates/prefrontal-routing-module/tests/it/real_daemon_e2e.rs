@@ -19,6 +19,11 @@ mod common;
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
+use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandle, ModuleHandler, RequestCtx};
+use subc_protocol::manifest::{
+    Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
+    TrustTier,
+};
 use tokio::process::{Child, Command};
 
 use common::{
@@ -35,6 +40,65 @@ struct RealDaemon {
     /// The central storage data_home; the module's store opens under
     /// `<data_home>/cortexkit/<module_id>/store.db`.
     data_home: PathBuf,
+    _credentials: ModuleHandle,
+    credential_service: tokio::task::JoinHandle<()>,
+}
+
+struct CredentialMetadata;
+
+#[async_trait]
+impl ModuleHandler for CredentialMetadata {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["method"], "credential.list_scoped");
+        assert_eq!(request["params"], serde_json::json!({}));
+        HandlerOutcome::Response(
+            serde_json::to_vec(&serde_json::json!({
+                "result": {
+                    "view": "routing-health-fixture-v1",
+                    "credentials": [{
+                        "id": "api:anthropic:routing-health-fixture",
+                        "categories": ["llm-provider"],
+                        "type": "api_key",
+                        "serves": ["anthropic"],
+                        "provider_ids": ["anthropic"],
+                        "state": "active",
+                        "record_version": 1,
+                        "operations": ["get"]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+    }
+}
+
+async fn serve_credential_metadata(
+    connection_file: &std::path::Path,
+) -> (ModuleHandle, tokio::task::JoinHandle<()>) {
+    let manifest = ModuleManifest::builder("claustrum", "0.0.0")
+        .trust_tier(Some(TrustTier::FirstParty))
+        .protocol_ver(subc_protocol::PROTOCOL_VERSION)
+        .provides(vec![ProviderRole::ManagementSurface {
+            concurrency: Concurrency::ModuleManaged,
+            operations: vec![ManagementOperation {
+                name: "credential.list_scoped".into(),
+                kind: ManagementOperationKind::Query,
+                description: None,
+            }],
+            config_schema: serde_json::json!({"type":"object"}),
+            observability: Vec::new(),
+            identity_scope: Vec::new(),
+        }])
+        .build();
+    let (handle, serving) =
+        subc_client_rs::serve_with_handle(connection_file, manifest, CredentialMetadata)
+            .await
+            .expect("register fixture credential metadata service");
+    let service = tokio::spawn(async move {
+        serving.await.expect("serve fixture credential metadata");
+    });
+    (handle, service)
 }
 
 impl RealDaemon {
@@ -50,6 +114,7 @@ impl RealDaemon {
 
 impl Drop for RealDaemon {
     fn drop(&mut self) {
+        self.credential_service.abort();
         let _ = self.child.start_kill();
         let _ = std::fs::remove_dir_all(&self.rig);
     }
@@ -105,12 +170,40 @@ async fn start_real_daemon() -> RealDaemon {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    RealDaemon {
+    // Routing health requires a scoped credential listing for Broca reachability
+    // (the health handler in src/main.rs). Supply metadata, never secret material.
+    let (credentials, credential_service) = serve_credential_metadata(&connection_file).await;
+    let daemon = RealDaemon {
         child,
         rig,
         connection_file,
         data_home,
+        _credentials: credentials,
+        credential_service,
+    };
+    let mut consumer = connect_consumer(&daemon.connection_file).await;
+    wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
+    let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
+    loop {
+        let frame = control_rpc(
+            &mut consumer,
+            5900,
+            serde_json::json!({
+                "op":"supervisor.health_probe", "module_id":MODULE_ID
+            }),
+        )
+        .await;
+        let health: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        if health["status"] == "ok" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "routing did not consume fixture credential metadata: {health}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    daemon
 }
 
 /// The full supervision proof: a real subc-core binary spawns the module from
