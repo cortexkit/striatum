@@ -1355,6 +1355,110 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         .unwrap_or_else(store_error)
 }
 
+/// Check a cold worker launch without reserving an account or creating affinity.
+/// The runner still performs the usual atomic admission when it starts sending.
+pub(crate) fn preflight_model(
+    ctx: &Ctx<'_>,
+    provider: &str,
+    model: &str,
+) -> Result<(), (String, String)> {
+    if !ctx.flags.enabled {
+        return Ok(());
+    }
+    let roster = roster_for_model(ctx, provider, Some(model));
+    // Providers outside the account allocator retain their normal credential admission.
+    if roster
+        .roster
+        .as_ref()
+        .is_some_and(|roster| roster.accounts.is_empty())
+    {
+        return Ok(());
+    }
+    let request = synthetic_request(provider, model, "worker-model-preflight".into());
+    let (decision, fences) = ctx
+        .store
+        .account_transaction(|tx| {
+            let fences = load_fences(tx, provider)?;
+            let decision = decide(
+                &request,
+                &AllocatorState {
+                    roster: roster.roster.clone(),
+                    affinity: None,
+                    fences: fences.clone(),
+                    principal_exclusions: Vec::new(),
+                    admissions: load_demand(tx, provider)?,
+                    operator_override: None,
+                    policy: ctx.policy.clone(),
+                },
+                ctx.now_ms,
+            );
+            Ok((decision, fences))
+        })
+        .map_err(|error| ("account_selection_unavailable".into(), error.to_string()))?;
+    match decision.outcome {
+        Outcome::Admit(_) => Ok(()),
+        Outcome::Hold(hold) => Err((
+            "quota_exhausted".into(),
+            format!(
+                "{provider}/{model}: quota_exhausted until {}",
+                rfc3339(hold.reset_at_ms)
+            ),
+        )),
+        Outcome::Refuse(refusal) => {
+            let code = refusal_code(refusal.code).to_string();
+            // A retry includes jitter/margin and is not itself a provider reset.
+            // Name the published reset only for quota refusals with dated evidence.
+            let family = ctx.policy.family_for_model(model);
+            let resets = roster
+                .roster
+                .iter()
+                .flat_map(|roster| &roster.accounts)
+                .filter_map(|account| account.quota.as_ref())
+                .flat_map(|quota| {
+                    let mut dates: Vec<i64> = quota
+                        .required_windows()
+                        .into_iter()
+                        .filter_map(|window| quota.window(window))
+                        .filter_map(|window| window.resets_at.at_ms())
+                        .collect();
+                    if let ScopedList::Listed(windows) = &quota.scoped {
+                        dates.extend(
+                            windows
+                                .iter()
+                                .filter(|window| {
+                                    ctx.policy.family_for_scope(window) == Some(family)
+                                })
+                                .filter_map(|window| window.resets_at.at_ms()),
+                        );
+                    }
+                    dates
+                })
+                .chain(
+                    fences
+                        .iter()
+                        .filter(|fence| fence.scope.applies_to(family))
+                        .filter_map(|fence| fence.reset.at_ms()),
+                );
+            let clearing = if matches!(
+                refusal.code,
+                RefusalCode::AccountPoolExhausted | RefusalCode::AccountPoolReserveLimited
+            ) {
+                resets
+                    .filter(|date| *date > ctx.now_ms)
+                    .min()
+                    .map(|date| format!(" until {}", rfc3339(date)))
+                    .unwrap_or_else(|| "; clearing time unknown".into())
+            } else {
+                String::new()
+            };
+            Err((
+                code.clone(),
+                format!("{provider}/{model}: {code}{clearing}"),
+            ))
+        }
+    }
+}
+
 /// The whole admission inside one write transaction: idempotency, the
 /// compare-and-set, the decision and its commit. The transaction commits
 /// before the reply leaves, so a reply always describes a durable decision.
@@ -3610,6 +3714,37 @@ mod tests {
         assert_eq!(fixture.store().account_serving_counts().unwrap().total(), 0);
         assert!(fixture.shadow_rows().is_empty());
         assert!(fixture.serve_rows().is_empty());
+    }
+
+    #[test]
+    fn pinned_model_account_preflight_refuses_all_walls_but_admits_a_healthy_sibling() {
+        let fixture = fixture("pin-preflight");
+        let mut a = claude_entry(ACCOUNT_A);
+        let mut b = claude_entry(ACCOUNT_B);
+        a["usage"]["primary"]["usedPercent"] = json!(100.0);
+        b["usage"]["primary"]["usedPercent"] = json!(100.0);
+        let apply = |b: &Value| {
+            let mut vault_only = a.clone();
+            vault_only["account"] = json!(VAULT_ONLY);
+            let bytes = serde_json::to_vec(
+                &json!({"result":[a,b,vault_only],"completeProviders":["claude"]}),
+            )
+            .unwrap();
+            apply_provider_reply(&mut fixture.accounts.lock().unwrap(), "claude", &bytes, NOW)
+                .unwrap();
+        };
+        apply(&b);
+        let ctx = fixture.ctx(true, false, NOW);
+        let (code, message) = preflight_model(&ctx, "anthropic", "claude-opus-5-5").unwrap_err();
+        assert_eq!(code, "account_pool_reserve_limited");
+        assert!(message.contains("until 2026-09-29T14:00:00Z"), "{message}");
+        b["usage"]["primary"]["usedPercent"] = json!(10.0);
+        apply(&b);
+        assert!(preflight_model(&ctx, "anthropic", "claude-opus-5-5").is_ok());
+        assert!(
+            fixture.serve_rows().is_empty(),
+            "preflight must not commit a runner admission"
+        );
     }
 
     #[test]

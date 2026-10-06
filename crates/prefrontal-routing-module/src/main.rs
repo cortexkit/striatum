@@ -24,6 +24,7 @@ mod fusiform_catalog;
 mod model_resolution;
 mod quota_consumer;
 mod winner_ladder;
+mod work_model_pin;
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -1290,6 +1291,8 @@ struct SelectBody {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SelectParams {
+    #[serde(default)]
+    model_pin: Option<String>,
     #[serde(default = "default_target_agent")]
     target_agent: String,
     /// Existing module callers may provide an already-resolved demand vector.
@@ -1667,7 +1670,7 @@ fn resolve_select_request(
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
     );
-    if policy.connected_model_count == 0 {
+    if params.model_pin.is_none() && policy.connected_model_count == 0 {
         return Err(no_route_error(
             RouteFailureReason::NoAvailableModel,
             format!(
@@ -1677,7 +1680,7 @@ fn resolve_select_request(
             requirements,
         ));
     }
-    if policy.available_models.is_empty() {
+    if params.model_pin.is_none() && policy.available_models.is_empty() {
         return Err(no_route_error(
             RouteFailureReason::NoAvailableModel,
             format!(
@@ -3000,6 +3003,90 @@ async fn handle_select_request(
 
     let min_best_effort_adequacy = min_band.lock().ok().and_then(|g| *g);
     let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
+
+    if let Some(pin) = params.model_pin.as_deref() {
+        let sub = subscription_keys.clone();
+        let selection = work_model_pin::select(
+            pin,
+            SelectModelRouteInput {
+                target_agent: target_agent.clone(),
+                requirements,
+                available_models: available.clone(),
+                facts: facts.clone(),
+                runtime_snapshot: Some(snapshot.clone()),
+                exclude_route_keys: exclude.clone(),
+                operator_exclude_keys: operator_exclude.clone(),
+                required_capabilities,
+                is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
+                    sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
+                })),
+                min_best_effort_adequacy,
+                prefer_prompt_cache: false,
+                providers_without_prompt_cache: HashSet::new(),
+            },
+            &routing_config,
+            concurrency_slots.as_ref(),
+        );
+        match selection {
+            Ok(selected) => {
+                let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+                let ctx = account_selection::Ctx {
+                    store: store.as_ref(),
+                    accounts: ACCOUNT_QUOTA.get(),
+                    flags: config_overrides::account_selection_flags(routing_config_path),
+                    policy: &policy,
+                    now_ms: now as i64,
+                };
+                if let Err((code, message)) = account_selection::preflight_model(
+                    &ctx,
+                    &selected.model.provider_id,
+                    &selected.model.model_id,
+                ) {
+                    return send_route_error(writer, ver, channel, epoch, corr, &code, &message)
+                        .await;
+                }
+                let decision = decision_input_for(
+                    &target_agent,
+                    &requirements,
+                    Some(&selected),
+                    None,
+                    &params,
+                    Some(&provenance),
+                    Some(&policy_sources_line(&operator_policy)),
+                );
+                let decision_id = store
+                    .record_decision(&decision)
+                    .map_err(|error| ModuleError::Message(error.to_string()))?;
+                let body = serde_json::to_vec(&json!({"result": {
+                    "selected": selected, "decisionID": decision_id,
+                    "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities}
+                }})).map_err(ModuleError::Json)?;
+                let response = Frame::build_with_version(
+                    ver,
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, false),
+                    channel,
+                    epoch,
+                    corr,
+                    body,
+                )
+                .map_err(|error| ModuleError::Message(error.to_string()))?;
+                return send(writer, response).await;
+            }
+            Err(refusal) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    &refusal.code,
+                    &refusal.message,
+                )
+                .await
+            }
+        }
+    }
 
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
         let sub = subscription_keys.clone();
@@ -10086,6 +10173,152 @@ mod tests {
             "anthropic/fixture-cheap"
         );
         assert!(body["result"]["selected"].get("slotSaturation").is_none());
+    }
+
+    async fn pinned_select(pin: &str, wall: bool) -> (Frame, Rig) {
+        let rig = Rig::new("head-pin");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("openai", "gpt-5.5"), FactSource::Override)
+            .unwrap();
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-5-5"), FactSource::Override)
+            .unwrap();
+        if wall {
+            store
+                .update_route_state(
+                    "openai/gpt-5.5",
+                    "openai/gpt-5.5",
+                    &prefrontal_routing_core::RouteStateUpdate {
+                        quota_exhausted_until: Some(2_000_000_000_000.0),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let frame = run_route_wire_request(
+            &store,
+            json!({"method":"route.select","params":{
+                "targetAgent":"mason", "requestedRequirements":{"iq":100,"eq":90},
+                "availableModels":["openai/gpt-5.5","anthropic/claude-opus-5-5"], "modelPin":pin
+            }}),
+        )
+        .await;
+        (frame, rig)
+    }
+
+    #[tokio::test]
+    async fn work_model_pin_selects_only_the_named_model_and_variant() {
+        let (frame, _rig) = pinned_select("openai/gpt-5.5:high", false).await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            body["result"]["selected"]["promptParams"]["providerID"], "openai",
+            "{body}"
+        );
+        assert_eq!(
+            body["result"]["selected"]["promptParams"]["modelID"],
+            "gpt-5.5"
+        );
+        assert_eq!(
+            body["result"]["selected"]["promptParams"]["variant"],
+            "high"
+        );
+        assert_eq!(
+            body["result"]["resolvedInput"]["requirements"],
+            json!({"iq":100.0,"eq":90.0})
+        );
+    }
+
+    #[tokio::test]
+    async fn work_model_pin_quota_wall_refuses_with_reset_without_fallback() {
+        let (frame, _rig) = pinned_select("openai/gpt-5.5:high", true).await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "quota_exhausted", "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("until 2033-05-18T03:33:20Z"),
+            "{body}"
+        );
+        assert!(
+            body.get("result").is_none(),
+            "a healthy sibling must not replace the pin: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_model_pin_bad_variant_names_valid_catalog_tiers() {
+        let (frame, _rig) = pinned_select("openai/gpt-5.5:absurd", false).await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "invalid_model_variant", "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("absurd")
+                && message.contains("valid variants: low, medium, high, xhigh"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_model_pin_unknown_provider_and_model_name_the_bad_part() {
+        for (pin, code, bad) in [
+            ("nowhere/gpt-5.5", "unknown_model_provider", "nowhere"),
+            ("openai/not-a-model", "unknown_model", "not-a-model"),
+        ] {
+            let (frame, _rig) = pinned_select(pin, false).await;
+            let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(body["code"], code, "{body}");
+            assert!(body["message"].as_str().unwrap().contains(bad), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn work_model_pin_preserves_a_colon_inside_the_catalog_model_id() {
+        let rig = Rig::new("pin-colon-id");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("ollama-cloud", "qwen3.5:397b"), FactSource::Override)
+            .unwrap();
+        let frame = run_route_wire_request(&store, json!({"method":"route.select","params":{
+            "targetAgent":"mason", "requestedRequirements":{"iq":72,"eq":0},
+            "availableModels":["ollama-cloud/qwen3.5:397b"], "modelPin":"ollama-cloud/qwen3.5:397b"
+        }})).await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            body["result"]["selected"]["model"]["modelID"], "qwen3.5:397b",
+            "{body}"
+        );
+        assert!(
+            body["result"]["selected"]["promptParams"]
+                .get("variant")
+                .is_none(),
+            "a size tag is not a reasoning tier: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_model_pin_without_credentials_refuses_the_named_route() {
+        let rig = Rig::new("pin-no-credentials");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("openai", "gpt-5.5"), FactSource::Override)
+            .unwrap();
+        let frame = run_route_wire_request(
+            &store,
+            json!({"method":"route.select","params":{
+                "targetAgent":"mason", "requestedRequirements":{"iq":72,"eq":0},
+                "availableModels":[], "modelPin":"openai/gpt-5.5:high"
+            }}),
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "not_available", "{body}");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("openai/gpt-5.5:high"));
+        assert!(body.get("result").is_none());
     }
 
     #[tokio::test]
