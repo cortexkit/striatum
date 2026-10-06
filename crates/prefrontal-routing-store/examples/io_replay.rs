@@ -35,48 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .all(|c| matches!(c, std::path::Component::Normal(_))),
         "replay path must not escape target/"
     );
-    let history = std::env::args().nth(2).as_deref() == Some("history");
-    let started = std::time::Instant::now();
     let store = SqliteRouteStateStore::open(&dev_descriptor("routing-io-replay", &path))?;
     let conn = Connection::open(&path)?;
-    if history {
-        println!(
-            "store migration/open: {:.3}s",
-            started.elapsed().as_secs_f64()
-        );
-        let now: i64 =
-            conn.query_row("SELECT max(observed_at) FROM model_route_usage", [], |r| {
-                r.get(0)
-            })?;
-        let policy = || -> Result<String, Box<dyn std::error::Error>> {
-            Ok(serde_json::to_string(
-                &store.get_facts_with_observed_speed(now as f64)?,
-            )?)
-        };
-        let before_policy = policy()?;
-        let started = std::time::Instant::now();
-        let mut total = (0, 0);
-        let mut sweeps = 0;
-        loop {
-            let removed = store.prune_history(now)?;
-            total.0 += removed.0;
-            total.1 += removed.1;
-            sweeps += 1;
-            if removed == (0, 0) {
-                break;
-            }
-        }
-        assert_eq!(policy()?, before_policy, "retention changed policy inputs");
-        println!("history replay: {sweeps} bounded sweeps, retired={} usage, pruned={} shadows, {:.3}s, policy inputs identical", total.0, total.1, started.elapsed().as_secs_f64());
-        // Offline copies only. Production retention reuses freed pages and does
-        // not VACUUM; this reports the compacted end-state size, not runtime I/O.
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
-        println!(
-            "offline compacted database: {} B",
-            std::fs::metadata(&path)?.len()
-        );
-        return Ok(());
-    }
     let now = 1_800_000_000_000_f64;
     let observations: Vec<_> = (0..1000)
         .map(|i| UsageObservation {

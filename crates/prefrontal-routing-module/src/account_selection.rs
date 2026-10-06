@@ -3767,33 +3767,6 @@ mod tests {
     }
 
     #[test]
-    fn shadow_retention_preserves_fixed_fixture_golden_decisions() {
-        let fixture = fixture("shadow-golden-retention");
-        let ctx = fixture.ctx(false, true, NOW);
-        let observation = json!({ "model": "claude-opus-5-5", "kind": "attempt" });
-        shadow_pass(&ctx, ShadowTrigger::Observation(&observation)).unwrap();
-        let before = fixture.shadow_rows();
-        assert_eq!(before.len(), 1);
-        assert_eq!(
-            (before[0].outcome.as_str(), before[0].code.as_str()),
-            ("admit", "cold_scored")
-        );
-        let conn = rusqlite::Connection::open(fixture.dir.join("store.db")).unwrap();
-        conn.execute(
-            "UPDATE account_decision SET created_at=?1",
-            [NOW - prefrontal_routing_store::HISTORY_RETENTION_MS - 1],
-        )
-        .unwrap();
-        assert_eq!(fixture.store().prune_history(NOW).unwrap(), (0, 1));
-        shadow_pass(&ctx, ShadowTrigger::Observation(&observation)).unwrap();
-        let after = fixture.shadow_rows();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].decision_json, before[0].decision_json);
-        assert_eq!(after[0].context_json, before[0].context_json);
-        assert_eq!(fixture.store().account_serving_counts().unwrap().total(), 0);
-    }
-
-    #[test]
     fn with_serving_off_an_observation_writes_one_shadow_record_carrying_it() {
         let fixture = fixture("observe-shadow");
         let ctx = fixture.ctx(false, true, NOW);

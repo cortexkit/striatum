@@ -976,10 +976,6 @@ mod io_tests {
     fn shadow_heartbeat_uses_an_exact_tuple_seek_without_sorting() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(crate::MIGRATION_044).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE model_route_usage(id TEXT PRIMARY KEY, observed_at INTEGER)",
-        )
-        .unwrap();
         conn.execute_batch(crate::MIGRATION_045).unwrap();
         let sql = format!("EXPLAIN QUERY PLAN {}", latest_decision_sql());
         let details = conn
@@ -1004,52 +1000,6 @@ mod io_tests {
 }
 
 impl SqliteRouteStateStore {
-    /// Retire old usage payload and shadow diagnostics in bounded transactions.
-    /// The latest timer row is the heartbeat's comparison baseline, even after
-    /// a provider has been absent for weeks. Serving decisions, admissions,
-    /// observations and fences are permanent replay/evidence and are not pruned.
-    /// Freed pages are reused by SQLite; no runtime VACUUM rewrites the store.
-    pub fn prune_history(&self, now_ms: i64) -> RouteStateResult<(usize, usize)> {
-        let cutoff = now_ms.saturating_sub(crate::HISTORY_RETENTION_MS);
-        let result = self
-            .store
-            .with_conn(|conn: &Connection| {
-                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO retired_usage_delivery(id)
-                 SELECT id FROM model_route_usage WHERE observed_at < ?1
-                 ORDER BY observed_at LIMIT ?2",
-                    params![cutoff, crate::HISTORY_SWEEP_LIMIT],
-                )?;
-                let usage = tx.execute(
-                    "DELETE FROM model_route_usage WHERE id IN (
-                   SELECT id FROM model_route_usage WHERE observed_at < ?1
-                   ORDER BY observed_at LIMIT ?2)",
-                    params![cutoff, crate::HISTORY_SWEEP_LIMIT],
-                )?;
-                let shadows = tx.execute(
-                    "DELETE FROM account_decision WHERE rowid IN (
-                   SELECT old.rowid FROM account_decision AS old
-                   WHERE old.mode = 'shadow' AND old.created_at < ?1
-                     AND (old.trigger != 'timer' OR old.rowid != (
-                       SELECT latest.rowid FROM account_decision AS latest
-                       WHERE latest.mode = old.mode AND latest.trigger = old.trigger
-                         AND latest.provider = old.provider AND latest.family = old.family
-                       ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1))
-                   ORDER BY old.created_at LIMIT ?2)",
-                    params![cutoff, crate::HISTORY_SWEEP_LIMIT],
-                )?;
-                tx.commit()?;
-                Ok((usage, shadows))
-            })
-            .map_err(err)?;
-        if result.0 > 0 {
-            self.usage_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
-        Ok(result)
-    }
-
     /// Run `f` inside one IMMEDIATE write transaction over the account
     /// tables. `Ok` commits before this returns, so a reply built from the
     /// result is sent only once the decision is durable; `Err` rolls every

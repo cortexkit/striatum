@@ -64,50 +64,6 @@ fn decision(id: &str) -> AccountDecisionRecord {
     }
 }
 
-#[test]
-fn shadow_retention_keeps_latest_timer_ties_and_all_serving_identity() {
-    let rig = Rig::new("shadow-retention");
-    let store = rig.open();
-    let now = 1_800_000_000_000;
-    let cutoff = now - prefrontal_routing_store::HISTORY_RETENTION_MS;
-    store
-        .account_transaction(|tx| {
-            let mut row = decision("served");
-            row.created_at = cutoff - 100;
-            tx.insert_decision(&row)?;
-            for (id, trigger, provider, at) in [
-                ("older", "timer", "anthropic", cutoff - 3),
-                ("tie-first", "timer", "anthropic", cutoff - 2),
-                ("tie-latest", "timer", "anthropic", cutoff - 2),
-                ("absent-provider-baseline", "timer", "absent", cutoff - 10),
-                ("old-observation", "observation", "anthropic", cutoff - 1),
-                ("old-request", "request", "anthropic", cutoff - 1),
-                ("boundary", "observation", "anthropic", cutoff),
-            ] {
-                row.decision_id = id.into();
-                row.mode = "shadow".into();
-                row.trigger = trigger.into();
-                row.provider = provider.into();
-                row.created_at = at;
-                tx.insert_decision(&row)?;
-            }
-            Ok(())
-        })
-        .unwrap();
-    let latest = |provider| {
-        store
-            .account_transaction(|tx| tx.latest_decision("shadow", "timer", provider, "opus"))
-            .unwrap()
-    };
-    let before = (latest("anthropic"), latest("absent"));
-    assert_eq!(before.0.as_ref().unwrap().decision_id, "tie-latest");
-    assert_eq!(store.prune_history(now).unwrap(), (0, 4));
-    assert_eq!((latest("anthropic"), latest("absent")), before);
-    assert!(store.account_decision("served").unwrap().is_some());
-    assert!(store.account_decision("boundary").unwrap().is_some());
-    assert_eq!(store.account_decisions("shadow", 100).unwrap().len(), 3);
-}
-
 fn pin(id: &str, generation: u64, account: &str, decision_id: &str) -> AccountPinRow {
     AccountPinRow {
         pin_id: id.into(),
