@@ -4036,6 +4036,164 @@ mod tests {
         remove_observed_speed_test_store(&dir);
     }
 
+    #[test]
+    fn usage_delivery_enriches_each_null_column_and_preserves_first_values() {
+        use rusqlite::types::Value;
+
+        struct Case {
+            column: &'static str,
+            clear: fn(&mut UsageObservation),
+            conflict: fn(&mut UsageObservation),
+            expected: Value,
+        }
+
+        let cases = [
+            Case {
+                column: "input_tokens",
+                clear: |obs| obs.input_tokens = None,
+                conflict: |obs| obs.input_tokens = Some(4000.0),
+                expected: Value::Integer(1000),
+            },
+            Case {
+                column: "output_tokens",
+                clear: |obs| obs.output_tokens = f64::NAN,
+                conflict: |obs| obs.output_tokens = 2000.0,
+                expected: Value::Integer(500),
+            },
+            Case {
+                column: "duration_ms",
+                clear: |obs| obs.duration_ms = f64::NAN,
+                conflict: |obs| obs.duration_ms = 2000.0,
+                expected: Value::Integer(1000),
+            },
+            Case {
+                column: "reasoning_tokens",
+                clear: |obs| obs.reasoning_tokens = None,
+                conflict: |obs| obs.reasoning_tokens = Some(300.0),
+                expected: Value::Integer(100),
+            },
+            Case {
+                column: "cached_read_tokens",
+                clear: |obs| obs.cached_read_tokens = None,
+                conflict: |obs| obs.cached_read_tokens = Some(400.0),
+                expected: Value::Integer(200),
+            },
+            Case {
+                column: "cache_write_tokens",
+                clear: |obs| obs.cache_write_tokens = None,
+                conflict: |obs| obs.cache_write_tokens = Some(500.0),
+                expected: Value::Integer(300),
+            },
+            Case {
+                column: "workload_class",
+                clear: |obs| obs.workload_class = None,
+                conflict: |obs| obs.workload_class = Some("head".into()),
+                expected: Value::Text("ephemeral".into()),
+            },
+            Case {
+                column: "account_key",
+                clear: |obs| obs.account_key = None,
+                conflict: |obs| obs.account_key = Some("io/rebound".into()),
+                expected: Value::Text("io/account".into()),
+            },
+        ];
+        let (path, store) = observed_speed_test_store("all-enrichment-columns");
+        let observer = Connection::open(&path).unwrap();
+        let stored = |id: &str, column: &str| {
+            observer
+                .query_row(
+                    &format!("SELECT {column} FROM model_route_usage WHERE id = ?1"),
+                    [id],
+                    |row| row.get::<_, Value>(0),
+                )
+                .unwrap()
+        };
+
+        for case in cases {
+            let complete =
+                io_observation(&format!("enrichment-{}", case.column), 1_800_000_000_000.0);
+            let mut missing = complete.clone();
+            // Output/duration are non-optional in the domain observation; an
+            // unavailable measurement is stored as NULL. Verify that setup
+            // rather than assuming the sentinel reached the database as NULL.
+            (case.clear)(&mut missing);
+            store.record_usage_delivery(&missing).unwrap();
+            assert_eq!(
+                stored(&complete.id, case.column),
+                Value::Null,
+                "{}: first delivery must leave this column NULL",
+                case.column
+            );
+
+            let before = store.usage_generation.load(Ordering::Acquire);
+            store.record_usage_delivery(&complete).unwrap();
+            assert_eq!(
+                stored(&complete.id, case.column),
+                case.expected,
+                "{}: late enrichment must persist",
+                case.column
+            );
+            assert_eq!(
+                store.usage_generation.load(Ordering::Acquire),
+                before + 1,
+                "{}: enrichment must invalidate the population cache",
+                case.column
+            );
+
+            let mut conflicting = complete.clone();
+            (case.conflict)(&mut conflicting);
+            let before = store.usage_generation.load(Ordering::Acquire);
+            store.record_usage_delivery(&conflicting).unwrap();
+            assert_eq!(
+                stored(&complete.id, case.column),
+                case.expected,
+                "{}: an already-set value must not be overwritten",
+                case.column
+            );
+            assert_eq!(
+                store.usage_generation.load(Ordering::Acquire),
+                before,
+                "{}: a conflicting repeat is still a no-op",
+                case.column
+            );
+
+            // Also exercise COALESCE during a real UPDATE, not just a delivery
+            // whose WHERE rejects every assignment. Filling another column
+            // must not replace the first value in the column under test.
+            let mut first = complete.clone();
+            first.id = format!("first-value-{}", case.column);
+            let (witness, witness_value) = if case.column == "input_tokens" {
+                first.reasoning_tokens = None;
+                ("reasoning_tokens", Value::Integer(100))
+            } else {
+                first.input_tokens = None;
+                ("input_tokens", Value::Integer(1000))
+            };
+            store.record_usage_delivery(&first).unwrap();
+            assert_eq!(stored(&first.id, case.column), case.expected);
+            assert_eq!(stored(&first.id, witness), Value::Null);
+            conflicting.id = first.id.clone();
+            let before = store.usage_generation.load(Ordering::Acquire);
+            store.record_usage_delivery(&conflicting).unwrap();
+            assert_eq!(
+                stored(&first.id, witness),
+                witness_value,
+                "{}: witness enrichment must execute the UPDATE",
+                case.column
+            );
+            assert_eq!(
+                stored(&first.id, case.column),
+                case.expected,
+                "{}: COALESCE must preserve the first value during another column's enrichment",
+                case.column
+            );
+            assert_eq!(store.usage_generation.load(Ordering::Acquire), before + 1);
+        }
+        drop(observer);
+        drop(store);
+        remove_observed_speed_test_store(&path);
+    }
+
     fn insert_usage_row(
         store: &SqliteRouteStateStore,
         id: &str,
