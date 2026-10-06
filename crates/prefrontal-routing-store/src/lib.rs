@@ -4055,8 +4055,15 @@ mod tests {
         let now = 1_800_000_000_000.0;
         let cutoff = now - HISTORY_RETENTION_MS as f64;
         for i in 0..10 {
+            // Include observations well inside the seven-day policy window,
+            // not just current samples, so a too-short retention fence fails.
+            let at = if i < 5 {
+                now - 6.0 * 24.0 * 60.0 * 60_000.0
+            } else {
+                now - 1000.0
+            };
             store
-                .record_usage_delivery(&io_observation(&format!("recent-{i}"), now - 1000.0))
+                .record_usage_delivery(&io_observation(&format!("recent-{i}"), at))
                 .unwrap();
         }
         let expired = io_observation("expired", cutoff - 1.0);
