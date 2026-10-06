@@ -761,6 +761,9 @@ async fn quota_refresh_loop(
 
     loop {
         prune_expired_decisions(store.as_ref(), now_ms());
+        if let Err(error) = store.prune_history(now_ms() as i64) {
+            tracing::warn!(error = %error, "routing history retention cycle failed");
+        }
         let mut consumer = match QuotaConsumer::connect(&connection_file_path, &project_root).await
         {
             Ok(c) => c,

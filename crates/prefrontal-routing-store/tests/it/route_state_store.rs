@@ -1511,7 +1511,21 @@ fn migration_036_extends_the_single_usage_table_and_adds_the_class_time_index() 
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(usage_tables, vec!["model_route_usage"]);
+    // There is still only one token-profile table. Migration 45 adds an
+    // identity-only tombstone so age retention cannot double-count redrives;
+    // it must never become a second usage/profile ledger.
+    assert_eq!(
+        usage_tables,
+        vec!["model_route_usage", "retired_usage_delivery"]
+    );
+    let retired_columns = connection
+        .prepare("PRAGMA table_info(retired_usage_delivery)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(retired_columns, vec!["id"]);
     let index_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master

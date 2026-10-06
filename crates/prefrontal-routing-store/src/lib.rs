@@ -154,6 +154,13 @@ const MIGRATION_043: &str = include_str!("../migrations/043_account_quota.sql");
 /// admissions, holds, observations, fences and per-admission exclusions).
 const MIGRATION_044: &str = include_str!("../migrations/044_account_selection.sql");
 
+const MIGRATION_045: &str = include_str!("../migrations/045_io_retention.sql");
+
+/// Payload retention covers both the seven-day policy statistics and the
+/// fourteen-day quota interval history. Durable serving identities never expire.
+pub const HISTORY_RETENTION_MS: i64 = 14 * 24 * 60 * 60_000;
+const HISTORY_SWEEP_LIMIT: i64 = 1_000;
+
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 /// How many omitted `not_available` route keys the rejection summary names.
@@ -196,7 +203,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 44] {
+fn route_state_migrations() -> [Migration; 45] {
     [
         Migration {
             version: 1,
@@ -373,6 +380,10 @@ fn route_state_migrations() -> [Migration; 44] {
         Migration {
             version: 44,
             statements: MIGRATION_044,
+        },
+        Migration {
+            version: 45,
+            statements: MIGRATION_045,
         },
     ]
 }
@@ -2936,6 +2947,14 @@ impl RouteStateStore for SqliteRouteStateStore {
 
         self.store
             .with_conn(|c: &Connection| {
+                let retired = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM retired_usage_delivery WHERE id = ?1)",
+                    [&obs.id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if retired {
+                    return Ok((UsageRecordResult::default(), false));
+                }
                 let held_speed_observation = c
                     .query_row(
                         "SELECT COALESCE(output_tokens >= ?2 AND duration_ms >= ?3, FALSE)
@@ -2974,8 +2993,16 @@ impl RouteStateStore for SqliteRouteStateStore {
                                                          excluded.cache_write_tokens),
                            workload_class = COALESCE(model_route_usage.workload_class,
                                                      excluded.workload_class),
-                           account_key = COALESCE(model_route_usage.account_key,
-                                                  excluded.account_key)
+                            account_key = COALESCE(model_route_usage.account_key,
+                                                   excluded.account_key)
+                         WHERE (model_route_usage.input_tokens IS NULL AND excluded.input_tokens IS NOT NULL)
+                            OR (model_route_usage.output_tokens IS NULL AND excluded.output_tokens IS NOT NULL)
+                            OR (model_route_usage.duration_ms IS NULL AND excluded.duration_ms IS NOT NULL)
+                            OR (model_route_usage.reasoning_tokens IS NULL AND excluded.reasoning_tokens IS NOT NULL)
+                            OR (model_route_usage.cached_read_tokens IS NULL AND excluded.cached_read_tokens IS NOT NULL)
+                            OR (model_route_usage.cache_write_tokens IS NULL AND excluded.cache_write_tokens IS NOT NULL)
+                            OR (model_route_usage.workload_class IS NULL AND excluded.workload_class IS NOT NULL)
+                            OR (model_route_usage.account_key IS NULL AND excluded.account_key IS NOT NULL)
                          RETURNING output_tokens, duration_ms",
                         params![
                             obs.id,
@@ -3002,16 +3029,19 @@ impl RouteStateStore for SqliteRouteStateStore {
                             .is_some_and(|tokens| tokens >= USAGE_MIN_OUTPUT_TOKENS.floor() as i64)
                             && duration.is_some_and(|ms| ms >= USAGE_MIN_DURATION_MS.floor() as i64)
                     });
-                Ok(UsageRecordResult {
+                Ok((UsageRecordResult {
                     recorded: !held_speed_observation.unwrap_or(false) && holds_speed_observation,
                     usage_recorded: held_speed_observation.is_none(),
-                })
+                }, stored_speed_values.is_some()))
             })
             .map_err(err)
-            .inspect(|_| {
-                // Any write here, an insert or the enrichment of an existing row,
-                // can move a class mean; the next selection recomputes.
-                self.usage_generation.fetch_add(1, Ordering::AcqRel);
+            .map(|(result, changed)| {
+                // Retries that supply no new measurements must not invalidate the
+                // seven-day population mean. Only inserts/enrichment can move it.
+                if changed {
+                    self.usage_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                result
             })
     }
 
@@ -3950,6 +3980,156 @@ mod tests {
         );
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         (path, store)
+    }
+
+    fn io_observation(id: &str, at: f64) -> UsageObservation {
+        UsageObservation {
+            id: id.into(),
+            route_key: "io/model".into(),
+            capacity_key: "io/model".into(),
+            provider_id: "io".into(),
+            input_tokens: Some(1000.0),
+            output_tokens: 500.0,
+            duration_ms: 1000.0,
+            observed_at: at,
+            reasoning_tokens: Some(100.0),
+            cached_read_tokens: Some(200.0),
+            cache_write_tokens: Some(300.0),
+            workload_class: Some("ephemeral".into()),
+            account_key: Some("io/account".into()),
+        }
+    }
+
+    #[test]
+    fn duplicate_usage_delivery_changes_no_database_pages() {
+        let (dir, store) = observed_speed_test_store("duplicate-io");
+        let obs = io_observation("message", 1_800_000_000_000.0);
+        assert!(store.record_usage_delivery(&obs).unwrap().usage_recorded);
+        let observer = Connection::open(&dir).unwrap();
+        let version = || {
+            observer
+                .pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = version();
+        for _ in 0..10 {
+            assert_eq!(
+                store.record_usage_delivery(&obs).unwrap(),
+                UsageRecordResult::default()
+            );
+        }
+        assert_eq!(
+            version(),
+            before,
+            "a duplicate must not write even unchanged values"
+        );
+        drop(observer);
+        drop(store);
+        remove_observed_speed_test_store(&dir);
+    }
+
+    #[test]
+    fn duplicate_usage_delivery_does_not_invalidate_the_population_cache() {
+        let (dir, store) = observed_speed_test_store("duplicate-cache");
+        let mut obs = io_observation("message", 1_800_000_000_000.0);
+        obs.cached_read_tokens = None;
+        store.record_usage_delivery(&obs).unwrap();
+        let before = store.usage_generation.load(Ordering::Acquire);
+        store.record_usage_delivery(&obs).unwrap();
+        assert_eq!(store.usage_generation.load(Ordering::Acquire), before);
+        // A NULL-only profile upgrade still invalidates, even if speed was
+        // already eligible and the reply reports neither new recording effect.
+        obs.cached_read_tokens = Some(200.0);
+        assert_eq!(
+            store.record_usage_delivery(&obs).unwrap(),
+            UsageRecordResult::default()
+        );
+        assert_eq!(store.usage_generation.load(Ordering::Acquire), before + 1);
+        drop(store);
+        remove_observed_speed_test_store(&dir);
+    }
+
+    #[test]
+    fn history_compaction_keeps_golden_speed_and_class_policy_and_retired_identity() {
+        let (dir, store) = observed_speed_test_store("history-policy");
+        let now = 1_800_000_000_000.0;
+        let cutoff = now - HISTORY_RETENTION_MS as f64;
+        for i in 0..10 {
+            store
+                .record_usage_delivery(&io_observation(&format!("recent-{i}"), now - 1000.0))
+                .unwrap();
+        }
+        let expired = io_observation("expired", cutoff - 1.0);
+        store.record_usage_delivery(&expired).unwrap();
+        store
+            .record_usage_delivery(&io_observation("boundary", cutoff))
+            .unwrap();
+        let before = (
+            store.get_observed_speed("io/model", now).unwrap(),
+            store.get_class_vector("ephemeral", now).unwrap(),
+        );
+        assert_eq!(before.0, Some(500.0));
+        let golden = before.1.as_ref().unwrap();
+        assert_eq!(
+            (
+                golden.fresh_input,
+                golden.output_excluding_reasoning,
+                golden.reasoning,
+                golden.cached_read,
+                golden.cache_write,
+                golden.sample_count
+            ),
+            (1000.0, 400.0, 100.0, 200.0, 300.0, 10)
+        );
+        assert_eq!(store.prune_history(now as i64).unwrap(), (1, 0));
+        assert_eq!(
+            (
+                store.get_observed_speed("io/model", now).unwrap(),
+                store.get_class_vector("ephemeral", now).unwrap()
+            ),
+            before
+        );
+        assert_eq!(
+            store.record_usage_delivery(&expired).unwrap(),
+            UsageRecordResult::default()
+        );
+        let conn = Connection::open(&dir).unwrap();
+        let active: i64 = conn
+            .query_row("SELECT count(*) FROM model_route_usage", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(active, 11, "a retired redrive must not recreate payload");
+        drop(conn);
+        drop(store);
+        remove_observed_speed_test_store(&dir);
+    }
+
+    #[test]
+    fn history_sweep_is_bounded_and_reports_the_actual_writer_pragmas() {
+        let (dir, store) = observed_speed_test_store("history-batch");
+        store.store.with_conn(|c: &Connection| {
+            let journal: String = c.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+            let synchronous: i64 = c.pragma_query_value(None, "synchronous", |r| r.get(0))?;
+            let autocheckpoint: i64 = c.pragma_query_value(None, "wal_autocheckpoint", |r| r.get(0))?;
+            println!("routing writer pragmas: journal_mode={journal}, synchronous={synchronous}, wal_autocheckpoint={autocheckpoint}");
+            c.execute_batch("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<1002)
+                INSERT INTO model_route_usage(id,route_key,capacity_key,provider_id,observed_at)
+                SELECT printf('old-%d',n),'io/model','io/model','io',1 FROM seq")?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            store.prune_history(HISTORY_RETENTION_MS + 2).unwrap(),
+            (1000, 0)
+        );
+        assert_eq!(
+            store.prune_history(HISTORY_RETENTION_MS + 2).unwrap(),
+            (2, 0)
+        );
+        assert_eq!(
+            store.prune_history(HISTORY_RETENTION_MS + 2).unwrap(),
+            (0, 0)
+        );
+        drop(store);
+        remove_observed_speed_test_store(&dir);
     }
 
     fn insert_usage_row(

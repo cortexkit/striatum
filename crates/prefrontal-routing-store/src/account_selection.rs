@@ -230,6 +230,14 @@ const DECISION_COLUMNS: &str =
      provider, model, family, outcome, code, account_id, credential_id, policy_version, \
      decision_json, context_json, created_at";
 
+fn latest_decision_sql() -> String {
+    format!(
+        "SELECT {DECISION_COLUMNS} FROM account_decision \
+         WHERE mode = ?1 AND trigger = ?2 AND provider = ?3 AND family = ?4 \
+         ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    )
+}
+
 fn decision_from_row(row: &Row<'_>) -> rusqlite::Result<AccountDecisionRecord> {
     Ok(AccountDecisionRecord {
         decision_id: row.get(0)?,
@@ -927,11 +935,7 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<Option<AccountDecisionRecord>> {
         self.conn
             .query_row(
-                &format!(
-                    "SELECT {DECISION_COLUMNS} FROM account_decision \
-                     WHERE mode = ?1 AND trigger = ?2 AND provider = ?3 AND family = ?4 \
-                     ORDER BY created_at DESC, rowid DESC LIMIT 1"
-                ),
+                &latest_decision_sql(),
                 params![mode, trigger, provider, family],
                 decision_from_row,
             )
@@ -964,7 +968,88 @@ impl AccountTx<'_> {
     }
 }
 
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    #[test]
+    fn shadow_heartbeat_uses_an_exact_tuple_seek_without_sorting() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::MIGRATION_044).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_route_usage(id TEXT PRIMARY KEY, observed_at INTEGER)",
+        )
+        .unwrap();
+        conn.execute_batch(crate::MIGRATION_045).unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {}", latest_decision_sql());
+        let details = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(params!["shadow", "timer", "anthropic", "opus"], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|d| d.contains("account_decision_latest")
+                && d.contains("mode=? AND trigger=? AND provider=? AND family=?")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().all(|d| !d.contains("TEMP B-TREE")),
+            "{details:?}"
+        );
+    }
+}
+
 impl SqliteRouteStateStore {
+    /// Retire old usage payload and shadow diagnostics in bounded transactions.
+    /// The latest timer row is the heartbeat's comparison baseline, even after
+    /// a provider has been absent for weeks. Serving decisions, admissions,
+    /// observations and fences are permanent replay/evidence and are not pruned.
+    /// Freed pages are reused by SQLite; no runtime VACUUM rewrites the store.
+    pub fn prune_history(&self, now_ms: i64) -> RouteStateResult<(usize, usize)> {
+        let cutoff = now_ms.saturating_sub(crate::HISTORY_RETENTION_MS);
+        let result = self
+            .store
+            .with_conn(|conn: &Connection| {
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO retired_usage_delivery(id)
+                 SELECT id FROM model_route_usage WHERE observed_at < ?1
+                 ORDER BY observed_at LIMIT ?2",
+                    params![cutoff, crate::HISTORY_SWEEP_LIMIT],
+                )?;
+                let usage = tx.execute(
+                    "DELETE FROM model_route_usage WHERE id IN (
+                   SELECT id FROM model_route_usage WHERE observed_at < ?1
+                   ORDER BY observed_at LIMIT ?2)",
+                    params![cutoff, crate::HISTORY_SWEEP_LIMIT],
+                )?;
+                let shadows = tx.execute(
+                    "DELETE FROM account_decision WHERE rowid IN (
+                   SELECT old.rowid FROM account_decision AS old
+                   WHERE old.mode = 'shadow' AND old.created_at < ?1
+                     AND (old.trigger != 'timer' OR old.rowid != (
+                       SELECT latest.rowid FROM account_decision AS latest
+                       WHERE latest.mode = old.mode AND latest.trigger = old.trigger
+                         AND latest.provider = old.provider AND latest.family = old.family
+                       ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1))
+                   ORDER BY old.created_at LIMIT ?2)",
+                    params![cutoff, crate::HISTORY_SWEEP_LIMIT],
+                )?;
+                tx.commit()?;
+                Ok((usage, shadows))
+            })
+            .map_err(err)?;
+        if result.0 > 0 {
+            self.usage_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(result)
+    }
+
     /// Run `f` inside one IMMEDIATE write transaction over the account
     /// tables. `Ok` commits before this returns, so a reply built from the
     /// result is sent only once the decision is durable; `Err` rolls every
