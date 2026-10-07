@@ -20,7 +20,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model_facts::{
-    fact_to_route, ModelFact, ModelMetric, ModelRequirements, ModelRoute, ScoreProvenance,
+    fact_to_route, BasketPrice, ClassVector, ModelFact, ModelMetric, ModelRequirements, ModelRoute,
+    ScoreProvenance, CLASS_VECTOR_SAMPLE_FLOOR,
 };
 use crate::model_resolution::{use_basket_permitted, CLASS_PRODUCER, COUNTERS_PRODUCER};
 use crate::provider_model_spec::{ExclusionPolicy, ExclusionSource, ExclusionSpecs};
@@ -175,6 +176,62 @@ pub struct ObjectiveBreakdown {
     /// preferable to repeating these short strings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_abundance_window: Option<String>,
+    /// How the route's cost was computed when its selection priced by the token
+    /// basket: which ephemeral vector it used and which dimensions, if any, had
+    /// tokens but no rate. Absent when the selection priced output-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basket_pricing: Option<BasketRoutePricing>,
+}
+
+/// Where the token profile a route was basket-priced on came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BasketVectorSource {
+    /// The route's own ephemeral vector, above the sample floor.
+    Own,
+    /// The fleet-wide ephemeral vector, used because the route has no usable
+    /// vector of its own.
+    Fleet,
+}
+
+impl BasketVectorSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BasketVectorSource::Own => "own",
+            BasketVectorSource::Fleet => "fleet",
+        }
+    }
+}
+
+/// Per-route record of how a basket price was formed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BasketRoutePricing {
+    pub vector: BasketVectorSource,
+    /// Dimensions the workload uses (tokens > 0) for which the route serves no
+    /// rate. Non-empty means the route could not be priced and carries the
+    /// unpriced-route cost instead (see [`selection_cost`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unpriced_dimensions: Vec<String>,
+}
+
+/// The unit a whole selection was priced in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingMode {
+    /// Every shortlisted route priced on a token basket.
+    Basket,
+    /// Every shortlisted route priced on its output $/Mtok ladder.
+    OutputOnly,
+}
+
+impl PricingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PricingMode::Basket => "basket",
+            PricingMode::OutputOnly => "output_only",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -219,6 +276,11 @@ pub struct SelectedRouteScore {
     pub selection_cost: f64,
     pub metrics: BTreeMap<ModelMetric, MetricFit>,
     pub objective: ObjectiveBreakdown,
+    /// The unit the whole selection was priced in.
+    pub pricing_mode: PricingMode,
+    /// Why the selection priced output-only, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -262,6 +324,9 @@ pub struct PricedShortlistEntry {
     pub overqualification: f64,
     /// Cached-read term in list dollars: `cached_read * cache_read_rate / 1e6`.
     pub cached_read_term_usd: Option<f64>,
+    /// How the route was basket-priced; None when the selection priced
+    /// output-only.
+    pub basket_pricing: Option<BasketRoutePricing>,
 }
 
 /// The shortlist `select_model_route` would price, with the whole-selection
@@ -270,10 +335,14 @@ pub struct PricedShortlistEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PricedShortlist {
     pub use_basket: bool,
-    /// First shortlisted route missing a required basket rate or a usable
-    /// ephemeral vector. Independent of the producer flags: when those flags
-    /// forbid the basket, this still names the rate/vector degrader if any.
+    /// First shortlisted route with neither a usable ephemeral vector of its
+    /// own nor a usable fleet vector to fall back on. A missing rate never
+    /// names a route here: it prices that one route as unpriced and leaves the
+    /// selection's mode alone. Independent of the producer flags: when those
+    /// flags forbid the basket, this still names the vector degrader if any.
     pub degraded_by: Option<String>,
+    /// Why the selection priced output-only, when it did.
+    pub pricing_fallback: Option<String>,
     pub routes: Vec<PricedShortlistEntry>,
 }
 
@@ -576,12 +645,59 @@ fn normalized_speed(speed: f64) -> f64 {
     ((speed - SPEED_FLOOR_TPS) / (SPEED_CEILING_TPS - SPEED_FLOOR_TPS)).clamp(0.0, 1.0)
 }
 
-/// Cached-read term in list dollars. None when the ephemeral vector or the
-/// cache-read rate is missing; an explicit zero rate is a present term of $0.
-fn cached_read_term_usd(fact: &ModelFact) -> Option<f64> {
-    let vector = fact.ephemeral_vector()?;
+/// Cached-read term in list dollars on `vector`. None when there is no vector
+/// or the cache-read rate is missing; an explicit zero rate is a present term
+/// of $0.
+fn cached_read_term_usd(fact: &ModelFact, vector: Option<&ClassVector>) -> Option<f64> {
+    let vector = vector?;
     let rate = fact.cache_read_rate?;
     Some((vector.cached_read * rate) / 1_000_000.0)
+}
+
+/// The unit one route is priced in, decided for the whole selection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CostBasis<'v> {
+    /// The output $/Mtok ladder (effective price, tier, unpriced rule).
+    OutputOnly,
+    /// A token basket on `vector`, which came from `source`.
+    Basket {
+        vector: &'v ClassVector,
+        source: BasketVectorSource,
+    },
+}
+
+/// The output-only ladder: effective output price, then tier, then the
+/// unpriced-route rule.
+fn output_only_cost(fact: &ModelFact, is_subscription: bool) -> f64 {
+    if subscription_price_unpublished(fact, is_subscription) {
+        return 0.0;
+    }
+    normalized_metered_cost(fact)
+}
+
+/// A subscription route whose catalog row publishes no price at all.
+fn subscription_price_unpublished(fact: &ModelFact, is_subscription: bool) -> bool {
+    is_subscription && fact.cost_per_m_tok_out.is_none() && fact.cost_tier.is_none()
+}
+
+/// The basket cost of one route on `vector`, with the dimension-level detail.
+/// A route that cannot be priced (a dimension with tokens and no rate) takes
+/// the existing unpriced-route rule: the maximum cost (1.0), except a
+/// subscription route that publishes no price at all, whose marginal token cost
+/// is zero as on the output-only ladder. Either way only that route is
+/// affected; the selection keeps its basket mode.
+fn basket_route_cost(
+    fact: &ModelFact,
+    is_subscription: bool,
+    vector: &ClassVector,
+) -> (f64, BasketPrice) {
+    let price = fact.basket_price(vector);
+    let cost = match price.cost {
+        Some(cost) => cost,
+        None if subscription_price_unpublished(fact, is_subscription) => 0.0,
+        None => 1.0,
+    };
+    (cost, price)
 }
 
 /// Selection cost among models that already clear the quality bar. Lower wins.
@@ -602,51 +718,113 @@ fn cached_read_term_usd(fact: &ModelFact) -> Option<f64> {
 /// subscription planes such as ollama-cloud at all. Ranking those routes at the
 /// maximum priced every glm, deepseek, and kimi route on the plan above sol. An
 /// unpublished price under a metered provider still ranks at the maximum.
+///
+/// Under the basket (`use_basket`), the route is priced on its attached
+/// ephemeral vector when that vector clears the sample floor, dimension by
+/// dimension: a dimension the workload never uses needs no rate, and a route
+/// with a used dimension it has no rate for takes the unpriced-route cost above.
+/// Without a usable vector the output-only ladder prices it.
 pub fn selection_cost(fact: &ModelFact, is_subscription: bool, use_basket: bool) -> f64 {
     if use_basket {
-        if let Some(basket_cost) = fact.basket_cost() {
-            return basket_cost;
+        if let Some(vector) = fact.ephemeral_vector().filter(|v| v.is_usable()) {
+            return basket_route_cost(fact, is_subscription, vector).0;
         }
     }
-    if is_subscription && fact.cost_per_m_tok_out.is_none() && fact.cost_tier.is_none() {
-        return 0.0;
-    }
-    normalized_metered_cost(fact)
+    output_only_cost(fact, is_subscription)
 }
 
 pub(crate) fn compute_objective(
     route: &ModelRoute,
     runtime: &RouteRuntimeState,
     is_subscription: bool,
-    use_basket: bool,
+    basis: CostBasis<'_>,
 ) -> (ObjectiveBreakdown, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
 
-    let cost = selection_cost(&route.fact, is_subscription, use_basket);
     let multiplier = subscription_multiplier(&route.fact);
     let coverage = if is_subscription {
         "subscription-covered"
     } else {
         "metered"
     };
-    let detail = if use_basket {
+    let mut basket_pricing = None;
+    let (cost, detail) = if let CostBasis::Basket { vector, source } = basis {
+        let (cost, price) = basket_route_cost(&route.fact, is_subscription, vector);
         let quantity = if is_subscription {
             "basket-per-message quota proxy"
         } else {
             "list dollars"
         };
-        let cached_read_term = cached_read_term_usd(&route.fact);
-        let mut detail = if let Some(cr) = cached_read_term {
-            format!("basket pricing ({quantity}), cached-read term ${:.4}", cr)
+        let mut detail = format!("basket pricing ({quantity})");
+        if price.unpriced.is_empty() {
+            if let Some(cr) = cached_read_term_usd(&route.fact, Some(vector)) {
+                detail.push_str(&format!(", cached-read term ${:.4}", cr));
+            }
         } else {
-            format!("basket pricing ({quantity})")
-        };
+            // Name every used dimension the catalog row serves no rate for, so a
+            // route losing on cost because it could not be priced does not read
+            // like one losing because it is expensive.
+            let missing = price
+                .unpriced
+                .iter()
+                .map(|dimension| {
+                    format!(
+                        "{} {:.0} tokens/message, no {}",
+                        dimension.as_str(),
+                        dimension.tokens(vector),
+                        dimension.rate_name()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            if subscription_price_unpublished(&route.fact, is_subscription) {
+                detail.push_str(&format!(
+                    ", price unpublished, subscription plan: marginal token cost zero ({missing})"
+                ));
+            } else {
+                detail.push_str(&format!(", unpriceable, ranked as max ({missing})"));
+            }
+        }
+        detail.push_str(&format!(
+            ", {} vector ({} samples)",
+            source.as_str(),
+            vector.sample_count
+        ));
+        if source == BasketVectorSource::Fleet {
+            detail.push_str(", no usable own vector");
+        }
         if (multiplier - 1.0).abs() > f64::EPSILON {
             detail.push_str(&format!(", x{} subsidy", fmt_num(multiplier)));
         }
         detail.push_str(&format!(", {coverage}"));
-        detail
-    } else if let Some(list_price) = route.fact.cost_per_m_tok_out {
+        basket_pricing = Some(BasketRoutePricing {
+            vector: source,
+            unpriced_dimensions: price
+                .unpriced
+                .iter()
+                .map(|dimension| dimension.as_str().to_string())
+                .collect(),
+        });
+        (cost, detail)
+    } else {
+        (
+            output_only_cost(&route.fact, is_subscription),
+            output_only_detail(route, is_subscription, multiplier, coverage),
+        )
+    };
+    notes.push(format!("cost +{cost:.2} ({detail})"));
+
+    objective_tail(route, runtime, is_subscription, cost, basket_pricing, notes)
+}
+
+/// The cost line's detail on the output-only ladder.
+fn output_only_detail(
+    route: &ModelRoute,
+    is_subscription: bool,
+    multiplier: f64,
+    coverage: &str,
+) -> String {
+    if let Some(list_price) = route.fact.cost_per_m_tok_out {
         let effective = list_price / multiplier;
         let mut detail = format!(
             "output $/Mtok: effective ${}/Mtok, list ${}/Mtok",
@@ -668,9 +846,19 @@ pub(crate) fn compute_objective(
         // every cost comparison because nobody knows its price looks identical
         // to one losing because it is genuinely expensive.
         format!("price unknown (ranked as max), {coverage}")
-    };
-    notes.push(format!("cost +{cost:.2} ({detail})"));
+    }
+}
 
+/// Everything in the objective after the cost line: quota terms, abundance,
+/// and the speed tie-break.
+fn objective_tail(
+    route: &ModelRoute,
+    runtime: &RouteRuntimeState,
+    is_subscription: bool,
+    cost: f64,
+    basket_pricing: Option<BasketRoutePricing>,
+    mut notes: Vec<String>,
+) -> (ObjectiveBreakdown, Vec<String>) {
     // A subscription route with NO pressure reading must say so, or a decision
     // reader cannot tell "known to be idle" from "nothing was measured" - and
     // both land on the same 0.0 in the term below.
@@ -724,6 +912,7 @@ pub(crate) fn compute_objective(
             subscription_covered: is_subscription,
             quota_abundance,
             quota_abundance_window,
+            basket_pricing,
         },
         notes,
     )
@@ -792,6 +981,9 @@ struct Scored {
     idx: usize,
     objective: ObjectiveBreakdown,
     objective_notes: Vec<String>,
+    /// Cached-read term on the vector the route was priced on (or, when the
+    /// selection priced output-only, on the fact's attached vector).
+    cached_read_term_usd: Option<f64>,
 }
 
 struct PricedAdmission {
@@ -800,8 +992,49 @@ struct PricedAdmission {
     scored: Vec<Scored>,
     use_basket: bool,
     degraded_by: Option<String>,
+    pricing_fallback: Option<String>,
     best_effort: bool,
     cleared_count: usize,
+}
+
+/// The fleet-wide ephemeral vector: the overlay the routing store lays over
+/// every fact (one whole-population statistic, so every overlaid fact carries
+/// the same one). When facts disagree, the one with the most samples is taken;
+/// the first such fact wins a tie so the choice does not depend on anything
+/// but input order.
+fn fleet_ephemeral_vector(facts: &[ModelFact]) -> Option<&ClassVector> {
+    facts
+        .iter()
+        .filter_map(ModelFact::fleet_ephemeral_vector)
+        .fold(None, |best: Option<&ClassVector>, candidate| match best {
+            Some(best) if best.sample_count >= candidate.sample_count => Some(best),
+            _ => Some(candidate),
+        })
+}
+
+/// The vector one route is basket-priced on: its own when that clears the
+/// sample floor, else the fleet vector when that does.
+fn route_basket_vector<'v>(
+    fact: &'v ModelFact,
+    fleet: Option<&'v ClassVector>,
+) -> Option<(&'v ClassVector, BasketVectorSource)> {
+    if let Some(own) = fact.own_ephemeral_vector().filter(|v| v.is_usable()) {
+        return Some((own, BasketVectorSource::Own));
+    }
+    fleet
+        .filter(|v| v.is_usable())
+        .map(|v| (v, BasketVectorSource::Fleet))
+}
+
+/// Why no usable vector exists for a route that has none of its own.
+fn fleet_vector_unusable_reason(fleet: Option<&ClassVector>) -> String {
+    match fleet {
+        None => "no fleet ephemeral vector".to_string(),
+        Some(vector) => format!(
+            "fleet ephemeral vector has {} samples, below the floor of {}",
+            vector.sample_count, CLASS_VECTOR_SAMPLE_FLOOR
+        ),
+    }
 }
 
 fn admit_and_price_shortlist(
@@ -935,22 +1168,37 @@ fn admit_and_price_shortlist(
         .map(|(i, _)| i)
         .collect();
 
-    // Whole-selection basket gate: producers must both exist, the overlay's
-    // ephemeral vector must be usable, and every shortlisted candidate must
-    // serve the required rates. account_producer is not in this predicate.
+    // Basket gate. Basket pricing is decided per route and per dimension: a
+    // missing rate only affects the route that lacks it (see
+    // `basket_route_cost`), so no catalog gap anywhere in the shortlist can
+    // switch the whole selection's unit. The one whole-selection fallback left
+    // is a shortlisted route with no usable token profile at all: neither its
+    // own ephemeral vector nor the fleet's clears the sample floor, so nothing
+    // can be basket-priced on equal terms. The producer flags are the other
+    // precondition; account_producer is not in this predicate.
+    let fleet_vector = fleet_ephemeral_vector(&input.facts);
     let degraded_by = shortlist.iter().find_map(|&idx| {
-        let fact = &admissible[idx].route.fact;
-        if fact.has_required_basket_rates()
-            && fact.ephemeral_vector().is_some_and(|v| v.is_usable())
-        {
-            None
-        } else {
-            Some(admissible[idx].route.route_key.clone())
-        }
+        let route = &admissible[idx].route;
+        route_basket_vector(&route.fact, fleet_vector)
+            .is_none()
+            .then(|| route.route_key.clone())
     });
-    let use_basket = use_basket_permitted(counters_producer, class_producer)
-        && !shortlist.is_empty()
-        && degraded_by.is_none();
+    let producers_permit = use_basket_permitted(counters_producer, class_producer);
+    let use_basket = producers_permit && !shortlist.is_empty() && degraded_by.is_none();
+    let pricing_fallback = if use_basket {
+        None
+    } else if !producers_permit {
+        Some(format!(
+            "basket producers absent (counters_producer={counters_producer}, class_producer={class_producer})"
+        ))
+    } else if let Some(route_key) = &degraded_by {
+        Some(format!(
+            "{route_key} has no usable ephemeral vector of its own and {}",
+            fleet_vector_unusable_reason(fleet_vector)
+        ))
+    } else {
+        Some("empty shortlist".to_string())
+    };
 
     let scored: Vec<Scored> = shortlist
         .into_iter()
@@ -961,8 +1209,21 @@ fn admit_and_price_shortlist(
                 .as_ref()
                 .map(|pred| pred(&a.route))
                 .unwrap_or(false);
-            let (mut breakdown, mut notes) =
-                compute_objective(&a.route, &a.runtime, is_sub, use_basket);
+            let basis = if use_basket {
+                let (vector, source) = route_basket_vector(&a.route.fact, fleet_vector)
+                    .expect("the basket gate admitted only routes with a usable vector");
+                CostBasis::Basket { vector, source }
+            } else {
+                CostBasis::OutputOnly
+            };
+            let cached_read_term = cached_read_term_usd(
+                &a.route.fact,
+                match basis {
+                    CostBasis::Basket { vector, .. } => Some(vector),
+                    CostBasis::OutputOnly => a.route.fact.ephemeral_vector(),
+                },
+            );
+            let (mut breakdown, mut notes) = compute_objective(&a.route, &a.runtime, is_sub, basis);
             apply_overqualification(
                 &mut breakdown,
                 &mut notes,
@@ -975,6 +1236,7 @@ fn admit_and_price_shortlist(
                 idx,
                 objective: breakdown,
                 objective_notes: notes,
+                cached_read_term_usd: cached_read_term,
             }
         })
         .collect();
@@ -985,24 +1247,26 @@ fn admit_and_price_shortlist(
         scored,
         use_basket,
         degraded_by,
+        pricing_fallback,
         best_effort,
         cleared_count,
     })
 }
 
 /// Prices every shortlisted route the way [`select_model_route`] would, including
-/// the whole-selection basket verdict. The bucket-membership replay uses this so
-/// a route is judged free in the selection it was actually priced in.
+/// the selection's pricing mode. The bucket-membership replay uses this so a
+/// route is judged free in the selection it was actually priced in.
 ///
 /// `counters_producer` and `class_producer` are the two flags that may engage
 /// the basket; there is no `account_producer` argument because its absence must
 /// never force the basket off.
 ///
-/// Reference calibration is measured off the host stores, not invented.
-/// Live routing `model_facts` is schema v35 and does not persist Fusiform rates.
-/// Joining the scored routable catalog to latest Fusiform eras, every
-/// reconstructed mason shortlist includes a route with no rate card, so the
-/// basket does not engage. See the catalog-and-readings replay test.
+/// Reference calibration is measured off the host stores, not invented. When
+/// the whole selection had to be all-or-nothing on rate cards, every
+/// reconstructed mason shortlist held a route with no rate card
+/// (gpt-5.6-sol-pro) and the basket never engaged. Pricing is per dimension
+/// now: that route prices as unpriced and the rest of the shortlist stays on
+/// the basket. See the catalog-and-readings replay test.
 pub fn price_selection_shortlist(
     input: SelectModelRouteInput<'_>,
     config: &RoutingConfig,
@@ -1013,6 +1277,7 @@ pub fn price_selection_shortlist(
     Ok(PricedShortlist {
         use_basket: priced.use_basket,
         degraded_by: priced.degraded_by,
+        pricing_fallback: priced.pricing_fallback,
         routes: priced
             .scored
             .iter()
@@ -1023,7 +1288,8 @@ pub fn price_selection_shortlist(
                     cost: s.objective.cost,
                     selection_cost: s.objective.selection_cost,
                     overqualification: s.objective.overqualification,
-                    cached_read_term_usd: cached_read_term_usd(&admitted.route.fact),
+                    cached_read_term_usd: s.cached_read_term_usd,
+                    basket_pricing: s.objective.basket_pricing.clone(),
                 }
             })
             .collect(),
@@ -1051,6 +1317,7 @@ pub fn select_model_route_with_slots(
         mut rejected,
         scored,
         use_basket,
+        pricing_fallback,
         best_effort,
         cleared_count,
         ..
@@ -1156,6 +1423,14 @@ pub fn select_model_route_with_slots(
         winner.objective.selection_cost,
     ));
     explanation.extend(winner.objective_notes.iter().cloned());
+    // The unit the whole shortlist was priced in, and why when it is not the
+    // basket: per-route lines above say how each route was priced, this one
+    // says which comparison they were all part of.
+    explanation.push(match &pricing_fallback {
+        None if use_basket => "pricing: basket for the whole shortlist".to_string(),
+        Some(reason) => format!("pricing: output-only for the whole shortlist ({reason})"),
+        None => "pricing: output-only for the whole shortlist".to_string(),
+    });
     explanation.extend(guard_note);
     explanation.extend(
         rejected
@@ -1208,6 +1483,12 @@ pub fn select_model_route_with_slots(
             selection_cost: winner.objective.selection_cost,
             metrics: winner_admissible.adequacy.metrics.clone(),
             objective: winner.objective.clone(),
+            pricing_mode: if use_basket {
+                PricingMode::Basket
+            } else {
+                PricingMode::OutputOnly
+            },
+            pricing_fallback: pricing_fallback.clone(),
         },
         prompt_params: PromptParams {
             provider_id: fact.provider_id.clone(),
@@ -1584,6 +1865,7 @@ mod abundance_tests {
             subscription_covered: false,
             quota_abundance: None,
             quota_abundance_window: None,
+            basket_pricing: None,
         };
 
         assert_eq!(

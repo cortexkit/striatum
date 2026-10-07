@@ -446,14 +446,33 @@ impl ModelFact {
             .map(GrandFamily::as_str)
     }
 
-    /// The ephemeral vector attached by `get_facts_with_observed_speed`.
+    /// The ephemeral vector attached by `get_facts_with_observed_speed`, whether
+    /// it is the route's own or the fleet-wide overlay (see
+    /// [`ModelFact::own_ephemeral_vector`] for the distinction).
     pub fn ephemeral_vector(&self) -> Option<&ClassVector> {
         self.class_vector
             .as_ref()
             .filter(|v| v.workload_class == "ephemeral")
     }
 
-    /// True when all four rates required for basket pricing are served.
+    /// The ephemeral vector measured on this route alone. A vector carried with
+    /// `class_vector_is_overlay` set is the fleet-wide statistic laid over every
+    /// fact at read time (the routing store computes one whole-population
+    /// ephemeral mean and stamps it on each fact), so it is not the route's own.
+    pub fn own_ephemeral_vector(&self) -> Option<&ClassVector> {
+        self.ephemeral_vector()
+            .filter(|_| !self.class_vector_is_overlay)
+    }
+
+    /// The fleet-wide ephemeral vector this fact carries as a read-time overlay.
+    pub fn fleet_ephemeral_vector(&self) -> Option<&ClassVector> {
+        self.ephemeral_vector()
+            .filter(|_| self.class_vector_is_overlay)
+    }
+
+    /// True when all four catalog rates a basket can use are served. Basket
+    /// pricing no longer requires this: a dimension the workload never uses
+    /// needs no rate (see [`ModelFact::basket_price`]).
     pub fn has_required_basket_rates(&self) -> bool {
         self.cost_per_m_tok_out.is_some()
             && self.input_rate.is_some()
@@ -461,30 +480,124 @@ impl ModelFact {
             && self.cache_write_rate.is_some()
     }
 
-    /// Basket price per message normalized against BASKET_REFERENCE_COST_PER_MESSAGE.
-    /// Returns None when the vector is unusable or any required rate is absent.
-    pub fn basket_cost(&self) -> Option<f64> {
-        let vector = self.ephemeral_vector().filter(|v| v.is_usable())?;
-        let cost_per_m_tok_out = self.cost_per_m_tok_out?;
-        let input_rate = self.input_rate?;
-        let cache_read_rate = self.cache_read_rate?;
-        let cache_write_rate = self.cache_write_rate?;
-        let reasoning_rate = self.reasoning_rate.unwrap_or(cost_per_m_tok_out);
+    /// The catalog rate ($/Mtok) for one basket dimension. Reasoning tokens fall
+    /// back to the output rate when no separate reasoning rate is served.
+    pub fn basket_rate(&self, dimension: BasketDimension) -> Option<f64> {
+        match dimension {
+            BasketDimension::FreshInput => self.input_rate,
+            BasketDimension::OutputExcludingReasoning => self.cost_per_m_tok_out,
+            BasketDimension::Reasoning => self.reasoning_rate.or(self.cost_per_m_tok_out),
+            BasketDimension::CachedRead => self.cache_read_rate,
+            BasketDimension::CacheWrite => self.cache_write_rate,
+        }
+    }
+
+    /// Prices one message of `vector`'s workload on this route, dimension by
+    /// dimension: the sum of tokens x rate over the five token dimensions, divided
+    /// by the subscription multiplier, normalized against
+    /// BASKET_REFERENCE_COST_PER_MESSAGE and clamped to 0..1.
+    ///
+    /// A dimension with no tokens needs no rate: it contributes zero whatever its
+    /// rate would be (Codex runs record no cache-write tokens, so a catalog row
+    /// without a cache-write rate still prices fully). A dimension with tokens
+    /// and no usable rate makes the route unpriceable; `cost` is then `None` and
+    /// `unpriced` names every such dimension. The vector's sample floor is the
+    /// caller's concern.
+    pub fn basket_price(&self, vector: &ClassVector) -> BasketPrice {
         let multiplier = self
             .subscription_multiplier
             .filter(|m| m.is_finite() && *m > 0.0)
             .unwrap_or(1.0);
-        let output_excluding_reasoning = vector.output_excluding_reasoning.max(0.0);
-        let raw_cost = (vector.fresh_input * input_rate
-            + output_excluding_reasoning * cost_per_m_tok_out
-            + vector.reasoning * reasoning_rate
-            + vector.cached_read * cache_read_rate
-            + vector.cache_write * cache_write_rate)
-            / 1_000_000.0;
-        let basket_unscaled = raw_cost / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE;
-        let normalized = basket_unscaled / multiplier;
-        Some(normalized.clamp(0.0, 1.0))
+        let mut raw_cost = 0.0;
+        let mut unpriced = Vec::new();
+        for dimension in BasketDimension::ALL {
+            let tokens = dimension.tokens(vector);
+            if tokens <= 0.0 || tokens.is_nan() {
+                continue;
+            }
+            match self.basket_rate(dimension).filter(|rate| rate.is_finite()) {
+                Some(rate) => raw_cost += tokens * rate,
+                None => unpriced.push(dimension),
+            }
+        }
+        let cost = unpriced.is_empty().then(|| {
+            let basket_unscaled =
+                raw_cost / 1_000_000.0 / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE;
+            (basket_unscaled / multiplier).clamp(0.0, 1.0)
+        });
+        BasketPrice { cost, unpriced }
     }
+
+    /// Basket price per message on this fact's attached ephemeral vector,
+    /// normalized against BASKET_REFERENCE_COST_PER_MESSAGE. Returns None when
+    /// the vector is absent or below the sample floor, or when a dimension the
+    /// vector uses has no rate (see [`ModelFact::basket_price`]).
+    pub fn basket_cost(&self) -> Option<f64> {
+        let vector = self.ephemeral_vector().filter(|v| v.is_usable())?;
+        self.basket_price(vector).cost
+    }
+}
+
+/// One token dimension of a basket price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasketDimension {
+    FreshInput,
+    OutputExcludingReasoning,
+    Reasoning,
+    CachedRead,
+    CacheWrite,
+}
+
+impl BasketDimension {
+    pub const ALL: [BasketDimension; 5] = [
+        BasketDimension::FreshInput,
+        BasketDimension::OutputExcludingReasoning,
+        BasketDimension::Reasoning,
+        BasketDimension::CachedRead,
+        BasketDimension::CacheWrite,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BasketDimension::FreshInput => "fresh_input",
+            BasketDimension::OutputExcludingReasoning => "output",
+            BasketDimension::Reasoning => "reasoning",
+            BasketDimension::CachedRead => "cached_read",
+            BasketDimension::CacheWrite => "cache_write",
+        }
+    }
+
+    /// The rate field a reader would look for when this dimension is unpriced.
+    pub fn rate_name(self) -> &'static str {
+        match self {
+            BasketDimension::FreshInput => "input_rate",
+            BasketDimension::OutputExcludingReasoning => "cost_per_m_tok_out",
+            BasketDimension::Reasoning => "reasoning_rate or cost_per_m_tok_out",
+            BasketDimension::CachedRead => "cache_read_rate",
+            BasketDimension::CacheWrite => "cache_write_rate",
+        }
+    }
+
+    /// Mean tokens per message on this dimension. Output excludes reasoning and
+    /// is floored at zero, as the store computes it.
+    pub fn tokens(self, vector: &ClassVector) -> f64 {
+        match self {
+            BasketDimension::FreshInput => vector.fresh_input,
+            BasketDimension::OutputExcludingReasoning => vector.output_excluding_reasoning.max(0.0),
+            BasketDimension::Reasoning => vector.reasoning,
+            BasketDimension::CachedRead => vector.cached_read,
+            BasketDimension::CacheWrite => vector.cache_write,
+        }
+    }
+}
+
+/// Result of [`ModelFact::basket_price`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BasketPrice {
+    /// Normalized basket cost (0..1), or None when a used dimension has no rate.
+    pub cost: Option<f64>,
+    /// Dimensions with tokens > 0 and no usable rate, in dimension order.
+    pub unpriced: Vec<BasketDimension>,
 }
 
 /// Derive the canonical provider key from a routing key.

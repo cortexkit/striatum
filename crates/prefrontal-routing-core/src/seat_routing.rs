@@ -26,7 +26,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use crate::model_facts::{ModelFact, ModelRequirements, ModelRoute};
 use crate::model_router::{
-    admit_routes, compute_objective, normalized_metered_cost, AdmittedRoute,
+    admit_routes, compute_objective, normalized_metered_cost, AdmittedRoute, CostBasis,
     ModelRouteStateSnapshot, ObjectiveBreakdown, RequiredCapabilities, SelectedModel,
 };
 use crate::provider_model_spec::ExclusionPolicy;
@@ -443,8 +443,12 @@ fn order_candidates(pool: Vec<AdmittedRoute>, input: &SeatRouteInput<'_>) -> Vec
                 .as_ref()
                 .map(|predicate| predicate(&admitted.route))
                 .unwrap_or(false);
-            let (objective, _) =
-                compute_objective(&admitted.route, &admitted.runtime, is_subscription, false);
+            let (objective, _) = compute_objective(
+                &admitted.route,
+                &admitted.runtime,
+                is_subscription,
+                CostBasis::OutputOnly,
+            );
             SeatCandidate {
                 metered_cost: normalized_metered_cost(&admitted.route.fact),
                 admitted,
