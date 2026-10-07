@@ -2379,7 +2379,9 @@ fn decision_shape(decision: &Value) -> Value {
 /// session for the observed model (Opus when it names none) and carries the
 /// observation in the record. Returns the recorded decision ids.
 pub fn shadow_pass(ctx: &Ctx<'_>, trigger: ShadowTrigger<'_>) -> RouteStateResult<Vec<String>> {
-    let mut recorded = Vec::new();
+    // Resolve the in-memory rosters before opening the store transaction, so a
+    // diagnostic write never holds the store lock while acquiring the quota lock.
+    let mut passes = Vec::new();
     for provider in tracked_providers(ctx) {
         let provider = provider.as_str();
         let models: Vec<(ModelFamily, String)> = match &trigger {
@@ -2416,7 +2418,24 @@ pub fn shadow_pass(ctx: &Ctx<'_>, trigger: ShadowTrigger<'_>) -> RouteStateResul
                 ShadowTrigger::Observation(observation) => Some((*observation).clone()),
                 ShadowTrigger::Timer => None,
             };
-            let id = ctx.store.account_transaction(|tx| {
+            passes.push((
+                provider.to_owned(),
+                family,
+                model,
+                roster,
+                trigger_name,
+                request,
+                observation,
+            ));
+        }
+    }
+    // One observation fans out to several providers. Commit its diagnostic
+    // decisions together rather than flushing the same indexes once per row.
+    ctx.store.account_transaction(|tx| {
+        let mut recorded = Vec::new();
+        for (provider, family, model, roster, trigger_name, request, observation) in passes {
+            let provider = provider.as_str();
+            let id = (|| {
                 let state = AllocatorState {
                     roster: roster.roster.clone(),
                     affinity: None,
@@ -2461,11 +2480,11 @@ pub fn shadow_pass(ctx: &Ctx<'_>, trigger: ShadowTrigger<'_>) -> RouteStateResul
                     now_ms: ctx.now_ms,
                 }))?;
                 Ok(Some(decision_id))
-            })?;
+            })()?;
             recorded.extend(id);
         }
-    }
-    Ok(recorded)
+        Ok(recorded)
+    })
 }
 
 /// Shadow a caller's own `route.account_for` while serving is off: the
@@ -3863,6 +3882,23 @@ mod tests {
             .all(|row| !row["why"].as_array().unwrap().is_empty()));
         let broca_view = result(fixture.call(&later, ACCOUNT_SHADOW_STATUS_OP, BROCA, json!({})));
         assert_eq!(broca_view["decisions"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn shadow_pass_batches_all_families_atomically() {
+        let fixture = fixture("shadow-atomic");
+        let conn = rusqlite::Connection::open(fixture.dir.join("store.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_opus BEFORE INSERT ON account_decision
+            WHEN NEW.family = 'opus' BEGIN SELECT RAISE(ABORT, 'fixture refusal'); END",
+        )
+        .unwrap();
+        let ctx = fixture.ctx(false, true, NOW);
+        assert!(shadow_pass(&ctx, ShadowTrigger::Timer).is_err());
+        assert!(
+            fixture.shadow_rows().is_empty(),
+            "earlier families must roll back with the refused family"
+        );
     }
 
     #[test]

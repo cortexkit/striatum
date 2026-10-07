@@ -230,6 +230,14 @@ const DECISION_COLUMNS: &str =
      provider, model, family, outcome, code, account_id, credential_id, policy_version, \
      decision_json, context_json, created_at";
 
+fn latest_decision_sql() -> String {
+    format!(
+        "SELECT {DECISION_COLUMNS} FROM account_decision \
+         WHERE mode = ?1 AND trigger = ?2 AND provider = ?3 AND family = ?4 \
+         ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    )
+}
+
 fn decision_from_row(row: &Row<'_>) -> rusqlite::Result<AccountDecisionRecord> {
     Ok(AccountDecisionRecord {
         decision_id: row.get(0)?,
@@ -927,11 +935,7 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<Option<AccountDecisionRecord>> {
         self.conn
             .query_row(
-                &format!(
-                    "SELECT {DECISION_COLUMNS} FROM account_decision \
-                     WHERE mode = ?1 AND trigger = ?2 AND provider = ?3 AND family = ?4 \
-                     ORDER BY created_at DESC, rowid DESC LIMIT 1"
-                ),
+                &latest_decision_sql(),
                 params![mode, trigger, provider, family],
                 decision_from_row,
             )
@@ -961,6 +965,37 @@ impl AccountTx<'_> {
             )
             .map(|_| ())
             .map_err(err)
+    }
+}
+
+#[cfg(test)]
+mod io_tests {
+    use super::*;
+
+    #[test]
+    fn shadow_heartbeat_uses_an_exact_tuple_seek_without_sorting() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::MIGRATION_044).unwrap();
+        conn.execute_batch(crate::MIGRATION_045).unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {}", latest_decision_sql());
+        let details = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(params!["shadow", "timer", "anthropic", "opus"], |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|d| d.contains("account_decision_latest")
+                && d.contains("mode=? AND trigger=? AND provider=? AND family=?")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().all(|d| !d.contains("TEMP B-TREE")),
+            "{details:?}"
+        );
     }
 }
 

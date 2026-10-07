@@ -154,6 +154,8 @@ const MIGRATION_043: &str = include_str!("../migrations/043_account_quota.sql");
 /// admissions, holds, observations, fences and per-admission exclusions).
 const MIGRATION_044: &str = include_str!("../migrations/044_account_selection.sql");
 
+const MIGRATION_045: &str = include_str!("../migrations/045_account_decision_latest.sql");
+
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 /// How many omitted `not_available` route keys the rejection summary names.
@@ -196,7 +198,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 44] {
+fn route_state_migrations() -> [Migration; 45] {
     [
         Migration {
             version: 1,
@@ -373,6 +375,10 @@ fn route_state_migrations() -> [Migration; 44] {
         Migration {
             version: 44,
             statements: MIGRATION_044,
+        },
+        Migration {
+            version: 45,
+            statements: MIGRATION_045,
         },
     ]
 }
@@ -2974,8 +2980,16 @@ impl RouteStateStore for SqliteRouteStateStore {
                                                          excluded.cache_write_tokens),
                            workload_class = COALESCE(model_route_usage.workload_class,
                                                      excluded.workload_class),
-                           account_key = COALESCE(model_route_usage.account_key,
-                                                  excluded.account_key)
+                            account_key = COALESCE(model_route_usage.account_key,
+                                                   excluded.account_key)
+                         WHERE (model_route_usage.input_tokens IS NULL AND excluded.input_tokens IS NOT NULL)
+                            OR (model_route_usage.output_tokens IS NULL AND excluded.output_tokens IS NOT NULL)
+                            OR (model_route_usage.duration_ms IS NULL AND excluded.duration_ms IS NOT NULL)
+                            OR (model_route_usage.reasoning_tokens IS NULL AND excluded.reasoning_tokens IS NOT NULL)
+                            OR (model_route_usage.cached_read_tokens IS NULL AND excluded.cached_read_tokens IS NOT NULL)
+                            OR (model_route_usage.cache_write_tokens IS NULL AND excluded.cache_write_tokens IS NOT NULL)
+                            OR (model_route_usage.workload_class IS NULL AND excluded.workload_class IS NOT NULL)
+                            OR (model_route_usage.account_key IS NULL AND excluded.account_key IS NOT NULL)
                          RETURNING output_tokens, duration_ms",
                         params![
                             obs.id,
@@ -3002,16 +3016,19 @@ impl RouteStateStore for SqliteRouteStateStore {
                             .is_some_and(|tokens| tokens >= USAGE_MIN_OUTPUT_TOKENS.floor() as i64)
                             && duration.is_some_and(|ms| ms >= USAGE_MIN_DURATION_MS.floor() as i64)
                     });
-                Ok(UsageRecordResult {
+                Ok((UsageRecordResult {
                     recorded: !held_speed_observation.unwrap_or(false) && holds_speed_observation,
                     usage_recorded: held_speed_observation.is_none(),
-                })
+                }, stored_speed_values.is_some()))
             })
             .map_err(err)
-            .inspect(|_| {
-                // Any write here, an insert or the enrichment of an existing row,
-                // can move a class mean; the next selection recomputes.
-                self.usage_generation.fetch_add(1, Ordering::AcqRel);
+            .map(|(result, changed)| {
+                // Retries that supply no new measurements must not invalidate the
+                // seven-day population mean. Only inserts/enrichment can move it.
+                if changed {
+                    self.usage_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                result
             })
     }
 
@@ -3950,6 +3967,231 @@ mod tests {
         );
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         (path, store)
+    }
+
+    fn io_observation(id: &str, at: f64) -> UsageObservation {
+        UsageObservation {
+            id: id.into(),
+            route_key: "io/model".into(),
+            capacity_key: "io/model".into(),
+            provider_id: "io".into(),
+            input_tokens: Some(1000.0),
+            output_tokens: 500.0,
+            duration_ms: 1000.0,
+            observed_at: at,
+            reasoning_tokens: Some(100.0),
+            cached_read_tokens: Some(200.0),
+            cache_write_tokens: Some(300.0),
+            workload_class: Some("ephemeral".into()),
+            account_key: Some("io/account".into()),
+        }
+    }
+
+    #[test]
+    fn duplicate_usage_delivery_changes_no_database_pages() {
+        let (dir, store) = observed_speed_test_store("duplicate-io");
+        let obs = io_observation("message", 1_800_000_000_000.0);
+        assert!(store.record_usage_delivery(&obs).unwrap().usage_recorded);
+        let observer = Connection::open(&dir).unwrap();
+        let version = || {
+            observer
+                .pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        let before = version();
+        for _ in 0..10 {
+            assert_eq!(
+                store.record_usage_delivery(&obs).unwrap(),
+                UsageRecordResult::default()
+            );
+        }
+        assert_eq!(
+            version(),
+            before,
+            "a duplicate must not write even unchanged values"
+        );
+        drop(observer);
+        drop(store);
+        remove_observed_speed_test_store(&dir);
+    }
+
+    #[test]
+    fn duplicate_usage_delivery_does_not_invalidate_the_population_cache() {
+        let (dir, store) = observed_speed_test_store("duplicate-cache");
+        let mut obs = io_observation("message", 1_800_000_000_000.0);
+        obs.cached_read_tokens = None;
+        store.record_usage_delivery(&obs).unwrap();
+        let before = store.usage_generation.load(Ordering::Acquire);
+        store.record_usage_delivery(&obs).unwrap();
+        assert_eq!(store.usage_generation.load(Ordering::Acquire), before);
+        // A NULL-only profile upgrade still invalidates, even if speed was
+        // already eligible and the reply reports neither new recording effect.
+        obs.cached_read_tokens = Some(200.0);
+        assert_eq!(
+            store.record_usage_delivery(&obs).unwrap(),
+            UsageRecordResult::default()
+        );
+        assert_eq!(store.usage_generation.load(Ordering::Acquire), before + 1);
+        drop(store);
+        remove_observed_speed_test_store(&dir);
+    }
+
+    #[test]
+    fn usage_delivery_enriches_each_null_column_and_preserves_first_values() {
+        use rusqlite::types::Value;
+
+        struct Case {
+            column: &'static str,
+            clear: fn(&mut UsageObservation),
+            conflict: fn(&mut UsageObservation),
+            expected: Value,
+        }
+
+        let cases = [
+            Case {
+                column: "input_tokens",
+                clear: |obs| obs.input_tokens = None,
+                conflict: |obs| obs.input_tokens = Some(4000.0),
+                expected: Value::Integer(1000),
+            },
+            Case {
+                column: "output_tokens",
+                clear: |obs| obs.output_tokens = f64::NAN,
+                conflict: |obs| obs.output_tokens = 2000.0,
+                expected: Value::Integer(500),
+            },
+            Case {
+                column: "duration_ms",
+                clear: |obs| obs.duration_ms = f64::NAN,
+                conflict: |obs| obs.duration_ms = 2000.0,
+                expected: Value::Integer(1000),
+            },
+            Case {
+                column: "reasoning_tokens",
+                clear: |obs| obs.reasoning_tokens = None,
+                conflict: |obs| obs.reasoning_tokens = Some(300.0),
+                expected: Value::Integer(100),
+            },
+            Case {
+                column: "cached_read_tokens",
+                clear: |obs| obs.cached_read_tokens = None,
+                conflict: |obs| obs.cached_read_tokens = Some(400.0),
+                expected: Value::Integer(200),
+            },
+            Case {
+                column: "cache_write_tokens",
+                clear: |obs| obs.cache_write_tokens = None,
+                conflict: |obs| obs.cache_write_tokens = Some(500.0),
+                expected: Value::Integer(300),
+            },
+            Case {
+                column: "workload_class",
+                clear: |obs| obs.workload_class = None,
+                conflict: |obs| obs.workload_class = Some("head".into()),
+                expected: Value::Text("ephemeral".into()),
+            },
+            Case {
+                column: "account_key",
+                clear: |obs| obs.account_key = None,
+                conflict: |obs| obs.account_key = Some("io/rebound".into()),
+                expected: Value::Text("io/account".into()),
+            },
+        ];
+        let (path, store) = observed_speed_test_store("all-enrichment-columns");
+        let observer = Connection::open(&path).unwrap();
+        let stored = |id: &str, column: &str| {
+            observer
+                .query_row(
+                    &format!("SELECT {column} FROM model_route_usage WHERE id = ?1"),
+                    [id],
+                    |row| row.get::<_, Value>(0),
+                )
+                .unwrap()
+        };
+
+        for case in cases {
+            let complete =
+                io_observation(&format!("enrichment-{}", case.column), 1_800_000_000_000.0);
+            let mut missing = complete.clone();
+            // Output/duration are non-optional in the domain observation; an
+            // unavailable measurement is stored as NULL. Verify that setup
+            // rather than assuming the sentinel reached the database as NULL.
+            (case.clear)(&mut missing);
+            store.record_usage_delivery(&missing).unwrap();
+            assert_eq!(
+                stored(&complete.id, case.column),
+                Value::Null,
+                "{}: first delivery must leave this column NULL",
+                case.column
+            );
+
+            let before = store.usage_generation.load(Ordering::Acquire);
+            store.record_usage_delivery(&complete).unwrap();
+            assert_eq!(
+                stored(&complete.id, case.column),
+                case.expected,
+                "{}: late enrichment must persist",
+                case.column
+            );
+            assert_eq!(
+                store.usage_generation.load(Ordering::Acquire),
+                before + 1,
+                "{}: enrichment must invalidate the population cache",
+                case.column
+            );
+
+            let mut conflicting = complete.clone();
+            (case.conflict)(&mut conflicting);
+            let before = store.usage_generation.load(Ordering::Acquire);
+            store.record_usage_delivery(&conflicting).unwrap();
+            assert_eq!(
+                stored(&complete.id, case.column),
+                case.expected,
+                "{}: an already-set value must not be overwritten",
+                case.column
+            );
+            assert_eq!(
+                store.usage_generation.load(Ordering::Acquire),
+                before,
+                "{}: a conflicting repeat is still a no-op",
+                case.column
+            );
+
+            // Also exercise COALESCE during a real UPDATE, not just a delivery
+            // whose WHERE rejects every assignment. Filling another column
+            // must not replace the first value in the column under test.
+            let mut first = complete.clone();
+            first.id = format!("first-value-{}", case.column);
+            let (witness, witness_value) = if case.column == "input_tokens" {
+                first.reasoning_tokens = None;
+                ("reasoning_tokens", Value::Integer(100))
+            } else {
+                first.input_tokens = None;
+                ("input_tokens", Value::Integer(1000))
+            };
+            store.record_usage_delivery(&first).unwrap();
+            assert_eq!(stored(&first.id, case.column), case.expected);
+            assert_eq!(stored(&first.id, witness), Value::Null);
+            conflicting.id = first.id.clone();
+            let before = store.usage_generation.load(Ordering::Acquire);
+            store.record_usage_delivery(&conflicting).unwrap();
+            assert_eq!(
+                stored(&first.id, witness),
+                witness_value,
+                "{}: witness enrichment must execute the UPDATE",
+                case.column
+            );
+            assert_eq!(
+                stored(&first.id, case.column),
+                case.expected,
+                "{}: COALESCE must preserve the first value during another column's enrichment",
+                case.column
+            );
+            assert_eq!(store.usage_generation.load(Ordering::Acquire), before + 1);
+        }
+        drop(observer);
+        drop(store);
+        remove_observed_speed_test_store(&path);
     }
 
     fn insert_usage_row(
