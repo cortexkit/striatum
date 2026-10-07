@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::process::{Child, Command};
+use prefrontal_test_support::TestDaemon as Child;
 
 use common::{
     catalog_list, connect_consumer, route_open, route_quota_status, route_select, unique_temp_dir,
@@ -46,7 +46,7 @@ struct RealDaemon {
 
 impl Drop for RealDaemon {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        self.child.stop();
         let _ = std::fs::remove_dir_all(&self.rig);
     }
 }
@@ -86,7 +86,9 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
 async fn start_both_modules_daemon() -> RealDaemon {
     let subc_core = prefrontal_test_support::SubcDaemonBinary::build();
     let quota_module = build_bin(&sibling(QUOTA_REPO_REL), "ck-insula");
-    let routing_module = PathBuf::from(env!("CARGO_BIN_EXE_ck-prefrontal-routing"));
+    let routing_module = prefrontal_test_support::stage_test_binary(Path::new(env!(
+        "CARGO_BIN_EXE_ck-prefrontal-routing"
+    )));
     assert!(routing_module.exists());
     prefrontal_test_support::sign_test_binary(&routing_module);
 
@@ -115,7 +117,8 @@ async fn start_both_modules_daemon() -> RealDaemon {
     )
     .unwrap();
 
-    let child = Command::from(subc_core.command(&rig))
+    let child = subc_core
+        .command(&rig)
         .env("SUBC_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
