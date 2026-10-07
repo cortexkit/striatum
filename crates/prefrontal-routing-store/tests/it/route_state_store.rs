@@ -3218,6 +3218,51 @@ fn complete_ephemeral_row_trailing_window_boundary_pinned_to_now_argument() {
     assert!((vec.fresh_input - 250.0).abs() < 1e-9);
 }
 
+// A Broca-reported run reaches the class vector with its reasoning counted once.
+// Source: a real Codex mason run's Broca usage block (below). Broca's canonical
+// output_tokens includes reasoning (broca-protocol crates/broca-protocol/src/
+// usage.rs:22 in Broca checkout 6c45a375: reasoning is "ALWAYS A SUBSET of
+// `output_tokens`"). The vector's output_excluding_reasoning must be the 28,338
+// visible tokens; 39,620 would price the 11,282 reasoning tokens twice.
+#[test]
+fn broca_codex_run_usage_reaches_the_class_vector_with_reasoning_counted_once() {
+    use prefrontal_routing_core::model_resolution::build_usage_observation;
+    use prefrontal_routing_core::{BrocaUsageFacts, NativeUsageFacts};
+
+    let rig = Rig::new("class-vector-broca-reasoning");
+    let store = rig.open();
+    let now = 10_000_000.0;
+    let usage: BrocaUsageFacts = serde_json::from_str(
+        r#"{"input_tokens":339380,"cached_input_tokens":20647936,"cache_write_tokens":0,"output_tokens":39620,"reasoning_tokens":11282}"#,
+    )
+    .unwrap();
+    let mut facts = NativeUsageFacts {
+        message_id: "codex-mason-run".into(),
+        provider_id: "openai".into(),
+        model_id: "gpt-6.1-sol".into(),
+        variant: Some("xhigh".into()),
+        agent: Some("mason".into()),
+        created_ms: now - 2_000.0,
+        completed_ms: now - 1_000.0,
+        ..Default::default()
+    };
+    facts.apply_broca_usage(Some(&usage));
+    let observation = build_usage_observation(&facts, &[]).unwrap();
+    store.record_usage_delivery(&observation).unwrap();
+
+    let vector = store.get_class_vector("ephemeral", now).unwrap().unwrap();
+    assert_eq!(vector.sample_count, 1);
+    assert!((vector.output_excluding_reasoning - 28_338.0).abs() < 1e-9);
+    assert!((vector.reasoning - 11_282.0).abs() < 1e-9);
+    assert!(
+        (vector.output_excluding_reasoning + vector.reasoning - 39_620.0).abs() < 1e-9,
+        "visible + reasoning must equal Broca's output total"
+    );
+    assert!((vector.fresh_input - 339_380.0).abs() < 1e-9);
+    assert!((vector.cached_read - 20_647_936.0).abs() < 1e-9);
+    assert_eq!(vector.cache_write, 0.0);
+}
+
 #[test]
 fn class_vector_floor_50_requires_complete_rows_and_null_duration_reaches_floor() {
     let rig = Rig::new("class-vector-floor-50");
@@ -3519,7 +3564,7 @@ fn route_input<'a>(facts: Vec<ModelFact>) -> SelectModelRouteInput<'a> {
 }
 
 #[test]
-fn vector_absence_is_whole_selection_fallback_never_per_route_degrade() {
+fn vector_absence_is_whole_selection_fallback_and_a_missing_rate_degrades_only_its_route() {
     let mut f1 = fact("p1", "m1");
     f1.cost_per_m_tok_out = Some(10.0);
     f1.input_rate = Some(2.0);
@@ -3558,10 +3603,14 @@ fn vector_absence_is_whole_selection_fallback_never_per_route_degrade() {
     assert_ne!(res_basket.score.objective.cost, 10.0 / 30.0);
     assert_eq!(res_basket.score.objective.cost, f1.basket_cost().unwrap());
 
+    // A missing rate on a used dimension degrades only the route that lacks it
+    // (priced at the maximum); f1 keeps its basket cost. Vector absence above is
+    // the only thing that still moves the whole selection.
     let mut f2_incomplete = f2.clone();
     f2_incomplete.input_rate = None;
     let res_degraded = select_model_route(route_input(vec![f1.clone(), f2_incomplete])).unwrap();
-    assert_eq!(res_degraded.score.objective.cost, 10.0 / 30.0);
+    assert_eq!(res_degraded.route_key, "p1/m1");
+    assert_eq!(res_degraded.score.objective.cost, f1.basket_cost().unwrap());
 }
 #[test]
 fn mutation_binding_sqlite_or_wall_clock_now_instead_of_argument_reddens() {

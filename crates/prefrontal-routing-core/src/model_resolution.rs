@@ -1393,20 +1393,29 @@ pub struct BrocaUsageFacts {
 }
 
 impl NativeUsageFacts {
-    /// Copies BrocaUsage into NativeUsageFacts following normative mapping:
+    /// Copies BrocaUsage into NativeUsageFacts:
     /// - cached_read = cached_input_tokens
     /// - cache_write = cache_write_tokens
     /// - reasoning = reasoning_tokens
-    /// - fresh_input = input_tokens (with no cache subtraction)
-    /// - output_tokens = output_tokens (Broca output taken whole, reasoning not subtracted)
+    /// - fresh_input = input_tokens (Broca already reports fresh, non-cached input)
+    /// - output_tokens = output_tokens - reasoning_tokens
     /// - absence of Broca usage is whole-object: None clears all five counters
+    ///
+    /// The output conversion is the load-bearing line. Broca's canonical
+    /// `output_tokens` INCLUDES reasoning (broca-protocol `Usage::reasoning_tokens`:
+    /// "ALWAYS A SUBSET of `output_tokens`"), while `NativeUsageFacts` follows the
+    /// OpenCode message shape, where `tokens.output` is visible output and
+    /// `tokens.reasoning` sits beside it. [`build_usage_observation`] adds the two
+    /// back together and the class vector subtracts reasoning again, so copying
+    /// Broca's total whole counted every reasoning token twice in the basket
+    /// (once inside output, once as reasoning).
     pub fn apply_broca_usage(&mut self, usage: Option<&BrocaUsageFacts>) {
         if let Some(u) = usage {
             self.cached_read_tokens = Some(u.cached_input_tokens as f64);
             self.cache_write_tokens = Some(u.cache_write_tokens as f64);
             self.reasoning_tokens = Some(u.reasoning_tokens as f64);
             self.input_tokens = Some(u.input_tokens as f64);
-            self.output_tokens = u.output_tokens as f64;
+            self.output_tokens = u.output_tokens.saturating_sub(u.reasoning_tokens) as f64;
         } else {
             self.cached_read_tokens = None;
             self.cache_write_tokens = None;
@@ -1998,8 +2007,11 @@ mod tests {
         assert_eq!(obs.cache_write_tokens, Some(20.0));
         assert_eq!(obs.reasoning_tokens, Some(80.0));
         assert_eq!(obs.input_tokens, Some(300.0));
-        assert_eq!(obs.output_tokens, 180.0);
-        assert_eq!(obs.output_tokens - obs.reasoning_tokens.unwrap(), 100.0);
+        // Broca's 100 output tokens already include the 80 reasoning tokens, so
+        // the stored total is 100, and the class vector's output-excluding-
+        // reasoning (stored output minus reasoning) is the 20 visible tokens.
+        assert_eq!(obs.output_tokens, 100.0);
+        assert_eq!(obs.output_tokens - obs.reasoning_tokens.unwrap(), 20.0);
     }
 
     #[test]
@@ -2021,23 +2033,44 @@ mod tests {
         assert_ne!(facts.input_tokens, Some(mutated_fresh_input));
     }
 
+    // Source of truth: Broca's normalized usage. broca-protocol
+    // crates/broca-protocol/src/usage.rs:22 (Broca checkout 6c45a375): reasoning
+    // tokens are "ALWAYS A SUBSET of `output_tokens`, never additional to it ...
+    // so a consumer summing the two double-counts"; the OpenAI Responses
+    // normalizer stores the provider's billing total as output_tokens
+    // (crates/broca-provider/src/families/openai_responses.rs:955) and the
+    // reasoning subset beside it without subtracting (:958). The usage block
+    // below is a real Codex mason run's Broca usage as Broca reported it.
+    // Routing's NativeUsageFacts follows OpenCode's shape instead (tokens.output
+    // is visible output, tokens.reasoning sits beside it), so the copy must
+    // subtract reasoning once; build_usage_observation adds it back, and the
+    // class vector's output_excluding_reasoning (output - reasoning, see
+    // compute_class_vector in prefrontal-routing-store) is then the 28,338
+    // visible tokens, not the 39,620 total.
     #[test]
-    fn mutation_subtracting_reasoning_from_broca_output_reddens() {
-        // Gated on counters_producer = true
-        // Asserts reasoning is not subtracted from the Broca output field
-        let u = BrocaUsageFacts {
-            input_tokens: 300,
-            cached_input_tokens: 40,
-            cache_write_tokens: 20,
-            output_tokens: 100,
-            reasoning_tokens: 80,
-            retries_used: 0,
-        };
-        let mut facts = usage_facts("output-no-reasoning-subtraction");
-        facts.apply_broca_usage(Some(&u));
-        let mutated_broca_output = (u.output_tokens - u.reasoning_tokens) as f64;
-        assert_eq!(facts.output_tokens, 100.0);
-        assert_ne!(facts.output_tokens, mutated_broca_output);
+    fn broca_output_includes_reasoning_so_the_copy_subtracts_it_once() {
+        let usage: BrocaUsageFacts = serde_json::from_str(
+            r#"{"input_tokens":339380,"cached_input_tokens":20647936,"cache_write_tokens":0,"output_tokens":39620,"reasoning_tokens":11282}"#,
+        )
+        .unwrap();
+        let mut facts = usage_facts("codex-mason-run");
+        facts.apply_broca_usage(Some(&usage));
+        assert_eq!(facts.output_tokens, 28_338.0);
+        assert_eq!(facts.reasoning_tokens, Some(11_282.0));
+        assert_eq!(facts.input_tokens, Some(339_380.0));
+        assert_eq!(facts.cached_read_tokens, Some(20_647_936.0));
+        assert_eq!(facts.cache_write_tokens, Some(0.0));
+
+        let obs = build_usage_observation(&facts, &[]).unwrap();
+        // The stored output is Broca's billing total, counted once.
+        assert_eq!(obs.output_tokens, 39_620.0);
+        let output_excluding_reasoning = obs.output_tokens - obs.reasoning_tokens.unwrap();
+        assert_eq!(output_excluding_reasoning, 28_338.0);
+        assert_eq!(
+            output_excluding_reasoning + obs.reasoning_tokens.unwrap(),
+            39_620.0,
+            "visible + reasoning must equal Broca's output total, not exceed it"
+        );
     }
 
     #[test]
