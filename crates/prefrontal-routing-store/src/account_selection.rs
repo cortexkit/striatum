@@ -360,6 +360,11 @@ fn observation_from_row(row: &Row<'_>) -> rusqlite::Result<AccountObservationRow
     })
 }
 
+pub const ACCOUNT_DEMAND_SQL: &str =
+    "SELECT account_id, state, committed_at, request_bytes FROM account_admission \
+     WHERE provider = ?1 AND charged = 1 AND state != 'released' \
+     ORDER BY committed_at, principal, admission_id";
+
 /// The account-selection tables inside one open write transaction. Every
 /// method reads or writes through the same transaction, so a whole admission
 /// commits or rolls back as one.
@@ -560,14 +565,7 @@ impl AccountTx<'_> {
 
     /// Charged demand of every admission for `provider` that is not released.
     pub fn demand(&self, provider: &str) -> RouteStateResult<Vec<AccountDemandRow>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT account_id, state, committed_at, request_bytes FROM account_admission \
-                 WHERE provider = ?1 AND charged = 1 AND state != 'released' \
-                 ORDER BY committed_at, principal, admission_id",
-            )
-            .map_err(err)?;
+        let mut statement = self.conn.prepare(ACCOUNT_DEMAND_SQL).map_err(err)?;
         let rows = statement
             .query_map(params![provider], |row| {
                 Ok(AccountDemandRow {
