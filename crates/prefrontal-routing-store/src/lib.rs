@@ -40,7 +40,7 @@ mod account_selection;
 pub use account_selection::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
     AccountExclusionRow, AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow,
-    AccountServingCounts, AccountTx, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
+    AccountServingCounts, AccountTx, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
 };
 
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
@@ -156,6 +156,9 @@ const MIGRATION_044: &str = include_str!("../migrations/044_account_selection.sq
 
 const MIGRATION_045: &str = include_str!("../migrations/045_account_decision_latest.sql");
 
+/// Migration 46: partial covering index for routing demand queries.
+const MIGRATION_046: &str = include_str!("../migrations/046_account_admission_demand.sql");
+
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
 /// How many omitted `not_available` route keys the rejection summary names.
@@ -198,7 +201,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 45] {
+fn route_state_migrations() -> [Migration; 46] {
     [
         Migration {
             version: 1,
@@ -379,6 +382,10 @@ fn route_state_migrations() -> [Migration; 45] {
         Migration {
             version: 45,
             statements: MIGRATION_045,
+        },
+        Migration {
+            version: 46,
+            statements: MIGRATION_046,
         },
     ]
 }

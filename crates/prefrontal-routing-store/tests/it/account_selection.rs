@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use prefrontal_routing_store::{
     dev_descriptor, AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord,
-    AccountFenceRow, AccountPinRow, SqliteRouteStateStore, DECISION_MODE_SERVE,
+    AccountDemandRow, AccountFenceRow, AccountPinRow, SqliteRouteStateStore, ACCOUNT_DEMAND_SQL,
+    DECISION_MODE_SERVE,
 };
+use rusqlite::{params, Connection};
 
 static NEXT_RIG: AtomicU64 = AtomicU64::new(0);
 
@@ -273,4 +275,162 @@ fn a_failed_transaction_writes_nothing_and_release_happens_once() {
     assert!(first);
     assert!(!second, "a second release is a no-op");
     assert!(demand.is_empty(), "a released admission charges no demand");
+}
+
+#[test]
+fn account_demand_query_plan_uses_partial_covering_index_without_temp_btree() {
+    let rig = Rig::new("demand-plan");
+    let store = rig.open();
+    let connection = Connection::open(rig.dir.join("store.db")).unwrap();
+    let explain_sql = format!("EXPLAIN QUERY PLAN {ACCOUNT_DEMAND_SQL}");
+
+    for provider in ["anthropic", "openai", "custom"] {
+        let mut statement = connection.prepare(&explain_sql).unwrap();
+        let details = statement
+            .query_map(params![provider], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains(
+                    "SEARCH account_admission USING COVERING INDEX account_admission_demand",
+                ) && detail.contains("provider=?")
+            }),
+            "expected covering index search using account_admission_demand for {provider}, got {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE")),
+            "expected no temporary sort for {provider}, got {details:?}"
+        );
+    }
+
+    drop(connection);
+    drop(store);
+}
+
+#[test]
+fn account_demand_results_identical_with_and_without_covering_index() {
+    let rig = Rig::new("demand-results-parity");
+    let store = rig.open();
+
+    store
+        .account_transaction(|tx| {
+            tx.insert_decision(&decision("dec-1"))?;
+            tx.insert_pin(&pin("pin-1", 1, "acct-a", "dec-1"))?;
+
+            // 1. anthropic, charged=1, state='reserved'
+            let mut adm1 = admission("adm-1", "pin-1", "dec-1");
+            adm1.provider = "anthropic".into();
+            adm1.committed_at = 3_000;
+            adm1.request_bytes = 10_000;
+            tx.insert_admission(&adm1)?;
+
+            // 2. anthropic, charged=1, state='started', earlier committed_at
+            let mut adm2 = admission("adm-2", "pin-1", "dec-1");
+            adm2.provider = "anthropic".into();
+            adm2.committed_at = 1_000;
+            adm2.state = "started".into();
+            adm2.request_bytes = 20_000;
+            tx.insert_admission(&adm2)?;
+
+            // 3. anthropic, charged=1, state='finished', tie-break committed_at with adm1
+            let mut adm3 = admission("adm-3", "pin-1", "dec-1");
+            adm3.provider = "anthropic".into();
+            adm3.committed_at = 3_000;
+            adm3.state = "finished".into();
+            adm3.request_bytes = 30_000;
+            tx.insert_admission(&adm3)?;
+
+            // 4. anthropic, charged=1, state='released' (MUST NOT be in demand)
+            let mut adm4 = admission("adm-4", "pin-1", "dec-1");
+            adm4.provider = "anthropic".into();
+            adm4.committed_at = 500;
+            adm4.state = "released".into();
+            adm4.request_bytes = 40_000;
+            tx.insert_admission(&adm4)?;
+
+            // 5. anthropic, charged=0, state='started' (MUST NOT be in demand)
+            let mut adm5 = admission("adm-5", "pin-1", "dec-1");
+            adm5.provider = "anthropic".into();
+            adm5.committed_at = 2_000;
+            adm5.charged = false;
+            adm5.state = "started".into();
+            adm5.request_bytes = 50_000;
+            tx.insert_admission(&adm5)?;
+
+            // 6. openai, charged=1, state='reserved'
+            let mut adm6 = admission("adm-6", "pin-1", "dec-1");
+            adm6.provider = "openai".into();
+            adm6.committed_at = 4_000;
+            adm6.request_bytes = 60_000;
+            tx.insert_admission(&adm6)?;
+
+            Ok(())
+        })
+        .unwrap();
+
+    let connection = Connection::open(rig.dir.join("store.db")).unwrap();
+
+    let query_unindexed =
+        "SELECT account_id, state, committed_at, request_bytes FROM account_admission NOT INDEXED \
+         WHERE provider = ?1 AND charged = 1 AND state != 'released' \
+         ORDER BY committed_at, principal, admission_id";
+
+    for provider in ["anthropic", "openai", "other"] {
+        let indexed_demand = store.account_transaction(|tx| tx.demand(provider)).unwrap();
+
+        let mut statement = connection.prepare(query_unindexed).unwrap();
+        let unindexed_demand = statement
+            .query_map(params![provider], |row| {
+                Ok(AccountDemandRow {
+                    account_id: row.get(0)?,
+                    state: row.get(1)?,
+                    committed_at: row.get(2)?,
+                    request_bytes: row.get::<_, i64>(3)? as u64,
+                })
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            indexed_demand, unindexed_demand,
+            "demand results mismatch for provider {provider}"
+        );
+    }
+
+    // Now drop the index and verify tx.demand still returns the exact same results
+    connection
+        .execute("DROP INDEX account_admission_demand", [])
+        .unwrap();
+
+    for provider in ["anthropic", "openai", "other"] {
+        let demand_after_drop = store.account_transaction(|tx| tx.demand(provider)).unwrap();
+
+        let mut statement = connection.prepare(query_unindexed).unwrap();
+        let unindexed_demand = statement
+            .query_map(params![provider], |row| {
+                Ok(AccountDemandRow {
+                    account_id: row.get(0)?,
+                    state: row.get(1)?,
+                    committed_at: row.get(2)?,
+                    request_bytes: row.get::<_, i64>(3)? as u64,
+                })
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            demand_after_drop, unindexed_demand,
+            "demand results mismatch after drop for provider {provider}"
+        );
+    }
+
+    drop(connection);
+    drop(store);
 }

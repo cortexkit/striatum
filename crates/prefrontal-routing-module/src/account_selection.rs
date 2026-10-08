@@ -2447,15 +2447,33 @@ pub fn shadow_pass(ctx: &Ctx<'_>, trigger: ShadowTrigger<'_>) -> RouteStateResul
     // decisions together rather than flushing the same indexes once per row.
     ctx.store.account_transaction(|tx| {
         let mut recorded = Vec::new();
+        let mut fences_by_provider = BTreeMap::<String, Vec<Fence>>::new();
+        let mut demand_by_provider = BTreeMap::<String, Vec<AdmissionDemand>>::new();
         for (provider, family, model, roster, trigger_name, request, observation) in passes {
+            let fences = match fences_by_provider.get(&provider) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let loaded = load_fences(tx, &provider)?;
+                    fences_by_provider.insert(provider.clone(), loaded.clone());
+                    loaded
+                }
+            };
+            let admissions = match demand_by_provider.get(&provider) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let loaded = load_demand(tx, &provider)?;
+                    demand_by_provider.insert(provider.clone(), loaded.clone());
+                    loaded
+                }
+            };
             let provider = provider.as_str();
             let id = (|| {
                 let state = AllocatorState {
                     roster: roster.roster.clone(),
                     affinity: None,
-                    fences: load_fences(tx, provider)?,
+                    fences,
                     principal_exclusions: Vec::new(),
-                    admissions: load_demand(tx, provider)?,
+                    admissions,
                     operator_override: None,
                     policy: ctx.policy.clone(),
                 };
