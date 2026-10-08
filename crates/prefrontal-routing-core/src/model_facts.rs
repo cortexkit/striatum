@@ -313,6 +313,9 @@ impl FamilySource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFact {
+    /// Read-time credential billing view; never written over the shared catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_plane: Option<crate::billing::BillingPlane>,
     #[serde(rename = "providerID")]
     pub provider_id: String,
     #[serde(rename = "modelID")]
@@ -483,6 +486,17 @@ impl ModelFact {
     /// The catalog rate ($/Mtok) for one basket dimension. Reasoning tokens fall
     /// back to the output rate when no separate reasoning rate is served.
     pub fn basket_rate(&self, dimension: BasketDimension) -> Option<f64> {
+        if let Some(plane) = &self.billing_plane {
+            // Reasoning is part of output unless the plane explicitly states
+            // otherwise. An explicit unpriced reasoning rule must not borrow
+            // an output price, unlike an absent separate reasoning rate.
+            if dimension == BasketDimension::Reasoning
+                && !plane.rates.contains_key("rate.reasoning")
+            {
+                return plane.rate("rate.output");
+            }
+            return plane.rate(dimension.fact_key());
+        }
         match dimension {
             BasketDimension::FreshInput => self.input_rate,
             BasketDimension::OutputExcludingReasoning => self.cost_per_m_tok_out,
@@ -568,6 +582,17 @@ impl BasketDimension {
     }
 
     /// The rate field a reader would look for when this dimension is unpriced.
+    pub fn fact_key(self) -> &'static str {
+        match self {
+            Self::FreshInput => "rate.input",
+            Self::OutputExcludingReasoning => "rate.output",
+            Self::Reasoning => "rate.reasoning",
+            Self::CachedRead => "rate.cache_read",
+            Self::CacheWrite => "rate.cache_write",
+        }
+    }
+
+    /// The legacy catalog field a reader would look for when unpriced.
     pub fn rate_name(self) -> &'static str {
         match self {
             BasketDimension::FreshInput => "input_rate",

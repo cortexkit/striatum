@@ -449,6 +449,7 @@ mod tests {
         vision: bool,
     ) -> ModelFact {
         ModelFact {
+            billing_plane: None,
             speed_is_fleet_median: false,
             provider_id: provider.to_string(),
             model_id: model.to_string(),

@@ -1586,6 +1586,7 @@ pub async fn account_quota_loop(
     resolver: Arc<dyn CredentialResolver>,
     broca_credentials: crate::broca_credentials::SharedBrocaCredentials,
 ) {
+    use prefrontal_routing_core::RouteStateStore as _;
     let project_root =
         prefrontal_core_store::scratch_root().join("prefrontal-routing-account-quota");
     let _ = std::fs::create_dir_all(&project_root);
@@ -1654,6 +1655,13 @@ pub async fn account_quota_loop(
                 ACCOUNT_RETRY_INTERVAL
             }
         };
+        // Account selection and pricing must agree on the serving login. Build
+        // the method map after both roster and readings have been refreshed.
+        if let (Ok(guard), Ok(facts)) = (state.lock(), store.get_facts()) {
+            if let Ok(mut credentials) = broca_credentials.lock() {
+                credentials.refresh_serving_methods(&guard, &facts, now_ms());
+            }
+        }
         tokio::time::sleep(delay).await;
     }
 }

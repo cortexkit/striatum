@@ -66,6 +66,7 @@ struct FactBuilder {
 fn fact(b: FactBuilder) -> ModelFact {
     let has_vector = b.class_vector.is_some();
     ModelFact {
+        billing_plane: None,
         speed_is_fleet_median: false,
         provider_id: b.provider_id,
         model_id: b.model_id,

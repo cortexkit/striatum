@@ -12,17 +12,17 @@
 //!
 //! Wire decoding is isolated here and pinned to the producer-real fixture copied
 //! from `fusiform/crates/fusiform-module/fixtures/served-payloads.json` at Fusiform
-//! commit `cab7afa`. `fusiform-protocol` has one manifest migration pending, so one
-//! re-pin is expected; no other module should depend on these private wire structs.
+//! commit `7d604d1`; no other module should depend on these private wire structs.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use prefrontal_routing_core::{BillingPlane, BillingRate};
 use prefrontal_routing_store::{FusiformCatalogCursor, FusiformFactUpdate, SqliteRouteStateStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -69,6 +69,10 @@ struct CatalogGetArguments {
     /// 2026-09-18 and its scored seat kept being rostered while Broca refused
     /// every open. Retired models are requested so their absence is written.
     include_retired: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_method: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,6 +87,7 @@ impl CatalogGetRequest {
             name: CATALOG_GET,
             arguments: CatalogGetArguments {
                 include_retired: true,
+                ..Default::default()
             },
         }
     }
@@ -152,17 +157,232 @@ enum CatalogRate {
         units: i64,
     },
     StatedZero,
+    NotBilled,
+    BilledAs {
+        key: String,
+    },
     Unpriced {
         #[serde(default)]
         #[allow(dead_code)]
         reason: Value,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
+    rates: BTreeMap<String, ModelRates>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ModelRates {
+    rates: BTreeMap<String, BillingRate>,
+    inherited: BTreeSet<String>,
+}
+
+fn model_rates(models: &Value) -> Result<BTreeMap<String, ModelRates>, FusiformCatalogError> {
+    let mut decoded = BTreeMap::new();
+    for (model, facts) in models
+        .as_object()
+        .ok_or_else(|| error("catalog models must be an object"))?
+    {
+        let mut rates = ModelRates::default();
+        for (key, value) in facts
+            .as_object()
+            .ok_or_else(|| error("model facts must be an object"))?
+        {
+            // Mode rates and unrelated additive catalog facts do not belong to
+            // the ordinary token basket. Keep above-context targets verbatim.
+            if !prefrontal_routing_core::BasketDimension::ALL
+                .into_iter()
+                .any(|dimension| {
+                    key == dimension.fact_key()
+                        || key
+                            .strip_prefix(dimension.fact_key())
+                            .is_some_and(|suffix| suffix.starts_with(".above_context."))
+                })
+            {
+                continue;
+            }
+            let served: CatalogRate =
+                serde_json::from_value(value.clone()).map_err(FusiformCatalogError::Json)?;
+            let rate = match &served {
+                CatalogRate::BilledAs { key } => BillingRate::BilledAs { key: key.clone() },
+                CatalogRate::NotBilled => BillingRate::NotBilled,
+                _ => match decoded_rate(model, key, Some(&served)) {
+                    Some(rate) => BillingRate::Priced { rate },
+                    None => BillingRate::Unpriced,
+                },
+            };
+            rates.rates.insert(key.clone(), rate);
+            if value.get("inherited_from").is_some_and(Value::is_object) {
+                rates.inherited.insert(key.clone());
+            }
+        }
+        decoded.insert(model.clone(), rates);
+    }
+    Ok(decoded)
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct PlaneDescriptor {
+    provider_id: String,
+    auth_method: String,
+    kind: String,
+    source_ref: Option<String>,
+    review_by_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct BillingRule {
+    model: String,
+    fact_key: String,
+    state: String,
+    as_class: Option<String>,
+    source_ref: String,
+    established_by: String,
+    established_at_ms: i64,
+    review_by_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PlanePage {
+    plane: PlaneDescriptor,
+    rates: BTreeMap<String, ModelRates>,
+    billing_rules: Vec<BillingRule>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PlaneReply {
+    Served(PlanePage),
+    Refused { code: String, message: String },
+}
+
+fn decode_plane_get(bytes: &[u8]) -> Result<PlaneReply, FusiformCatalogError> {
+    let value = unwrap_tool_result(bytes)?;
+    let refusal = value.get("error").unwrap_or(&value);
+    if let Some(code) = refusal.get("code").and_then(Value::as_str) {
+        return Ok(PlaneReply::Refused {
+            code: code.to_string(),
+            message: refusal
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(PlaneReply::Served(PlanePage {
+        plane: serde_json::from_value(value["plane"].clone())
+            .map_err(FusiformCatalogError::Json)?,
+        rates: model_rates(&value["models"])?,
+        billing_rules: serde_json::from_value(
+            value
+                .get("billing_rules")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(FusiformCatalogError::Json)?,
+    }))
+}
+
+/// Published atomically by the catalog poller, read without I/O by selection.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlaneCatalog {
+    version: Option<i64>,
+    base: BTreeMap<String, ModelRates>,
+    pages: BTreeMap<(String, String), PlaneReply>,
+}
+
+impl PlaneCatalog {
+    #[cfg(test)]
+    pub(crate) fn ordinary_test_catalog(facts: &[prefrontal_routing_core::ModelFact]) -> Self {
+        let mut catalog = Self::default();
+        for fact in facts {
+            catalog.base.insert(
+                format!("{}/{}", fact.provider_id, fact.model_id),
+                ModelRates {
+                    rates: prefrontal_routing_core::BasketDimension::ALL
+                        .into_iter()
+                        .filter_map(|dimension| {
+                            fact.basket_rate(dimension).map(|rate| {
+                                (dimension.fact_key().into(), BillingRate::Priced { rate })
+                            })
+                        })
+                        .collect(),
+                    inherited: BTreeSet::new(),
+                },
+            );
+            catalog.pages.insert(
+                (fact.provider_id.clone(), "apikey".into()),
+                PlaneReply::Refused {
+                    code: "no_coverage".into(),
+                    message: "test catalog".into(),
+                },
+            );
+        }
+        catalog
+    }
+
+    pub(crate) fn for_route(
+        &self,
+        model: &str,
+        method: &crate::broca_credentials::ServingMethod,
+    ) -> BillingPlane {
+        let provider = model
+            .split_once('/')
+            .map_or(model, |(provider, _)| provider);
+        let auth_method = method.auth_method.as_deref().unwrap_or("ambiguous");
+        let mut plane = BillingPlane {
+            provider_id: provider.into(),
+            auth_method: auth_method.into(),
+            kind: "unpriced".into(),
+            selection_reason: method.reason.clone(),
+            rates: BTreeMap::new(),
+        };
+        match self.pages.get(&(provider.into(), auth_method.into())) {
+            Some(PlaneReply::Served(page)) => {
+                plane.kind = page.plane.kind.clone();
+                plane.rates = page
+                    .rates
+                    .get(model)
+                    .map(|rates| rates.rates.clone())
+                    .unwrap_or_default();
+            }
+            Some(PlaneReply::Refused { code, .. }) if code == "no_coverage" => {
+                plane.kind = "no_coverage fallback".into();
+                if let Some(base) = self.base.get(model) {
+                    plane.rates = base
+                        .rates
+                        .iter()
+                        .map(|(key, rate)| {
+                            (
+                                key.clone(),
+                                if auth_method == "apikey" || base.inherited.contains(key) {
+                                    rate.clone()
+                                } else {
+                                    BillingRate::Unpriced
+                                },
+                            )
+                        })
+                        .collect();
+                    if auth_method == "apikey" && !plane.rates.contains_key("rate.reasoning") {
+                        plane.rates.insert(
+                            "rate.reasoning".into(),
+                            BillingRate::BilledAs {
+                                key: "rate.output".into(),
+                            },
+                        );
+                    }
+                }
+            }
+            Some(PlaneReply::Refused { code, .. }) => plane.kind = format!("refused: {code}"),
+            None => {}
+        }
+        plane
+    }
 }
 
 /// What a served catalog rate yields, or why it yields no price.
@@ -214,8 +434,10 @@ fn rate_cost(rate: Option<&CatalogRate>) -> OutputPrice {
         }
         // A stated zero is a real price of zero; whether zero is "free" is
         // routing policy downstream, and it must not read as absent.
-        CatalogRate::StatedZero => OutputPrice::Known(0.0),
-        CatalogRate::Unpriced { .. } => OutputPrice::NotPublished,
+        CatalogRate::StatedZero | CatalogRate::NotBilled => OutputPrice::Known(0.0),
+        CatalogRate::Unpriced { .. } | CatalogRate::BilledAs { .. } | CatalogRate::Unknown => {
+            OutputPrice::NotPublished
+        }
     }
 }
 
@@ -280,8 +502,10 @@ fn unwrap_tool_result(bytes: &[u8]) -> Result<Value, FusiformCatalogError> {
 }
 
 fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogError> {
+    let value = unwrap_tool_result(bytes)?;
+    let rates = model_rates(&value["models"])?;
     let reply: CatalogGetReply =
-        serde_json::from_value(unwrap_tool_result(bytes)?).map_err(FusiformCatalogError::Json)?;
+        serde_json::from_value(value).map_err(FusiformCatalogError::Json)?;
     let mut facts = Vec::with_capacity(reply.models.len());
     for (served_key, model) in reply.models {
         let (provider_id, model_id) = served_key
@@ -339,6 +563,7 @@ fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogEr
             resolved_at_ms: reply.resolved_at_ms,
         },
         facts,
+        rates,
     })
 }
 
@@ -349,6 +574,7 @@ fn decode_catalog_status(bytes: &[u8]) -> Result<CatalogStatusReply, FusiformCat
 /// Short-lived Fusiform connection. Callers create one per bootstrap/poll cycle
 /// and close it before sleeping, so the consumer never owns an idle socket.
 pub struct FusiformCatalogConsumer {
+    credentials: Option<crate::broca_credentials::SharedBrocaCredentials>,
     stream: TcpStream,
     route_channel: u16,
     route_epoch: u32,
@@ -356,6 +582,19 @@ pub struct FusiformCatalogConsumer {
 }
 
 impl FusiformCatalogConsumer {
+    #[cfg(test)]
+    pub(crate) async fn dry_run_refresh(
+        &mut self,
+        store: &SqliteRouteStateStore,
+        credentials: crate::broca_credentials::SharedBrocaCredentials,
+    ) -> Result<(), FusiformCatalogError> {
+        self.credentials = Some(credentials);
+        let snapshot = self.catalog_get().await?;
+        self.refresh_planes(Some(&snapshot)).await?;
+        apply_catalog_snapshot(store, &snapshot, None, None, "dry run copy")?;
+        self.close().await
+    }
+
     pub async fn connect(
         connection_file_path: &Path,
         project_root: &Path,
@@ -379,6 +618,7 @@ impl FusiformCatalogConsumer {
         .await
         .map_err(|_| error("timed out setting up Fusiform connection"))??;
         let mut consumer = Self {
+            credentials: None,
             stream,
             route_channel: 0,
             route_epoch: 0,
@@ -444,7 +684,7 @@ impl FusiformCatalogConsumer {
         Ok((channel, epoch))
     }
 
-    async fn call(&mut self, body: Vec<u8>) -> Result<Vec<u8>, FusiformCatalogError> {
+    async fn call_frame(&mut self, body: Vec<u8>) -> Result<Frame, FusiformCatalogError> {
         let corr = self.corr();
         let frame = Frame::build(
             FrameType::Request,
@@ -461,6 +701,11 @@ impl FusiformCatalogConsumer {
         let reply = self
             .read_reply(self.route_channel, self.route_epoch, corr)
             .await?;
+        Ok(reply)
+    }
+
+    async fn call(&mut self, body: Vec<u8>) -> Result<Vec<u8>, FusiformCatalogError> {
+        let reply = self.call_frame(body).await?;
         if reply.header.ty == FrameType::Error {
             return Err(error(String::from_utf8_lossy(&reply.body).to_string()));
         }
@@ -516,9 +761,68 @@ trait CatalogWire {
     async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError>;
     async fn catalog_status(&mut self) -> Result<CatalogStatusReply, FusiformCatalogError>;
     async fn close(&mut self) -> Result<(), FusiformCatalogError>;
+    async fn refresh_planes(
+        &mut self,
+        _snapshot: Option<&CatalogSnapshot>,
+    ) -> Result<(), FusiformCatalogError> {
+        Ok(())
+    }
 }
 
 impl CatalogWire for FusiformCatalogConsumer {
+    async fn refresh_planes(
+        &mut self,
+        snapshot: Option<&CatalogSnapshot>,
+    ) -> Result<(), FusiformCatalogError> {
+        let Some(credentials) = self.credentials.clone() else {
+            return Ok(());
+        };
+        let (keys, mut cache) = {
+            let guard = credentials
+                .lock()
+                .map_err(|_| error("credential cache lock poisoned"))?;
+            (guard.plane_keys(), guard.billing_catalog.clone())
+        };
+        if let Some(snapshot) = snapshot {
+            cache.version = Some(snapshot.cursor.catalog_version);
+            cache.base = snapshot.rates.clone();
+            cache.pages.clear();
+        }
+        for (provider_id, auth_method) in keys {
+            if cache
+                .pages
+                .contains_key(&(provider_id.clone(), auth_method.clone()))
+            {
+                continue;
+            }
+            let body = serde_json::to_vec(&CatalogGetRequest {
+                name: CATALOG_GET,
+                arguments: CatalogGetArguments {
+                    include_retired: true,
+                    provider_id: Some(provider_id.clone()),
+                    auth_method: Some(auth_method.clone()),
+                },
+            })
+            .map_err(FusiformCatalogError::Json)?;
+            // no_coverage is a valid answer for an undeclared billing plane,
+            // not a failed ordinary catalog poll. Error frames use this decoder
+            // too, so neither transport envelope borrows API rows accidentally.
+            let frame = self.call_frame(body).await?;
+            let page = decode_plane_get(&frame.body)?;
+            if let PlaneReply::Served(page) = &page {
+                if page.plane.provider_id != provider_id || page.plane.auth_method != auth_method {
+                    return Err(error("Fusiform replied on a different billing plane"));
+                }
+            }
+            cache.pages.insert((provider_id, auth_method), page);
+        }
+        credentials
+            .lock()
+            .map_err(|_| error("credential cache lock poisoned"))?
+            .billing_catalog = cache;
+        Ok(())
+    }
+
     async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError> {
         let body = serde_json::to_vec(&CatalogGetRequest::all_with_retired())
             .map_err(FusiformCatalogError::Json)?;
@@ -644,6 +948,7 @@ async fn bootstrap_cycle<C: CatalogWire>(
     ladder: Option<&LadderSources>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let snapshot = client.catalog_get().await?;
+    client.refresh_planes(Some(&snapshot)).await?;
     apply_catalog_snapshot(store, &snapshot, family_config_path, ladder, "catalog.get")?;
     if let Ok(mut health) = health.lock() {
         health.note_reached(now_ms());
@@ -671,6 +976,7 @@ async fn poll_cycle<C: CatalogWire>(
         .unwrap_or(true);
     let get_calls = if should_get {
         let snapshot = client.catalog_get().await?;
+        client.refresh_planes(Some(&snapshot)).await?;
         apply_catalog_snapshot(
             store,
             &snapshot,
@@ -680,6 +986,7 @@ async fn poll_cycle<C: CatalogWire>(
         )?;
         1
     } else {
+        client.refresh_planes(None).await?;
         0
     };
     client.close().await?;
@@ -692,6 +999,7 @@ pub async fn catalog_refresh_loop(
     health: SharedCatalogHealth,
     poll_ms: u64,
     ladder_sources: LadderSources,
+    credentials: crate::broca_credentials::SharedBrocaCredentials,
 ) {
     let project_root = std::env::temp_dir().join("prefrontal-routing-fusiform-consumer");
     let _ = std::fs::create_dir_all(&project_root);
@@ -702,6 +1010,7 @@ pub async fn catalog_refresh_loop(
         let result =
             match FusiformCatalogConsumer::connect(&connection_file_path, &project_root).await {
                 Ok(mut consumer) if bootstrapped => {
+                    consumer.credentials = Some(Arc::clone(&credentials));
                     poll_cycle(
                         &mut consumer,
                         &store,
@@ -712,6 +1021,7 @@ pub async fn catalog_refresh_loop(
                     .await
                 }
                 Ok(mut consumer) => {
+                    consumer.credentials = Some(Arc::clone(&credentials));
                     bootstrap_cycle(
                         &mut consumer,
                         &store,
@@ -786,6 +1096,368 @@ mod tests {
 
     fn get_reply(name: &str) -> Vec<u8> {
         serde_json::to_vec(&fixture()[name]["response"]).unwrap()
+    }
+
+    #[test]
+    fn all_eighteen_pinned_plane_cases_and_refusals_decode() {
+        let fixture = fixture();
+        let mut served = 0;
+        let mut refused = 0;
+        for (name, case) in fixture.as_object().unwrap() {
+            if case["request"]["arguments"].get("auth_method").is_none() {
+                continue;
+            }
+            let payload = case.get("response").unwrap_or(&case["error"]);
+            let decoded = decode_plane_get(&serde_json::to_vec(payload).unwrap())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let wrapped = json!({"result": payload});
+            assert_eq!(
+                decoded,
+                decode_plane_get(&serde_json::to_vec(&wrapped).unwrap()).unwrap()
+            );
+            match decoded {
+                PlaneReply::Served(page) => {
+                    served += 1;
+                    assert_eq!(
+                        page.plane.auth_method,
+                        case["request"]["arguments"]["auth_method"]
+                    );
+                    assert_eq!(
+                        page.plane.provider_id,
+                        case["request"]["arguments"]["provider_id"]
+                    );
+                }
+                PlaneReply::Refused { code, .. } => {
+                    refused += 1;
+                    assert_eq!(code, case["error"]["code"]);
+                }
+            }
+        }
+        assert_eq!((served, refused), (13, 5));
+        let pin: Value =
+            serde_json::from_str(include_str!("../fixtures/served-payloads.pin.json")).unwrap();
+        assert_eq!(pin["commit"], "7d604d1623b9085b3f3277c889d417d2ccb6f5e0");
+        assert_eq!(
+            pin["sha256"],
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!("../fixtures/served-payloads.json"))
+            )
+        );
+    }
+
+    fn fixture_plane(name: &str, model: &str) -> BillingPlane {
+        let PlaneReply::Served(page) = decode_plane_get(&get_reply(name)).unwrap() else {
+            panic!("served fixture")
+        };
+        BillingPlane {
+            provider_id: page.plane.provider_id,
+            auth_method: page.plane.auth_method,
+            kind: page.plane.kind,
+            selection_reason: "roster".into(),
+            rates: page.rates[model].rates.clone(),
+        }
+    }
+
+    fn vector() -> prefrontal_routing_core::ClassVector {
+        prefrontal_routing_core::ClassVector {
+            workload_class: "ephemeral".into(),
+            sample_count: 50,
+            trailing_window_days: 7.0,
+            statistic: "mean".into(),
+            is_overlay: false,
+            fresh_input: 0.0,
+            output_excluding_reasoning: 0.0,
+            reasoning: 0.0,
+            cached_read: 0.0,
+            cache_write: 1000.0,
+        }
+    }
+
+    #[test]
+    fn chatgpt_cache_writes_are_priced_at_input_via_billed_as() {
+        let mut fact = crate::tests::fact("openai", "gpt-5.6-luna");
+        fact.cache_write_rate = Some(99.0);
+        fact.billing_plane = Some(fixture_plane(
+            "chatgpt luna — named, unfiltered",
+            "openai/gpt-5.6-luna",
+        ));
+        let price = fact.basket_price(&vector());
+        assert!(price.unpriced.is_empty());
+        let expected = 0.0002 / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE;
+        assert!((price.cost.unwrap() - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn anthropic_oauth_uses_quota_proxy_prices_not_the_api_fact() {
+        let mut fact = crate::tests::fact("anthropic", "claude-sonnet-4-5");
+        fact.cache_write_rate = Some(99.0);
+        fact.billing_plane = Some(fixture_plane(
+            "oauth anthropic — quota weights",
+            "anthropic/claude-sonnet-4-5",
+        ));
+        assert_eq!(fact.billing_plane.as_ref().unwrap().kind, "quota_proxy");
+        assert_eq!(
+            fact.basket_rate(prefrontal_routing_core::BasketDimension::CacheWrite),
+            Some(3.75)
+        );
+        let expected = 0.00375 / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE;
+        assert!((fact.basket_price(&vector()).cost.unwrap() - expected).abs() < 1e-12);
+    }
+
+    fn fallback_catalog() -> PlaneCatalog {
+        PlaneCatalog {
+            version: Some(0),
+            base: model_rates(&json!({"openai/example": {
+                "rate.input": {"state":"priced", "currency":"USD", "units":2000000000_i64, "exponent":9},
+                "rate.output": {"state":"priced", "currency":"USD", "units":4000000000_i64, "exponent":9, "inherited_from":{"basis":"family"}}
+            }})).unwrap(),
+            pages: ["oauth", "apikey"].into_iter().map(|method| (("openai".into(), method.into()), PlaneReply::Refused { code:"no_coverage".into(), message:"undeclared".into() })).collect(),
+        }
+    }
+
+    #[test]
+    fn subscription_no_coverage_refuses_unmarked_rates_and_ranks_as_max() {
+        let mut fact = crate::tests::fact("openai", "example");
+        fact.billing_plane = Some(fallback_catalog().for_route(
+            "openai/example",
+            &crate::broca_credentials::ServingMethod {
+                auth_method: Some("oauth".into()),
+                reason: "single listed method".into(),
+            },
+        ));
+        let mut vector = vector();
+        vector.cache_write = 0.0;
+        vector.fresh_input = 1000.0;
+        assert_eq!(
+            fact.basket_rate(prefrontal_routing_core::BasketDimension::FreshInput),
+            None
+        );
+        assert_eq!(
+            fact.basket_rate(prefrontal_routing_core::BasketDimension::OutputExcludingReasoning),
+            Some(4.0)
+        );
+        assert_eq!(
+            fact.basket_price(&vector).unpriced,
+            [prefrontal_routing_core::BasketDimension::FreshInput]
+        );
+        fact.class_vector = Some(vector);
+        assert_eq!(
+            prefrontal_routing_core::selection_cost(&fact, true, true),
+            1.0
+        );
+        fact.billing_plane.as_mut().unwrap().rates.clear();
+        fact.cost_per_m_tok_out = None;
+        fact.cost_tier = None;
+        assert_eq!(
+            prefrontal_routing_core::selection_cost(&fact, true, false),
+            1.0
+        );
+    }
+
+    #[test]
+    fn apikey_no_coverage_keeps_ordinary_catalog_rates() {
+        let plane = fallback_catalog().for_route(
+            "openai/example",
+            &crate::broca_credentials::ServingMethod {
+                auth_method: Some("apikey".into()),
+                reason: "single listed method".into(),
+            },
+        );
+        assert_eq!(plane.rate("rate.input"), Some(2.0));
+        assert_eq!(plane.rate("rate.output"), Some(4.0));
+        assert_eq!(plane.rate("rate.reasoning"), Some(4.0));
+    }
+
+    #[test]
+    fn chatgpt_roster_with_an_apikey_also_listed_prices_on_chatgpt() {
+        use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
+        let listing = ScopedCredentialListing {
+            view: "mixed-openai".into(),
+            credentials: vec![
+                ListedCredential {
+                    id: "arbitrary-login-id".into(),
+                    categories: vec!["llm-provider".into()],
+                    provider_ids: vec!["openai".into()],
+                    refresh_adapter: Some("openai".into()),
+                    credential_type: "oauth".into(),
+                    state: "active".into(),
+                    account_id: Some("account-a".into()),
+                    ..Default::default()
+                },
+                ListedCredential {
+                    id: "arbitrary-api-id".into(),
+                    categories: vec!["llm-provider".into()],
+                    provider_ids: vec!["openai".into()],
+                    credential_type: "apikey".into(),
+                    state: "active".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut state = crate::account_quota::AccountQuotaState::default();
+        crate::account_quota::apply_roster_listing(&mut state, &listing, 1);
+        crate::account_quota::apply_usage_reply(
+            &mut state,
+            &serde_json::to_vec(&json!({"result":[{
+                "provider":"codex", "apiProvider":"openai", "account":"account-a", "source":"vault",
+                "fetchedAt":"2026-10-07T00:00:00Z", "usage":{}
+            }]}))
+            .unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+        credentials.apply_listing(&listing, 1);
+        let mut facts = vec![crate::tests::fact("openai", "gpt-5.6-luna")];
+        credentials.refresh_serving_methods(&state, &facts, 1);
+        credentials.billing_catalog.pages.insert(
+            ("openai".into(), "chatgpt".into()),
+            decode_plane_get(&get_reply("chatgpt luna — named, unfiltered")).unwrap(),
+        );
+        credentials.price_facts(&mut facts);
+        let plane = facts[0].billing_plane.as_ref().unwrap();
+        assert_eq!(plane.auth_method, "chatgpt");
+        assert_eq!(plane.selection_reason, "roster");
+        assert_eq!(plane.rate("rate.cache_write"), Some(0.2));
+    }
+
+    #[tokio::test]
+    async fn refusals_decode_without_failing_poll_and_planes_refresh_only_on_catalog_change() {
+        use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
+        let rig = Rig::new("plane-poll");
+        let store = rig.store();
+        let facts = vec![
+            crate::tests::fact("google", "example"),
+            crate::tests::fact("openai", "example"),
+        ];
+        let listing = ScopedCredentialListing {
+            view: "planes".into(),
+            credentials: vec![
+                ListedCredential {
+                    provider_ids: vec!["google".into()],
+                    refresh_adapter: Some("antigravity".into()),
+                    credential_type: "oauth".into(),
+                    state: "active".into(),
+                    categories: vec!["llm-provider".into()],
+                    ..Default::default()
+                },
+                ListedCredential {
+                    provider_ids: vec!["openai".into()],
+                    credential_type: "bogus".into(),
+                    state: "active".into(),
+                    categories: vec!["llm-provider".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let credentials = Arc::new(Mutex::new(
+            crate::broca_credentials::BrocaCredentials::default(),
+        ));
+        {
+            let mut guard = credentials.lock().unwrap();
+            guard.apply_listing(&listing, 1);
+            guard.refresh_serving_methods(
+                &crate::account_quota::AccountQuotaState::default(),
+                &facts,
+                1,
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let peer = tokio::spawn(async move {
+            let mut planes = 0;
+            let mut gets = 0;
+            loop {
+                let frame = read_frame(&mut server).await.unwrap().unwrap();
+                if frame.header.ty == FrameType::Goodbye {
+                    break;
+                }
+                let request: Value = serde_json::from_slice(&frame.body).unwrap();
+                let plane = request["arguments"].get("auth_method").is_some();
+                let payload = if plane {
+                    planes += 1;
+                    assert!(request["arguments"].get("at_ms").is_none());
+                    let code = if request["arguments"]["auth_method"] == "bogus" {
+                        "bad_request"
+                    } else {
+                        "no_coverage"
+                    };
+                    json!({"code":code,"message":"refused"})
+                } else if request["name"] == CATALOG_STATUS {
+                    json!({"catalog_version":1})
+                } else {
+                    gets += 1;
+                    let mut payload =
+                        fixture()["catalog.get — one model, current"]["response"].clone();
+                    payload["catalog_version"] = json!(1);
+                    payload
+                };
+                let response = Frame::build(
+                    if plane {
+                        FrameType::Error
+                    } else {
+                        FrameType::Response
+                    },
+                    Flags::new(false, Priority::Interactive, false),
+                    frame.header.channel,
+                    frame.header.epoch,
+                    frame.header.corr,
+                    serde_json::to_vec(&payload).unwrap(),
+                )
+                .unwrap();
+                write_frame(&mut server, &response).await.unwrap();
+            }
+            (gets, planes)
+        });
+        let mut client = FusiformCatalogConsumer {
+            stream,
+            credentials: Some(Arc::clone(&credentials)),
+            route_channel: 1,
+            route_epoch: 1,
+            next_corr: 1,
+        };
+        let mut snapshot =
+            decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
+        client.refresh_planes(Some(&snapshot)).await.unwrap();
+        client.refresh_planes(None).await.unwrap(); // no network request
+        snapshot.cursor.catalog_version = 1;
+        client.refresh_planes(Some(&snapshot)).await.unwrap(); // both refusals retried
+        store
+            .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
+            .unwrap();
+        let health = Arc::new(Mutex::new(CatalogReachHealth::new(100)));
+        assert_eq!(
+            poll_cycle(&mut client, &store, &health, None, None)
+                .await
+                .unwrap()
+                .get_calls,
+            0
+        );
+        assert_eq!(peer.await.unwrap(), (0, 4));
+        assert_eq!(
+            store
+                .fusiform_catalog_cursor()
+                .unwrap()
+                .unwrap()
+                .catalog_version,
+            1
+        );
+        let mut priced = facts;
+        credentials.lock().unwrap().price_facts(&mut priced);
+        assert_eq!(
+            priced[0].billing_plane.as_ref().unwrap().kind,
+            "no_coverage fallback"
+        );
+        assert_eq!(
+            priced[1].billing_plane.as_ref().unwrap().kind,
+            "refused: bad_request"
+        );
     }
 
     #[test]
@@ -951,7 +1623,7 @@ mod tests {
         );
         assert_eq!(
             digest,
-            "8cd9a59b5dc45a2aebd90b5aee930dac0eb170144a87f8a0bf6289151d633050"
+            "f9555ed07197b60119627a391d75ffa59a3f9f5647df28251220fbe19faee1fc"
         );
         let snapshot = decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
         assert_eq!(snapshot.cursor.catalog_version, 0);

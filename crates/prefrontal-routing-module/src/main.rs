@@ -867,6 +867,15 @@ where
         account_quota::restore_account_state(store.as_ref()),
     ));
     let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
+    // Restored login identities identify their serving plane before the first
+    // catalog poll; API-only providers wait for the non-secret listing poll.
+    if let (Ok(accounts), Ok(facts), Ok(mut credentials)) = (
+        account_state.lock(),
+        store.get_facts(),
+        broca_credentials.lock(),
+    ) {
+        credentials.refresh_serving_methods(&accounts, &facts, now_ms() as i64);
+    }
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
         let roster_resolver: Arc<dyn prefrontal_ckcred_client::CredentialResolver> =
             Arc::new(prefrontal_ckcred_client::CkcredCredentialResolver::new(
@@ -952,6 +961,7 @@ where
         Arc::clone(&catalog_health),
         catalog_poll_ms,
         ladder_sources.clone(),
+        Arc::clone(&broca_credentials),
     ));
     // Compares a ladder when a config file the ladder reads changed or live
     // selection reported a different availability set (including the first one
@@ -1728,6 +1738,7 @@ fn merge_model_upsert(
                 ));
             };
             ModelFact {
+                billing_plane: None,
                 speed_is_fleet_median: false,
                 provider_id: params.provider_id.clone(),
                 model_id: params.model_id.clone(),
@@ -2967,6 +2978,10 @@ async fn handle_select_request(
         policy_revision,
     };
 
+    if let Ok(credentials) = broca_credentials.lock() {
+        credentials.price_facts(&mut facts);
+    }
+
     let subscription_keys: HashSet<String> = resolved_request
         .policy
         .subscription_keys
@@ -3125,6 +3140,19 @@ async fn handle_select_request(
                         "selected": selected,
                         "decisionID": decision_id,
                         "resolvedInput": resolved_input,
+                        "billingPlanes": facts.iter().filter(|fact| {
+                            let route = fact_to_route(fact);
+                            available.contains(&route.route_key) || available.contains(&route.capacity_key)
+                        }).filter_map(|fact| fact.billing_plane.as_ref().map(|plane| json!({
+                            "providerID": fact.provider_id,
+                            "modelID": fact.model_id,
+                            "authMethod": plane.auth_method,
+                            "kind": plane.kind,
+                            "servingMethod": plane.selection_reason,
+                            "dimensionRates": prefrontal_routing_core::BasketDimension::ALL.into_iter().map(|dimension| {
+                                (dimension.fact_key().to_string(), fact.basket_rate(dimension))
+                            }).collect::<std::collections::BTreeMap<_, _>>(),
+                        }))).collect::<Vec<_>>(),
                     });
                     if is_broca_substrate(params.substrate.as_deref()) {
                         result["runner"] =
@@ -3365,6 +3393,9 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
+    if let Ok(credentials) = broca_credentials.lock() {
+        credentials.price_facts(&mut prepared.facts);
+    }
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     // Explicit roster pins bypass exclusions; automatic seats and replacements
     // receive both the operator fence and this request's own exclusions, whether
@@ -5355,6 +5386,7 @@ mod tests {
 
     pub(super) fn fact(provider: &str, model: &str) -> ModelFact {
         ModelFact {
+            billing_plane: None,
             speed_is_fleet_median: false,
             provider_id: provider.into(),
             model_id: model.into(),
@@ -5728,6 +5760,136 @@ mod tests {
         .await
         .unwrap();
         rx.recv().await.unwrap()
+    }
+
+    /// Explicitly ignored: reads live Fusiform metadata, but all route.select
+    /// decisions and catalog updates go only to a VACUUM INTO copy under target.
+    /// The real persisted account roster identifies login methods. The listing
+    /// is not persisted, so non-roster serving methods remain explicitly unknown.
+    #[tokio::test]
+    #[ignore = "requires a copied routing store and live Fusiform"]
+    async fn billing_plane_route_select_dry_run_on_store_copy() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let copy = root.join("target/billing-dry-run/store.db");
+        let connection = PathBuf::from(
+            std::env::var("ROUTING_BILLING_SUBC_CONNECTION").expect("live subc connection path"),
+        );
+        assert!(copy.is_file(), "create target/billing-dry-run/store.db with sqlite3 -readonly live.db VACUUM INTO first");
+        let store: SharedStore = Arc::new(
+            SqliteRouteStateStore::open(&prefrontal_routing_store::dev_descriptor(
+                "billing-dry-run-copy",
+                copy.to_string_lossy().into_owned(),
+            ))
+            .unwrap(),
+        );
+        let mut before = BrocaCredentials::default();
+        before.legacy_pricing_baseline = true;
+        let before_credentials = Arc::new(Mutex::new(before));
+        let state = account_quota::restore_account_state(&store);
+        assert!(
+            state.roster.is_some(),
+            "the copy must carry the real persisted account roster"
+        );
+        let credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
+        let routing_config = config_overrides::config_path();
+        // The roster is non-secret metadata; never read the operator's secret
+        // OpenCode auth file in a replay. Subscription policy remains live.
+        let auth_path = empty_opencode_auth();
+        let mut report = Vec::new();
+        for (phase, cache) in [
+            ("before_ordinary_catalog", &before_credentials),
+            ("after_credential_planes", &credentials),
+        ] {
+            if phase == "after_credential_planes" {
+                {
+                    let mut guard = credentials.lock().unwrap();
+                    guard.refresh_serving_methods(
+                        &state,
+                        &store.get_facts().unwrap(),
+                        now_ms() as i64,
+                    );
+                    guard.mark_copy_listing_gap();
+                }
+                let mut catalog =
+                    fusiform_catalog::FusiformCatalogConsumer::connect(&connection, &root)
+                        .await
+                        .expect("live Fusiform catalog");
+                catalog
+                    .dry_run_refresh(&store, Arc::clone(&credentials))
+                    .await
+                    .unwrap();
+                let mut guard = credentials.lock().unwrap();
+                guard.refresh_serving_methods(&state, &store.get_facts().unwrap(), now_ms() as i64);
+                guard.mark_copy_listing_gap();
+            }
+            for iq in [70, 85] {
+                let request = json!({"method": ROUTE_SELECT_OP, "params": {
+                    "targetAgent":"mason", "requirements":{"iq":iq,"eq":40},
+                    "substrate":"broca", "availableModels":[], "taskId":format!("billing-dry-run-{phase}-{iq}")
+                }});
+                let frame = Frame::build(
+                    FrameType::Request,
+                    Flags::new(false, Priority::Interactive, false),
+                    7,
+                    1,
+                    99,
+                    serde_json::to_vec(&request).unwrap(),
+                )
+                .unwrap();
+                let (tx, mut rx) = mpsc::channel(1);
+                handle_select_request(
+                    frame,
+                    1,
+                    &tx,
+                    &Arc::new(Mutex::new(restore_quota_cache(&store))),
+                    &store,
+                    &Arc::new(Mutex::new(None)),
+                    &routing_config,
+                    &routing_config,
+                    cache,
+                    &auth_path,
+                )
+                .await
+                .unwrap();
+                let response = rx.recv().await.unwrap();
+                assert_eq!(
+                    response.header.ty,
+                    FrameType::Response,
+                    "{}",
+                    String::from_utf8_lossy(&response.body)
+                );
+                let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                let result = &value["result"];
+                let ordinary_rates: Vec<_> = if phase == "before_ordinary_catalog" {
+                    store.get_facts().unwrap().iter().map(|fact| json!({
+                        "providerID":fact.provider_id, "modelID":fact.model_id,
+                        "dimensionRates":prefrontal_routing_core::BasketDimension::ALL.into_iter().map(|dimension| (dimension.fact_key().to_string(), fact.basket_rate(dimension))).collect::<std::collections::BTreeMap<_,_>>(),
+                    })).collect()
+                } else {
+                    Vec::new()
+                };
+                report.push(json!({"phase":phase, "iq":iq, "eq":40, "selected":result["selected"], "billingPlanes":result["billingPlanes"], "ordinaryCatalogRates":ordinary_rates}));
+            }
+        }
+        std::fs::write(
+            root.join("target/billing-dry-run/route-select.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        for entry in &report {
+            println!(
+                "{} IQ {}: {} cost={} pricing={}",
+                entry["phase"],
+                entry["iq"],
+                entry["selected"]["routeKey"],
+                entry["selected"]["score"]["objective"]["cost"],
+                entry["selected"]["score"]["pricingMode"]
+            );
+        }
+        println!("4 route.select dry runs; per-plane prices captured in target/billing-dry-run/route-select.json; non-roster providers have no live listing proof");
     }
 
     #[tokio::test]
@@ -8164,7 +8326,9 @@ mod tests {
             &Arc::new(Mutex::new(None)),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
             Path::new("/nonexistent/alfonso-routing.jsonc"),
-            &empty_broca_credentials(),
+            &Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
+                &quota_decides_facts(),
+            ))),
             &empty_opencode_auth(),
         )
         .await

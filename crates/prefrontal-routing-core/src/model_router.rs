@@ -447,7 +447,7 @@ fn subscription_multiplier(fact: &ModelFact) -> f64 {
 /// by the subscription multiplier. `None` when the route has no known list price
 /// (an absent price is NOT treated as free).
 fn effective_cost_per_m_tok_out(fact: &ModelFact) -> Option<f64> {
-    fact.cost_per_m_tok_out
+    fact.basket_rate(crate::model_facts::BasketDimension::OutputExcludingReasoning)
         .map(|list_price| list_price / subscription_multiplier(fact))
 }
 
@@ -461,7 +461,7 @@ pub(crate) fn normalized_metered_cost(fact: &ModelFact) -> f64 {
     if let Some(per_m_tok) = effective_cost_per_m_tok_out(fact) {
         return (per_m_tok / COST_REFERENCE_PER_MTOK).clamp(0.0, 1.0);
     }
-    if let Some(cost_tier) = fact.cost_tier {
+    if let Some(cost_tier) = fact.cost_tier.filter(|_| fact.billing_plane.is_none()) {
         return (cost_tier / 6.0).min(1.0);
     }
     1.0
@@ -650,7 +650,7 @@ fn normalized_speed(speed: f64) -> f64 {
 /// of $0.
 fn cached_read_term_usd(fact: &ModelFact, vector: Option<&ClassVector>) -> Option<f64> {
     let vector = vector?;
-    let rate = fact.cache_read_rate?;
+    let rate = fact.basket_rate(crate::model_facts::BasketDimension::CachedRead)?;
     Some((vector.cached_read * rate) / 1_000_000.0)
 }
 
@@ -677,7 +677,10 @@ fn output_only_cost(fact: &ModelFact, is_subscription: bool) -> f64 {
 
 /// A subscription route whose catalog row publishes no price at all.
 fn subscription_price_unpublished(fact: &ModelFact, is_subscription: bool) -> bool {
-    is_subscription && fact.cost_per_m_tok_out.is_none() && fact.cost_tier.is_none()
+    fact.billing_plane.is_none()
+        && is_subscription
+        && fact.cost_per_m_tok_out.is_none()
+        && fact.cost_tier.is_none()
 }
 
 /// The basket cost of one route on `vector`, with the dimension-level detail.
@@ -813,6 +816,12 @@ pub(crate) fn compute_objective(
         )
     };
     notes.push(format!("cost +{cost:.2} ({detail})"));
+    if let Some(plane) = &route.fact.billing_plane {
+        notes.push(format!(
+            "billing plane: {}/{} ({}, serving method: {})",
+            plane.provider_id, plane.auth_method, plane.kind, plane.selection_reason
+        ));
+    }
 
     objective_tail(route, runtime, is_subscription, cost, basket_pricing, notes)
 }
@@ -824,7 +833,10 @@ fn output_only_detail(
     multiplier: f64,
     coverage: &str,
 ) -> String {
-    if let Some(list_price) = route.fact.cost_per_m_tok_out {
+    if let Some(list_price) = route
+        .fact
+        .basket_rate(crate::model_facts::BasketDimension::OutputExcludingReasoning)
+    {
         let effective = list_price / multiplier;
         let mut detail = format!(
             "output $/Mtok: effective ${}/Mtok, list ${}/Mtok",
@@ -836,9 +848,13 @@ fn output_only_detail(
         }
         detail.push_str(&format!(", {coverage}"));
         detail
-    } else if let Some(tier) = route.fact.cost_tier {
+    } else if let Some(tier) = route
+        .fact
+        .cost_tier
+        .filter(|_| route.fact.billing_plane.is_none())
+    {
         format!("tier {}, {coverage}", fmt_num(tier))
-    } else if is_subscription {
+    } else if is_subscription && route.fact.billing_plane.is_none() {
         "price unpublished, subscription plan: marginal token cost zero".to_string()
     } else {
         // An unpriced metered route is ranked at the MAXIMUM cost (see
@@ -1752,6 +1768,7 @@ mod abundance_tests {
         elo: f64,
     ) -> ModelFact {
         ModelFact {
+            billing_plane: None,
             input_rate: None,
             cache_read_rate: None,
             cache_write_rate: None,

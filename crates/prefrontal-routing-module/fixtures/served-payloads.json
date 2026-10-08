@@ -1,4 +1,716 @@
 {
+  "apikey deepseek — cache-write fill": {
+    "request": {
+      "arguments": {
+        "auth_method": "apikey",
+        "model_id": "deepseek-flash",
+        "provider_id": "deepseek"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "deepseek/deepseek-flash",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://api-docs.deepseek.com/api/create-chat-completion",
+          "state": "billed_as"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "deepseek/deepseek-flash": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 393216,
+          "model.family": "deepseek-flash",
+          "model.open_weights": true,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3000000
+          },
+          "rate.cache_write": {
+            "key": "rate.input",
+            "state": "billed_as"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 150000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 600000000
+          },
+          "rate.reasoning": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 600000000
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "apikey",
+        "kind": "upstream",
+        "provider_id": "deepseek",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://api-docs.deepseek.com/api/create-chat-completion"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "apikey luna — published cache-write": {
+    "request": {
+      "arguments": {
+        "auth_method": "apikey",
+        "model_id": "gpt-5.6-luna",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1050000,
+          "limit.output": 128000,
+          "model.family": "gpt-luna",
+          "model.open_weights": false,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 20000000
+          },
+          "rate.cache_read.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 40000000
+          },
+          "rate.cache_read.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 40000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 250000000
+          },
+          "rate.cache_write.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 500000000
+          },
+          "rate.cache_write.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 500000000
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.input.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.input.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1200000000
+          },
+          "rate.output.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1800000000
+          },
+          "rate.output.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 2400000000
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "apikey",
+        "kind": "upstream",
+        "provider_id": "openai"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "apikey xai — cache-write fill": {
+    "request": {
+      "arguments": {
+        "auth_method": "apikey",
+        "model_id": "grok-4.20-0309-non-reasoning",
+        "provider_id": "xai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "xai/grok-4.20-0309-non-reasoning",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write.above_context.200000",
+          "model": "xai/grok-4.20-0309-non-reasoning",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing",
+          "state": "billed_as"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "xai/grok-4.20-0309-non-reasoning": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": false,
+          "capability.reasoning_options": null,
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 30000,
+          "model.family": "grok",
+          "model.open_weights": false,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.cache_read.above_context.200000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.cache_write": {
+            "key": "rate.input",
+            "state": "billed_as"
+          },
+          "rate.cache_write.above_context.200000": {
+            "key": "rate.input.above_context.200000",
+            "state": "billed_as"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1250000000
+          },
+          "rate.input.above_context.200000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 2500000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 2500000000
+          },
+          "rate.output.above_context.200000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 5000000000
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "apikey",
+        "kind": "upstream",
+        "provider_id": "xai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://docs.x.ai/developers/advanced-api-usage/prompt-caching/usage-and-pricing"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "catalog.get — a curated alias": {
+    "request": {
+      "arguments": {
+        "model_id": "antigravity-gemini-3.8-flash",
+        "provider_id": "google"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "aliased": [
+        {
+          "model": "google/antigravity-gemini-3.8-flash",
+          "source_ref": "antigravity-auth@44eb8fa0ddd93e236942b9b36f9bb10fa2abde6d packages/core/src/model-registry.ts (GEMINI_38_FLASH_ROUTES), resolved by packages/core/src/transform/model-resolver.ts (resolveModelWithTier)",
+          "target_model_id": "gemini-3.8-flash",
+          "target_provider_id": "google"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "google/antigravity-gemini-3.8-flash": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "audio",
+            "image",
+            "pdf",
+            "text",
+            "video"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1048576,
+          "limit.output": 65536,
+          "model.family": "gemini-flash",
+          "model.open_weights": false,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "alias",
+              "family": "gemini-flash",
+              "model_id": "gemini-3.8-flash",
+              "provider_id": "google"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 75000000
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "alias",
+              "family": "gemini-flash",
+              "model_id": "gemini-3.8-flash",
+              "provider_id": "google"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 750000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "alias",
+              "family": "gemini-flash",
+              "model_id": "gemini-3.8-flash",
+              "provider_id": "google"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3750000000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "catalog.get — a model priced only in a mode, with no base rate": {
+    "request": {
+      "arguments": {
+        "model_id": "anthropic/claude-opus-4-6",
+        "provider_id": "anyapi"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "anyapi/anthropic/claude-opus-4-6": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "toggle"
+            },
+            {
+              "type": "effort",
+              "values": [
+                "low",
+                "medium",
+                "high"
+              ]
+            },
+            {
+              "max": 127999,
+              "min": 1024,
+              "type": "budget_tokens"
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1000000,
+          "limit.output": 128000,
+          "model.family": "claude-opus",
+          "model.open_weights": false,
+          "rate.cache_read.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3000000000
+          },
+          "rate.cache_write.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 37500000000
+          },
+          "rate.input.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 30000000000
+          },
+          "rate.output.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 150000000000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "catalog.get — a model stating it takes no reasoning options": {
+    "request": {
+      "arguments": {
+        "fact_prefixes": [
+          "capability."
+        ],
+        "model_id": "Qwen/Qwen3-Next-80B-A3B-Thinking",
+        "provider_id": "nebius"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "nebius/Qwen/Qwen3-Next-80B-A3B-Thinking": {
+          "capability.attachment": false,
+          "capability.input_modalities": [
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [],
+          "capability.tool_call": true
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "catalog.get — a model that prices reasoning separately": {
+    "request": {
+      "arguments": {
+        "fact_prefixes": [
+          "rate."
+        ],
+        "model_id": "Qwen/Qwen3-Next-80B-A3B-Thinking",
+        "provider_id": "nebius"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "nebius/Qwen/Qwen3-Next-80B-A3B-Thinking": {
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 15000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 180000000
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 150000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1200000000
+          },
+          "rate.reasoning": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1200000000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
   "catalog.get — a model whose reasoning capability is unknown": {
     "request": {
       "arguments": {
@@ -15,14 +727,149 @@
           "capability.input_modalities": null,
           "capability.output_modalities": null,
           "capability.reasoning": null,
+          "capability.reasoning_options": null,
           "capability.tool_call": null,
           "existence": "present",
           "limit.context": 128000,
-          "limit.output": 8192
+          "limit.output": 8192,
+          "model.family": null,
+          "model.open_weights": null
         }
       },
       "resolved_at_ms": -1,
       "source": "models.dev"
+    }
+  },
+  "catalog.get — a named read of a retired model": {
+    "request": {
+      "arguments": {
+        "model_id": "google/veo-3",
+        "provider_id": "poe"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {},
+      "resolved_at_ms": -1,
+      "retired": [
+        {
+          "model": "poe/google/veo-3",
+          "retired_at_ms": 1500
+        }
+      ],
+      "source": "models.dev"
+    }
+  },
+  "catalog.get — a rate published as zero": {
+    "request": {
+      "arguments": {
+        "fact_prefixes": [
+          "rate."
+        ],
+        "model_id": "green-s",
+        "provider_id": "greenpt"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "greenpt/green-s": {
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 4370000
+          },
+          "rate.output": {
+            "state": "stated_zero"
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "catalog.get — a rate the upstream withdrew": {
+    "request": {
+      "arguments": {
+        "fact_prefixes": [
+          "rate."
+        ],
+        "model_id": "glm-4.5-flash",
+        "provider_id": "zhipuai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "zhipuai/glm-4.5-flash": {
+          "rate.cache_read": {
+            "state": "stated_zero"
+          },
+          "rate.cache_write": {
+            "reason": "missing_rate",
+            "state": "unpriced"
+          },
+          "rate.input": {
+            "state": "stated_zero"
+          },
+          "rate.output": {
+            "state": "stated_zero"
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "catalog.get — an instant inside an unobserved window": {
+    "request": {
+      "arguments": {
+        "at_ms": 1200,
+        "fact_prefixes": [
+          "rate."
+        ],
+        "model_id": "glm-4.5-flash",
+        "provider_id": "zhipuai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "zhipuai/glm-4.5-flash": {
+          "rate.cache_read": {
+            "state": "stated_zero"
+          },
+          "rate.cache_write": {
+            "state": "stated_zero"
+          },
+          "rate.input": {
+            "state": "stated_zero"
+          },
+          "rate.output": {
+            "state": "stated_zero"
+          }
+        }
+      },
+      "resolved_at_ms": 1200,
+      "source": "models.dev",
+      "uncertain": [
+        {
+          "fact_key": "rate.cache_write",
+          "model_id": "glm-4.5-flash",
+          "provider_id": "zhipuai",
+          "superseded_after_ms": 1000,
+          "superseded_by_ms": 1500
+        }
+      ]
     }
   },
   "catalog.get — inside a corrected interval": {
@@ -48,10 +895,18 @@
             "text"
           ],
           "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "min": 1024,
+              "type": "budget_tokens"
+            }
+          ],
           "capability.tool_call": true,
           "existence": "present",
           "limit.context": 1000000,
           "limit.output": 64000,
+          "model.family": "claude-sonnet",
+          "model.open_weights": false,
           "rate.cache_read": {
             "currency": "USD",
             "exponent": 9,
@@ -107,6 +962,147 @@
       ]
     }
   },
+  "catalog.get — mode rates beside base rates, and a mode with no price": {
+    "request": {
+      "arguments": {
+        "fact_prefixes": [
+          "rate."
+        ],
+        "model_id": "gpt-5.6-luna",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 20000000
+          },
+          "rate.cache_read.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 40000000
+          },
+          "rate.cache_read.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 40000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 250000000
+          },
+          "rate.cache_write.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 500000000
+          },
+          "rate.cache_write.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 500000000
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.input.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.input.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1200000000
+          },
+          "rate.output.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1800000000
+          },
+          "rate.output.mode.fast": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 2400000000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
   "catalog.get — one model, current": {
     "request": {
       "arguments": {
@@ -129,10 +1125,18 @@
             "text"
           ],
           "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "min": 1024,
+              "type": "budget_tokens"
+            }
+          ],
           "capability.tool_call": true,
           "existence": "present",
           "limit.context": 200000,
           "limit.output": 64000,
+          "model.family": "claude-sonnet",
+          "model.open_weights": false,
           "rate.cache_read": {
             "currency": "USD",
             "exponent": 9,
@@ -241,8 +1245,32 @@
         }
       ],
       "fact_key": "rate.input",
+      "last_changed_at_ms": 9000,
       "model_id": "claude-sonnet-4-5",
       "provider_id": "anthropic",
+      "source": "models.dev"
+    }
+  },
+  "catalog.history — an alias id names its target": {
+    "request": {
+      "arguments": {
+        "fact_key": "rate.input",
+        "model_id": "antigravity-gemini-3.8-flash",
+        "provider_id": "google"
+      },
+      "name": "catalog.history"
+    },
+    "response": {
+      "eras": [],
+      "fact_key": "rate.input",
+      "inherited_from": {
+        "basis": "alias",
+        "family": "gemini-flash",
+        "model_id": "gemini-3.8-flash",
+        "provider_id": "google"
+      },
+      "model_id": "antigravity-gemini-3.8-flash",
+      "provider_id": "google",
       "source": "models.dev"
     }
   },
@@ -255,15 +1283,15 @@
     },
     "response": {
       "catalog_version": 0,
-      "era_count": 164,
+      "era_count": 281,
       "failures": {
         "ever": 1,
         "last_at_ms": 2000,
         "last_class": "http_status",
         "polls_back": 1
       },
-      "model_count": 15,
-      "models_priced": 9,
+      "model_count": 19,
+      "models_priced": 13,
       "overridden": [
         {
           "authority": "https://docs.claude.com/en/docs/build-with-claude/context-windows (read 2026-08-13) — 'Other Claude models, including Claude Sonnet 4.5, have a 200k-token context window'",
@@ -283,12 +1311,1469 @@
           "outcome": "failed"
         },
         {
+          "changes": {
+            "eras": 2,
+            "facts_changed": 1,
+            "models_arrived": 0,
+            "models_withdrawn": 1
+          },
+          "duration_ms": 210,
+          "observed_at_ms": 1500,
+          "outcome": "changed"
+        },
+        {
           "duration_ms": 12,
           "observed_at_ms": 1000,
           "outcome": "seeded"
         }
       ],
+      "served_facts": [
+        "existence",
+        "limit.context",
+        "limit.output",
+        "capability.reasoning",
+        "capability.reasoning_options",
+        "capability.tool_call",
+        "capability.attachment",
+        "capability.input_modalities",
+        "capability.output_modalities",
+        "model.family",
+        "model.open_weights",
+        "rate.input",
+        "rate.output",
+        "rate.cache_read",
+        "rate.cache_write",
+        "rate.reasoning"
+      ],
       "source": "models.dev"
+    }
+  },
+  "chatgpt image — missing input target": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "model_id": "gpt-image-1",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-image-1",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "not_established"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-image-1": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "image"
+          ],
+          "capability.reasoning": false,
+          "capability.reasoning_options": null,
+          "capability.tool_call": false,
+          "existence": "present",
+          "limit.context": null,
+          "limit.output": null,
+          "model.family": "gpt-image",
+          "model.open_weights": false,
+          "rate.cache_write": {
+            "reason": "not_established",
+            "state": "unpriced"
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "chatgpt luna — bulk, cache-write": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "fact_prefixes": [
+          "rate.cache_write"
+        ],
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write.above_context.272000",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-image-1",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "not_established"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "rate.cache_write": {
+            "key": "rate.input",
+            "state": "billed_as"
+          },
+          "rate.cache_write.above_context.272000": {
+            "key": "rate.input.above_context.272000",
+            "state": "billed_as"
+          }
+        },
+        "openai/gpt-image-1": {
+          "rate.cache_write": {
+            "reason": "not_established",
+            "state": "unpriced"
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "chatgpt luna — bulk, capabilities": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "fact_prefixes": [
+          "capability."
+        ],
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true
+        },
+        "openai/gpt-image-1": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "image"
+          ],
+          "capability.reasoning": false,
+          "capability.reasoning_options": null,
+          "capability.tool_call": false
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "chatgpt luna — bulk, rates": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "fact_prefixes": [
+          "rate."
+        ],
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write.above_context.272000",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-image-1",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "not_established"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 20000000
+          },
+          "rate.cache_read.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 40000000
+          },
+          "rate.cache_write": {
+            "key": "rate.input",
+            "state": "billed_as"
+          },
+          "rate.cache_write.above_context.272000": {
+            "key": "rate.input.above_context.272000",
+            "state": "billed_as"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.input.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1200000000
+          },
+          "rate.output.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1800000000
+          }
+        },
+        "openai/gpt-image-1": {
+          "rate.cache_write": {
+            "reason": "not_established",
+            "state": "unpriced"
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "chatgpt luna — bulk, unfiltered": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write.above_context.272000",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-image-1",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "not_established"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1050000,
+          "limit.output": 128000,
+          "model.family": "gpt-luna",
+          "model.open_weights": false,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 20000000
+          },
+          "rate.cache_read.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 40000000
+          },
+          "rate.cache_write": {
+            "key": "rate.input",
+            "state": "billed_as"
+          },
+          "rate.cache_write.above_context.272000": {
+            "key": "rate.input.above_context.272000",
+            "state": "billed_as"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.input.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1200000000
+          },
+          "rate.output.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1800000000
+          }
+        },
+        "openai/gpt-image-1": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "image"
+          ],
+          "capability.reasoning": false,
+          "capability.reasoning_options": null,
+          "capability.tool_call": false,
+          "existence": "present",
+          "limit.context": null,
+          "limit.output": null,
+          "model.family": "gpt-image",
+          "model.open_weights": false,
+          "rate.cache_write": {
+            "reason": "not_established",
+            "state": "unpriced"
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "chatgpt luna — named, cache-write": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "fact_prefixes": [
+          "rate.cache_write"
+        ],
+        "model_id": "gpt-5.6-luna",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write.above_context.272000",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "rate.cache_write": {
+            "key": "rate.input",
+            "state": "billed_as"
+          },
+          "rate.cache_write.above_context.272000": {
+            "key": "rate.input.above_context.272000",
+            "state": "billed_as"
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "chatgpt luna — named, capabilities": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "fact_prefixes": [
+          "capability."
+        ],
+        "model_id": "gpt-5.6-luna",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "chatgpt luna — named, rates": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "fact_prefixes": [
+          "rate."
+        ],
+        "model_id": "gpt-5.6-luna",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write.above_context.272000",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 20000000
+          },
+          "rate.cache_read.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 40000000
+          },
+          "rate.cache_write": {
+            "key": "rate.input",
+            "state": "billed_as"
+          },
+          "rate.cache_write.above_context.272000": {
+            "key": "rate.input.above_context.272000",
+            "state": "billed_as"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.input.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1200000000
+          },
+          "rate.output.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1800000000
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "chatgpt luna — named, unfiltered": {
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt",
+        "model_id": "gpt-5.6-luna",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "billing_rules": [
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        },
+        {
+          "as_class": "input",
+          "established_at_ms": 1791331200000,
+          "established_by": "fusiform",
+          "fact_key": "rate.cache_write.above_context.272000",
+          "model": "openai/gpt-5.6-luna",
+          "review_by_ms": 1796515200000,
+          "source_ref": "https://help.openai.com/en/articles/20001106",
+          "state": "billed_as"
+        }
+      ],
+      "catalog_version": 0,
+      "models": {
+        "openai/gpt-5.6-luna": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "type": "effort",
+              "values": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 1050000,
+          "limit.output": 128000,
+          "model.family": "gpt-luna",
+          "model.open_weights": false,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 20000000
+          },
+          "rate.cache_read.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 40000000
+          },
+          "rate.cache_write": {
+            "key": "rate.input",
+            "state": "billed_as"
+          },
+          "rate.cache_write.above_context.272000": {
+            "key": "rate.input.above_context.272000",
+            "state": "billed_as"
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 200000000
+          },
+          "rate.input.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 400000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1200000000
+          },
+          "rate.output.above_context.272000": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "gpt-luna",
+              "provider_id": "openai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 1800000000
+          }
+        }
+      },
+      "plane": {
+        "auth_method": "chatgpt",
+        "kind": "quota_proxy",
+        "provider_id": "openai",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://help.openai.com/en/articles/20001106"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "creator row, unmarked": {
+    "request": {
+      "arguments": {
+        "model_id": "synthetic-glm",
+        "provider_id": "zai"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "zai/synthetic-glm": {
+          "capability.attachment": null,
+          "capability.input_modalities": null,
+          "capability.output_modalities": null,
+          "capability.reasoning": null,
+          "capability.reasoning_options": null,
+          "capability.tool_call": null,
+          "existence": "present",
+          "limit.context": 128000,
+          "limit.output": 8192,
+          "model.family": "glm",
+          "model.open_weights": true,
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 75000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 250000000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "inherited rate": {
+    "request": {
+      "arguments": {
+        "model_id": "synthetic-glm",
+        "provider_id": "synthetic-reseller"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "synthetic-reseller/synthetic-glm": {
+          "capability.attachment": null,
+          "capability.input_modalities": null,
+          "capability.output_modalities": null,
+          "capability.reasoning": null,
+          "capability.reasoning_options": null,
+          "capability.tool_call": null,
+          "existence": "present",
+          "limit.context": 128000,
+          "limit.output": 8192,
+          "model.family": "glm",
+          "model.open_weights": true,
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "open_weights",
+              "family": "glm",
+              "provider_id": "zai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 75000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "open_weights",
+              "family": "glm",
+              "provider_id": "zai"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 250000000
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "inherited stated zero": {
+    "request": {
+      "arguments": {
+        "fact_prefixes": [
+          "rate."
+        ],
+        "model_id": "synthetic-glm-free",
+        "provider_id": "synthetic-reseller"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "synthetic-reseller/synthetic-glm-free": {
+          "rate.input": {
+            "inherited_from": {
+              "basis": "open_weights",
+              "family": "glm",
+              "provider_id": "zai"
+            },
+            "state": "stated_zero"
+          },
+          "rate.output": {
+            "inherited_from": {
+              "basis": "open_weights",
+              "family": "glm",
+              "provider_id": "zai"
+            },
+            "state": "stated_zero"
+          }
+        }
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "oauth anthropic — quota weights": {
+    "request": {
+      "arguments": {
+        "auth_method": "oauth",
+        "provider_id": "anthropic"
+      },
+      "name": "catalog.get"
+    },
+    "response": {
+      "catalog_version": 0,
+      "models": {
+        "anthropic/claude-sonnet-4-5": {
+          "capability.attachment": true,
+          "capability.input_modalities": [
+            "image",
+            "pdf",
+            "text"
+          ],
+          "capability.output_modalities": [
+            "text"
+          ],
+          "capability.reasoning": true,
+          "capability.reasoning_options": [
+            {
+              "min": 1024,
+              "type": "budget_tokens"
+            }
+          ],
+          "capability.tool_call": true,
+          "existence": "present",
+          "limit.context": 200000,
+          "limit.output": 64000,
+          "model.family": "claude-sonnet",
+          "model.open_weights": false,
+          "rate.cache_read": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-sonnet",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 300000000
+          },
+          "rate.cache_write": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-sonnet",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3750000000
+          },
+          "rate.input": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-sonnet",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 3000000000
+          },
+          "rate.output": {
+            "currency": "USD",
+            "exponent": 9,
+            "inherited_from": {
+              "basis": "quota_proxy",
+              "family": "claude-sonnet",
+              "provider_id": "anthropic"
+            },
+            "state": "priced",
+            "unit_provenance": {
+              "kind": "assumed_by_policy",
+              "policy": "models-dev-usd-v1"
+            },
+            "units": 15000000000
+          }
+        }
+      },
+      "overridden": [
+        {
+          "authority": "https://docs.claude.com/en/docs/build-with-claude/context-windows (read 2026-08-13) — 'Other Claude models, including Claude Sonnet 4.5, have a 200k-token context window'",
+          "fact_key": "limit.context",
+          "model_id": "claude-sonnet-4-5",
+          "provider_id": "anthropic",
+          "served_value": "200000",
+          "upstream_value": "1000000"
+        }
+      ],
+      "plane": {
+        "auth_method": "oauth",
+        "kind": "quota_proxy",
+        "provider_id": "anthropic",
+        "review_by_ms": 1796515200000,
+        "source_ref": "https://support.anthropic.com/en/articles/9797557"
+      },
+      "resolved_at_ms": -1,
+      "source": "models.dev"
+    }
+  },
+  "plan.prices — every curated row": {
+    "request": {
+      "arguments": {},
+      "name": "plan.prices"
+    },
+    "response": {
+      "prices": [
+        {
+          "boundary_at_ms": 1789689600000,
+          "established_at_ms": 1789776000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 20000,
+            "period": "month"
+          },
+          "provider_id": "anthropic",
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://support.claude.com/en/articles/11049741-what-is-the-max-plan",
+          "tier": "max_20x"
+        },
+        {
+          "boundary_at_ms": 1789689600000,
+          "established_at_ms": 1789776000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 10000,
+            "period": "month"
+          },
+          "provider_id": "anthropic",
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://support.claude.com/en/articles/11049741-what-is-the-max-plan",
+          "tier": "max_5x"
+        },
+        {
+          "boundary_at_ms": 1789689600000,
+          "established_at_ms": 1789776000000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 2000,
+            "period": "month"
+          },
+          "provider_id": "anthropic",
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://www.anthropic.com/pricing",
+          "tier": "pro"
+        },
+        {
+          "boundary_at_ms": 1789785600000,
+          "established_at_ms": 1789785600000,
+          "established_by": "fusiform",
+          "provider_id": "openai",
+          "refusal_reason": "\"pro\" is an API plan string, not a vendor tier name. OpenAI publishes Pro 5x ($100) and Pro 20x ($200) and its API reports plan_type \"pro\" for both, so this key cannot carry one price. The tier rows are openai/pro_5x and openai/pro_20x; which one an account holds is not published on any surface and is a fact about the account.",
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://help.openai.com/en/articles/9793128",
+          "tier": "pro"
+        },
+        {
+          "boundary_at_ms": 1789785600000,
+          "established_at_ms": 1789785600000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 20000,
+            "period": "month"
+          },
+          "provider_id": "openai",
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://help.openai.com/en/articles/9793128",
+          "tier": "pro_20x"
+        },
+        {
+          "boundary_at_ms": 1789785600000,
+          "established_at_ms": 1789785600000,
+          "established_by": "fusiform",
+          "price": {
+            "currency": "USD",
+            "exponent": 2,
+            "minor_units": 10000,
+            "period": "month"
+          },
+          "provider_id": "openai",
+          "review_by_ms": 1797552000000,
+          "source_ref": "https://help.openai.com/en/articles/9793128",
+          "tier": "pro_5x"
+        }
+      ],
+      "resolved_at_ms": -1,
+      "tier_vocabulary": "The tier is the VENDOR'S OWN TIER NAME, never an API plan string. Those are different vocabularies and do not correspond one-to-one, so a consumer holding an API string must map it to a tier itself, with knowledge of the account.",
+      "unit_policy": "US list price, monthly-billed, web subscription. An operator on an annual term, in another country, or subscribed through an app store pays something else, and this plane cannot see which."
+    }
+  },
+  "refused — historical plane": {
+    "error": {
+      "code": "no_coverage",
+      "message": "billing plane views are current-only: auth_method cannot be used with at_ms"
+    },
+    "request": {
+      "arguments": {
+        "at_ms": 1000,
+        "auth_method": "chatgpt",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    }
+  },
+  "refused — missing provider": {
+    "error": {
+      "code": "bad_request",
+      "message": "auth_method requires provider_id"
+    },
+    "request": {
+      "arguments": {
+        "auth_method": "chatgpt"
+      },
+      "name": "catalog.get"
+    }
+  },
+  "refused — undeclared google antigravity": {
+    "error": {
+      "code": "no_coverage",
+      "message": "no billing plane declared for (google, antigravity); API rows cannot establish subscription billing"
+    },
+    "request": {
+      "arguments": {
+        "auth_method": "antigravity",
+        "provider_id": "google"
+      },
+      "name": "catalog.get"
+    }
+  },
+  "refused — undeclared openai oauth": {
+    "error": {
+      "code": "no_coverage",
+      "message": "no billing plane declared for (openai, oauth); API rows cannot establish subscription billing"
+    },
+    "request": {
+      "arguments": {
+        "auth_method": "oauth",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
+    }
+  },
+  "refused — unknown auth": {
+    "error": {
+      "code": "bad_request",
+      "message": "unknown auth_method \"bogus\"; expected apikey, chatgpt, oauth or antigravity"
+    },
+    "request": {
+      "arguments": {
+        "auth_method": "bogus",
+        "provider_id": "openai"
+      },
+      "name": "catalog.get"
     }
   }
 }

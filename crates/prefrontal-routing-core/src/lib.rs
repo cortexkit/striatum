@@ -13,6 +13,7 @@
 pub mod aa_infer;
 pub mod account_wall;
 pub mod accounts;
+pub mod billing;
 pub mod break_glass;
 pub mod failure_backoff;
 pub mod launch_policy;
@@ -39,6 +40,7 @@ pub use aa_infer::{
     inherit_eq_from_curated_neighbors, interpolate_elo, EqSource, AA_INFERRED_DEFAULT_SPEED,
     AA_INFERRED_PENALTY,
 };
+pub use billing::{BillingPlane, BillingRate};
 pub use break_glass::{
     live_billing_wall_error, relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot,
 };

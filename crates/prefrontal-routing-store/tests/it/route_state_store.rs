@@ -60,6 +60,7 @@ impl Drop for Rig {
 
 fn fact(provider: &str, model: &str) -> ModelFact {
     ModelFact {
+        billing_plane: None,
         speed_is_fleet_median: false,
         provider_id: provider.into(),
         model_id: model.into(),
