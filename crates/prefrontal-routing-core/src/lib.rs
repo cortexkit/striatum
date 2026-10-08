@@ -13,6 +13,7 @@
 pub mod aa_infer;
 pub mod account_wall;
 pub mod accounts;
+pub mod billing;
 pub mod break_glass;
 pub mod failure_backoff;
 pub mod launch_policy;
@@ -39,6 +40,7 @@ pub use aa_infer::{
     inherit_eq_from_curated_neighbors, interpolate_elo, EqSource, AA_INFERRED_DEFAULT_SPEED,
     AA_INFERRED_PENALTY,
 };
+pub use billing::{BillingPlane, BillingRate};
 pub use break_glass::{
     live_billing_wall_error, relax_earliest_reset, BreakGlassCandidate, RelaxedSnapshot,
 };
@@ -55,11 +57,11 @@ pub use launch_policy::{
 };
 pub use model_facts::{
     derive_provider_key, fact_to_route, is_valid_grand_family_id, make_capacity_key,
-    make_route_key, normalize_grand_family_id, ClassVector, Confidence, FamilySource, GrandFamily,
-    ModelFact, ModelMetric, ModelPromptDefaults, ModelRequirements, ModelRoute, ModelScores,
-    ReasoningEffort, ScoreProvenance, CLASS_VECTOR_SAMPLE_FLOOR, CLASS_VECTOR_TRAILING_WINDOW_DAYS,
-    CLASS_VECTOR_TRAILING_WINDOW_MS, ENUMERATED_WORKLOAD_CLASSES, GRAND_FAMILY_NORMALIZATIONS,
-    MODEL_METRICS,
+    make_route_key, normalize_grand_family_id, BasketDimension, BasketPrice, ClassVector,
+    Confidence, FamilySource, GrandFamily, ModelFact, ModelMetric, ModelPromptDefaults,
+    ModelRequirements, ModelRoute, ModelScores, ReasoningEffort, ScoreProvenance,
+    CLASS_VECTOR_SAMPLE_FLOOR, CLASS_VECTOR_TRAILING_WINDOW_DAYS, CLASS_VECTOR_TRAILING_WINDOW_MS,
+    ENUMERATED_WORKLOAD_CLASSES, GRAND_FAMILY_NORMALIZATIONS, MODEL_METRICS,
 };
 pub use model_facts_seed::model_facts_seed;
 pub use model_resolution::{
@@ -78,9 +80,10 @@ pub use model_resolution::{
 pub use model_router::{
     admit_routes, select_model_route, select_model_route_with_config,
     select_model_route_with_slots, selection_cost, AdmissionResult, AdmittedRoute,
-    BelowFloorWarning, ModelRouteStateSnapshot, NoRouteError, ObjectiveBreakdown, PromptParams,
-    RejectedCandidate, RejectedRoute, RequiredCapabilities, RouteFailureReason, RouteRuntimeState,
-    SelectModelRouteInput, SelectedModel, SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED,
+    BasketRoutePricing, BasketVectorSource, BelowFloorWarning, ModelRouteStateSnapshot,
+    NoRouteError, ObjectiveBreakdown, PricingMode, PromptParams, RejectedCandidate, RejectedRoute,
+    RequiredCapabilities, RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
+    SelectedModel, SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED,
     REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
 pub use panel::{

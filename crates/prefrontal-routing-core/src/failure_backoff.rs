@@ -90,6 +90,7 @@ pub fn classify_failure_attribution(
     // OpenAI's cyber-program refusal (2026-09-06, a review brief), plus the generic
     // content-filter wordings the major providers use.
     if [
+        "provider_policy_refusal",
         "flagged for possible cybersecurity risk",
         "trusted access for cyber",
         "content_filter",
@@ -193,6 +194,25 @@ mod tests {
 
     /// Verbatim from the live routing store (openai/gpt-6-astra, 2026-09-06).
     const CONTENT_POLICY_SPECIMEN: &str = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
+
+    #[test]
+    fn typed_provider_policy_refusal_does_not_charge_any_route_strike() {
+        let error = "provider_policy_refusal: provider openai: cyber_policy; HTTP 400";
+        assert_eq!(
+            classify_failure_attribution(RouteOutcome::SessionError, Some(error)),
+            FailureAttribution::ContentPolicy
+        );
+        assert_eq!(
+            failure_backoff_transition(
+                2,
+                RouteOutcome::SessionError,
+                Some(error),
+                1_000,
+                FailureBackoffConfig::default()
+            ),
+            FailureBackoffTransition::Unchanged
+        );
+    }
 
     #[test]
     fn a_provider_content_policy_refusal_does_not_charge_the_route() {

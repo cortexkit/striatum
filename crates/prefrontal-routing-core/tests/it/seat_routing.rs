@@ -31,6 +31,7 @@ use prefrontal_routing_core::ModelRequirements;
 /// fixtures deliberately contradict the name to prove no inference happens).
 fn fact(provider: &str, model: &str, family: Option<&str>, elo: f64, cost: f64) -> ModelFact {
     ModelFact {
+        billing_plane: None,
         speed_is_fleet_median: false,
         provider_id: provider.to_string(),
         model_id: model.to_string(),

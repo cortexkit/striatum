@@ -10,7 +10,7 @@ use crate::model_facts::{
     make_capacity_key, ModelFact, ModelRequirements, ModelRoute, FAST_SUFFIX,
 };
 use crate::model_router::{
-    admit_routes, compute_objective, normalized_metered_cost, ModelRouteStateSnapshot,
+    admit_routes, compute_objective, normalized_metered_cost, CostBasis, ModelRouteStateSnapshot,
     RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
 use crate::package_ceiling::seat_package_ceiling;
@@ -593,8 +593,12 @@ fn select_panel_admitted(
             .as_ref()
             .map(|predicate| predicate(&admitted.route))
             .unwrap_or(false);
-        let (objective, _) =
-            compute_objective(&admitted.route, &admitted.runtime, is_subscription, false);
+        let (objective, _) = compute_objective(
+            &admitted.route,
+            &admitted.runtime,
+            is_subscription,
+            CostBasis::OutputOnly,
+        );
         candidates.push(Candidate {
             metered_cost: normalized_metered_cost(&admitted.route.fact),
             route: admitted.route,

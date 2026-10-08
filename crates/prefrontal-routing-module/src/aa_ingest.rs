@@ -175,6 +175,7 @@ pub fn seed_aa(
         .unwrap_or_else(|| (1_000.0, "unknown_default".to_string()));
     let review_by_ms = now_ms.saturating_add(aa_config.review_by_ms);
     let mut fact = existing.unwrap_or_else(|| ModelFact {
+        billing_plane: None,
         speed_is_fleet_median: false,
         provider_id: params.provider_id.clone(),
         model_id: params.model_id.clone(),

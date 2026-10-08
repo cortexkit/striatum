@@ -16,7 +16,8 @@ use prefrontal_routing_core::model_facts::{
 use prefrontal_routing_core::model_facts_seed::model_facts_seed;
 use prefrontal_routing_core::model_router::{
     admit_routes, price_selection_shortlist, select_model_route, select_model_route_with_config,
-    ModelRouteStateSnapshot, RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
+    BasketVectorSource, ModelRouteStateSnapshot, PricingMode, RouteFailureReason,
+    RouteRuntimeState, SelectModelRouteInput,
 };
 use prefrontal_routing_core::{
     ExclusionPolicy, OverqualificationConfig, RoutingConfig, DEFAULT_OVERQUALIFICATION,
@@ -65,6 +66,7 @@ struct FactBuilder {
 fn fact(b: FactBuilder) -> ModelFact {
     let has_vector = b.class_vector.is_some();
     ModelFact {
+        billing_plane: None,
         speed_is_fleet_median: false,
         provider_id: b.provider_id,
         model_id: b.model_id,
@@ -2150,7 +2152,7 @@ fn counters_producer_false_complete_rate_card_selection_bit_identical() {
 }
 
 #[test]
-fn selection_cost_prices_with_basket_only_when_usable_class_vector_and_complete_rates_present() {
+fn selection_cost_prices_with_basket_on_a_usable_class_vector_and_rates_for_every_used_dimension() {
     use prefrontal_routing_core::{selection_cost, ClassVector};
 
     let mut fact_item = fact(FactBuilder {
@@ -2204,9 +2206,22 @@ fn selection_cost_prices_with_basket_only_when_usable_class_vector_and_complete_
     fact_item.reasoning_rate = None;
     assert_eq!(selection_cost(&fact_item, false, true), basket_cost);
 
-    // Missing input rate: degrades to today's ladder
+    // Missing input rate while the vector carries fresh input: the route cannot
+    // be priced on the basket and takes the unpriced-route cost (max), not the
+    // output-only ladder. Pricing it output-only would put it in a different
+    // unit from every other route in the same basket-priced selection.
     fact_item.input_rate = None;
-    assert_eq!(selection_cost(&fact_item, false, true), 10.0 / 30.0);
+    assert_eq!(selection_cost(&fact_item, false, true), 1.0);
+    assert!(fact_item.basket_cost().is_none());
+
+    // A missing rate on a dimension the workload never uses changes nothing.
+    fact_item.input_rate = Some(2.0);
+    fact_item.cache_write_rate = None;
+    let mut no_writes = fact_item.class_vector.clone().unwrap();
+    no_writes.cache_write = 0.0;
+    fact_item.class_vector = Some(no_writes);
+    let expected = (1000.0 * 2.0 + 500.0 * 10.0 + 100.0 * 10.0 + 2000.0 * 0.5) / 1e6 / 0.05;
+    assert!((selection_cost(&fact_item, false, true) - expected).abs() < 1e-12);
 }
 
 #[test]
@@ -2379,103 +2394,142 @@ fn whole_selection_engagement_all_candidates_complete_prices_in_basket() {
     assert!(exp.contains("basket pricing (list dollars)"), "{exp}");
 }
 
+/// Prices `facts` the way selection does (producers on, term off) and returns
+/// the shortlist verdict.
+fn price_basket_selection(
+    facts: Vec<ModelFact>,
+) -> prefrontal_routing_core::model_router::PricedShortlist {
+    price_selection_shortlist(
+        input(facts, req(50.0, 0.0), Extra::default()),
+        &RoutingConfig {
+            overqualification: OverqualificationConfig {
+                base: 0.0,
+                ..DEFAULT_OVERQUALIFICATION
+            },
+            ..DEFAULT_ROUTING_CONFIG
+        },
+        true,
+        true,
+    )
+    .unwrap()
+}
+
+fn priced_entry<'p>(
+    priced: &'p prefrontal_routing_core::model_router::PricedShortlist,
+    route_key: &str,
+) -> &'p prefrontal_routing_core::model_router::PricedShortlistEntry {
+    priced
+        .routes
+        .iter()
+        .find(|route| route.route_key == route_key)
+        .unwrap_or_else(|| panic!("{route_key} not shortlisted: {priced:?}"))
+}
+
+// A shortlisted route missing a rate for a dimension the workload uses used to
+// switch the WHOLE selection to output-only pricing, so one catalog gap on a
+// low-ranked route changed every other route's cost and the winner with it.
+// Pricing is per route now: that route alone is unpriceable and ranks at the
+// maximum; the complete route keeps its basket price and the selection stays
+// on the basket.
 #[test]
-fn whole_selection_engagement_one_candidate_missing_rate_forces_whole_selection_fallback() {
+fn one_candidate_missing_a_used_rate_prices_at_max_and_the_selection_stays_on_the_basket() {
     let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
     let fact_complete = make_complete_basket_fact("p", "model_complete", 100.0, Some(vec.clone()));
+    let complete_basket = fact_complete.basket_cost().unwrap();
 
-    // Degrade case 1: card missing cache rates
-    let mut fact_missing_cache = fact_complete.clone();
-    fact_missing_cache.model_id = "missing_cache".into();
-    fact_missing_cache.cache_read_rate = None;
-    fact_missing_cache.cache_write_rate = None;
+    let mut missing_cache = fact_complete.clone();
+    missing_cache.model_id = "missing_cache".into();
+    missing_cache.cache_read_rate = None;
+    missing_cache.cache_write_rate = None;
 
-    let res = select_without_overqualification(input(
-        vec![fact_complete.clone(), fact_missing_cache],
-        req(50.0, 0.0),
-        Extra::default(),
-    ))
-    .unwrap();
-    // Complete candidate must degrade to today's ladder bit-identically (10.0 / 30.0), not basket cost!
-    assert_eq!(res.score.selection_cost, 10.0 / 30.0);
-    assert_ne!(
-        res.score.selection_cost,
-        fact_complete.basket_cost().unwrap()
-    );
-    let exp = res.explanation.join("\n");
-    assert!(exp.contains("output $/Mtok"), "{exp}");
+    let mut no_input = fact_complete.clone();
+    no_input.model_id = "no_input".into();
+    no_input.input_rate = None;
 
-    // Degrade case 2: card with no input rate
-    let mut fact_no_input = fact_complete.clone();
-    fact_no_input.model_id = "no_input".into();
-    fact_no_input.input_rate = None;
-
-    let res2 = select_without_overqualification(input(
-        vec![fact_complete.clone(), fact_no_input],
-        req(50.0, 0.0),
-        Extra::default(),
-    ))
-    .unwrap();
-    assert_eq!(res2.score.selection_cost, 10.0 / 30.0);
-
-    // Degrade case 3: tier-only fact
-    let mut fact_tier_only = fact(FactBuilder {
+    let mut tier_only = fact(FactBuilder {
         provider_id: "p".into(),
         model_id: "tier_only".into(),
         scores: scores(80.0, 1800.0, 100.0),
         cost_tier: Some(3.0),
         ..Default::default()
     });
-    fact_tier_only.class_vector = Some(vec.clone());
-    fact_tier_only.class_vector_is_overlay = true;
+    tier_only.class_vector = Some(vec.clone());
+    tier_only.class_vector_is_overlay = true;
 
-    let res3 = select_without_overqualification(input(
-        vec![fact_complete.clone(), fact_tier_only],
-        req(50.0, 0.0),
-        Extra::default(),
-    ))
-    .unwrap();
-    assert_eq!(res3.score.selection_cost, 10.0 / 30.0);
+    let mut no_output = fact_complete.clone();
+    no_output.model_id = "no_output".into();
+    no_output.cost_per_m_tok_out = None;
 
-    // Degrade case 4: fact serving input and cache rates but no cost_per_m_tok_out
-    let mut fact_no_output = fact_complete.clone();
-    fact_no_output.model_id = "no_output".into();
-    fact_no_output.cost_per_m_tok_out = None;
+    for (incomplete, unpriced) in [
+        (missing_cache, vec!["cached_read", "cache_write"]),
+        (no_input, vec!["fresh_input"]),
+        (
+            tier_only,
+            vec![
+                "fresh_input",
+                "output",
+                "reasoning",
+                "cached_read",
+                "cache_write",
+            ],
+        ),
+        (no_output, vec!["output"]),
+    ] {
+        let incomplete_key = format!("p/{}", incomplete.model_id);
+        let facts = vec![fact_complete.clone(), incomplete];
+        let priced = price_basket_selection(facts.clone());
+        assert!(priced.use_basket, "{incomplete_key}: {priced:?}");
+        assert_eq!(priced.degraded_by, None);
+        assert_eq!(priced.pricing_fallback, None);
+        let complete = priced_entry(&priced, "p/model_complete");
+        assert_eq!(complete.cost, complete_basket, "{incomplete_key}");
+        let gap = priced_entry(&priced, &incomplete_key);
+        assert_eq!(gap.cost, 1.0, "{incomplete_key} prices at the maximum");
+        assert_eq!(
+            gap.basket_pricing.as_ref().unwrap().unpriced_dimensions,
+            unpriced,
+            "{incomplete_key}"
+        );
 
-    let res4 = select_without_overqualification(input(
-        vec![fact_complete.clone(), fact_no_output],
-        req(50.0, 0.0),
-        Extra::default(),
-    ))
-    .unwrap();
-    assert_eq!(res4.score.selection_cost, 10.0 / 30.0);
+        let res = select_without_overqualification(input(facts, req(50.0, 0.0), Extra::default()))
+            .unwrap();
+        assert_eq!(res.route_key, "p/model_complete");
+        assert_eq!(res.score.selection_cost, complete_basket);
+        assert_eq!(res.score.pricing_mode, PricingMode::Basket);
+        assert!(res.priced_with_basket);
+        let exp = res.explanation.join("\n");
+        assert!(exp.contains("basket pricing (list dollars)"), "{exp}");
+        assert!(
+            exp.contains("pricing: basket for the whole shortlist"),
+            "{exp}"
+        );
+    }
 }
 
+// A decoder-refused rate decodes to None on the fact. It is never read as a
+// zero rate: the refusing route is unpriceable (max), and it cannot switch the
+// complete route off the basket.
 #[test]
-fn whole_selection_engagement_refused_rate_forces_whole_selection_fallback() {
+fn refused_rate_prices_its_route_at_max_without_switching_the_selection() {
     let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
     let fact_complete = make_complete_basket_fact("p", "model_complete", 100.0, Some(vec.clone()));
 
-    // A card whose rate was refused by the decoder leaves the rate None on ModelFact
     let mut fact_refused = fact_complete.clone();
     fact_refused.model_id = "model_refused".into();
     fact_refused.cache_read_rate = None;
 
-    let res = select_without_overqualification(input(
-        vec![fact_complete.clone(), fact_refused],
-        req(50.0, 0.0),
-        Extra::default(),
-    ))
-    .unwrap();
-
-    // Whole selection falls back to today's ladder bit-identically
-    assert_eq!(res.score.selection_cost, 10.0 / 30.0);
-    assert_ne!(
-        res.score.selection_cost,
+    let priced = price_basket_selection(vec![fact_complete.clone(), fact_refused]);
+    assert!(priced.use_basket);
+    assert_eq!(
+        priced_entry(&priced, "p/model_complete").cost,
         fact_complete.basket_cost().unwrap()
     );
-    let exp = res.explanation.join("\n");
-    assert!(exp.contains("output $/Mtok"), "{exp}");
+    let refused = priced_entry(&priced, "p/model_refused");
+    assert_eq!(refused.cost, 1.0);
+    assert_eq!(
+        refused.basket_pricing.as_ref().unwrap().unpriced_dimensions,
+        vec!["cached_read"]
+    );
 }
 
 #[test]
@@ -2506,8 +2560,11 @@ fn ladder_asserted_in_order_basket_effective_tier_metered_subscription() {
     assert_eq!(selection_cost(&unpriced_fact, true, false), 0.0);
 }
 
+// The incomplete route's gap stays on the incomplete route: the complete one is
+// priced at its own basket cost (0.1775), never at the output-only ladder
+// (10/30) it was dragged to while one route's gap decided the whole selection.
 #[test]
-fn mutation_degrading_only_incomplete_route_reddens() {
+fn incomplete_route_cannot_move_the_complete_route_off_its_basket_price() {
     let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
     let fact_complete = make_complete_basket_fact("p", "complete_route", 100.0, Some(vec.clone()));
     let mut fact_incomplete = fact_complete.clone();
@@ -2521,13 +2578,12 @@ fn mutation_degrading_only_incomplete_route_reddens() {
     ))
     .unwrap();
 
-    // A mutation that degraded only the incomplete route would price complete_route
-    // with its basket cost (0.1775). In the normative design, it MUST be priced at 10.0 / 30.0.
-    assert_eq!(res.score.selection_cost, 10.0 / 30.0);
-    assert_ne!(
+    assert_eq!(res.route_key, "p/complete_route");
+    assert_eq!(
         res.score.selection_cost,
         fact_complete.basket_cost().unwrap()
     );
+    assert_ne!(res.score.selection_cost, 10.0 / 30.0);
 }
 
 #[test]
@@ -2652,22 +2708,42 @@ fn cache_separation_fixture_routes_rank_apart_on_cached_read_term() {
     assert!(exp.contains("list dollars"), "{exp}");
     assert!(exp.contains("cached-read term"), "{exp}");
 
-    // With any required rate absent or refused on the served catalog the same pair
-    // ranks exactly as it does today:
+    // A route without a cache-read rate while the workload reads from cache
+    // cannot be priced on the basket: it ranks at the maximum and the caching
+    // route keeps its basket price. It no longer switches the pair to the
+    // output-only ladder, where nocache won on speed at equal output price.
     let mut route_nocache_absent = route_nocache.clone();
     route_nocache_absent.cache_read_rate = None;
 
-    let winner_fallback = select_model_route(input(
-        vec![route_caching.clone(), route_nocache_absent],
+    let winner_absent = select_model_route(input(
+        vec![route_caching.clone(), route_nocache_absent.clone()],
         req(50.0, 0.0),
         Extra::default(),
     ))
     .unwrap();
-    // In today's ladder, both have cost 5.0 / 30.0 = 0.16666... and tie on cost.
-    // Speed tie-break decides: route_nocache has speed 150.0 vs caching 100.0, so nocache wins!
-    assert_eq!(winner_fallback.model.model_id, "nocache");
-    let exp_fallback = winner_fallback.explanation.join("\n");
-    assert!(exp_fallback.contains("output $/Mtok"), "{exp_fallback}");
+    assert_eq!(winner_absent.model.model_id, "caching");
+    assert_eq!(winner_absent.score.pricing_mode, PricingMode::Basket);
+    let priced = price_selection_shortlist(
+        input(
+            vec![route_caching.clone(), route_nocache_absent],
+            req(50.0, 0.0),
+            Extra::default(),
+        ),
+        &DEFAULT_ROUTING_CONFIG,
+        true,
+        true,
+    )
+    .unwrap();
+    let absent = priced
+        .routes
+        .iter()
+        .find(|route| route.route_key == "p/nocache")
+        .unwrap();
+    assert_eq!(absent.cost, 1.0);
+    assert_eq!(
+        absent.basket_pricing.as_ref().unwrap().unpriced_dimensions,
+        vec!["cached_read"]
+    );
 }
 
 #[test]
@@ -3132,12 +3208,16 @@ const MASON_DECISION_REQS: &[(f64, f64, usize)] = &[
     (95.0, 70.0, 1),
 ];
 
+// Every reconstructed shortlist holds openai/gpt-5.6-sol-pro, whose catalog row
+// serves only an output price. Under the whole-selection rate gate it switched
+// all 732 mason decisions to output-only pricing. Per-dimension pricing keeps
+// every one of them on the basket and prices sol-pro alone as unpriceable.
 #[test]
-fn reconstructed_mason_shortlists_all_degrade_on_gpt_5_6_sol_pro() {
+fn reconstructed_mason_shortlists_stay_on_the_basket_and_price_gpt_5_6_sol_pro_as_unpriced() {
     let catalog = scored_routable_catalog();
     let total: usize = MASON_DECISION_REQS.iter().map(|(_, _, n)| n).sum();
     assert_eq!(total, 732);
-    let mut degraded_on_sol_pro = 0usize;
+    let mut basket_priced = 0usize;
     for &(iq, eq, n) in MASON_DECISION_REQS {
         let priced = price_selection_shortlist(
             input(catalog.clone(), req(iq, eq), Extra::default()),
@@ -3147,18 +3227,25 @@ fn reconstructed_mason_shortlists_all_degrade_on_gpt_5_6_sol_pro() {
         )
         .unwrap_or_else(|err| panic!("iq {iq} eq {eq} failed to price: {err:?}"));
         assert!(
-            !priced.use_basket,
-            "iq {iq} eq {eq} engaged the basket; twin rate inheritance may have landed"
+            priced.use_basket,
+            "iq {iq} eq {eq} left the basket: {:?}",
+            priced.pricing_fallback
         );
+        assert_eq!(priced.degraded_by, None, "iq {iq} eq {eq}");
+        let sol_pro = priced
+            .routes
+            .iter()
+            .find(|route| route.route_key == "openai/gpt-5.6-sol-pro")
+            .unwrap_or_else(|| panic!("iq {iq} eq {eq}: sol-pro not shortlisted"));
+        assert_eq!(sol_pro.cost, 1.0, "iq {iq} eq {eq}");
         assert_eq!(
-            priced.degraded_by.as_deref(),
-            Some("openai/gpt-5.6-sol-pro"),
-            "iq {iq} eq {eq} degrader {:?}",
-            priced.degraded_by
+            sol_pro.basket_pricing.as_ref().unwrap().unpriced_dimensions,
+            vec!["fresh_input", "cached_read", "cache_write"],
+            "iq {iq} eq {eq}"
         );
-        degraded_on_sol_pro += n;
+        basket_priced += n;
     }
-    assert_eq!(degraded_on_sol_pro, 732);
+    assert_eq!(basket_priced, 732);
 }
 
 // Two routes on one subscription plan share one quota pool, so they compare
@@ -3703,4 +3790,316 @@ mod slot_saturation {
             ConcurrencySlots::new([slot("anthropic/opus", 39, 40), slot("openai/sol", 50, 0)]);
         assert_eq!(select(Some(&roomy)), baseline);
     }
+}
+
+// ── Per-dimension basket pricing: live-shaped mason IQ band ─────────────────
+//
+// Live-shaped facts. Opus 5.5 and Sol 6.1 are on subscription plans (x18 and
+// x25); the Grok-shaped route is metered and its catalog row serves no
+// cache-write rate, as Grok, Kimi and GLM rows do. Its elo (1700) clears the
+// mason iq bar up to iq 75 and drops out of the shortlist from iq 78 up.
+// Opus has more quota headroom than Sol, which decides between them whenever
+// both sit in the effectively-free bucket.
+
+fn mason_live_vector() -> prefrontal_routing_core::ClassVector {
+    make_ephemeral_vector(4723.88, 225.29, 161.18, 137755.25, 171.12, 61_878)
+}
+
+fn live_rated(
+    provider: &str,
+    model: &str,
+    elo: f64,
+    speed: f64,
+    rates: (f64, f64, f64, Option<f64>),
+    multiplier: Option<f64>,
+) -> ModelFact {
+    let (out, inp, cache_read, cache_write) = rates;
+    let mut f = fact(FactBuilder {
+        provider_id: provider.into(),
+        model_id: model.into(),
+        scores: scores(elo, 1_500.0, speed),
+        cost_per_m_tok_out: Some(out),
+        class_vector: Some(mason_live_vector()),
+        ..Default::default()
+    });
+    f.input_rate = Some(inp);
+    f.cache_read_rate = Some(cache_read);
+    f.cache_write_rate = cache_write;
+    f.subscription_multiplier = multiplier;
+    f
+}
+
+fn live_band_facts() -> Vec<ModelFact> {
+    vec![
+        live_rated(
+            "anthropic",
+            "claude-opus-5-5",
+            1_960.0,
+            120.0,
+            (20.0, 4.0, 0.20, Some(5.0)),
+            Some(18.0),
+        ),
+        live_rated(
+            "openai",
+            "gpt-6.1-sol",
+            1_884.0,
+            80.0,
+            (10.0, 2.0, 0.10, Some(2.50)),
+            Some(25.0),
+        ),
+        live_rated(
+            "xai",
+            "grok-5",
+            1_700.0,
+            90.0,
+            (15.0, 3.0, 0.75, None),
+            None,
+        ),
+    ]
+}
+
+fn live_band_extra<'a>() -> Extra<'a> {
+    let abundance = |value: f64| RouteRuntimeState {
+        quota_abundance: Some(value),
+        quota_abundance_window: Some("weekly".into()),
+        ..Default::default()
+    };
+    Extra {
+        runtime_snapshot: Some(ModelRouteStateSnapshot {
+            now: 1_000.0,
+            by_route: HashMap::new(),
+            by_capacity: HashMap::from([
+                ("anthropic/claude-opus-5-5".to_string(), abundance(0.9)),
+                ("openai/gpt-6.1-sol".to_string(), abundance(0.3)),
+            ]),
+        }),
+        is_subscription_route: Some(Box::new(|r: &ModelRoute| r.provider_id != "xai")),
+        ..Default::default()
+    }
+}
+
+// The reported flip: at mason iq 60-75 the Grok-shaped route (no cache-write
+// rate) sat in the shortlist and switched the whole selection to output-only
+// pricing, where Opus (20/18/30 = 0.037) and Sol (10/25/30 = 0.013) both sat in
+// the effectively-free bucket and Opus won on quota headroom. From iq 78 Grok
+// dropped out, the basket engaged, Opus priced at 0.061 (above the bucket) and
+// Sol at 0.022 won. Before this change: Opus at iq 60/70/75, Sol at iq 80.
+// Now every iq prices on the basket and Sol wins all four.
+#[test]
+fn mason_iq_band_keeps_one_pricing_mode_and_one_winner_across_the_grok_cutoff() {
+    let mut grok_shortlisted = Vec::new();
+    for iq in [60.0, 70.0, 75.0, 80.0] {
+        let priced = price_selection_shortlist(
+            input(live_band_facts(), req(iq, 0.0), live_band_extra()),
+            &DEFAULT_ROUTING_CONFIG,
+            COUNTERS_PRODUCER,
+            CLASS_PRODUCER,
+        )
+        .unwrap();
+        assert!(
+            priced.use_basket,
+            "iq {iq} left the basket: {:?}",
+            priced.pricing_fallback
+        );
+        let cost = |key: &str| {
+            priced
+                .routes
+                .iter()
+                .find(|route| route.route_key == key)
+                .map(|route| route.cost)
+        };
+        assert!((cost("anthropic/claude-opus-5-5").unwrap() - 0.061_146).abs() < 1e-5);
+        assert!((cost("openai/gpt-6.1-sol").unwrap() - 0.022_013).abs() < 1e-5);
+        if let Some(grok) = priced.routes.iter().find(|r| r.route_key == "xai/grok-5") {
+            grok_shortlisted.push(iq);
+            assert_eq!(grok.cost, 1.0, "iq {iq}");
+            assert_eq!(
+                grok.basket_pricing.as_ref().unwrap().unpriced_dimensions,
+                vec!["cache_write"]
+            );
+        }
+
+        let selected =
+            select_model_route(input(live_band_facts(), req(iq, 0.0), live_band_extra())).unwrap();
+        assert_eq!(selected.route_key, "openai/gpt-6.1-sol", "iq {iq}");
+        assert_eq!(selected.score.pricing_mode, PricingMode::Basket, "iq {iq}");
+        assert_eq!(selected.score.pricing_fallback, None);
+    }
+    // Anti-vacuity: the fixture must straddle the cutoff the defect lived on.
+    assert_eq!(grok_shortlisted, vec![60.0, 70.0, 75.0]);
+}
+
+// Codex runs record no cache-write tokens. A route whose catalog row lacks a
+// cache-write rate is then fully priceable: the dimension contributes zero
+// whatever its rate would be.
+#[test]
+fn route_without_cache_write_rate_stays_basket_priced_when_the_vector_writes_no_cache() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 0.0, 50);
+    let complete = make_complete_basket_fact("p", "complete", 100.0, Some(vec.clone()));
+    let mut no_cache_write = make_complete_basket_fact("q", "no_cache_write", 100.0, Some(vec));
+    no_cache_write.cache_write_rate = None;
+    let expected = no_cache_write
+        .basket_cost()
+        .expect("no rate is needed for a dimension the workload never uses");
+
+    let priced = price_basket_selection(vec![complete, no_cache_write]);
+    assert!(priced.use_basket, "{:?}", priced.pricing_fallback);
+    let entry = priced_entry(&priced, "q/no_cache_write");
+    assert_eq!(entry.cost, expected);
+    assert!(entry.cost < 1.0);
+    assert!(entry
+        .basket_pricing
+        .as_ref()
+        .unwrap()
+        .unpriced_dimensions
+        .is_empty());
+}
+
+#[test]
+fn route_with_cache_write_tokens_and_no_rate_prices_at_max_and_leaves_the_others_on_the_basket() {
+    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let complete = make_complete_basket_fact("p", "complete", 100.0, Some(vec.clone()));
+    let complete_basket = complete.basket_cost().unwrap();
+    let mut no_cache_write = make_complete_basket_fact("q", "no_cache_write", 100.0, Some(vec));
+    no_cache_write.cache_write_rate = None;
+
+    let priced = price_basket_selection(vec![complete, no_cache_write.clone()]);
+    assert!(priced.use_basket);
+    assert_eq!(priced_entry(&priced, "p/complete").cost, complete_basket);
+    let entry = priced_entry(&priced, "q/no_cache_write");
+    assert_eq!(entry.cost, 1.0);
+    assert_eq!(
+        entry.basket_pricing.as_ref().unwrap().unpriced_dimensions,
+        vec!["cache_write"]
+    );
+
+    // Alone it wins (nothing else to pick) and its line says why it is at max.
+    let alone = select_without_overqualification(input(
+        vec![no_cache_write],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    let exp = alone.explanation.join("\n");
+    assert!(
+        exp.contains(
+            "unpriceable, ranked as max (cache_write 50 tokens/message, no cache_write_rate)"
+        ),
+        "{exp}"
+    );
+}
+
+fn own_vector(sample_count: u64) -> prefrontal_routing_core::ClassVector {
+    prefrontal_routing_core::ClassVector {
+        is_overlay: false,
+        ..make_ephemeral_vector(500.0, 250.0, 0.0, 1000.0, 0.0, sample_count)
+    }
+}
+
+fn with_own_vector(mut fact: ModelFact, vector: prefrontal_routing_core::ClassVector) -> ModelFact {
+    fact.class_vector = Some(vector);
+    fact.class_vector_is_overlay = false;
+    fact
+}
+
+#[test]
+fn route_with_no_usable_own_vector_prices_on_the_fleet_vector_and_says_so() {
+    let fleet = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 60);
+    let on_fleet = make_complete_basket_fact("p", "on_fleet", 100.0, Some(fleet.clone()));
+    let own = with_own_vector(
+        make_complete_basket_fact("q", "own", 100.0, None),
+        own_vector(80),
+    );
+    let thin_own = with_own_vector(
+        make_complete_basket_fact("r", "thin_own", 100.0, None),
+        own_vector(49),
+    );
+
+    let priced = price_basket_selection(vec![on_fleet.clone(), own.clone(), thin_own.clone()]);
+    assert!(priced.use_basket, "{:?}", priced.pricing_fallback);
+    let source = |key: &str| {
+        priced_entry(&priced, key)
+            .basket_pricing
+            .as_ref()
+            .unwrap()
+            .vector
+    };
+    assert_eq!(source("p/on_fleet"), BasketVectorSource::Fleet);
+    assert_eq!(source("q/own"), BasketVectorSource::Own);
+    // An own vector below the sample floor is not used; the fleet's is.
+    assert_eq!(source("r/thin_own"), BasketVectorSource::Fleet);
+    assert_eq!(
+        priced_entry(&priced, "r/thin_own").cost,
+        thin_own.basket_price(&fleet).cost.unwrap()
+    );
+    assert_eq!(
+        priced_entry(&priced, "q/own").cost,
+        own.basket_price(&own_vector(80)).cost.unwrap()
+    );
+
+    // With only the thin route in the input there is no fleet vector at all,
+    // so the selection has nothing to basket-price it on.
+    let selected =
+        select_without_overqualification(input(vec![thin_own], req(50.0, 0.0), Extra::default()))
+            .unwrap();
+    assert_eq!(selected.score.pricing_mode, PricingMode::OutputOnly);
+    assert_eq!(
+        selected.score.pricing_fallback.as_deref(),
+        Some("r/thin_own has no usable ephemeral vector of its own and no fleet ephemeral vector")
+    );
+
+    let with_fleet = select_without_overqualification(input(
+        vec![
+            make_complete_basket_fact("r", "thin_own", 100.0, None),
+            on_fleet,
+        ],
+        req(50.0, 0.0),
+        Extra::default(),
+    ))
+    .unwrap();
+    let exp = with_fleet.explanation.join("\n");
+    assert!(
+        exp.contains("fleet vector (60 samples), no usable own vector"),
+        "{exp}"
+    );
+    let json = serde_json::to_value(&with_fleet.score).unwrap();
+    assert_eq!(json["pricingMode"], "basket");
+    assert_eq!(json["objective"]["basketPricing"]["vector"], "fleet");
+    assert!(json.get("pricingFallback").is_none());
+}
+
+// The only whole-selection fallback left: a shortlisted route with no usable
+// own vector while the fleet vector is below the sample floor. It names the
+// route and the floor.
+#[test]
+fn unusable_fleet_vector_is_the_only_whole_selection_fallback_and_names_its_cause() {
+    let thin_fleet = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 12);
+    let a = make_complete_basket_fact("p", "a", 100.0, Some(thin_fleet.clone()));
+    let b = with_own_vector(
+        make_complete_basket_fact("q", "b", 100.0, None),
+        own_vector(80),
+    );
+
+    let priced = price_basket_selection(vec![a.clone(), b.clone()]);
+    assert!(!priced.use_basket);
+    assert_eq!(priced.degraded_by.as_deref(), Some("p/a"));
+    assert_eq!(
+        priced.pricing_fallback.as_deref(),
+        Some("p/a has no usable ephemeral vector of its own and fleet ephemeral vector has 12 samples, below the floor of 50")
+    );
+    assert!(priced.routes.iter().all(|r| r.basket_pricing.is_none()));
+
+    let selected =
+        select_without_overqualification(input(vec![a, b], req(50.0, 0.0), Extra::default()))
+            .unwrap();
+    assert_eq!(selected.score.pricing_mode, PricingMode::OutputOnly);
+    assert!(!selected.priced_with_basket);
+    let exp = selected.explanation.join("\n");
+    assert!(
+        exp.contains("pricing: output-only for the whole shortlist (p/a has no usable ephemeral vector of its own and fleet ephemeral vector has 12 samples, below the floor of 50)"),
+        "{exp}"
+    );
+    let json = serde_json::to_value(&selected.score).unwrap();
+    assert_eq!(json["pricingMode"], "output_only");
+    assert!(json["objective"].get("basketPricing").is_none());
 }

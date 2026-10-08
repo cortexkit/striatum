@@ -676,6 +676,20 @@ fn roster_for_model(ctx: &Ctx<'_>, provider: &str, model: Option<&str>) -> Roste
     }
 }
 
+/// Pricing uses the same roster as account_for, not the subscription policy or
+/// a guessed credential id. Called by the poller, never during model selection.
+pub(crate) fn billing_roster(
+    state: &AccountQuotaState,
+    provider: &str,
+    model: &str,
+    now_ms: i64,
+) -> Vec<AccountView> {
+    allocator_roster_for_model(state, provider, Some(model), now_ms)
+        .roster
+        .map(|roster| roster.accounts)
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Stored rows as allocator inputs
 // ---------------------------------------------------------------------------

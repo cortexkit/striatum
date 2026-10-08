@@ -1693,6 +1693,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
     };
     let source = FactSource::parse(&row.get::<_, String>("source")?);
     Ok(ModelFact {
+        billing_plane: None,
         // Read-time provenance, never stored: a fact loaded from the row has whatever
         // speed the row holds, and the median stand-in is applied above this.
         speed_is_fleet_median: false,

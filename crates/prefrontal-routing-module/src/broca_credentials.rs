@@ -5,11 +5,11 @@
 //! initially emit empty mappings, so either shape requires a catalog fallback.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::{Arc, Mutex},
 };
 
-use prefrontal_ckcred_client::ScopedCredentialListing;
+use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
 use prefrontal_routing_core::{make_route_key, ModelFact};
 use subc_protocol::session::{HealthReport, HealthStatus};
 
@@ -27,11 +27,71 @@ pub struct BrocaCredentials {
     unmapped_ids: Vec<String>,
     unreadable: usize,
     last_error: Option<String>,
+    listed: Vec<ListedCredential>,
+    serving: BTreeMap<String, ServingMethod>,
+    pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
+    #[cfg(test)]
+    pub(crate) legacy_pricing_baseline: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServingMethod {
+    pub auth_method: Option<String>,
+    pub reason: String,
+}
+
+pub(crate) fn credential_method(adapter: Option<&str>, credential_type: &str) -> String {
+    match adapter {
+        Some("openai" | "chatgpt") => "chatgpt",
+        Some("antigravity") => "antigravity",
+        Some("anthropic") => "oauth",
+        _ => credential_type,
+    }
+    .to_string()
+}
+
+fn choose_method(roster: BTreeSet<String>, listed: BTreeSet<String>) -> ServingMethod {
+    let (methods, source) = if roster.is_empty() {
+        (listed, "single listed method")
+    } else {
+        (roster, "roster")
+    };
+    ServingMethod {
+        auth_method: (methods.len() == 1).then(|| methods.iter().next().unwrap().clone()),
+        reason: if methods.len() == 1 {
+            source.into()
+        } else {
+            format!(
+                "ambiguous ({source}: {})",
+                methods.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        },
+    }
 }
 
 pub type SharedBrocaCredentials = Arc<Mutex<BrocaCredentials>>;
 
 impl BrocaCredentials {
+    #[cfg(test)]
+    pub(crate) fn api_test_credentials(facts: &[ModelFact]) -> Self {
+        let mut credentials = Self::default();
+        credentials.serving = facts
+            .iter()
+            .map(|fact| {
+                (
+                    format!("{}/{}", fact.provider_id, fact.model_id),
+                    ServingMethod {
+                        auth_method: Some("apikey".into()),
+                        reason: "single listed method".into(),
+                    },
+                )
+            })
+            .collect();
+        credentials.billing_catalog =
+            crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(facts);
+        credentials
+    }
+
     /// Every successful poll renews freshness. Only a changed view rebuilds the
     /// join, even if tokens refreshed or the previous call failed.
     pub fn apply_listing(&mut self, listing: &ScopedCredentialListing, at_ms: u64) -> bool {
@@ -41,6 +101,7 @@ impl BrocaCredentials {
             return false;
         }
         self.view = Some(listing.view.clone());
+        self.listed = listing.credentials.clone();
         self.providers.clear();
         self.active = 0;
         self.unmapped = 0;
@@ -64,6 +125,98 @@ impl BrocaCredentials {
                 .extend(credential.provider_ids.iter().cloned());
         }
         true
+    }
+
+    pub(crate) fn refresh_serving_methods(
+        &mut self,
+        state: &crate::account_quota::AccountQuotaState,
+        facts: &[ModelFact],
+        at_ms: i64,
+    ) {
+        self.serving = facts
+            .iter()
+            .map(|fact| {
+                let roster = crate::account_selection::billing_roster(
+                    state,
+                    &fact.provider_id,
+                    &fact.model_id,
+                    at_ms,
+                );
+                let methods = roster
+                    .iter()
+                    .flat_map(|account| {
+                        account.credentials.iter().map(|record| {
+                            let credential_type = self
+                                .listed
+                                .iter()
+                                .find(|row| row.id == record.credential_id)
+                                .map_or("oauth", |row| row.credential_type.as_str());
+                            credential_method(Some(&account.refresh_adapter), credential_type)
+                        })
+                    })
+                    .collect();
+                let listed = self
+                    .listed
+                    .iter()
+                    .filter(|row| {
+                        row.state == "active"
+                            && row
+                                .categories
+                                .iter()
+                                .any(|category| category == "llm-provider")
+                            && row.provider_ids.contains(&fact.provider_id)
+                    })
+                    .map(|row| {
+                        credential_method(row.refresh_adapter.as_deref(), &row.credential_type)
+                    })
+                    .collect();
+                (
+                    format!("{}/{}", fact.provider_id, fact.model_id),
+                    choose_method(methods, listed),
+                )
+            })
+            .collect();
+    }
+
+    pub(crate) fn plane_keys(&self) -> BTreeSet<(String, String)> {
+        self.serving
+            .iter()
+            .filter_map(|(key, method)| {
+                Some((
+                    key.split_once('/')?.0.to_string(),
+                    method.auth_method.clone()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Only cached data is read here; a selection cannot trigger a catalog call.
+    pub(crate) fn price_facts(&self, facts: &mut [ModelFact]) {
+        // The ignored live replay can run the pre-plane scorer on the same
+        // copied database. This switch does not exist in production builds.
+        #[cfg(test)]
+        if self.legacy_pricing_baseline {
+            return;
+        }
+        for fact in facts {
+            let key = format!("{}/{}", fact.provider_id, fact.model_id);
+            let method = self
+                .serving
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| choose_method(BTreeSet::new(), BTreeSet::new()));
+            fact.billing_plane = Some(self.billing_catalog.for_route(&key, &method));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_copy_listing_gap(&mut self) {
+        for method in self.serving.values_mut() {
+            if method.reason == "ambiguous (single listed method: )" {
+                method.reason =
+                    "serving method not verified live: no listing in a store copy".into();
+            }
+        }
     }
 
     pub fn note_failure(&mut self, error: impl ToString) {
@@ -134,6 +287,57 @@ mod tests {
         CredentialResolverFuture, ListedCredential,
     };
     use serde_json::{json, Value};
+
+    #[test]
+    fn serving_method_prefers_roster_and_marks_mixed_rosters_ambiguous() {
+        let listed = BTreeSet::from(["apikey".into(), "chatgpt".into()]);
+        let choice = choose_method(BTreeSet::from(["chatgpt".into()]), listed.clone());
+        assert_eq!(choice.auth_method.as_deref(), Some("chatgpt"));
+        assert_eq!(choice.reason, "roster");
+        let mixed = choose_method(
+            BTreeSet::from(["oauth".into(), "antigravity".into()]),
+            listed,
+        );
+        assert_eq!(mixed.auth_method, None);
+        assert!(mixed.reason.starts_with("ambiguous (roster:"));
+    }
+
+    #[test]
+    fn empty_roster_uses_only_a_single_distinct_listed_method() {
+        let single = choose_method(BTreeSet::new(), BTreeSet::from(["apikey".into()]));
+        assert_eq!(single.auth_method.as_deref(), Some("apikey"));
+        assert_eq!(single.reason, "single listed method");
+        let mixed = choose_method(
+            BTreeSet::new(),
+            BTreeSet::from(["apikey".into(), "oauth".into()]),
+        );
+        assert_eq!(mixed.auth_method, None);
+        assert!(mixed.reason.starts_with("ambiguous"));
+    }
+
+    #[test]
+    fn methods_come_from_metadata_never_credential_ids() {
+        assert_eq!(credential_method(Some("openai"), "oauth"), "chatgpt");
+        assert_eq!(credential_method(Some("anthropic"), "oauth"), "oauth");
+        assert_eq!(
+            credential_method(Some("antigravity"), "oauth"),
+            "antigravity"
+        );
+        assert_eq!(credential_method(None, "apikey"), "apikey");
+        let mut row = credential("chatgpt:openai:misleading", &["openai"]);
+        row.credential_type = "apikey".into();
+        let mut credentials = BrocaCredentials::default();
+        credentials.apply_listing(&listing(vec![row]), 1);
+        credentials.refresh_serving_methods(
+            &crate::account_quota::AccountQuotaState::default(),
+            &[crate::tests::fact("openai", "example")],
+            1,
+        );
+        assert_eq!(
+            credentials.serving["openai/example"].auth_method.as_deref(),
+            Some("apikey")
+        );
+    }
 
     struct FixtureTarget(Value);
 

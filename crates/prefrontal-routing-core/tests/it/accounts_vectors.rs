@@ -24,6 +24,80 @@ const VECTORS: &str = include_str!("../fixtures/antauth-routing-vectors-b504bc84
 /// The digest `docs/designs/account-selection.md` records for the vectors (ref N).
 const VECTORS_SHA256: &str = "82cfd614d8d7de8f1a533debe2a78f2a3639c90d0e14e4eca0ca3919e38478ff";
 
+#[test]
+fn broca_fresh_admission_leaves_weekly_affinity_for_a_healthy_sibling() {
+    use prefrontal_routing_core::accounts::{AffinityOutcome, CallerKind, Outcome};
+    for provider in ["openai", "anthropic"] {
+        let mut request = with_model(
+            request(),
+            if provider == "openai" {
+                "gpt-6.1-sol"
+            } else {
+                "claude-opus-5-5"
+            },
+        );
+        request.provider = provider.into();
+        request.caller = CallerKind::Broca;
+        let mut state = state(vec![
+            account("walled", Some(reading(10.0, 100.0))),
+            account("healthy", Some(reading(10.0, 21.0))),
+        ]);
+        for account in &mut state.roster.as_mut().unwrap().accounts {
+            account.routing_provider = provider.into();
+        }
+        state.affinity = Some(affinity("walled", &request.affinity_model, 1));
+        state.fences.push(fence(
+            "walled",
+            FenceScope::General(GeneralWindow::SevenDay),
+            ResetTime::At(NOW + 7 * 24 * HOUR),
+        ));
+        let decision = decide(&request, &state, NOW);
+        let Outcome::Admit(admission) = decision.outcome else {
+            panic!("healthy sibling not admitted: {decision:?}");
+        };
+        assert_eq!(admission.account_id, "healthy");
+        assert!(matches!(
+            admission.affinity,
+            AffinityOutcome::New {
+                pin_generation: 2,
+                previous: Some(_)
+            }
+        ));
+    }
+}
+
+#[test]
+fn broca_all_weekly_accounts_walled_refuses_with_the_real_pool_horizon() {
+    use prefrontal_routing_core::accounts::{CallerKind, Outcome, RefusalCode};
+    let mut request = request();
+    request.caller = CallerKind::Broca;
+    let reset = NOW + 7 * 24 * HOUR;
+    let mut quota = reading(10.0, 100.0);
+    quota.five_hour.as_mut().unwrap().resets_at = ResetTime::At(reset);
+    quota.seven_day.as_mut().unwrap().resets_at = ResetTime::At(reset);
+    let mut state = state(vec![
+        account("a", Some(quota.clone())),
+        account("b", Some(quota)),
+    ]);
+    for account in ["a", "b"] {
+        state.fences.push(fence(
+            account,
+            FenceScope::General(GeneralWindow::SevenDay),
+            ResetTime::At(reset),
+        ));
+    }
+    state.affinity = Some(affinity("a", &request.affinity_model, 1));
+    let decision = decide(&request, &state, NOW);
+    let Outcome::Refuse(refusal) = decision.outcome else {
+        panic!("walled pool admitted or held: {decision:?}");
+    };
+    assert_eq!(refusal.code, RefusalCode::AccountPoolExhausted);
+    assert_eq!(
+        refusal.retry_after_s,
+        Some((reset - NOW) as u64 / 1000 + state.policy.pool_retry_margin_s)
+    );
+}
+
 fn vectors() -> Value {
     serde_json::from_str(VECTORS).expect("vectors parse")
 }

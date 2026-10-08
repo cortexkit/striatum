@@ -727,6 +727,7 @@ mod tests {
 
     fn fact(provider: &str, model: &str, speed: f64) -> ModelFact {
         ModelFact {
+            billing_plane: None,
             input_rate: None,
             cache_read_rate: None,
             cache_write_rate: None,
