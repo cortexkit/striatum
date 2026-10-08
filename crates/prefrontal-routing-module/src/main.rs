@@ -1565,6 +1565,11 @@ fn head_content_policy_exclusions(
     };
     let mut refused_providers: Vec<(String, String, i64)> = Vec::new();
     for decision in failed {
+        // Typed core refusals carry durable item-scoped exclusions. Withholding
+        // this provider from the whole head would also penalize unrelated items.
+        if decision.outcome_error.contains("provider_policy_refusal") {
+            continue;
+        }
         let attribution = prefrontal_routing_core::classify_failure_attribution(
             RouteOutcome::SessionError,
             Some(decision.outcome_error.as_str()),
@@ -7772,13 +7777,62 @@ mod tests {
         assert!(message.contains(billing_error), "{message}");
     }
 
-    // A content-policy refusal charges no strike, so the refusing route stays at
-    // full adequacy and the same head's relaunch went straight back to it: two
-    // seats lost two workers each in one day (2026-09-20). The refusal is keyed on
-    // the head because a launch decision has no task id yet and a relaunch is a
-    // new task anyway. Every route of the refusing PROVIDER is withheld from that
-    // head for a bounded window; another head, and a head whose failure was
-    // transport, keep the routes.
+    #[tokio::test]
+    async fn typed_policy_refusal_excludes_only_the_retry_item_not_its_heads_other_items() {
+        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
+        let rig = Rig::new("item-policy-refusal");
+        let store = Arc::new(rig.open_store());
+        for model in ["sol", "astra"] {
+            let mut route = fact("openai", model);
+            route.scores.elo = 95.0;
+            route.scores.speed = 200.0;
+            store.upsert_fact(&route, FactSource::Override).unwrap();
+        }
+        store
+            .upsert_fact(&fact("anthropic", "opus"), FactSource::Override)
+            .unwrap();
+        let select = |label: &str, exclude: &[&str]| {
+            json!({
+                "targetAgent":"mason", "requirements":{"iq":30,"eq":0},
+                "availableModels":["openai/sol","openai/astra","anthropic/opus"],
+                "excludeRouteKeys":exclude, "parentSessionID":"same-head", "taskId":label
+            })
+        };
+        let first = select_with_store(&store, select("refused-item-first", &["anthropic"])).await;
+        assert_eq!(
+            first["result"]["selected"]["model"]["providerID"], "openai",
+            "{first}"
+        );
+        let decision = store
+            .get_decisions_for_task("refused-item-first")
+            .unwrap()
+            .remove(0);
+        store
+            .set_decision_outcome(
+                &decision.id,
+                &DecisionOutcomeUpdate {
+                    outcome: RouteOutcome::SessionError,
+                    last_error: Some(
+                        "provider_policy_refusal: provider openai: content_filter".into(),
+                    ),
+                    observed_at_ms: now_ms() as i64,
+                    failure_backoff: FailureBackoffConfig::default(),
+                },
+            )
+            .unwrap();
+        let retry = select_with_store(&store, select("refused-item-retry", &["openai"])).await;
+        assert_eq!(
+            retry["result"]["selected"]["model"]["providerID"], "anthropic",
+            "{retry}"
+        );
+        let other = select_with_store(&store, select("unrelated-item", &[])).await;
+        assert_eq!(
+            other["result"]["selected"]["model"]["providerID"], "openai",
+            "{other}"
+        );
+    }
+
+    // Legacy untyped refusals still use the bounded head-level exclusion window.
     #[tokio::test]
     async fn head_refused_on_content_policy_loses_that_provider_for_its_next_launch() {
         let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
