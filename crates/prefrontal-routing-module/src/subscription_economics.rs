@@ -66,14 +66,6 @@ fn decimal(value: &Value, units_key: &str) -> Option<f64> {
 }
 
 fn price_row<'a>(prices: &'a Value, provider: &str, tier: &str) -> Option<&'a Value> {
-    let live_tier = match provider {
-        "anthropic" => matches!(tier, "pro" | "max_5x" | "max_20x"),
-        "openai" => matches!(tier, "plus" | "pro_100" | "pro_200" | "pro_500"),
-        _ => false,
-    };
-    if !live_tier {
-        return None;
-    }
     prices["prices"]
         .as_array()?
         .iter()
@@ -103,6 +95,9 @@ fn astro_fee(report: &Value, provider: &str, account_id: &str, now: i64) -> Opti
 /// rows served by Fusiform, the service that supplies these prices. Missing or
 /// refused measurements, and observations outside their date limits, stay unknown.
 fn fusiform_value(row: &Value, now: i64) -> Option<f64> {
+    if row.get("retired").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
     let value = row.get("quota_value")?.as_object()?;
     if value.get("review_by_ms")?.as_i64()? < now {
         return None;
@@ -618,19 +613,20 @@ mod tests {
         );
         let without_value = json!({"provider_id":"anthropic", "tier":"max_20x"});
         assert_eq!(fusiform_value(&without_value, NOW), None);
+        let explicitly_retired = json!({"retired":true, "quota_value":row["quota_value"]});
+        assert_eq!(fusiform_value(&explicitly_retired, NOW), None);
         let mut stale_retired_prices = p.clone();
         for tier in ["pro_5x", "pro_20x"] {
-            let mut retired_row = row.clone();
-            retired_row["tier"] = json!(tier);
             stale_retired_prices["prices"]
                 .as_array_mut()
                 .unwrap()
-                .push(retired_row);
-            assert!(price_row(&stale_retired_prices, "anthropic", tier).is_none());
+                .push(json!({"provider_id":"anthropic", "tier":tier}));
+            let retired_row = price_row(&stale_retired_prices, "anthropic", tier).unwrap();
+            assert_eq!(fusiform_value(retired_row, NOW), None);
         }
-        assert!(price_row(&p, "openai", "pro").is_none());
-        assert!(price_row(&p, "openai", "pro_5x").is_none());
-        assert!(price_row(&p, "openai", "pro_20x").is_none());
+        let refused_row = price_row(&p, "openai", "pro").unwrap();
+        assert!(refused_row.get("refusal_reason").is_some());
+        assert_eq!(fusiform_value(refused_row, NOW), None);
         let without_tier = build(&state(3.0, None), &report(), &p, &HashMap::new(), NOW);
         assert_eq!(
             without_tier.pools["anthropic"].plans[0].fusiform_multiplier,
