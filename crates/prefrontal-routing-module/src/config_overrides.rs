@@ -348,6 +348,10 @@ struct ModelRoutingSection {
     /// overrides its provider's value for that route only.
     #[serde(default)]
     subscription_multipliers: HashMap<String, f64>,
+    /// Percent of each weekly account window reserved from delegated workers;
+    /// long-lived head agents may spend that reserved share.
+    #[serde(default)]
+    keep_free_percent: HashMap<String, f64>,
 }
 
 /// `model_routing.overqualification`: `term = 0` while a route's surplus over
@@ -774,6 +778,7 @@ pub fn reload_live_multipliers(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             prefrontal_routing_core::model_facts::set_speed_multipliers(HashMap::new());
             prefrontal_routing_core::model_facts::set_subscription_multipliers(HashMap::new());
+            prefrontal_routing_core::model_facts::set_keep_free_percent(HashMap::new());
             return Ok(());
         }
         Err(error) => return Err(format!("reading {}: {error}", path.display())),
@@ -790,6 +795,17 @@ pub fn reload_live_multipliers(path: &Path) -> Result<(), String> {
     // (openai at 33x) for as long as the file stayed broken. A missing file is the
     // withdrawal and clears above.
     let config = parsed?;
+
+    let mut keep_free = HashMap::new();
+    for (provider, value) in config.model_routing.keep_free_percent {
+        if value.is_finite() && (0.0..=100.0).contains(&value) && !provider.trim().is_empty() {
+            keep_free.insert(provider.trim().to_string(), value);
+        } else {
+            return Err(format!(
+                "invalid keep_free_percent for {provider}: must be in 0..100"
+            ));
+        }
+    }
 
     let mut speed_multipliers = HashMap::new();
     let mut subscription_multipliers = HashMap::new();
@@ -832,6 +848,7 @@ pub fn reload_live_multipliers(path: &Path) -> Result<(), String> {
     }
     prefrontal_routing_core::model_facts::set_speed_multipliers(speed_multipliers);
     prefrontal_routing_core::model_facts::set_subscription_multipliers(subscription_multipliers);
+    prefrontal_routing_core::model_facts::set_keep_free_percent(keep_free);
     Ok(())
 }
 
@@ -2678,5 +2695,42 @@ mod catalog_poll_tests {
             .unwrap_err()
             .contains("greater than zero"));
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod keep_free_tests {
+    use super::*;
+    use prefrontal_routing_core::model_facts::get_keep_free_percent;
+
+    #[test]
+    fn keep_free_percent_is_live_validated_and_withdrawn_when_missing() {
+        let _guard = multiplier_map_guard();
+        let dir = prefrontal_test_support::scratch_root()
+            .join(format!("routing-keep-free-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing.jsonc");
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"keep_free_percent":{"anthropic":20,"openai":100}}}"#,
+        )
+        .unwrap();
+        reload_live_multipliers(&path).unwrap();
+        assert_eq!(get_keep_free_percent("anthropic"), 20.0);
+        assert_eq!(get_keep_free_percent("openai"), 100.0);
+        assert_eq!(get_keep_free_percent("unknown"), 0.0);
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"keep_free_percent":{"anthropic":101}}}"#,
+        )
+        .unwrap();
+        assert!(reload_live_multipliers(&path)
+            .unwrap_err()
+            .contains("0..100"));
+        assert_eq!(get_keep_free_percent("anthropic"), 20.0);
+        std::fs::remove_file(&path).unwrap();
+        reload_live_multipliers(&path).unwrap();
+        assert_eq!(get_keep_free_percent("anthropic"), 0.0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

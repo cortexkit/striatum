@@ -4103,3 +4103,289 @@ fn unusable_fleet_vector_is_the_only_whole_selection_fallback_and_names_its_caus
     assert_eq!(json["pricingMode"], "output_only");
     assert!(json["objective"].get("basketPricing").is_none());
 }
+
+/// A fixed 1,000-selection probe; run with --ignored --nocapture to report latency.
+#[test]
+#[ignore]
+fn subscription_selection_latency_1000() {
+    let facts = model_facts_seed().to_vec();
+    let scenario = subscription_scenario(&[3.0, 3.0, 51.0, 53.0, 100.0], 20.0, "mason");
+    let reference = scenario.runtime_snapshot.unwrap();
+    let mut snapshot = ModelRouteStateSnapshot {
+        now: reference.now,
+        ..Default::default()
+    };
+    for fact in &facts {
+        let key = if fact.provider_id == "anthropic" {
+            "anthropic/claude-opus"
+        } else {
+            "openai/gpt-6.1-sol"
+        };
+        if matches!(fact.provider_id.as_str(), "anthropic" | "openai") {
+            snapshot.by_capacity.insert(
+                make_capacity_key(&fact.provider_id, &fact.model_id),
+                reference.by_capacity[key].clone(),
+            );
+        }
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..1_000 {
+        std::hint::black_box(
+            select_model_route(input(
+                facts.clone(),
+                req(70.0, 0.0),
+                Extra {
+                    runtime_snapshot: Some(snapshot.clone()),
+                    is_subscription_route: Some(Box::new(|r| {
+                        matches!(r.provider_id.as_str(), "anthropic" | "openai")
+                    })),
+                    ..Extra::default()
+                },
+            ))
+            .unwrap(),
+        );
+    }
+    eprintln!(
+        "subscription_selection_latency_1000: {} us total",
+        start.elapsed().as_micros()
+    );
+}
+
+fn quota_account(used: f64) -> prefrontal_routing_core::subscription::QuotaAccount {
+    prefrontal_routing_core::subscription::QuotaAccount {
+        weekly_used: used,
+        weekly_remaining_fraction: 0.5,
+        hours_to_reset: 84.0,
+        short_walled: false,
+        short_windows: Vec::new(),
+        banked_resets: 3,
+        banked_expires_at_ms: Some(2_000_000),
+    }
+}
+
+fn subscription_plan(
+    tier: &str,
+    fee: f64,
+    used: &[f64],
+) -> prefrontal_routing_core::subscription::SubscriptionPlan {
+    prefrontal_routing_core::subscription::SubscriptionPlan {
+        tier: Some(tier.into()),
+        fee_usd: fee,
+        fusiform_multiplier: None,
+        accounts: used
+            .iter()
+            .map(|u| {
+                let mut account = quota_account(*u);
+                if tier.starts_with("max_") {
+                    account.banked_resets = 0;
+                }
+                account
+            })
+            .collect(),
+        head_points_per_hour: None,
+    }
+}
+
+fn subscription_scenario(
+    claude_use: &[f64],
+    margin: f64,
+    agent: &str,
+) -> SelectModelRouteInput<'static> {
+    use prefrontal_routing_core::subscription::{MeasuredValue, SubscriptionPool};
+    let mut facts = vec![
+        fact(FactBuilder {
+            provider_id: "anthropic".into(),
+            model_id: "claude-opus".into(),
+            scores: scores(1700.0, 1700.0, 80.0),
+            cost_per_m_tok_out: Some(25.0),
+            ..Default::default()
+        }),
+        fact(FactBuilder {
+            provider_id: "openai".into(),
+            model_id: "gpt-6.1-sol".into(),
+            scores: scores(1705.0, 1700.0, 100.0),
+            cost_per_m_tok_out: Some(20.0),
+            ..Default::default()
+        }),
+    ];
+    for f in &mut facts {
+        f.input_rate = Some(if f.provider_id == "anthropic" {
+            5.0
+        } else {
+            4.0
+        });
+        f.class_vector = Some(prefrontal_routing_core::ClassVector {
+            workload_class: "ephemeral".into(),
+            fresh_input: 1000.0,
+            output_excluding_reasoning: 1000.0,
+            reasoning: 0.0,
+            cached_read: 0.0,
+            cache_write: 0.0,
+            sample_count: 100,
+            trailing_window_days: 7.0,
+            statistic: "mean".into(),
+            is_overlay: true,
+        });
+        f.class_vector_is_overlay = true;
+    }
+    let mut snapshot = ModelRouteStateSnapshot {
+        now: 1_000_000.0,
+        ..Default::default()
+    };
+    for f in &facts {
+        let claude = f.provider_id == "anthropic";
+        let plans = if claude {
+            vec![subscription_plan("max_20x", 200.0, claude_use)]
+        } else {
+            vec![
+                subscription_plan("pro_200", 200.0, &[73.0, 89.0]),
+                subscription_plan("pro_100", 100.0, &[100.0]),
+            ]
+        };
+        snapshot.by_capacity.insert(
+            make_capacity_key(&f.provider_id, &f.model_id),
+            RouteRuntimeState {
+                subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
+                    provider: f.provider_id.clone(),
+                    keep_free_percent: if claude { margin } else { 0.0 },
+                    measured: Some(MeasuredValue {
+                        usd_per_point: if claude { 28.4 } else { 9.42 },
+                        interval_end_ms: 999_999,
+                        row_date: "2026-10-09".into(),
+                    }),
+                    plans,
+                    allow_banked: false,
+                    now_ms: 1_000_000,
+                })),
+                ..Default::default()
+            },
+        );
+    }
+    let mut input = input(
+        facts,
+        req(70.0, 0.0),
+        Extra {
+            runtime_snapshot: Some(snapshot),
+            is_subscription_route: Some(Box::new(|_| true)),
+            ..Default::default()
+        },
+    );
+    input.target_agent = agent.into();
+    input
+}
+
+#[test]
+fn subscription_margin_blocks_workers_but_not_heads() {
+    let worker = select_model_route(subscription_scenario(&[81.0], 20.0, "mason")).unwrap();
+    assert_eq!(worker.route_key, "openai/gpt-6.1-sol");
+    assert!(worker
+        .rejected
+        .iter()
+        .any(|r| r.route_key == "anthropic/claude-opus" && r.reason == "subscription_reserve"));
+    let head = select_model_route(subscription_scenario(&[81.0], 20.0, "alfonso")).unwrap();
+    assert!(!head
+        .rejected
+        .iter()
+        .any(|r| r.route_key == "anthropic/claude-opus"));
+    let unknown_worker =
+        select_model_route(subscription_scenario(&[81.0], 20.0, "hire_research")).unwrap();
+    assert!(unknown_worker
+        .rejected
+        .iter()
+        .any(|r| r.reason == "subscription_reserve"));
+}
+
+#[test]
+fn subscription_today_iq70_claude_wins_then_reserve_pressure_flips_to_sol() {
+    let selected = select_model_route(subscription_scenario(
+        &[3.0, 3.0, 51.0, 53.0, 100.0],
+        20.0,
+        "mason",
+    ))
+    .unwrap();
+    assert_eq!(selected.route_key, "anthropic/claude-opus");
+    let pricing = selected.score.objective.subscription_pricing.unwrap();
+    assert_eq!(pricing.available_points, Some(210.0));
+    assert_eq!(pricing.banked_resets_applied, 0);
+    assert!((pricing.message_points - 0.03 / 28.4).abs() < 1e-12);
+    assert!(selected
+        .explanation
+        .iter()
+        .any(|line| line.contains("astrocyte 2026-10-09")
+            && line.contains("head reserve unavailable")));
+    let selected = select_model_route(subscription_scenario(
+        &[78.0, 78.0, 78.0, 78.0, 100.0],
+        20.0,
+        "mason",
+    ))
+    .unwrap();
+    assert_eq!(selected.route_key, "openai/gpt-6.1-sol");
+    assert_eq!(
+        selected
+            .score
+            .objective
+            .subscription_pricing
+            .unwrap()
+            .banked_resets_applied,
+        0
+    );
+}
+
+#[test]
+fn subscription_pressure_is_monotone_and_expiring_headroom_is_cheaper() {
+    use prefrontal_routing_core::subscription::plan_pressure;
+    assert!(plan_pressure(0.5, 0.01) > 90.0 * plan_pressure(0.5, 0.1));
+    assert!(plan_pressure(0.01, 0.5) < plan_pressure(0.5, 0.5));
+}
+
+#[test]
+#[ignore]
+fn quota_priced_selection_latency_1000() {
+    let start = std::time::Instant::now();
+    for _ in 0..1_000 {
+        std::hint::black_box(
+            select_model_route(subscription_scenario(
+                &[3.0, 3.0, 51.0, 53.0, 100.0],
+                20.0,
+                "mason",
+            ))
+            .unwrap(),
+        );
+    }
+    eprintln!(
+        "quota_priced_selection_latency_1000: {} us total (2 candidates)",
+        start.elapsed().as_micros()
+    );
+}
+
+#[test]
+fn subscription_operator_value_overrides_fresh_astro_in_decision() {
+    let mut input = subscription_scenario(&[3.0], 20.0, "mason");
+    input.facts[0].subscription_multiplier = Some(18.0);
+    let selected = select_model_route(input).unwrap();
+    let pricing = selected.score.objective.subscription_pricing.unwrap();
+    assert_eq!(pricing.value_source, "operator override");
+    assert_eq!(pricing.value_per_point_usd, 36.0);
+    assert!(selected
+        .explanation
+        .iter()
+        .any(|line| line.contains("operator override")));
+}
+
+#[test]
+fn subscription_close_economic_prices_preserve_quality_tiebreak() {
+    let mut input = subscription_scenario(&[3.0], 0.0, "mason");
+    input.requirements = req(100.0, 0.0);
+    let runtime = input
+        .runtime_snapshot
+        .as_mut()
+        .unwrap()
+        .by_capacity
+        .get_mut("openai/gpt-6.1-sol")
+        .unwrap();
+    let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
+    pool.measured.as_mut().unwrap().usd_per_point = 22.5;
+    pool.plans = vec![subscription_plan("pro_200", 200.0, &[3.0])];
+    let selected = select_model_route(input).unwrap();
+    assert_eq!(selected.route_key, "openai/gpt-6.1-sol");
+}

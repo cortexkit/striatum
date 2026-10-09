@@ -50,6 +50,8 @@ pub const REASON_NOT_AVAILABLE: &str = "not_available";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteRuntimeState {
+    /// Slow-refresh account economics, shared by every route on this provider.
+    pub subscription_pool: Option<std::sync::Arc<crate::subscription::SubscriptionPool>>,
     /// Confirmed cooldown/retry-after; route inadmissible until this time (ms epoch).
     pub cooldown_until: Option<f64>,
     /// Confirmed quota exhaustion until this time (ms epoch).
@@ -148,7 +150,9 @@ pub struct SelectModelRouteInput<'a> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectiveBreakdown {
-    /// Continuous cost component (output $/Mtok ÷ reference, clamped 0..1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_pricing: Option<crate::subscription::SubscriptionPricing>,
+    /// Normalized economic cost; quota-priced subscriptions may exceed one.
     pub cost: f64,
     /// Soft quota pressure component (0..1 · weight).
     pub quota: f64,
@@ -162,10 +166,8 @@ pub struct ObjectiveBreakdown {
     /// the route is not over-qualified or the request has no iq demand.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub overqualification: f64,
-    /// Whether the route is served under a flat subscription. Marginal dollars
-    /// under a flat plan are sunk, so two such routes compare as equal cost in
-    /// the effectively-free bucket whatever their basket price says; the quota
-    /// the plan actually spends is ordered by abundance there.
+    /// Whether the route is served under a flat subscription. Account-economics
+    /// snapshots price the quota consumed; legacy snapshots retain free buckets.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subscription_covered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -741,6 +743,7 @@ pub(crate) fn compute_objective(
     runtime: &RouteRuntimeState,
     is_subscription: bool,
     basis: CostBasis<'_>,
+    head: bool,
 ) -> (ObjectiveBreakdown, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
 
@@ -823,7 +826,66 @@ pub(crate) fn compute_objective(
         ));
     }
 
-    objective_tail(route, runtime, is_subscription, cost, basket_pricing, notes)
+    let (mut objective, mut notes) =
+        objective_tail(route, runtime, is_subscription, cost, basket_pricing, notes);
+    if is_subscription {
+        if let Some(pool) = &runtime.subscription_pool {
+            // Compute list dollars before normalization or subsidy. A clamped
+            // basket score cannot be inverted into its original message price.
+            let (list_usd, reference) = match basis {
+                CostBasis::Basket { vector, .. } => {
+                    let mut dollars = 0.0;
+                    let mut priced = true;
+                    for dimension in crate::model_facts::BasketDimension::ALL {
+                        let tokens = dimension.tokens(vector);
+                        if tokens > 0.0 {
+                            if let Some(rate) =
+                                route.fact.basket_rate(dimension).filter(|r| r.is_finite())
+                            {
+                                dollars += tokens * rate / 1_000_000.0;
+                            } else {
+                                priced = false;
+                            }
+                        }
+                    }
+                    (
+                        priced.then_some(dollars),
+                        crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE,
+                    )
+                }
+                // Without a usable workload vector the common comparison unit
+                // remains one million output tokens, not an invented message.
+                CostBasis::OutputOnly => (
+                    route.fact.cost_per_m_tok_out,
+                    crate::routing_config::COST_REFERENCE_PER_MTOK,
+                ),
+            };
+            if let Some(list_usd) = list_usd {
+                if let Some(mut pricing) = pool.price(
+                    list_usd,
+                    route.fact.subscription_multiplier,
+                    pool.keep_free_percent,
+                    head,
+                ) {
+                    if matches!(basis, CostBasis::OutputOnly) {
+                        pricing.price_unit = "million output tokens";
+                    }
+                    notes.retain(|note| {
+                        !note.starts_with("cost +")
+                            && !note.starts_with("quota +")
+                            && !note.starts_with("quota signal:")
+                            && !note.starts_with("quota abundance")
+                    });
+                    notes.push(pricing.explanation());
+                    objective.cost = pricing.dollars() / reference;
+                    objective.quota = 0.0;
+                    objective.selection_cost = objective.cost;
+                    objective.subscription_pricing = Some(pricing);
+                }
+            }
+        }
+    }
+    (objective, notes)
 }
 
 /// The cost line's detail on the output-only ladder.
@@ -863,6 +925,13 @@ fn output_only_detail(
         // to one losing because it is genuinely expensive.
         format!("price unknown (ranked as max), {coverage}")
     }
+}
+
+pub(crate) fn subscription_budget_available(runtime: &RouteRuntimeState, head: bool) -> bool {
+    runtime
+        .subscription_pool
+        .as_ref()
+        .is_none_or(|pool| pool.available(pool.keep_free_percent, head))
 }
 
 /// Everything in the objective after the cost line: quota terms, abundance,
@@ -920,6 +989,7 @@ fn objective_tail(
     notes.push(speed_note);
     (
         ObjectiveBreakdown {
+            subscription_pricing: None,
             cost,
             quota,
             speed_score,
@@ -1094,8 +1164,8 @@ fn admit_and_price_shortlist(
     // `top_routable` is the frontier the demand bar was drawn against; the
     // over-qualification term maps each route back onto that same scale.
     let AdmissionResult {
-        admitted: admissible,
-        rejected,
+        admitted: mut admissible,
+        mut rejected,
         top_routable,
     } = admit_routes(
         &input.facts,
@@ -1109,6 +1179,26 @@ fn admit_and_price_shortlist(
         &requirements,
         config,
     );
+
+    admissible.retain(|a| {
+        let covered = input
+            .is_subscription_route
+            .as_ref()
+            .is_some_and(|pred| pred(&a.route));
+        let permitted = !covered
+            || subscription_budget_available(
+                &a.runtime,
+                crate::subscription::is_head(&input.target_agent),
+            );
+        if !permitted {
+            rejected.push(RejectedRoute {
+                route_key: a.route.route_key.clone(),
+                reason: "subscription_reserve".into(),
+                detail: Some("weekly headroom is inside keep-free margin plus head reserve".into()),
+            });
+        }
+        permitted
+    });
 
     if admissible.is_empty() {
         let earliest_reset =
@@ -1239,7 +1329,13 @@ fn admit_and_price_shortlist(
                     CostBasis::OutputOnly => a.route.fact.ephemeral_vector(),
                 },
             );
-            let (mut breakdown, mut notes) = compute_objective(&a.route, &a.runtime, is_sub, basis);
+            let (mut breakdown, mut notes) = compute_objective(
+                &a.route,
+                &a.runtime,
+                is_sub,
+                basis,
+                crate::subscription::is_head(&input.target_agent),
+            );
             apply_overqualification(
                 &mut breakdown,
                 &mut notes,
@@ -1353,6 +1449,7 @@ pub fn select_model_route_with_slots(
                     provider_id: &a.route.provider_id,
                     route_key: &a.route.route_key,
                     subscription_covered: s.objective.subscription_covered,
+                    quota_priced: s.objective.subscription_pricing.is_some(),
                     selection_cost: if with_term {
                         s.objective.selection_cost
                     } else {
@@ -1581,6 +1678,7 @@ pub(crate) struct RouteOrderFacts<'r> {
     pub provider_id: &'r str,
     pub route_key: &'r str,
     pub subscription_covered: bool,
+    pub quota_priced: bool,
     pub selection_cost: f64,
     /// True only when the caller prefers prompt caching and this route's
     /// provider does not cache prompts.
@@ -1614,35 +1712,25 @@ pub(crate) struct RouteOrderKey<'r> {
     pub metered_cost: f64,
 }
 
-/// Computes the per-route sort keys.
+/// Compute a stable sort key for each candidate before comparing routes.
 ///
-/// Two routes on the same subscription plan draw on one quota pool, so no
-/// dollar figure can pick between them: the plan is paid for and the pool is
-/// shared. Basket pricing (cached reads are three quarters of a mason message)
-/// can lift such a route above the effectively-free threshold, and without
-/// this rule iq 100 bought sol over astra on a basket difference the shared
-/// pool makes meaningless. Across plans the basket still orders, because a
-/// cheaper route there spends a different pool.
+/// Quota-priced routes keep their own economic cost because different token
+/// baskets consume different amounts of the same subscription pool. Legacy
+/// snapshots without account economics retain a free bucket and price each
+/// provider's covered routes at that provider's cheapest covered cost. Quality
+/// then decides within a shared pool or free bucket.
 ///
-/// That rule used to be applied pairwise inside the comparator ("both covered
-/// and same provider, so both count as free"). Membership then depended on
-/// which route a route was compared with, the relation was not transitive,
-/// and Rust's sort panics on such comparators. Here the rule is a property of
-/// each route instead: a covered route is priced at the cheapest covered
-/// route of its own provider (its pool), so every member of one pool carries
-/// the same cost key, compares as equal cost, and adequacy decides.
-///
-/// Inside the effectively-free bucket two subsidized routes also compare as
-/// equal cost, so the demand's own quality metric decides. Without the bucket,
-/// cost-primary ordering lets a deeper subsidy outrank a stronger model on work
-/// that explicitly asked for strength: the caller's iq demand raised the bar,
-/// both routes cleared it, and the router then optimized a cent-scale dollar
-/// difference the subsidy made meaningless.
+/// Pool membership and cost keys must be properties of individual routes, not
+/// pairwise exceptions: otherwise three routes can form inconsistent rankings
+/// and violate the ordering contract required by Rust's sort.
 pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteOrderKey<'r>> {
     // Per provider: the cheapest covered route's cost and how many covered
     // routes share the pool.
     let mut pools: HashMap<&str, (f64, usize)> = HashMap::new();
-    for route in routes.iter().filter(|r| r.subscription_covered) {
+    for route in routes
+        .iter()
+        .filter(|r| r.subscription_covered && !r.quota_priced)
+    {
         pools
             .entry(route.provider_id)
             .and_modify(|(min, members)| {
@@ -1654,13 +1742,13 @@ pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteO
     routes
         .iter()
         .map(|route| {
-            let (pool_cost, shared_pool) = if route.subscription_covered {
+            let (pool_cost, shared_pool) = if route.subscription_covered && !route.quota_priced {
                 let (min, members) = pools[route.provider_id];
                 (min, members >= 2)
             } else {
                 (route.selection_cost, false)
             };
-            let free = pool_cost <= EFFECTIVELY_FREE_SELECTION_COST;
+            let free = !route.quota_priced && pool_cost <= EFFECTIVELY_FREE_SELECTION_COST;
             // An absent or non-finite abundance sample is neutral rather than
             // favourable or fatal; quantizing keeps tiny float noise from
             // outranking the speed tie-break.
@@ -1671,8 +1759,17 @@ pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteO
             RouteOrderKey {
                 route_key: route.route_key,
                 uncached: route.uncached,
-                cost_key: if free { 0.0 } else { pool_cost },
-                in_bucket: free || shared_pool,
+                // Prices in one fixed 10% band share a cost key, letting quality
+                // break the tie. Fixed bands keep rankings consistent across
+                // three or more routes, unlike pairwise tolerance exceptions.
+                cost_key: if route.quota_priced && pool_cost > 0.0 {
+                    1.1_f64.powf((pool_cost.ln() / 1.1_f64.ln()).round())
+                } else if free {
+                    0.0
+                } else {
+                    pool_cost
+                },
+                in_bucket: route.quota_priced || free || shared_pool,
                 adequacy: route.adequacy,
                 raw_adequacy: route.raw_adequacy,
                 abundance_quantum: (abundance * 1000.0).round() as i64,
@@ -1874,6 +1971,7 @@ mod abundance_tests {
     #[test]
     fn objective_without_abundance_is_byte_identical_to_the_previous_shape() {
         let objective = ObjectiveBreakdown {
+            subscription_pricing: None,
             cost: 0.25,
             quota: 0.125,
             speed_score: 0.75,
@@ -2210,6 +2308,7 @@ mod route_order_tests {
         adequacy: f64,
     ) -> RouteOrderFacts<'r> {
         RouteOrderFacts {
+            quota_priced: false,
             provider_id,
             route_key,
             subscription_covered,

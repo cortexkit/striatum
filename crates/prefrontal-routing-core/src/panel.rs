@@ -598,7 +598,18 @@ fn select_panel_admitted(
             &admitted.runtime,
             is_subscription,
             CostBasis::OutputOnly,
+            false,
         );
+        if is_subscription
+            && !crate::model_router::subscription_budget_available(&admitted.runtime, false)
+        {
+            causes.push(PanelCause {
+                model,
+                reason: PanelCauseReason::QuotaExhausted,
+                detail: Some("weekly headroom is reserved for heads".into()),
+            });
+            continue;
+        }
         candidates.push(Candidate {
             metered_cost: normalized_metered_cost(&admitted.route.fact),
             route: admitted.route,

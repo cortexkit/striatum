@@ -234,7 +234,7 @@ pub fn select_seat_route_with_config(
     // Seat routing takes the operator fence through its available-model set, which
     // the caller resolves against the operator policy before it gets here, so only
     // the per-request exclusions are applied at admission.
-    let admission = admit_routes(
+    let mut admission = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy::caller_only(&input.exclude_route_keys),
@@ -243,6 +243,21 @@ pub fn select_seat_route_with_config(
         &input.requirements,
         config,
     );
+    admission.admitted.retain(|route| {
+        let permitted = !input
+            .is_subscription_route
+            .as_ref()
+            .is_some_and(|pred| pred(&route.route))
+            || crate::model_router::subscription_budget_available(&route.runtime, false);
+        if !permitted {
+            admission.rejected.push(crate::model_router::RejectedRoute {
+                route_key: route.route.route_key.clone(),
+                reason: "subscription_reserve".into(),
+                detail: Some("weekly headroom is reserved for heads".into()),
+            });
+        }
+        permitted
+    });
 
     // Adequacy gate: seats have no best-effort band. A route is adequate only
     // when it clears the existing floor against the persona's demands.
@@ -448,6 +463,7 @@ fn order_candidates(pool: Vec<AdmittedRoute>, input: &SeatRouteInput<'_>) -> Vec
                 &admitted.runtime,
                 is_subscription,
                 CostBasis::OutputOnly,
+                false,
             );
             SeatCandidate {
                 metered_cost: normalized_metered_cost(&admitted.route.fact),

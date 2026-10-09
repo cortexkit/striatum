@@ -23,6 +23,7 @@ mod config_overrides;
 mod fusiform_catalog;
 mod model_resolution;
 mod quota_consumer;
+mod subscription_economics;
 mod winner_ladder;
 mod work_model_pin;
 
@@ -2625,6 +2626,7 @@ fn prepare_selection_inputs(
     if let Some(windows) = quota_windows.as_ref().filter(|_| stale_age_ms.is_none()) {
         merge_quota_overlay(&mut snapshot, windows, &facts, quota_name_map());
     }
+    subscription_economics::overlay(&mut snapshot, &facts, now as i64);
     let quota_signal_json = quota_signal_json(
         &snapshot,
         &QuotaSignalView {

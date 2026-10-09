@@ -34,6 +34,7 @@ pub mod routing_config;
 pub mod runner;
 pub mod seat_routing;
 pub mod slot_saturation;
+pub mod subscription;
 
 pub use aa_infer::{
     aa_elo_curve, elo_floor, infer_elo_from_aa, infer_elo_from_aa_static, inferred_scores,

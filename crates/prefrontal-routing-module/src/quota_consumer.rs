@@ -106,6 +106,21 @@ impl QuotaConsumer {
         connection_file_path: &Path,
         project_root: &Path,
     ) -> Result<Self, QuotaConsumerError> {
+        Self::connect_module(
+            connection_file_path,
+            project_root,
+            QUOTA_MODULE_ID,
+            "management_surface",
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_module(
+        connection_file_path: &Path,
+        project_root: &Path,
+        module: &str,
+        kind: &str,
+    ) -> Result<Self, QuotaConsumerError> {
         let conn = connection_file::read(connection_file_path)
             .map_err(|e| msg(format!("reading connection file: {e}")))?;
         let endpoint = conn
@@ -131,7 +146,8 @@ impl QuotaConsumer {
             route_epoch: 0,
             next_corr: 1,
         };
-        (consumer.route_channel, consumer.route_epoch) = consumer.route_open(project_root).await?;
+        (consumer.route_channel, consumer.route_epoch) =
+            consumer.route_open(project_root, module, kind).await?;
         Ok(consumer)
     }
 
@@ -141,11 +157,16 @@ impl QuotaConsumer {
         c
     }
 
-    async fn route_open(&mut self, project_root: &Path) -> Result<(u16, u32), QuotaConsumerError> {
+    async fn route_open(
+        &mut self,
+        project_root: &Path,
+        module: &str,
+        kind: &str,
+    ) -> Result<(u16, u32), QuotaConsumerError> {
         let corr = self.corr();
         let body = serde_json::json!({
             "op": "route.open",
-            "target": { "kind": "management_surface", "module_id": QUOTA_MODULE_ID },
+            "target": { "kind": kind, "module_id": module },
             "identity": {
                 "project_root": project_root,
                 "harness": "prefrontal-routing",
@@ -214,13 +235,60 @@ impl QuotaConsumer {
         &mut self,
         params: serde_json::Value,
     ) -> Result<Vec<u8>, QuotaConsumerError> {
-        let corr = self.corr();
         let body = serde_json::json!({ "method": USAGE_GET_OP, "params": params });
+        self.operation_body(body).await
+    }
+
+    /// Optional economics queries are read-only. Missing modules or operations
+    /// are normal refusals and are handled as unavailable by the adapter.
+    pub(crate) async fn query(
+        &mut self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, QuotaConsumerError> {
+        let bytes = self.operation_body(body).await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(QuotaConsumerError::Json)?;
+        Ok(value.get("result").cloned().unwrap_or(value))
+    }
+
+    async fn operation_body(
+        &mut self,
+        body: serde_json::Value,
+    ) -> Result<Vec<u8>, QuotaConsumerError> {
+        self.operation_at(self.route_channel, self.route_epoch, body)
+            .await
+    }
+
+    /// Read registered management operation names from the daemon catalog.
+    /// The pace adapter calls an operation only when its name is advertised.
+    pub(crate) async fn management_operations(
+        &mut self,
+        module: &str,
+    ) -> Result<std::collections::HashSet<String>, QuotaConsumerError> {
+        let bytes = self
+            .operation_at(
+                0,
+                0,
+                serde_json::json!({"op":"catalog.list", "module_id":module}),
+            )
+            .await?;
+        let catalog: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(QuotaConsumerError::Json)?;
+        Ok(management_operation_names(&catalog, module))
+    }
+
+    async fn operation_at(
+        &mut self,
+        channel: u16,
+        epoch: u32,
+        body: serde_json::Value,
+    ) -> Result<Vec<u8>, QuotaConsumerError> {
+        let corr = self.corr();
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
-            self.route_channel,
-            self.route_epoch,
+            channel,
+            epoch,
             corr,
             serde_json::to_vec(&body).map_err(QuotaConsumerError::Json)?,
         )
@@ -228,9 +296,7 @@ impl QuotaConsumer {
         write_frame(&mut self.stream, &frame)
             .await
             .map_err(|e| msg(e.to_string()))?;
-        let reply = self
-            .read_reply(self.route_channel, self.route_epoch, corr)
-            .await?;
+        let reply = self.read_reply(channel, epoch, corr).await?;
         if reply.header.ty == FrameType::Error {
             return Err(msg(format!(
                 "usage.get failed: {}",
@@ -282,6 +348,22 @@ impl QuotaConsumer {
             }
         }
     }
+}
+
+fn management_operation_names(
+    catalog: &serde_json::Value,
+    module: &str,
+) -> std::collections::HashSet<String> {
+    catalog["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["module_id"] == module)
+        .flat_map(|entry| entry["roles"].as_array().into_iter().flatten())
+        .filter(|role| role["role"] == "management_surface")
+        .flat_map(|role| role["operations"].as_array().into_iter().flatten())
+        .filter_map(|op| op["name"].as_str().map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]
@@ -519,5 +601,27 @@ mod tests {
         // is pinned here so a regression to the old name reddens a test by name instead
         // of surfacing as a silent quota-signal outage.
         assert_eq!(QUOTA_MODULE_ID, "insula");
+    }
+}
+
+#[cfg(test)]
+mod operation_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_discovers_only_registered_management_operations() {
+        // Obtain provider roles through the protocol's manifest serializer, the
+        // same serialization used for the roles in daemon catalog entries.
+        let manifest = serde_json::to_value(crate::manifest("astrocyte")).unwrap();
+        let mut catalog = serde_json::json!({"op":"catalog.list","modules":[{"module_id":"astrocyte","roles":manifest["provides"]}]});
+        let ops = management_operation_names(&catalog, "astrocyte");
+        assert!(ops.contains("route.select"));
+        assert!(!ops.contains("spend.multiplier.pace"));
+        catalog["modules"][0]["roles"][0]["operations"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"spend.multiplier.pace","kind":"query"}));
+        assert!(management_operation_names(&catalog, "astrocyte").contains("spend.multiplier.pace"));
+        assert!(management_operation_names(&catalog, "absent").is_empty());
     }
 }

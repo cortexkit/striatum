@@ -518,6 +518,8 @@ pub struct RosterIdentity {
     pub credential_ids: Vec<String>,
     pub active_credential_ids: Vec<String>,
     pub first_seen_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,6 +601,20 @@ pub fn build_roster(
                 })
                 .map_or(fetched_at_ms, |known| known.first_seen_ms);
             RosterIdentity {
+                // When credentials for one account disagree on its billing tier,
+                // leave it unknown rather than borrowing another plan's pricing.
+                plan_tier: {
+                    let tiers: BTreeSet<_> = listing
+                        .credentials
+                        .iter()
+                        .filter(|c| {
+                            c.refresh_adapter.as_deref() == Some(&refresh_adapter)
+                                && c.account_id.as_deref() == Some(&account_id)
+                        })
+                        .filter_map(|c| c.plan_tier.clone())
+                        .collect();
+                    (tiers.len() == 1).then(|| tiers.into_iter().next().unwrap())
+                },
                 refresh_adapter,
                 account_id,
                 credential_ids: order(all),
@@ -1662,6 +1678,13 @@ pub async fn account_quota_loop(
                 credentials.refresh_serving_methods(&guard, &facts, now_ms());
             }
         }
+        crate::subscription_economics::refresh(
+            &connection_file_path,
+            &project_root,
+            &state,
+            listing.as_ref().ok(),
+        )
+        .await;
         tokio::time::sleep(delay).await;
     }
 }
@@ -1678,6 +1701,7 @@ pub fn status_json(state: &AccountQuotaState, now_ms: i64) -> Value {
         "report": report,
         "last_insula_error": state.last_insula_error,
         "restored_readings": state.restored_readings,
+        "subscription_economics": crate::subscription_economics::health_detail(),
     })
 }
 

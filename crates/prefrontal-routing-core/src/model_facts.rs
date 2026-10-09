@@ -49,6 +49,21 @@ pub fn get_speed_multiplier(route_key: &str) -> Option<f64> {
 /// adjusted) price: 1.0 means "no subsidy known", larger values make the route
 /// proportionally cheaper than list.
 static SUBSCRIPTION_MULTIPLIERS: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
+static KEEP_FREE_PERCENT: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
+
+pub fn set_keep_free_percent(values: HashMap<String, f64>) {
+    *KEEP_FREE_PERCENT
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap() = values;
+}
+
+pub fn get_keep_free_percent(provider: &str) -> f64 {
+    KEEP_FREE_PERCENT
+        .get()
+        .and_then(|m| m.lock().unwrap().get(provider).copied())
+        .unwrap_or(0.0)
+}
 
 pub fn set_subscription_multipliers(multipliers: HashMap<String, f64>) {
     let mut map = SUBSCRIPTION_MULTIPLIERS
