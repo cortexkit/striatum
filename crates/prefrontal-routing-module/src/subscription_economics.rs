@@ -116,12 +116,6 @@ fn fusiform_value(row: &Value, now: i64) -> Option<f64> {
             let high = decimal(value.get("high")?, "units")?;
             (low <= high).then_some(low)
         }
-        "not_established" => {
-            if value.get("refusal_reason")?.as_str()?.trim().is_empty() {
-                return None;
-            }
-            None
-        }
         _ => None,
     }
 }
@@ -649,20 +643,22 @@ mod tests {
     #[test]
     fn unpriced_tier_health_is_deduplicated_and_names_unknown_and_refused_rows() {
         use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
-        let credential = ListedCredential {
+        let unknown = ListedCredential {
+            provider_ids: vec!["anthropic".into()],
+            plan_tier: Some("pro_5x".into()),
+            ..Default::default()
+        };
+        let refused = ListedCredential {
             provider_ids: vec!["openai".into()],
-            plan_tier: Some("pro_200".into()),
+            plan_tier: Some("pro".into()),
             ..Default::default()
         };
         let listing = ScopedCredentialListing {
             credentials: vec![
-                credential.clone(),
-                credential,
-                ListedCredential {
-                    provider_ids: vec!["openai".into()],
-                    plan_tier: Some("pro_500".into()),
-                    ..Default::default()
-                },
+                unknown.clone(),
+                unknown,
+                refused.clone(),
+                refused,
                 ListedCredential {
                     provider_ids: vec!["anthropic".into()],
                     plan_tier: Some("max_20x".into()),
@@ -674,8 +670,8 @@ mod tests {
         assert_eq!(
             unpriced_tiers(&listing, &prices(), NOW),
             BTreeSet::from([
-                "unpriced plan tier: openai/pro_200".into(),
-                "unpriced plan tier: openai/pro_500".into()
+                "unpriced plan tier: anthropic/pro_5x".into(),
+                "unpriced plan tier: openai/pro".into()
             ])
         );
     }
