@@ -66,6 +66,14 @@ fn decimal(value: &Value, units_key: &str) -> Option<f64> {
 }
 
 fn price_row<'a>(prices: &'a Value, provider: &str, tier: &str) -> Option<&'a Value> {
+    let live_tier = match provider {
+        "anthropic" => matches!(tier, "pro" | "max_5x" | "max_20x"),
+        "openai" => matches!(tier, "plus" | "pro_100" | "pro_200" | "pro_500"),
+        _ => false,
+    };
+    if !live_tier {
+        return None;
+    }
     prices["prices"]
         .as_array()?
         .iter()
@@ -91,20 +99,36 @@ fn astro_fee(report: &Value, provider: &str, account_id: &str, now: i64) -> Opti
     (fee.is_finite() && fee > 0.0).then_some(fee)
 }
 
-/// Read Fusiform's optional quota_value range. Its format remains provisional
-/// until actual served output can replace the adapter fixture. The low end is
-/// conservative; unknown, refused and overdue values remain unknown.
+/// Read the conservative measured quota value from the subscription-plan price
+/// rows served by Fusiform, the service that supplies these prices. Missing or
+/// refused measurements, and observations outside their date limits, stay unknown.
 fn fusiform_value(row: &Value, now: i64) -> Option<f64> {
-    let value = row.get("quota_value")?;
-    if value["state"] != "measured"
-        || value["review_by_ms"].as_i64()? < now
-        || value["as_of_ms"].as_i64()? > now
-    {
+    let value = row.get("quota_value")?.as_object()?;
+    if value.get("review_by_ms")?.as_i64()? < now {
         return None;
     }
-    let low = decimal(&value["low"], "units")?;
-    let high = decimal(&value["high"], "units")?;
-    (low <= high).then_some(low)
+    match value.get("state")?.as_str()? {
+        "measured" => {
+            if value.get("as_of_ms")?.as_i64()? > now {
+                return None;
+            }
+            for field in ["basis", "token_mix", "established_by", "source_ref"] {
+                if value.get(field)?.as_str()?.trim().is_empty() {
+                    return None;
+                }
+            }
+            let low = decimal(value.get("low")?, "units")?;
+            let high = decimal(value.get("high")?, "units")?;
+            (low <= high).then_some(low)
+        }
+        "not_established" => {
+            if value.get("refusal_reason")?.as_str()?.trim().is_empty() {
+                return None;
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Read the expected spend.multiplier.pace reply structure. Each time bucket
@@ -483,6 +507,7 @@ pub(crate) fn overlay(snapshot: &mut ModelRouteStateSnapshot, facts: &[ModelFact
 mod tests {
     use super::*;
     use crate::account_quota::{RosterIdentity, StoredReading, VaultRoster};
+    use sha2::{Digest, Sha256};
     const NOW: i64 = 1791507600000;
 
     // Captured from the read-only spend.multiplier.report on 2026-10-09, with
@@ -498,12 +523,11 @@ mod tests {
             .clone()
     }
     fn prices() -> Value {
-        // quota_value low/high ranges are provisional until actual Fusiform
-        // output is available. The surrounding plan.prices format already exists.
-        serde_json::from_str(include_str!(
-            "../fixtures/fusiform-quota-value-provisional.json"
-        ))
-        .unwrap()
+        // Adapter tests use this saved upstream response to confirm the decoder
+        // reads Fusiform's served quota_value rows, not a test-only schema.
+        // Source: crates/fusiform-module/fixtures/served-payloads.json at commit 2e689aab.
+        // Fixture SHA-256: 95a576e57ab51182853ce52aff0240c4026f6fcf6d4104c997d9ee68cf410a45.
+        serde_json::from_str(include_str!("../fixtures/fusiform-plan-prices.json")).unwrap()
     }
     fn state(raw: f64, tier: Option<&str>) -> AccountQuotaState {
         let mut state = AccountQuotaState::default();
@@ -563,19 +587,50 @@ mod tests {
     }
 
     #[test]
+    fn fusiform_plan_prices_fixture_is_digest_pinned() {
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(include_bytes!("../fixtures/fusiform-plan-prices.json"))
+        );
+        assert_eq!(
+            digest,
+            "95a576e57ab51182853ce52aff0240c4026f6fcf6d4104c997d9ee68cf410a45"
+        );
+    }
+
+    #[test]
     fn fusiform_conservative_low_requires_live_value_and_operator_tier() {
         let p = prices();
         let row = price_row(&p, "anthropic", "max_20x").unwrap();
-        assert_eq!(fusiform_value(row, NOW), Some(27.5));
-        assert_eq!(fusiform_value(row, 1794096000001), None);
+        assert_eq!(fusiform_value(row, NOW), Some(57.4));
         assert_eq!(
             fusiform_value(price_row(&p, "openai", "pro_200").unwrap(), NOW),
+            Some(29.0)
+        );
+        assert_eq!(fusiform_value(row, 1794182400001), None);
+        assert_eq!(
+            fusiform_value(price_row(&p, "anthropic", "max_5x").unwrap(), NOW),
             None
         );
         assert_eq!(
             fusiform_value(price_row(&p, "openai", "plus").unwrap(), NOW),
             None
         );
+        let without_value = json!({"provider_id":"anthropic", "tier":"max_20x"});
+        assert_eq!(fusiform_value(&without_value, NOW), None);
+        let mut stale_retired_prices = p.clone();
+        for tier in ["pro_5x", "pro_20x"] {
+            let mut retired_row = row.clone();
+            retired_row["tier"] = json!(tier);
+            stale_retired_prices["prices"]
+                .as_array_mut()
+                .unwrap()
+                .push(retired_row);
+            assert!(price_row(&stale_retired_prices, "anthropic", tier).is_none());
+        }
+        assert!(price_row(&p, "openai", "pro").is_none());
+        assert!(price_row(&p, "openai", "pro_5x").is_none());
+        assert!(price_row(&p, "openai", "pro_20x").is_none());
         let without_tier = build(&state(3.0, None), &report(), &p, &HashMap::new(), NOW);
         assert_eq!(
             without_tier.pools["anthropic"].plans[0].fusiform_multiplier,
@@ -590,7 +645,7 @@ mod tests {
         );
         assert_eq!(
             with_tier.pools["anthropic"].plans[0].fusiform_multiplier,
-            Some(27.5)
+            Some(57.4)
         );
         assert_eq!(with_tier.pools["anthropic"].plans[0].fee_usd, 200.0);
     }
