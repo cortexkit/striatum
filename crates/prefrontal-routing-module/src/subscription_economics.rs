@@ -221,10 +221,29 @@ fn head_pace_result(
 }
 
 fn pace_call_is_transient(error: &QuotaConsumerError) -> bool {
+    // The Astrocyte management service returns `malformed`, `unknown_quota_provider`,
+    // `invalid_range`, `range_too_large`, and `no_multiplier_observation` when the
+    // request is bad or data is absent; repeating that query cannot help. Invalid
+    // success JSON is also final; transport and other operation errors retry once.
     match error {
-        // Astrocyte application refusals arrive as Error frames. Retrying a
-        // refused range or provider cannot make the request valid.
-        QuotaConsumerError::Message(message) => !message.starts_with("usage.get failed: "),
+        QuotaConsumerError::Message(message) => {
+            let Some(body) = message.strip_prefix("usage.get failed: ") else {
+                return true;
+            };
+            let code = serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|body| body["code"].as_str().map(str::to_owned));
+            !matches!(
+                code.as_deref(),
+                Some(
+                    "malformed"
+                        | "unknown_quota_provider"
+                        | "invalid_range"
+                        | "range_too_large"
+                        | "no_multiplier_observation"
+                )
+            )
+        }
         QuotaConsumerError::Json(_) => false,
     }
 }
@@ -925,6 +944,9 @@ mod tests {
         let body = &frame["result"];
         let error = QuotaConsumerError::Message(format!("usage.get failed: {body}"));
         assert!(!pace_call_is_transient(&error));
+        assert!(pace_call_is_transient(&QuotaConsumerError::Message(
+            "read timed out".into()
+        )));
         assert!(
             head_pace_result(Err(error), "claude", 1_791_532_800_000, 1_791_619_200_000).is_none()
         );
