@@ -3,7 +3,7 @@
 
 use crate::{
     account_quota::{parse_rfc3339_ms, AccountQuotaState, SharedAccountQuota},
-    quota_consumer::QuotaConsumer,
+    quota_consumer::{QuotaConsumer, QuotaConsumerError},
 };
 use prefrontal_routing_core::{
     model_facts::{get_keep_free_percent, make_capacity_key},
@@ -120,9 +120,44 @@ fn fusiform_value(row: &Value, now: i64) -> Option<f64> {
     }
 }
 
-/// Read the expected spend.multiplier.pace reply structure. Each time bucket
-/// contains per-client list-price nanos, estimated pooled points and their value.
-/// A gap or overlap in [from_ms,to_ms) is incomplete evidence, not a zero pace.
+const PACE_HOUR_MS: i64 = 3_600_000;
+const PACE_WINDOW_HOURS: i64 = 24;
+
+fn pace_window(now_ms: i64) -> (i64, i64) {
+    let to = now_ms - now_ms.rem_euclid(PACE_HOUR_MS);
+    (to - PACE_WINDOW_HOURS * PACE_HOUR_MS, to)
+}
+
+fn pace_request(provider: &str, from: i64, to: i64) -> Value {
+    json!({
+        "method": "spend.multiplier.pace",
+        "params": {"quota_provider": provider, "from_ms": from, "to_ms": to}
+    })
+}
+
+fn producer_points(producer: &Value) -> Option<f64> {
+    producer["events"].as_u64()?;
+    producer["list_nanos"].as_i64()?;
+    let points = producer["estimated_points"].as_f64()?;
+    if points < 0.0 || !points.is_finite() {
+        return None;
+    }
+    if producer["unpriced_tokens"].as_i64()? < 0 {
+        return None;
+    }
+    for work_class in producer["by_work_class"].as_object()?.values() {
+        work_class["events"].as_u64()?;
+        work_class["list_nanos"].as_i64()?;
+        let class_points = work_class["estimated_points"].as_f64()?;
+        if class_points < 0.0 || !class_points.is_finite() {
+            return None;
+        }
+    }
+    Some(points)
+}
+
+/// Read pooled points from Astrocyte's complete hourly series. A gap or
+/// malformed producer is incomplete evidence, not a zero pace.
 fn head_pace(reply: &Value, provider: &str, from: i64, to: i64) -> Option<f64> {
     if reply["quota_provider"] != provider
         || reply["from_ms"].as_i64()? != from
@@ -130,26 +165,68 @@ fn head_pace(reply: &Value, provider: &str, from: i64, to: i64) -> Option<f64> {
     {
         return None;
     }
+    if reply["basis"] != "pro_rata_list_value"
+        || reply["per_point_nanos"].as_i64()? <= 0
+        || reply["observation_day"].as_str()?.is_empty()
+        || reply["observation_id"].as_i64()? <= 0
+        || reply["undated_events"].as_i64()? < 0
+    {
+        return None;
+    }
+    let span = to.checked_sub(from)?;
+    if from.rem_euclid(PACE_HOUR_MS) != 0
+        || to.rem_euclid(PACE_HOUR_MS) != 0
+        || span <= 0
+        || span % PACE_HOUR_MS != 0
+    {
+        return None;
+    }
+    let window_hours = (span / PACE_HOUR_MS) as usize;
+    if window_hours > 192 {
+        return None;
+    }
+    let hours = reply["hours"].as_array()?;
+    if hours.len() != window_hours {
+        return None;
+    }
     let mut points = 0.0;
-    let mut covered = from;
-    for bucket in reply["buckets"].as_array()? {
-        if bucket["from_ms"].as_i64()? != covered {
+    for (index, hour) in hours.iter().enumerate() {
+        let expected_hour = from + index as i64 * PACE_HOUR_MS;
+        if hour["hour_start_ms"].as_i64()? != expected_hour {
             return None;
         }
-        covered = bucket["to_ms"].as_i64()?;
-        for producer in bucket["producers"].as_array()? {
-            let name = producer["producer"].as_str()?;
-            let used = producer["estimated_pooled_points"].as_f64()?;
-            let value = producer["value_per_point_usd"].as_f64()?;
-            if used < 0.0 || !used.is_finite() || value <= 0.0 || !value.is_finite() {
-                return None;
-            }
-            if matches!(name, "opencode" | "pi" | "claude-code") {
-                points += used;
+        for (name, producer) in hour["producers"].as_object()? {
+            let estimated_points = producer_points(producer)?;
+            if matches!(name.as_str(), "opencode" | "pi" | "claude-code") {
+                points += estimated_points;
+                if !points.is_finite() {
+                    return None;
+                }
             }
         }
     }
-    (covered == to && to > from).then_some(points * 3_600_000.0 / (to - from) as f64)
+    let pace = points / window_hours as f64;
+    pace.is_finite().then_some(pace)
+}
+
+fn head_pace_result(
+    result: Result<Value, QuotaConsumerError>,
+    provider: &str,
+    from: i64,
+    to: i64,
+) -> Option<f64> {
+    result
+        .ok()
+        .and_then(|reply| head_pace(&reply, provider, from, to))
+}
+
+fn pace_call_is_transient(error: &QuotaConsumerError) -> bool {
+    match error {
+        // Astrocyte application refusals arrive as Error frames. Retrying a
+        // refused range or provider cannot make the request valid.
+        QuotaConsumerError::Message(message) => !message.starts_with("usage.get failed: "),
+        QuotaConsumerError::Json(_) => false,
+    }
 }
 
 fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
@@ -338,6 +415,7 @@ pub(crate) async fn refresh(
 ) {
     let now = crate::now_ms() as i64;
     let from = now - 24 * 3_600_000;
+    let (pace_from, pace_to) = pace_window(now);
     let mut report = Value::Null;
     let mut paces = HashMap::new();
     if let Ok(mut astro) =
@@ -368,12 +446,18 @@ pub(crate) async fn refresh(
             .unwrap_or_default();
         for provider in providers
             .into_iter()
+            .filter(|provider| matches!(provider.as_str(), "claude" | "codex"))
             .filter(|_| operations.contains("spend.multiplier.pace"))
         {
             // Only registered operations are read. Missing or unreadable pace
             // replies leave the reserve unavailable without a routing error.
-            if let Ok(reply) = astro.query(json!({"method":"spend.multiplier.pace", "params":{"quota_provider":provider,"from_ms":from,"to_ms":now,"bucket":"hour"}})).await {
-                if let Some(pace) = head_pace(&reply, &provider, from, now) { paces.insert(provider, pace); }
+            let request = pace_request(&provider, pace_from, pace_to);
+            let mut result = astro.query(request.clone()).await;
+            if matches!(&result, Err(error) if pace_call_is_transient(error)) {
+                result = astro.query(request).await;
+            }
+            if let Some(pace) = head_pace_result(result, &provider, pace_from, pace_to) {
+                paces.insert(provider, pace);
             }
         }
     }
@@ -723,24 +807,76 @@ mod tests {
     }
 
     #[test]
-    fn provisional_pace_fixture_projects_only_head_producers() {
-        // Expected hourly pace reply structure, not captured Astrocyte output.
-        let reply: Value =
-            serde_json::from_str(include_str!("../fixtures/astrocyte-pace-provisional.json"))
-                .unwrap();
-        let pace = head_pace(&reply, "claude", 1791504000000, NOW).unwrap();
-        assert!((pace - 0.06).abs() < 1e-12);
+    fn astrocyte_captured_pace_frames_are_sha256_pinned() {
+        // These are production Response-frame bodies from Astrocyte's captured
+        // `spend.multiplier.pace` vectors at commit `9e1841c`. The paths and
+        // hashes identify the exact producer-owned bytes copied into this crate;
+        // the assertions below prevent fixture edits from changing that contract.
+        // `crates/astrocyte-core/tests/vectors/spend-multiplier-pace/claude-2026-10-09T08Z-24h.json`
+        // SHA-256 `4092920808e92a18648e4db427c539b22f33b290a7a68b205f23551b09659273`, and
+        // `crates/astrocyte-core/tests/vectors/spend-multiplier-pace/codex-2026-10-09T08Z-24h.json`
+        // SHA-256 `a999a212e65672599a810a0578361b5fdeda1fc0753cc23e6e7a42838e3dc179`.
+        let fixtures: [(&[u8], &str); 2] = [
+            (
+                include_bytes!(
+                    "../fixtures/astrocyte-spend-multiplier-pace-claude-2026-10-09T08Z-24h.json"
+                ),
+                "4092920808e92a18648e4db427c539b22f33b290a7a68b205f23551b09659273",
+            ),
+            (
+                include_bytes!(
+                    "../fixtures/astrocyte-spend-multiplier-pace-codex-2026-10-09T08Z-24h.json"
+                ),
+                "a999a212e65672599a810a0578361b5fdeda1fc0753cc23e6e7a42838e3dc179",
+            ),
+        ];
+        for (bytes, expected) in fixtures {
+            assert_eq!(format!("{:x}", Sha256::digest(bytes)), expected);
+        }
+    }
+
+    #[test]
+    fn captured_pace_frames_decode_and_apply_the_head_reserve() {
+        // These are production Response frame bodies from Astrocyte commit
+        // `9e1841c`; each frame contains a `result` envelope. Claude's head
+        // producers sum to 45.66346337585237 points over 24 hours, or
+        // 1.9026443073271821 points/hour. Codex's sum is 26.10972709861734,
+        // or 1.0879052957757225 points/hour. The broker (`broca`) is excluded.
+        let claude_frame: Value = serde_json::from_slice(include_bytes!(
+            "../fixtures/astrocyte-spend-multiplier-pace-claude-2026-10-09T08Z-24h.json"
+        ))
+        .unwrap();
+        let codex_frame: Value = serde_json::from_slice(include_bytes!(
+            "../fixtures/astrocyte-spend-multiplier-pace-codex-2026-10-09T08Z-24h.json"
+        ))
+        .unwrap();
+        let from = 1_791_532_800_000;
+        let to = 1_791_619_200_000;
+        let claude_pace = head_pace(&claude_frame["result"], "claude", from, to).unwrap();
+        let codex_pace = head_pace(&codex_frame["result"], "codex", from, to).unwrap();
+        assert!((claude_pace - 1.9026443073271821).abs() < 1e-12);
+        assert!((codex_pace - 1.0879052957757225).abs() < 1e-12);
+
+        let mut quota = state(3.0, Some("max_20x"));
+        quota
+            .readings
+            .readings
+            .get_mut(&("claude".into(), "a".into()))
+            .unwrap()
+            .entry["usage"]["secondary"]["resetsAt"] = json!("2026-10-09T02:00:00Z");
         let pools = build(
-            &state(3.0, Some("max_20x")),
+            &quota,
             &report(),
             &prices(),
-            &HashMap::from([("claude".into(), pace)]),
+            &HashMap::from([("claude".into(), claude_pace)]),
             NOW,
         );
         let pool = &pools.pools["anthropic"];
+        assert_eq!(pool.plans[0].head_points_per_hour, Some(claude_pace));
         let worker = pool.price(0.1, None, 20.0, false).unwrap();
         assert!(
-            (worker.head_reserve_points.unwrap() - pace * pool.plans[0].accounts[0].hours_to_reset)
+            (worker.head_reserve_points.unwrap()
+                - claude_pace * pool.plans[0].accounts[0].hours_to_reset)
                 .abs()
                 < 1e-12
         );
@@ -750,6 +886,64 @@ mod tests {
                 .head_reserve_points,
             Some(0.0)
         );
-        assert!(head_pace(&Value::Null, "claude", 1791504000000, NOW).is_none());
+    }
+
+    #[test]
+    fn one_hour_removed_from_captured_pace_frame_is_unavailable() {
+        // This labelled one-edit derivation removes one hour from the captured
+        // Claude frame; it is a gap test, not a separate Astrocyte capture.
+        let mut frame: Value = serde_json::from_slice(include_bytes!(
+            "../fixtures/astrocyte-spend-multiplier-pace-claude-2026-10-09T08Z-24h.json"
+        ))
+        .unwrap();
+        frame["result"]["hours"].as_array_mut().unwrap().remove(0);
+        assert!(head_pace(
+            &frame["result"],
+            "claude",
+            1_791_532_800_000,
+            1_791_619_200_000
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn no_observation_refusal_derived_from_capture_is_unavailable() {
+        // One edit replaces the captured result with Astrocyte's documented
+        // `no_multiplier_observation` ErrorBody (synthetic, not a capture).
+        // The source refusal is at `crates/astrocyte-core/src/multiplier.rs`
+        // in commit `9e1841c`.
+        let mut frame: Value = serde_json::from_slice(include_bytes!(
+            "../fixtures/astrocyte-spend-multiplier-pace-claude-2026-10-09T08Z-24h.json"
+        ))
+        .unwrap();
+        frame["result"] = json!({
+            "code": "no_multiplier_observation",
+            "message": "no multiplier row is recorded for this provider",
+            "detail": null
+        });
+        assert_eq!(frame["result"]["code"], "no_multiplier_observation");
+        let body = &frame["result"];
+        let error = QuotaConsumerError::Message(format!("usage.get failed: {body}"));
+        assert!(!pace_call_is_transient(&error));
+        assert!(
+            head_pace_result(Err(error), "claude", 1_791_532_800_000, 1_791_619_200_000).is_none()
+        );
+    }
+
+    #[test]
+    fn pace_request_has_exact_fields_and_hour_aligned_times() {
+        let (from, to) = pace_window(1_791_619_200_000 + 12_345);
+        assert_eq!(to, 1_791_619_200_000);
+        assert_eq!(from, 1_791_532_800_000);
+
+        for provider in ["claude", "codex"] {
+            let request = pace_request(provider, from, to);
+            assert_eq!(request["method"], "spend.multiplier.pace");
+            let params = request["params"].as_object().unwrap();
+            assert_eq!(params.len(), 3);
+            assert_eq!(params["quota_provider"], provider);
+            assert_eq!(params["from_ms"], from);
+            assert_eq!(params["to_ms"], to);
+        }
     }
 }
