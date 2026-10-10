@@ -1194,7 +1194,12 @@ fn admit_and_price_shortlist(
             rejected.push(RejectedRoute {
                 route_key: a.route.route_key.clone(),
                 reason: "subscription_reserve".into(),
-                detail: Some("weekly headroom is inside keep-free margin plus head reserve".into()),
+                detail: a.runtime.subscription_pool.as_ref().map(|pool| {
+                    pool.reserve_diagnostic(
+                        pool.keep_free_percent,
+                        crate::subscription::is_head(&input.target_agent),
+                    )
+                }),
             });
         }
         permitted

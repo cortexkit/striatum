@@ -4282,6 +4282,22 @@ fn subscription_margin_blocks_workers_but_not_heads() {
         .rejected
         .iter()
         .any(|r| r.route_key == "anthropic/claude-opus" && r.reason == "subscription_reserve"));
+    let rejection = worker
+        .rejected
+        .iter()
+        .find(|r| r.reason == "subscription_reserve")
+        .unwrap();
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(rejection.detail.as_deref().unwrap()).unwrap();
+    assert_eq!(diagnostic["pool"], "anthropic");
+    assert_eq!(diagnostic["unit"], "weekly_percentage_points_per_account");
+    assert_eq!(diagnostic["plans"][0]["headroomPoints"], 19.0);
+    assert_eq!(diagnostic["plans"][0]["keepFreePoints"], 19.0);
+    assert_eq!(diagnostic["plans"][0]["availablePoints"], 0.0);
+    assert_eq!(
+        diagnostic["plans"][0]["headReservePoints"],
+        serde_json::Value::Null
+    );
     let head = select_model_route(subscription_scenario(&[81.0], 20.0, "alfonso")).unwrap();
     assert!(!head
         .rejected

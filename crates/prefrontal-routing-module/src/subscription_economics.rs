@@ -413,6 +413,20 @@ fn build(
     for ((provider, _, _), plan) in plans {
         out.pools.get_mut(&provider).unwrap().plans.push(plan);
     }
+    for pool in out.pools.values_mut() {
+        let accounts: usize = pool.plans.iter().map(|plan| plan.accounts.len()).sum();
+        if accounts == 0 {
+            continue;
+        }
+        // Astrocyte reports one provider-wide demand, not one demand per tier.
+        // Each account contributes 100 weekly points, so split that demand by
+        // account capacity before each tier projects its own reset horizon.
+        for plan in &mut pool.plans {
+            plan.head_points_per_hour = plan
+                .head_points_per_hour
+                .map(|pace| pace * plan.accounts.len() as f64 / accounts as f64);
+        }
+    }
     out
 }
 
@@ -905,6 +919,234 @@ mod tests {
                 .head_reserve_points,
             Some(0.0)
         );
+    }
+
+    fn outage_fixture() -> (AccountQuotaState, Value) {
+        // Numeric readings precede the October 10 worker-selection request with
+        // an IQ requirement of 90, identified in the fixture's source_decision.
+        // Account aliases omit personal identities; the producer fetchedAt is
+        // preserved so receipt of a stale reading does not make it fresh.
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../fixtures/routing-reserve-outage-2026-10-10.json"
+        ))
+        .unwrap();
+        let now = fixture["now_ms"].as_i64().unwrap();
+        let mut state = AccountQuotaState::default();
+        let mut identities = Vec::new();
+        for row in fixture["accounts"].as_array().unwrap() {
+            let entry = row["entry"].clone();
+            let provider = entry["provider"].as_str().unwrap().to_string();
+            let account_id = entry["account"].as_str().unwrap().to_string();
+            let credential = format!("fixture:{account_id}");
+            identities.push(RosterIdentity {
+                refresh_adapter: provider.clone(),
+                account_id: account_id.clone(),
+                credential_ids: vec![credential.clone()],
+                active_credential_ids: vec![credential],
+                first_seen_ms: now - 86_400_000,
+                plan_tier: Some(row["tier"].as_str().unwrap().into()),
+            });
+            state.readings.readings.insert(
+                (provider.clone(), account_id.clone()),
+                StoredReading {
+                    provider,
+                    account_id,
+                    entry,
+                    received_at_ms: fixture["observed_at_ms"].as_i64().unwrap(),
+                    tombstoned_at_ms: None,
+                },
+            );
+        }
+        state.roster = Some(VaultRoster {
+            view: "outage-fixture".into(),
+            fetched_at_ms: now,
+            grants: Vec::new(),
+            identities,
+        });
+        (state, fixture)
+    }
+
+    fn captured_head_paces() -> HashMap<String, f64> {
+        [
+            (
+                "claude",
+                include_bytes!(
+                    "../fixtures/astrocyte-spend-multiplier-pace-claude-2026-10-09T08Z-24h.json"
+                )
+                .as_slice(),
+            ),
+            (
+                "codex",
+                include_bytes!(
+                    "../fixtures/astrocyte-spend-multiplier-pace-codex-2026-10-09T08Z-24h.json"
+                )
+                .as_slice(),
+            ),
+        ]
+        .into_iter()
+        .map(|(provider, bytes)| {
+            let frame: Value = serde_json::from_slice(bytes).unwrap();
+            let reply = &frame["result"];
+            (
+                provider.into(),
+                head_pace(
+                    reply,
+                    provider,
+                    reply["from_ms"].as_i64().unwrap(),
+                    reply["to_ms"].as_i64().unwrap(),
+                )
+                .unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    fn outage_selection(
+        paces: &HashMap<String, f64>,
+    ) -> Result<
+        prefrontal_routing_core::model_router::SelectedModelRoute,
+        prefrontal_routing_core::model_router::NoRouteError,
+    > {
+        use prefrontal_routing_core::model_router::{
+            select_model_route, RouteRuntimeState, SelectModelRouteInput,
+        };
+        let (state, fixture) = outage_fixture();
+        let now = fixture["now_ms"].as_i64().unwrap();
+        let mut pools = build(&state, &Value::Null, &prices(), paces, now).pools;
+        pools.get_mut("anthropic").unwrap().keep_free_percent = 20.0;
+        pools.get_mut("openai").unwrap().keep_free_percent = 0.0;
+        set_banked_allowance(&mut pools, now);
+        let mut snapshot = ModelRouteStateSnapshot {
+            now: now as f64,
+            ..Default::default()
+        };
+        // These scores and rates are from the copied routing catalog. The three
+        // subscription routes share provider pools. The xAI route has a live
+        // quota wall, so this test must find capacity on a subscription route.
+        let facts: Vec<ModelFact> = [
+            json!({"providerID":"anthropic", "modelID":"claude-opus-5-5", "scores":{"elo":1960.0,"eq":2200.0,"speed":0.0}, "confidence":"curated", "costPerMTokOut":20.0}),
+            json!({"providerID":"openai", "modelID":"gpt-6.1-sol", "scores":{"elo":1884.0,"eq":1620.0,"speed":0.0}, "confidence":"curated", "costPerMTokOut":10.0}),
+            json!({"providerID":"openai", "modelID":"gpt-6-luna", "scores":{"elo":1641.0,"eq":1555.0,"speed":0.0}, "confidence":"curated", "costPerMTokOut":0.5}),
+            json!({"providerID":"xai", "modelID":"grok-4.7", "scores":{"elo":1808.0,"eq":1600.0,"speed":0.0}, "confidence":"curated", "costPerMTokOut":6.0}),
+        ].into_iter().map(|value| serde_json::from_value(value).unwrap()).collect();
+        for fact in &facts {
+            let runtime = if fact.provider_id == "xai" {
+                RouteRuntimeState {
+                    quota_exhausted_until: fixture["xai_wall_until_ms"].as_f64(),
+                    ..Default::default()
+                }
+            } else {
+                RouteRuntimeState {
+                    subscription_pool: Some(Arc::new(pools[&fact.provider_id].clone())),
+                    ..Default::default()
+                }
+            };
+            snapshot.by_capacity.insert(
+                make_capacity_key(&fact.provider_id, &fact.model_id),
+                runtime,
+            );
+        }
+        select_model_route(SelectModelRouteInput {
+            target_agent: "mason".into(),
+            requirements: prefrontal_routing_core::model_facts::ModelRequirements {
+                iq: 70.0,
+                eq: 0.0,
+            },
+            available_models: facts
+                .iter()
+                .map(|f| make_capacity_key(&f.provider_id, &f.model_id))
+                .collect(),
+            facts,
+            runtime_snapshot: Some(snapshot),
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            required_capabilities: None,
+            is_subscription_route: Some(Box::new(|r| r.provider_id != "xai")),
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: Default::default(),
+        })
+    }
+
+    #[test]
+    fn realistic_outage_snapshot_leaves_iq70_worker_route_without_spending_saved_resets() {
+        let selected =
+            outage_selection(&captured_head_paces()).expect("pooled quota can serve a worker");
+        assert_eq!(selected.route_key, "openai/gpt-6.1-sol");
+        assert!(selected
+            .rejected
+            .iter()
+            .any(|r| r.route_key == "xai/grok-4.7" && r.reason == "quota_exhausted"));
+        let pricing = selected.score.objective.subscription_pricing.unwrap();
+        // Copied headroom is 90 points on Pro Lite. One third of the captured
+        // provider pace projects to 60.467435696986634 points over its horizon.
+        assert_eq!(pricing.plan_tier.as_deref(), Some("pro_100"));
+        assert_eq!(pricing.banked_resets_applied, 0);
+        assert!((pricing.available_points.unwrap() - 29.532564303013366).abs() < 1e-9);
+        assert!((pricing.head_reserve_points.unwrap() - 60.467435696986634).abs() < 1e-9);
+    }
+
+    #[test]
+    fn provider_head_pace_is_conserved_across_copied_plan_groups() {
+        let (state, fixture) = outage_fixture();
+        let paces = captured_head_paces();
+        let pools = build(
+            &state,
+            &Value::Null,
+            &prices(),
+            &paces,
+            fixture["now_ms"].as_i64().unwrap(),
+        );
+        let plans = &pools.pools["openai"].plans;
+        assert_eq!(plans.len(), 2);
+        let sum: f64 = plans.iter().map(|p| p.head_points_per_hour.unwrap()).sum();
+        assert!((sum - 1.0879052957757225).abs() < 1e-12);
+        let pro = plans
+            .iter()
+            .find(|p| p.tier.as_deref() == Some("pro_200"))
+            .unwrap();
+        assert_eq!(pro.accounts.len(), 2);
+        assert!(pro.accounts.iter().all(|a| a.weekly_used == 100.0));
+        assert_eq!(
+            pro.accounts
+                .iter()
+                .map(|a| a.banked_resets)
+                .collect::<Vec<_>>()
+                .iter()
+                .sum::<u32>(),
+            3
+        );
+        assert!((pro.head_points_per_hour.unwrap() - 0.725270197183815).abs() < 1e-12);
+    }
+
+    #[test]
+    fn projected_head_demand_exceeding_copied_pooled_headroom_still_blocks_workers() {
+        let error = outage_selection(&HashMap::from([
+            ("claude".into(), 10.0),
+            ("codex".into(), 10.0),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            error
+                .rejected
+                .iter()
+                .filter(|r| r.reason == "subscription_reserve")
+                .count(),
+            3
+        );
+        for rejection in error
+            .rejected
+            .iter()
+            .filter(|r| r.reason == "subscription_reserve")
+        {
+            let detail: Value = serde_json::from_str(rejection.detail.as_deref().unwrap()).unwrap();
+            assert_eq!(detail["unit"], "weekly_percentage_points_per_account");
+            assert!(detail["plans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["availablePoints"] == 0.0));
+        }
     }
 
     #[test]

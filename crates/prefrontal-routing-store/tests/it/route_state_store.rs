@@ -1172,6 +1172,78 @@ fn decision_rejections_name_every_omitted_unavailable_route() {
     );
 }
 
+#[test]
+fn decision_rejections_retain_subscription_reserve_numbers_ahead_of_catalog_tail() {
+    use prefrontal_routing_core::subscription::{QuotaAccount, SubscriptionPlan, SubscriptionPool};
+    let rig = Rig::new("decision-subscription-reserve");
+    let store = rig.open();
+    let pool = SubscriptionPool {
+        provider: "openai".into(),
+        keep_free_percent: 0.0,
+        plans: vec![SubscriptionPlan {
+            tier: Some("pro_100".into()),
+            fee_usd: 100.0,
+            fusiform_multiplier: None,
+            head_points_per_hour: Some(1.0879052957757225),
+            accounts: vec![QuotaAccount {
+                weekly_used: 10.0,
+                weekly_remaining_fraction: 0.99,
+                hours_to_reset: 166.74457583333333,
+                short_walled: false,
+                short_windows: Vec::new(),
+                banked_resets: 0,
+                banked_expires_at_ms: None,
+            }],
+        }],
+        ..Default::default()
+    };
+    let detail = pool.reserve_diagnostic(0.0, false);
+    let numbers: serde_json::Value = serde_json::from_str(&detail).unwrap();
+    assert_eq!(numbers["pool"], "openai");
+    assert_eq!(numbers["unit"], "weekly_percentage_points_per_account");
+    assert_eq!(numbers["plans"][0]["headroomPoints"], 90.0);
+    assert_eq!(numbers["plans"][0]["keepFreePoints"], 0.0);
+    assert!(
+        (numbers["plans"][0]["headReservePoints"].as_f64().unwrap() - 181.40230709095988).abs()
+            < 1e-9
+    );
+    let reserve = serde_json::json!({"routeKey":"openai/gpt-6.1-sol", "reason":"subscription_reserve", "detail":detail});
+    let mut rejected: Vec<_> = (0..12)
+        .map(|i| {
+            serde_json::json!({
+                "routeKey":format!("fenced-{i}"), "reason":"excluded_by_operator"
+            })
+        })
+        .collect();
+    rejected.push(reserve.clone());
+    store
+        .record_decision(&DecisionInput {
+            decision_id: Some("reserve-numbers".into()),
+            target_agent: "mason".into(),
+            requirements_json: "{}".into(),
+            score_json: "null".into(),
+            rejected_json: serde_json::to_string(&rejected).unwrap(),
+            anchor_version: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    let stored: String = rusqlite::Connection::open(rig.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT rejected_json FROM model_route_decisions WHERE id='reserve-numbers'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored[0], reserve);
+    assert_eq!(stored.as_array().unwrap().len(), 13);
+    assert_eq!(
+        stored[12],
+        serde_json::json!({"truncated":1,"reasons":{"excluded_by_operator":1}})
+    );
+}
+
 // ── build_snapshot capacity propagation ─────────────────────────────────────
 
 #[test]
