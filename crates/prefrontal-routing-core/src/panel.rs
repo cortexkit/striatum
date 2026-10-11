@@ -606,7 +606,7 @@ fn select_panel_admitted(
             causes.push(PanelCause {
                 model,
                 reason: PanelCauseReason::QuotaExhausted,
-                detail: Some("weekly headroom is reserved for heads".into()),
+                detail: Some(reserved_headroom_detail(&admitted.runtime)),
             });
             continue;
         }
@@ -791,6 +791,68 @@ fn select_panel_admitted(
         shortfall,
         policy,
     })
+}
+
+fn reserved_headroom_detail(runtime: &crate::model_router::RouteRuntimeState) -> String {
+    let reset = runtime.subscription_pool.as_ref().and_then(|pool| {
+        pool.plans
+            .iter()
+            .flat_map(|plan| &plan.accounts)
+            .map(|account| account.hours_to_reset)
+            .filter(|hours| hours.is_finite() && *hours > 0.0)
+            .reduce(f64::min)
+            .map(|hours| {
+                pool.now_ms
+                    .saturating_add((hours * 3_600_000.0).ceil() as i64)
+            })
+    });
+    // Reserved quota is unavailable to panel seats even though it is not a hard
+    // wall. Preserve the known weekly reset so callers can wait and refire.
+    match reset {
+        Some(reset) => format!("weekly headroom is reserved for heads (until_ms={reset})"),
+        None => "weekly headroom is reserved for heads".into(),
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_headroom_shortfall_retains_earliest_known_weekly_reset() {
+        use crate::subscription::{QuotaAccount, SubscriptionPlan, SubscriptionPool};
+        let account = |hours_to_reset| QuotaAccount {
+            weekly_used: 99.0,
+            weekly_remaining_fraction: 0.01,
+            hours_to_reset,
+            short_walled: false,
+            short_windows: vec![],
+            banked_resets: 0,
+            banked_expires_at_ms: None,
+        };
+        let runtime = crate::model_router::RouteRuntimeState {
+            subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
+                now_ms: 1791682778812,
+                plans: vec![SubscriptionPlan {
+                    tier: None,
+                    fee_usd: 0.0,
+                    fusiform_multiplier: None,
+                    accounts: vec![account(2.0), account(1.0), account(f64::NAN)],
+                    head_points_per_hour: None,
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            reserved_headroom_detail(&runtime),
+            "weekly headroom is reserved for heads (until_ms=1791686378812)"
+        );
+        assert_eq!(
+            reserved_headroom_detail(&Default::default()),
+            "weekly headroom is reserved for heads"
+        );
+    }
 }
 
 /// A catalog context window as whole tokens; absent, non-finite or non-positive
