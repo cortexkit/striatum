@@ -4533,3 +4533,72 @@ fn subscription_close_economic_prices_preserve_quality_tiebreak() {
     let selected = select_model_route(input).unwrap();
     assert_eq!(selected.route_key, "openai/gpt-6.1-sol");
 }
+
+#[test]
+fn no_route_refusal_groups_fences_and_attributes_xai_wall() {
+    let mut input = subscription_scenario(&[81.0], 20.0, "mason");
+    let now = 1_791_694_675_127.0;
+    let until = 1_792_081_969_000.0;
+    input.facts[1].provider_id = "xai".into();
+    input.facts[1].model_id = "grok-4.7".into();
+    let snapshot = input.runtime_snapshot.as_mut().unwrap();
+    snapshot.now = now;
+    let runtime = snapshot
+        .by_capacity
+        .get_mut("anthropic/claude-opus")
+        .unwrap();
+    let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
+    for plan in &mut pool.plans {
+        for account in &mut plan.accounts {
+            account.hours_to_reset = 133.0346825;
+        }
+    }
+    snapshot.by_route.insert(
+        "xai/grok-4.7".into(),
+        RouteRuntimeState {
+            quota_exhausted_until: Some(until),
+            ..Default::default()
+        },
+    );
+    input.facts.push(fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "gpt".into(),
+        ..Default::default()
+    }));
+    input.exclude_route_keys = vec!["openai".into()];
+    for i in 0..10 {
+        let model = format!("operator-{i}");
+        input.facts.push(fact(FactBuilder {
+            provider_id: "google".into(),
+            model_id: model.clone(),
+            ..Default::default()
+        }));
+        input.operator_exclude_keys.push(format!("google/{model}"));
+    }
+    input.available_models = input
+        .facts
+        .iter()
+        .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
+        .collect();
+    input.is_subscription_route = Some(Box::new(|route| route.provider_id == "anthropic"));
+    let error = select_model_route(input).unwrap_err();
+    assert_eq!(error.reason, RouteFailureReason::QuotaOrCooldownExhausted);
+    assert_eq!(error.earliest_reset, Some(until));
+    assert_eq!(error.earliest_reset_route.as_deref(), Some("xai/grok-4.7"));
+    let message = error.refusal_message();
+    for expected in [
+        "excluded by operator: 10",
+        "reserved for heads: 1 (anthropic, until weekly reset in 133 h)",
+        "out of credit: 1 (xai/grok-4.7, until_ms=1792081969000)",
+        "excluded for this item/caller: 1 (openai)",
+        "Earliest route wall expiry: xai/grok-4.7 (until_ms=1792081969000)",
+    ] {
+        assert!(message.contains(expected), "missing {expected}: {message}");
+    }
+    let groups = serde_json::to_value(error.blocking_causes()).unwrap();
+    assert!(groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|group| group["reason"] == "excluded_by_operator" && group["count"] == 10));
+}

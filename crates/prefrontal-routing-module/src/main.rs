@@ -1654,6 +1654,7 @@ fn no_route_error(
         requirements: Some(requirements),
         best_rejected: None,
         earliest_reset: None,
+        earliest_reset_route: None,
     }
 }
 
@@ -3748,9 +3749,11 @@ fn decision_input_for(
                 explanation_json: Some(
                     serde_json::to_string(&json!({
                         "failureReason": failure.reason.as_str(),
-                        "message": &failure.message,
+                        "message": failure.refusal_message(),
                         "bestRejected": failure.best_rejected.as_ref(),
                         "earliestReset": failure.earliest_reset,
+                        "earliestResetRoute": failure.earliest_reset_route,
+                        "blockingCauses": failure.blocking_causes(),
                         "policySources": policy_sources,
                     }))
                     .unwrap_or_else(|_| "{}".into()),
@@ -4609,10 +4612,10 @@ async fn handle_record_cooldown(
     }
 }
 
-/// Map a typed `NoRouteError` to an Error frame, preserving the reason code so a
-/// consumer can branch (e.g. break-glass on quota/cooldown) the same way the TS
-/// caller does on the typed error. For `AllRoutesInadequate`, the error body also
-/// carries the best rejected candidate and earliest reset timestamp.
+/// Preserve the `NoRouteError` reason code on the wire so consumers can distinguish
+/// quota/cooldown exhaustion from invalid requirements or inadequate models.
+/// Include grouped blocking reasons and the route whose wall expires earliest;
+/// inadequate-route errors also name the best rejected candidate.
 async fn send_no_route(
     writer: &mpsc::Sender<Frame>,
     ver: u8,
@@ -4636,13 +4639,8 @@ async fn send_no_route(
         };
         format!("{}{}{}", err.message, best_part, reset_part)
     } else {
-        err.message.clone()
+        err.refusal_message()
     };
-    if err.reason == RouteFailureReason::QuotaOrCooldownExhausted {
-        if let Some(ts) = err.earliest_reset {
-            message.push_str(&format!(" Earliest route wall expiry (until_ms={ts:.0})."));
-        }
-    }
     if !message.starts_with("No models available")
         && !message.contains("requires explicit model_requirements")
     {
@@ -4653,9 +4651,12 @@ async fn send_no_route(
             ));
         }
     }
-    // Build the error body. For AllRoutesInadequate, include structured fields
-    // alongside the standard code/message so future clients can parse them.
-    let body_value = if err.reason == RouteFailureReason::AllRoutesInadequate {
+    // blockingCauses names why routes are blocked, and earliestResetRoute names
+    // whose expiry earliestReset reports; clients need not parse the message.
+    let body_value = if matches!(
+        err.reason,
+        RouteFailureReason::AllRoutesInadequate | RouteFailureReason::QuotaOrCooldownExhausted
+    ) {
         let mut obj = serde_json::Map::new();
         obj.insert("code".into(), json!(code));
         obj.insert("message".into(), json!(message));
@@ -4668,6 +4669,10 @@ async fn send_no_route(
         if let Some(earliest) = err.earliest_reset {
             obj.insert("earliestReset".into(), json!(earliest));
         }
+        if let Some(route) = &err.earliest_reset_route {
+            obj.insert("earliestResetRoute".into(), json!(route));
+        }
+        obj.insert("blockingCauses".into(), json!(err.blocking_causes()));
         serde_json::Value::Object(obj)
     } else {
         json!({ "code": code, "message": message })
@@ -7916,6 +7921,20 @@ mod tests {
         };
 
         let blocked = select_with_store(&store, request("billing-wall-blocked")).await;
+        assert_eq!(blocked["earliestReset"], json!(wall_until));
+        assert_eq!(blocked["earliestResetRoute"], "xai/grok-4.6");
+        assert_eq!(blocked["blockingCauses"][0]["count"], 1);
+        let decision = store
+            .get_decisions_for_task("billing-wall-blocked")
+            .unwrap()
+            .remove(0);
+        let explanation: serde_json::Value =
+            serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            explanation["earliestResetRoute"],
+            blocked["earliestResetRoute"]
+        );
+        assert_eq!(explanation["blockingCauses"], blocked["blockingCauses"]);
         let message = blocked["message"]
             .as_str()
             .unwrap_or_else(|| panic!("billing wall must return no_route: {blocked}"));
