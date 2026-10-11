@@ -20,7 +20,9 @@ use prefrontal_routing_core::model_router::{
     RouteRuntimeState, SelectModelRouteInput,
 };
 use prefrontal_routing_core::{
-    ExclusionPolicy, OverqualificationConfig, RoutingConfig, DEFAULT_OVERQUALIFICATION,
+    select_panel, AvailabilitySubstrate, ExclusionPolicy, OverqualificationConfig,
+    PanelCauseReason, PanelClass, PanelDiversity, PanelRosterEntry, PanelSelection,
+    PanelShortfallCode, PanelSpec, RoutingConfig, SelectPanelInput, DEFAULT_OVERQUALIFICATION,
     DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY,
 };
 
@@ -4282,6 +4284,22 @@ fn subscription_margin_blocks_workers_but_not_heads() {
         .rejected
         .iter()
         .any(|r| r.route_key == "anthropic/claude-opus" && r.reason == "subscription_reserve"));
+    let rejection = worker
+        .rejected
+        .iter()
+        .find(|r| r.reason == "subscription_reserve")
+        .unwrap();
+    let diagnostic: serde_json::Value =
+        serde_json::from_str(rejection.detail.as_deref().unwrap()).unwrap();
+    assert_eq!(diagnostic["pool"], "anthropic");
+    assert_eq!(diagnostic["unit"], "weekly_percentage_points_per_account");
+    assert_eq!(diagnostic["plans"][0]["headroomPoints"], 19.0);
+    assert_eq!(diagnostic["plans"][0]["keepFreePoints"], 19.0);
+    assert_eq!(diagnostic["plans"][0]["availablePoints"], 0.0);
+    assert_eq!(
+        diagnostic["plans"][0]["headReservePoints"],
+        serde_json::Value::Null
+    );
     let head = select_model_route(subscription_scenario(&[81.0], 20.0, "alfonso")).unwrap();
     assert!(!head
         .rejected
@@ -4293,6 +4311,132 @@ fn subscription_margin_blocks_workers_but_not_heads() {
         .rejected
         .iter()
         .any(|r| r.reason == "subscription_reserve"));
+}
+
+fn all_reserved_subscription_scenario() -> SelectModelRouteInput<'static> {
+    let mut input = subscription_scenario(&[81.0], 20.0, "mason");
+    for runtime in input
+        .runtime_snapshot
+        .as_mut()
+        .unwrap()
+        .by_capacity
+        .values_mut()
+    {
+        std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap()).keep_free_percent =
+            100.0;
+    }
+    input
+}
+
+fn subscription_panel_input(
+    input: SelectModelRouteInput<'static>,
+    selection: PanelSelection,
+    iq_floor: f64,
+) -> SelectPanelInput<'static> {
+    SelectPanelInput {
+        panel_spec: PanelSpec {
+            size: input.facts.len(),
+            iq_floor,
+            diversity: PanelDiversity::Family,
+            class: PanelClass::Audit,
+            temperature_spread: None,
+        },
+        roster: input
+            .facts
+            .iter()
+            .map(|fact| PanelRosterEntry {
+                model: make_capacity_key(&fact.provider_id, &fact.model_id),
+                prompt_params: serde_json::Map::new(),
+            })
+            .collect(),
+        selection,
+        facts: input.facts,
+        runtime_snapshot: input.runtime_snapshot,
+        available_models: input.available_models,
+        availability_substrate: AvailabilitySubstrate::Host,
+        exclude_route_keys: input.exclude_route_keys,
+        operator_exclude_keys: input.operator_exclude_keys,
+        required_capabilities: input.required_capabilities,
+        is_subscription_route: input.is_subscription_route,
+        package_tokens: None,
+    }
+}
+
+#[test]
+fn all_reserved_pinned_roster_preserves_each_reserve_cause() {
+    let partial = select_panel(subscription_panel_input(
+        subscription_scenario(&[81.0], 20.0, "mason"),
+        PanelSelection::Roster,
+        0.0,
+    ))
+    .unwrap();
+    assert_eq!(partial.members.len(), 1);
+    let partial_cause = &partial.shortfall.unwrap().causes[0];
+
+    for iq_floor in [0.0, 100.0] {
+        let panel = select_panel(subscription_panel_input(
+            all_reserved_subscription_scenario(),
+            PanelSelection::Roster,
+            iq_floor,
+        ))
+        .expect("a reserved roster returns a decision instead of panicking");
+        assert!(panel.members.is_empty());
+        assert!(panel.runner_up.is_empty());
+        let shortfall = panel.shortfall.expect("every requested seat is reserved");
+        assert_eq!(shortfall.code, PanelShortfallCode::SizeReduced);
+        assert_eq!(
+            shortfall.detail,
+            "only 0 of 2 requested panel slots can be served"
+        );
+        assert_eq!(shortfall.causes.len(), 2);
+        assert_eq!(&shortfall.causes[0], partial_cause);
+        for (cause, model) in shortfall
+            .causes
+            .iter()
+            .zip(["anthropic/claude-opus", "openai/gpt-6.1-sol"])
+        {
+            assert_eq!(cause.model, model);
+            assert_eq!(cause.reason, PanelCauseReason::QuotaExhausted);
+            assert_eq!(
+                cause.detail.as_deref(),
+                Some("weekly headroom is reserved for heads")
+            );
+        }
+    }
+}
+
+#[test]
+fn all_reserved_automatic_panel_reports_quota_before_iq_package_and_diversity() {
+    for iq_floor in [0.0, 100.0] {
+        for package_tokens in [None, Some(usize::MAX)] {
+            let mut input = subscription_panel_input(
+                all_reserved_subscription_scenario(),
+                PanelSelection::NPick,
+                iq_floor,
+            );
+            input.package_tokens = package_tokens;
+            let panel = select_panel(input).unwrap();
+            assert!(panel.members.is_empty());
+            let shortfall = panel.shortfall.unwrap();
+            assert_eq!(shortfall.code, PanelShortfallCode::SizeReduced);
+            assert_eq!(shortfall.causes.len(), 2);
+            assert!(shortfall.causes.iter().all(|cause| {
+                cause.reason == PanelCauseReason::QuotaExhausted
+                    && cause.detail.as_deref() == Some("weekly headroom is reserved for heads")
+            }));
+        }
+    }
+}
+
+#[test]
+fn all_reserved_single_selection_returns_a_typed_refusal() {
+    let refusal = select_model_route(all_reserved_subscription_scenario()).unwrap_err();
+    assert_eq!(refusal.reason, RouteFailureReason::NoAvailableModel);
+    assert_eq!(refusal.rejected.len(), 2);
+    assert!(refusal
+        .rejected
+        .iter()
+        .all(|rejection| rejection.reason == "subscription_reserve"));
 }
 
 #[test]
@@ -4388,4 +4532,73 @@ fn subscription_close_economic_prices_preserve_quality_tiebreak() {
     pool.plans = vec![subscription_plan("pro_200", 200.0, &[3.0])];
     let selected = select_model_route(input).unwrap();
     assert_eq!(selected.route_key, "openai/gpt-6.1-sol");
+}
+
+#[test]
+fn no_route_refusal_groups_fences_and_attributes_xai_wall() {
+    let mut input = subscription_scenario(&[81.0], 20.0, "mason");
+    let now = 1_791_694_675_127.0;
+    let until = 1_792_081_969_000.0;
+    input.facts[1].provider_id = "xai".into();
+    input.facts[1].model_id = "grok-4.7".into();
+    let snapshot = input.runtime_snapshot.as_mut().unwrap();
+    snapshot.now = now;
+    let runtime = snapshot
+        .by_capacity
+        .get_mut("anthropic/claude-opus")
+        .unwrap();
+    let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
+    for plan in &mut pool.plans {
+        for account in &mut plan.accounts {
+            account.hours_to_reset = 133.0346825;
+        }
+    }
+    snapshot.by_route.insert(
+        "xai/grok-4.7".into(),
+        RouteRuntimeState {
+            quota_exhausted_until: Some(until),
+            ..Default::default()
+        },
+    );
+    input.facts.push(fact(FactBuilder {
+        provider_id: "openai".into(),
+        model_id: "gpt".into(),
+        ..Default::default()
+    }));
+    input.exclude_route_keys = vec!["openai".into()];
+    for i in 0..10 {
+        let model = format!("operator-{i}");
+        input.facts.push(fact(FactBuilder {
+            provider_id: "google".into(),
+            model_id: model.clone(),
+            ..Default::default()
+        }));
+        input.operator_exclude_keys.push(format!("google/{model}"));
+    }
+    input.available_models = input
+        .facts
+        .iter()
+        .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
+        .collect();
+    input.is_subscription_route = Some(Box::new(|route| route.provider_id == "anthropic"));
+    let error = select_model_route(input).unwrap_err();
+    assert_eq!(error.reason, RouteFailureReason::QuotaOrCooldownExhausted);
+    assert_eq!(error.earliest_reset, Some(until));
+    assert_eq!(error.earliest_reset_route.as_deref(), Some("xai/grok-4.7"));
+    let message = error.refusal_message();
+    for expected in [
+        "excluded by operator: 10",
+        "reserved for heads: 1 (anthropic, until weekly reset in 133 h)",
+        "out of credit: 1 (xai/grok-4.7, until_ms=1792081969000)",
+        "excluded for this item/caller: 1 (openai)",
+        "Earliest route wall expiry: xai/grok-4.7 (until_ms=1792081969000)",
+    ] {
+        assert!(message.contains(expected), "missing {expected}: {message}");
+    }
+    let groups = serde_json::to_value(error.blocking_causes()).unwrap();
+    assert!(groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|group| group["reason"] == "excluded_by_operator" && group["count"] == 10));
 }

@@ -577,19 +577,18 @@ fn bound_rejected_json(raw: &str) -> String {
         return raw.to_string();
     }
 
-    // Runtime walls (backoff, cooldown, quota) are the operator-actionable answer
-    // to "why not this route" and they carry the deadline they were judged
-    // against, so they stay inline even when an alphabetically earlier catalog
-    // tail (unscored, excluded, unavailable rows) would fill the bound first.
-    let is_runtime_wall = |entry: &&serde_json::Value| {
+    // Runtime walls and subscription budgets explain why otherwise usable
+    // routes were refused. Preserve their deadlines and reserve arithmetic
+    // ahead of catalog-tail exclusions so an outage remains diagnosable.
+    let is_actionable = |entry: &&serde_json::Value| {
         matches!(
             entry.get("reason").and_then(serde_json::Value::as_str),
-            Some("backoff_active" | "cooldown_active" | "quota_exhausted")
+            Some("backoff_active" | "cooldown_active" | "quota_exhausted" | "subscription_reserve")
         )
     };
     let mut prioritized = Vec::with_capacity(rejected.len());
-    prioritized.extend(rejected.iter().filter(is_runtime_wall));
-    prioritized.extend(rejected.iter().filter(|entry| !is_runtime_wall(entry)));
+    prioritized.extend(rejected.iter().filter(is_actionable));
+    prioritized.extend(rejected.iter().filter(|entry| !is_actionable(entry)));
 
     let mut reasons = BTreeMap::<String, usize>::new();
     for entry in &prioritized[MAX_STORED_REJECTIONS..] {

@@ -393,10 +393,110 @@ pub struct NoRouteError {
     /// For `AllRoutesInadequate`: the best rejected candidate (highest adequacy
     /// below the band), so the caller can surface which route was closest.
     pub best_rejected: Option<RejectedCandidate>,
-    /// For `AllRoutesInadequate`: the earliest quota/cooldown reset timestamp
-    /// across blocked candidates (millisecond epoch), reused from the break-glass
-    /// pass. `None` when no blocked candidate has a future reset.
+    /// Earliest quota/cooldown wall expiry across blocked candidates (millisecond
+    /// epoch). This is not a promise that other admission fences will clear then.
     pub earliest_reset: Option<f64>,
+    pub earliest_reset_route: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockingCause {
+    pub reason: String,
+    pub count: usize,
+    pub routes: Vec<RejectedRoute>,
+}
+
+impl NoRouteError {
+    pub fn blocking_causes(&self) -> Vec<BlockingCause> {
+        let mut groups = std::collections::BTreeMap::<String, Vec<RejectedRoute>>::new();
+        for route in &self.rejected {
+            groups
+                .entry(route.reason.clone())
+                .or_default()
+                .push(route.clone());
+        }
+        groups
+            .into_iter()
+            .map(|(reason, routes)| BlockingCause {
+                reason,
+                count: routes.len(),
+                routes,
+            })
+            .collect()
+    }
+
+    /// Report every reason selection is blocked. A head reserve or operator
+    /// exclusion can still prevent selection after a quota/cooldown wall expires.
+    pub fn refusal_message(&self) -> String {
+        if self.reason != RouteFailureReason::QuotaOrCooldownExhausted {
+            return self.message.clone();
+        }
+        let groups = self
+            .blocking_causes()
+            .into_iter()
+            .map(|group| {
+                let label = match group.reason.as_str() {
+                    "excluded_by_operator" => "excluded by operator",
+                    "subscription_reserve" => "reserved for heads",
+                    "quota_exhausted" => "out of credit",
+                    "excluded" => "excluded for this item/caller",
+                    "cooldown_active" => "cooldown active",
+                    "backoff_active" => "backoff active",
+                    other => other,
+                };
+                let mut details = std::collections::BTreeSet::new();
+                for route in &group.routes {
+                    let provider = route
+                        .route_key
+                        .split('/')
+                        .next()
+                        .unwrap_or(&route.route_key);
+                    let mut detail = provider.to_string();
+                    if group.reason == "subscription_reserve" {
+                        if let Some(hours) = route
+                            .detail
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                            .and_then(|value| {
+                                value["plans"].as_array().map(|plans| {
+                                    plans
+                                        .iter()
+                                        .filter_map(|plan| plan["resetHorizonHours"].as_f64())
+                                        .fold(0.0_f64, f64::max)
+                                })
+                            })
+                            .filter(|hours| *hours > 0.0)
+                        {
+                            detail.push_str(&format!(", until weekly reset in {hours:.0} h"));
+                        }
+                    } else if let Some(raw) = &route.detail {
+                        if let Some(until) = raw
+                            .split("until_ms=")
+                            .nth(1)
+                            .and_then(|tail| tail.split([',', ')']).next())
+                        {
+                            detail = format!("{}, until_ms={until}", route.route_key);
+                        }
+                    }
+                    details.insert(detail);
+                }
+                format!(
+                    "{label}: {} ({})",
+                    group.count,
+                    details.into_iter().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut message = self.message.clone();
+        if let (Some(until), Some(route)) = (self.earliest_reset, &self.earliest_reset_route) {
+            message.push_str(&format!(". Earliest route wall expiry: {route} (until_ms={until:.0}); other fences may remain."));
+        }
+        if !groups.is_empty() {
+            message.push_str(&format!(" {}.", groups.join("; ")));
+        }
+        message
+    }
 }
 
 /// The best route rejected by the adequacy band, carrying its route key and
@@ -484,7 +584,7 @@ fn wall_detail(until: f64, now: f64) -> String {
     format!("wall for {remaining_s}s more (until_ms={until:.0}, now_ms={now:.0})")
 }
 
-fn merged_runtime_state(
+pub(crate) fn merged_runtime_state(
     route: &ModelRoute,
     snapshot: Option<&ModelRouteStateSnapshot>,
 ) -> RouteRuntimeState {
@@ -1142,6 +1242,7 @@ fn admit_and_price_shortlist(
             requirements: Some(requirements),
             best_rejected: None,
             earliest_reset: None,
+            earliest_reset_route: None,
         });
     }
     let capability_only = all_zero(&requirements);
@@ -1158,6 +1259,7 @@ fn admit_and_price_shortlist(
             requirements: Some(requirements),
             best_rejected: None,
             earliest_reset: None,
+            earliest_reset_route: None,
         });
     }
 
@@ -1194,14 +1296,19 @@ fn admit_and_price_shortlist(
             rejected.push(RejectedRoute {
                 route_key: a.route.route_key.clone(),
                 reason: "subscription_reserve".into(),
-                detail: Some("weekly headroom is inside keep-free margin plus head reserve".into()),
+                detail: a.runtime.subscription_pool.as_ref().map(|pool| {
+                    pool.reserve_diagnostic(
+                        pool.keep_free_percent,
+                        crate::subscription::is_head(&input.target_agent),
+                    )
+                }),
             });
         }
         permitted
     });
 
     if admissible.is_empty() {
-        let earliest_reset =
+        let (earliest_reset, earliest_reset_route) =
             earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
         return Err(NoRouteError {
             reason: classify_empty_admission(&rejected),
@@ -1210,6 +1317,7 @@ fn admit_and_price_shortlist(
             requirements: Some(requirements),
             best_rejected: None,
             earliest_reset,
+            earliest_reset_route,
         });
     }
 
@@ -1244,7 +1352,7 @@ fn admit_and_price_shortlist(
             route_key: a.route.route_key.clone(),
             adequacy: a.adequacy.adequacy,
         });
-        let earliest_reset =
+        let (earliest_reset, earliest_reset_route) =
             earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
 
         return Err(NoRouteError {
@@ -1257,6 +1365,7 @@ fn admit_and_price_shortlist(
             requirements: Some(requirements),
             best_rejected,
             earliest_reset,
+            earliest_reset_route,
         });
     }
 
@@ -1626,7 +1735,7 @@ fn earliest_reset_for_rejections(
     facts: &[ModelFact],
     snapshot: Option<&ModelRouteStateSnapshot>,
     rejected: &[RejectedRoute],
-) -> Option<f64> {
+) -> (Option<f64>, Option<String>) {
     let blocked: HashSet<&str> = rejected
         .iter()
         .filter(|rejection| {
@@ -1646,9 +1755,23 @@ fn earliest_reset_for_rejections(
             capacity_key: route.capacity_key,
         })
         .collect::<Vec<_>>();
-    snapshot.and_then(|snapshot| {
+    let earliest = snapshot.and_then(|snapshot| {
         crate::break_glass::earliest_reset_among_candidates(snapshot, &candidates)
-    })
+    });
+    let route = snapshot.and_then(|snapshot| {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                earliest.is_some()
+                    && crate::break_glass::earliest_reset_among_candidates(
+                        snapshot,
+                        std::slice::from_ref(*candidate),
+                    ) == earliest
+            })
+            .map(|candidate| candidate.route_key.clone())
+            .min()
+    });
+    (earliest, route)
 }
 
 fn classify_empty_admission(rejected: &[RejectedRoute]) -> RouteFailureReason {

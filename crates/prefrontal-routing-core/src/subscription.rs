@@ -32,7 +32,8 @@ pub struct SubscriptionPlan {
     pub fee_usd: f64,
     pub fusiform_multiplier: Option<f64>,
     pub accounts: Vec<QuotaAccount>,
-    /// Pooled points per hour, summed over opencode, pi and claude-code producers.
+    /// This tier's share of provider-wide head demand in pooled points per hour.
+    /// Shares across the provider's tiers must sum to the measured provider pace.
     pub head_points_per_hour: Option<f64>,
 }
 
@@ -134,7 +135,7 @@ impl SubscriptionPlan {
             .iter()
             .filter(|a| !a.short_walled && a.weekly_used < 100.0)
             .collect();
-        let mut points: f64 = live
+        let live_points: f64 = live
             .iter()
             .map(|a| (100.0 - a.weekly_used - margin).max(0.0))
             .sum();
@@ -146,7 +147,7 @@ impl SubscriptionPlan {
         let reserve = self
             .head_points_per_hour
             .map(|pace| if head { 0.0 } else { pace.max(0.0) * hours });
-        points = (points - reserve.unwrap_or(0.0)).max(0.0);
+        let mut points = (live_points - reserve.unwrap_or(0.0)).max(0.0);
         // Keep paid capacity fixed as accounts wall. Dropping a walled account
         // from the denominator would make the remaining pool suddenly cheaper.
         let capacity = (self.accounts.len().max(1) * 100) as f64;
@@ -172,7 +173,9 @@ impl SubscriptionPlan {
                 .collect();
             reserves.sort_by_key(|a| a.banked_expires_at_ms.unwrap_or(i64::MAX));
             if let Some(account) = reserves.first() {
-                points += (100.0 - margin - reserve.unwrap_or(0.0)).max(0.0);
+                // A reset replenishes this pool; it does not create a second
+                // head demand. Subtract the reserve once from combined capacity.
+                points = (live_points + 100.0 - margin - reserve.unwrap_or(0.0)).max(0.0);
                 pressure = plan_pressure(account.weekly_remaining_fraction, points / capacity);
                 banked_applied = 1;
             }
@@ -201,6 +204,41 @@ impl SubscriptionPlan {
 }
 
 impl SubscriptionPool {
+    /// Serialize admission budget arithmetic so refused tiers remain diagnosable.
+    pub fn reserve_diagnostic(&self, keep_free: f64, head: bool) -> String {
+        let margin = if head { 0.0 } else { keep_free };
+        let plans: Vec<_> = self.plans.iter().enumerate().map(|(index, plan)| {
+            let headroom: f64 = plan.accounts.iter()
+                .filter(|a| !a.short_walled)
+                .map(|a| (100.0 - a.weekly_used).max(0.0)).sum();
+            let after_margin: f64 = plan.accounts.iter()
+                .filter(|a| !a.short_walled)
+                .map(|a| (100.0 - a.weekly_used - margin).max(0.0)).sum();
+            let (available, _, reserve, banked) = plan.budget(
+                keep_free, head, self.banked_for(index, keep_free, head), self.now_ms);
+            serde_json::json!({
+                "tier": plan.tier,
+                "accountCount": plan.accounts.len(),
+                "shortWalledAccountCount": plan.accounts.iter().filter(|a| a.short_walled).count(),
+                "headroomPoints": headroom,
+                "keepFreePercentPerAccount": margin,
+                "keepFreePoints": headroom - after_margin,
+                "headPointsPerHour": plan.head_points_per_hour,
+                "headReservePoints": reserve,
+                "availablePoints": available,
+                "bankedResetsApplied": banked,
+                "resetHorizonHours": plan.accounts.iter().map(|a| a.hours_to_reset).fold(0.0, f64::max),
+            })
+        }).collect();
+        serde_json::json!({
+            "pool": self.provider,
+            "unit": "weekly_percentage_points_per_account",
+            "aggregation": "sum_within_tier",
+            "plans": plans,
+        })
+        .to_string()
+    }
+
     fn banked_for(&self, index: usize, keep_free: f64, head: bool) -> bool {
         self.allow_banked
             && !self.plans.iter().enumerate().any(|(other, plan)| {
@@ -374,5 +412,15 @@ mod tests {
         assert_eq!(worker.0, Some(0.0));
         assert_eq!(worker.2, Some(8.4));
         assert_eq!(p.budget(20.0, true, false, 1).0, Some(25.0));
+    }
+
+    #[test]
+    fn banked_reset_subtracts_head_demand_once_from_combined_headroom() {
+        let mut p = plan(95.0);
+        p.head_points_per_hour = Some(1.2);
+        let worker = p.budget(0.0, false, true, 1);
+        assert_eq!(worker.3, 1);
+        assert!((worker.0.unwrap() - 4.2).abs() < 1e-12);
+        assert!((worker.2.unwrap() - 100.8).abs() < 1e-12);
     }
 }

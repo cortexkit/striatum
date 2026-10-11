@@ -181,6 +181,9 @@ pub struct PanelCause {
     pub reason: PanelCauseReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Known quota/cooldown reset in epoch milliseconds, independent of display text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -333,6 +336,7 @@ pub fn select_panel_with_config(
         .map(|(slot, ceiling)| PanelCause {
             model: panel.members[*slot].route_key.clone(),
             reason: PanelCauseReason::PackageExceedsCeiling,
+            reset_at_ms: None,
             detail: Some(format!(
                 "package {tokens} tokens exceeds {} ceiling {} tokens",
                 ceiling.route_key, ceiling.tokens
@@ -506,29 +510,75 @@ fn select_panel_admitted(
         &ModelRequirements { iq: 0.0, eq: 0.0 },
         config,
     );
-    let admitted_count = admission.admitted.len();
     let top_routable_elo = admission.top_routable.elo;
     let availability_substrate = input.availability_substrate;
-    causes.extend(admission.rejected.into_iter().map(|rejected| PanelCause {
-        reason: match rejected.reason.as_str() {
-            REASON_EXCLUDED => PanelCauseReason::Excluded,
-            REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
-            "quota_exhausted" | "cooldown_active" => PanelCauseReason::QuotaExhausted,
-            "backoff_active" => PanelCauseReason::BackoffActive,
-            "missing_vision" | "context_too_small" => PanelCauseReason::Capability,
-            _ => PanelCauseReason::Unavailable,
-        },
-        // An availability rejection names the substrate whose list was consulted.
-        // Without it, a reader of a recorded rejection cannot tell a route the
-        // sender genuinely cannot reach from one that is merely missing from the
-        // caller's host list, and the two have different fixes.
-        detail: if rejected.reason == REASON_NOT_AVAILABLE {
-            Some(availability_substrate.as_str().to_string())
-        } else {
-            rejected.detail
-        },
-        model: rejected.route_key,
+    causes.extend(admission.rejected.into_iter().map(|rejected| {
+        // Use the same merged route/capacity deadlines as admission. Display text
+        // may change independently, and must not become a retry protocol.
+        let reset_at_ms = considered_facts
+            .iter()
+            .map(crate::model_facts::fact_to_route)
+            .find(|route| route.route_key == rejected.route_key)
+            .map(|route| {
+                crate::model_router::merged_runtime_state(&route, input.runtime_snapshot.as_ref())
+            })
+            .and_then(|runtime| match rejected.reason.as_str() {
+                "quota_exhausted" => runtime.quota_exhausted_until,
+                "cooldown_active" => runtime.cooldown_until,
+                _ => None,
+            })
+            .filter(|until| until.is_finite() && *until > 0.0)
+            .map(|until| until.ceil() as i64);
+        PanelCause {
+            reason: match rejected.reason.as_str() {
+                REASON_EXCLUDED => PanelCauseReason::Excluded,
+                REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
+                "quota_exhausted" | "cooldown_active" => PanelCauseReason::QuotaExhausted,
+                "backoff_active" => PanelCauseReason::BackoffActive,
+                "missing_vision" | "context_too_small" => PanelCauseReason::Capability,
+                _ => PanelCauseReason::Unavailable,
+            },
+            // An availability rejection names the substrate whose list was consulted.
+            // Without it, a reader of a recorded rejection cannot tell a route the
+            // sender genuinely cannot reach from one that is merely missing from the
+            // caller's host list, and the two have different fixes.
+            detail: if rejected.reason == REASON_NOT_AVAILABLE {
+                Some(availability_substrate.as_str().to_string())
+            } else {
+                rejected.detail
+            },
+            model: rejected.route_key,
+            reset_at_ms,
+        }
     }));
+
+    // Reserved subscription headroom is an admission wall, not an IQ failure.
+    // Apply it before counting survivors so an entirely reserved panel reports
+    // each route's quota cause even when a pinned roster has no IQ bar.
+    let admitted = admission
+        .admitted
+        .into_iter()
+        .filter_map(|admitted| {
+            let is_subscription = input
+                .is_subscription_route
+                .as_ref()
+                .is_some_and(|predicate| predicate(&admitted.route));
+            if is_subscription
+                && !crate::model_router::subscription_budget_available(&admitted.runtime, false)
+            {
+                causes.push(PanelCause {
+                    model: admitted.route.capacity_key.clone(),
+                    reason: PanelCauseReason::QuotaExhausted,
+                    detail: Some("weekly headroom is reserved for heads".into()),
+                    reset_at_ms: reserved_headroom_reset_at_ms(&admitted.runtime),
+                });
+                None
+            } else {
+                Some((admitted, is_subscription))
+            }
+        })
+        .collect::<Vec<_>>();
+    let admitted_count = admitted.len();
 
     // Zero means no IQ requirement, matching singular route selection. The floor
     // governs AUTOMATIC (n_pick) admission only: an explicit roster is the
@@ -547,12 +597,13 @@ fn select_panel_admitted(
         });
     let mut candidates = Vec::new();
     let mut largest_package_ceiling = None;
-    for admitted in admission.admitted {
+    for (admitted, is_subscription) in admitted {
         let model = admitted.route.capacity_key.clone();
         if iq_bar.is_some_and(|bar| admitted.route.fact.scores.elo < bar) {
             causes.push(PanelCause {
                 model,
                 reason: PanelCauseReason::BelowIqFloor,
+                reset_at_ms: None,
                 detail: None,
             });
             continue;
@@ -572,6 +623,7 @@ fn select_panel_admitted(
                 causes.push(PanelCause {
                     model,
                     reason: PanelCauseReason::PackageTooLarge,
+                    reset_at_ms: None,
                     detail: Some(format!(
                         "package {} tokens exceeds ceiling {} tokens",
                         input.package_tokens.unwrap(),
@@ -588,11 +640,6 @@ fn select_panel_admitted(
                 .unwrap_or_default(),
             PanelSelection::NPick => fact_prompt_params(&admitted.route.fact),
         };
-        let is_subscription = input
-            .is_subscription_route
-            .as_ref()
-            .map(|predicate| predicate(&admitted.route))
-            .unwrap_or(false);
         let (objective, _) = compute_objective(
             &admitted.route,
             &admitted.runtime,
@@ -600,16 +647,6 @@ fn select_panel_admitted(
             CostBasis::OutputOnly,
             false,
         );
-        if is_subscription
-            && !crate::model_router::subscription_budget_available(&admitted.runtime, false)
-        {
-            causes.push(PanelCause {
-                model,
-                reason: PanelCauseReason::QuotaExhausted,
-                detail: Some("weekly headroom is reserved for heads".into()),
-            });
-            continue;
-        }
         candidates.push(Candidate {
             metered_cost: normalized_metered_cost(&admitted.route.fact),
             route: admitted.route,
@@ -651,6 +688,7 @@ fn select_panel_admitted(
                 causes.push(PanelCause {
                     model: candidate.route.capacity_key.clone(),
                     reason: PanelCauseReason::FamilyUnlabeled,
+                    reset_at_ms: None,
                     detail: None,
                 });
                 false
@@ -677,6 +715,7 @@ fn select_panel_admitted(
                 causes.push(PanelCause {
                     model: candidate.route.capacity_key.clone(),
                     reason: PanelCauseReason::FamilyDuplicate,
+                    reset_at_ms: None,
                     detail: None,
                 });
             }
@@ -712,55 +751,60 @@ fn select_panel_admitted(
         }
     }
 
-    let shortfall_code = if input.package_tokens.is_some()
+    let size_reduced = || {
+        (
+            PanelShortfallCode::SizeReduced,
+            format!(
+                "only {} of {} requested panel slots can be served",
+                members.len(),
+                input.panel_spec.size
+            ),
+        )
+    };
+    let shortfall_kind = if input.package_tokens.is_some()
         && members.len() < input.panel_spec.size
         && causes
             .iter()
             .any(|cause| cause.reason == PanelCauseReason::PackageTooLarge)
     {
-        Some(PanelShortfallCode::PackageUnmeetable)
-    } else if admitted_count == 0 {
-        Some(PanelShortfallCode::SizeReduced)
-    } else if iq_eligible_count == 0 {
-        Some(PanelShortfallCode::IqFloorUnmeetable)
-    } else if enforce_family_diversity && members.len() < input.panel_spec.size {
-        Some(PanelShortfallCode::DiversityUnmeetable)
-    } else if members.len() < input.panel_spec.size {
-        Some(PanelShortfallCode::SizeReduced)
-    } else {
-        None
-    };
-
-    let shortfall = shortfall_code.map(|code| {
-        if causes.is_empty() {
-            causes.push(PanelCause {
-                model: "<unfilled-slot>".into(),
-                reason: PanelCauseReason::Unavailable,
-                detail: None,
-            });
-        }
-        let detail = match code {
-            PanelShortfallCode::PackageUnmeetable => package_refusal(
+        Some((
+            PanelShortfallCode::PackageUnmeetable,
+            package_refusal(
                 input.package_tokens.unwrap(),
                 largest_package_ceiling.unwrap_or(0),
             ),
-            PanelShortfallCode::IqFloorUnmeetable => {
-                format!(
-                    "no admitted roster model clears raw iq floor {:.2}",
-                    iq_bar.expect("an IQ-floor shortfall requires a positive floor")
-                )
-            }
-            PanelShortfallCode::DiversityUnmeetable => format!(
+        ))
+    } else if admitted_count == 0 {
+        Some(size_reduced())
+    } else if let Some(bar) = iq_bar.filter(|_| iq_eligible_count == 0) {
+        Some((
+            PanelShortfallCode::IqFloorUnmeetable,
+            format!("no admitted roster model clears raw iq floor {bar:.2}"),
+        ))
+    } else if enforce_family_diversity && members.len() < input.panel_spec.size {
+        Some((
+            PanelShortfallCode::DiversityUnmeetable,
+            format!(
                 "only {} distinct labeled families can fill {} requested slots",
                 members.len(),
                 input.panel_spec.size
             ),
-            PanelShortfallCode::SizeReduced => format!(
-                "only {} of {} requested panel slots can be served",
-                members.len(),
-                input.panel_spec.size
-            ),
-        };
+        ))
+    } else if members.len() < input.panel_spec.size {
+        Some(size_reduced())
+    } else {
+        None
+    };
+
+    let shortfall = shortfall_kind.map(|(code, detail)| {
+        if causes.is_empty() {
+            causes.push(PanelCause {
+                model: "<unfilled-slot>".into(),
+                reset_at_ms: None,
+                reason: PanelCauseReason::Unavailable,
+                detail: None,
+            });
+        }
         PanelShortfall {
             code,
             detail,
@@ -791,6 +835,74 @@ fn select_panel_admitted(
         shortfall,
         policy,
     })
+}
+
+fn reserved_headroom_reset_at_ms(runtime: &crate::model_router::RouteRuntimeState) -> Option<i64> {
+    // Reserved quota is unavailable to panel seats even though it is not a hard
+    // wall. Preserve the known weekly reset separately from the display wording.
+    runtime.subscription_pool.as_ref().and_then(|pool| {
+        pool.plans
+            .iter()
+            .flat_map(|plan| &plan.accounts)
+            .map(|account| account.hours_to_reset)
+            .filter(|hours| hours.is_finite() && *hours > 0.0)
+            .reduce(f64::min)
+            .map(|hours| {
+                pool.now_ms
+                    .saturating_add((hours * 3_600_000.0).ceil() as i64)
+            })
+    })
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+
+    #[test]
+    fn reserved_headroom_shortfall_retains_earliest_known_weekly_reset() {
+        use crate::subscription::{QuotaAccount, SubscriptionPlan, SubscriptionPool};
+        let account = |hours_to_reset| QuotaAccount {
+            weekly_used: 99.0,
+            weekly_remaining_fraction: 0.01,
+            hours_to_reset,
+            short_walled: false,
+            short_windows: vec![],
+            banked_resets: 0,
+            banked_expires_at_ms: None,
+        };
+        let runtime = crate::model_router::RouteRuntimeState {
+            subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
+                now_ms: 1791682778812,
+                plans: vec![SubscriptionPlan {
+                    tier: None,
+                    fee_usd: 0.0,
+                    fusiform_multiplier: None,
+                    accounts: vec![account(2.0), account(1.0), account(f64::NAN)],
+                    head_points_per_hour: None,
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let cause = PanelCause {
+            model: "anthropic/claude-opus-5-5".into(),
+            reason: PanelCauseReason::QuotaExhausted,
+            detail: Some("weekly headroom is reserved for heads".into()),
+            reset_at_ms: reserved_headroom_reset_at_ms(&runtime),
+        };
+        assert_eq!(cause.reset_at_ms, Some(1791686378812));
+        let wire = serde_json::to_value(&cause).unwrap();
+        assert_eq!(wire["reset_at_ms"], 1791686378812i64);
+        assert_eq!(wire["detail"], "weekly headroom is reserved for heads");
+        let unknown = PanelCause {
+            reset_at_ms: reserved_headroom_reset_at_ms(&Default::default()),
+            ..cause
+        };
+        assert!(serde_json::to_value(&unknown)
+            .unwrap()
+            .get("reset_at_ms")
+            .is_none());
+    }
 }
 
 /// A catalog context window as whole tokens; absent, non-finite or non-positive
@@ -824,6 +936,7 @@ fn roster_facts(
             None => causes.push(PanelCause {
                 model: entry.model.clone(),
                 reason: PanelCauseReason::MissingFact,
+                reset_at_ms: None,
                 detail: None,
             }),
         }

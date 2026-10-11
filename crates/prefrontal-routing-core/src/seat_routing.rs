@@ -253,7 +253,11 @@ pub fn select_seat_route_with_config(
             admission.rejected.push(crate::model_router::RejectedRoute {
                 route_key: route.route.route_key.clone(),
                 reason: "subscription_reserve".into(),
-                detail: Some("weekly headroom is reserved for heads".into()),
+                detail: route
+                    .runtime
+                    .subscription_pool
+                    .as_ref()
+                    .map(|pool| pool.reserve_diagnostic(pool.keep_free_percent, false)),
             });
         }
         permitted

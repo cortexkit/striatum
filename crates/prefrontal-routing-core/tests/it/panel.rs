@@ -526,38 +526,111 @@ fn a_pinned_seat_walled_by_quota_reads_as_quota_with_its_reset() {
         AvailabilitySubstrate::Host,
         AvailabilitySubstrate::BrocaServedCatalog,
     ] {
-        let walled = vec![fact("walled", 1_700.0, Some("a"))];
-        let mut input = panel_input(walled, spec(1, 0.0, PanelDiversity::None));
-        input.availability_substrate = substrate;
-        input.runtime_snapshot = Some(ModelRouteStateSnapshot {
-            now: 1_000.0,
-            by_route: HashMap::from([(
-                "p/walled".into(),
-                RouteRuntimeState {
-                    cooldown_until: Some(61_000.0),
-                    quota_exhausted_until: Some(61_000.0),
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        });
-        let panel = select_panel(input).unwrap();
-        assert!(panel.members.is_empty(), "a walled pin does not sit");
-        let cause = panel
-            .shortfall
-            .expect("the walled pin leaves the panel short")
-            .causes
-            .into_iter()
-            .find(|cause| cause.model == "p/walled")
-            .expect("the walled pin is reported");
-        assert_eq!(
-            cause.reason,
-            PanelCauseReason::QuotaExhausted,
-            "{substrate:?}"
-        );
-        let detail = cause.detail.expect("a wall names its reset");
-        assert!(detail.contains("until_ms=61000"), "{substrate:?}: {detail}");
+        for (cooldown_until, quota_exhausted_until) in
+            [(Some(61_000.0), None), (None, Some(61_000.0))]
+        {
+            let walled = vec![fact("walled", 1_700.0, Some("a"))];
+            let mut input = panel_input(walled, spec(1, 0.0, PanelDiversity::None));
+            input.availability_substrate = substrate;
+            input.runtime_snapshot = Some(ModelRouteStateSnapshot {
+                now: 1_000.0,
+                by_route: HashMap::from([(
+                    "p/walled".into(),
+                    RouteRuntimeState {
+                        cooldown_until,
+                        quota_exhausted_until,
+                        ..Default::default()
+                    },
+                )]),
+                by_capacity: HashMap::from([(
+                    "p/walled".into(),
+                    RouteRuntimeState {
+                        cooldown_until: cooldown_until.map(|_| 91_000.0),
+                        quota_exhausted_until: quota_exhausted_until.map(|_| 91_000.0),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            });
+            let panel = select_panel(input).unwrap();
+            assert!(panel.members.is_empty(), "a walled pin does not sit");
+            let cause = panel
+                .shortfall
+                .expect("the walled pin leaves the panel short")
+                .causes
+                .into_iter()
+                .find(|cause| cause.model == "p/walled")
+                .expect("the walled pin is reported");
+            assert_eq!(
+                cause.reason,
+                PanelCauseReason::QuotaExhausted,
+                "{substrate:?}"
+            );
+            assert_eq!(cause.reset_at_ms, Some(91_000), "{substrate:?}");
+            assert_eq!(serde_json::to_value(&cause).unwrap()["reset_at_ms"], 91_000);
+            let detail = cause.detail.expect("a wall names its reset");
+            assert!(detail.contains("until_ms=91000"), "{substrate:?}: {detail}");
+        }
     }
+}
+
+#[test]
+fn reserved_headroom_panel_cause_publishes_structured_reset_without_prose_timestamp() {
+    use prefrontal_routing_core::subscription::{QuotaAccount, SubscriptionPlan, SubscriptionPool};
+    let account = |hours_to_reset| QuotaAccount {
+        weekly_used: 99.0,
+        weekly_remaining_fraction: 0.01,
+        hours_to_reset,
+        short_walled: false,
+        short_windows: vec![],
+        banked_resets: 0,
+        banked_expires_at_ms: None,
+    };
+    let mut input = panel_input(
+        vec![
+            fact("sub", 1_700.0, Some("a")),
+            fact("plain", 1_700.0, Some("b")),
+        ],
+        spec(2, 0.0, PanelDiversity::None),
+    );
+    input.is_subscription_route = Some(Box::new(|route| route.model_id == "sub"));
+    input.runtime_snapshot = Some(ModelRouteStateSnapshot {
+        now: 1791682778812.0,
+        by_capacity: HashMap::from([(
+            "p/sub".into(),
+            RouteRuntimeState {
+                subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
+                    keep_free_percent: 20.0,
+                    now_ms: 1791682778812,
+                    plans: vec![SubscriptionPlan {
+                        tier: None,
+                        fee_usd: 0.0,
+                        fusiform_multiplier: None,
+                        accounts: vec![account(2.0), account(1.0)],
+                        head_points_per_hour: None,
+                    }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    });
+    let panel = select_panel(input).unwrap();
+    assert_eq!(panel.members.len(), 1);
+    assert_eq!(panel.members[0].route_key, "p/plain");
+    let cause = panel
+        .shortfall
+        .unwrap()
+        .causes
+        .into_iter()
+        .find(|cause| cause.model == "p/sub")
+        .unwrap();
+    assert_eq!(cause.reason, PanelCauseReason::QuotaExhausted);
+    assert_eq!(cause.reset_at_ms, Some(1791686378812));
+    let wire = serde_json::to_value(cause).unwrap();
+    assert_eq!(wire["reset_at_ms"], 1791686378812i64);
+    assert_eq!(wire["detail"], "weekly headroom is reserved for heads");
 }
 
 #[test]
