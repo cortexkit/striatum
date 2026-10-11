@@ -20,7 +20,9 @@ use prefrontal_routing_core::model_router::{
     RouteRuntimeState, SelectModelRouteInput,
 };
 use prefrontal_routing_core::{
-    ExclusionPolicy, OverqualificationConfig, RoutingConfig, DEFAULT_OVERQUALIFICATION,
+    select_panel, AvailabilitySubstrate, ExclusionPolicy, OverqualificationConfig,
+    PanelCauseReason, PanelClass, PanelDiversity, PanelRosterEntry, PanelSelection,
+    PanelShortfallCode, PanelSpec, RoutingConfig, SelectPanelInput, DEFAULT_OVERQUALIFICATION,
     DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY,
 };
 
@@ -4309,6 +4311,132 @@ fn subscription_margin_blocks_workers_but_not_heads() {
         .rejected
         .iter()
         .any(|r| r.reason == "subscription_reserve"));
+}
+
+fn all_reserved_subscription_scenario() -> SelectModelRouteInput<'static> {
+    let mut input = subscription_scenario(&[81.0], 20.0, "mason");
+    for runtime in input
+        .runtime_snapshot
+        .as_mut()
+        .unwrap()
+        .by_capacity
+        .values_mut()
+    {
+        std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap()).keep_free_percent =
+            100.0;
+    }
+    input
+}
+
+fn subscription_panel_input(
+    input: SelectModelRouteInput<'static>,
+    selection: PanelSelection,
+    iq_floor: f64,
+) -> SelectPanelInput<'static> {
+    SelectPanelInput {
+        panel_spec: PanelSpec {
+            size: input.facts.len(),
+            iq_floor,
+            diversity: PanelDiversity::Family,
+            class: PanelClass::Audit,
+            temperature_spread: None,
+        },
+        roster: input
+            .facts
+            .iter()
+            .map(|fact| PanelRosterEntry {
+                model: make_capacity_key(&fact.provider_id, &fact.model_id),
+                prompt_params: serde_json::Map::new(),
+            })
+            .collect(),
+        selection,
+        facts: input.facts,
+        runtime_snapshot: input.runtime_snapshot,
+        available_models: input.available_models,
+        availability_substrate: AvailabilitySubstrate::Host,
+        exclude_route_keys: input.exclude_route_keys,
+        operator_exclude_keys: input.operator_exclude_keys,
+        required_capabilities: input.required_capabilities,
+        is_subscription_route: input.is_subscription_route,
+        package_tokens: None,
+    }
+}
+
+#[test]
+fn all_reserved_pinned_roster_preserves_each_reserve_cause() {
+    let partial = select_panel(subscription_panel_input(
+        subscription_scenario(&[81.0], 20.0, "mason"),
+        PanelSelection::Roster,
+        0.0,
+    ))
+    .unwrap();
+    assert_eq!(partial.members.len(), 1);
+    let partial_cause = &partial.shortfall.unwrap().causes[0];
+
+    for iq_floor in [0.0, 100.0] {
+        let panel = select_panel(subscription_panel_input(
+            all_reserved_subscription_scenario(),
+            PanelSelection::Roster,
+            iq_floor,
+        ))
+        .expect("a reserved roster returns a decision instead of panicking");
+        assert!(panel.members.is_empty());
+        assert!(panel.runner_up.is_empty());
+        let shortfall = panel.shortfall.expect("every requested seat is reserved");
+        assert_eq!(shortfall.code, PanelShortfallCode::SizeReduced);
+        assert_eq!(
+            shortfall.detail,
+            "only 0 of 2 requested panel slots can be served"
+        );
+        assert_eq!(shortfall.causes.len(), 2);
+        assert_eq!(&shortfall.causes[0], partial_cause);
+        for (cause, model) in shortfall
+            .causes
+            .iter()
+            .zip(["anthropic/claude-opus", "openai/gpt-6.1-sol"])
+        {
+            assert_eq!(cause.model, model);
+            assert_eq!(cause.reason, PanelCauseReason::QuotaExhausted);
+            assert_eq!(
+                cause.detail.as_deref(),
+                Some("weekly headroom is reserved for heads")
+            );
+        }
+    }
+}
+
+#[test]
+fn all_reserved_automatic_panel_reports_quota_before_iq_package_and_diversity() {
+    for iq_floor in [0.0, 100.0] {
+        for package_tokens in [None, Some(usize::MAX)] {
+            let mut input = subscription_panel_input(
+                all_reserved_subscription_scenario(),
+                PanelSelection::NPick,
+                iq_floor,
+            );
+            input.package_tokens = package_tokens;
+            let panel = select_panel(input).unwrap();
+            assert!(panel.members.is_empty());
+            let shortfall = panel.shortfall.unwrap();
+            assert_eq!(shortfall.code, PanelShortfallCode::SizeReduced);
+            assert_eq!(shortfall.causes.len(), 2);
+            assert!(shortfall.causes.iter().all(|cause| {
+                cause.reason == PanelCauseReason::QuotaExhausted
+                    && cause.detail.as_deref() == Some("weekly headroom is reserved for heads")
+            }));
+        }
+    }
+}
+
+#[test]
+fn all_reserved_single_selection_returns_a_typed_refusal() {
+    let refusal = select_model_route(all_reserved_subscription_scenario()).unwrap_err();
+    assert_eq!(refusal.reason, RouteFailureReason::NoAvailableModel);
+    assert_eq!(refusal.rejected.len(), 2);
+    assert!(refusal
+        .rejected
+        .iter()
+        .all(|rejection| rejection.reason == "subscription_reserve"));
 }
 
 #[test]
