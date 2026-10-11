@@ -114,11 +114,11 @@ pub(crate) fn capability_rejection_reason(
     None
 }
 
-/// Input to [`select_model_route`]. `is_subscription_route` mirrors the TS
-/// optional predicate: a route the caller logs into as flat-rate subscription.
-/// It is reported in the decision explanation (subscription coverage) but does NOT
-/// zero the cost term — every route is priced from its model fact. `None` → treat
-/// everything as metered.
+/// Input to [`select_model_route`]. `is_subscription_route` supplies legacy
+/// subscription-policy coverage; a resolved quota-proxy billing plane also
+/// establishes coverage independently of the launching host's auth metadata.
+/// Covered routes use subscription economics when a runtime pool is available,
+/// including the head reserve for workers, rather than treating quota as free.
 pub struct SelectModelRouteInput<'a> {
     pub target_agent: String,
     pub requirements: ModelRequirements,
@@ -1034,6 +1034,22 @@ pub(crate) fn subscription_budget_available(runtime: &RouteRuntimeState, head: b
         .is_none_or(|pool| pool.available(pool.keep_free_percent, head))
 }
 
+/// A quota-proxy billing plane identifies the subscription credential that
+/// actually serves the route. A launching host's missing OAuth metadata must
+/// not turn that shared quota into metered capacity and bypass the head reserve.
+/// The policy predicate still covers subscriptions without a resolved plane.
+pub(crate) fn subscription_route_covered(
+    route: &ModelRoute,
+    predicate: Option<&dyn Fn(&ModelRoute) -> bool>,
+) -> bool {
+    route
+        .fact
+        .billing_plane
+        .as_ref()
+        .is_some_and(|plane| plane.kind == "quota_proxy")
+        || predicate.is_some_and(|pred| pred(route))
+}
+
 /// Everything in the objective after the cost line: quota terms, abundance,
 /// and the speed tie-break.
 fn objective_tail(
@@ -1283,10 +1299,7 @@ fn admit_and_price_shortlist(
     );
 
     admissible.retain(|a| {
-        let covered = input
-            .is_subscription_route
-            .as_ref()
-            .is_some_and(|pred| pred(&a.route));
+        let covered = subscription_route_covered(&a.route, input.is_subscription_route.as_deref());
         let permitted = !covered
             || subscription_budget_available(
                 &a.runtime,
@@ -1419,11 +1432,8 @@ fn admit_and_price_shortlist(
         .into_iter()
         .map(|idx| {
             let a = &admissible[idx];
-            let is_sub = input
-                .is_subscription_route
-                .as_ref()
-                .map(|pred| pred(&a.route))
-                .unwrap_or(false);
+            let is_sub =
+                subscription_route_covered(&a.route, input.is_subscription_route.as_deref());
             let basis = if use_basket {
                 let (vector, source) = route_basket_vector(&a.route.fact, fleet_vector)
                     .expect("the basket gate admitted only routes with a usable vector");
