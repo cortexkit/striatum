@@ -559,10 +559,10 @@ fn select_panel_admitted(
         .admitted
         .into_iter()
         .filter_map(|admitted| {
-            let is_subscription = input
-                .is_subscription_route
-                .as_ref()
-                .is_some_and(|predicate| predicate(&admitted.route));
+            let is_subscription = crate::model_router::subscription_route_covered(
+                &admitted.route,
+                input.is_subscription_route.as_deref(),
+            );
             if is_subscription
                 && !crate::model_router::subscription_budget_available(&admitted.runtime, false)
             {

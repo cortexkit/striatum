@@ -921,6 +921,513 @@ mod tests {
         );
     }
 
+    fn pi_incident_input(
+        harness: Option<&str>,
+        target_agent: &str,
+        requirements: Value,
+    ) -> (
+        prefrontal_routing_core::model_router::SelectModelRouteInput<'static>,
+        Value,
+    ) {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../fixtures/pi-mason-subscription-reserve.json"
+        ))
+        .unwrap();
+        subscription_fixture_input(harness, target_agent, requirements, fixture)
+    }
+
+    fn subscription_fixture_input(
+        harness: Option<&str>,
+        target_agent: &str,
+        requirements: Value,
+        fixture: Value,
+    ) -> (
+        prefrontal_routing_core::model_router::SelectModelRouteInput<'static>,
+        Value,
+    ) {
+        use prefrontal_routing_core::{
+            billing::{BillingPlane, BillingRate},
+            model_router::{RouteRuntimeState, SelectModelRouteInput},
+        };
+        let now = fixture["now_ms"].as_i64().unwrap();
+        let mut state = AccountQuotaState::default();
+        let mut identities = Vec::new();
+        for (index, account) in fixture["accounts"].as_array().unwrap().iter().enumerate() {
+            let account_id = format!("anonymous-{index}");
+            let credential = format!("fixture:{index}");
+            identities.push(RosterIdentity {
+                refresh_adapter: "anthropic".into(),
+                account_id: account_id.clone(),
+                credential_ids: vec![credential.clone()],
+                active_credential_ids: vec![credential],
+                first_seen_ms: now - 86_400_000,
+                plan_tier: Some("max_20x".into()),
+            });
+            state.readings.readings.insert(("claude".into(), account_id.clone()), StoredReading {
+                provider: "claude".into(), account_id: account_id.clone(),
+                entry: json!({"provider":"claude", "apiProvider":"anthropic", "account":account_id,
+                    "fetchedAt":fixture["fetched_at"], "usage":{"secondary":{
+                        "usedPercent":account["used_percent"], "windowKind":"weekly", "windowMinutes":10080,
+                        "resetsAt":account["resets_at"]}}}),
+                received_at_ms: now, tombstoned_at_ms: None,
+            });
+        }
+        state.roster = Some(VaultRoster {
+            view: "incident".into(),
+            fetched_at_ms: now,
+            grants: Vec::new(),
+            identities,
+        });
+        let mut pool = build(
+            &state,
+            &Value::Null,
+            &prices(),
+            &HashMap::from([(
+                "claude".into(),
+                fixture["head_points_per_hour"].as_f64().unwrap(),
+            )]),
+            now,
+        )
+        .pools
+        .remove("anthropic")
+        .unwrap();
+        pool.keep_free_percent = fixture["keep_free_percent"].as_f64().unwrap();
+
+        // The fixture stores account readings and demand vectors. This synthetic
+        // workload exercises basket pricing on the roster-selected OAuth plane
+        // without depending on live usage statistics.
+        let mut fact: ModelFact = serde_json::from_value(json!({
+            "providerID":"anthropic", "modelID":"claude-opus-5-5", "confidence":"curated", "family":"claude",
+            "scores":{"elo":1960.0,"eq":2200.0,"speed":0.0}, "costPerMTokOut":20.0
+        }))
+        .unwrap();
+        fact.class_vector = Some(prefrontal_routing_core::ClassVector {
+            workload_class: "ephemeral".into(),
+            sample_count: 50,
+            trailing_window_days: 7.0,
+            statistic: "mean".into(),
+            is_overlay: true,
+            fresh_input: 0.0,
+            output_excluding_reasoning: 1000.0,
+            reasoning: 0.0,
+            cached_read: 1000.0,
+            cache_write: 0.0,
+        });
+        fact.class_vector_is_overlay = true;
+        let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+        credentials.refresh_serving_methods(&state, &[fact.clone()], now);
+        assert_eq!(
+            credentials.plane_keys(),
+            BTreeSet::from([("anthropic".into(), "oauth".into())])
+        );
+        fact.billing_plane = Some(BillingPlane {
+            provider_id: "anthropic".into(),
+            auth_method: "oauth".into(),
+            kind: "quota_proxy".into(),
+            selection_reason: "roster".into(),
+            rates: BTreeMap::from([
+                ("rate.output".into(), BillingRate::Priced { rate: 20.0 }),
+                ("rate.cache_read".into(), BillingRate::Priced { rate: 0.25 }),
+            ]),
+        });
+        let mut params = json!({"targetAgent":target_agent, "requirements":requirements,
+            "substrate":"broca", "availableModels":["anthropic/claude-opus-5-5"]});
+        // OpenCode discovers OAuth locally; Pi supplies no host auth facts for
+        // the worker. Broca sends both workers using the same subscription
+        // accounts; its billing plane describes those accounts' quota rates.
+        params["providerAuthTypes"] = if harness == Some("pi") {
+            json!({})
+        } else {
+            json!({"anthropic":"oauth"})
+        };
+        if let Some(harness) = harness {
+            params["harness"] = json!(harness);
+        }
+        let params: crate::SelectParams = serde_json::from_value(params).unwrap();
+        let resolved = crate::resolve_select_request(
+            &params,
+            &Default::default(),
+            Path::new("/unused/host-auth.json"),
+        )
+        .unwrap();
+        let sub: std::collections::HashSet<String> =
+            resolved.policy.subscription_keys.into_iter().collect();
+        assert_eq!(sub.is_empty(), harness == Some("pi"));
+        let snapshot = ModelRouteStateSnapshot {
+            now: now as f64,
+            by_capacity: HashMap::from([(
+                "anthropic/claude-opus-5-5".into(),
+                RouteRuntimeState {
+                    subscription_pool: Some(Arc::new(pool)),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        (
+            SelectModelRouteInput {
+                target_agent: params.target_agent,
+                requirements: resolved.requirements,
+                available_models: resolved.policy.available_models.into_iter().collect(),
+                facts: vec![fact],
+                runtime_snapshot: Some(snapshot),
+                exclude_route_keys: Vec::new(),
+                operator_exclude_keys: Vec::new(),
+                required_capabilities: None,
+                is_subscription_route: Some(Box::new(move |r| sub.contains(&r.route_key))),
+                min_best_effort_adequacy: None,
+                prefer_prompt_cache: false,
+                providers_without_prompt_cache: Default::default(),
+            },
+            fixture,
+        )
+    }
+
+    fn live_reset_input(
+        harness: Option<&str>,
+        target_agent: &str,
+    ) -> prefrontal_routing_core::model_router::SelectModelRouteInput<'static> {
+        // Live weekly readings from the Astrocyte quota telemetry service on
+        // 2026-10-11: 57418c50 32%, 57ce2cb7 37%, c8ac16a9 17%, d4bc9dbc 100%,
+        // ec72a6ee 100%. Workers were refused despite returning reset capacity.
+        // Pin the observed 119.354-hour horizon to the last account's reset to
+        // reproduce that refusal and verify the corrected budget below.
+        let fetched_at = "2026-10-11T18:38:45.600Z";
+        subscription_fixture_input(
+            harness,
+            target_agent,
+            json!({"iq":85,"eq":15}),
+            json!({
+                "now_ms":parse_rfc3339_ms(fetched_at).unwrap(), "fetched_at":fetched_at,
+                "head_points_per_hour":2.2139919776613524, "keep_free_percent":20.0,
+                "accounts":[
+                    {"used_percent":32.0, "resets_at":"2026-10-15T21:00:00Z"},
+                    {"used_percent":37.0, "resets_at":"2026-10-15T21:00:00Z"},
+                    {"used_percent":17.0, "resets_at":"2026-10-16T18:00:00Z"},
+                    {"used_percent":100.0, "resets_at":"2026-10-14T04:00:00Z"},
+                    {"used_percent":100.0, "resets_at":"2026-10-14T14:00:00Z"}
+                ]
+            }),
+        )
+        .0
+    }
+
+    #[test]
+    fn live_october_11_resets_leave_opus_available_to_workers_and_panels() {
+        use prefrontal_routing_core::model_router::select_model_route;
+        let diagnostic_input = live_reset_input(Some("pi"), "mason");
+        let pool = diagnostic_input
+            .runtime_snapshot
+            .as_ref()
+            .unwrap()
+            .by_capacity["anthropic/claude-opus-5-5"]
+            .subscription_pool
+            .as_ref()
+            .unwrap();
+        let detail: Value = serde_json::from_str(&pool.reserve_diagnostic(20.0, false)).unwrap();
+        let plan = &detail["plans"][0];
+        // By hand: today's headroom is 68 + 63 + 83 = 214, minus 3 * 20 = 154.
+        // The first reset is 119.354 - 62 = 57.354 hours away. Before it returns
+        // capacity, heads need 2.2139919776613524 * 57.354 = 126.9812958867892,
+        // leaving 27.0187041132108 points. That reset adds 100 - 20 = 80;
+        // later pre-reset budgets are 84.8787843365973, 96.2450330290953,
+        // and 118.751201498207. The minimum is positive, not 154 - 264.2488.
+        assert_eq!(plan["headroomPoints"], 214.0);
+        assert_eq!(plan["keepFreePoints"], 60.0);
+        assert!((plan["availablePoints"].as_f64().unwrap() - 27.0187041132108).abs() < 1e-8);
+        assert_eq!(plan["bankedResetsApplied"], 0);
+        assert_eq!(plan["tightestPoint"]["phase"], "before_reset");
+        assert_eq!(plan["tightestPoint"]["hoursFromNow"], 57.354);
+        let steps = plan["headReserveSteps"].as_array().unwrap();
+        assert_eq!(steps.len(), 10);
+        let expected = [
+            (0.0, 214.0, 60.0, 154.0),
+            (57.354, 214.0, 60.0, 27.0187041132108),
+            (57.354, 314.0, 80.0, 107.018704113211),
+            (67.354, 314.0, 80.0, 84.8787843365973),
+            (67.354, 414.0, 100.0, 164.878784336597),
+            (98.354, 414.0, 100.0, 96.2450330290953),
+            (98.354, 483.0, 100.0, 165.245033029095),
+            (119.354, 483.0, 100.0, 118.751201498207),
+            (119.354, 500.0, 100.0, 135.751201498207),
+            (119.354, 500.0, 100.0, 135.751201498207),
+        ];
+        for (step, (hours, headroom, margin, available)) in steps.iter().zip(expected) {
+            assert_eq!(step["hoursFromNow"], hours);
+            assert_eq!(step["headroomPoints"], headroom);
+            assert_eq!(step["keepFreePoints"], margin);
+            assert!((step["availablePoints"].as_f64().unwrap() - available).abs() < 1e-8);
+        }
+        for harness in [Some("pi"), Some("opencode"), None] {
+            let selected = select_model_route(live_reset_input(harness, "mason")).unwrap();
+            assert_eq!(selected.route_key, "anthropic/claude-opus-5-5");
+            let pricing = selected.score.objective.subscription_pricing.unwrap();
+            assert!((pricing.available_points.unwrap() - 27.0187041132108).abs() < 1e-8);
+            assert_eq!(pricing.banked_resets_applied, 0);
+            let pricing_json = serde_json::to_value(pricing).unwrap();
+            assert_eq!(pricing_json["headReserveSteps"], plan["headReserveSteps"]);
+            assert_eq!(pricing_json["tightestPoint"], plan["tightestPoint"]);
+        }
+        for head in ["pi", "opencode", "claude-code", "alfonso"] {
+            let selected = select_model_route(live_reset_input(Some(head), head)).unwrap();
+            let pricing = selected.score.objective.subscription_pricing.unwrap();
+            assert_eq!(pricing.available_points, Some(214.0));
+            assert_eq!(pricing.head_reserve_points, Some(0.0));
+        }
+        let input = live_reset_input(Some("pi"), "athena");
+        let panel =
+            prefrontal_routing_core::select_panel(prefrontal_routing_core::SelectPanelInput {
+                panel_spec: prefrontal_routing_core::PanelSpec {
+                    size: 1,
+                    iq_floor: 85.0,
+                    diversity: prefrontal_routing_core::PanelDiversity::Family,
+                    class: prefrontal_routing_core::PanelClass::Audit,
+                    temperature_spread: None,
+                },
+                facts: input.facts,
+                available_models: input.available_models,
+                availability_substrate: prefrontal_routing_core::AvailabilitySubstrate::Broca,
+                runtime_snapshot: input.runtime_snapshot,
+                is_subscription_route: input.is_subscription_route,
+                package_tokens: None,
+                selection: prefrontal_routing_core::PanelSelection::NPick,
+                roster: Vec::new(),
+                exclude_route_keys: Vec::new(),
+                operator_exclude_keys: Vec::new(),
+                required_capabilities: None,
+            })
+            .unwrap();
+        assert_eq!(panel.members.len(), 1);
+        assert!(panel.shortfall.is_none());
+    }
+
+    #[test]
+    fn pi_masons_share_corrected_incident_subscription_admission_with_opencode() {
+        use prefrontal_routing_core::model_router::select_model_route;
+        let (_, fixture) = pi_incident_input(Some("pi"), "mason", json!({"iq":85,"eq":15}));
+        // The captured refusal used the old single-horizon subtraction. With
+        // resets credited, the tightest point is before the first reset:
+        // 232 - 66 - 2.2290952598960083 * 63.43205138888889 = 24.603914923547762.
+        // Reset timestamps are parsed at millisecond precision. Keep the captured
+        // readings unchanged and assert corrected admission;
+        // Pi's missing host OAuth metadata must not change the pooled decision.
+        for decision in fixture["decisions"].as_array().unwrap() {
+            let mut selections = Vec::new();
+            for harness in [Some("pi"), Some("opencode"), None] {
+                let (input, _) =
+                    pi_incident_input(harness, "mason", decision["requirements"].clone());
+                let pool = input.runtime_snapshot.as_ref().unwrap().by_capacity
+                    ["anthropic/claude-opus-5-5"]
+                    .subscription_pool
+                    .as_ref()
+                    .unwrap();
+                let detail: Value =
+                    serde_json::from_str(&pool.reserve_diagnostic(20.0, false)).unwrap();
+                assert_eq!(detail["pool"], "anthropic");
+                assert_eq!(detail["unit"], "weekly_percentage_points_per_account");
+                let plan = &detail["plans"][0];
+                for (key, value) in fixture["expected_plan"].as_object().unwrap() {
+                    if key == "availablePoints" {
+                        assert!((plan[key].as_f64().unwrap() - 24.603914923547762).abs() < 1e-8);
+                    } else if key == "headReservePoints" {
+                        assert!(
+                            (plan[key].as_f64().unwrap() - value.as_f64().unwrap()).abs() < 1e-6
+                        );
+                    } else {
+                        assert_eq!(&plan[key], value, "{key}");
+                    }
+                }
+                let selected = select_model_route(input).unwrap();
+                assert_eq!(selected.route_key, "anthropic/claude-opus-5-5");
+                assert!(
+                    (selected
+                        .score
+                        .objective
+                        .subscription_pricing
+                        .as_ref()
+                        .unwrap()
+                        .available_points
+                        .unwrap()
+                        - 24.603914923547762)
+                        .abs()
+                        < 1e-8
+                );
+                selections.push((
+                    selected.route_key,
+                    selected.score.objective.subscription_pricing,
+                ));
+            }
+            assert_eq!(selections[0], selections[1]);
+            assert_eq!(selections[0], selections[2]);
+        }
+    }
+
+    fn high_pace_incident_input(
+        harness: Option<&str>,
+        target_agent: &str,
+        requirements: Value,
+    ) -> prefrontal_routing_core::model_router::SelectModelRouteInput<'static> {
+        let (mut input, _) = pi_incident_input(harness, target_agent, requirements);
+        let pool = input
+            .runtime_snapshot
+            .as_mut()
+            .unwrap()
+            .by_capacity
+            .get_mut("anthropic/claude-opus-5-5")
+            .unwrap()
+            .subscription_pool
+            .as_mut()
+            .unwrap();
+        // The captured readings now admit workers. A separately labelled pace
+        // of 4 points/hour needs 253.728 points before the first reset, exceeding
+        // the 166-point budget and preserving refusal coverage without changing
+        // the captured readings or treating the old refusal as correct policy.
+        Arc::make_mut(pool).plans[0].head_points_per_hour = Some(4.0);
+        input
+    }
+
+    #[test]
+    fn pi_masons_share_high_pace_incident_subscription_refusal_with_opencode() {
+        use prefrontal_routing_core::model_router::select_model_route;
+        let (_, fixture) = pi_incident_input(Some("pi"), "mason", json!({"iq":85,"eq":15}));
+        for decision in fixture["decisions"].as_array().unwrap() {
+            let mut rejections = Vec::new();
+            for harness in [Some("pi"), Some("opencode"), None] {
+                let error = select_model_route(high_pace_incident_input(
+                    harness,
+                    "mason",
+                    decision["requirements"].clone(),
+                ))
+                .expect_err("workers cannot spend the head reserve at the higher pace");
+                assert_eq!(error.rejected.len(), 1);
+                let rejection = &error.rejected[0];
+                assert_eq!(rejection.route_key, "anthropic/claude-opus-5-5");
+                assert_eq!(rejection.reason, "subscription_reserve");
+                let detail: Value =
+                    serde_json::from_str(rejection.detail.as_deref().unwrap()).unwrap();
+                assert_eq!(detail["plans"][0]["availablePoints"], 0.0);
+                assert_eq!(detail["plans"][0]["bankedResetsApplied"], 0);
+                rejections.push(error.rejected);
+            }
+            assert_eq!(rejections[0], rejections[1]);
+            assert_eq!(rejections[0], rejections[2]);
+        }
+        for head in ["pi", "opencode", "claude-code", "alfonso"] {
+            let selected = select_model_route(high_pace_incident_input(
+                Some(head),
+                head,
+                json!({"iq":85,"eq":15}),
+            ))
+            .unwrap();
+            assert_eq!(selected.route_key, "anthropic/claude-opus-5-5");
+            assert_eq!(
+                selected
+                    .score
+                    .objective
+                    .subscription_pricing
+                    .unwrap()
+                    .head_reserve_points,
+                Some(0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn incident_subscription_heads_keep_access_and_subscription_pricing() {
+        for harness in ["pi", "opencode", "claude-code"] {
+            let (input, _) = pi_incident_input(Some(harness), harness, json!({"iq":85,"eq":15}));
+            let selected =
+                prefrontal_routing_core::model_router::select_model_route(input).unwrap();
+            assert_eq!(selected.route_key, "anthropic/claude-opus-5-5");
+            let pricing = selected.score.objective.subscription_pricing.unwrap();
+            assert_eq!(pricing.head_reserve_points, Some(0.0));
+            assert_eq!(pricing.available_points, Some(232.0));
+        }
+    }
+
+    #[test]
+    fn incident_subscription_workers_get_subscription_pricing_when_head_reserve_clears() {
+        for harness in ["pi", "opencode"] {
+            let (mut input, _) =
+                pi_incident_input(Some(harness), "mason", json!({"iq":85,"eq":15}));
+            let pool = input
+                .runtime_snapshot
+                .as_mut()
+                .unwrap()
+                .by_capacity
+                .get_mut("anthropic/claude-opus-5-5")
+                .unwrap()
+                .subscription_pool
+                .as_mut()
+                .unwrap();
+            Arc::make_mut(pool).plans[0].head_points_per_hour = Some(0.0);
+            let selected =
+                prefrontal_routing_core::model_router::select_model_route(input).unwrap();
+            let pricing = selected.score.objective.subscription_pricing.unwrap();
+            assert_eq!(pricing.head_reserve_points, Some(0.0));
+            assert_eq!(pricing.available_points, Some(166.0));
+            assert_eq!(
+                selected.score.pricing_mode,
+                prefrontal_routing_core::model_router::PricingMode::Basket
+            );
+        }
+    }
+
+    #[test]
+    fn incident_api_plane_is_still_metered_not_subscription_reserved() {
+        let (mut input, _) = pi_incident_input(Some("pi"), "mason", json!({"iq":85,"eq":15}));
+        let plane = input.facts[0].billing_plane.as_mut().unwrap();
+        plane.auth_method = "apikey".into();
+        plane.kind = "upstream".into();
+        let selected = prefrontal_routing_core::model_router::select_model_route(input).unwrap();
+        assert!(selected.score.objective.subscription_pricing.is_none());
+        assert!(selected
+            .explanation
+            .iter()
+            .any(|line| line.contains("metered")));
+    }
+
+    #[test]
+    fn high_pace_incident_panel_reports_weekly_headroom_reserved_for_heads() {
+        // Use the high-pace variant because the corrected captured budget is
+        // positive; the panel must still explain a genuinely binding reserve.
+        let input = high_pace_incident_input(Some("opencode"), "mason", json!({"iq":70,"eq":0}));
+        let panel =
+            prefrontal_routing_core::select_panel(prefrontal_routing_core::SelectPanelInput {
+                panel_spec: prefrontal_routing_core::PanelSpec {
+                    size: 4,
+                    iq_floor: 70.0,
+                    diversity: prefrontal_routing_core::PanelDiversity::Family,
+                    class: prefrontal_routing_core::PanelClass::Audit,
+                    temperature_spread: None,
+                },
+                facts: input.facts,
+                available_models: input.available_models,
+                availability_substrate: prefrontal_routing_core::AvailabilitySubstrate::Broca,
+                runtime_snapshot: input.runtime_snapshot,
+                is_subscription_route: input.is_subscription_route,
+                package_tokens: None,
+                selection: prefrontal_routing_core::PanelSelection::NPick,
+                roster: Vec::new(),
+                exclude_route_keys: Vec::new(),
+                operator_exclude_keys: Vec::new(),
+                required_capabilities: None,
+            })
+            .unwrap();
+        assert!(panel.members.is_empty());
+        let causes = panel.shortfall.unwrap().causes;
+        assert_eq!(causes.len(), 1);
+        assert_eq!(causes[0].model, "anthropic/claude-opus-5-5");
+        assert_eq!(
+            causes[0].reason,
+            prefrontal_routing_core::PanelCauseReason::QuotaExhausted
+        );
+        assert_eq!(
+            causes[0].detail.as_deref(),
+            Some("weekly headroom is reserved for heads")
+        );
+    }
+
     fn outage_fixture() -> (AccountQuotaState, Value) {
         // Numeric readings precede the October 10 worker-selection request with
         // an IQ requirement of 90, identified in the fixture's source_decision.

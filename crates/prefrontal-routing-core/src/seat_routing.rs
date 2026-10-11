@@ -244,11 +244,11 @@ pub fn select_seat_route_with_config(
         config,
     );
     admission.admitted.retain(|route| {
-        let permitted = !input
-            .is_subscription_route
-            .as_ref()
-            .is_some_and(|pred| pred(&route.route))
-            || crate::model_router::subscription_budget_available(&route.runtime, false);
+        let permitted =
+            !crate::model_router::subscription_route_covered(
+                &route.route,
+                input.is_subscription_route.as_deref(),
+            ) || crate::model_router::subscription_budget_available(&route.runtime, false);
         if !permitted {
             admission.rejected.push(crate::model_router::RejectedRoute {
                 route_key: route.route.route_key.clone(),
@@ -457,11 +457,10 @@ fn order_candidates(pool: Vec<AdmittedRoute>, input: &SeatRouteInput<'_>) -> Vec
     let mut candidates: Vec<SeatCandidate> = pool
         .into_iter()
         .map(|admitted| {
-            let is_subscription = input
-                .is_subscription_route
-                .as_ref()
-                .map(|predicate| predicate(&admitted.route))
-                .unwrap_or(false);
+            let is_subscription = crate::model_router::subscription_route_covered(
+                &admitted.route,
+                input.is_subscription_route.as_deref(),
+            );
             let (objective, _) = compute_objective(
                 &admitted.route,
                 &admitted.runtime,
