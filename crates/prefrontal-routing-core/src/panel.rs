@@ -510,7 +510,6 @@ fn select_panel_admitted(
         &ModelRequirements { iq: 0.0, eq: 0.0 },
         config,
     );
-    let admitted_count = admission.admitted.len();
     let top_routable_elo = admission.top_routable.elo;
     let availability_substrate = input.availability_substrate;
     causes.extend(admission.rejected.into_iter().map(|rejected| {
@@ -553,6 +552,34 @@ fn select_panel_admitted(
         }
     }));
 
+    // Reserved subscription headroom is an admission wall, not an IQ failure.
+    // Apply it before counting survivors so an entirely reserved panel reports
+    // each route's quota cause even when a pinned roster has no IQ bar.
+    let admitted = admission
+        .admitted
+        .into_iter()
+        .filter_map(|admitted| {
+            let is_subscription = input
+                .is_subscription_route
+                .as_ref()
+                .is_some_and(|predicate| predicate(&admitted.route));
+            if is_subscription
+                && !crate::model_router::subscription_budget_available(&admitted.runtime, false)
+            {
+                causes.push(PanelCause {
+                    model: admitted.route.capacity_key.clone(),
+                    reason: PanelCauseReason::QuotaExhausted,
+                    detail: Some("weekly headroom is reserved for heads".into()),
+                    reset_at_ms: reserved_headroom_reset_at_ms(&admitted.runtime),
+                });
+                None
+            } else {
+                Some((admitted, is_subscription))
+            }
+        })
+        .collect::<Vec<_>>();
+    let admitted_count = admitted.len();
+
     // Zero means no IQ requirement, matching singular route selection. The floor
     // governs AUTOMATIC (n_pick) admission only: an explicit roster is the
     // operator's statement of who sits, and every generic filter that has been
@@ -570,7 +597,7 @@ fn select_panel_admitted(
         });
     let mut candidates = Vec::new();
     let mut largest_package_ceiling = None;
-    for admitted in admission.admitted {
+    for (admitted, is_subscription) in admitted {
         let model = admitted.route.capacity_key.clone();
         if iq_bar.is_some_and(|bar| admitted.route.fact.scores.elo < bar) {
             causes.push(PanelCause {
@@ -613,11 +640,6 @@ fn select_panel_admitted(
                 .unwrap_or_default(),
             PanelSelection::NPick => fact_prompt_params(&admitted.route.fact),
         };
-        let is_subscription = input
-            .is_subscription_route
-            .as_ref()
-            .map(|predicate| predicate(&admitted.route))
-            .unwrap_or(false);
         let (objective, _) = compute_objective(
             &admitted.route,
             &admitted.runtime,
@@ -625,17 +647,6 @@ fn select_panel_admitted(
             CostBasis::OutputOnly,
             false,
         );
-        if is_subscription
-            && !crate::model_router::subscription_budget_available(&admitted.runtime, false)
-        {
-            causes.push(PanelCause {
-                model,
-                reason: PanelCauseReason::QuotaExhausted,
-                detail: Some("weekly headroom is reserved for heads".into()),
-                reset_at_ms: reserved_headroom_reset_at_ms(&admitted.runtime),
-            });
-            continue;
-        }
         candidates.push(Candidate {
             metered_cost: normalized_metered_cost(&admitted.route.fact),
             route: admitted.route,
@@ -740,26 +751,52 @@ fn select_panel_admitted(
         }
     }
 
-    let shortfall_code = if input.package_tokens.is_some()
+    let size_reduced = || {
+        (
+            PanelShortfallCode::SizeReduced,
+            format!(
+                "only {} of {} requested panel slots can be served",
+                members.len(),
+                input.panel_spec.size
+            ),
+        )
+    };
+    let shortfall_kind = if input.package_tokens.is_some()
         && members.len() < input.panel_spec.size
         && causes
             .iter()
             .any(|cause| cause.reason == PanelCauseReason::PackageTooLarge)
     {
-        Some(PanelShortfallCode::PackageUnmeetable)
+        Some((
+            PanelShortfallCode::PackageUnmeetable,
+            package_refusal(
+                input.package_tokens.unwrap(),
+                largest_package_ceiling.unwrap_or(0),
+            ),
+        ))
     } else if admitted_count == 0 {
-        Some(PanelShortfallCode::SizeReduced)
-    } else if iq_eligible_count == 0 {
-        Some(PanelShortfallCode::IqFloorUnmeetable)
+        Some(size_reduced())
+    } else if let Some(bar) = iq_bar.filter(|_| iq_eligible_count == 0) {
+        Some((
+            PanelShortfallCode::IqFloorUnmeetable,
+            format!("no admitted roster model clears raw iq floor {bar:.2}"),
+        ))
     } else if enforce_family_diversity && members.len() < input.panel_spec.size {
-        Some(PanelShortfallCode::DiversityUnmeetable)
+        Some((
+            PanelShortfallCode::DiversityUnmeetable,
+            format!(
+                "only {} distinct labeled families can fill {} requested slots",
+                members.len(),
+                input.panel_spec.size
+            ),
+        ))
     } else if members.len() < input.panel_spec.size {
-        Some(PanelShortfallCode::SizeReduced)
+        Some(size_reduced())
     } else {
         None
     };
 
-    let shortfall = shortfall_code.map(|code| {
+    let shortfall = shortfall_kind.map(|(code, detail)| {
         if causes.is_empty() {
             causes.push(PanelCause {
                 model: "<unfilled-slot>".into(),
@@ -768,28 +805,6 @@ fn select_panel_admitted(
                 detail: None,
             });
         }
-        let detail = match code {
-            PanelShortfallCode::PackageUnmeetable => package_refusal(
-                input.package_tokens.unwrap(),
-                largest_package_ceiling.unwrap_or(0),
-            ),
-            PanelShortfallCode::IqFloorUnmeetable => {
-                format!(
-                    "no admitted roster model clears raw iq floor {:.2}",
-                    iq_bar.expect("an IQ-floor shortfall requires a positive floor")
-                )
-            }
-            PanelShortfallCode::DiversityUnmeetable => format!(
-                "only {} distinct labeled families can fill {} requested slots",
-                members.len(),
-                input.panel_spec.size
-            ),
-            PanelShortfallCode::SizeReduced => format!(
-                "only {} of {} requested panel slots can be served",
-                members.len(),
-                input.panel_spec.size
-            ),
-        };
         PanelShortfall {
             code,
             detail,
