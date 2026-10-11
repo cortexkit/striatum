@@ -484,7 +484,7 @@ fn wall_detail(until: f64, now: f64) -> String {
     format!("wall for {remaining_s}s more (until_ms={until:.0}, now_ms={now:.0})")
 }
 
-fn merged_runtime_state(
+pub(crate) fn merged_runtime_state(
     route: &ModelRoute,
     snapshot: Option<&ModelRouteStateSnapshot>,
 ) -> RouteRuntimeState {
