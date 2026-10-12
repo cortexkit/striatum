@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use prefrontal_routing_core::{DecisionInput, RouteStateStore};
 use prefrontal_routing_store::{
-    dev_descriptor, AccountDecisionRecord, AccountFenceRow, AccountObservationRow, AccountPinRow,
-    DecisionRetentionCursor, RetentionBatch, SqliteRouteStateStore, DECISION_MODE_SERVE,
-    DECISION_MODE_SHADOW, ROUTINE_REFUSAL_CODE,
+    dev_descriptor, AccountAdmissionRow, AccountDecisionRecord, AccountExclusionRow,
+    AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, DecisionRetentionCursor,
+    RetentionBatch, SqliteRouteStateStore, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
+    ROUTINE_REFUSAL_CODE,
 };
 use rusqlite::{params, Connection};
 
@@ -305,50 +306,163 @@ fn routine_rows_behind_a_run_of_kept_refusals_are_still_reached() {
     );
 }
 
-#[test]
-fn a_decision_something_still_references_is_skipped_not_failed() {
-    let rig = Rig::new("decision-referenced");
-    let store = rig.open();
-    insert_decisions(
-        &store,
-        &[
-            decision(
-                "pinned",
-                DECISION_MODE_SHADOW,
+/// The child table that keeps one shadow decision alive in the reference
+/// tests below.
+#[derive(Debug, Clone, Copy)]
+enum DecisionChild {
+    Pin,
+    Admission,
+    Hold,
+}
+
+fn pin_row(pin_id: &str, decision_id: &str) -> AccountPinRow {
+    AccountPinRow {
+        pin_id: pin_id.into(),
+        principal: "reserved:broca".into(),
+        conversation_hash: format!("conversation-{pin_id}"),
+        provider: "anthropic".into(),
+        pin_generation: 1,
+        affinity_model: "claude-opus-5-5".into(),
+        account_id: "acct-a".into(),
+        credential_id: "oauth:anthropic".into(),
+        pin_mode: "run_frozen".into(),
+        previous_pin_id: None,
+        decision_id: decision_id.into(),
+        created_at: NOW - 30 * DAY,
+    }
+}
+
+/// Make `child` the only row that references `decision_id`. An admission
+/// must name a pin, so its pin points at a separate serve decision, which
+/// retention never deletes.
+fn reference_decision(store: &SqliteRouteStateStore, child: DecisionChild, decision_id: &str) {
+    if let DecisionChild::Admission = child {
+        insert_decisions(
+            store,
+            &[decision(
+                &format!("anchor-{decision_id}"),
+                DECISION_MODE_SERVE,
                 "admit",
                 "cold_scored",
                 NOW - 30 * DAY,
-            ),
-            decision(
-                "free",
-                DECISION_MODE_SHADOW,
-                "admit",
-                "cold_scored",
-                NOW - 30 * DAY + 1,
-            ),
-        ],
-    );
+            )],
+        );
+    }
     store
-        .account_transaction(|tx| {
-            tx.insert_pin(&AccountPinRow {
-                pin_id: "pin-1".into(),
+        .account_transaction(|tx| match child {
+            DecisionChild::Pin => {
+                tx.insert_pin(&pin_row(&format!("pin-{decision_id}"), decision_id))
+            }
+            DecisionChild::Admission => {
+                let pin_id = format!("pin-anchor-{decision_id}");
+                tx.insert_pin(&pin_row(&pin_id, &format!("anchor-{decision_id}")))?;
+                tx.insert_admission(&AccountAdmissionRow {
+                    principal: "reserved:broca".into(),
+                    admission_id: format!("admission-{decision_id}"),
+                    request_fingerprint: "fp".into(),
+                    request_mode: "admit".into(),
+                    decision_id: decision_id.into(),
+                    conversation_hash: format!("conversation-{pin_id}"),
+                    provider: "anthropic".into(),
+                    model: "claude-opus-5-5".into(),
+                    account_id: "acct-a".into(),
+                    credential_id: "oauth:anthropic".into(),
+                    pin_id,
+                    pin_generation: 1,
+                    state: "finished".into(),
+                    charged: true,
+                    request_bytes: 12_000,
+                    request_bytes_estimated: false,
+                    committed_at: NOW - 30 * DAY,
+                    admission_valid_until: NOW - 30 * DAY,
+                    lease_valid_until: NOW - 30 * DAY,
+                    reply_json: "{}".into(),
+                    run_id: None,
+                    started_at: None,
+                    started_late: false,
+                    released_at: None,
+                    finished_at: Some(NOW - 30 * DAY),
+                })
+            }
+            DecisionChild::Hold => tx.insert_hold(&AccountHoldRow {
+                decision_id: decision_id.into(),
                 principal: "reserved:broca".into(),
                 conversation_hash: "conversation".into(),
                 provider: "anthropic".into(),
+                pin_id: "pin-none".into(),
                 pin_generation: 1,
-                affinity_model: "claude-opus-5-5".into(),
                 account_id: "acct-a".into(),
                 credential_id: "oauth:anthropic".into(),
-                pin_mode: "run_frozen".into(),
-                previous_pin_id: None,
-                decision_id: "pinned".into(),
+                basis: "five_hour".into(),
+                reset_at: NOW,
+                retry_after_s: 60,
                 created_at: NOW - 30 * DAY,
-            })
+            }),
         })
         .unwrap();
+}
 
-    assert_eq!(prune_all(&store, 256), 1);
-    assert_eq!(decision_ids(&store), vec!["pinned"]);
+/// One old routine decision older than both windows and one between the
+/// cutoffs are each referenced only by `child`; unreferenced neighbours sit
+/// on both sides of them in time. Retention runs with foreign keys on, so
+/// deleting a referenced row would fail the batch: the referenced rows must
+/// be skipped, and every neighbour still deleted, both with one large batch
+/// and with batches smaller than the run of rows.
+fn a_decision_only_one_child_references_survives(child: DecisionChild) {
+    for limit in [256, 2] {
+        let rig = Rig::new(&format!("decision-child-{child:?}-{limit}"));
+        let store = rig.open();
+        let mut rows = Vec::new();
+        for (prefix, base) in [("old", NOW - 30 * DAY), ("band", NOW - 10 * DAY)] {
+            for offset in [0, 2, 3] {
+                rows.push(decision(
+                    &format!("free-{prefix}-{offset}"),
+                    DECISION_MODE_SHADOW,
+                    "admit",
+                    "cold_scored",
+                    base + offset,
+                ));
+            }
+            rows.push(decision(
+                &format!("referenced-{prefix}"),
+                DECISION_MODE_SHADOW,
+                "admit",
+                "cold_scored",
+                base + 1,
+            ));
+        }
+        insert_decisions(&store, &rows);
+        reference_decision(&store, child, "referenced-old");
+        reference_decision(&store, child, "referenced-band");
+
+        let deleted = prune_all(&store, limit);
+
+        assert_eq!(deleted, 6, "{child:?} limit {limit}");
+        let mut expected = vec!["referenced-band".to_string(), "referenced-old".to_string()];
+        if let DecisionChild::Admission = child {
+            expected.extend([
+                "anchor-referenced-band".into(),
+                "anchor-referenced-old".into(),
+            ]);
+            expected.sort();
+        }
+        assert_eq!(decision_ids(&store), expected, "{child:?} limit {limit}");
+    }
+}
+
+#[test]
+fn a_decision_only_a_pin_references_survives_and_its_neighbours_go() {
+    a_decision_only_one_child_references_survives(DecisionChild::Pin);
+}
+
+#[test]
+fn a_decision_only_an_admission_references_survives_and_its_neighbours_go() {
+    a_decision_only_one_child_references_survives(DecisionChild::Admission);
+}
+
+#[test]
+fn a_decision_only_a_hold_references_survives_and_its_neighbours_go() {
+    a_decision_only_one_child_references_survives(DecisionChild::Hold);
 }
 
 fn observation(id: &str, received_at: i64) -> AccountObservationRow {
@@ -412,6 +526,48 @@ fn observation_retention_keeps_young_and_fenced_rows_and_is_bounded() {
         .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert_eq!(kept, vec!["at-cutoff", "fenced", "young"]);
+}
+
+/// An old observation referenced only by a scoped not-found exclusion is
+/// kept, and its unreferenced neighbours on both sides are still deleted
+/// without a foreign-key error.
+#[test]
+fn an_observation_only_an_exclusion_references_survives_and_its_neighbours_go() {
+    let rig = Rig::new("observation-exclusion");
+    let store = rig.open();
+    let before = NOW - 7 * DAY;
+    store
+        .account_transaction(|tx| {
+            tx.insert_observation(&observation("free-0", before - 30))?;
+            tx.insert_observation(&observation("excluded", before - 20))?;
+            tx.insert_observation(&observation("free-1", before - 10))?;
+            tx.insert_observation(&observation("free-2", before - 5))?;
+            tx.insert_exclusion(&AccountExclusionRow {
+                principal: "reserved:broca".into(),
+                admission_id: "admission-1".into(),
+                credential_id: "oauth:anthropic".into(),
+                runner_view_digest: "runner-view".into(),
+                roster_view_digest: "roster-view".into(),
+                observation_id: Some("excluded".into()),
+                recorded_at: before - 20,
+            })
+            .map(|_| ())
+        })
+        .unwrap();
+
+    assert_eq!(store.prune_account_observations(before, 2).unwrap(), 2);
+    assert_eq!(store.prune_account_observations(before, 2).unwrap(), 1);
+    assert_eq!(store.prune_account_observations(before, 2).unwrap(), 0);
+
+    let connection = Connection::open(rig.db_path()).unwrap();
+    let kept: String = connection
+        .query_row(
+            "SELECT group_concat(observation_id) FROM account_observation",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, "excluded");
 }
 
 #[test]
