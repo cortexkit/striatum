@@ -21,6 +21,7 @@ mod available_models_text;
 mod broca_credentials;
 mod config_overrides;
 mod fusiform_catalog;
+mod key_pool;
 mod model_resolution;
 mod quota_consumer;
 mod subscription_economics;
@@ -2847,6 +2848,20 @@ async fn handle_select_request(
     if envelope.method == ROUTE_LIST_UNSCORED_OP {
         return handle_list_unscored(frame, writer, store).await;
     }
+    if key_pool::handles(&envelope.method) {
+        let policy = config_overrides::read_operator_routing_policy(operator_config_path);
+        let reply = key_pool::handle(
+            &envelope.method,
+            &frame.body,
+            &key_pool::PoolCtx {
+                store: store.as_ref(),
+                credentials: broca_credentials,
+                policy: &policy,
+                now_ms: now_ms() as i64,
+            },
+        );
+        return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
+    }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(
             frame,
@@ -3118,9 +3133,16 @@ async fn handle_select_request(
                 // place its credential pin is decided, so an unresolvable mapping
                 // refuses the pin before any decision is recorded.
                 let runner = if is_broca_substrate(params.substrate.as_deref()) {
+                    let session = pool_session(
+                        params.task_id.as_deref(),
+                        params.send_id.as_deref(),
+                        &format!("route.select:{}", now as i64),
+                    );
                     match runner_for_route(
                         &operator_policy,
                         broca_credentials,
+                        store.as_ref(),
+                        &session,
                         &selected.model.provider_id,
                         &selected.model.model_id,
                         selected.prompt_params.variant.as_deref(),
@@ -3143,8 +3165,11 @@ async fn handle_select_request(
                     "selected": selected, "decisionID": decision_id,
                     "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities}
                 });
-                if let Some(runner) = runner {
+                if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
+                    if let Some(grant) = grant {
+                        result["poolLease"] = grant.lease_json();
+                    }
                 }
                 let body =
                     serde_json::to_vec(&json!({"result": result})).map_err(ModuleError::Json)?;
@@ -3313,14 +3338,21 @@ async fn handle_select_request(
                         // Automatic selection never admits an explicit-only provider, so this
                         // resolves to the ordinary provider translation. Going through
                         // runner_for_route keeps one rule for every launch target.
+                        let session = pool_session(
+                            params.task_id.as_deref(),
+                            params.send_id.as_deref(),
+                            &decision_id,
+                        );
                         match runner_for_route(
                             &operator_policy,
                             broca_credentials,
+                            store.as_ref(),
+                            &session,
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
                         ) {
-                            Ok(runner) => result["runner"] = json!(runner),
+                            Ok((runner, _)) => result["runner"] = json!(runner),
                             Err((code, message)) => {
                                 return send_route_error(
                                     writer, ver, channel, epoch, corr, &code, &message,
@@ -3435,63 +3467,60 @@ fn panel_availability(
 /// per-send credential pin, requested for a substrate that cannot carry one.
 const PROVIDER_REQUIRES_RUNNER_PIN: &str = "provider_requires_runner_pin";
 
-/// Whether `provider` exists only as a vault credential mapping that every send
-/// must pin: an explicit-only provider that borrows another provider's rows
-/// through `score_alias` (the paid Anthropic API keys, `anthropic-platform*`).
-/// An explicit-only provider without an alias is a provider Broca serves under
-/// its own name and needs no pin.
 fn needs_runner_pin(policy: &ModelRoutingPolicyInput, provider: &str) -> bool {
-    policy
-        .explicit_only_providers
-        .iter()
-        .any(|entry| entry == provider)
-        && prefrontal_routing_core::score_alias::alias_target(&policy.score_alias, provider)
-            .is_some()
+    key_pool::is_pool_provider(policy, provider)
 }
 
 /// The Broca launch target for a selected route: the plain translation for an
-/// ordinary provider, or the credential the vault maps the provider to plus its
-/// typed pin. Refuses by name when that credential cannot be resolved, or when
-/// it serves a different provider than the one the alias borrows rows from.
+/// ordinary provider. For an explicit-only key-pool provider it leases a key for
+/// `session` from the pool and returns the target that pins it, with the grant;
+/// a pool that cannot be resolved or has no admissible key refuses by name.
 fn runner_for_route(
     policy: &ModelRoutingPolicyInput,
     credentials: &SharedBrocaCredentials,
+    store: &SqliteRouteStateStore,
+    session: &str,
     provider: &str,
     model: &str,
     variant: Option<&str>,
-) -> Result<prefrontal_routing_core::runner::RunnerModel, (String, String)> {
+) -> Result<
+    (
+        prefrontal_routing_core::runner::RunnerModel,
+        Option<key_pool::PoolGrant>,
+    ),
+    (String, String),
+> {
     if !needs_runner_pin(policy, provider) {
-        return Ok(prefrontal_routing_core::runner::RunnerModel::broca(
-            provider, model, variant,
+        return Ok((
+            prefrontal_routing_core::runner::RunnerModel::broca(provider, model, variant),
+            None,
         ));
     }
-    let credential_id = credentials
-        .lock()
-        .map_err(|_| {
-            (
-                broca_credentials::EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED.to_string(),
-                format!(
-                    "no vault credential resolves provider {provider}: credential cache poisoned"
-                ),
-            )
-        })?
-        .explicit_provider_credential(provider, now_ms())?;
-    let target = prefrontal_routing_core::score_alias::alias_target(&policy.score_alias, provider)
-        .unwrap_or_default();
-    match prefrontal_routing_core::runner::RunnerModel::pinned(&credential_id, model, variant) {
-        Some(runner) if runner.provider == target => Ok(runner),
-        Some(runner) => Err((
-            broca_credentials::EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED.to_string(),
-            format!(
-                "provider {provider} maps to credential {credential_id}, which serves {}, but model_routing.score_alias borrows its rows from {target}",
-                runner.provider
-            ),
-        )),
-        None => Err((
-            broca_credentials::EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED.to_string(),
-            format!("provider {provider} maps to credential {credential_id}, which is not a method:provider[:account] id"),
-        )),
-    }
+    let grant = key_pool::acquire(
+        &key_pool::PoolCtx {
+            store,
+            credentials,
+            policy,
+            now_ms: now_ms() as i64,
+        },
+        provider,
+        model,
+        variant,
+        session,
+    )
+    .map_err(|refusal| (refusal.code, refusal.message))?;
+    Ok((grant.runner.clone(), Some(grant)))
+}
+
+/// The session a selection's pool lease belongs to: the caller's task, else its
+/// send, else this decision alone (its lease then simply expires).
+fn pool_session(task_id: Option<&str>, send_id: Option<&str>, fallback: &str) -> String {
+    task_id
+        .or(send_id)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// A pinned route on a provider that needs a per-send credential pin can only
@@ -3742,7 +3771,7 @@ async fn handle_select_panel(
     // carries its launch target and pin in its prompt params, the same place a
     // single route.select reply puts `runner` for core's durable payloads.
     if is_broca_substrate(params.substrate.as_deref()) {
-        for member in &mut panel.members {
+        for (slot, member) in panel.members.iter_mut().enumerate() {
             let Some((provider, model)) = member.route_key.split_once('/') else {
                 continue;
             };
@@ -3754,15 +3783,32 @@ async fn handle_select_panel(
                 .get("variant")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
+            // Each seat is its own session for the key pool: seats spread over
+            // the keys and each keeps its own prompt-cache workspace.
+            let session = format!(
+                "{}#seat{slot}",
+                pool_session(
+                    params.task_id.as_deref(),
+                    params.send_id.as_deref(),
+                    &format!("route.select_panel:{}", now_ms())
+                )
+            );
             match runner_for_route(
                 &operator_policy,
                 broca_credentials,
+                store.as_ref(),
+                &session,
                 provider,
                 model,
                 variant.as_deref(),
             ) {
-                Ok(runner) => {
+                Ok((runner, grant)) => {
                     member.prompt_params.insert("runner".into(), json!(runner));
+                    if let Some(grant) = grant {
+                        member
+                            .prompt_params
+                            .insert("poolLease".into(), grant.lease_json());
+                    }
                 }
                 Err((code, message)) => {
                     return send_route_error(writer, ver, channel, epoch, corr, &code, &message)
@@ -4911,6 +4957,45 @@ async fn send_no_route(
     send(writer, frame).await
 }
 
+/// Send a key-pool reply: a `{"result": ...}` response, or an error frame
+/// carrying the typed refusal code and its detail (for an exhausted pool, every
+/// key with its reason and reset).
+async fn send_pool_reply(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    reply: Result<serde_json::Value, key_pool::PoolRefusal>,
+) -> Result<(), ModuleError> {
+    let (ty, body) = match reply {
+        Ok(result) => (
+            FrameType::Response,
+            serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?,
+        ),
+        Err(refusal) => (
+            FrameType::Error,
+            serde_json::to_vec(&ErrorBody {
+                code: refusal.code,
+                message: refusal.message,
+                detail: refusal.detail,
+            })
+            .map_err(ModuleError::Json)?,
+        ),
+    };
+    let frame = Frame::build_with_version(
+        ver,
+        ty,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
+}
+
 async fn send_route_error(
     writer: &mpsc::Sender<Frame>,
     ver: u8,
@@ -5024,12 +5109,24 @@ fn handles(method: &str) -> bool {
             | account_selection::ACCOUNT_OBSERVE_OP
             | account_selection::ACCOUNT_RELEASE_OP
             | account_selection::ACCOUNT_SHADOW_STATUS_OP
-    )
+    ) || key_pool::handles(method)
 }
 
 /// Operations registered in HELLO and exposed by `--print-manifest`.
 fn served_operations() -> Vec<ManagementOperation> {
-    vec![
+    let pool_operations = [
+        key_pool::POOL_ACQUIRE_OP,
+        key_pool::POOL_RENEW_OP,
+        key_pool::POOL_RELEASE_OP,
+        key_pool::POOL_WALL_OP,
+    ]
+    .into_iter()
+    .map(|name| ManagementOperation {
+        name: name.to_string(),
+        kind: ManagementOperationKind::Mutate,
+        description: None,
+    });
+    let mut operations = vec![
         // route.select is a mutation because it records the decision it returns.
         ManagementOperation {
             name: ROUTE_SELECT_OP.to_string(),
@@ -5199,7 +5296,9 @@ fn served_operations() -> Vec<ManagementOperation> {
                     .to_string(),
             ),
         },
-    ]
+    ];
+    operations.extend(pool_operations);
+    operations
 }
 
 #[derive(Serialize)]
@@ -10965,9 +11064,15 @@ mod tests {
         assert_eq!(
             body["result"]["runner"],
             json!({"provider": "anthropic", "model": "claude-opus-4-1",
-                   "auth": {"method": "apikey", "account": "work"}}),
+                   "auth": {"method": "apikey", "account": "work"},
+                   "pool": "anthropic-platform"}),
             "{body}"
         );
+        assert_eq!(
+            body["result"]["poolLease"]["credentialId"],
+            "apikey:anthropic:work"
+        );
+        assert_eq!(body["result"]["poolLease"]["workspace"], "workspace-7");
         // Pricing is the target's API plane under the key's own method, never
         // a subscription view.
         let plane = &body["result"]["billingPlanes"];
@@ -10978,34 +11083,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pinned_explicit_only_route_refuses_by_name_without_a_single_key() {
-        let ambiguous = platform_listing(&[
+    async fn the_key_pool_spreads_walls_keys_and_refuses_without_falling_back() {
+        // Two keys of one workspace; the second key's label differs from its
+        // workspace (`account_id`), and only the label goes in the pin.
+        let credentials = platform_listing(&[
             ("apikey:anthropic", &["anthropic-platform"]),
             ("apikey:anthropic:work", &["anthropic-platform"]),
         ]);
-        let (body, _rig, _store) = platform_select(
-            "platform-ambiguous",
+        let rig = Rig::new("platform-pool");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+            .unwrap();
+        let config = platform_operator_config(&rig);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": method, "params": params}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        let acquire = |session: &'static str| {
+            call(
+                "route.pool_acquire",
+                json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": session}),
+            )
+        };
+        // Spread: two concurrent sessions take the two keys.
+        let first = acquire("ses-1").await;
+        let second = acquire("ses-2").await;
+        let keys = [
+            first["result"]["credentialId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            second["result"]["credentialId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        ];
+        assert_ne!(keys[0], keys[1], "{first} {second}");
+        let work = if keys[0] == "apikey:anthropic:work" {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(work["result"]["workspace"], "workspace-7");
+        assert_eq!(
+            work["result"]["runner"]["auth"],
+            json!({"method": "apikey", "account": "work"}),
+            "the pin carries the key's label, never its workspace: {work}"
+        );
+        assert_eq!(work["result"]["runner"]["provider"], "anthropic");
+        assert_eq!(work["result"]["runner"]["pool"], "anthropic-platform");
+
+        // ses-1's key is walled, so its revival is handed the remaining key and its pin.
+        let walled_key = keys[0].clone();
+        let wall = call(
+            "route.pool_wall",
+            json!({"provider": "anthropic-platform", "credentialId": walled_key,
+                   "kind": "billing_exhausted", "untilMs": now_ms() as i64 + 3_600_000}),
+        )
+        .await;
+        assert_eq!(wall["result"]["ok"], true, "{wall}");
+        let revival = acquire("ses-1").await;
+        assert_eq!(
+            revival["result"]["credentialId"],
+            keys[1].as_str(),
+            "{revival}"
+        );
+
+        // Every key walled: a named refusal listing each key, never a subscription route.
+        call(
+            "route.pool_wall",
+            json!({"provider": "anthropic-platform", "credentialId": keys[1],
+                   "kind": "rate_limited", "untilMs": now_ms() as i64 + 30_000}),
+        )
+        .await;
+        let refused = acquire("ses-3").await;
+        assert_eq!(
+            refused["code"], "explicit_provider_pool_exhausted",
+            "{refused}"
+        );
+        let reasons: Vec<&str> = refused["detail"]["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons.len(), 2, "{refused}");
+        assert!(reasons.contains(&"billing_exhausted") && reasons.contains(&"rate_limited"));
+        let pinned = call(
+            "route.select",
             json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
-                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1"}),
-            &ambiguous,
-            false,
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1",
+                   "taskId": "ses-4"}),
         )
         .await;
         assert_eq!(
-            body["code"], "explicit_provider_credential_ambiguous",
-            "{body}"
+            pinned["code"], "explicit_provider_pool_exhausted",
+            "{pinned}"
         );
-        assert!(body.get("result").is_none());
+        assert!(
+            pinned.get("result").is_none(),
+            "no fallback route: {pinned}"
+        );
 
         // A host substrate cannot carry the pin at all.
-        let single = platform_listing(&[("apikey:anthropic", &["anthropic-platform"])]);
-        let (host, _rig, _store) = platform_select(
-            "platform-host",
+        let host = call(
+            "route.select",
             json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
                    "availableModels": ["anthropic-platform/claude-opus-4-1"],
                    "modelPin": "anthropic-platform/claude-opus-4-1"}),
-            &single,
-            false,
         )
         .await;
         assert_eq!(host["code"], "provider_requires_runner_pin", "{host}");
@@ -11062,23 +11259,25 @@ mod tests {
     }
 
     #[test]
-    fn explicit_provider_credential_resolution_never_guesses() {
+    fn pool_membership_comes_from_the_listing_and_never_guesses() {
         let listing = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
         let credentials = listing.lock().unwrap();
-        assert_eq!(
-            credentials.explicit_provider_credential("anthropic-platform", now_ms()),
-            Ok("apikey:anthropic:work".to_string())
-        );
+        let keys = credentials
+            .pool_keys("anthropic-platform", now_ms())
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].credential_id, "apikey:anthropic:work");
+        assert_eq!(keys[0].workspace, "workspace-7");
         assert_eq!(
             credentials
-                .explicit_provider_credential("anthropic-platform-work", now_ms())
+                .pool_keys("anthropic-platform-work", now_ms())
                 .unwrap_err()
                 .0,
             "explicit_provider_credential_unresolved"
         );
         assert_eq!(
             BrocaCredentials::default()
-                .explicit_provider_credential("anthropic-platform", now_ms())
+                .pool_keys("anthropic-platform", now_ms())
                 .unwrap_err()
                 .0,
             "explicit_provider_credential_unresolved",

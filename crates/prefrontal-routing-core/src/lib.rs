@@ -16,6 +16,7 @@ pub mod accounts;
 pub mod billing;
 pub mod break_glass;
 pub mod failure_backoff;
+pub mod key_pool;
 pub mod launch_policy;
 pub mod model_facts;
 pub mod model_facts_seed;

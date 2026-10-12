@@ -53,6 +53,12 @@ pub struct RunnerModel {
     /// that exist only as a vault credential mapping (see `pinned`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<RunnerAuthPin>,
+    /// The routing provider whose key pool `auth` was drawn from (for example
+    /// `anthropic-platform`). A sender that starts a new run on this target asks
+    /// routing for a key again (`route.pool_acquire`), because the key a revival
+    /// should use may differ from the launch's. Never sent to Broca.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 }
 
 impl RunnerModel {
@@ -68,6 +74,7 @@ impl RunnerModel {
             model: model.to_string(),
             variant: variant.map(str::to_string),
             auth: None,
+            pool: None,
         }
     }
 
@@ -80,6 +87,15 @@ impl RunnerModel {
         Some(Self {
             auth: Some(pin),
             ..Self::broca(&provider, model, variant)
+        })
+    }
+
+    /// The vault credential id this target's pin selects, `method:provider[:account]`.
+    pub fn pinned_credential_id(&self) -> Option<String> {
+        let pin = self.auth.as_ref()?;
+        Some(match pin.account.as_deref() {
+            Some(account) => format!("{}:{}:{account}", pin.method, self.provider),
+            None => format!("{}:{}", pin.method, self.provider),
         })
     }
 }

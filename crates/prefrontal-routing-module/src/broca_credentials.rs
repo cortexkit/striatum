@@ -17,12 +17,9 @@ use subc_protocol::session::{HealthReport, HealthStatus};
 /// good answer briefly, but cannot assert reachability indefinitely.
 const MAX_AGE_MS: u64 = 15 * 60 * 1000;
 
-/// No active credential maps an explicit-only provider, or the listing is unknown.
+/// No credential maps an explicit-only pool provider, or the listing is unknown.
 pub(crate) const EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED: &str =
     "explicit_provider_credential_unresolved";
-/// More than one active credential maps the same explicit-only provider.
-pub(crate) const EXPLICIT_PROVIDER_CREDENTIAL_AMBIGUOUS: &str =
-    "explicit_provider_credential_ambiguous";
 
 #[derive(Debug, Clone, Default)]
 pub struct BrocaCredentials {
@@ -246,52 +243,50 @@ impl BrocaCredentials {
         }
     }
 
-    /// The one vault credential whose `provider_ids` names `provider`, for a
-    /// routing provider that exists only as such a mapping. Zero or several
-    /// matching rows refuse by name: guessing would send on the wrong key, or
-    /// on the subscription logins the mapping exists to avoid.
-    pub(crate) fn explicit_provider_credential(
+    /// The key pool of a routing provider that exists only as vault credential
+    /// mappings: every llm-provider credential whose `provider_ids` names it, in
+    /// any lifecycle state (a key the vault marks unusable is reported as such,
+    /// not dropped). The workspace is the row's `account_id`. An unknown or stale
+    /// listing, or no mapped credential, refuses by name: guessing a key would
+    /// send on the wrong account or on the subscription logins.
+    pub(crate) fn pool_keys(
         &self,
         provider: &str,
         now_ms: u64,
-    ) -> Result<String, (String, String)> {
-        let unresolved = |detail: String| {
+    ) -> Result<Vec<prefrontal_routing_core::key_pool::PoolKey>, (String, String)> {
+        let unresolved = |detail: &str| {
             Err((
                 EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED.to_string(),
                 format!("no vault credential resolves provider {provider}: {detail}"),
             ))
         };
         let Some(reached_at_ms) = self.reached_at_ms else {
-            return unresolved("the credential listing has not been read".into());
+            return unresolved("the credential listing has not been read");
         };
         if now_ms.saturating_sub(reached_at_ms) > MAX_AGE_MS {
-            return unresolved("the credential listing is over 15 minutes old".into());
+            return unresolved("the credential listing is over 15 minutes old");
         }
-        let matching: Vec<&str> = self
+        let keys: Vec<_> = self
             .listed
             .iter()
             .filter(|row| {
-                row.state == "active"
-                    && row
-                        .categories
-                        .iter()
-                        .any(|category| category == "llm-provider")
+                row.categories
+                    .iter()
+                    .any(|category| category == "llm-provider")
                     && row.provider_ids.iter().any(|id| id == provider)
             })
-            .map(|row| row.id.as_str())
+            .map(|row| {
+                prefrontal_routing_core::key_pool::PoolKey::new(
+                    &row.id,
+                    row.account_id.as_deref(),
+                    &row.state,
+                )
+            })
             .collect();
-        match matching.as_slice() {
-            [] => unresolved("no active llm-provider credential lists it in provider_ids".into()),
-            [id] => Ok((*id).to_string()),
-            several => Err((
-                EXPLICIT_PROVIDER_CREDENTIAL_AMBIGUOUS.to_string(),
-                format!(
-                    "provider {provider} is listed by {} active credentials ({}); map it on exactly one",
-                    several.len(),
-                    several.join(", ")
-                ),
-            )),
+        if keys.is_empty() {
+            return unresolved("no llm-provider credential lists it in provider_ids");
         }
+        Ok(keys)
     }
 
     pub fn note_failure(&mut self, error: impl ToString) {
