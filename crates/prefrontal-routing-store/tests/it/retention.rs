@@ -215,8 +215,20 @@ fn account_decision_retention_deletes_only_rows_past_their_window_and_keeps_refu
 fn account_decision_retention_is_bounded_per_batch() {
     let rig = Rig::new("decision-bounded");
     let store = rig.open();
+    // Ten rows older than both windows, which the batch deletes outright,
+    // and ten routine rows between the two cutoffs, which it deletes after
+    // checking their class. The bound must hold on both paths.
     let rows: Vec<AccountDecisionRecord> = (0..10)
         .map(|index| {
+            decision(
+                &format!("very-old-{index:02}"),
+                DECISION_MODE_SHADOW,
+                "admit",
+                "cold_scored",
+                NOW - 20 * DAY + index,
+            )
+        })
+        .chain((0..10).map(|index| {
             decision(
                 &format!("old-{index:02}"),
                 DECISION_MODE_SHADOW,
@@ -224,7 +236,7 @@ fn account_decision_retention_is_bounded_per_batch() {
                 "cold_scored",
                 NOW - 10 * DAY + index,
             )
-        })
+        }))
         .collect();
     insert_decisions(&store, &rows);
 
@@ -241,7 +253,9 @@ fn account_decision_retention_is_bounded_per_batch() {
     }
 
     let deleted: Vec<usize> = batches.iter().map(|batch| batch.deleted).collect();
-    assert_eq!(deleted, vec![3, 3, 3, 1]);
+    // The fourth batch finishes the very old rows and spends its remaining
+    // two rows on the band.
+    assert_eq!(deleted, vec![3, 3, 3, 3, 3, 3, 2]);
     assert!(decision_ids(&store).is_empty());
     assert_eq!(
         store
