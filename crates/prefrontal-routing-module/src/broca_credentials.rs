@@ -244,7 +244,7 @@ impl BrocaCredentials {
     }
 
     /// The key pool of a routing provider that exists only as vault credential
-    /// mappings: every llm-provider credential whose `provider_ids` names it, in
+    /// mappings: every llm-provider API key whose `provider_ids` names it, in
     /// any lifecycle state (a key the vault marks unusable is reported as such,
     /// not dropped). The workspace is the row's `account_id`. An unknown or stale
     /// listing, or no mapped credential, refuses by name: guessing a key would
@@ -274,6 +274,11 @@ impl BrocaCredentials {
                     .iter()
                     .any(|category| category == "llm-provider")
                     && row.provider_ids.iter().any(|id| id == provider)
+                    // A key pool holds API keys only. A login can share a label
+                    // with a key (`oauth:anthropic:ysample` beside
+                    // `apikey:anthropic:ysample`); even a mis-mapped login must
+                    // never be pinned as a pool key.
+                    && row.id.starts_with("apikey:")
             })
             .map(|row| {
                 prefrontal_routing_core::key_pool::PoolKey::new(

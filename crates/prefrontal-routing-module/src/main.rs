@@ -11220,6 +11220,188 @@ mod tests {
         }
     }
 
+    /// The first real key, as CKCRED lists it: a labelled id, active,
+    /// llm-provider, mapped to `anthropic-platform`, and no `account_id`. Every
+    /// real key carries a label, so the pin always names it; with no
+    /// `account_id` the key is its own prompt-cache workspace.
+    #[tokio::test]
+    async fn the_first_real_platform_key_pins_its_label_and_is_its_own_workspace() {
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: vec![prefrontal_ckcred_client::ListedCredential {
+                    id: "apikey:anthropic:wsampleyahoo".into(),
+                    categories: vec!["llm-provider".into()],
+                    credential_type: "apikey".into(),
+                    state: "active".into(),
+                    provider_ids: vec!["anthropic-platform".into()],
+                    account_id: None,
+                    ..Default::default()
+                }],
+                view: "ckcred-first-real-key".into(),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        let (body, _rig, _store) = platform_select(
+            "platform-first-real-key",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1",
+                   "taskId": "bg_first_key"}),
+            &credentials,
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["result"]["runner"]["auth"],
+            json!({"method": "apikey", "account": "wsampleyahoo"}),
+            "a labelled key never pins without its account: {body}"
+        );
+        assert_eq!(body["result"]["runner"]["provider"], "anthropic");
+        assert_eq!(
+            body["result"]["poolLease"]["credentialId"],
+            "apikey:anthropic:wsampleyahoo"
+        );
+        assert_eq!(
+            body["result"]["poolLease"]["workspace"], "key:apikey:anthropic:wsampleyahoo",
+            "no account_id: the key is its own workspace"
+        );
+    }
+
+    /// A vault listing with explicit rows: (id, provider_ids, account_id).
+    fn vault_listing(rows: &[(&str, &[&str], Option<&str>)]) -> SharedBrocaCredentials {
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: rows
+                    .iter()
+                    .map(
+                        |(id, providers, account)| prefrontal_ckcred_client::ListedCredential {
+                            id: (*id).into(),
+                            categories: vec!["llm-provider".into()],
+                            credential_type: if id.starts_with("apikey:") {
+                                "apikey"
+                            } else {
+                                "oauth"
+                            }
+                            .into(),
+                            state: "active".into(),
+                            provider_ids: providers.iter().map(|p| (*p).into()).collect(),
+                            account_id: account.map(str::to_string),
+                            ..Default::default()
+                        },
+                    )
+                    .collect(),
+                view: format!("vault-view-{}", rows.len()),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        credentials
+    }
+
+    /// The live vault: four labelled Anthropic API keys mapped to the pool, a
+    /// key whose id looks like a pool key but is not mapped to it, and a
+    /// subscription login sharing the label `ysample`. Membership comes from the
+    /// mapping alone, keyed on the full credential id.
+    #[tokio::test]
+    async fn the_pool_is_the_mapped_api_keys_and_never_a_login_with_the_same_label() {
+        let platform: &[&str] = &["anthropic-platform"];
+        let credentials = vault_listing(&[
+            ("apikey:anthropic:wsampleyahoo", platform, None),
+            ("apikey:anthropic:wsamplegmail", platform, None),
+            ("apikey:anthropic:usersamplegmail", platform, None),
+            ("apikey:anthropic:ysample", platform, None),
+            ("apikey:anthropic:unmapped", &["anthropic"], None),
+            ("oauth:anthropic:ysample", &["anthropic"], Some("acct-ysample")),
+        ]);
+        let mut members: Vec<String> = credentials
+            .lock()
+            .unwrap()
+            .pool_keys("anthropic-platform", now_ms())
+            .unwrap()
+            .into_iter()
+            .map(|key| key.credential_id)
+            .collect();
+        members.sort();
+        assert_eq!(
+            members,
+            vec![
+                "apikey:anthropic:usersamplegmail",
+                "apikey:anthropic:wsamplegmail",
+                "apikey:anthropic:wsampleyahoo",
+                "apikey:anthropic:ysample",
+            ],
+            "an apikey:anthropic: id not mapped to the provider is not a member"
+        );
+        // Even a login wrongly mapped to the pool is never a member.
+        let misconfigured = vault_listing(&[
+            ("apikey:anthropic:ysample", platform, None),
+            ("oauth:anthropic:ysample", platform, Some("acct-ysample")),
+        ]);
+        let keys = misconfigured
+            .lock()
+            .unwrap()
+            .pool_keys("anthropic-platform", now_ms())
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].credential_id, "apikey:anthropic:ysample");
+
+        // Four sessions spread over the four keys; a wall recorded on the
+        // subscription login's id never touches the API key sharing its label.
+        let rig = Rig::new("platform-live-vault");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+            .unwrap();
+        let config = platform_operator_config(&rig);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": method, "params": params}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        call(
+            "route.pool_wall",
+            json!({"provider": "anthropic-platform", "credentialId": "oauth:anthropic:ysample",
+                   "kind": "billing_exhausted", "untilMs": now_ms() as i64 + 3_600_000}),
+        )
+        .await;
+        let mut leased = Vec::new();
+        for session in ["s1", "s2", "s3", "s4"] {
+            let reply = call(
+                "route.pool_acquire",
+                json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": session}),
+            )
+            .await;
+            let id = reply["result"]["credentialId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{reply}"))
+                .to_string();
+            let label = id.rsplit(':').next().unwrap().to_string();
+            assert_eq!(
+                reply["result"]["runner"]["auth"],
+                json!({"method": "apikey", "account": label}),
+                "the pin names the key's own label: {reply}"
+            );
+            leased.push(id);
+        }
+        leased.sort();
+        assert_eq!(
+            leased, members,
+            "four concurrent runs take the four keys, apikey:anthropic:ysample included"
+        );
+    }
+
     #[tokio::test]
     async fn a_pinned_launch_and_its_sends_share_one_pool_lease() {
         // Selection leases under the caller's task; the launch target carries
