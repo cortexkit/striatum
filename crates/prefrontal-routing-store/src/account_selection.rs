@@ -9,6 +9,8 @@
 //! fences, decide, write the result) inside [`SqliteRouteStateStore::account_transaction`],
 //! so concurrent admissions serialize and the reply is sent only after the
 //! commit. Nothing here deletes a row: expiry is a comparison with the clock.
+//! Old shadow decisions and runner observations are removed only by the
+//! bounded retention batches in `retention.rs`.
 
 use prefrontal_routing_core::RouteStateResult;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
