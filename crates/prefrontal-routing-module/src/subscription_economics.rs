@@ -9,7 +9,7 @@ use prefrontal_routing_core::{
     model_facts::{get_keep_free_percent, make_capacity_key},
     model_router::ModelRouteStateSnapshot,
     subscription::{
-        is_head, HeadPaceBreakdown, MeasuredValue, QuotaAccount, SubscriptionPlan,
+        is_delegated_role, HeadPaceBreakdown, MeasuredValue, QuotaAccount, SubscriptionPlan,
         SubscriptionPool, DEFAULT_PLAN_FEE_USD,
     },
     ModelFact,
@@ -176,11 +176,13 @@ fn head_pace(reply: &Value, provider: &str, from: i64, to: i64) -> Option<f64> {
 /// malformed producer is incomplete evidence, not a zero pace.
 ///
 /// Astrocyte values every event in the configured subscription scope, worker
-/// sessions included, and splits each producer's hour by work class. A class
-/// counts toward head demand only when routing's `is_head` accepts it, so a
-/// worker such as `mason` running inside OpenCode does not reserve quota
-/// against other workers. Usage with no class (Pi records none) and any
-/// producer total not covered by its classes stay counted as head demand.
+/// sessions included, and splits each producer's hour by work class. Only
+/// classes that `is_delegated_role` recognizes as delegated work (for example
+/// `mason` running inside OpenCode) are left out of head demand, so they do
+/// not reserve quota against other workers. Every other class counts as head
+/// demand: OpenCode's interactive `build` and `plan` agents, head names, names
+/// routing does not know, usage with no class (Pi records none), and any
+/// producer total not covered by its classes.
 fn head_pace_breakdown(
     reply: &Value,
     provider: &str,
@@ -241,11 +243,11 @@ fn head_pace_breakdown(
                     *head_by_class
                         .entry(UNLABELLED_WORK_CLASS.into())
                         .or_default() += class_points;
-                } else if is_head(class) {
-                    *head_by_class.entry(class.into()).or_default() += class_points;
-                } else {
+                } else if is_delegated_role(class) {
                     excluded += class_points;
                     *excluded_by_class.entry(class.into()).or_default() += class_points;
+                } else {
+                    *head_by_class.entry(class.into()).or_default() += class_points;
                 }
             }
             // Points the classes do not account for have no known class, so
@@ -1052,14 +1054,17 @@ mod tests {
     }
 
     #[test]
-    fn head_pace_counts_head_and_unlabelled_classes_but_not_worker_classes() {
+    fn head_pace_excludes_only_delegated_classes() {
         // OpenCode copies its agent name into the work class, so a worker that
-        // runs inside OpenCode arrives under the `opencode` producer. Only
-        // `Alfonso` is a head here; Pi and Claude Code record no class.
+        // runs inside OpenCode arrives under the `opencode` producer. `build`
+        // and `plan` are OpenCode's own interactive agents and `night-shift`
+        // is a name routing does not know: all three count as head demand, as
+        // do Alfonso and the unlabelled Pi and Claude Code usage.
         let from = 1_791_532_800_000;
         let mut reply = pace_reply("claude", from, 2, |hour| {
             let mut rows = vec![
                 ("opencode", "Alfonso", 0.5),
+                ("opencode", "build", 0.25),
                 ("opencode", "mason", 3.0),
                 ("opencode", "sidekick", 0.25),
                 ("pi", "unlabelled", 1.0),
@@ -1067,8 +1072,11 @@ mod tests {
                 ("broca", "mason", 5.0),
                 ("broca", "unlabelled", 2.0),
             ];
-            if hour == 1 {
+            if hour == 0 {
+                rows.push(("opencode", "plan", 0.125));
+            } else {
                 rows.extend([
+                    ("opencode", "night-shift", 0.5),
                     ("opencode", "consult", 0.125),
                     ("opencode", "explore", 0.0625),
                     ("opencode", "librarian", 0.0625),
@@ -1083,13 +1091,20 @@ mod tests {
         let to = from + 2 * PACE_HOUR_MS;
 
         let pace = head_pace_breakdown(&reply, "claude", from, to).unwrap();
-        // Per hour: Alfonso 0.5 + Pi 1.0 + Claude Code 0.25, plus 0.5 / 2 hours
-        // of unclassified OpenCode usage. Broca and every worker class are out.
+        // Per hour: Alfonso 0.5 + build 0.25 + plan 0.0625 + night-shift 0.25
+        // + Pi 1.0 + Claude Code 0.25 + 0.5 / 2 hours of unclassified OpenCode
+        // usage = 2.5625. Broca and the delegated classes are out.
         assert_eq!(pace.window_hours, 2);
-        assert_eq!(pace.head_points_per_hour, 2.0);
+        assert_eq!(pace.head_points_per_hour, 2.5625);
         assert_eq!(
             pace.head_by_work_class,
-            BTreeMap::from([("Alfonso".into(), 0.5), ("unlabelled".into(), 1.5)])
+            BTreeMap::from([
+                ("Alfonso".into(), 0.5),
+                ("build".into(), 0.25),
+                ("night-shift".into(), 0.25),
+                ("plan".into(), 0.0625),
+                ("unlabelled".into(), 1.5),
+            ])
         );
         assert_eq!(
             pace.excluded_worker_points_per_hour,
@@ -1112,10 +1127,10 @@ mod tests {
             NOW,
         );
         let pool = &pools.pools["anthropic"];
-        assert_eq!(pool.plans[0].head_points_per_hour, Some(2.0));
+        assert_eq!(pool.plans[0].head_points_per_hour, Some(2.5625));
         let detail: Value = serde_json::from_str(&pool.reserve_diagnostic(20.0, false)).unwrap();
-        assert_eq!(detail["plans"][0]["headPointsPerHour"], 2.0);
-        assert_eq!(detail["headPace"]["headPointsPerHour"], 2.0);
+        assert_eq!(detail["plans"][0]["headPointsPerHour"], 2.5625);
+        assert_eq!(detail["headPace"]["headPointsPerHour"], 2.5625);
         assert_eq!(detail["headPace"]["headByWorkClass"]["unlabelled"], 1.5);
         assert_eq!(
             detail["headPace"]["excludedWorkerPointsPerHour"]["mason"],
