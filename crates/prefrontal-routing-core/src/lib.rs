@@ -16,6 +16,7 @@ pub mod accounts;
 pub mod billing;
 pub mod break_glass;
 pub mod failure_backoff;
+pub mod key_pool;
 pub mod launch_policy;
 pub mod model_facts;
 pub mod model_facts_seed;
@@ -32,6 +33,7 @@ pub mod route_scoring;
 pub mod route_state_store;
 pub mod routing_config;
 pub mod runner;
+pub mod score_alias;
 pub mod seat_routing;
 pub mod slot_saturation;
 pub mod subscription;
@@ -85,7 +87,7 @@ pub use model_router::{
     NoRouteError, ObjectiveBreakdown, PricingMode, PromptParams, RejectedCandidate, RejectedRoute,
     RequiredCapabilities, RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
     SelectedModel, SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED,
-    REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
+    REASON_EXCLUDED_BY_OPERATOR, REASON_EXPLICIT_ONLY_PROVIDER, REASON_NOT_AVAILABLE,
 };
 pub use panel::{
     select_panel, select_panel_with_config, validate_panel_spec, AvailabilitySubstrate,

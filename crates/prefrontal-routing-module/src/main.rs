@@ -21,6 +21,7 @@ mod available_models_text;
 mod broca_credentials;
 mod config_overrides;
 mod fusiform_catalog;
+mod key_pool;
 mod model_resolution;
 mod quota_consumer;
 mod retention;
@@ -872,6 +873,10 @@ where
         store.get_facts(),
         broca_credentials.lock(),
     ) {
+        credentials.set_score_alias(
+            config_overrides::read_operator_routing_policy(&config_overrides::config_path())
+                .score_alias,
+        );
         credentials.refresh_serving_methods(&accounts, &facts, now_ms() as i64);
     }
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
@@ -2227,9 +2232,11 @@ async fn handle_model_facts(
     // anything (it reads 0 on every row), so serving it raw told every inventory
     // consumer that nothing is excluded while routing was excluding 30+ routes.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
+    // Explicit-only providers are not excluded: a pin still admits them.
     let exclusions = ExclusionSpecs::parse(ExclusionPolicy {
         operator: &operator_policy.exclude,
         caller: &[],
+        explicit_only: &[],
     });
     for fact in &mut facts {
         let route_key = make_route_key(
@@ -2837,6 +2844,20 @@ async fn handle_select_request(
     if envelope.method == ROUTE_LIST_UNSCORED_OP {
         return handle_list_unscored(frame, writer, store).await;
     }
+    if key_pool::handles(&envelope.method) {
+        let policy = config_overrides::read_operator_routing_policy(operator_config_path);
+        let reply = key_pool::handle(
+            &envelope.method,
+            &frame.body,
+            &key_pool::PoolCtx {
+                store: store.as_ref(),
+                credentials: broca_credentials,
+                policy: &policy,
+                now_ms: now_ms() as i64,
+            },
+        );
+        return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
+    }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(
             frame,
@@ -2886,12 +2907,20 @@ async fn handle_select_request(
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     let availability = if is_broca_substrate(params.substrate.as_deref()) {
         match store.get_facts() {
-            Ok(facts) => select_availability(
-                params.substrate.as_deref(),
-                std::mem::take(&mut params.available_models),
-                &facts,
-                broca_credentials,
-            ),
+            Ok(mut facts) => {
+                // Aliased providers are reachable through their own credentials,
+                // so their borrowed rows join the served-route join.
+                prefrontal_routing_core::score_alias::append_alias_rows(
+                    &mut facts,
+                    &operator_policy.score_alias,
+                );
+                select_availability(
+                    params.substrate.as_deref(),
+                    std::mem::take(&mut params.available_models),
+                    &facts,
+                    broca_credentials,
+                )
+            }
             Err(e) => {
                 return send_route_error(
                     writer,
@@ -2980,6 +3009,12 @@ async fn handle_select_request(
         policy_revision,
     };
 
+    // Borrowed rows are added after the live overlays so they carry the target's
+    // current quality data, and before pricing so they get their own plane.
+    prefrontal_routing_core::score_alias::append_alias_rows(
+        &mut facts,
+        &operator_policy.score_alias,
+    );
     if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(&mut facts);
     }
@@ -3024,6 +3059,20 @@ async fn handle_select_request(
     let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
 
     if let Some(pin) = params.model_pin.as_deref() {
+        if let Some(refusal) =
+            host_runner_pin_refusal(&operator_policy, params.substrate.as_deref(), [pin])
+        {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                PROVIDER_REQUIRES_RUNNER_PIN,
+                &refusal,
+            )
+            .await;
+        }
         let sub = subscription_keys.clone();
         let selection = work_model_pin::select(
             pin,
@@ -3035,6 +3084,8 @@ async fn handle_select_request(
                 runtime_snapshot: Some(snapshot.clone()),
                 exclude_route_keys: exclude.clone(),
                 operator_exclude_keys: operator_exclude.clone(),
+                // A pin is the explicit choice explicit-only providers wait for.
+                explicit_only_providers: Vec::new(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                     sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
@@ -3073,13 +3124,51 @@ async fn handle_select_request(
                     Some(&provenance),
                     Some(&policy_sources_line(&operator_policy)),
                 );
+                // A pinned Broca launch carries its launch target. For a provider
+                // that exists only as a vault credential mapping this is the only
+                // place its credential pin is decided, so an unresolvable mapping
+                // refuses the pin before any decision is recorded.
+                let runner = if is_broca_substrate(params.substrate.as_deref()) {
+                    let session = pool_session(
+                        params.task_id.as_deref(),
+                        params.send_id.as_deref(),
+                        &format!("route.select:{}", now as i64),
+                    );
+                    match runner_for_route(
+                        &operator_policy,
+                        broca_credentials,
+                        store.as_ref(),
+                        &session,
+                        &selected.model.provider_id,
+                        &selected.model.model_id,
+                        selected.prompt_params.variant.as_deref(),
+                    ) {
+                        Ok(runner) => Some(runner),
+                        Err((code, message)) => {
+                            return send_route_error(
+                                writer, ver, channel, epoch, corr, &code, &message,
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let decision_id = store
                     .record_decision(&decision)
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
-                let body = serde_json::to_vec(&json!({"result": {
+                let mut result = json!({
                     "selected": selected, "decisionID": decision_id,
                     "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities}
-                }})).map_err(ModuleError::Json)?;
+                });
+                if let Some((runner, grant)) = runner {
+                    result["runner"] = json!(runner);
+                    if let Some(grant) = grant {
+                        result["poolLease"] = grant.lease_json();
+                    }
+                }
+                let body =
+                    serde_json::to_vec(&json!({"result": result})).map_err(ModuleError::Json)?;
                 let response = Frame::build_with_version(
                     ver,
                     FrameType::Response,
@@ -3118,6 +3207,7 @@ async fn handle_select_request(
                 runtime_snapshot: Some(snap),
                 exclude_route_keys: exclude.clone(),
                 operator_exclude_keys: operator_exclude.clone(),
+                explicit_only_providers: operator_policy.explicit_only_providers.clone(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                     sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
@@ -3241,12 +3331,31 @@ async fn handle_select_request(
                         }))).collect::<Vec<_>>(),
                     });
                     if is_broca_substrate(params.substrate.as_deref()) {
-                        result["runner"] =
-                            json!(prefrontal_routing_core::runner::RunnerModel::broca(
-                                &selected.model.provider_id,
-                                &selected.model.model_id,
-                                selected.prompt_params.variant.as_deref(),
-                            ));
+                        // Automatic selection never admits an explicit-only provider, so this
+                        // resolves to the ordinary provider translation. Going through
+                        // runner_for_route keeps one rule for every launch target.
+                        let session = pool_session(
+                            params.task_id.as_deref(),
+                            params.send_id.as_deref(),
+                            &decision_id,
+                        );
+                        match runner_for_route(
+                            &operator_policy,
+                            broca_credentials,
+                            store.as_ref(),
+                            &session,
+                            &selected.model.provider_id,
+                            &selected.model.model_id,
+                            selected.prompt_params.variant.as_deref(),
+                        ) {
+                            Ok((runner, _)) => result["runner"] = json!(runner),
+                            Err((code, message)) => {
+                                return send_route_error(
+                                    writer, ver, channel, epoch, corr, &code, &message,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     let body = serde_json::to_vec(&json!({ "result": result }))
                         .map_err(ModuleError::Json)?;
@@ -3350,6 +3459,89 @@ fn panel_availability(
     (substrate, available.into_iter().collect())
 }
 
+/// Refusal code for a pinned route whose provider Broca reaches only through a
+/// per-send credential pin, requested for a substrate that cannot carry one.
+const PROVIDER_REQUIRES_RUNNER_PIN: &str = "provider_requires_runner_pin";
+
+fn needs_runner_pin(policy: &ModelRoutingPolicyInput, provider: &str) -> bool {
+    key_pool::is_pool_provider(policy, provider)
+}
+
+/// The Broca launch target for a selected route: the plain translation for an
+/// ordinary provider. For an explicit-only key-pool provider it leases a key for
+/// `session` from the pool and returns the target that pins it, with the grant;
+/// a pool that cannot be resolved or has no admissible key refuses by name.
+fn runner_for_route(
+    policy: &ModelRoutingPolicyInput,
+    credentials: &SharedBrocaCredentials,
+    store: &SqliteRouteStateStore,
+    session: &str,
+    provider: &str,
+    model: &str,
+    variant: Option<&str>,
+) -> Result<
+    (
+        prefrontal_routing_core::runner::RunnerModel,
+        Option<key_pool::PoolGrant>,
+    ),
+    (String, String),
+> {
+    if !needs_runner_pin(policy, provider) {
+        return Ok((
+            prefrontal_routing_core::runner::RunnerModel::broca(provider, model, variant),
+            None,
+        ));
+    }
+    let grant = key_pool::acquire(
+        &key_pool::PoolCtx {
+            store,
+            credentials,
+            policy,
+            now_ms: now_ms() as i64,
+        },
+        provider,
+        model,
+        variant,
+        session,
+    )
+    .map_err(|refusal| (refusal.code, refusal.message))?;
+    Ok((grant.runner.clone(), Some(grant)))
+}
+
+/// The session a selection's pool lease belongs to: the caller's task, else its
+/// send, else this decision alone (its lease then simply expires).
+fn pool_session(task_id: Option<&str>, send_id: Option<&str>, fallback: &str) -> String {
+    task_id
+        .or(send_id)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+/// A pinned route on a provider that needs a per-send credential pin can only
+/// run on Broca: the host plugins send a model with no auth selection, so the
+/// send would silently land on the provider's default logins. Refuse such pins
+/// by name for every other substrate.
+fn host_runner_pin_refusal<'a>(
+    policy: &ModelRoutingPolicyInput,
+    requested_substrate: Option<&str>,
+    pinned_routes: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    if is_broca_substrate(requested_substrate) {
+        return None;
+    }
+    pinned_routes.into_iter().find_map(|route| {
+        let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
+        needs_runner_pin(policy, provider).then(|| {
+            format!(
+                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, and this request names substrate {}. {provider} can be used through spec and Athena panel roster pins and core-side Broca launches; a `work run model=` launched through the host plugin cannot use it until the host plugin passes substrate \"broca\" to route.select",
+                requested_substrate.unwrap_or("none (the host plugin's launch path)")
+            )
+        })
+    })
+}
+
 fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
     requested_substrate.map(str::trim) == Some("broca")
 }
@@ -3449,6 +3641,24 @@ async fn handle_select_panel(
     if let Err(e) = validate_panel_spec(&params.panel_spec) {
         return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &e.0).await;
     }
+    if params.selection == PanelSelection::Roster {
+        if let Some(refusal) = host_runner_pin_refusal(
+            &config_overrides::read_operator_routing_policy(operator_config_path),
+            params.substrate.as_deref(),
+            params.roster.iter().map(|entry| entry.model.as_str()),
+        ) {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                PROVIDER_REQUIRES_RUNNER_PIN,
+                &refusal,
+            )
+            .await;
+        }
+    }
     if let Err(error) = config_overrides::reload_live_multipliers(routing_config_path) {
         eprintln!(
             "[prefrontal-routing] live route multiplier reload failed (using no multipliers): {error}"
@@ -3479,19 +3689,24 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
-    if let Ok(credentials) = broca_credentials.lock() {
-        credentials.price_facts(&mut prepared.facts);
-    }
-    warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     // Explicit roster pins bypass exclusions; automatic seats and replacements
     // receive both the operator fence and this request's own exclusions, whether
     // or not a package size was supplied. Subscription classification is owned by
     // routing rather than the caller.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
+    prefrontal_routing_core::score_alias::append_alias_rows(
+        &mut prepared.facts,
+        &operator_policy.score_alias,
+    );
+    if let Ok(credentials) = broca_credentials.lock() {
+        credentials.price_facts(&mut prepared.facts);
+    }
+    warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
         &ModelRoutingPolicyInput {
             subscription: operator_policy.subscription.clone(),
+            score_alias: operator_policy.score_alias.clone(),
             ..ModelRoutingPolicyInput::default()
         },
         &ModelRoutingPolicyInput::default(),
@@ -3521,7 +3736,7 @@ async fn handle_select_panel(
             prepared.snapshot.clone(),
         );
     }
-    let panel = match select_panel_with_config(
+    let mut panel = match select_panel_with_config(
         SelectPanelInput {
             package_tokens: params.package_tokens,
             panel_spec: params.panel_spec.clone(),
@@ -3531,6 +3746,7 @@ async fn handle_select_panel(
             runtime_snapshot: Some(prepared.snapshot),
             exclude_route_keys: params.exclude_route_keys.clone(),
             operator_exclude_keys: operator_policy.exclude.clone(),
+            explicit_only_providers: operator_policy.explicit_only_providers.clone(),
             required_capabilities: params.required_capabilities,
             available_models,
             availability_substrate,
@@ -3547,6 +3763,56 @@ async fn handle_select_panel(
                 .await;
         }
     };
+    // A roster seat on a provider that exists only as a vault credential mapping
+    // carries its launch target and pin in its prompt params, the same place a
+    // single route.select reply puts `runner` for core's durable payloads.
+    if is_broca_substrate(params.substrate.as_deref()) {
+        for (slot, member) in panel.members.iter_mut().enumerate() {
+            let Some((provider, model)) = member.route_key.split_once('/') else {
+                continue;
+            };
+            if !needs_runner_pin(&operator_policy, provider) {
+                continue;
+            }
+            let variant = member
+                .prompt_params
+                .get("variant")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            // Each seat is its own session for the key pool: seats spread over
+            // the keys and each keeps its own prompt-cache workspace.
+            let session = format!(
+                "{}#seat{slot}",
+                pool_session(
+                    params.task_id.as_deref(),
+                    params.send_id.as_deref(),
+                    &format!("route.select_panel:{}", now_ms())
+                )
+            );
+            match runner_for_route(
+                &operator_policy,
+                broca_credentials,
+                store.as_ref(),
+                &session,
+                provider,
+                model,
+                variant.as_deref(),
+            ) {
+                Ok((runner, grant)) => {
+                    member.prompt_params.insert("runner".into(), json!(runner));
+                    if let Some(grant) = grant {
+                        member
+                            .prompt_params
+                            .insert("poolLease".into(), grant.lease_json());
+                    }
+                }
+                Err((code, message)) => {
+                    return send_route_error(writer, ver, channel, epoch, corr, &code, &message)
+                        .await;
+                }
+            }
+        }
+    }
     let decision = panel_decision_input(
         &params,
         &panel,
@@ -4688,6 +4954,45 @@ async fn send_no_route(
     send(writer, frame).await
 }
 
+/// Send a key-pool reply: a `{"result": ...}` response, or an error frame
+/// carrying the typed refusal code and its detail (for an exhausted pool, every
+/// key with its reason and reset).
+async fn send_pool_reply(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    reply: Result<serde_json::Value, key_pool::PoolRefusal>,
+) -> Result<(), ModuleError> {
+    let (ty, body) = match reply {
+        Ok(result) => (
+            FrameType::Response,
+            serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?,
+        ),
+        Err(refusal) => (
+            FrameType::Error,
+            serde_json::to_vec(&ErrorBody {
+                code: refusal.code,
+                message: refusal.message,
+                detail: refusal.detail,
+            })
+            .map_err(ModuleError::Json)?,
+        ),
+    };
+    let frame = Frame::build_with_version(
+        ver,
+        ty,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|e| ModuleError::Message(e.to_string()))?;
+    send(writer, frame).await
+}
+
 async fn send_route_error(
     writer: &mpsc::Sender<Frame>,
     ver: u8,
@@ -4801,12 +5106,24 @@ fn handles(method: &str) -> bool {
             | account_selection::ACCOUNT_OBSERVE_OP
             | account_selection::ACCOUNT_RELEASE_OP
             | account_selection::ACCOUNT_SHADOW_STATUS_OP
-    )
+    ) || key_pool::handles(method)
 }
 
 /// Operations registered in HELLO and exposed by `--print-manifest`.
 fn served_operations() -> Vec<ManagementOperation> {
-    vec![
+    let pool_operations = [
+        key_pool::POOL_ACQUIRE_OP,
+        key_pool::POOL_RENEW_OP,
+        key_pool::POOL_RELEASE_OP,
+        key_pool::POOL_WALL_OP,
+    ]
+    .into_iter()
+    .map(|name| ManagementOperation {
+        name: name.to_string(),
+        kind: ManagementOperationKind::Mutate,
+        description: None,
+    });
+    let mut operations = vec![
         // route.select is a mutation because it records the decision it returns.
         ManagementOperation {
             name: ROUTE_SELECT_OP.to_string(),
@@ -4976,7 +5293,9 @@ fn served_operations() -> Vec<ManagementOperation> {
                     .to_string(),
             ),
         },
-    ]
+    ];
+    operations.extend(pool_operations);
+    operations
 }
 
 #[derive(Serialize)]
@@ -10558,6 +10877,653 @@ mod tests {
         assert!(body.get("result").is_none());
     }
 
+    /// The routing file for the paid Anthropic API key: an explicit-only routing
+    /// provider whose rows are borrowed from `anthropic`.
+    fn platform_operator_config(rig: &Rig) -> PathBuf {
+        let path = rig.dir.join("alfonso-routing.jsonc");
+        std::fs::write(
+            &path,
+            r#"{ "model_routing": {
+                "explicit_only_providers": ["anthropic-platform"],
+                "score_alias": { "anthropic-platform": "anthropic" }
+            } }"#,
+        )
+        .unwrap();
+        path
+    }
+
+    /// A vault listing whose rows map `provider_ids` as given. `account_id` is
+    /// the key's workspace, deliberately different from the id's label.
+    fn platform_listing(rows: &[(&str, &[&str])]) -> SharedBrocaCredentials {
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: rows
+                    .iter()
+                    .map(
+                        |(id, providers)| prefrontal_ckcred_client::ListedCredential {
+                            id: (*id).into(),
+                            categories: vec!["llm-provider".into()],
+                            credential_type: if id.starts_with("apikey:") {
+                                "apikey"
+                            } else {
+                                "oauth"
+                            }
+                            .into(),
+                            state: "active".into(),
+                            provider_ids: providers.iter().map(|p| (*p).into()).collect(),
+                            account_id: Some("workspace-7".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .collect(),
+                view: format!("platform-view-{}", rows.len()),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        credentials
+    }
+
+    async fn platform_select(
+        label: &str,
+        params: serde_json::Value,
+        credentials: &SharedBrocaCredentials,
+        wall_subscription: bool,
+    ) -> (serde_json::Value, Rig, SharedStore) {
+        let rig = Rig::new(label);
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+            .unwrap();
+        if wall_subscription {
+            // Every subscription route is quota-walled, so failover (and its
+            // break-glass retry) has nothing on the logins left to move to.
+            for stored in store.get_facts().unwrap() {
+                if stored.provider_id != "anthropic" {
+                    continue;
+                }
+                let key = make_route_key(
+                    &stored.provider_id,
+                    &stored.model_id,
+                    stored.variant.as_deref(),
+                );
+                store
+                    .update_route_state(
+                        &key,
+                        &make_capacity_key(&stored.provider_id, &stored.model_id),
+                        &prefrontal_routing_core::RouteStateUpdate {
+                            quota_exhausted_until: Some(2_000_000_000_000.0),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let config = platform_operator_config(&rig);
+        let frame = run_route_wire_request_with_paths(
+            &store,
+            json!({"method": "route.select", "params": params}),
+            &config,
+            credentials,
+        )
+        .await;
+        (serde_json::from_slice(&frame.body).unwrap(), rig, store)
+    }
+
+    fn recorded_rejections(store: &SharedStore, send_id: &str) -> serde_json::Value {
+        let row = store
+            .get_decision_by_send_id(send_id)
+            .unwrap()
+            .expect("the selection recorded a decision");
+        serde_json::from_str(&row.rejected_json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn automatic_selection_never_returns_an_explicit_only_provider() {
+        // Broca can reach only the paid key: the subscription login is absent.
+        let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
+        let (body, _rig, store) = platform_select(
+            "platform-auto-only",
+            json!({"targetAgent": "explore", "requirements": {"iq": 30, "eq": 0},
+                   "substrate": "broca", "sendID": "auto-only"}),
+            &credentials,
+            false,
+        )
+        .await;
+        assert!(
+            body.get("result").is_none(),
+            "auto selection took the paid key: {body}"
+        );
+        // The recorded rejections name the explicit-only restriction. Long lists
+        // are summarized by reason, so the reason is checked rather than one row.
+        let rejected = recorded_rejections(&store, "auto-only").to_string();
+        assert!(rejected.contains("explicit_only_provider"), "{rejected}");
+    }
+
+    #[tokio::test]
+    async fn failover_and_reroute_never_fall_to_the_explicit_only_provider() {
+        let credentials = platform_listing(&[
+            ("oauth:anthropic:ysample", &["anthropic"]),
+            ("apikey:anthropic", &["anthropic-platform"]),
+        ]);
+        // Reroute: every subscription route is excluded by the caller, so the paid
+        // key is the only reachable route left.
+        let (rerouted, _rig, _store) = platform_select(
+            "platform-reroute",
+            json!({"targetAgent": "explore", "requirements": {"iq": 30, "eq": 0},
+                   "substrate": "broca", "excludeRouteKeys": ["anthropic"]}),
+            &credentials,
+            false,
+        )
+        .await;
+        assert!(
+            rerouted.get("result").is_none(),
+            "reroute fell to the paid key: {rerouted}"
+        );
+        // Failover past a quota wall, including the break-glass retry.
+        let (walled, _rig, store) = platform_select(
+            "platform-failover",
+            json!({"targetAgent": "explore", "requirements": {"iq": 30, "eq": 0},
+                   "substrate": "broca", "sendID": "failover"}),
+            &credentials,
+            true,
+        )
+        .await;
+        let chosen = walled["result"]["selected"]["routeKey"]
+            .as_str()
+            .unwrap_or("");
+        assert!(!chosen.starts_with("anthropic-platform/"), "{walled}");
+        if walled.get("result").is_none() {
+            let rejected = recorded_rejections(&store, "failover");
+            assert!(
+                rejected.to_string().contains("explicit_only_provider"),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pinned_selection_admits_the_explicit_only_provider_with_its_key_pin() {
+        let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
+        let (body, _rig, _store) = platform_select(
+            "platform-pin",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1"}),
+            &credentials,
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["result"]["selected"]["routeKey"], "anthropic-platform/claude-opus-4-1",
+            "{body}"
+        );
+        // The pin's account is the credential's label, never its workspace.
+        let session = body["result"]["runner"]["pool_session"].clone();
+        assert!(session.is_string(), "{body}");
+        assert_eq!(
+            body["result"]["runner"],
+            json!({"provider": "anthropic", "model": "claude-opus-4-1",
+                   "auth": {"method": "apikey", "account": "work"},
+                   "pool": "anthropic-platform", "pool_session": session}),
+            "{body}"
+        );
+        assert_eq!(
+            body["result"]["poolLease"]["credentialId"],
+            "apikey:anthropic:work"
+        );
+        assert_eq!(body["result"]["poolLease"]["workspace"], "workspace-7");
+        // Pricing is the target's API plane under the key's own method, never
+        // a subscription view.
+        let plane = &body["result"]["billingPlanes"];
+        assert!(
+            plane.is_null() || !plane.to_string().contains("oauth"),
+            "{plane}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_key_pool_spreads_walls_keys_and_refuses_without_falling_back() {
+        // Two keys of one workspace; the second key's label differs from its
+        // workspace (`account_id`), and only the label goes in the pin.
+        let credentials = platform_listing(&[
+            ("apikey:anthropic", &["anthropic-platform"]),
+            ("apikey:anthropic:work", &["anthropic-platform"]),
+        ]);
+        let rig = Rig::new("platform-pool");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+            .unwrap();
+        let config = platform_operator_config(&rig);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": method, "params": params}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        let acquire = |session: &'static str| {
+            call(
+                "route.pool_acquire",
+                json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": session}),
+            )
+        };
+        // Spread: two concurrent sessions take the two keys.
+        let first = acquire("ses-1").await;
+        let second = acquire("ses-2").await;
+        let keys = [
+            first["result"]["credentialId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            second["result"]["credentialId"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        ];
+        assert_ne!(keys[0], keys[1], "{first} {second}");
+        let work = if keys[0] == "apikey:anthropic:work" {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(work["result"]["workspace"], "workspace-7");
+        assert_eq!(
+            work["result"]["runner"]["auth"],
+            json!({"method": "apikey", "account": "work"}),
+            "the pin carries the key's label, never its workspace: {work}"
+        );
+        assert_eq!(work["result"]["runner"]["provider"], "anthropic");
+        assert_eq!(work["result"]["runner"]["pool"], "anthropic-platform");
+
+        // ses-1's key is walled, so its revival is handed the remaining key and its pin.
+        let walled_key = keys[0].clone();
+        let wall = call(
+            "route.pool_wall",
+            json!({"provider": "anthropic-platform", "credentialId": walled_key,
+                   "kind": "billing_exhausted", "untilMs": now_ms() as i64 + 3_600_000}),
+        )
+        .await;
+        assert_eq!(wall["result"]["ok"], true, "{wall}");
+        let revival = acquire("ses-1").await;
+        assert_eq!(
+            revival["result"]["credentialId"],
+            keys[1].as_str(),
+            "{revival}"
+        );
+
+        // Every key walled: a named refusal listing each key, never a subscription route.
+        call(
+            "route.pool_wall",
+            json!({"provider": "anthropic-platform", "credentialId": keys[1],
+                   "kind": "rate_limited", "untilMs": now_ms() as i64 + 30_000}),
+        )
+        .await;
+        let refused = acquire("ses-3").await;
+        assert_eq!(
+            refused["code"], "explicit_provider_pool_exhausted",
+            "{refused}"
+        );
+        let reasons: Vec<&str> = refused["detail"]["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons.len(), 2, "{refused}");
+        assert!(reasons.contains(&"billing_exhausted") && reasons.contains(&"rate_limited"));
+        let pinned = call(
+            "route.select",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1",
+                   "taskId": "ses-4"}),
+        )
+        .await;
+        assert_eq!(
+            pinned["code"], "explicit_provider_pool_exhausted",
+            "{pinned}"
+        );
+        assert!(
+            pinned.get("result").is_none(),
+            "no fallback route: {pinned}"
+        );
+
+        // A host substrate cannot carry the pin at all.
+        let host = call(
+            "route.select",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "availableModels": ["anthropic-platform/claude-opus-4-1"],
+                   "modelPin": "anthropic-platform/claude-opus-4-1"}),
+        )
+        .await;
+        assert_eq!(host["code"], "provider_requires_runner_pin", "{host}");
+        let message = host["message"].as_str().unwrap();
+        for part in [
+            "spec and Athena panel",
+            "core-side Broca launches",
+            "work run model=",
+            "passes substrate",
+        ] {
+            assert!(
+                message.contains(part),
+                "the refusal names {part:?}: {message}"
+            );
+        }
+    }
+
+    /// The first real key, as CKCRED lists it: a labelled id, active,
+    /// llm-provider, mapped to `anthropic-platform`, and no `account_id`. Every
+    /// real key carries a label, so the pin always names it; with no
+    /// `account_id` the key is its own prompt-cache workspace.
+    #[tokio::test]
+    async fn the_first_real_platform_key_pins_its_label_and_is_its_own_workspace() {
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: vec![prefrontal_ckcred_client::ListedCredential {
+                    id: "apikey:anthropic:wsampleyahoo".into(),
+                    categories: vec!["llm-provider".into()],
+                    credential_type: "apikey".into(),
+                    state: "active".into(),
+                    provider_ids: vec!["anthropic-platform".into()],
+                    account_id: None,
+                    ..Default::default()
+                }],
+                view: "ckcred-first-real-key".into(),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        let (body, _rig, _store) = platform_select(
+            "platform-first-real-key",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1",
+                   "taskId": "bg_first_key"}),
+            &credentials,
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["result"]["runner"]["auth"],
+            json!({"method": "apikey", "account": "wsampleyahoo"}),
+            "a labelled key never pins without its account: {body}"
+        );
+        assert_eq!(body["result"]["runner"]["provider"], "anthropic");
+        assert_eq!(
+            body["result"]["poolLease"]["credentialId"],
+            "apikey:anthropic:wsampleyahoo"
+        );
+        assert_eq!(
+            body["result"]["poolLease"]["workspace"], "key:apikey:anthropic:wsampleyahoo",
+            "no account_id: the key is its own workspace"
+        );
+    }
+
+    /// A vault listing with explicit rows: (id, provider_ids, account_id).
+    fn vault_listing(rows: &[(&str, &[&str], Option<&str>)]) -> SharedBrocaCredentials {
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: rows
+                    .iter()
+                    .map(
+                        |(id, providers, account)| prefrontal_ckcred_client::ListedCredential {
+                            id: (*id).into(),
+                            categories: vec!["llm-provider".into()],
+                            credential_type: if id.starts_with("apikey:") {
+                                "apikey"
+                            } else {
+                                "oauth"
+                            }
+                            .into(),
+                            state: "active".into(),
+                            provider_ids: providers.iter().map(|p| (*p).into()).collect(),
+                            account_id: account.map(str::to_string),
+                            ..Default::default()
+                        },
+                    )
+                    .collect(),
+                view: format!("vault-view-{}", rows.len()),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        credentials
+    }
+
+    /// The live vault: four labelled Anthropic API keys mapped to the pool, a
+    /// key whose id looks like a pool key but is not mapped to it, and a
+    /// subscription login sharing the label `ysample`. Membership comes from the
+    /// mapping alone, keyed on the full credential id.
+    #[tokio::test]
+    async fn the_pool_is_the_mapped_api_keys_and_never_a_login_with_the_same_label() {
+        let platform: &[&str] = &["anthropic-platform"];
+        let credentials = vault_listing(&[
+            ("apikey:anthropic:wsampleyahoo", platform, None),
+            ("apikey:anthropic:wsamplegmail", platform, None),
+            ("apikey:anthropic:usersamplegmail", platform, None),
+            ("apikey:anthropic:ysample", platform, None),
+            ("apikey:anthropic:unmapped", &["anthropic"], None),
+            ("oauth:anthropic:ysample", &["anthropic"], Some("acct-ysample")),
+        ]);
+        let mut members: Vec<String> = credentials
+            .lock()
+            .unwrap()
+            .pool_keys("anthropic-platform", now_ms())
+            .unwrap()
+            .into_iter()
+            .map(|key| key.credential_id)
+            .collect();
+        members.sort();
+        assert_eq!(
+            members,
+            vec![
+                "apikey:anthropic:usersamplegmail",
+                "apikey:anthropic:wsamplegmail",
+                "apikey:anthropic:wsampleyahoo",
+                "apikey:anthropic:ysample",
+            ],
+            "an apikey:anthropic: id not mapped to the provider is not a member"
+        );
+        // Even a login wrongly mapped to the pool is never a member.
+        let misconfigured = vault_listing(&[
+            ("apikey:anthropic:ysample", platform, None),
+            ("oauth:anthropic:ysample", platform, Some("acct-ysample")),
+        ]);
+        let keys = misconfigured
+            .lock()
+            .unwrap()
+            .pool_keys("anthropic-platform", now_ms())
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].credential_id, "apikey:anthropic:ysample");
+
+        // Four sessions spread over the four keys; a wall recorded on the
+        // subscription login's id never touches the API key sharing its label.
+        let rig = Rig::new("platform-live-vault");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+            .unwrap();
+        let config = platform_operator_config(&rig);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": method, "params": params}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        call(
+            "route.pool_wall",
+            json!({"provider": "anthropic-platform", "credentialId": "oauth:anthropic:ysample",
+                   "kind": "billing_exhausted", "untilMs": now_ms() as i64 + 3_600_000}),
+        )
+        .await;
+        let mut leased = Vec::new();
+        for session in ["s1", "s2", "s3", "s4"] {
+            let reply = call(
+                "route.pool_acquire",
+                json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": session}),
+            )
+            .await;
+            let id = reply["result"]["credentialId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{reply}"))
+                .to_string();
+            let label = id.rsplit(':').next().unwrap().to_string();
+            assert_eq!(
+                reply["result"]["runner"]["auth"],
+                json!({"method": "apikey", "account": label}),
+                "the pin names the key's own label: {reply}"
+            );
+            leased.push(id);
+        }
+        leased.sort();
+        assert_eq!(
+            leased, members,
+            "four concurrent runs take the four keys, apikey:anthropic:ysample included"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_launch_and_its_sends_share_one_pool_lease() {
+        // Selection leases under the caller's task; the launch target carries
+        // that session, and the first send acquires under it again. One launch
+        // must be one run in flight, never two for the lease's lifetime.
+        let credentials = platform_listing(&[
+            ("apikey:anthropic", &["anthropic-platform"]),
+            ("apikey:anthropic:work", &["anthropic-platform"]),
+        ]);
+        let (body, rig, store) = platform_select(
+            "platform-one-lease",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1",
+                   "taskId": "bg_launch"}),
+            &credentials,
+            false,
+        )
+        .await;
+        let runner = &body["result"]["runner"];
+        assert_eq!(runner["pool_session"], "bg_launch", "{body}");
+        let selected_lease = body["result"]["poolLease"]["leaseId"].clone();
+        let config = platform_operator_config(&rig);
+        let frame = run_route_wire_request_with_paths(
+            &store,
+            json!({"method": "route.pool_acquire", "params": {
+                "provider": "anthropic-platform", "model": "claude-opus-4-1",
+                "session": runner["pool_session"]}}),
+            &config,
+            &credentials,
+        )
+        .await;
+        let send: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            send["result"]["leaseId"], selected_lease,
+            "the send reuses the selection's lease: {send}"
+        );
+        let in_flight: u32 = store
+            .pool_key_states("anthropic-platform", now_ms() as i64)
+            .unwrap()
+            .values()
+            .map(|state| state.in_flight)
+            .sum();
+        assert_eq!(in_flight, 1, "one launch is one run in flight");
+    }
+
+    #[tokio::test]
+    async fn panels_seat_the_explicit_only_provider_only_from_a_roster_pin() {
+        let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
+        let panel = |label: &'static str, roster: serde_json::Value, selection: &'static str| {
+            let credentials = credentials.clone();
+            async move {
+                let rig = Rig::new(label);
+                let store: SharedStore = Arc::new(rig.open_store());
+                store
+                    .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+                    .unwrap();
+                let config = platform_operator_config(&rig);
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": ROUTE_SELECT_PANEL_OP, "params": {
+                        "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
+                        "selection": selection, "roster": roster, "substrate": "broca",
+                        "taskId": label,
+                    }}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        let automatic = panel("platform-panel-npick", json!([]), "n_pick").await;
+        assert_eq!(automatic["result"]["members"], json!([]), "{automatic}");
+        assert!(
+            automatic.to_string().contains("explicit_only_provider"),
+            "an automatic seat names why the paid key was skipped: {automatic}"
+        );
+        let pinned = panel(
+            "platform-panel-roster",
+            json!([{"model": "anthropic-platform/claude-opus-4-1"}]),
+            "roster",
+        )
+        .await;
+        let member = &pinned["result"]["members"][0];
+        assert_eq!(
+            member["routeKey"], "anthropic-platform/claude-opus-4-1",
+            "{pinned}"
+        );
+        assert_eq!(
+            member["promptParams"]["runner"]["auth"],
+            json!({"method": "apikey", "account": "work"}),
+            "{pinned}"
+        );
+    }
+
+    #[test]
+    fn pool_membership_comes_from_the_listing_and_never_guesses() {
+        let listing = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
+        let credentials = listing.lock().unwrap();
+        let keys = credentials
+            .pool_keys("anthropic-platform", now_ms())
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].credential_id, "apikey:anthropic:work");
+        assert_eq!(keys[0].workspace, "workspace-7");
+        assert_eq!(
+            credentials
+                .pool_keys("anthropic-platform-work", now_ms())
+                .unwrap_err()
+                .0,
+            "explicit_provider_credential_unresolved"
+        );
+        assert_eq!(
+            BrocaCredentials::default()
+                .pool_keys("anthropic-platform", now_ms())
+                .unwrap_err()
+                .0,
+            "explicit_provider_credential_unresolved",
+            "an unread listing is unresolved, not a default key"
+        );
+    }
+
     #[tokio::test]
     async fn route_select_skips_a_saturated_provider_for_the_next_adequate_route() {
         let (response, rig) = run_select_wire_request(
@@ -11161,6 +12127,7 @@ mod tests {
                 runtime_snapshot: Some(observation.snapshot.clone()),
                 exclude_route_keys: Vec::new(),
                 operator_exclude_keys: Vec::new(),
+                explicit_only_providers: Vec::new(),
                 required_capabilities: resolved.required_capabilities,
                 is_subscription_route: None,
                 min_best_effort_adequacy: None,

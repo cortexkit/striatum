@@ -17,6 +17,10 @@ use subc_protocol::session::{HealthReport, HealthStatus};
 /// good answer briefly, but cannot assert reachability indefinitely.
 const MAX_AGE_MS: u64 = 15 * 60 * 1000;
 
+/// No credential maps an explicit-only pool provider, or the listing is unknown.
+pub(crate) const EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED: &str =
+    "explicit_provider_credential_unresolved";
+
 #[derive(Debug, Clone, Default)]
 pub struct BrocaCredentials {
     view: Option<String>,
@@ -30,6 +34,11 @@ pub struct BrocaCredentials {
     listed: Vec<ListedCredential>,
     serving: BTreeMap<String, ServingMethod>,
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
+    /// The operator's `model_routing.score_alias` as of the last refresh. An
+    /// aliased provider has no Fusiform plane of its own: its serving method is
+    /// read from the credentials mapped to the alias, and its rates from the
+    /// target provider's catalog under that method.
+    score_alias: std::collections::BTreeMap<String, String>,
     #[cfg(test)]
     pub(crate) legacy_pricing_baseline: bool,
 }
@@ -127,12 +136,22 @@ impl BrocaCredentials {
         true
     }
 
+    /// Replace the score aliases used for serving methods, Fusiform plane keys
+    /// and pricing. Takes effect for serving methods on the next refresh.
+    pub(crate) fn set_score_alias(&mut self, aliases: std::collections::BTreeMap<String, String>) {
+        self.score_alias = aliases;
+    }
+
     pub(crate) fn refresh_serving_methods(
         &mut self,
         state: &crate::account_quota::AccountQuotaState,
         facts: &[ModelFact],
         at_ms: i64,
     ) {
+        // Aliased providers have no stored rows; serve them the borrowed rows
+        // selection will see so their credential method is known.
+        let mut facts = facts.to_vec();
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &self.score_alias);
         self.serving = facts
             .iter()
             .map(|fact| {
@@ -182,10 +201,13 @@ impl BrocaCredentials {
         self.serving
             .iter()
             .filter_map(|(key, method)| {
-                Some((
-                    key.split_once('/')?.0.to_string(),
-                    method.auth_method.clone()?,
-                ))
+                // An aliased provider is priced on its target's plane, the only
+                // one Fusiform knows, under the alias's own credential method.
+                let provider = key.split_once('/')?.0;
+                let provider =
+                    prefrontal_routing_core::score_alias::alias_target(&self.score_alias, provider)
+                        .unwrap_or(provider);
+                Some((provider.to_string(), method.auth_method.clone()?))
             })
             .collect()
     }
@@ -205,7 +227,9 @@ impl BrocaCredentials {
                 .get(&key)
                 .cloned()
                 .unwrap_or_else(|| choose_method(BTreeSet::new(), BTreeSet::new()));
-            fact.billing_plane = Some(self.billing_catalog.for_route(&key, &method));
+            let catalog_key =
+                prefrontal_routing_core::score_alias::catalog_key(&self.score_alias, &key);
+            fact.billing_plane = Some(self.billing_catalog.for_route(&catalog_key, &method));
         }
     }
 
@@ -217,6 +241,57 @@ impl BrocaCredentials {
                     "serving method not verified live: no listing in a store copy".into();
             }
         }
+    }
+
+    /// The key pool of a routing provider that exists only as vault credential
+    /// mappings: every llm-provider API key whose `provider_ids` names it, in
+    /// any lifecycle state (a key the vault marks unusable is reported as such,
+    /// not dropped). The workspace is the row's `account_id`. An unknown or stale
+    /// listing, or no mapped credential, refuses by name: guessing a key would
+    /// send on the wrong account or on the subscription logins.
+    pub(crate) fn pool_keys(
+        &self,
+        provider: &str,
+        now_ms: u64,
+    ) -> Result<Vec<prefrontal_routing_core::key_pool::PoolKey>, (String, String)> {
+        let unresolved = |detail: &str| {
+            Err((
+                EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED.to_string(),
+                format!("no vault credential resolves provider {provider}: {detail}"),
+            ))
+        };
+        let Some(reached_at_ms) = self.reached_at_ms else {
+            return unresolved("the credential listing has not been read");
+        };
+        if now_ms.saturating_sub(reached_at_ms) > MAX_AGE_MS {
+            return unresolved("the credential listing is over 15 minutes old");
+        }
+        let keys: Vec<_> = self
+            .listed
+            .iter()
+            .filter(|row| {
+                row.categories
+                    .iter()
+                    .any(|category| category == "llm-provider")
+                    && row.provider_ids.iter().any(|id| id == provider)
+                    // A key pool holds API keys only. A login can share a label
+                    // with a key (`oauth:anthropic:ysample` beside
+                    // `apikey:anthropic:ysample`); even a mis-mapped login must
+                    // never be pinned as a pool key.
+                    && row.id.starts_with("apikey:")
+            })
+            .map(|row| {
+                prefrontal_routing_core::key_pool::PoolKey::new(
+                    &row.id,
+                    row.account_id.as_deref(),
+                    &row.state,
+                )
+            })
+            .collect();
+        if keys.is_empty() {
+            return unresolved("no llm-provider credential lists it in provider_ids");
+        }
+        Ok(keys)
     }
 
     pub fn note_failure(&mut self, error: impl ToString) {

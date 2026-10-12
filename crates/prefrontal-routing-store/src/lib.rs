@@ -36,8 +36,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 mod account_selection;
+mod key_pool;
 mod retention;
 
+pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
 pub use retention::{
     is_routine_decision, DecisionRetentionCursor, RetentionBatch, ROUTINE_REFUSAL_CODE,
 };
@@ -163,9 +165,11 @@ const MIGRATION_045: &str = include_str!("../migrations/045_account_decision_lat
 
 /// Migration 46: partial covering index for routing demand queries.
 const MIGRATION_046: &str = include_str!("../migrations/046_account_admission_demand.sql");
-
 /// Migration 47: the indexes the bounded retention deletes walk.
 const MIGRATION_047: &str = include_str!("../migrations/047_retention_indexes.sql");
+/// Migration 48: the key pool for explicit-only API-key providers (leases,
+/// per-key walls and cooldowns, and session workspace affinity).
+const MIGRATION_048: &str = include_str!("../migrations/048_pool_keys.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -209,7 +213,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 47] {
+fn route_state_migrations() -> [Migration; 48] {
     [
         Migration {
             version: 1,
@@ -398,6 +402,10 @@ fn route_state_migrations() -> [Migration; 47] {
         Migration {
             version: 47,
             statements: MIGRATION_047,
+        },
+        Migration {
+            version: 48,
+            statements: MIGRATION_048,
         },
     ]
 }

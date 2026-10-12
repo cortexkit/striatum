@@ -107,10 +107,16 @@ pub fn resolve_spec(specs: &[ParsedSpec], key: &str, base: bool) -> bool {
 /// results OR-ed. Concatenating them into one list would let a caller negation
 /// ("-anthropic") cancel an operator entry, because within one list the last
 /// matching entry wins: a caller must only ever be able to ADD an exclusion.
+///
+/// `explicit_only` is a third, provider-level list: providers the operator keeps
+/// out of every automatic choice but still admits when a caller pins them by
+/// name. Automatic selection passes it; pinned selection leaves it empty. It is
+/// not an exclusion entry because the operator's `exclude` refuses pins too.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExclusionPolicy<'a> {
     pub operator: &'a [String],
     pub caller: &'a [String],
+    pub explicit_only: &'a [String],
 }
 
 impl<'a> ExclusionPolicy<'a> {
@@ -122,6 +128,7 @@ impl<'a> ExclusionPolicy<'a> {
         Self {
             operator: &[],
             caller,
+            explicit_only: &[],
         }
     }
 
@@ -130,6 +137,7 @@ impl<'a> ExclusionPolicy<'a> {
         ExclusionPolicy {
             operator: &[],
             caller: &[],
+            explicit_only: &[],
         }
     }
 }
@@ -141,6 +149,9 @@ impl<'a> ExclusionPolicy<'a> {
 pub enum ExclusionSource {
     Operator,
     Caller,
+    /// The provider is on the operator's explicit-only list and this selection
+    /// was automatic.
+    ExplicitOnly,
 }
 
 /// Both exclusion lists parsed once for a selection pass.
@@ -148,6 +159,7 @@ pub enum ExclusionSource {
 pub struct ExclusionSpecs {
     operator: Vec<ParsedSpec>,
     caller: Vec<ParsedSpec>,
+    explicit_only: Vec<String>,
 }
 
 impl ExclusionSpecs {
@@ -155,6 +167,12 @@ impl ExclusionSpecs {
         Self {
             operator: parse_spec_list(policy.operator),
             caller: parse_spec_list(policy.caller),
+            explicit_only: policy
+                .explicit_only
+                .iter()
+                .map(|provider| provider.trim().to_string())
+                .filter(|provider| !provider.is_empty())
+                .collect(),
         }
     }
 
@@ -164,6 +182,10 @@ impl ExclusionSpecs {
     pub fn source_for(&self, key: &str) -> Option<ExclusionSource> {
         if resolve_spec(&self.operator, key, false) {
             return Some(ExclusionSource::Operator);
+        }
+        let provider = key_provider(key);
+        if self.explicit_only.iter().any(|entry| entry == provider) {
+            return Some(ExclusionSource::ExplicitOnly);
         }
         if resolve_spec(&self.caller, key, false) {
             return Some(ExclusionSource::Caller);
@@ -191,7 +213,7 @@ pub fn filter_excluded_keys_with_policy(
     available: &std::collections::HashSet<String>,
     policy: ExclusionPolicy<'_>,
 ) -> std::collections::HashSet<String> {
-    if policy.operator.is_empty() && policy.caller.is_empty() {
+    if policy.operator.is_empty() && policy.caller.is_empty() && policy.explicit_only.is_empty() {
         return available.clone();
     }
     let specs = ExclusionSpecs::parse(policy);
@@ -259,6 +281,7 @@ mod tests {
         let specs = ExclusionSpecs::parse(ExclusionPolicy {
             operator: &operator,
             caller: &caller,
+            explicit_only: &[],
         });
         assert_eq!(
             specs.source_for("anthropic/claude-opus-4-8"),
@@ -280,11 +303,34 @@ mod tests {
         let specs = ExclusionSpecs::parse(ExclusionPolicy {
             operator: &operator,
             caller: &[],
+            explicit_only: &[],
         });
         assert_eq!(specs.source_for("openai/gpt-5.5"), None);
         assert_eq!(
             specs.source_for("openai/gpt-5.4"),
             Some(ExclusionSource::Operator)
+        );
+    }
+
+    #[test]
+    fn explicit_only_providers_are_named_by_provider_and_never_by_prefix() {
+        let explicit_only = vec!["anthropic-platform".to_string()];
+        let specs = ExclusionSpecs::parse(ExclusionPolicy {
+            explicit_only: &explicit_only,
+            ..ExclusionPolicy::default()
+        });
+        assert_eq!(
+            specs.source_for("anthropic-platform/claude-opus-4-1"),
+            Some(ExclusionSource::ExplicitOnly)
+        );
+        // The subscription provider whose name the platform provider extends
+        // stays an ordinary automatic candidate.
+        assert_eq!(specs.source_for("anthropic/claude-opus-4-1"), None);
+        // A pinned selection passes no explicit-only list and admits the route.
+        assert_eq!(
+            ExclusionSpecs::parse(ExclusionPolicy::none())
+                .source_for("anthropic-platform/claude-opus-4-1"),
+            None
         );
     }
 

@@ -136,6 +136,7 @@ fn render_from_store(
     let caller_policy = ModelRoutingPolicyInput {
         exclude: Vec::new(),
         subscription: params.subscription_entries.clone(),
+        ..ModelRoutingPolicyInput::default()
     };
     let capacity_keys = params.available_models.iter().cloned().collect::<Vec<_>>();
     let resolved_policy = resolve_routing_policy(
@@ -564,6 +565,7 @@ mod tests {
         let policy = ModelRoutingPolicyInput {
             exclude: vec!["p/model30".into()],
             subscription: vec![],
+            ..ModelRoutingPolicyInput::default()
         };
         let mut request = params(&[], &[]);
         request.available_models = models;

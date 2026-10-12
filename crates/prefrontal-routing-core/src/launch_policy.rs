@@ -1,6 +1,6 @@
 //! Launch-time request and pricing policy resolution shared by every route-selection path.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +115,19 @@ pub struct ModelRoutingPolicyInput {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub subscription: Vec<String>,
+    /// Providers admitted only when a caller pins a route on them by name (a
+    /// work run's `model=`, a panel roster entry). Automatic selection, n_pick
+    /// panel seats, fallback, failover and reroute never consider them. Unlike
+    /// `exclude`, this list does not refuse pins.
+    #[serde(default)]
+    pub explicit_only_providers: Vec<String>,
+    /// Routing providers that have no catalog rows of their own and take their
+    /// quality, capability, context and speed rows from another provider's
+    /// route with the same model id: `{"anthropic-platform": "anthropic"}`.
+    /// Pricing comes from the target provider's catalog under the alias's own
+    /// credential method. An aliased provider is never subscription-covered.
+    #[serde(default)]
+    pub score_alias: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -144,9 +157,13 @@ pub fn resolve_routing_policy(
     let connected_model_count = connected.len();
     let filtered = filter_excluded_keys_with_policy(
         &connected,
+        // The explicit-only list is deliberately not applied to the available
+        // models: a pinned selection is admitted against the same available set,
+        // and a pin is how an explicit-only provider gets selected at all.
         ExclusionPolicy {
             operator: &operator.exclude,
             caller: &caller.exclude,
+            explicit_only: &[],
         },
     );
 
@@ -166,6 +183,12 @@ pub fn resolve_routing_policy(
         .iter()
         .filter(|key| {
             let provider = key.split('/').next().unwrap_or(key);
+            // A score-aliased provider borrows another provider's rows but bills
+            // its own credential (a metered API key). Treating it as covered would
+            // let a subscription spec meant for the target price it as quota.
+            if operator.score_alias.contains_key(provider) {
+                return false;
+            }
             let oauth = provider_auth_types
                 .get(provider)
                 .is_some_and(|kind| kind == "oauth");
