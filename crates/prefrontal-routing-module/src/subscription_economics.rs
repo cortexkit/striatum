@@ -1073,6 +1073,7 @@ mod tests {
                 runtime_snapshot: Some(snapshot),
                 exclude_route_keys: Vec::new(),
                 operator_exclude_keys: Vec::new(),
+                explicit_only_providers: Vec::new(),
                 required_capabilities: None,
                 is_subscription_route: Some(Box::new(move |r| sub.contains(&r.route_key))),
                 min_best_effort_adequacy: None,
@@ -1194,6 +1195,7 @@ mod tests {
                 roster: Vec::new(),
                 exclude_route_keys: Vec::new(),
                 operator_exclude_keys: Vec::new(),
+                explicit_only_providers: Vec::new(),
                 required_capabilities: None,
             })
             .unwrap();
@@ -1411,6 +1413,7 @@ mod tests {
                 roster: Vec::new(),
                 exclude_route_keys: Vec::new(),
                 operator_exclude_keys: Vec::new(),
+                explicit_only_providers: Vec::new(),
                 required_capabilities: None,
             })
             .unwrap();
@@ -1567,6 +1570,7 @@ mod tests {
             runtime_snapshot: Some(snapshot),
             exclude_route_keys: Vec::new(),
             operator_exclude_keys: Vec::new(),
+            explicit_only_providers: Vec::new(),
             required_capabilities: None,
             is_subscription_route: Some(Box::new(|r| r.provider_id != "xai")),
             min_best_effort_adequacy: None,

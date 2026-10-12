@@ -11,7 +11,8 @@ use crate::model_facts::{
 };
 use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, CostBasis, ModelRouteStateSnapshot,
-    RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
+    RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
+    REASON_EXPLICIT_ONLY_PROVIDER, REASON_NOT_AVAILABLE,
 };
 use crate::package_ceiling::seat_package_ceiling;
 use crate::provider_model_spec::ExclusionPolicy;
@@ -116,6 +117,10 @@ pub struct SelectPanelInput<'a> {
     /// The operator's standing exclude list. Applied to automatic (n_pick)
     /// admission only; an explicit roster is a pin and pins bypass exclusion.
     pub operator_exclude_keys: Vec<String>,
+    /// Providers the operator admits only by explicit pin. Applied to automatic
+    /// (n_pick) seats and to automatic replacements of oversized pins; a roster
+    /// entry naming one of these providers is the pin that admits it.
+    pub explicit_only_providers: Vec<String>,
     pub required_capabilities: Option<RequiredCapabilities>,
     /// The routes the sending substrate can reach. Which substrate that is comes
     /// from `availability_substrate`, which also labels every rejection here.
@@ -165,6 +170,9 @@ pub enum PanelCauseReason {
     /// because the fix is different: one is loosening a config file, the other is
     /// changing what this call asked for.
     ExcludedByOperator,
+    /// The provider is admitted only by an explicit roster pin, and this seat was
+    /// an automatic choice.
+    ExplicitOnlyProvider,
     Unavailable,
     QuotaExhausted,
     BackoffActive,
@@ -497,6 +505,7 @@ fn select_panel_admitted(
         PanelSelection::NPick => ExclusionPolicy {
             operator: &input.operator_exclude_keys,
             caller: &input.exclude_route_keys,
+            explicit_only: &input.explicit_only_providers,
         },
     };
     // Panel selection has no adequacy fallback. The zero requirements are only an
@@ -533,6 +542,7 @@ fn select_panel_admitted(
             reason: match rejected.reason.as_str() {
                 REASON_EXCLUDED => PanelCauseReason::Excluded,
                 REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
+                REASON_EXPLICIT_ONLY_PROVIDER => PanelCauseReason::ExplicitOnlyProvider,
                 "quota_exhausted" | "cooldown_active" => PanelCauseReason::QuotaExhausted,
                 "backoff_active" => PanelCauseReason::BackoffActive,
                 "missing_vision" | "context_too_small" => PanelCauseReason::Capability,

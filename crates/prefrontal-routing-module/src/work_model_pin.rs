@@ -130,12 +130,17 @@ pub(crate) fn select(
         defaults.reasoning_effort = None;
     }
     input.facts = vec![fact];
+    // The caller named this exact route (a work run's `model=`), which is the one
+    // way an explicit-only provider is admitted. A caller that forwarded the operator's explicit-only list
+    // must not turn the pin into a refusal.
+    input.explicit_only_providers.clear();
     let admission = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy {
             operator: &input.operator_exclude_keys,
             caller: &input.exclude_route_keys,
+            explicit_only: &[],
         },
         input.required_capabilities,
         &input.available_models,
@@ -241,6 +246,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                explicit_only_providers: Vec::new(),
                 required_capabilities: Some(RequiredCapabilities {
                     vision: None,
                     min_context: Some(context),

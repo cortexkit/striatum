@@ -468,6 +468,9 @@ pub(crate) fn compute_ladder(
                             runtime_snapshot,
                             exclude_route_keys: Vec::new(),
                             operator_exclude_keys: operator.exclude.clone(),
+                            // The ladder replays automatic selection, so the
+                            // explicit-only fence applies as it does live.
+                            explicit_only_providers: operator.explicit_only_providers.clone(),
                             required_capabilities: resolved.required_capabilities,
                             is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                                 subscription.contains(&route.route_key)

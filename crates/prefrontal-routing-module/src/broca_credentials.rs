@@ -17,6 +17,13 @@ use subc_protocol::session::{HealthReport, HealthStatus};
 /// good answer briefly, but cannot assert reachability indefinitely.
 const MAX_AGE_MS: u64 = 15 * 60 * 1000;
 
+/// No active credential maps an explicit-only provider, or the listing is unknown.
+pub(crate) const EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED: &str =
+    "explicit_provider_credential_unresolved";
+/// More than one active credential maps the same explicit-only provider.
+pub(crate) const EXPLICIT_PROVIDER_CREDENTIAL_AMBIGUOUS: &str =
+    "explicit_provider_credential_ambiguous";
+
 #[derive(Debug, Clone, Default)]
 pub struct BrocaCredentials {
     view: Option<String>,
@@ -30,6 +37,11 @@ pub struct BrocaCredentials {
     listed: Vec<ListedCredential>,
     serving: BTreeMap<String, ServingMethod>,
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
+    /// The operator's `model_routing.score_alias` as of the last refresh. An
+    /// aliased provider has no Fusiform plane of its own: its serving method is
+    /// read from the credentials mapped to the alias, and its rates from the
+    /// target provider's catalog under that method.
+    score_alias: std::collections::BTreeMap<String, String>,
     #[cfg(test)]
     pub(crate) legacy_pricing_baseline: bool,
 }
@@ -127,12 +139,22 @@ impl BrocaCredentials {
         true
     }
 
+    /// Replace the score aliases used for serving methods, Fusiform plane keys
+    /// and pricing. Takes effect for serving methods on the next refresh.
+    pub(crate) fn set_score_alias(&mut self, aliases: std::collections::BTreeMap<String, String>) {
+        self.score_alias = aliases;
+    }
+
     pub(crate) fn refresh_serving_methods(
         &mut self,
         state: &crate::account_quota::AccountQuotaState,
         facts: &[ModelFact],
         at_ms: i64,
     ) {
+        // Aliased providers have no stored rows; serve them the borrowed rows
+        // selection will see so their credential method is known.
+        let mut facts = facts.to_vec();
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &self.score_alias);
         self.serving = facts
             .iter()
             .map(|fact| {
@@ -182,10 +204,13 @@ impl BrocaCredentials {
         self.serving
             .iter()
             .filter_map(|(key, method)| {
-                Some((
-                    key.split_once('/')?.0.to_string(),
-                    method.auth_method.clone()?,
-                ))
+                // An aliased provider is priced on its target's plane, the only
+                // one Fusiform knows, under the alias's own credential method.
+                let provider = key.split_once('/')?.0;
+                let provider =
+                    prefrontal_routing_core::score_alias::alias_target(&self.score_alias, provider)
+                        .unwrap_or(provider);
+                Some((provider.to_string(), method.auth_method.clone()?))
             })
             .collect()
     }
@@ -205,7 +230,9 @@ impl BrocaCredentials {
                 .get(&key)
                 .cloned()
                 .unwrap_or_else(|| choose_method(BTreeSet::new(), BTreeSet::new()));
-            fact.billing_plane = Some(self.billing_catalog.for_route(&key, &method));
+            let catalog_key =
+                prefrontal_routing_core::score_alias::catalog_key(&self.score_alias, &key);
+            fact.billing_plane = Some(self.billing_catalog.for_route(&catalog_key, &method));
         }
     }
 
@@ -216,6 +243,54 @@ impl BrocaCredentials {
                 method.reason =
                     "serving method not verified live: no listing in a store copy".into();
             }
+        }
+    }
+
+    /// The one vault credential whose `provider_ids` names `provider`, for a
+    /// routing provider that exists only as such a mapping. Zero or several
+    /// matching rows refuse by name: guessing would send on the wrong key, or
+    /// on the subscription logins the mapping exists to avoid.
+    pub(crate) fn explicit_provider_credential(
+        &self,
+        provider: &str,
+        now_ms: u64,
+    ) -> Result<String, (String, String)> {
+        let unresolved = |detail: String| {
+            Err((
+                EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED.to_string(),
+                format!("no vault credential resolves provider {provider}: {detail}"),
+            ))
+        };
+        let Some(reached_at_ms) = self.reached_at_ms else {
+            return unresolved("the credential listing has not been read".into());
+        };
+        if now_ms.saturating_sub(reached_at_ms) > MAX_AGE_MS {
+            return unresolved("the credential listing is over 15 minutes old".into());
+        }
+        let matching: Vec<&str> = self
+            .listed
+            .iter()
+            .filter(|row| {
+                row.state == "active"
+                    && row
+                        .categories
+                        .iter()
+                        .any(|category| category == "llm-provider")
+                    && row.provider_ids.iter().any(|id| id == provider)
+            })
+            .map(|row| row.id.as_str())
+            .collect();
+        match matching.as_slice() {
+            [] => unresolved("no active llm-provider credential lists it in provider_ids".into()),
+            [id] => Ok((*id).to_string()),
+            several => Err((
+                EXPLICIT_PROVIDER_CREDENTIAL_AMBIGUOUS.to_string(),
+                format!(
+                    "provider {provider} is listed by {} active credentials ({}); map it on exactly one",
+                    several.len(),
+                    several.join(", ")
+                ),
+            )),
         }
     }
 

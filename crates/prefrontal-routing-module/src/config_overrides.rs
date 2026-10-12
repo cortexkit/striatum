@@ -314,6 +314,14 @@ struct ModelRoutingSection {
     /// Providers and models priced as subscription-backed in addition to auth facts.
     #[serde(default)]
     subscription: Vec<String>,
+    /// Providers routing admits only when a caller pins one of their routes by
+    /// name; never an automatic, fallback or reroute candidate. Default empty.
+    #[serde(default)]
+    explicit_only_providers: Vec<String>,
+    /// Providers that borrow another provider's catalog rows, keyed alias to
+    /// target: `{"anthropic-platform": "anthropic"}`. Default empty.
+    #[serde(default)]
+    score_alias: std::collections::BTreeMap<String, String>,
     /// Keyed by "provider/model" or "provider/model/variant".
     #[serde(default)]
     models: HashMap<String, ModelFactOverride>,
@@ -1150,6 +1158,13 @@ fn parse_operator_routing_policy(
     Ok(ModelRoutingPolicyInput {
         exclude: clean_spec_entries(section.exclude),
         subscription: clean_spec_entries(section.subscription),
+        explicit_only_providers: clean_spec_entries(section.explicit_only_providers),
+        score_alias: section
+            .score_alias
+            .into_iter()
+            .map(|(alias, target)| (alias.trim().to_string(), target.trim().to_string()))
+            .filter(|(alias, target)| !alias.is_empty() && !target.is_empty())
+            .collect(),
     })
 }
 
@@ -1167,10 +1182,22 @@ fn clean_spec_entries(entries: Vec<String>) -> Vec<String> {
 /// not read as a selection-policy change.
 pub fn operator_policy_revision(policy: &ModelRoutingPolicyInput) -> String {
     let mut hasher = Sha256::new();
+    let aliases = policy
+        .score_alias
+        .iter()
+        .map(|(alias, target)| format!("{alias}={target}"))
+        .collect::<Vec<_>>();
     for (label, entries) in [
         ("exclude", &policy.exclude),
         ("subscription", &policy.subscription),
+        ("explicit_only_providers", &policy.explicit_only_providers),
+        ("score_alias", &aliases),
     ] {
+        // The two later lists are hashed only when set, so a policy that does
+        // not use them keeps the revision it had before they existed.
+        if entries.is_empty() && matches!(label, "explicit_only_providers" | "score_alias") {
+            continue;
+        }
         hasher.update(label.as_bytes());
         hasher.update([0u8]);
         for entry in entries {

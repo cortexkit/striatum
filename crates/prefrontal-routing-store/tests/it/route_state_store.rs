@@ -1412,6 +1412,7 @@ fn persisted_double_mirror_break_glass_clears_only_the_rejected_candidate() {
         runtime_snapshot: Some(snapshot.clone()),
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
+        explicit_only_providers: Vec::new(),
 
         required_capabilities: None,
         is_subscription_route: None,
@@ -1454,6 +1455,7 @@ fn persisted_double_mirror_break_glass_clears_only_the_rejected_candidate() {
         runtime_snapshot: Some(relaxed.snapshot),
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
+        explicit_only_providers: Vec::new(),
 
         required_capabilities: None,
         is_subscription_route: None,
@@ -3627,6 +3629,7 @@ fn route_input<'a>(facts: Vec<ModelFact>) -> SelectModelRouteInput<'a> {
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
+        explicit_only_providers: Vec::new(),
 
         required_capabilities: None,
         is_subscription_route: None,
