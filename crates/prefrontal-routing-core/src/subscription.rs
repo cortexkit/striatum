@@ -2,6 +2,7 @@
 //! This module consumes snapshots only; selection never calls a quota service.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 pub const ASTRO_MAX_AGE_MS: i64 = 48 * 60 * 60 * 1000;
 pub const DEFAULT_PLAN_FEE_USD: f64 = 200.0;
@@ -24,6 +25,25 @@ pub struct SubscriptionPool {
     /// False while another available subscription plan has live, unreserved quota.
     pub allow_banked: bool,
     pub now_ms: i64,
+    /// How the provider-wide head pace was assembled from usage per work class.
+    /// Kept only so the reserve diagnostic can show what was counted and what
+    /// was left out; admission arithmetic reads each plan's share instead.
+    pub head_pace: Option<HeadPaceBreakdown>,
+}
+
+/// Provider-wide head demand split by the work class each usage event carried,
+/// in pooled points per hour over the measured window. Usage from classes that
+/// `is_head` rejects (workers, readers, reviewers) is reported separately and
+/// is not part of `head_points_per_hour`. Usage without a class is counted as
+/// head demand under the `unlabelled` key: it may come from a head, and
+/// under-reserving for heads is the harmful direction.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadPaceBreakdown {
+    pub window_hours: u32,
+    pub head_points_per_hour: f64,
+    pub head_by_work_class: BTreeMap<String, f64>,
+    pub excluded_worker_points_per_hour: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +122,8 @@ pub struct SubscriptionPricing {
     pub plan_tier: Option<String>,
 }
 
+/// True for agents whose demand the subscription reserve protects. The same
+/// rule decides which Astrocyte work classes count toward head pace.
 pub fn is_head(agent: &str) -> bool {
     matches!(
         agent.trim().to_ascii_lowercase().as_str(),
@@ -374,6 +396,7 @@ impl SubscriptionPool {
             "pool": self.provider,
             "unit": "weekly_percentage_points_per_account",
             "aggregation": "sum_within_tier",
+            "headPace": self.head_pace,
             "plans": plans,
         })
         .to_string()
