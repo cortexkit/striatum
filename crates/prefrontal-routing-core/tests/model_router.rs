@@ -4259,6 +4259,7 @@ fn subscription_scenario(
                     plans,
                     allow_banked: false,
                     now_ms: 1_000_000,
+                    head_pace: None,
                 })),
                 ..Default::default()
             },

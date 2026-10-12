@@ -1,7 +1,9 @@
 //! Subscription economics in pooled percentage points (one account-window percent).
 //! This module consumes snapshots only; selection never calls a quota service.
 
+use crate::model_resolution::map_agent_to_workload_class;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 pub const ASTRO_MAX_AGE_MS: i64 = 48 * 60 * 60 * 1000;
 pub const DEFAULT_PLAN_FEE_USD: f64 = 200.0;
@@ -24,6 +26,26 @@ pub struct SubscriptionPool {
     /// False while another available subscription plan has live, unreserved quota.
     pub allow_banked: bool,
     pub now_ms: i64,
+    /// How the provider-wide head pace was assembled from usage per work class.
+    /// Kept only so the reserve diagnostic can show what was counted and what
+    /// was left out; admission arithmetic reads each plan's share instead.
+    pub head_pace: Option<HeadPaceBreakdown>,
+}
+
+/// Provider-wide head demand split by the work class each usage event carried,
+/// in pooled points per hour over the measured window. Usage from classes that
+/// `is_delegated_role` names (workers, readers, reviewers) is reported
+/// separately and is not part of `head_points_per_hour`. Every other class
+/// counts as head demand, including unknown names and usage without a class
+/// (kept under the `unlabelled` key): such usage may come from a person's own
+/// session, and under-reserving for heads is the harmful direction.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadPaceBreakdown {
+    pub window_hours: u32,
+    pub head_points_per_hour: f64,
+    pub head_by_work_class: BTreeMap<String, f64>,
+    pub excluded_worker_points_per_hour: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +122,49 @@ pub struct SubscriptionPricing {
     pub tightest_point: Option<ReserveStep>,
     pub banked_resets_applied: u32,
     pub plan_tier: Option<String>,
+}
+
+/// Delegated role families that `map_agent_to_workload_class` does not cover.
+/// Each entry matches the name itself or any name continuing it after a
+/// separator, so `athena` covers `athena.panel_member` and `athena-panel`.
+/// The dotted names follow core's role inventory (`persona::role::inventory`).
+const DELEGATED_ROLE_FAMILIES: &[&str] = &[
+    "consult",
+    "athena",
+    "spec",
+    "comment.reviewer",
+    "wake.author",
+    "mint.planner",
+];
+
+/// True for agent or work-class names that only ever run delegated work:
+/// workers, readers, reviewers and panel members started on someone's behalf.
+/// Mason, explore, librarian and every sidekick lane come from routing's
+/// workload mapping (`map_agent_to_workload_class`: `ephemeral` or `gather`);
+/// the remaining families are listed in `DELEGATED_ROLE_FAMILIES`. Matching
+/// ignores case and treats `-`, `_` and spaces like `.`, because hosts spell
+/// the same role differently (`comment-reviewer`, `comment.reviewer`).
+///
+/// Anything not recognized returns false. Callers that protect head quota
+/// rely on that: an unknown name is treated as a possible head.
+pub fn is_delegated_role(name: &str) -> bool {
+    if matches!(
+        map_agent_to_workload_class(name),
+        Some("ephemeral" | "gather")
+    ) {
+        return true;
+    }
+    let normalized: String = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if matches!(c, '-' | '_' | ' ') { '.' } else { c })
+        .collect();
+    DELEGATED_ROLE_FAMILIES.iter().any(|family| {
+        normalized
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
 }
 
 pub fn is_head(agent: &str) -> bool {
@@ -374,6 +439,7 @@ impl SubscriptionPool {
             "pool": self.provider,
             "unit": "weekly_percentage_points_per_account",
             "aggregation": "sum_within_tier",
+            "headPace": self.head_pace,
             "plans": plans,
         })
         .to_string()
@@ -468,6 +534,49 @@ impl SubscriptionPricing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_roles_are_known_workers_and_everything_else_is_not() {
+        for role in [
+            "mason",
+            "Mason",
+            "explore",
+            "librarian",
+            "sidekick",
+            "sidekick.reader.answer",
+            "sidekick-research",
+            "consult",
+            "athena",
+            "athena-panel",
+            "athena.panel_member",
+            "spec.aggregator",
+            "spec-member",
+            "comment.reviewer",
+            "comment-reviewer",
+            "wake.author",
+            "wake_author",
+            "mint.planner",
+        ] {
+            assert!(is_delegated_role(role), "{role} is delegated work");
+        }
+        // Heads, OpenCode's built-in interactive agents, unlabelled usage and
+        // unknown names are not delegated, nor are names that merely share a
+        // prefix with a delegated family.
+        for name in [
+            "Alfonso",
+            "build",
+            "plan",
+            "pi",
+            "unlabelled",
+            "",
+            "night-shift",
+            "specialist",
+            "comment",
+            "consultant",
+        ] {
+            assert!(!is_delegated_role(name), "{name} may be a head");
+        }
+    }
 
     #[test]
     fn value_precedence_override_fresh_stale_and_absent() {

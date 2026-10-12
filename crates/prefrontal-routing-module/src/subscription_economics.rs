@@ -9,7 +9,8 @@ use prefrontal_routing_core::{
     model_facts::{get_keep_free_percent, make_capacity_key},
     model_router::ModelRouteStateSnapshot,
     subscription::{
-        MeasuredValue, QuotaAccount, SubscriptionPlan, SubscriptionPool, DEFAULT_PLAN_FEE_USD,
+        is_delegated_role, HeadPaceBreakdown, MeasuredValue, QuotaAccount, SubscriptionPlan,
+        SubscriptionPool, DEFAULT_PLAN_FEE_USD,
     },
     ModelFact,
 };
@@ -156,9 +157,38 @@ fn producer_points(producer: &Value) -> Option<f64> {
     Some(points)
 }
 
+/// Astrocyte's `by_work_class` key for usage whose producer recorded no class.
+const UNLABELLED_WORK_CLASS: &str = "unlabelled";
+
+/// Producers whose usage can be a head session. Broca only runs delegated
+/// requests, so none of its usage is head demand.
+fn is_head_producer(producer: &str) -> bool {
+    matches!(producer, "opencode" | "pi" | "claude-code")
+}
+
+/// Head pace in pooled points per hour; see `head_pace_breakdown`.
+#[cfg(test)]
+fn head_pace(reply: &Value, provider: &str, from: i64, to: i64) -> Option<f64> {
+    head_pace_breakdown(reply, provider, from, to).map(|pace| pace.head_points_per_hour)
+}
+
 /// Read pooled points from Astrocyte's complete hourly series. A gap or
 /// malformed producer is incomplete evidence, not a zero pace.
-fn head_pace(reply: &Value, provider: &str, from: i64, to: i64) -> Option<f64> {
+///
+/// Astrocyte values every event in the configured subscription scope, worker
+/// sessions included, and splits each producer's hour by work class. Only
+/// classes that `is_delegated_role` recognizes as delegated work (for example
+/// `mason` running inside OpenCode) are left out of head demand, so they do
+/// not reserve quota against other workers. Every other class counts as head
+/// demand: OpenCode's interactive `build` and `plan` agents, head names, names
+/// routing does not know, usage with no class (Pi records none), and any
+/// producer total not covered by its classes.
+fn head_pace_breakdown(
+    reply: &Value,
+    provider: &str,
+    from: i64,
+    to: i64,
+) -> Option<HeadPaceBreakdown> {
     if reply["quota_provider"] != provider
         || reply["from_ms"].as_i64()? != from
         || reply["to_ms"].as_i64()? != to
@@ -190,6 +220,8 @@ fn head_pace(reply: &Value, provider: &str, from: i64, to: i64) -> Option<f64> {
         return None;
     }
     let mut points = 0.0;
+    let mut head_by_class: BTreeMap<String, f64> = BTreeMap::new();
+    let mut excluded_by_class: BTreeMap<String, f64> = BTreeMap::new();
     for (index, hour) in hours.iter().enumerate() {
         let expected_hour = from + index as i64 * PACE_HOUR_MS;
         if hour["hour_start_ms"].as_i64()? != expected_hour {
@@ -197,16 +229,56 @@ fn head_pace(reply: &Value, provider: &str, from: i64, to: i64) -> Option<f64> {
         }
         for (name, producer) in hour["producers"].as_object()? {
             let estimated_points = producer_points(producer)?;
-            if matches!(name.as_str(), "opencode" | "pi" | "claude-code") {
-                points += estimated_points;
-                if !points.is_finite() {
-                    return None;
+            if !is_head_producer(name) {
+                continue;
+            }
+            let mut classified = 0.0;
+            let mut excluded = 0.0;
+            for (class, usage) in producer["by_work_class"].as_object()? {
+                // producer_points has already validated every class value.
+                let class_points = usage["estimated_points"].as_f64()?;
+                classified += class_points;
+                let class = class.trim();
+                if class.is_empty() || class.eq_ignore_ascii_case(UNLABELLED_WORK_CLASS) {
+                    *head_by_class
+                        .entry(UNLABELLED_WORK_CLASS.into())
+                        .or_default() += class_points;
+                } else if is_delegated_role(class) {
+                    excluded += class_points;
+                    *excluded_by_class.entry(class.into()).or_default() += class_points;
+                } else {
+                    *head_by_class.entry(class.into()).or_default() += class_points;
                 }
+            }
+            // Points the classes do not account for have no known class, so
+            // they are treated like unlabelled usage. The tolerance ignores
+            // floating-point rounding between the total and its class sum.
+            let unclassified = estimated_points - classified;
+            if unclassified > 1e-9 {
+                *head_by_class
+                    .entry(UNLABELLED_WORK_CLASS.into())
+                    .or_default() += unclassified;
+            }
+            points += (estimated_points - excluded).max(0.0);
+            if !points.is_finite() {
+                return None;
             }
         }
     }
-    let pace = points / window_hours as f64;
-    pace.is_finite().then_some(pace)
+    let per_hour = |total: f64| total / window_hours as f64;
+    let pace = per_hour(points);
+    pace.is_finite().then(|| HeadPaceBreakdown {
+        window_hours: window_hours as u32,
+        head_points_per_hour: pace,
+        head_by_work_class: head_by_class
+            .into_iter()
+            .map(|(class, total)| (class, per_hour(total)))
+            .collect(),
+        excluded_worker_points_per_hour: excluded_by_class
+            .into_iter()
+            .map(|(class, total)| (class, per_hour(total)))
+            .collect(),
+    })
 }
 
 fn head_pace_result(
@@ -214,10 +286,10 @@ fn head_pace_result(
     provider: &str,
     from: i64,
     to: i64,
-) -> Option<f64> {
+) -> Option<HeadPaceBreakdown> {
     result
         .ok()
-        .and_then(|reply| head_pace(&reply, provider, from, to))
+        .and_then(|reply| head_pace_breakdown(&reply, provider, from, to))
 }
 
 fn pace_call_is_transient(error: &QuotaConsumerError) -> bool {
@@ -329,7 +401,7 @@ fn build(
     state: &AccountQuotaState,
     report: &Value,
     prices: &Value,
-    paces: &HashMap<String, f64>,
+    paces: &HashMap<String, HeadPaceBreakdown>,
     now: i64,
 ) -> EconomicsCache {
     let mut out = EconomicsCache {
@@ -384,7 +456,9 @@ fn build(
                 fee_usd: fee,
                 fusiform_multiplier: row.and_then(|r| fusiform_value(r, now)),
                 accounts: Vec::new(),
-                head_points_per_hour: paces.get(&reading.provider).copied(),
+                head_points_per_hour: paces
+                    .get(&reading.provider)
+                    .map(|pace| pace.head_points_per_hour),
             });
         plan.accounts.push(account);
         let pool = out
@@ -394,6 +468,7 @@ fn build(
                 provider: provider.into(),
                 measured: measured(report, &reading.provider),
                 now_ms: now,
+                head_pace: paces.get(&reading.provider).cloned(),
                 ..Default::default()
             });
         pool.keep_free_percent = get_keep_free_percent(provider);
@@ -574,6 +649,9 @@ pub(crate) fn overlay(snapshot: &mut ModelRouteStateSnapshot, facts: &[ModelFact
     }
     for pool in pools.values_mut() {
         let elapsed = (now - pool.now_ms).max(0) as f64 / 3_600_000.0;
+        if elapsed > 0.25 {
+            pool.head_pace = None;
+        }
         for plan in &mut pool.plans {
             if elapsed > 0.25 {
                 plan.accounts.clear();
@@ -653,6 +731,22 @@ mod tests {
             }],
         });
         state
+    }
+
+    /// Paces given only as a provider-wide rate, with no per-class detail.
+    fn flat_paces<const N: usize>(paces: [(&str, f64); N]) -> HashMap<String, HeadPaceBreakdown> {
+        paces
+            .into_iter()
+            .map(|(provider, pace)| {
+                (
+                    provider.to_string(),
+                    HeadPaceBreakdown {
+                        head_points_per_hour: pace,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -901,7 +995,7 @@ mod tests {
             &quota,
             &report(),
             &prices(),
-            &HashMap::from([("claude".into(), claude_pace)]),
+            &flat_paces([("claude", claude_pace)]),
             NOW,
         );
         let pool = &pools.pools["anthropic"];
@@ -919,6 +1013,172 @@ mod tests {
                 .head_reserve_points,
             Some(0.0)
         );
+    }
+
+    /// A `spend.multiplier.pace` reply with the field set and per-producer
+    /// shape of the captured Astrocyte frames above. `usage(hour)` lists the
+    /// `(producer, work_class, estimated_points)` rows for that hour; each
+    /// producer's total is the sum of its classes, as Astrocyte reports it.
+    fn pace_reply(
+        provider: &str,
+        from: i64,
+        hours: usize,
+        usage: impl Fn(usize) -> Vec<(&'static str, &'static str, f64)>,
+    ) -> Value {
+        const PER_POINT_NANOS: f64 = 7_122_241_116.0;
+        let hours: Vec<Value> = (0..hours)
+            .map(|hour| {
+                let mut producers = serde_json::Map::new();
+                for (producer, class, points) in usage(hour) {
+                    let entry = producers.entry(producer).or_insert_with(|| {
+                        json!({"by_work_class":{}, "estimated_points":0.0, "events":0,
+                            "list_nanos":0, "unpriced_tokens":0})
+                    });
+                    let list_nanos = (points * PER_POINT_NANOS).round() as i64;
+                    entry["by_work_class"][class] = json!({"estimated_points":points,
+                        "events":1, "list_nanos":list_nanos});
+                    entry["estimated_points"] =
+                        json!(entry["estimated_points"].as_f64().unwrap() + points);
+                    entry["events"] = json!(entry["events"].as_u64().unwrap() + 1);
+                    entry["list_nanos"] = json!(entry["list_nanos"].as_i64().unwrap() + list_nanos);
+                }
+                json!({"hour_start_ms": from + hour as i64 * PACE_HOUR_MS, "producers":producers})
+            })
+            .collect();
+        let to = from + hours.len() as i64 * PACE_HOUR_MS;
+        json!({
+            "basis":"pro_rata_list_value", "from_ms":from, "to_ms":to, "quota_provider":provider,
+            "observation_day":"2026-10-12", "observation_id":41,
+            "per_point_nanos":PER_POINT_NANOS as i64, "undated_events":0, "hours":hours,
+        })
+    }
+
+    #[test]
+    fn head_pace_excludes_only_delegated_classes() {
+        // OpenCode copies its agent name into the work class, so a worker that
+        // runs inside OpenCode arrives under the `opencode` producer. `build`
+        // and `plan` are OpenCode's own interactive agents and `night-shift`
+        // is a name routing does not know: all three count as head demand, as
+        // do Alfonso and the unlabelled Pi and Claude Code usage.
+        let from = 1_791_532_800_000;
+        let mut reply = pace_reply("claude", from, 2, |hour| {
+            let mut rows = vec![
+                ("opencode", "Alfonso", 0.5),
+                ("opencode", "build", 0.25),
+                ("opencode", "mason", 3.0),
+                ("opencode", "sidekick", 0.25),
+                ("pi", "unlabelled", 1.0),
+                ("claude-code", "unlabelled", 0.25),
+                ("broca", "mason", 5.0),
+                ("broca", "unlabelled", 2.0),
+            ];
+            if hour == 0 {
+                rows.push(("opencode", "plan", 0.125));
+            } else {
+                rows.extend([
+                    ("opencode", "night-shift", 0.5),
+                    ("opencode", "consult", 0.125),
+                    ("opencode", "explore", 0.0625),
+                    ("opencode", "librarian", 0.0625),
+                ]);
+            }
+            rows
+        });
+        // Half a point of OpenCode usage in hour 0 is not under any class; it
+        // must be counted as head demand, like unlabelled usage.
+        let opencode = &mut reply["hours"][0]["producers"]["opencode"];
+        opencode["estimated_points"] = json!(opencode["estimated_points"].as_f64().unwrap() + 0.5);
+        let to = from + 2 * PACE_HOUR_MS;
+
+        let pace = head_pace_breakdown(&reply, "claude", from, to).unwrap();
+        // Per hour: Alfonso 0.5 + build 0.25 + plan 0.0625 + night-shift 0.25
+        // + Pi 1.0 + Claude Code 0.25 + 0.5 / 2 hours of unclassified OpenCode
+        // usage = 2.5625. Broca and the delegated classes are out.
+        assert_eq!(pace.window_hours, 2);
+        assert_eq!(pace.head_points_per_hour, 2.5625);
+        assert_eq!(
+            pace.head_by_work_class,
+            BTreeMap::from([
+                ("Alfonso".into(), 0.5),
+                ("build".into(), 0.25),
+                ("night-shift".into(), 0.25),
+                ("plan".into(), 0.0625),
+                ("unlabelled".into(), 1.5),
+            ])
+        );
+        assert_eq!(
+            pace.excluded_worker_points_per_hour,
+            BTreeMap::from([
+                ("consult".into(), 0.0625),
+                ("explore".into(), 0.03125),
+                ("librarian".into(), 0.03125),
+                ("mason".into(), 3.0),
+                ("sidekick".into(), 0.25),
+            ])
+        );
+
+        // The persisted reserve diagnostic carries the class split, and the
+        // admission arithmetic uses only the head pace.
+        let pools = build(
+            &state(3.0, Some("max_20x")),
+            &report(),
+            &prices(),
+            &HashMap::from([("claude".to_string(), pace)]),
+            NOW,
+        );
+        let pool = &pools.pools["anthropic"];
+        assert_eq!(pool.plans[0].head_points_per_hour, Some(2.5625));
+        let detail: Value = serde_json::from_str(&pool.reserve_diagnostic(20.0, false)).unwrap();
+        assert_eq!(detail["plans"][0]["headPointsPerHour"], 2.5625);
+        assert_eq!(detail["headPace"]["headPointsPerHour"], 2.5625);
+        assert_eq!(detail["headPace"]["headByWorkClass"]["unlabelled"], 1.5);
+        assert_eq!(
+            detail["headPace"]["excludedWorkerPointsPerHour"]["mason"],
+            3.0
+        );
+    }
+
+    #[test]
+    fn report_168h_window_without_mason_matches_the_report_worker_free_pace() {
+        // Reconstructed from reports/2026-10-12-openai-head-reserve.md, which
+        // valued Astrocyte's Codex usage for the 168 complete hours ending
+        // Oct 12 16:00Z. Routing counted 176.389968 points for OpenCode, Pi and
+        // Claude Code. Of that, 19.564473 came from OpenCode sessions running
+        // the `mason` worker agent, all before Oct 6 19:00Z (the first 27
+        // hours). The rest is Pi unlabelled (156.820915) and OpenCode Alfonso
+        // (0.004580). Broca's 740.908180 points were never head demand.
+        let from = 1_791_216_000_000;
+        let reply = pace_reply("codex", from, 168, |hour| {
+            let mut rows = vec![
+                ("pi", "unlabelled", 156.820915 / 168.0),
+                ("opencode", "Alfonso", 0.004580 / 168.0),
+                ("broca", "mason", 740.908180 / 168.0),
+            ];
+            if hour < 27 {
+                rows.push(("opencode", "mason", 19.564473 / 27.0));
+            }
+            rows
+        });
+        let to = from + 168 * PACE_HOUR_MS;
+        let pace = head_pace_breakdown(&reply, "codex", from, to).unwrap();
+
+        // The report gives 0.933485090 points/hour once the `mason` class is
+        // excluded, and 1.049940288 when every OpenCode class is counted as
+        // head demand (head pace plus mason's excluded pace).
+        assert!((pace.head_points_per_hour - 0.933485090).abs() < 1e-8);
+        let mason = pace.excluded_worker_points_per_hour["mason"];
+        assert!((mason - 19.564473 / 168.0).abs() < 1e-12);
+        assert!((pace.head_points_per_hour + mason - 1.049940288).abs() < 1e-8);
+        // Mason's share of that all-classes figure is 11.091602%.
+        assert!((mason / (pace.head_points_per_hour + mason) - 0.11091602).abs() < 1e-8);
+        assert!((pace.head_by_work_class["unlabelled"] - 156.820915 / 168.0).abs() < 1e-12);
+        // The report's OpenAI pool had two Pro 200 accounts and one Pro 100
+        // account, so the Pro 200 tier carries two thirds of provider pace.
+        // Its accounts reset 132.014776 hours after the refused decision, so
+        // its head reserve is pace * 2/3 * 132.014776: 82.155884 points here,
+        // against 92.405088 with the all-classes pace of 1.049940288.
+        let pro_200 = pace.head_points_per_hour * 2.0 / 3.0 * 132.014776;
+        assert!((pro_200 - 82.155884).abs() < 1e-5);
     }
 
     fn pi_incident_input(
@@ -982,10 +1242,7 @@ mod tests {
             &state,
             &Value::Null,
             &prices(),
-            &HashMap::from([(
-                "claude".into(),
-                fixture["head_points_per_hour"].as_f64().unwrap(),
-            )]),
+            &flat_paces([("claude", fixture["head_points_per_hour"].as_f64().unwrap())]),
             now,
         )
         .pools
@@ -1476,7 +1733,7 @@ mod tests {
         (state, fixture)
     }
 
-    fn captured_head_paces() -> HashMap<String, f64> {
+    fn captured_head_paces() -> HashMap<String, HeadPaceBreakdown> {
         [
             (
                 "claude",
@@ -1499,7 +1756,7 @@ mod tests {
             let reply = &frame["result"];
             (
                 provider.into(),
-                head_pace(
+                head_pace_breakdown(
                     reply,
                     provider,
                     reply["from_ms"].as_i64().unwrap(),
@@ -1512,7 +1769,7 @@ mod tests {
     }
 
     fn outage_selection(
-        paces: &HashMap<String, f64>,
+        paces: &HashMap<String, HeadPaceBreakdown>,
     ) -> Result<
         prefrontal_routing_core::model_router::SelectedModelRoute,
         prefrontal_routing_core::model_router::NoRouteError,
@@ -1632,11 +1889,7 @@ mod tests {
 
     #[test]
     fn projected_head_demand_exceeding_copied_pooled_headroom_still_blocks_workers() {
-        let error = outage_selection(&HashMap::from([
-            ("claude".into(), 10.0),
-            ("codex".into(), 10.0),
-        ]))
-        .unwrap_err();
+        let error = outage_selection(&flat_paces([("claude", 10.0), ("codex", 10.0)])).unwrap_err();
         assert_eq!(
             error
                 .rejected

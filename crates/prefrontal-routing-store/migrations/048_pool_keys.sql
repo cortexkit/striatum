@@ -1,4 +1,4 @@
--- Migration 47 (namespace "route_state"): the key pool for explicit-only
+-- Migration 48 (namespace "route_state"): the key pool for explicit-only
 -- providers whose credentials are interchangeable API keys (the paid Anthropic
 -- keys behind `anthropic-platform`). Keyed on the full vault credential id,
 -- because these keys have no refresh adapter, are not in the subscription

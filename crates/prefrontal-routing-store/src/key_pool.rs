@@ -1,6 +1,6 @@
 //! Persistence for the key pool of explicit-only API-key providers: leases (runs
 //! in flight), per-key walls and cooldowns, and session workspace affinity. The
-//! schema is migration 47; the choice itself is
+//! schema is migration 48; the choice itself is
 //! [`prefrontal_routing_core::key_pool::pick_pool_key`].
 //!
 //! An acquire runs as one immediate transaction (read leases, walls and

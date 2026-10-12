@@ -460,9 +460,16 @@ pub trait RouteStateStore {
     /// Decisions for a task, oldest first.
     fn get_decisions_for_task(&self, task_id: &str) -> RouteStateResult<Vec<DecisionRow>>;
 
-    /// Delete decision audit rows created before the supplied Unix-millisecond
-    /// cutoff. Durable backends override this; lightweight test stores may skip it.
-    fn delete_decisions_older_than(&self, _created_before_ms: i64) -> RouteStateResult<usize> {
+    /// Delete at most `limit` decision audit rows created before the supplied
+    /// Unix-millisecond cutoff, oldest first, and return how many went. The
+    /// limit keeps each call one short transaction; a caller with more to
+    /// delete calls again. Durable backends override this; lightweight test
+    /// stores may skip it.
+    fn delete_decisions_older_than(
+        &self,
+        _created_before_ms: i64,
+        _limit: usize,
+    ) -> RouteStateResult<usize> {
         Ok(0)
     }
 

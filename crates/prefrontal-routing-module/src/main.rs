@@ -24,6 +24,7 @@ mod fusiform_catalog;
 mod key_pool;
 mod model_resolution;
 mod quota_consumer;
+mod retention;
 mod subscription_economics;
 mod winner_ladder;
 mod work_model_pin;
@@ -138,9 +139,6 @@ const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// The module degrades gracefully (seed-only selection) until quota appears. Kept
 /// short so a sibling module that registers slightly later is picked up promptly.
 const QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(3);
-/// Decision audit rows are retained for one month before the existing refresh
-/// cycle deletes them.
-const DECISION_RETENTION_MS: u64 = 30 * 24 * 60 * 60_000;
 /// Age past which the cached quota snapshot no longer steers selection. The
 /// refresh runs every minute, so a snapshot this old means refreshes have been
 /// failing (or hanging) for many cycles. Quota windows move within that time:
@@ -575,13 +573,6 @@ fn record_cooldown_update(
     store.update_route_state(&params.route_key, &params.capacity_key, &update)
 }
 
-fn prune_expired_decisions(store: &impl RouteStateStore, now: u64) {
-    let cutoff = now.saturating_sub(DECISION_RETENTION_MS) as i64;
-    if let Err(error) = store.delete_decisions_older_than(cutoff) {
-        tracing::debug!(error = %error, "decision retention cycle failed");
-    }
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -751,7 +742,6 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
 /// outbound connection; the connection is never held across the refresh sleep. The
 /// fetch `.await` happens with NO lock held; the cache lock is taken only to merge
 /// the fresh poll, so a slow/blocked quota call can never stall `route.select`.
-/// The same cadence also prunes expired decision audit rows, avoiding another timer.
 async fn quota_refresh_loop(
     connection_file_path: PathBuf,
     cache: SharedQuotaCache,
@@ -763,7 +753,6 @@ async fn quota_refresh_loop(
     let _ = std::fs::create_dir_all(&project_root);
 
     loop {
-        prune_expired_decisions(store.as_ref(), now_ms());
         let mut consumer = match QuotaConsumer::connect(&connection_file_path, &project_root).await
         {
             Ok(c) => c,
@@ -862,6 +851,13 @@ where
         config.connection_file_path.clone(),
         Arc::clone(&quota_cache),
         Arc::clone(&store),
+    ));
+    // Old audit, usage and shadow rows are deleted in small batches on their
+    // own timer. Each retention pass re-reads how long every table keeps its
+    // rows from the routing file's `retention` block.
+    tokio::spawn(retention::retention_loop(
+        Arc::clone(&store),
+        config_overrides::config_path(),
     ));
     // Per-account quota views: restored with their original source dates before
     // the first poll, then refreshed on their own loop. Model selection does not
@@ -4486,7 +4482,8 @@ async fn handle_route_explain(
     let decision = match lookup {
         Ok(Some(decision)) => decision,
         Ok(None) => {
-            let retention_days = DECISION_RETENTION_MS / (24 * 60 * 60_000);
+            let retention_days = retention::retention_windows(&config_overrides::config_path())
+                .model_route_decisions_days;
             return send_route_error(
                 writer,
                 ver,
@@ -9810,7 +9807,8 @@ mod tests {
         assert_eq!(response.header.ty, FrameType::Error);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         let message = body["message"].as_str().unwrap();
-        let retention_days = DECISION_RETENTION_MS / (24 * 60 * 60_000);
+        let retention_days = retention::retention_windows(&config_overrides::config_path())
+            .model_route_decisions_days;
         assert_eq!(body["code"], "not_found");
         assert!(message.contains("decisionID 'dec-pruned'"));
         assert!(message.contains(&format!(
