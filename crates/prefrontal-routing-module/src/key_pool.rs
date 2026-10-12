@@ -200,6 +200,7 @@ pub fn acquire(
     let mut runner = RunnerModel::pinned(&lease.credential_id, model, variant)
         .expect("pool keys were checked to parse as credential ids");
     runner.pool = Some(provider.to_string());
+    runner.pool_session = Some(session.to_string());
     Ok(PoolGrant {
         lease_id: lease.lease_id,
         credential_id: lease.credential_id,

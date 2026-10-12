@@ -3535,8 +3535,8 @@ fn host_runner_pin_refusal<'a>(
         let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
         needs_runner_pin(policy, provider).then(|| {
             format!(
-                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries; the requested substrate ({}) cannot send it",
-                requested_substrate.unwrap_or("host")
+                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, and this request names substrate {}. {provider} can be used through spec and Athena panel roster pins and core-side Broca launches; a `work run model=` launched through the host plugin cannot use it until the host plugin passes substrate \"broca\" to route.select",
+                requested_substrate.unwrap_or("none (the host plugin's launch path)")
             )
         })
     })
@@ -11059,11 +11059,13 @@ mod tests {
             "{body}"
         );
         // The pin's account is the credential's label, never its workspace.
+        let session = body["result"]["runner"]["pool_session"].clone();
+        assert!(session.is_string(), "{body}");
         assert_eq!(
             body["result"]["runner"],
             json!({"provider": "anthropic", "model": "claude-opus-4-1",
                    "auth": {"method": "apikey", "account": "work"},
-                   "pool": "anthropic-platform"}),
+                   "pool": "anthropic-platform", "pool_session": session}),
             "{body}"
         );
         assert_eq!(
@@ -11204,6 +11206,63 @@ mod tests {
         )
         .await;
         assert_eq!(host["code"], "provider_requires_runner_pin", "{host}");
+        let message = host["message"].as_str().unwrap();
+        for part in [
+            "spec and Athena panel",
+            "core-side Broca launches",
+            "work run model=",
+            "passes substrate",
+        ] {
+            assert!(
+                message.contains(part),
+                "the refusal names {part:?}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pinned_launch_and_its_sends_share_one_pool_lease() {
+        // Selection leases under the caller's task; the launch target carries
+        // that session, and the first send acquires under it again. One launch
+        // must be one run in flight, never two for the lease's lifetime.
+        let credentials = platform_listing(&[
+            ("apikey:anthropic", &["anthropic-platform"]),
+            ("apikey:anthropic:work", &["anthropic-platform"]),
+        ]);
+        let (body, rig, store) = platform_select(
+            "platform-one-lease",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1",
+                   "taskId": "bg_launch"}),
+            &credentials,
+            false,
+        )
+        .await;
+        let runner = &body["result"]["runner"];
+        assert_eq!(runner["pool_session"], "bg_launch", "{body}");
+        let selected_lease = body["result"]["poolLease"]["leaseId"].clone();
+        let config = platform_operator_config(&rig);
+        let frame = run_route_wire_request_with_paths(
+            &store,
+            json!({"method": "route.pool_acquire", "params": {
+                "provider": "anthropic-platform", "model": "claude-opus-4-1",
+                "session": runner["pool_session"]}}),
+            &config,
+            &credentials,
+        )
+        .await;
+        let send: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            send["result"]["leaseId"], selected_lease,
+            "the send reuses the selection's lease: {send}"
+        );
+        let in_flight: u32 = store
+            .pool_key_states("anthropic-platform", now_ms() as i64)
+            .unwrap()
+            .values()
+            .map(|state| state.in_flight)
+            .sum();
+        assert_eq!(in_flight, 1, "one launch is one run in flight");
     }
 
     #[tokio::test]
