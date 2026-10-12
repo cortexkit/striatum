@@ -1059,7 +1059,7 @@ fn decision_retention_deletes_old_rows_and_keeps_young_rows() {
         }
     }
 
-    assert_eq!(store.delete_decisions_older_than(cutoff).unwrap(), 1);
+    assert_eq!(store.delete_decisions_older_than(cutoff, 100).unwrap(), 1);
     let kept: Vec<String> = store
         .get_decisions_for_task("retention-task")
         .unwrap()

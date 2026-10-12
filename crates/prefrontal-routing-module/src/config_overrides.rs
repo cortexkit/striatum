@@ -599,6 +599,22 @@ fn read_routing_config(path: &Path) -> Result<Option<RoutingConfigFile>, String>
         .map_err(|error| format!("invalid config in {}: {error}", path.display()))
 }
 
+/// The routing file as untyped JSON, for a reader that must not depend on
+/// every other block parsing (a typo elsewhere in the file leaves it working).
+/// A missing file is `Ok(None)`.
+pub(crate) fn read_routing_config_value(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    let doc = match std::fs::read_to_string(path) {
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("reading {}: {error}", path.display())),
+    };
+    let json = jsonc_to_json(&doc)
+        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
+    serde_json::from_str(&json)
+        .map(Some)
+        .map_err(|error| format!("invalid json in {}: {error}", path.display()))
+}
+
 pub(crate) fn apply_family_rules_from_config<S: RouteStateStore>(
     store: &S,
     path: &Path,
