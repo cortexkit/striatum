@@ -184,6 +184,21 @@ async fn start_real_daemon() -> RealDaemon {
         credential_service,
     };
     let mut consumer = connect_consumer(&daemon.connection_file).await;
+    wait_for_catalog(&mut consumer, "claustrum", SETUP_TIMEOUT).await;
+    wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
+    // Routing can list credentials before the Claustrum fixture registers.
+    // Restart routing after Claustrum is ready so its first credential poll
+    // succeeds, rather than racing a periodic retry against the setup deadline.
+    let restarted = control_rpc(
+        &mut consumer,
+        5899,
+        serde_json::json!({ "op": "supervisor.restart", "module_id": MODULE_ID }),
+    )
+    .await;
+    assert_eq!(restarted.header.ty, subc_protocol::FrameType::Response);
+    let restarted: serde_json::Value = serde_json::from_slice(&restarted.body).unwrap();
+    assert_eq!(restarted["op"], "supervisor.ack");
+    assert_eq!(restarted["applied"], true, "{restarted}");
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
     let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
     loop {
