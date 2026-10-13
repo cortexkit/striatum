@@ -13,6 +13,7 @@ use serde_json::{json, Map};
 fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
     ModelFact {
         billing_plane: None,
+        auth_methods: None,
         speed_is_fleet_median: false,
         provider_id: "p".into(),
         model_id: model.into(),

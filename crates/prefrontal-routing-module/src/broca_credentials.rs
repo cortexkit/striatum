@@ -59,6 +59,25 @@ pub(crate) fn credential_method(adapter: Option<&str>, credential_type: &str) ->
     .to_string()
 }
 
+fn listed_method(row: &ListedCredential) -> String {
+    row.auth_method
+        .clone()
+        .unwrap_or_else(|| credential_method(row.refresh_adapter.as_deref(), &row.credential_type))
+}
+
+fn credential_serves_fact(row: &ListedCredential, fact: &ModelFact) -> bool {
+    row.state == "active"
+        && row
+            .categories
+            .iter()
+            .any(|category| category == "llm-provider")
+        && row.provider_ids.contains(&fact.provider_id)
+        && fact
+            .auth_methods
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(&listed_method(row)))
+}
+
 fn choose_method(roster: BTreeSet<String>, listed: BTreeSet<String>) -> ServingMethod {
     let (methods, source) = if roster.is_empty() {
         (listed, "single listed method")
@@ -164,29 +183,35 @@ impl BrocaCredentials {
                 let methods = roster
                     .iter()
                     .flat_map(|account| {
-                        account.credentials.iter().map(|record| {
-                            let credential_type = self
+                        account.credentials.iter().filter_map(|record| {
+                            let listed = self
                                 .listed
                                 .iter()
-                                .find(|row| row.id == record.credential_id)
-                                .map_or("oauth", |row| row.credential_type.as_str());
-                            credential_method(Some(&account.refresh_adapter), credential_type)
+                                .find(|row| row.id == record.credential_id);
+                            if fact.auth_methods.is_some() {
+                                // A quota identity match cannot make a credential eligible
+                                // if its provider mapping or the model's login policy excludes it.
+                                return listed
+                                    .filter(|row| credential_serves_fact(row, fact))
+                                    .map(listed_method);
+                            }
+                            Some(credential_method(
+                                Some(&account.refresh_adapter),
+                                listed.map_or("oauth", |row| row.credential_type.as_str()),
+                            ))
                         })
                     })
                     .collect();
                 let listed = self
                     .listed
                     .iter()
-                    .filter(|row| {
-                        row.state == "active"
-                            && row
-                                .categories
-                                .iter()
-                                .any(|category| category == "llm-provider")
-                            && row.provider_ids.contains(&fact.provider_id)
-                    })
+                    .filter(|row| credential_serves_fact(row, fact))
                     .map(|row| {
-                        credential_method(row.refresh_adapter.as_deref(), &row.credential_type)
+                        if fact.auth_methods.is_some() {
+                            listed_method(row)
+                        } else {
+                            credential_method(row.refresh_adapter.as_deref(), &row.credential_type)
+                        }
                     })
                     .collect();
                 (
@@ -340,14 +365,25 @@ impl BrocaCredentials {
         report
     }
 
-    /// Rows arrive already filtered for catalog withdrawals. An incomplete or
-    /// stale mapping widens to that served catalog, never to the caller's host
-    /// list. With complete mappings the exact provider-id join is exclusive.
+    /// Rows arrive already filtered for catalog withdrawals. When the vault
+    /// listing is unknown, stale, or has no mapped providers, unrestricted models
+    /// fall back to that served catalog, never the caller's host list. A fresh
+    /// listing with mapped providers instead uses the exact provider-id join.
+    /// Restricted models cannot use the catalog fallback: an active credential
+    /// in a fresh listing must map the provider and satisfy the login allowlist.
     pub fn served_routes(&self, facts: &[ModelFact], now_ms: u64) -> (Vec<String>, Option<String>) {
         let fallback = self.fallback_reason(now_ms);
         let routes = facts
             .iter()
             .filter(|fact| fallback.is_some() || self.providers.contains(&fact.provider_id))
+            .filter(|fact| {
+                fact.auth_methods.is_none()
+                    || (fallback.is_none()
+                        && self
+                            .listed
+                            .iter()
+                            .any(|row| credential_serves_fact(row, fact)))
+            })
             .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
             .collect();
         (routes, fallback)

@@ -335,6 +335,10 @@ pub struct ModelFact {
     pub provider_id: String,
     #[serde(rename = "modelID")]
     pub model_id: String,
+    /// Fusiform's allowed login methods. Absence is unrestricted; an empty list
+    /// permits no credential. The operator's provider mapping is still required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_methods: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
     /// Curated model lineage used for diversity; never inferred from provider id.

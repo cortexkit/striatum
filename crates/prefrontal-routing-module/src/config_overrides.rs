@@ -1294,6 +1294,7 @@ fn apply_overrides<S: RouteStateStore>(
             .or_else(|| seed_fact.cloned())
             .unwrap_or_else(|| ModelFact {
                 billing_plane: None,
+                auth_methods: None,
                 speed_is_fleet_median: false,
                 provider_id,
                 model_id,
@@ -1445,6 +1446,7 @@ mod tests {
     fn family_override_distinguishes_absent_null_and_value() {
         let base = ModelFact {
             billing_plane: None,
+            auth_methods: None,
             speed_is_fleet_median: false,
             provider_id: "p".into(),
             model_id: "m".into(),

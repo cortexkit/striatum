@@ -1745,6 +1745,7 @@ fn merge_model_upsert(
             };
             ModelFact {
                 billing_plane: None,
+                auth_methods: None,
                 speed_is_fleet_median: false,
                 provider_id: params.provider_id.clone(),
                 model_id: params.model_id.clone(),
@@ -5797,6 +5798,7 @@ mod tests {
     pub(super) fn fact(provider: &str, model: &str) -> ModelFact {
         ModelFact {
             billing_plane: None,
+            auth_methods: None,
             speed_is_fleet_median: false,
             provider_id: provider.into(),
             model_id: model.into(),

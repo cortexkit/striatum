@@ -61,6 +61,7 @@ impl Drop for Rig {
 fn fact(provider: &str, model: &str) -> ModelFact {
     ModelFact {
         billing_plane: None,
+        auth_methods: None,
         speed_is_fleet_median: false,
         provider_id: provider.into(),
         model_id: model.into(),
@@ -2830,6 +2831,7 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
     assert_eq!(initial.supports_vision, Some(true));
 
     let update = |vision| FusiformFactUpdate {
+        auth_methods: None,
         provider_id: "anthropic".to_string(),
         model_id: "claude-opus-4-5".to_string(),
         present: true,
@@ -2933,6 +2935,7 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
     let rig = Rig::new("fusiform-pair-key");
     let store = rig.open();
     let fact = |provider: &str| FusiformFactUpdate {
+        auth_methods: None,
         provider_id: provider.to_string(),
         model_id: "shared-spelling".to_string(),
         present: true,
@@ -2977,6 +2980,7 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
     let rig = Rig::new("fusiform-provider-scope");
     let store = rig.open();
     let fact = |provider: &str, model: &str| FusiformFactUpdate {
+        auth_methods: None,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         present: true,
@@ -3031,6 +3035,7 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
     let store = rig.open();
     let route_key = make_route_key("anthropic", "claude-opus-4-5", None);
     let withdrawn = |provider: &str, model: &str| FusiformFactUpdate {
+        auth_methods: None,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         present: false,

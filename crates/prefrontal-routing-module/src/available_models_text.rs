@@ -451,6 +451,7 @@ mod tests {
     ) -> ModelFact {
         ModelFact {
             billing_plane: None,
+            auth_methods: None,
             speed_is_fleet_median: false,
             provider_id: provider.to_string(),
             model_id: model.to_string(),

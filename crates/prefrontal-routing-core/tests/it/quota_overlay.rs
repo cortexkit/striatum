@@ -25,6 +25,7 @@ const NOW: f64 = 1_000_000.0;
 fn fact(provider: &str, model: &str, cost: f64) -> ModelFact {
     ModelFact {
         billing_plane: None,
+        auth_methods: None,
         speed_is_fleet_median: false,
         provider_id: provider.into(),
         model_id: model.into(),

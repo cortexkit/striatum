@@ -2009,6 +2009,7 @@ mod abundance_tests {
     ) -> ModelFact {
         ModelFact {
             billing_plane: None,
+            auth_methods: None,
             input_rate: None,
             cache_read_rate: None,
             cache_write_rate: None,

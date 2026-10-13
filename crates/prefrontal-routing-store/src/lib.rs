@@ -172,6 +172,7 @@ const MIGRATION_047: &str = include_str!("../migrations/047_retention_indexes.sq
 /// Migration 48: the key pool for explicit-only API-key providers (leases,
 /// per-key walls and cooldowns, and session workspace affinity).
 const MIGRATION_048: &str = include_str!("../migrations/048_pool_keys.sql");
+const MIGRATION_049: &str = include_str!("../migrations/049_model_auth_methods.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -215,7 +216,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 48] {
+fn route_state_migrations() -> [Migration; 49] {
     [
         Migration {
             version: 1,
@@ -409,6 +410,10 @@ fn route_state_migrations() -> [Migration; 48] {
             version: 48,
             statements: MIGRATION_048,
         },
+        Migration {
+            version: 49,
+            statements: MIGRATION_049,
+        },
     ]
 }
 
@@ -489,6 +494,7 @@ pub struct FusiformCatalogCursor {
 pub struct FusiformFactUpdate {
     pub provider_id: String,
     pub model_id: String,
+    pub auth_methods: Option<Vec<String>>,
     pub present: bool,
     pub context_window: Option<f64>,
     pub max_output_tokens: Option<u64>,
@@ -528,13 +534,14 @@ struct CatalogFingerprintRow {
     speed_multiplier: Option<f64>,
     excluded: bool,
     fusiform_present: Option<bool>,
+    auth_methods_json: Option<String>,
 }
 
 /// BLAKE3 over every routing-read `model_facts` column: route/capacity identity,
 /// provider/model/variant, family, Elo/EQ/speed, context and output limits, price
-/// data, vision/tool capability flags, prompt defaults, confidence, speed multiplier,
-/// and exclusion. Adding a routing-read column without extending this row is the
-/// defect this hash exists to catch. Query ordering—not insertion ordering—is the
+/// data, vision/tool capability flags, allowed login methods, prompt defaults,
+/// confidence, speed multiplier, and exclusion. Adding a routing-read column
+/// without extending this row is the defect this hash exists to catch. Query ordering—not insertion ordering—is the
 /// generation contract, so a no-op reseed or shuffled input cannot mint a different
 /// fingerprint for the same catalog.
 ///
@@ -550,7 +557,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                 input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
-                speed_multiplier, excluded, fusiform_present
+                speed_multiplier, excluded, fusiform_present, auth_methods_json
          FROM model_facts
          ORDER BY route_key",
     )?;
@@ -580,6 +587,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             speed_multiplier: row.get(21)?,
             excluded: row.get::<_, i64>(22)? != 0,
             fusiform_present: row.get::<_, Option<i64>>(23)?.map(|value| value != 0),
+            auth_methods_json: row.get(24)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -922,6 +930,12 @@ impl SqliteRouteStateStore {
                             "Fusiform provider/model identity must be non-empty".to_string(),
                         ));
                     }
+                    let auth_methods_json = fact
+                        .auth_methods
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                     let route_key = prefrontal_routing_core::make_route_key(
                         &fact.provider_id,
                         &fact.model_id,
@@ -966,7 +980,7 @@ impl SqliteRouteStateStore {
                                fusiform_present, context_window_source,
                                max_output_tokens_source, cost_tier_source,
                                cost_per_mtok_out_source, supports_vision_source,
-                               supports_tool_use_source
+                               supports_tool_use_source, auth_methods_json
                              ) VALUES (
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
                                ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
@@ -974,7 +988,7 @@ impl SqliteRouteStateStore {
                                NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
                                'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
-                               'fusiform', 'fusiform'
+                               'fusiform', 'fusiform', ?18
                              )",
                             params![
                                 route_key,
@@ -994,6 +1008,7 @@ impl SqliteRouteStateStore {
                                 now_ms(),
                                 cursor.catalog_version,
                                 if fact.present { 1_i64 } else { 0_i64 },
+                                auth_methods_json,
                             ],
                         )?;
                         let provider_key = derive_provider_key(&fact.provider_id).ok_or_else(|| {
@@ -1056,7 +1071,8 @@ impl SqliteRouteStateStore {
                                supports_tool_use_source = CASE WHEN supports_tool_use_source = 'override'
                                  THEN supports_tool_use_source ELSE 'fusiform' END,
                                facts_source = 'fusiform', fusiform_version = ?11,
-                               fusiform_present = ?12, updated_at = ?13
+                               fusiform_present = ?12, updated_at = ?13,
+                               auth_methods_json = ?16
                              WHERE provider_id = ?14 AND model_id = ?15",
                             params![
                                 fact.context_window,
@@ -1074,6 +1090,7 @@ impl SqliteRouteStateStore {
                                 now_ms(),
                                 fact.provider_id,
                                 fact.model_id,
+                                auth_methods_json,
                             ],
                         )?;
                     }
@@ -1706,6 +1723,19 @@ fn decision_explain_row(row: &Row<'_>) -> rusqlite::Result<DecisionExplainRow> {
 }
 
 fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
+    let auth_methods_index = row.as_ref().column_index("auth_methods_json")?;
+    let auth_methods = row
+        .get::<_, Option<String>>("auth_methods_json")?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    auth_methods_index,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
     let scores_json: String = row.get("scores_json")?;
     let scores: ModelScores = serde_json::from_str(&scores_json).unwrap_or(ModelScores {
         elo: 0.0,
@@ -1722,6 +1752,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
     let source = FactSource::parse(&row.get::<_, String>("source")?);
     Ok(ModelFact {
         billing_plane: None,
+        auth_methods,
         // Read-time provenance, never stored: a fact loaded from the row has whatever
         // speed the row holds, and the median stand-in is applied above this.
         speed_is_fleet_median: false,
@@ -1916,14 +1947,19 @@ impl RouteStateStore for SqliteRouteStateStore {
                         }
                     }
                 }
+                 // Login restrictions belong to the served model, not its route
+                 // variant. When upsert_fact places a new variant's scores, it
+                 // inherits the model's policy; updating scores cannot erase it.
                  tx.execute(
                      "INSERT INTO model_facts (
                        route_key, capacity_key, provider_id, model_id, variant, family, family_source,
                        scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                          input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                          supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
-                         source, updated_at, aa_index, review_by_ms, eq_source
-                        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
+                          source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json
+                         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,
+                           (SELECT auth_methods_json FROM model_facts
+                            WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1))
                       ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,

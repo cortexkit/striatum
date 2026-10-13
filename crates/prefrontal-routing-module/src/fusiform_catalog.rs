@@ -109,6 +109,14 @@ struct CatalogGetReply {
     catalog_version: i64,
     models: BTreeMap<String, CatalogModelFacts>,
     resolved_at_ms: i64,
+    #[serde(default)]
+    curated: Vec<CatalogCuratedModel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CatalogCuratedModel {
+    model: String,
+    auth_methods: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -506,6 +514,18 @@ fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogEr
     let rates = model_rates(&value["models"])?;
     let reply: CatalogGetReply =
         serde_json::from_value(value).map_err(FusiformCatalogError::Json)?;
+    let mut auth_methods = BTreeMap::new();
+    for row in reply.curated {
+        let mut methods = row.auth_methods;
+        methods.sort();
+        methods.dedup();
+        if auth_methods.insert(row.model.clone(), methods).is_some() {
+            return Err(error(format!(
+                "duplicate Fusiform curated model: {}",
+                row.model
+            )));
+        }
+    }
     let mut facts = Vec::with_capacity(reply.models.len());
     for (served_key, model) in reply.models {
         let (provider_id, model_id) = served_key
@@ -544,6 +564,7 @@ fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogEr
         facts.push(FusiformFactUpdate {
             provider_id: provider_id.to_string(),
             model_id: model_id.to_string(),
+            auth_methods: auth_methods.remove(&served_key),
             present,
             context_window: model.context.map(|value| value as f64),
             max_output_tokens: model.output,
@@ -1096,6 +1117,265 @@ mod tests {
 
     fn get_reply(name: &str) -> Vec<u8> {
         serde_json::to_vec(&fixture()[name]["response"]).unwrap()
+    }
+
+    fn muse_reply() -> Value {
+        let mut reply: Value =
+            serde_json::from_slice(include_bytes!("../fixtures/muse-curated.json")).unwrap();
+        // The fixture omits catalog_version and resolved_at_ms, required for
+        // polling. Add those fields without changing its model and curated rows.
+        reply["catalog_version"] = json!(1);
+        reply["resolved_at_ms"] = json!(-1);
+        reply
+    }
+
+    fn stored_muse_facts(rig: &Rig) -> Vec<prefrontal_routing_core::ModelFact> {
+        use prefrontal_routing_core::{FactSource, RouteStateStore as _};
+        let store = rig.store();
+        // Hard admission rejects unscored facts before checking credentials.
+        // Score only these test fixtures so the credential policy is exercised;
+        // do not add a Muse placement to the production catalog.
+        for model in ["muse-wonder-full-1.0", "unrestricted"] {
+            store
+                .upsert_fact(&crate::tests::fact("meta", model), FactSource::Seed)
+                .unwrap();
+        }
+        let snapshot = decode_catalog_get(&serde_json::to_vec(&muse_reply()).unwrap()).unwrap();
+        assert_eq!(snapshot.facts[0].auth_methods, Some(vec!["oauth".into()]));
+        store
+            .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
+            .unwrap();
+        drop(store);
+        rig.store()
+            .get_facts()
+            .unwrap()
+            .into_iter()
+            .filter(|fact| fact.provider_id == "meta")
+            .collect()
+    }
+
+    fn muse_credential(method: &str, mapped: bool) -> prefrontal_ckcred_client::ListedCredential {
+        prefrontal_ckcred_client::ListedCredential {
+            id: format!("{method}:meta"),
+            categories: vec!["llm-provider".into()],
+            credential_type: method.into(),
+            auth_method: Some(method.into()),
+            serves: vec!["meta".into()],
+            provider_ids: if mapped {
+                vec!["meta".into()]
+            } else {
+                Vec::new()
+            },
+            state: "active".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn muse_golden_curated_auth_methods_gate_credential_admission() {
+        use prefrontal_routing_core::{
+            admit_routes, ExclusionPolicy, ModelRequirements, DEFAULT_ROUTING_CONFIG,
+        };
+        let rig = Rig::new("muse-auth-admission");
+        let facts = stored_muse_facts(&rig);
+        let restricted = "meta/muse-wonder-full-1.0";
+        for (methods, admitted) in [
+            (vec!["apikey"], false),
+            (vec!["oauth"], true),
+            (vec!["apikey", "oauth"], true),
+        ] {
+            let mut cache = crate::broca_credentials::BrocaCredentials::default();
+            cache.apply_listing(
+                &prefrontal_ckcred_client::ScopedCredentialListing {
+                    credentials: methods
+                        .iter()
+                        .map(|method| muse_credential(method, true))
+                        .collect(),
+                    view: "muse-test".into(),
+                    ..Default::default()
+                },
+                1,
+            );
+            let (routes, fallback) = cache.served_routes(&facts, 1);
+            assert!(fallback.is_none());
+            assert!(routes.iter().any(|key| key == "meta/unrestricted"));
+            let available = routes.into_iter().collect();
+            let admission = admit_routes(
+                &facts,
+                None,
+                ExclusionPolicy::default(),
+                None,
+                &available,
+                &ModelRequirements { iq: 0.0, eq: 0.0 },
+                &DEFAULT_ROUTING_CONFIG,
+            );
+            assert_eq!(
+                admission
+                    .admitted
+                    .iter()
+                    .any(|row| row.route.route_key == restricted),
+                admitted,
+                "credential methods {methods:?}"
+            );
+            if !admitted {
+                assert!(admission
+                    .rejected
+                    .iter()
+                    .any(|row| row.route_key == restricted && row.reason == "not_available"));
+            }
+            cache.refresh_serving_methods(
+                &crate::account_quota::AccountQuotaState::default(),
+                &facts,
+                1,
+            );
+            if methods.contains(&"oauth") {
+                assert!(cache
+                    .plane_keys()
+                    .contains(&("meta".into(), "oauth".into())));
+            }
+            if methods.len() > 1 {
+                assert!(!cache.plane_keys().contains(&("meta".into(), "apikey".into())),
+                    "an ineligible key must not make the restricted model's billing method ambiguous");
+            }
+        }
+    }
+
+    #[test]
+    fn muse_requires_fresh_operator_provider_mapping_even_with_catalog_fallback() {
+        let rig = Rig::new("muse-no-auto-route");
+        let facts = stored_muse_facts(&rig);
+        let restricted = "meta/muse-wonder-full-1.0";
+        let mut cache = crate::broca_credentials::BrocaCredentials::default();
+        assert!(!cache
+            .served_routes(&facts, 1)
+            .0
+            .contains(&restricted.into()));
+        cache.apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: vec![muse_credential("oauth", false)],
+                view: "unmapped".into(),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(
+            !cache
+                .served_routes(&facts, 1)
+                .0
+                .contains(&restricted.into()),
+            "a vendor name and OAuth token cannot substitute for provider_ids"
+        );
+        assert!(cache
+            .served_routes(&facts, 1)
+            .0
+            .contains(&"meta/unrestricted".into()));
+        cache.apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: vec![muse_credential("oauth", true)],
+                view: "mapped".into(),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(cache
+            .served_routes(&facts, 1)
+            .0
+            .contains(&restricted.into()));
+        assert!(
+            !cache
+                .served_routes(&facts, 1 + 16 * 60 * 1000)
+                .0
+                .contains(&restricted.into()),
+            "a stale listing cannot prove the allowed credential is still mapped"
+        );
+    }
+
+    #[test]
+    fn curated_auth_methods_refresh_all_variants_and_fingerprint() {
+        use prefrontal_routing_core::{FactSource, RouteStateStore as _};
+        let rig = Rig::new("muse-auth-refresh");
+        let facts = stored_muse_facts(&rig);
+        let store = rig.store();
+        let mut variant = facts
+            .iter()
+            .find(|fact| fact.model_id == "muse-wonder-full-1.0")
+            .unwrap()
+            .clone();
+        variant.variant = Some("high".into());
+        variant.auth_methods = None;
+        store.upsert_fact(&variant, FactSource::Override).unwrap();
+        assert_eq!(
+            store.get_fact_by_route_key("meta/muse-wonder-full-1.0/high").unwrap().unwrap().auth_methods,
+            Some(vec!["oauth".into()]),
+            "a new score variant must inherit the served model's policy before the next catalog poll"
+        );
+        let mut reply = muse_reply();
+        let apply = |reply: &Value| {
+            let snapshot = decode_catalog_get(&serde_json::to_vec(reply).unwrap()).unwrap();
+            store
+                .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
+                .unwrap();
+        };
+        apply(&reply);
+        let restricted_fingerprint = store.catalog_fingerprint().unwrap();
+        for key in [
+            "meta/muse-wonder-full-1.0",
+            "meta/muse-wonder-full-1.0/high",
+        ] {
+            assert_eq!(
+                store
+                    .get_fact_by_route_key(key)
+                    .unwrap()
+                    .unwrap()
+                    .auth_methods,
+                Some(vec!["oauth".into()])
+            );
+        }
+        reply["curated"][0]["auth_methods"] = json!([]);
+        reply["catalog_version"] = json!(2);
+        apply(&reply);
+        assert_ne!(restricted_fingerprint, store.catalog_fingerprint().unwrap());
+        assert_eq!(
+            store
+                .get_fact_by_route_key("meta/muse-wonder-full-1.0/high")
+                .unwrap()
+                .unwrap()
+                .auth_methods,
+            Some(Vec::new())
+        );
+        let empty_policy = store.get_facts().unwrap();
+        let mut cache = crate::broca_credentials::BrocaCredentials::default();
+        cache.apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                credentials: vec![muse_credential("oauth", true)],
+                view: "empty-policy".into(),
+                ..Default::default()
+            },
+            1,
+        );
+        assert!(
+            !cache
+                .served_routes(&empty_policy, 1)
+                .0
+                .iter()
+                .any(|key| key.starts_with("meta/muse-wonder-full-1.0")),
+            "an empty allowlist denies every credential, including OAuth"
+        );
+        reply.as_object_mut().unwrap().remove("curated");
+        reply["catalog_version"] = json!(3);
+        apply(&reply);
+        let fact = store
+            .get_fact_by_route_key("meta/muse-wonder-full-1.0/high")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fact.auth_methods, None,
+            "absence removes a prior catalog restriction"
+        );
+        assert_eq!(
+            fact.scores, variant.scores,
+            "catalog policy must not rewrite score overrides"
+        );
     }
 
     #[test]
