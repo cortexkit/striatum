@@ -135,6 +135,10 @@ const DELEGATED_ROLE_FAMILIES: &[&str] = &[
     "comment.reviewer",
     "wake.author",
     "mint.planner",
+    // Background Claude Code sessions the harness module launches for delegated
+    // work. A user-launched Claude Code session is not one of these and stays a
+    // possible head.
+    "claude.code.worker",
 ];
 
 /// True for agent or work-class names that only ever run delegated work:
@@ -556,6 +560,8 @@ mod tests {
             "wake.author",
             "wake_author",
             "mint.planner",
+            "claude-code-worker",
+            "claude_code_worker",
         ] {
             assert!(is_delegated_role(role), "{role} is delegated work");
         }
@@ -573,6 +579,8 @@ mod tests {
             "specialist",
             "comment",
             "consultant",
+            "claude-code",
+            "claude",
         ] {
             assert!(!is_delegated_role(name), "{name} may be a head");
         }
