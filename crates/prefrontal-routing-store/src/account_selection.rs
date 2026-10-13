@@ -197,6 +197,7 @@ pub struct AccountExclusionRow {
 /// Row counts of the tables that serving writes (everything but the decision
 /// log), for diagnostics and for proving a code path wrote none of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct AccountServingCounts {
     pub affinity: i64,
     pub pins: i64,
@@ -207,6 +208,7 @@ pub struct AccountServingCounts {
     pub exclusions: i64,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl AccountServingCounts {
     pub fn total(&self) -> i64 {
         self.affinity
@@ -1061,6 +1063,7 @@ impl SqliteRouteStateStore {
     }
 
     /// Row counts of the tables serving writes.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn account_serving_counts(&self) -> RouteStateResult<AccountServingCounts> {
         self.store
             .with_conn(|c: &Connection| {

@@ -16,5 +16,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = "1"
 
+[features]
+test-support = []
+
 [dev-dependencies]
 prefrontal-test-support = { path = "../prefrontal-test-support" }

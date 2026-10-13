@@ -44,10 +44,12 @@ pub use retention::{
     is_routine_decision, DecisionRetentionCursor, RetentionBatch, ROUTINE_REFUSAL_CODE,
 };
 
+#[cfg(any(test, feature = "test-support"))]
+pub use account_selection::AccountServingCounts;
 pub use account_selection::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
     AccountExclusionRow, AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow,
-    AccountServingCounts, AccountTx, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
+    AccountTx, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
 };
 
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
