@@ -125,6 +125,7 @@ async fn start_real_daemon() -> RealDaemon {
     let module_bin = prefrontal_test_support::stage_test_binary(std::path::Path::new(env!(
         "CARGO_BIN_EXE_ck-prefrontal-routing"
     )));
+    prefrontal_test_support::sign_test_binary(&module_bin);
     // Warm-exec the freshly built module binary too (same assessment stall).
     prefrontal_test_support::warm_exec_fenced(&module_bin);
     assert!(module_bin.exists());

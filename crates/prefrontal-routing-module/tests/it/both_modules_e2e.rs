@@ -90,6 +90,7 @@ async fn start_both_modules_daemon() -> RealDaemon {
         "CARGO_BIN_EXE_ck-prefrontal-routing"
     )));
     assert!(routing_module.exists());
+    prefrontal_test_support::sign_test_binary(&routing_module);
 
     let rig = unique_temp_dir("both-modules-real-daemon");
     let config_dir = rig.join("config/cortexkit");
