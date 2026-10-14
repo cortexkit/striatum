@@ -49,7 +49,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use prefrontal_routing_core::routing_config::DEFAULT_ROUTING_CONFIG;
 use prefrontal_routing_core::{
     resolve_launch_requirements, select_model_route_with_config, ModelRoute,
     ModelRouteStateSnapshot, RequestedModelRequirements, RouteStateStore, SelectModelRouteInput,
@@ -57,7 +56,6 @@ use prefrontal_routing_core::{
 use prefrontal_routing_store::SqliteRouteStateStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use crate::config_overrides;
 
@@ -418,20 +416,18 @@ pub(crate) fn compute_ladder(
     // other order, the first ladder after boot priced every subscription route
     // at list price and disagreed with every later ladder on identical facts.
     // A broken document keeps the last good multipliers, as selection does.
-    let _ = config_overrides::reload_live_multipliers(&sources.routing_config);
+    let live_config = config_overrides::live_config(&sources.routing_config);
     let now = now_ms() as f64;
-    let mut facts = store
-        .get_facts_with_observed_speed(now)
+    let mut facts = live_config
+        .prepare(|| store.get_facts_with_observed_speed(now))
         .map_err(|error| format!("reading facts: {error}"))?;
-    let routing_config =
-        config_overrides::apply_live_selection_config(&sources.routing_config, &mut facts)
-            .map(|outcome| outcome.routing_config)
-            .unwrap_or(DEFAULT_ROUTING_CONFIG);
-    let min_best_effort_adequacy =
-        config_overrides::read_min_best_effort_adequacy(&sources.routing_config)
-            .ok()
-            .flatten();
-    let operator = config_overrides::read_operator_routing_policy(&sources.operator_config);
+    let routing_config = live_config.apply(&mut facts).routing_config;
+    let min_best_effort_adequacy = live_config.min_band();
+    let operator = if sources.operator_config == sources.routing_config {
+        live_config.operator_policy()
+    } else {
+        config_overrides::read_operator_routing_policy(&sources.operator_config)
+    };
 
     let mut ladders = BTreeMap::new();
     let mut ladder_eq = 0.0;
@@ -693,11 +689,9 @@ struct ConfigFingerprint {
 }
 
 fn file_digest(path: &Path) -> String {
-    match std::fs::read(path) {
-        Ok(bytes) => format!("sha256:{:x}", Sha256::digest(&bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "absent".to_string(),
-        Err(error) => format!("unreadable:{}", error.kind()),
-    }
+    // Compare the published document, not a pending or rejected disk edit.
+    // Otherwise the watcher can consume a change before selections can use it.
+    config_overrides::live_config(path).policy_revision()
 }
 
 fn fingerprint(sources: &LadderSources) -> ConfigFingerprint {
@@ -712,7 +706,7 @@ fn fingerprint(sources: &LadderSources) -> ConfigFingerprint {
 /// selection reports. A change (subscription multipliers, exclusions, Elo or
 /// model overrides, a provider appearing in or leaving a substrate's list, or
 /// the first selection after boot) gets a ladder comparison; an unchanged
-/// fingerprint costs a few small file reads and no selection.
+/// fingerprint costs metadata reads and cached-document hashes, but no selection.
 pub(crate) struct ConfigReloadWatch {
     last: ConfigFingerprint,
 }

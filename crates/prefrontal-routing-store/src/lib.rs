@@ -31,7 +31,7 @@ use prefrontal_routing_core::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -916,6 +916,18 @@ impl SqliteRouteStateStore {
         facts: &[FusiformFactUpdate],
         cursor: FusiformCatalogCursor,
     ) -> RouteStateResult<()> {
+        self.apply_fusiform_catalog_for_providers(facts, cursor, &HashSet::new())
+    }
+
+    /// Credential metadata's `provider_ids` and explicit `route.model_upsert`
+    /// requests name providers the operator intends to use. Admit their rows
+    /// without importing thousands of models under unrelated providers.
+    pub fn apply_fusiform_catalog_for_providers(
+        &self,
+        facts: &[FusiformFactUpdate],
+        cursor: FusiformCatalogCursor,
+        mapped_providers: &HashSet<String>,
+    ) -> RouteStateResult<()> {
         let scores_json = serde_json::to_string(&ModelScores::default()).map_err(err)?;
         self.store
             .with_conn(|connection: &Connection| {
@@ -954,18 +966,17 @@ impl SqliteRouteStateStore {
                         if !fact.present {
                             continue;
                         }
-                        // First sight of a model. Fusiform serves ~7,500 models across
-                        // ~200 providers; a first-sight row is minted only under a
-                        // provider the operator already routes (one that has any fact
-                        // row), so `route.list_unscored` stays an operator worklist and
-                        // the candidate scan is not 7,000 rejections deep. Models under
-                        // unknown providers are not stored at all.
+                        // Discover models only under providers already in the store
+                        // or authorized by credential metadata or a score placement.
+                        // Importing every provider would turn route.list_unscored
+                        // into thousands of unrelated rows instead of an operator
+                        // worklist, and deepen every selection's candidate scan.
                         let known_provider: i64 = tx.query_row(
                             "SELECT COUNT(*) FROM model_facts WHERE provider_id = ?1",
                             params![fact.provider_id],
                             |row| row.get(0),
                         )?;
-                        if known_provider == 0 {
+                        if known_provider == 0 && !mapped_providers.contains(&fact.provider_id) {
                             continue;
                         }
                         tx.execute(

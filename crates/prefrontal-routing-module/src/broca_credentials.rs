@@ -34,6 +34,9 @@ pub struct BrocaCredentials {
     listed: Vec<ListedCredential>,
     serving: BTreeMap<String, ServingMethod>,
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
+    pub(crate) catalog_snapshot: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
+    pub(crate) catalog_wake: Arc<tokio::sync::Notify>,
+    pub(crate) connection_file_path: Option<std::path::PathBuf>,
     /// The operator's `model_routing.score_alias` as of the last refresh. An
     /// aliased provider has no Fusiform plane of its own: its serving method is
     /// read from the credentials mapped to the alias, and its rates from the
@@ -130,6 +133,7 @@ impl BrocaCredentials {
         }
         self.view = Some(listing.view.clone());
         self.listed = listing.credentials.clone();
+        self.serving.clear();
         self.providers.clear();
         self.active = 0;
         self.unmapped = 0;
@@ -152,7 +156,12 @@ impl BrocaCredentials {
             self.providers
                 .extend(credential.provider_ids.iter().cloned());
         }
+        self.catalog_wake.notify_one();
         true
+    }
+
+    pub(crate) fn mapped_providers(&self) -> HashSet<String> {
+        self.providers.clone()
     }
 
     /// Replace the score aliases used for serving methods, Fusiform plane keys
@@ -223,7 +232,8 @@ impl BrocaCredentials {
     }
 
     pub(crate) fn plane_keys(&self) -> BTreeSet<(String, String)> {
-        self.serving
+        let mut keys: BTreeSet<_> = self
+            .serving
             .iter()
             .filter_map(|(key, method)| {
                 // An aliased provider is priced on its target's plane, the only
@@ -234,7 +244,34 @@ impl BrocaCredentials {
                         .unwrap_or(provider);
                 Some((provider.to_string(), method.auth_method.clone()?))
             })
-            .collect()
+            .collect();
+        // A newly mapped provider may have no local model row yet. Its login is
+        // still enough to request the plane before the first placement arrives.
+        for row in &self.listed {
+            if row.state == "active"
+                && row
+                    .categories
+                    .iter()
+                    .any(|category| category == "llm-provider")
+            {
+                for provider in &row.provider_ids {
+                    if self
+                        .serving
+                        .keys()
+                        .any(|key| key.split_once('/').is_some_and(|(id, _)| id == provider))
+                    {
+                        continue;
+                    }
+                    let provider = prefrontal_routing_core::score_alias::alias_target(
+                        &self.score_alias,
+                        provider,
+                    )
+                    .unwrap_or(provider);
+                    keys.insert((provider.to_string(), listed_method(row)));
+                }
+            }
+        }
+        keys
     }
 
     /// Only cached data is read here; a selection cannot trigger a catalog call.
@@ -247,11 +284,16 @@ impl BrocaCredentials {
         }
         for fact in facts {
             let key = format!("{}/{}", fact.provider_id, fact.model_id);
-            let method = self
-                .serving
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| choose_method(BTreeSet::new(), BTreeSet::new()));
+            let method = self.serving.get(&key).cloned().unwrap_or_else(|| {
+                choose_method(
+                    BTreeSet::new(),
+                    self.listed
+                        .iter()
+                        .filter(|row| credential_serves_fact(row, fact))
+                        .map(listed_method)
+                        .collect(),
+                )
+            });
             let catalog_key =
                 prefrontal_routing_core::score_alias::catalog_key(&self.score_alias, &key);
             fact.billing_plane = Some(self.billing_catalog.for_route(&catalog_key, &method));

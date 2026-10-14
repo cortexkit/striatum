@@ -1363,54 +1363,76 @@ fn unknown_price_normalizes_to_maximum_cost() {
     );
 }
 
-/// A subscription plane publishes no per-token rate (ollama-cloud in Fusiform holds
-/// existence, limits, and capabilities only), so an unpriced route on a plan the
-/// operator pays for costs zero and beats a cheap metered route on the same demand;
-/// the same unpriced fact on a metered provider still ranks at the maximum.
+/// Subscription coverage alone says nothing about the amount of plan consumed.
 #[test]
-fn unpublished_price_on_a_subscription_plan_is_zero_marginal_cost() {
+fn unpriced_high_elo_subscription_loses_iq30_and_names_unknown_price() {
     let plan = fact(FactBuilder {
-        provider_id: "ollama-cloud".into(),
-        model_id: "glm-5.3-flash".into(),
-        scores: scores(55.0, 1610.0, 60.0),
+        provider_id: "meta".into(),
+        model_id: "muse-wonder-full-1.0".into(),
+        scores: scores(1884.0, 1620.0, 200.0),
         ..Default::default()
     });
     let metered = fact(FactBuilder {
-        provider_id: "openai".into(),
-        model_id: "sol".into(),
-        scores: scores(55.0, 1838.0, 60.0),
-        // Above the effectively-free bucket, so cost decides ahead of adequacy.
-        cost_per_m_tok_out: Some(6.0),
+        provider_id: "meta".into(),
+        model_id: "priced-reader".into(),
+        scores: scores(1808.0, 1600.0, 60.0),
+        cost_per_m_tok_out: Some(0.2),
         ..Default::default()
     });
-    let r = select_model_route(input(
+    let selected = select_model_route(input(
         vec![plan.clone(), metered],
-        req(40.0, 0.0),
+        req(30.0, 0.0),
         Extra {
-            is_subscription_route: Some(Box::new(|route: &ModelRoute| {
-                route.fact.provider_id == "ollama-cloud"
-            })),
+            is_subscription_route: Some(Box::new(|r| r.provider_id == "meta")),
             ..Default::default()
         },
     ))
     .unwrap();
-    assert_eq!(r.route_key, "ollama-cloud/glm-5.3-flash");
-    assert!(
-        (r.score.objective.cost - 0.0).abs() < 1e-9,
-        "{}",
-        r.score.objective.cost
-    );
-    assert!(
-        r.explanation
-            .join("\n")
-            .contains("subscription plan: marginal token cost zero"),
-        "{}",
-        r.explanation.join("\n")
-    );
+    assert_eq!(selected.route_key, "meta/priced-reader");
+    assert!(selected
+        .explanation
+        .join("\n")
+        .contains("meta/muse-wonder-full-1.0: price_unknown"));
+    let alone = select_model_route(input(
+        vec![plan],
+        req(30.0, 0.0),
+        Extra {
+            is_subscription_route: Some(Box::new(|_| true)),
+            ..Default::default()
+        },
+    ))
+    .unwrap();
+    assert_eq!(alone.score.objective.cost, 1.0);
+    assert!(alone.explanation.join("\n").contains("price unknown"));
+}
 
-    let metered_unpriced =
-        select_model_route(input(vec![plan], req(40.0, 0.0), Extra::default())).unwrap();
-    assert!((metered_unpriced.score.objective.cost - 1.0).abs() < 1e-9);
+#[test]
+fn unknown_subscription_cannot_borrow_pool_price_or_win_a_clamped_cost_tie() {
+    for price in [0.0, 1000.0] {
+        let unknown = fact(FactBuilder {
+            provider_id: "meta".into(),
+            model_id: "unknown".into(),
+            scores: scores(1884.0, 1620.0, 1000.0),
+            ..Default::default()
+        });
+        let known = fact(FactBuilder {
+            provider_id: "meta".into(),
+            model_id: "priced".into(),
+            scores: scores(1808.0, 1600.0, 1.0),
+            cost_per_m_tok_out: Some(price),
+            ..Default::default()
+        });
+        let selected = select_model_route(input(
+            vec![unknown, known],
+            req(30.0, 0.0),
+            Extra {
+                is_subscription_route: Some(Box::new(|_| true)),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        assert_eq!(selected.route_key, "meta/priced");
+    }
 }
 
 #[test]
@@ -2560,8 +2582,8 @@ fn ladder_asserted_in_order_basket_effective_tier_metered_subscription() {
     unpriced_fact.cost_tier = None;
     assert_eq!(selection_cost(&unpriced_fact, false, false), 1.0);
 
-    // 5. Else 0.0 for a subscription route with neither figure
-    assert_eq!(selection_cost(&unpriced_fact, true, false), 0.0);
+    // Subscription coverage does not turn an absent price into free tokens.
+    assert_eq!(selection_cost(&unpriced_fact, true, false), 1.0);
 }
 
 // The incomplete route's gap stays on the incomplete route: the complete one is
@@ -4518,6 +4540,32 @@ fn subscription_operator_value_overrides_fresh_astro_in_decision() {
         .explanation
         .iter()
         .any(|line| line.contains("operator override")));
+}
+
+#[test]
+fn unpriced_subscription_cannot_win_basket_or_plan_value_pricing() {
+    for measured in [false, true] {
+        let mut input = subscription_scenario(&[3.0], 0.0, "explore");
+        input.requirements = req(30.0, 0.0);
+        input.facts[0].scores.elo = 1884.0;
+        input.facts[0].scores.speed = 1000.0;
+        input.facts[0].cost_per_m_tok_out = None;
+        input.facts[0].cost_tier = None;
+        if !measured {
+            for state in input
+                .runtime_snapshot
+                .as_mut()
+                .unwrap()
+                .by_capacity
+                .values_mut()
+            {
+                std::sync::Arc::make_mut(state.subscription_pool.as_mut().unwrap()).measured = None;
+            }
+        }
+        let selected = select_model_route(input).unwrap();
+        assert_eq!(selected.model.provider_id, "openai", "measured={measured}");
+        assert!(selected.explanation.join("\n").contains("price_unknown"));
+    }
 }
 
 #[test]

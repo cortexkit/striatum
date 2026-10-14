@@ -179,7 +179,7 @@ enum CatalogRate {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct CatalogSnapshot {
+pub(crate) struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
     rates: BTreeMap<String, ModelRates>,
@@ -509,7 +509,7 @@ fn unwrap_tool_result(bytes: &[u8]) -> Result<Value, FusiformCatalogError> {
     })
 }
 
-fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogError> {
+pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogError> {
     let value = unwrap_tool_result(bytes)?;
     let rates = model_rates(&value["models"])?;
     let reply: CatalogGetReply =
@@ -612,7 +612,7 @@ impl FusiformCatalogConsumer {
         self.credentials = Some(credentials);
         let snapshot = self.catalog_get().await?;
         self.refresh_planes(Some(&snapshot)).await?;
-        apply_catalog_snapshot(store, &snapshot, None, None, "dry run copy")?;
+        apply_catalog_snapshot(store, &snapshot, None, None, None, "dry run copy")?;
         self.close().await
     }
 
@@ -779,6 +779,9 @@ impl FusiformCatalogConsumer {
 }
 
 trait CatalogWire {
+    fn credentials(&self) -> Option<crate::broca_credentials::SharedBrocaCredentials> {
+        None
+    }
     async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError>;
     async fn catalog_status(&mut self) -> Result<CatalogStatusReply, FusiformCatalogError>;
     async fn close(&mut self) -> Result<(), FusiformCatalogError>;
@@ -791,6 +794,9 @@ trait CatalogWire {
 }
 
 impl CatalogWire for FusiformCatalogConsumer {
+    fn credentials(&self) -> Option<crate::broca_credentials::SharedBrocaCredentials> {
+        self.credentials.clone()
+    }
     async fn refresh_planes(
         &mut self,
         snapshot: Option<&CatalogSnapshot>,
@@ -942,10 +948,10 @@ fn apply_catalog_snapshot(
     snapshot: &CatalogSnapshot,
     family_config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
+    credentials: Option<&crate::broca_credentials::SharedBrocaCredentials>,
     context: &str,
 ) -> Result<(), FusiformCatalogError> {
-    store
-        .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
+    apply_mapped_catalog(store, snapshot, credentials, None)
         .map_err(|reason| error(format!("apply {context}: {reason}")))?;
     if let Some(path) = family_config_path {
         crate::config_overrides::apply_family_rules_from_config(store, path)
@@ -961,6 +967,79 @@ fn apply_catalog_snapshot(
     Ok(())
 }
 
+fn apply_mapped_catalog(
+    store: &SqliteRouteStateStore,
+    snapshot: &CatalogSnapshot,
+    credentials: Option<&crate::broca_credentials::SharedBrocaCredentials>,
+    explicit_provider: Option<&str>,
+) -> Result<(), FusiformCatalogError> {
+    let mut providers = credentials
+        .and_then(|cache| cache.lock().ok().map(|guard| guard.mapped_providers()))
+        .unwrap_or_default();
+    if let Some(provider) = explicit_provider {
+        providers.insert(provider.to_string());
+    }
+    store
+        .apply_fusiform_catalog_for_providers(&snapshot.facts, snapshot.cursor, &providers)
+        .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
+    if let Some(credentials) = credentials {
+        credentials
+            .lock()
+            .map_err(|_| error("credential cache poisoned"))?
+            .catalog_snapshot = Some(Arc::new(snapshot.clone()));
+    }
+    Ok(())
+}
+
+/// `route.model_upsert` places operator-supplied quality scores on a model. First
+/// apply the facts cached from Fusiform, fetching them if the model is not cached.
+/// An operator can then onboard a provider before the background import runs
+/// without creating a score-only row missing prices or allowed login methods.
+pub(crate) async fn ingest_before_upsert(
+    store: &SqliteRouteStateStore,
+    credentials: &crate::broca_credentials::SharedBrocaCredentials,
+    provider: &str,
+    model: &str,
+) -> Result<(), FusiformCatalogError> {
+    let (snapshot, connection) = {
+        let guard = credentials
+            .lock()
+            .map_err(|_| error("credential cache poisoned"))?;
+        (
+            guard.catalog_snapshot.clone(),
+            guard.connection_file_path.clone(),
+        )
+    };
+    let cached = snapshot.as_ref().is_some_and(|snapshot| {
+        snapshot
+            .facts
+            .iter()
+            .any(|fact| fact.provider_id == provider && fact.model_id == model)
+    });
+    let snapshot = if !cached {
+        if let Some(connection) = connection {
+            let root = prefrontal_core_store::scratch_root().join("routing-upsert-catalog");
+            let mut client = FusiformCatalogConsumer::connect(&connection, &root).await?;
+            let snapshot = client.catalog_get().await?;
+            client.close().await?;
+            Some(Arc::new(snapshot))
+        } else {
+            snapshot
+        }
+    } else {
+        snapshot
+    };
+    if let Some(snapshot) = snapshot {
+        apply_mapped_catalog(store, &snapshot, Some(credentials), Some(provider))?;
+        credentials
+            .lock()
+            .map_err(|_| error("credential cache poisoned"))?
+            .catalog_wake
+            .notify_one();
+    }
+    Ok(())
+}
+
 async fn bootstrap_cycle<C: CatalogWire>(
     client: &mut C,
     store: &SqliteRouteStateStore,
@@ -970,7 +1049,14 @@ async fn bootstrap_cycle<C: CatalogWire>(
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let snapshot = client.catalog_get().await?;
     client.refresh_planes(Some(&snapshot)).await?;
-    apply_catalog_snapshot(store, &snapshot, family_config_path, ladder, "catalog.get")?;
+    apply_catalog_snapshot(
+        store,
+        &snapshot,
+        family_config_path,
+        ladder,
+        client.credentials().as_ref(),
+        "catalog.get",
+    )?;
     if let Ok(mut health) = health.lock() {
         health.note_reached(now_ms());
     }
@@ -1003,6 +1089,7 @@ async fn poll_cycle<C: CatalogWire>(
             &snapshot,
             family_config_path,
             ladder,
+            client.credentials().as_ref(),
             "catalog replay",
         )?;
         1
@@ -1018,7 +1105,7 @@ pub async fn catalog_refresh_loop(
     connection_file_path: PathBuf,
     store: Arc<SqliteRouteStateStore>,
     health: SharedCatalogHealth,
-    poll_ms: u64,
+    _poll_ms: u64,
     ladder_sources: LadderSources,
     credentials: crate::broca_credentials::SharedBrocaCredentials,
 ) {
@@ -1027,6 +1114,11 @@ pub async fn catalog_refresh_loop(
     let mut bootstrapped = false;
     let mut last_logged_error: Option<String> = None;
     let family_config_path = crate::config_overrides::config_path();
+    let wake = {
+        let mut guard = credentials.lock().unwrap();
+        guard.connection_file_path = Some(connection_file_path.clone());
+        Arc::clone(&guard.catalog_wake)
+    };
     loop {
         let result =
             match FusiformCatalogConsumer::connect(&connection_file_path, &project_root).await {
@@ -1057,7 +1149,15 @@ pub async fn catalog_refresh_loop(
         match result {
             Ok(_) => {
                 bootstrapped = true;
-                tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+                let cadence =
+                    crate::config_overrides::live_config(&family_config_path).catalog_poll_ms();
+                if let Ok(mut health) = health.lock() {
+                    health.set_poll_ms(cadence);
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(cadence)) => {},
+                    _ = wake.notified() => { bootstrapped = false; },
+                }
             }
             Err(reason) => {
                 // One line per DISTINCT reason: a repeating failure is visible in the
@@ -1070,7 +1170,10 @@ pub async fn catalog_refresh_loop(
                 if let Ok(mut health) = health.lock() {
                     health.note_error(reason);
                 }
-                tokio::time::sleep(RETRY_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(RETRY_INTERVAL) => {},
+                    _ = wake.notified() => { bootstrapped = false; },
+                }
             }
         }
     }
@@ -1169,6 +1272,64 @@ mod tests {
             state: "active".into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn new_vault_mapping_wakes_catalog_and_ingests_prices_and_auth_at_unchanged_version() {
+        use prefrontal_routing_core::RouteStateStore as _;
+        let rig = Rig::new("mapped-muse-ingest");
+        let store = rig.store();
+        let mut reply = muse_reply();
+        reply["models"]["meta/muse-wonder-1.0"] = json!({
+            "existence": "present", "rate.input": {"state":"priced","currency":"USD","exponent":0,"units":4},
+            "rate.output": {"state":"priced","currency":"USD","exponent":0,"units":20}
+        });
+        reply["curated"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"model":"meta/muse-wonder-1.0","auth_methods":["oauth"]}));
+        let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
+        let credentials = Arc::new(Mutex::new(
+            crate::broca_credentials::BrocaCredentials::default(),
+        ));
+        apply_mapped_catalog(&store, &snapshot, Some(&credentials), None).unwrap();
+        assert!(store
+            .get_fact_by_route_key("meta/muse-wonder-1.0")
+            .unwrap()
+            .is_none());
+        let wake = Arc::clone(&credentials.lock().unwrap().catalog_wake);
+        credentials.lock().unwrap().apply_listing(
+            &prefrontal_ckcred_client::ScopedCredentialListing {
+                view: "mapped".into(),
+                credentials: vec![muse_credential("oauth", true)],
+                ..Default::default()
+            },
+            1,
+        );
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .expect("a mapping must wake the catalog loop, not wait ten minutes");
+        assert!(credentials
+            .lock()
+            .unwrap()
+            .plane_keys()
+            .contains(&("meta".into(), "oauth".into())));
+        apply_mapped_catalog(&store, &snapshot, Some(&credentials), None).unwrap();
+        let fact = store
+            .get_fact_by_route_key("meta/muse-wonder-1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fact.cost_per_m_tok_out, Some(20.0));
+        assert_eq!(fact.input_rate, Some(4.0));
+        assert_eq!(fact.auth_methods, Some(vec!["oauth".into()]));
+        assert_eq!(
+            fact.score_provenance,
+            prefrontal_routing_core::ScoreProvenance::Unscored
+        );
+        assert_eq!(
+            store.fusiform_catalog_cursor().unwrap(),
+            Some(snapshot.cursor)
+        );
     }
 
     #[test]

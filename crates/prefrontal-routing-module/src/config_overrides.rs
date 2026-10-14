@@ -1,29 +1,23 @@
-//! Boot-time model-fact overrides from the module's OWN config-home file.
-//!
-//! Ported from the TS `applyModelFactOverrides` + the subscription-classifier's
-//! config-read pattern. Per the locked contract with the daemon owner, routing
-//! config does NOT flow over subc-mediated config (that path is unwired); instead
-//! the module reads `~/.config/cortexkit/alfonso-routing.jsonc` itself at boot and
-//! merges the `model_routing.models` overrides onto the migration-applied seed.
-//!
-//! Overrides are upserted with source `override`; an override row that disappears
-//! from config is reverted to the seed fact (or deleted if the model is not in the
-//! seed). This is the user-GLOBAL tier (elo/eq/cost are not per-project); the
-//! project tier (read at route.bind) is deferred.
+//! Validated, last-good snapshots of the routing-owned global configuration.
+//! Each selection overlays one complete snapshot onto catalog facts; reloads
+//! never rewrite the catalog or replace an in-flight request's configuration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
-    make_capacity_key, make_route_key, model_facts_seed, CatalogFactField, FactSource,
-    FailureBackoffConfig, FamilySource, GrandFamily, ModelRoutingPolicyInput,
-    OverqualificationConfig, RouteStateStore, RoutingConfig,
+    make_capacity_key, make_route_key, FailureBackoffConfig, FamilySource, GrandFamily,
+    ModelRoutingPolicyInput, OverqualificationConfig, RouteStateStore, RoutingConfig,
     DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
     DEFAULT_OVERQUALIFICATION,
 };
+#[cfg(test)]
+use prefrontal_routing_core::{model_facts_seed, CatalogFactField, FactSource};
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
@@ -34,7 +28,467 @@ pub const DEFAULT_AA_API_KEY_REF: &str = "apikey:artificial-analysis";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
 
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
+pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A complete, validated document held for the lifetime of one selection. Model
+/// overrides are overlays, not store writes: withdrawing one exposes stored facts
+/// again, and a request cannot observe a partially applied edit.
+#[derive(Debug, Clone, Default)]
+pub struct LiveConfig {
+    config: RoutingConfigFile,
+    document: Option<String>,
+}
+
+type FileStamp = Option<(SystemTime, u64)>;
+
+struct LiveConfigCache {
+    stamp: FileStamp,
+    pending: Option<(FileStamp, Instant)>,
+    active: Arc<LiveConfig>,
+}
+
+fn live_configs() -> &'static Mutex<HashMap<PathBuf, LiveConfigCache>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, LiveConfigCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn live_config(path: &Path) -> Arc<LiveConfig> {
+    live_config_at(path, Instant::now())
+}
+
+#[cfg(test)]
+pub(crate) fn settle_live_config(path: &Path) -> Arc<LiveConfig> {
+    let now = Instant::now();
+    live_config_at(path, now);
+    live_config_at(path, now + RELOAD_DEBOUNCE)
+}
+
+fn live_config_at(path: &Path, now: Instant) -> Arc<LiveConfig> {
+    let mut caches = live_configs().lock().unwrap();
+    let stamp = match std::fs::metadata(path) {
+        Ok(metadata) => Some((
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            metadata.len(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            eprintln!(
+                "[prefrontal-routing] routing-config-reload-rejected: {}: {error}",
+                path.display()
+            );
+            return caches
+                .get(path)
+                .map(|cache| Arc::clone(&cache.active))
+                .unwrap_or_default();
+        }
+    };
+    if let Some(cache) = caches.get_mut(path) {
+        if cache.stamp == stamp {
+            cache.pending = None;
+            return Arc::clone(&cache.active);
+        }
+        match &cache.pending {
+            Some((pending, since))
+                if *pending == stamp
+                    && now.saturating_duration_since(*since) >= RELOAD_DEBOUNCE => {}
+            Some((pending, _)) if *pending == stamp => return Arc::clone(&cache.active),
+            _ => {
+                cache.pending = Some((stamp, now));
+                return Arc::clone(&cache.active);
+            }
+        }
+    }
+    let next = (|| {
+        let document = match std::fs::read_to_string(path) {
+            Ok(document) => Some(document),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let config = match &document {
+            Some(document) => {
+                let json = jsonc_to_json(document)?;
+                let value: serde_json::Value =
+                    serde_json::from_str(&json).map_err(|error| error.to_string())?;
+                if value
+                    .get("aa")
+                    .is_some_and(|aa| aa.get("api_key").is_some())
+                {
+                    return Err("aa.api_key is forbidden; use aa.api_key_ref".into());
+                }
+                let config: RoutingConfigFile =
+                    serde_json::from_str(&json).map_err(|error| error.to_string())?;
+                validate_live_config(&config)?;
+                config
+            }
+            None => RoutingConfigFile::default(),
+        };
+        Ok(LiveConfig { config, document })
+    })();
+    let active = match next {
+        Ok(config) => Arc::new(config),
+        Err(error) => {
+            eprintln!("[prefrontal-routing] routing-config-reload-rejected: {}: {error}; keeping last good config", path.display());
+            caches
+                .get(path)
+                .map(|cache| Arc::clone(&cache.active))
+                .unwrap_or_default()
+        }
+    };
+    caches.insert(
+        path.to_path_buf(),
+        LiveConfigCache {
+            stamp,
+            pending: None,
+            active: Arc::clone(&active),
+        },
+    );
+    active
+}
+
+fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
+    let section = &config.model_routing;
+    if section
+        .demand_exponent
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        return Err("model_routing.demand_exponent must be positive".into());
+    }
+    section.overqualification.resolve()?;
+    if let Some(value) = section.min_best_effort_adequacy {
+        validate_min_best_effort_adequacy(value)?;
+    }
+    if section.consecutive_terminal_failure_threshold == Some(0) {
+        return Err("consecutive_terminal_failure_threshold must be at least 1".into());
+    }
+    if config.catalog.poll_ms == Some(0) {
+        return Err("catalog.poll_ms must be positive".into());
+    }
+    if section
+        .elo_overrides
+        .values()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err("elo_overrides must be positive".into());
+    }
+    if config
+        .aa
+        .as_ref()
+        .is_some_and(|aa| aa.review_by_days == Some(0))
+    {
+        return Err("aa.review_by_days must be positive".into());
+    }
+    if config
+        .aa
+        .as_ref()
+        .and_then(|aa| aa.api_key_ref.as_ref())
+        .is_some_and(|reference| reference.trim().is_empty())
+    {
+        return Err("aa.api_key_ref must be a non-empty credential id".into());
+    }
+    for (provider, value) in &section.subscription_multipliers {
+        if provider.trim().is_empty() || !value.is_finite() || *value <= 0.0 {
+            return Err(format!("invalid subscription_multiplier for {provider}"));
+        }
+    }
+    for (provider, value) in &section.keep_free_percent {
+        if provider.trim().is_empty() || !value.is_finite() || !(0.0..=100.0).contains(value) {
+            return Err(format!("invalid keep_free_percent for {provider}"));
+        }
+    }
+    for (key, model) in &section.models {
+        if parse_model_key(key).is_none() {
+            return Err(format!("invalid model key {key}"));
+        }
+        for value in [
+            model.elo,
+            model.eq,
+            model.subscription_multiplier,
+            model.context_window,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("invalid positive model override for {key}"));
+            }
+        }
+        if model
+            .speed
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(format!("invalid speed override for {key}"));
+        }
+        if model
+            .cost_per_mtok_out
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+            || model
+                .speed_multiplier
+                .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 2.0)
+        {
+            return Err(format!("invalid cost/speed override for {key}"));
+        }
+    }
+    Ok(())
+}
+
+impl LiveConfig {
+    pub fn policy_revision(&self) -> String {
+        self.document
+            .as_deref()
+            .map(policy_revision)
+            .unwrap_or_else(default_policy_revision)
+    }
+
+    pub fn operator_policy(&self) -> ModelRoutingPolicyInput {
+        let section = &self.config.model_routing;
+        ModelRoutingPolicyInput {
+            exclude: clean_spec_entries(section.exclude.clone()),
+            subscription: clean_spec_entries(section.subscription.clone()),
+            explicit_only_providers: clean_spec_entries(section.explicit_only_providers.clone()),
+            score_alias: section.score_alias.clone(),
+        }
+    }
+
+    pub fn min_band(&self) -> Option<f64> {
+        self.config
+            .model_routing
+            .min_best_effort_adequacy
+            .map(|value| value.clamp(0.0, 1.0))
+    }
+
+    pub fn account_flags(&self) -> AccountSelectionFlags {
+        self.config.account_selection
+    }
+
+    pub fn failure_backoff(&self) -> FailureBackoffConfig {
+        FailureBackoffConfig {
+            consecutive_terminal_failure_threshold: self
+                .config
+                .model_routing
+                .consecutive_terminal_failure_threshold
+                .unwrap_or(DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD),
+        }
+    }
+
+    pub fn catalog_poll_ms(&self) -> u64 {
+        self.config
+            .catalog
+            .poll_ms
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_CATALOG_POLL_MS)
+    }
+
+    pub fn aa_config(&self) -> AaConfig {
+        self.config
+            .aa
+            .as_ref()
+            .map(|aa| AaConfig {
+                api_key_ref: Some(
+                    aa.api_key_ref
+                        .as_ref()
+                        .map(|reference| reference.trim().to_string())
+                        .unwrap_or_else(|| DEFAULT_AA_API_KEY_REF.into()),
+                ),
+                model_map: aa.model_map.clone(),
+                review_by_ms: aa
+                    .review_by_days
+                    .map(|days| days.saturating_mul(86_400_000).min(i64::MAX as u64) as i64)
+                    .unwrap_or(DEFAULT_AA_REVIEW_BY_MS),
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn providers_without_prompt_cache(&self) -> Vec<String> {
+        self.config
+            .model_routing
+            .providers_without_prompt_cache
+            .clone()
+    }
+
+    /// The store reads speed and subsidy multipliers from process-wide maps while
+    /// loading measured speeds. Replace the maps and copy the request's facts and
+    /// quota state under one lock, so another selection or winner-ladder read
+    /// cannot change settings halfway through. Release the lock before scoring
+    /// or awaiting; the returned snapshots are independent copies.
+    pub fn prepare<T>(&self, read_snapshot: impl FnOnce() -> T) -> T {
+        static PREPARE: Mutex<()> = Mutex::new(());
+        let _guard = PREPARE.lock().unwrap();
+        let mut speeds = HashMap::new();
+        let mut subsidies = self.config.model_routing.subscription_multipliers.clone();
+        for (key, model) in &self.config.model_routing.models {
+            if let Some(value) = model.speed_multiplier {
+                speeds.insert(key.clone(), value);
+            }
+            if let Some(value) = model.subscription_multiplier {
+                subsidies.insert(key.clone(), value);
+            }
+        }
+        prefrontal_routing_core::model_facts::set_speed_multipliers(speeds);
+        prefrontal_routing_core::model_facts::set_subscription_multipliers(subsidies);
+        prefrontal_routing_core::model_facts::set_keep_free_percent(
+            self.config.model_routing.keep_free_percent.clone(),
+        );
+        read_snapshot()
+    }
+
+    pub fn apply(&self, facts: &mut Vec<ModelFact>) -> SelectionOverrideOutcome {
+        let section = &self.config.model_routing;
+        for key in section.models.keys() {
+            let (provider, model, variant) = parse_model_key(key).expect("validated model key");
+            if !facts.iter().any(|fact| {
+                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()) == *key
+            }) {
+                facts.push(ModelFact {
+                    provider_id: provider,
+                    model_id: model,
+                    variant,
+                    family: None,
+                    billing_plane: None,
+                    auth_methods: None,
+                    scores: ModelScores::default(),
+                    context_window: None,
+                    max_output_tokens: None,
+                    cost_tier: None,
+                    cost_per_m_tok_out: None,
+                    input_rate: None,
+                    cache_read_rate: None,
+                    cache_write_rate: None,
+                    reasoning_rate: None,
+                    supports_vision: None,
+                    supports_tool_use: None,
+                    prompt_defaults: None,
+                    confidence: Confidence::Curated,
+                    notes: None,
+                    speed_multiplier: None,
+                    subscription_multiplier: None,
+                    speed_is_fleet_median: false,
+                    score_provenance: ScoreProvenance::Unscored,
+                    aa_index: None,
+                    review_by_ms: None,
+                    eq_source: None,
+                    class_vector: None,
+                    class_vector_is_overlay: false,
+                });
+            }
+        }
+        for fact in facts.iter_mut() {
+            let key = make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
+            if let Some(model) = section.models.get(&key) {
+                let observed_speed = fact.scores.speed;
+                *fact = merge_override(fact, model);
+                if model.elo.is_some() && model.eq.is_some() {
+                    fact.score_provenance = ScoreProvenance::Override;
+                }
+                if let (Some(cost), Some(plane)) =
+                    (model.cost_per_mtok_out, fact.billing_plane.as_mut())
+                {
+                    plane.rates.insert(
+                        "rate.output".into(),
+                        prefrontal_routing_core::billing::BillingRate::Priced { rate: cost },
+                    );
+                }
+                if let Some(speed) = model.speed {
+                    fact.scores.speed = speed * model.speed_multiplier.unwrap_or(1.0);
+                } else {
+                    fact.scores.speed = observed_speed;
+                }
+            }
+            if let Some(elo) = section.elo_overrides.get(&key) {
+                fact.scores.elo = *elo;
+            }
+            fact.subscription_multiplier = section
+                .models
+                .get(&key)
+                .and_then(|model| model.subscription_multiplier)
+                .or_else(|| {
+                    section
+                        .subscription_multipliers
+                        .get(&fact.provider_id)
+                        .copied()
+                });
+        }
+        SelectionOverrideOutcome {
+            routing_config: RoutingConfig {
+                demand_exponent: section.demand_exponent.unwrap_or(DEFAULT_DEMAND_EXPONENT),
+                overqualification: section
+                    .overqualification
+                    .resolve()
+                    .expect("validated config"),
+            },
+            applied: section.models.len() + section.elo_overrides.len(),
+            unknown_keys: Vec::new(),
+            policy_revision: self.policy_revision(),
+        }
+    }
+}
+
+pub async fn config_refresh_loop(path: PathBuf, catalog_wake: Arc<tokio::sync::Notify>) {
+    let mut active = live_config(&path);
+    loop {
+        tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
+        let next = live_config(&path);
+        if !Arc::ptr_eq(&active, &next) {
+            eprintln!(
+                "[prefrontal-routing] routing-config-reloaded: {}",
+                path.display()
+            );
+            active = next;
+            catalog_wake.notify_one();
+        }
+    }
+}
+
+#[cfg(test)]
+mod live_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn changed_config_is_debounced_and_in_flight_snapshot_stays_immutable() {
+        let dir = prefrontal_test_support::scratch_root()
+            .join(format!("routing-config-debounce-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routing.jsonc");
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"explicit_only_providers":["meta"]}}"#,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let held = live_config_at(&path, now);
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"explicit_only_providers":["other-provider"]}}"#,
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&held, &live_config_at(&path, now)));
+        assert!(Arc::ptr_eq(
+            &held,
+            &live_config_at(&path, now + RELOAD_DEBOUNCE / 2)
+        ));
+        let published = live_config_at(&path, now + RELOAD_DEBOUNCE);
+        assert_eq!(
+            published.operator_policy().explicit_only_providers,
+            ["other-provider"]
+        );
+        assert_eq!(held.operator_policy().explicit_only_providers, ["meta"]);
+        assert!(!Arc::ptr_eq(&held, &published));
+        std::fs::remove_file(&path).unwrap();
+        assert!(Arc::ptr_eq(
+            &published,
+            &live_config_at(&path, now + RELOAD_DEBOUNCE)
+        ));
+        let defaults = live_config_at(&path, now + RELOAD_DEBOUNCE * 2);
+        assert!(defaults
+            .operator_policy()
+            .explicit_only_providers
+            .is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct PromptCacheProvidersCache {
     /// Freshness key is (mtime, byte length), not mtime alone: two writes can
     /// land inside one filesystem clock tick (Linux coarse clocks tick ~4ms;
@@ -46,6 +500,7 @@ struct PromptCacheProvidersCache {
     providers: Vec<String>,
 }
 
+#[cfg(test)]
 fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCacheProvidersCache>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, PromptCacheProvidersCache>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -55,7 +510,7 @@ pub fn default_providers_without_prompt_cache() -> Vec<String> {
     vec!["ollama-cloud".to_string()]
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 struct RoutingConfigFile {
     #[serde(default)]
     model_routing: ModelRoutingSection,
@@ -83,21 +538,13 @@ pub struct AccountSelectionFlags {
     pub shadow: bool,
 }
 
-/// Read the account-selection flags. A missing file, or one routing cannot
-/// read or parse, leaves both flags off: selection never turns on by accident.
+/// Read account-selection flags from the active document. Without a valid
+/// document both are off; malformed edits retain the last accepted flags.
 pub fn account_selection_flags(path: &Path) -> AccountSelectionFlags {
-    match read_routing_config(path) {
-        Ok(config) => config
-            .map(|config| config.account_selection)
-            .unwrap_or_default(),
-        Err(error) => {
-            tracing::warn!(error = %error, "routing config unreadable; account selection stays off");
-            AccountSelectionFlags::default()
-        }
-    }
+    live_config(path).account_flags()
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 struct CatalogSection {
     #[serde(default)]
     poll_ms: Option<u64>,
@@ -258,6 +705,7 @@ impl Default for AaConfig {
 
 /// Read the AA ingest section. Missing file or section disables ingest. A
 /// present section defaults to the operator's claustrum credential ID.
+#[cfg(test)]
 pub fn read_aa_config(path: &Path) -> Result<AaConfig, String> {
     let document = match std::fs::read_to_string(path) {
         Ok(document) => document,
@@ -306,7 +754,7 @@ pub fn read_aa_config(path: &Path) -> Result<AaConfig, String> {
     })
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Clone)]
 struct ModelRoutingSection {
     /// Providers and models excluded from every automatic routing pool.
     #[serde(default)]
@@ -360,6 +808,12 @@ struct ModelRoutingSection {
     /// long-lived head agents may spend that reserved share.
     #[serde(default)]
     keep_free_percent: HashMap<String, f64>,
+}
+
+impl Default for ModelRoutingSection {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("empty model routing section")
+    }
 }
 
 /// `model_routing.overqualification`: `term = 0` while a route's surplus over
@@ -518,12 +972,14 @@ fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
     fact
 }
 
+#[cfg(test)]
 const CONFIG_CATALOG_FACT_FIELDS: [CatalogFactField; 3] = [
     CatalogFactField::ContextWindow,
     CatalogFactField::CostPerMtokOut,
     CatalogFactField::SupportsVision,
 ];
 
+#[cfg(test)]
 fn named_catalog_fields(ov: &ModelFactOverride) -> Vec<CatalogFactField> {
     let mut fields = Vec::new();
     if ov.context_window.is_some() {
@@ -538,6 +994,7 @@ fn named_catalog_fields(ov: &ModelFactOverride) -> Vec<CatalogFactField> {
     fields
 }
 
+#[cfg(test)]
 fn restore_withdrawn_catalog_fields(
     base: &mut ModelFact,
     seed: Option<&ModelFact>,
@@ -566,6 +1023,7 @@ fn restore_withdrawn_catalog_fields(
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub struct OverrideOutcome {
     pub applied: usize,
     pub reverted: usize,
@@ -584,6 +1042,7 @@ pub fn validate_min_best_effort_adequacy(raw: f64) -> Result<f64, String> {
 
 /// Reconcile explicit overrides and the default family rules against the store.
 /// A missing file keeps catalog families complete while adding no explicit override.
+#[cfg(test)]
 pub fn apply_overrides_from_config<S: RouteStateStore>(
     store: &S,
     path: &std::path::Path,
@@ -594,6 +1053,7 @@ pub fn apply_overrides_from_config<S: RouteStateStore>(
     Ok(outcome)
 }
 
+#[cfg(test)]
 fn read_routing_config(path: &Path) -> Result<Option<RoutingConfigFile>, String> {
     let doc = match std::fs::read_to_string(path) {
         Ok(document) => document,
@@ -627,7 +1087,7 @@ pub(crate) fn apply_family_rules_from_config<S: RouteStateStore>(
     store: &S,
     path: &Path,
 ) -> Result<usize, String> {
-    let config = read_routing_config(path)?.unwrap_or_default();
+    let config = &live_config(path).config;
     apply_family_rules(store, &config.model_families, &config.model_routing.models)
 }
 
@@ -734,6 +1194,7 @@ fn apply_family_rules<S: RouteStateStore>(
 /// clamping the value. Returns `None` when absent or the file is missing.
 /// Poll cadence for the Fusiform catalog consumer. Missing configuration uses
 /// ten minutes; zero is refused because it would create a reconnect hot loop.
+#[cfg(test)]
 pub fn read_catalog_poll_ms(path: &Path) -> Result<u64, String> {
     let doc = match std::fs::read_to_string(path) {
         Ok(doc) => doc,
@@ -752,6 +1213,7 @@ pub fn read_catalog_poll_ms(path: &Path) -> Result<u64, String> {
     }
 }
 
+#[cfg(test)]
 pub fn read_failure_backoff_config(path: &Path) -> Result<FailureBackoffConfig, String> {
     let doc = match std::fs::read_to_string(path) {
         Ok(document) => document,
@@ -778,6 +1240,7 @@ pub fn read_failure_backoff_config(path: &Path) -> Result<FailureBackoffConfig, 
     })
 }
 
+#[cfg(test)]
 pub fn read_min_best_effort_adequacy(path: &std::path::Path) -> Result<Option<f64>, String> {
     let doc = match std::fs::read_to_string(path) {
         Ok(d) => d,
@@ -796,6 +1259,7 @@ pub fn read_min_best_effort_adequacy(path: &std::path::Path) -> Result<Option<f6
 
 /// Refresh route multipliers before facts are loaded for a selection. Removing
 /// the config file or a multiplier clears its previous value on the next request.
+#[cfg(test)]
 pub fn reload_live_multipliers(path: &Path) -> Result<(), String> {
     let document = match std::fs::read_to_string(path) {
         Ok(document) => document,
@@ -908,6 +1372,7 @@ fn policy_revision(document: &str) -> String {
 /// Re-read request-time Elo settings and apply known route overrides to this
 /// selection's fact snapshot. Nothing is persisted, so removing an override
 /// restores the catalog Elo value on the next request.
+#[cfg(test)]
 pub fn apply_live_selection_config(
     path: &Path,
     facts: &mut [ModelFact],
@@ -985,6 +1450,7 @@ pub fn apply_live_selection_config(
 /// is checked at selection time so changing this operational policy does not need a
 /// routing-module restart, but the JSONC is reparsed only after its mtime changes.
 /// A missing file or missing field uses the safe default.
+#[cfg(test)]
 pub fn read_providers_without_prompt_cache(path: &Path) -> Result<Vec<String>, String> {
     read_providers_without_prompt_cache_with_reader(path, |path| {
         std::fs::read_to_string(path)
@@ -992,6 +1458,7 @@ pub fn read_providers_without_prompt_cache(path: &Path) -> Result<Vec<String>, S
     })
 }
 
+#[cfg(test)]
 fn read_providers_without_prompt_cache_with_reader<F>(
     path: &Path,
     read_file: F,
@@ -1061,6 +1528,7 @@ where
 
 /// The operator's routing policy as it was last read, keyed by config path.
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct OperatorPolicyCache {
     /// Freshness key of the document behind `policy`: (mtime, byte length). Same
     /// two-part key as the prompt-cache provider list, for the same reason: two
@@ -1075,6 +1543,7 @@ struct OperatorPolicyCache {
     reported_failure: Option<(Option<SystemTime>, Option<u64>)>,
 }
 
+#[cfg(test)]
 fn operator_policy_cache() -> &'static Mutex<HashMap<PathBuf, OperatorPolicyCache>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, OperatorPolicyCache>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -1089,12 +1558,10 @@ fn operator_policy_cache() -> &'static Mutex<HashMap<PathBuf, OperatorPolicyCach
 /// on the hot path without re-parsing per request and an operator edit takes
 /// effect on the next selection with no restart.
 pub fn read_operator_routing_policy(path: &Path) -> ModelRoutingPolicyInput {
-    read_operator_routing_policy_with_reader(path, |path| {
-        std::fs::read_to_string(path)
-            .map_err(|error| format!("reading {}: {error}", path.display()))
-    })
+    live_config(path).operator_policy()
 }
 
+#[cfg(test)]
 fn read_operator_routing_policy_with_reader<F>(path: &Path, read_file: F) -> ModelRoutingPolicyInput
 where
     F: FnOnce(&Path) -> Result<String, String>,
@@ -1162,6 +1629,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn parse_operator_routing_policy(
     path: &Path,
     document: &str,
@@ -1225,6 +1693,7 @@ pub fn operator_policy_revision(policy: &ModelRoutingPolicyInput) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+#[cfg(test)]
 fn apply_overrides<S: RouteStateStore>(
     store: &S,
     overrides: &HashMap<String, ModelFactOverride>,

@@ -157,6 +157,10 @@ pub struct SelectModelRouteInput<'a> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectiveBreakdown {
+    /// No usable price for the comparison unit. Cost comparisons put priced routes first,
+    /// even when a known price clamps to the maximum or has quota surcharges.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub price_unknown: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_pricing: Option<crate::subscription::SubscriptionPricing>,
     /// Normalized economic cost; quota-priced subscriptions may exceed one.
@@ -779,36 +783,26 @@ pub(crate) enum CostBasis<'v> {
 
 /// The output-only ladder: effective output price, then tier, then the
 /// unpriced-route rule.
-fn output_only_cost(fact: &ModelFact, is_subscription: bool) -> f64 {
-    if subscription_price_unpublished(fact, is_subscription) {
-        return 0.0;
-    }
+fn output_only_cost(fact: &ModelFact, _is_subscription: bool) -> f64 {
     normalized_metered_cost(fact)
 }
 
-/// A subscription route whose catalog row publishes no price at all.
-fn subscription_price_unpublished(fact: &ModelFact, is_subscription: bool) -> bool {
-    fact.billing_plane.is_none()
-        && is_subscription
-        && fact.cost_per_m_tok_out.is_none()
-        && fact.cost_tier.is_none()
+fn output_price_unknown(fact: &ModelFact) -> bool {
+    effective_cost_per_m_tok_out(fact).is_none()
 }
 
 /// The basket cost of one route on `vector`, with the dimension-level detail.
 /// A route that cannot be priced (a dimension with tokens and no rate) takes
-/// the existing unpriced-route rule: the maximum cost (1.0), except a
-/// subscription route that publishes no price at all, whose marginal token cost
-/// is zero as on the output-only ladder. Either way only that route is
-/// affected; the selection keeps its basket mode.
+/// the unpriced-route cost (1.0), regardless of subscription coverage. Only that
+/// route is affected; the selection keeps its basket mode.
 fn basket_route_cost(
     fact: &ModelFact,
-    is_subscription: bool,
+    _is_subscription: bool,
     vector: &ClassVector,
 ) -> (f64, BasketPrice) {
     let price = fact.basket_price(vector);
     let cost = match price.cost {
         Some(cost) => cost,
-        None if subscription_price_unpublished(fact, is_subscription) => 0.0,
         None => 1.0,
     };
     (cost, price)
@@ -826,12 +820,8 @@ fn basket_route_cost(
 /// explanation carries the effective price, the list price, the multiplier when it
 /// is not 1.0, and whether the route is subscription-covered, so a reader can tell
 /// "cheap because subsidized" from "cheap because it is a cheap model".
-/// The selection cost of a route. An unpublished price under a subscription plan is
-/// a zero marginal token cost: the plan is the operator's own business fact, and
-/// the catalog (models.dev via Fusiform) publishes no per-token rate for
-/// subscription planes such as ollama-cloud at all. Ranking those routes at the
-/// maximum priced every glm, deepseek, and kimi route on the plan above sol. An
-/// unpublished price under a metered provider still ranks at the maximum.
+/// Subscription coverage is not evidence of zero consumption. An unpublished
+/// price takes the maximum proxy cost and sorts after every priced candidate.
 ///
 /// Under the basket (`use_basket`), the route is priced on its attached
 /// ephemeral vector when that vector clears the sample floor, dimension by
@@ -892,13 +882,9 @@ pub(crate) fn compute_objective(
                 })
                 .collect::<Vec<_>>()
                 .join("; ");
-            if subscription_price_unpublished(&route.fact, is_subscription) {
-                detail.push_str(&format!(
-                    ", price unpublished, subscription plan: marginal token cost zero ({missing})"
-                ));
-            } else {
-                detail.push_str(&format!(", unpriceable, ranked as max ({missing})"));
-            }
+            detail.push_str(&format!(
+                ", price unknown, unpriceable, ranked as max ({missing})"
+            ));
         }
         detail.push_str(&format!(
             ", {} vector ({} samples)",
@@ -937,6 +923,10 @@ pub(crate) fn compute_objective(
 
     let (mut objective, mut notes) =
         objective_tail(route, runtime, is_subscription, cost, basket_pricing, notes);
+    objective.price_unknown = match basis {
+        CostBasis::Basket { vector, .. } => route.fact.basket_price(vector).cost.is_none(),
+        CostBasis::OutputOnly => output_price_unknown(&route.fact),
+    };
     if is_subscription {
         if let Some(pool) = &runtime.subscription_pool {
             // Compute list dollars before normalization or subsidy. A clamped
@@ -965,7 +955,9 @@ pub(crate) fn compute_objective(
                 // Without a usable workload vector the common comparison unit
                 // remains one million output tokens, not an invented message.
                 CostBasis::OutputOnly => (
-                    route.fact.cost_per_m_tok_out,
+                    route
+                        .fact
+                        .basket_rate(crate::model_facts::BasketDimension::OutputExcludingReasoning),
                     crate::routing_config::COST_REFERENCE_PER_MTOK,
                 ),
             };
@@ -990,9 +982,13 @@ pub(crate) fn compute_objective(
                     objective.quota = 0.0;
                     objective.selection_cost = objective.cost;
                     objective.subscription_pricing = Some(pricing);
+                    objective.price_unknown = false;
                 }
             }
         }
+    }
+    if objective.price_unknown {
+        notes.push("price_unknown: no effective price; ranked after known prices".into());
     }
     (objective, notes)
 }
@@ -1000,7 +996,7 @@ pub(crate) fn compute_objective(
 /// The cost line's detail on the output-only ladder.
 fn output_only_detail(
     route: &ModelRoute,
-    is_subscription: bool,
+    _is_subscription: bool,
     multiplier: f64,
     coverage: &str,
 ) -> String {
@@ -1025,8 +1021,6 @@ fn output_only_detail(
         .filter(|_| route.fact.billing_plane.is_none())
     {
         format!("tier {}, {coverage}", fmt_num(tier))
-    } else if is_subscription && route.fact.billing_plane.is_none() {
-        "price unpublished, subscription plan: marginal token cost zero".to_string()
     } else {
         // An unpriced metered route is ranked at the MAXIMUM cost (see
         // `selection_cost`), never as free. Say so on the line: a route losing
@@ -1114,6 +1108,7 @@ fn objective_tail(
     notes.push(speed_note);
     (
         ObjectiveBreakdown {
+            price_unknown: false,
             subscription_pricing: None,
             cost,
             quota,
@@ -1579,6 +1574,7 @@ pub fn select_model_route_with_slots(
                     route_key: &a.route.route_key,
                     subscription_covered: s.objective.subscription_covered,
                     quota_priced: s.objective.subscription_pricing.is_some(),
+                    price_unknown: s.objective.price_unknown,
                     selection_cost: if with_term {
                         s.objective.selection_cost
                     } else {
@@ -1665,6 +1661,14 @@ pub fn select_model_route_with_slots(
         winner.objective.selection_cost,
     ));
     explanation.extend(winner.objective_notes.iter().cloned());
+    for candidate in &scored {
+        if candidate.idx != winner.idx && candidate.objective.price_unknown {
+            let route_key = &admissible[candidate.idx].route.route_key;
+            explanation.push(format!(
+                "route {route_key}: price_unknown (ranked after known prices)"
+            ));
+        }
+    }
     // The unit the whole shortlist was priced in, and why when it is not the
     // basket: per-route lines above say how each route was priced, this one
     // says which comparison they were all part of.
@@ -1818,6 +1822,7 @@ fn classify_empty_admission(rejected: &[RejectedRoute]) -> RouteFailureReason {
 /// What the route ordering needs to know about one priced, admissible route.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteOrderFacts<'r> {
+    pub price_unknown: bool,
     pub provider_id: &'r str,
     pub route_key: &'r str,
     pub subscription_covered: bool,
@@ -1837,6 +1842,7 @@ pub(crate) struct RouteOrderFacts<'r> {
 /// comparing keys lexicographically is a total order.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteOrderKey<'r> {
+    pub price_unknown: bool,
     pub route_key: &'r str,
     pub uncached: bool,
     /// The cost this route is compared on: 0 inside the effectively-free
@@ -1872,7 +1878,7 @@ pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteO
     let mut pools: HashMap<&str, (f64, usize)> = HashMap::new();
     for route in routes
         .iter()
-        .filter(|r| r.subscription_covered && !r.quota_priced)
+        .filter(|r| r.subscription_covered && !r.quota_priced && !r.price_unknown)
     {
         pools
             .entry(route.provider_id)
@@ -1885,12 +1891,13 @@ pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteO
     routes
         .iter()
         .map(|route| {
-            let (pool_cost, shared_pool) = if route.subscription_covered && !route.quota_priced {
-                let (min, members) = pools[route.provider_id];
-                (min, members >= 2)
-            } else {
-                (route.selection_cost, false)
-            };
+            let (pool_cost, shared_pool) =
+                if route.subscription_covered && !route.quota_priced && !route.price_unknown {
+                    let (min, members) = pools[route.provider_id];
+                    (min, members >= 2)
+                } else {
+                    (route.selection_cost, false)
+                };
             let free = !route.quota_priced && pool_cost <= EFFECTIVELY_FREE_SELECTION_COST;
             // An absent or non-finite abundance sample is neutral rather than
             // favourable or fatal; quantizing keeps tiny float noise from
@@ -1900,6 +1907,7 @@ pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteO
                 .filter(|value| value.is_finite())
                 .unwrap_or(1.0);
             RouteOrderKey {
+                price_unknown: route.price_unknown,
                 route_key: route.route_key,
                 uncached: route.uncached,
                 // Prices in one fixed 10% band share a cost key, letting quality
@@ -1947,6 +1955,8 @@ pub(crate) fn compare_route_order_keys(
         Ordering::Equal
     };
     best_effort_first
+        // Unknown prices cannot borrow a cheap pool cost or win a clamped tie.
+        .then(a.price_unknown.cmp(&b.price_unknown))
         // 2. Prompt-cache preference partitions otherwise eligible candidates.
         // It never lets a cache-capable route bypass the normal adequacy gate.
         .then(a.uncached.cmp(&b.uncached))
@@ -2116,6 +2126,7 @@ mod abundance_tests {
     #[test]
     fn objective_without_abundance_is_byte_identical_to_the_previous_shape() {
         let objective = ObjectiveBreakdown {
+            price_unknown: false,
             subscription_pricing: None,
             cost: 0.25,
             quota: 0.125,
@@ -2453,6 +2464,7 @@ mod route_order_tests {
         adequacy: f64,
     ) -> RouteOrderFacts<'r> {
         RouteOrderFacts {
+            price_unknown: false,
             quota_priced: false,
             provider_id,
             route_key,

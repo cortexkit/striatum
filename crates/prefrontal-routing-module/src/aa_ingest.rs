@@ -427,13 +427,7 @@ async fn run_aa_ingest_cycle_with(
     fetcher: &dyn AaIndexFetcher,
     credential_logger: &dyn AaCredentialFailureLogger,
 ) {
-    let config = match config_overrides::read_aa_config(config_path) {
-        Ok(config) => config,
-        Err(_) => {
-            log_aa_ingest_failure("config");
-            return;
-        }
-    };
+    let config = config_overrides::live_config(config_path).aa_config();
     let Some(api_key_ref) = config.api_key_ref.as_deref() else {
         log_aa_ingest_skipped();
         return;

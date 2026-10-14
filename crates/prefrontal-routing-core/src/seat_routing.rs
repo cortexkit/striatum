@@ -477,8 +477,13 @@ fn order_candidates(pool: Vec<AdmittedRoute>, input: &SeatRouteInput<'_>) -> Vec
         .collect();
     candidates.sort_by(|a, b| {
         a.objective
-            .selection_cost
-            .total_cmp(&b.objective.selection_cost)
+            .price_unknown
+            .cmp(&b.objective.price_unknown)
+            .then_with(|| {
+                a.objective
+                    .selection_cost
+                    .total_cmp(&b.objective.selection_cost)
+            })
             .then_with(|| b.objective.speed_score.total_cmp(&a.objective.speed_score))
             .then_with(|| a.metered_cost.total_cmp(&b.metered_cost))
             .then_with(|| {

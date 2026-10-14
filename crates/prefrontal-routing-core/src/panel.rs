@@ -280,6 +280,7 @@ pub struct SelectedPanel {
 pub struct InvalidPanelRequest(pub String);
 
 struct Candidate {
+    price_unknown: bool,
     route: ModelRoute,
     prompt_params: Map<String, Value>,
     selection_cost: f64,
@@ -658,6 +659,7 @@ fn select_panel_admitted(
             false,
         );
         candidates.push(Candidate {
+            price_unknown: objective.price_unknown,
             metered_cost: normalized_metered_cost(&admitted.route.fact),
             route: admitted.route,
             prompt_params: params,
@@ -1047,6 +1049,7 @@ fn iq_cost_order(a: &Candidate, b: &Candidate) -> Ordering {
         .scores
         .elo
         .total_cmp(&a.route.fact.scores.elo)
+        .then_with(|| a.price_unknown.cmp(&b.price_unknown))
         .then_with(|| a.selection_cost.total_cmp(&b.selection_cost))
         .then_with(|| b.speed_score.total_cmp(&a.speed_score))
         .then_with(|| a.metered_cost.total_cmp(&b.metered_cost))
@@ -1059,6 +1062,7 @@ fn iq_lineage_order(a: &Candidate, b: &Candidate) -> Ordering {
         .scores
         .elo
         .total_cmp(&a.route.fact.scores.elo)
+        .then_with(|| a.price_unknown.cmp(&b.price_unknown))
         .then_with(|| a.selection_cost.total_cmp(&b.selection_cost))
         .then_with(|| b.speed_score.total_cmp(&a.speed_score))
         .then_with(|| a.metered_cost.total_cmp(&b.metered_cost))
@@ -1067,8 +1071,9 @@ fn iq_lineage_order(a: &Candidate, b: &Candidate) -> Ordering {
 }
 
 fn cost_primary_order(a: &Candidate, b: &Candidate) -> Ordering {
-    a.selection_cost
-        .total_cmp(&b.selection_cost)
+    a.price_unknown
+        .cmp(&b.price_unknown)
+        .then_with(|| a.selection_cost.total_cmp(&b.selection_cost))
         .then_with(|| b.speed_score.total_cmp(&a.speed_score))
         .then_with(|| a.metered_cost.total_cmp(&b.metered_cost))
         .then_with(|| a.route.route_key.cmp(&b.route.route_key))

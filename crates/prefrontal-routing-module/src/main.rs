@@ -51,17 +51,19 @@ use prefrontal_routing_core::model_router::{
 use prefrontal_routing_core::quota::quota_poll::record_reading_log_poll;
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
 use prefrontal_routing_core::route_state_store::FactSource;
-use prefrontal_routing_core::routing_config::{ANCHOR_VERSION, DEFAULT_ROUTING_CONFIG};
+use prefrontal_routing_core::routing_config::ANCHOR_VERSION;
 use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, live_billing_wall_error, make_route_key,
     relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
     select_panel_with_config, validate_panel_spec, AvailabilitySubstrate, BreakGlassCandidate,
     CatalogFactField, DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy, ExclusionSpecs,
-    FailureBackoffConfig, ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput,
-    PanelRosterEntry, PanelSelection, PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy,
-    RouteOutcome, RouteStateStore, RouteWallClass, SelectPanelInput, SelectedPanel,
+    ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry,
+    PanelSelection, PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome,
+    RouteStateStore, RouteWallClass, SelectPanelInput, SelectedPanel,
 };
+#[cfg(test)]
+use prefrontal_routing_core::{routing_config::DEFAULT_ROUTING_CONFIG, FailureBackoffConfig};
 use prefrontal_routing_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
 use quota_consumer::QuotaConsumer;
 use serde::{Deserialize, Serialize};
@@ -866,6 +868,8 @@ where
         account_quota::restore_account_state(store.as_ref()),
     ));
     let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
+    broca_credentials.lock().unwrap().connection_file_path =
+        Some(config.connection_file_path.clone());
     // Restored login identities identify their serving plane before the first
     // catalog poll; API-only providers wait for the non-secret listing poll.
     if let (Ok(accounts), Ok(facts), Ok(mut credentials)) = (
@@ -922,39 +926,23 @@ where
         aa_credential_resolver,
     ));
 
-    // Merge the user's model-fact overrides (model_routing.models) from the module's
-    // OWN config-home file onto the migration-applied seed. The module owns its
-    // catalog incl overrides (NOT subc-mediated config, which is unwired). A missing
-    // file is a no-op; a parse error is logged but never aborts boot (routing
-    // degrades to the seed catalog).
+    // Load a validated config snapshot before serving. The watcher publishes
+    // replacements; model overrides remain request overlays so withdrawing one
+    // exposes the stored fact without rewriting operator score placements.
     let override_path = config_overrides::config_path();
     // Selection policy and model-fact overrides share the routing-owned file.
     let operator_config_path = override_path.clone();
     // OpenCode owns this file; routing reads only each provider's auth kind.
     let opencode_auth_path = config_overrides::auth_json_path();
-    match config_overrides::apply_overrides_from_config(store.as_ref(), &override_path) {
-        Ok(outcome) => {
-            if outcome.applied > 0 || outcome.reverted > 0 || !outcome.skipped.is_empty() {
-                eprintln!(
-                    "[prefrontal-routing] model-fact overrides: applied {}, reverted {}, skipped {:?}",
-                    outcome.applied, outcome.reverted, outcome.skipped
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!("[prefrontal-routing] model-fact override read failed (using seed): {e}")
-        }
-    }
+    config_overrides::live_config(&override_path);
+    tokio::spawn(config_overrides::config_refresh_loop(
+        override_path.clone(),
+        Arc::clone(&broca_credentials.lock().unwrap().catalog_wake),
+    ));
 
-    // Read `min_best_effort_adequacy` from the same config file. Clamp to [0,1];
-    // reject NaN loudly. Absent means use the module default (0.6).
-    let catalog_poll_ms = match config_overrides::read_catalog_poll_ms(&override_path) {
-        Ok(poll_ms) => poll_ms,
-        Err(error) => {
-            tracing::warn!(error = %error, "invalid catalog.poll_ms; using ten-minute default");
-            config_overrides::DEFAULT_CATALOG_POLL_MS
-        }
-    };
+    // Seed catalog health with the active polling cadence; reloads wake the
+    // catalog loop, which updates both its cadence and the health threshold.
+    let catalog_poll_ms = config_overrides::live_config(&override_path).catalog_poll_ms();
     if let Ok(mut health) = catalog_health.lock() {
         health.set_poll_ms(catalog_poll_ms);
     }
@@ -975,19 +963,7 @@ where
     ));
 
     let min_band: SharedMinBand = Arc::new(std::sync::Mutex::new(
-        match config_overrides::read_min_best_effort_adequacy(&override_path) {
-            Ok(Some(val)) => {
-                eprintln!("[prefrontal-routing] min_best_effort_adequacy: {val}");
-                Some(val)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                eprintln!(
-                    "[prefrontal-routing] min_best_effort_adequacy config error (using default): {e}"
-                );
-                None
-            }
-        },
+        config_overrides::live_config(&override_path).min_band(),
     ));
 
     let mut route_epochs = RouteEpochs::new();
@@ -1836,6 +1812,7 @@ async fn handle_model_upsert(
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
     ladder_sources: &winner_ladder::LadderSources,
+    broca_credentials: &SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -1912,6 +1889,25 @@ async fn handle_model_upsert(
         &params.model_id,
         params.variant.as_deref(),
     );
+    if let Err(error) = fusiform_catalog::ingest_before_upsert(
+        store,
+        broca_credentials,
+        &params.provider_id,
+        &params.model_id,
+    )
+    .await
+    {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "catalog_unavailable",
+            &format!("model_upsert catalog ingest: {error}"),
+        )
+        .await;
+    }
     let existing = match store.get_fact_by_route_key(&route_key) {
         Ok(existing) => existing,
         Err(error) => {
@@ -1928,6 +1924,17 @@ async fn handle_model_upsert(
         }
     };
     let created = existing.is_none();
+    let existing = if existing.is_none() && params.variant.is_some() {
+        store
+            .get_fact_by_route_key(&make_route_key(&params.provider_id, &params.model_id, None))
+            .map_err(|error| ModuleError::Message(error.to_string()))?
+            .map(|mut fact| {
+                fact.variant = params.variant.clone();
+                fact
+            })
+    } else {
+        existing
+    };
     let fact = match merge_model_upsert(existing, &params) {
         Ok(fact) => fact,
         Err(message) => {
@@ -2055,13 +2062,7 @@ async fn handle_model_seed_aa(
             .await;
         }
     };
-    let aa_config = match config_overrides::read_aa_config(routing_config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &error)
-                .await;
-        }
-    };
+    let aa_config = config_overrides::live_config(routing_config_path).aa_config();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -2661,7 +2662,7 @@ async fn handle_select_request(
     writer: &mpsc::Sender<Frame>,
     quota_cache: &SharedQuotaCache,
     store: &SharedStore,
-    min_band: &SharedMinBand,
+    _min_band: &SharedMinBand,
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
@@ -2672,6 +2673,7 @@ async fn handle_select_request(
     let epoch = route_epoch;
     let corr = frame.header.corr;
     let ver = frame.header.ver;
+    let live_config = config_overrides::live_config(routing_config_path);
 
     // Decode the method first: an unknown method must report `unknown_method` even
     // when params are absent/malformed (the params are method-specific).
@@ -2767,7 +2769,7 @@ async fn handle_select_request(
         let ctx = account_selection::Ctx {
             store: store.as_ref(),
             accounts: ACCOUNT_QUOTA.get(),
-            flags: config_overrides::account_selection_flags(routing_config_path),
+            flags: live_config.account_flags(),
             policy: &policy,
             now_ms: account_selection::now_ms(),
         };
@@ -2831,7 +2833,7 @@ async fn handle_select_request(
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         let ladder_sources =
             winner_ladder::LadderSources::live(routing_config_path, operator_config_path);
-        return handle_model_upsert(frame, writer, store, &ladder_sources).await;
+        return handle_model_upsert(frame, writer, store, &ladder_sources, broca_credentials).await;
     }
     if envelope.method == ROUTE_MODEL_SEED_AA_OP {
         let ladder_sources =
@@ -2905,10 +2907,15 @@ async fn handle_select_request(
         params.routing_policy.is_some() || !params.subscription_keys.is_empty(),
     );
     // The operator fence is read HERE, on the module side, for every selection.
-    let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
+    let operator_policy = if operator_config_path == routing_config_path {
+        live_config.operator_policy()
+    } else {
+        config_overrides::read_operator_routing_policy(operator_config_path)
+    };
     let availability = if is_broca_substrate(params.substrate.as_deref()) {
         match store.get_facts() {
             Ok(mut facts) => {
+                live_config.apply(&mut facts);
                 // Aliased providers are reachable through their own credentials,
                 // so their borrowed rows join the served-route join.
                 prefrontal_routing_core::score_alias::append_alias_rows(
@@ -2962,49 +2969,21 @@ async fn handle_select_request(
                 return send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
             }
         };
-    let providers_without_prompt_cache = match config_overrides::read_providers_without_prompt_cache(
-        routing_config_path,
-    ) {
-        Ok(providers) => providers,
-        Err(error) => {
-            eprintln!(
-                    "[prefrontal-routing] prompt-cache provider config reload failed (using default): {error}"
-                );
-            config_overrides::default_providers_without_prompt_cache()
-        }
-    };
-    if let Err(error) = config_overrides::reload_live_multipliers(routing_config_path) {
-        eprintln!(
-            "[prefrontal-routing] live route multiplier reload failed (using no multipliers): {error}"
-        );
-    }
+    let providers_without_prompt_cache = live_config.providers_without_prompt_cache();
     let PreparedSelectionInputs {
         now,
         mut facts,
         snapshot,
         quota_signal_json,
         quota_note,
-    } = match prepare_selection_inputs(quota_cache, store) {
+    } = match live_config.prepare(|| prepare_selection_inputs(quota_cache, store)) {
         Ok(prepared) => prepared,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
         }
     };
-    let (routing_config, policy_revision) = match config_overrides::apply_live_selection_config(
-        routing_config_path,
-        &mut facts,
-    ) {
-        Ok(outcome) => (outcome.routing_config, outcome.policy_revision),
-        Err(error) => {
-            eprintln!(
-                "[prefrontal-routing] live Elo routing config reload failed (using defaults): {error}"
-            );
-            (
-                DEFAULT_ROUTING_CONFIG,
-                config_overrides::default_policy_revision(),
-            )
-        }
-    };
+    let outcome = live_config.apply(&mut facts);
+    let (routing_config, policy_revision) = (outcome.routing_config, outcome.policy_revision);
     let provenance = DecisionProvenance {
         quota_signal_json,
         policy_revision,
@@ -3019,6 +2998,7 @@ async fn handle_select_request(
     if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(&mut facts);
     }
+    live_config.apply(&mut facts);
 
     let subscription_keys: HashSet<String> = resolved_request
         .policy
@@ -3056,7 +3036,7 @@ async fn handle_select_request(
     let target_agent = params.target_agent.clone();
     let prefer_prompt_cache = params.prefer_prompt_cache;
 
-    let min_best_effort_adequacy = min_band.lock().ok().and_then(|g| *g);
+    let min_best_effort_adequacy = live_config.min_band();
     let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
 
     if let Some(pin) = params.model_pin.as_deref() {
@@ -3104,7 +3084,7 @@ async fn handle_select_request(
                 let ctx = account_selection::Ctx {
                     store: store.as_ref(),
                     accounts: ACCOUNT_QUOTA.get(),
-                    flags: config_overrides::account_selection_flags(routing_config_path),
+                    flags: live_config.account_flags(),
                     policy: &policy,
                     now_ms: now as i64,
                 };
@@ -3624,6 +3604,12 @@ async fn handle_select_panel(
     let epoch = frame.header.epoch;
     let corr = frame.header.corr;
     let ver = frame.header.ver;
+    let live_config = config_overrides::live_config(routing_config_path);
+    let operator_policy = if operator_config_path == routing_config_path {
+        live_config.operator_policy()
+    } else {
+        config_overrides::read_operator_routing_policy(operator_config_path)
+    };
     let params = match serde_json::from_slice::<SelectPanelBody>(&frame.body) {
         Ok(body) => body.params,
         Err(e) => {
@@ -3644,7 +3630,7 @@ async fn handle_select_panel(
     }
     if params.selection == PanelSelection::Roster {
         if let Some(refusal) = host_runner_pin_refusal(
-            &config_overrides::read_operator_routing_policy(operator_config_path),
+            &operator_policy,
             params.substrate.as_deref(),
             params.roster.iter().map(|entry| entry.model.as_str()),
         ) {
@@ -3660,32 +3646,14 @@ async fn handle_select_panel(
             .await;
         }
     }
-    if let Err(error) = config_overrides::reload_live_multipliers(routing_config_path) {
-        eprintln!(
-            "[prefrontal-routing] live route multiplier reload failed (using no multipliers): {error}"
-        );
-    }
-    let mut prepared = match prepare_selection_inputs(quota_cache, store) {
+    let mut prepared = match live_config.prepare(|| prepare_selection_inputs(quota_cache, store)) {
         Ok(prepared) => prepared,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
         }
     };
-    let (routing_config, policy_revision) = match config_overrides::apply_live_selection_config(
-        routing_config_path,
-        &mut prepared.facts,
-    ) {
-        Ok(outcome) => (outcome.routing_config, outcome.policy_revision),
-        Err(error) => {
-            eprintln!(
-                "[prefrontal-routing] live Elo routing config reload failed (using defaults): {error}"
-            );
-            (
-                DEFAULT_ROUTING_CONFIG,
-                config_overrides::default_policy_revision(),
-            )
-        }
-    };
+    let outcome = live_config.apply(&mut prepared.facts);
+    let (routing_config, policy_revision) = (outcome.routing_config, outcome.policy_revision);
     let provenance = DecisionProvenance {
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
@@ -3694,7 +3662,6 @@ async fn handle_select_panel(
     // receive both the operator fence and this request's own exclusions, whether
     // or not a package size was supplied. Subscription classification is owned by
     // routing rather than the caller.
-    let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
     prefrontal_routing_core::score_alias::append_alias_rows(
         &mut prepared.facts,
         &operator_policy.score_alias,
@@ -3702,6 +3669,7 @@ async fn handle_select_panel(
     if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(&mut prepared.facts);
     }
+    live_config.apply(&mut prepared.facts);
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
@@ -4213,13 +4181,7 @@ async fn handle_set_decision_outcome(
         )
         .await;
     };
-    let failure_backoff = match config_overrides::read_failure_backoff_config(routing_config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("[prefrontal-routing] failure backoff config error (using default): {error}");
-            FailureBackoffConfig::default()
-        }
-    };
+    let failure_backoff = config_overrides::live_config(routing_config_path).failure_backoff();
     let update = DecisionOutcomeUpdate {
         outcome,
         last_error: params.last_error,
@@ -9483,6 +9445,7 @@ mod tests {
         )
         .unwrap();
         set_config_mtime(&operator_config, 1_700_000_001);
+        config_overrides::settle_live_config(&operator_config);
         let reloaded =
             run_select_against_rig(&rig, select_params(None), &facts, &operator_config).await;
         let reloaded_body: serde_json::Value = serde_json::from_slice(&reloaded.body).unwrap();
@@ -11619,6 +11582,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn placement_before_provider_ingestion_merges_fusiform_price_and_login_policy() {
+        let rig = Rig::new("upsert-catalog-merge");
+        let store = Arc::new(rig.open_store());
+        let snapshot = fusiform_catalog::decode_catalog_get(
+            &serde_json::to_vec(&json!({
+                "catalog_version": 1, "resolved_at_ms": 1,
+                "curated": [{"model":"meta/muse-wonder-1.0","auth_methods":["oauth"]}],
+                "models": {"meta/muse-wonder-1.0": {
+                    "existence":"present", "limit.context":200000,
+                    "rate.input":{"state":"priced","currency":"USD","units":4,"exponent":0},
+                    "rate.output":{"state":"priced","currency":"USD","units":20,"exponent":0}
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+        for variant in [None, Some("thinking")] {
+            let response = run_route_wire_request_with_paths(&store, json!({"method": ROUTE_MODEL_UPSERT_OP,
+                "params":{"providerID":"meta","modelID":"muse-wonder-1.0","variant":variant,"elo":1808,"eq":1600}
+            }), Path::new("/nonexistent/alfonso-routing.jsonc"), &credentials).await;
+            assert_eq!(
+                response.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            let fact = store
+                .get_fact_by_route_key(&make_route_key("meta", "muse-wonder-1.0", variant))
+                .unwrap()
+                .unwrap();
+            assert_eq!(fact.cost_per_m_tok_out, Some(20.0));
+            assert_eq!(fact.input_rate, Some(4.0));
+            assert_eq!(fact.auth_methods, Some(vec!["oauth".into()]));
+            assert_eq!(fact.scores.elo, 1808.0);
+            assert_eq!(fact.score_provenance, ScoreProvenance::Override);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_config_reloads_cost_and_explicit_only_atomically_and_keeps_last_good() {
+        let _guard = config_overrides::multiplier_map_guard();
+        let rig = Rig::new("live-atomic-config");
+        let store = Arc::new(rig.open_store());
+        let mut a = fact("a", "reader");
+        a.cost_per_m_tok_out = Some(3.0);
+        let mut b = fact("b", "reader");
+        b.cost_per_m_tok_out = Some(6.0);
+        for fact in [&a, &b] {
+            store.upsert_fact(fact, FactSource::Seed).unwrap();
+        }
+        let credentials = Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(&[a, b])));
+        let path = rig.dir.join("routing.jsonc");
+        std::fs::write(&path, "{}").unwrap();
+        async fn select(
+            store: &SharedStore,
+            credentials: &SharedBrocaCredentials,
+            path: &Path,
+        ) -> serde_json::Value {
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(&json!({"method": ROUTE_SELECT_OP, "params": {
+                    "targetAgent": "explore", "requirements": {"iq": 30, "eq": 0},
+                    "availableModels": ["a/reader", "b/reader"]
+                }}))
+                .unwrap(),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            handle_select_request(
+                frame,
+                1,
+                &tx,
+                &Arc::new(Mutex::new(QuotaCache::default())),
+                store,
+                &Arc::new(Mutex::new(None)),
+                path,
+                path,
+                credentials,
+                &empty_opencode_auth(),
+            )
+            .await
+            .unwrap();
+            let response = rx.recv().await.unwrap();
+            assert_eq!(response.header.ty, FrameType::Response);
+            serde_json::from_slice(&response.body).unwrap()
+        }
+        let first = select(&store, &credentials, &path).await;
+        assert_eq!(first["result"]["selected"]["routeKey"], "a/reader");
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#,
+        )
+        .unwrap();
+        config_overrides::settle_live_config(&path);
+        let cost_edit = select(&store, &credentials, &path).await;
+        assert_eq!(cost_edit["result"]["selected"]["routeKey"], "b/reader");
+        std::fs::write(&path, r#"{"model_routing":{"explicit_only_providers":["b"],"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
+        config_overrides::settle_live_config(&path);
+        let fenced = select(&store, &credentials, &path).await;
+        assert_eq!(fenced["result"]["selected"]["routeKey"], "a/reader");
+        assert_eq!(
+            rejection_reason(&fenced, "b/reader").as_deref(),
+            Some("explicit_only_provider")
+        );
+        let good = config_overrides::live_config(&path);
+        for invalid in [
+            "{broken",
+            r#"{"model_routing":{"explicit_only_providers":["a"],"models":{"b/reader":{"cost_per_mtok_out":-1}}}}"#,
+            r#"{"aa":{"api_key_ref":" "},"model_routing":{"explicit_only_providers":["a"]}}"#,
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            let retained = config_overrides::settle_live_config(&path);
+            assert!(
+                Arc::ptr_eq(&good, &retained),
+                "invalid documents must never partially publish"
+            );
+            let selected = select(&store, &credentials, &path).await;
+            assert_eq!(selected["result"]["selected"], fenced["result"]["selected"]);
+        }
+        std::fs::write(&path, "{}").unwrap();
+        config_overrides::settle_live_config(&path);
+        let removed = select(&store, &credentials, &path).await;
+        assert_eq!(removed["result"]["selected"]["routeKey"], "a/reader");
+        assert_eq!(
+            store
+                .get_fact_by_route_key("b/reader")
+                .unwrap()
+                .unwrap()
+                .cost_per_m_tok_out,
+            Some(6.0),
+            "overlays must not replace the catalog base"
+        );
+    }
+
+    #[tokio::test]
     async fn next_selection_observes_a_live_elo_override_edit() {
         let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         async fn select(
@@ -11626,6 +11730,7 @@ mod tests {
             quota_cache: &SharedQuotaCache,
             config_path: &Path,
         ) -> String {
+            config_overrides::settle_live_config(config_path);
             let request = json!({
                 "method": ROUTE_SELECT_OP,
                 "params": {
@@ -12066,9 +12171,15 @@ mod tests {
             )
             .unwrap();
             let (tx, mut rx) = mpsc::channel(1);
-            handle_model_upsert(frame, &tx, &self.store, &self.sources)
-                .await
-                .unwrap();
+            handle_model_upsert(
+                frame,
+                &tx,
+                &self.store,
+                &self.sources,
+                &empty_broca_credentials(),
+            )
+            .await
+            .unwrap();
             rx.recv().await.unwrap()
         }
 
@@ -12395,6 +12506,12 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            watch.check(rig.store.as_ref(), &rig.sources),
+            None,
+            "a pending edit has not changed the active config"
+        );
+        config_overrides::settle_live_config(&rig.sources.routing_config);
         let notice = watch
             .check(rig.store.as_ref(), &rig.sources)
             .expect("excluding the iq-100 winner moves it");
