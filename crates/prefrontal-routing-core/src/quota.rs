@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::quota_pace::ProviderWindowModel;
 
+/// Maximum source age of last-good quota served through a fetch failure.
+pub const LAST_GOOD_MAX_AGE_MS: i64 = 30 * 60_000;
+
 /// One rate-limit window: how much of a quota pool is spent and when it resets.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

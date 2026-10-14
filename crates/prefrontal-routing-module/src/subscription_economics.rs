@@ -2,7 +2,9 @@
 //! never from route.select. Missing services and unshipped fields are normal.
 
 use crate::{
-    account_quota::{parse_rfc3339_ms, AccountQuotaState, SharedAccountQuota},
+    account_quota::{
+        parse_rfc3339_ms, AccountEntry, AccountQuotaState, AgeBand, SharedAccountQuota,
+    },
     quota_consumer::{QuotaConsumer, QuotaConsumerError},
 };
 use prefrontal_routing_core::{
@@ -329,6 +331,18 @@ fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
     if let Some(extra) = usage["extraRateWindows"].as_array() {
         windows.extend(extra.iter().filter_map(|w| w.get("window")));
     }
+    // A past reset does not make last-good free. Even a short window with expired
+    // usage makes a stale account unknown until a new observation arrives.
+    if reading.get("stale").is_some_and(|stale| !stale.is_null())
+        && windows.iter().any(|window| {
+            window["resetsAt"]
+                .as_str()
+                .and_then(parse_rfc3339_ms)
+                .is_some_and(|reset| reset <= now)
+        })
+    {
+        return None;
+    }
     let weekly = windows.iter().find(|w| {
         w["windowKind"] == "weekly"
             || w["windowMinutes"]
@@ -410,18 +424,24 @@ fn build(
     };
     let mut plans: BTreeMap<(String, Option<String>, u64), SubscriptionPlan> = BTreeMap::new();
     for reading in state.readings.readings.values() {
-        if reading.tombstoned_at_ms.is_some()
-            || reading.entry.get("error").is_some_and(|e| !e.is_null())
-        {
+        if reading.tombstoned_at_ms.is_some() {
             continue;
         }
-        let Some(fetched) = reading.entry["fetchedAt"]
-            .as_str()
-            .and_then(parse_rfc3339_ms)
-        else {
+        let Ok(entry) = serde_json::from_value::<AccountEntry>(reading.entry.clone()) else {
             continue;
         };
-        if now < fetched || now - fetched > 15 * 60_000 {
+        // Share accounts::eligibility::assess_reading's last-good age limit so
+        // the head reserve does not drop capacity that account placement can use.
+        // Stale is usable below 30 minutes of producer age with unchanged windows.
+        if entry.has_error()
+            || !entry.understood_stale()
+            || !matches!(entry.age(now).band, AgeBand::Full | AgeBand::Discounted)
+            || (entry.stale.is_none()
+                && entry
+                    .age(now)
+                    .age_ms
+                    .is_none_or(|age| !(0..=15 * 60_000).contains(&age)))
+        {
             continue;
         }
         let Some(provider) = reading.routing_provider() else {
@@ -747,6 +767,82 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn error_only_restart_keeps_last_good_in_real_head_reserve() {
+        use crate::account_quota::apply_usage_reply;
+        let good = |id: &str, fetched| {
+            json!({
+                "provider": "claude", "apiProvider": "anthropic", "account": id,
+                "fetchedAt": crate::account_selection::rfc3339(fetched),
+                "usage": {
+                    "primary": {"usedPercent": 20.0, "windowMinutes": 300, "resetsAt": "2026-10-09T06:00:00Z"},
+                    "secondary": {"usedPercent": 30.0, "windowMinutes": 10080, "resetsAt": "2026-10-09T07:00:00Z"}
+                }
+            })
+        };
+        let mut quota = AccountQuotaState::default();
+        let original = good("a", NOW);
+        let body =
+            json!({"result": [original.clone(), good("b", NOW)], "completeProviders": ["claude"]});
+        apply_usage_reply(&mut quota, &serde_json::to_vec(&body).unwrap(), NOW).unwrap();
+        let paces = flat_paces([("claude", 10.0)]);
+        assert!(
+            build(&quota, &report(), &prices(), &paces, NOW).pools["anthropic"]
+                .available(20.0, false)
+        );
+
+        let later = NOW + 27 * 60_000;
+        let failed = json!({"provider": "claude", "apiProvider": "anthropic", "account": "a",
+            "fetchedAt": crate::account_selection::rfc3339(later),
+            "error": "no reading after restart", "errorClass": "upstream_failed"});
+        let body = json!({"result": [failed, good("b", later)], "completeProviders": ["claude"]});
+        apply_usage_reply(&mut quota, &serde_json::to_vec(&body).unwrap(), later).unwrap();
+        let built = build(&quota, &report(), &prices(), &paces, later);
+        let pool = &built.pools["anthropic"];
+        assert!(
+            pool.available(20.0, false),
+            "last-good capacity must survive the real head reserve: {}",
+            pool.reserve_diagnostic(20.0, false)
+        );
+        assert_eq!(pool.plans[0].accounts.len(), 2);
+        assert_eq!(
+            quota.readings.readings[&("claude".into(), "a".into())].entry["usage"],
+            original["usage"]
+        );
+        assert_eq!(pool.plans[0].accounts[0].weekly_used, 30.0);
+        assert!(
+            pool.price(0.1, None, 20.0, false)
+                .unwrap()
+                .head_reserve_points
+                .unwrap()
+                > 50.0
+        );
+
+        let expired = build(&quota, &report(), &prices(), &paces, NOW + 30 * 60_000);
+        let pool = &expired.pools["anthropic"];
+        assert_eq!(
+            pool.plans[0].accounts.len(),
+            1,
+            "source age expires without another poll"
+        );
+        assert!(!pool.available(20.0, false));
+        assert!(pool.available(20.0, true));
+    }
+
+    #[test]
+    fn expired_short_window_in_last_good_is_unknown_to_head_reserve() {
+        let mut quota = state(30.0, None);
+        let entry = &mut quota.readings.readings.values_mut().next().unwrap().entry;
+        entry["usage"]["primary"] =
+            json!({"usedPercent": 0.0, "windowMinutes": 300, "resetsAt": "2026-10-09T01:01:00Z"});
+        entry["stale"] = json!({"since": "2026-10-09T01:00:30Z", "class": "upstream_failed"});
+        let later = NOW + 2 * 60_000;
+        assert!(account(entry, later).is_none());
+        let built = build(&quota, &report(), &prices(), &HashMap::new(), later);
+        assert!(built.pools["anthropic"].plans.is_empty());
+        assert!(!built.pools["anthropic"].available(20.0, false));
     }
 
     #[test]

@@ -1278,6 +1278,17 @@ fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
         if !freshness.unknown.is_empty() {
             return WarmReason::ReadingStale;
         }
+        if entry.stale.is_some()
+            && windows.iter().any(|window| {
+                window
+                    .resets_at
+                    .as_deref()
+                    .and_then(account_quota::parse_rfc3339_ms)
+                    .is_some_and(|reset| reset <= ctx.now_ms)
+            })
+        {
+            return WarmReason::ReadingStale;
+        }
         // Missing or malformed windows cannot be treated as unused quota.
         if windows.is_empty()
             || reading.required_windows().is_empty()
@@ -2751,6 +2762,61 @@ mod tests {
                 ]
             }
         })
+    }
+
+    #[test]
+    fn last_good_is_admissible_until_thirty_minutes_but_not_after_a_reset() {
+        use prefrontal_routing_core::accounts::eligibility::evaluate_quota;
+        use prefrontal_routing_core::accounts::ExclusionReason;
+        let mut state = AccountQuotaState::default();
+        let mut good = claude_entry(ACCOUNT_A);
+        good["fetchedAt"] = json!("2026-09-29T12:00:00Z");
+        let body = json!({"result": [good], "completeProviders": ["claude"]});
+        apply_provider_reply(
+            &mut state,
+            "claude",
+            &serde_json::to_vec(&body).unwrap(),
+            NOW,
+        )
+        .unwrap();
+        let body = json!({"result": [{"provider": "claude", "apiProvider": "anthropic", "account": ACCOUNT_A,
+            "errorClass": "upstream_failed", "error": "restart"}], "completeProviders": ["claude"]});
+        apply_provider_reply(
+            &mut state,
+            "claude",
+            &serde_json::to_vec(&body).unwrap(),
+            NOW + 27 * 60_000,
+        )
+        .unwrap();
+        let entry = &state.readings.readings.values().next().unwrap().entry;
+        let reading = quota_reading_for_model(entry, None).unwrap();
+        let evaluate = |reading: &QuotaReading, now| {
+            evaluate_quota(
+                Some(reading),
+                ModelFamily::Opus,
+                CallerKind::Plugin,
+                now,
+                &AllocatorPolicy::default(),
+            )
+        };
+        let kept = evaluate(&reading, NOW + 27 * 60_000);
+        assert!(kept.eligible(), "{:?}", kept.unknown);
+        assert_eq!(reading.five_hour.as_ref().unwrap().used_percent, 10.0);
+        let expired = evaluate(&reading, NOW + 30 * 60_000);
+        assert!(expired
+            .unknown
+            .iter()
+            .any(|reason| matches!(reason, ExclusionReason::AgeExcluded { .. })));
+
+        let mut past_reset = entry.clone();
+        past_reset["usage"]["primary"]["resetsAt"] = json!("2026-09-29T12:01:00Z");
+        let reading = quota_reading_for_model(&past_reset, None).unwrap();
+        let expired_window = evaluate(&reading, NOW + 2 * 60_000);
+        assert!(!expired_window.eligible());
+        assert!(expired_window
+            .unknown
+            .iter()
+            .any(|reason| matches!(reason, ExclusionReason::WindowResetElapsed { .. })));
     }
 
     fn listing() -> ScopedCredentialListing {

@@ -244,7 +244,14 @@ pub fn assess_reading(
             });
         }
     }
-    match age_band(reading.observed_at_ms, now, policy) {
+    // Both head reserve and worker admission may use last-good for less than
+    // 30 minutes from fetchedAt, never from stale.since or local receipt time.
+    // Stale is a disclosure, not unknown quota; unrecognized classes still fail closed.
+    let mut freshness_policy = policy.clone();
+    if reading.stale.is_some() {
+        freshness_policy.excluded_band_ms = crate::quota::LAST_GOOD_MAX_AGE_MS;
+    }
+    match age_band(reading.observed_at_ms, now, &freshness_policy) {
         Ok((band, factor, age_ms)) => {
             eval.age_band = Some(band);
             if band == AgeBand::Excluded {
@@ -299,10 +306,30 @@ pub fn evaluate_quota(
                     window: window.into(),
                 })
             }
+            Some(w)
+                if reading.stale.is_some()
+                    && matches!(w.resets_at, ResetTime::At(reset) if reset <= now) =>
+            {
+                eval.unknown.push(ExclusionReason::WindowResetElapsed {
+                    window: window.into(),
+                });
+            }
             Some(_) => {}
         }
     }
     let scope = scope_check(family, &reading.scoped, policy);
+    let scope_reset_elapsed = match &reading.scoped {
+        ScopedList::Missing => false,
+        ScopedList::Listed(windows) => windows.iter().any(|window| {
+            policy.family_for_scope(window) == Some(family)
+                && matches!(window.resets_at, ResetTime::At(reset) if reset <= now)
+        }),
+    };
+    if reading.stale.is_some() && scope_reset_elapsed {
+        eval.unknown.push(ExclusionReason::WindowResetElapsed {
+            window: ApplicableWindow::FamilyScope,
+        });
+    }
     eval.scoped_list = Some(scope.list_state);
     if !scope.unmapped_scope_ids.is_empty() {
         eval.unknown.push(ExclusionReason::ScopeUnmapped {

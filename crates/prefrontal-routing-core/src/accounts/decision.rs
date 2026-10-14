@@ -106,6 +106,10 @@ pub enum ExclusionReason {
     InvalidPercent {
         window: ApplicableWindow,
     },
+    /// The old period ended; its usage says nothing about the current period.
+    WindowResetElapsed {
+        window: ApplicableWindow,
+    },
     /// The family's known scope id is absent and an unmapped scoped window is
     /// present, so the family's scope is unknown.
     ScopeUnmapped {
@@ -144,6 +148,7 @@ impl ExclusionReason {
             | AgeExcluded { .. }
             | GeneralWindowMissing { .. }
             | InvalidPercent { .. }
+            | WindowResetElapsed { .. }
             | ScopeUnmapped { .. } => ExclusionTier::QuotaUnknown,
             ScopeExhausted { .. } | BelowReserve { .. } | BelowBrocaFloor { .. } => {
                 ExclusionTier::Reserve

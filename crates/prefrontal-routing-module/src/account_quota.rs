@@ -15,9 +15,9 @@
 //!   omits keeps its reading and keeps aging on its producer date. Only a reply
 //!   that lists the provider in `completeProviders` may tombstone an absent
 //!   account, and a tombstone keeps the row.
-//! * Entries are taken whole. One account's windows are never mixed with another
-//!   account's, and a duplicate lane for the same account is resolved to one
-//!   entry deterministically.
+//! * Entries are taken whole. A windowless error may retain the same account's
+//!   last-good entry for less than 30 minutes from fetchedAt, disclosed as stale.
+//!   Accounts' windows are never mixed, and duplicate lanes resolve deterministically.
 //! * Accounts join the vault by account id, never by email or provider aliases.
 //! * General windows come from the reading, never from a provider table; a
 //!   scoped window is identified by producer id plus `windowMinutes`, never by
@@ -32,7 +32,7 @@ use std::time::Duration;
 use prefrontal_ckcred_client::{
     CredentialErrorClass, CredentialResolver, CredentialResolverError, ScopedCredentialListing,
 };
-use prefrontal_routing_core::quota::{RateWindow, StaleDisclosure, Usage};
+use prefrontal_routing_core::quota::{RateWindow, StaleDisclosure, Usage, LAST_GOOD_MAX_AGE_MS};
 use prefrontal_routing_store::{
     PersistedAccountReading, PersistedProviderCompleteness, PersistedVaultRoster,
     SqliteRouteStateStore,
@@ -316,6 +316,10 @@ pub struct AgeAssessment {
 /// Age band of a reading whose producer date is `fetched_at_ms`, measured on
 /// routing's clock at `now_ms`. Poll or receipt time is never used as the age.
 pub fn age_band(fetched_at_ms: Option<i64>, now_ms: i64) -> AgeAssessment {
+    age_band_with_bound(fetched_at_ms, now_ms, EXCLUDED_BAND_MS)
+}
+
+fn age_band_with_bound(fetched_at_ms: Option<i64>, now_ms: i64, excluded_ms: i64) -> AgeAssessment {
     let Some(fetched_at_ms) = fetched_at_ms else {
         return AgeAssessment {
             band: AgeBand::Missing,
@@ -328,8 +332,8 @@ pub fn age_band(fetched_at_ms: Option<i64>, now_ms: i64) -> AgeAssessment {
         (AgeBand::ClockInvalid, 0.0)
     } else if age_ms < FULL_BAND_MS {
         (AgeBand::Full, 1.0)
-    } else if age_ms < EXCLUDED_BAND_MS {
-        let progress = (age_ms - FULL_BAND_MS) as f64 / (EXCLUDED_BAND_MS - FULL_BAND_MS) as f64;
+    } else if age_ms < excluded_ms {
+        let progress = (age_ms - FULL_BAND_MS) as f64 / (excluded_ms - FULL_BAND_MS) as f64;
         (AgeBand::Discounted, 1.0 - (1.0 - DISCOUNT_FLOOR) * progress)
     } else {
         (AgeBand::Excluded, 0.0)
@@ -341,6 +345,82 @@ pub fn age_band(fetched_at_ms: Option<i64>, now_ms: i64) -> AgeAssessment {
     }
 }
 
+impl AccountEntry {
+    fn has_usable_windows(&self) -> bool {
+        self.usage.as_ref().is_some_and(|usage| {
+            [
+                usage.primary.as_ref(),
+                usage.secondary.as_ref(),
+                usage.tertiary.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(
+                usage
+                    .extra_rate_windows
+                    .iter()
+                    .flatten()
+                    .filter_map(|extra| extra.window.as_ref()),
+            )
+            .any(|window| {
+                window.used_percent.is_finite()
+                    && (0.0..=100.0).contains(&window.used_percent)
+                    && window.window_minutes.is_some_and(|minutes| minutes > 0)
+            })
+        })
+    }
+
+    pub(super) fn age(&self, now_ms: i64) -> AgeAssessment {
+        age_band_with_bound(
+            self.fetched_at.as_deref().and_then(parse_rfc3339_ms),
+            now_ms,
+            if self.stale.is_some() {
+                LAST_GOOD_MAX_AGE_MS
+            } else {
+                EXCLUDED_BAND_MS
+            },
+        )
+    }
+
+    pub(super) fn has_error(&self) -> bool {
+        self.error.is_some() || self.error_class.is_some()
+    }
+
+    pub(super) fn understood_stale(&self) -> bool {
+        self.stale
+            .as_ref()
+            .and_then(|stale| stale.class.as_deref())
+            .is_none_or(|class| class == UNDERSTOOD_STALE_CLASS)
+    }
+}
+
+fn keep_last_good(previous: &StoredReading, incoming: &AccountEntry, now_ms: i64) -> Option<Value> {
+    let old: AccountEntry = serde_json::from_value(previous.entry.clone()).ok()?;
+    let fetched = old.fetched_at.as_deref().and_then(parse_rfc3339_ms)?;
+    if previous.tombstoned_at_ms.is_some()
+        || old.has_error()
+        || !old.understood_stale()
+        || !old.has_usable_windows()
+        || !(0..LAST_GOOD_MAX_AGE_MS).contains(&now_ms.saturating_sub(fetched))
+        || !incoming.has_error()
+        || incoming.has_usable_windows()
+    {
+        return None;
+    }
+    let mut kept = previous.entry.clone();
+    // Keep the producer date and every window verbatim. `since` is the first
+    // failure, not a second age source; Insula may already be serving last-good.
+    // The new error class belongs to the stale disclosure, not to the good entry.
+    kept["stale"] = serde_json::json!({
+        "since": old.stale.as_ref().and_then(|stale| stale.since.clone())
+            .or_else(|| incoming.stale.as_ref().and_then(|stale| stale.since.clone()))
+            .unwrap_or_else(|| crate::account_selection::rfc3339(now_ms)),
+        "class": incoming.error_class.as_ref()
+            .or_else(|| incoming.stale.as_ref().and_then(|stale| stale.class.as_ref())),
+    });
+    Some(kept)
+}
+
 // ---------------------------------------------------------------------------
 // Readings and merge
 // ---------------------------------------------------------------------------
@@ -350,7 +430,7 @@ pub fn age_band(fetched_at_ms: Option<i64>, now_ms: i64) -> AgeAssessment {
 pub struct StoredReading {
     pub provider: String,
     pub account_id: String,
-    /// The whole entry exactly as Insula published it.
+    /// The whole Insula entry, with a stale disclosure if routing kept last-good.
     pub entry: Value,
     /// Local clock when routing accepted the entry (Unix ms). Not the age source.
     pub received_at_ms: i64,
@@ -414,7 +494,8 @@ fn lane_order_key(
 }
 
 /// Merge one provider's poll into `readings`. Accounts in the reply replace
-/// their stored entry whole. Accounts the reply omits keep their reading; only
+/// their stored entry whole, except an error without windows may keep last-good
+/// for less than 30 minutes from its producer date. Omitted accounts keep their reading; only
 /// when Insula lists the provider in `completeProviders` are they tombstoned,
 /// and even then the row and its source date are kept.
 pub fn merge_provider_poll(
@@ -454,14 +535,19 @@ pub fn merge_provider_poll(
             "{provider} account {account}: kept the {source} lane"
         ));
     }
-    for (account, (_, raw)) in &chosen {
+    for (account, (entry, raw)) in &chosen {
         let key = (provider.to_string(), account.clone());
+        let entry = readings
+            .readings
+            .get(&key)
+            .and_then(|previous| keep_last_good(previous, entry, received_at_ms))
+            .unwrap_or_else(|| (*raw).clone());
         readings.readings.insert(
             key.clone(),
             StoredReading {
                 provider: provider.to_string(),
                 account_id: account.clone(),
-                entry: (*raw).clone(),
+                entry,
                 received_at_ms,
                 tombstoned_at_ms: None,
             },
@@ -1084,7 +1170,9 @@ fn account_view(
         ));
     }
     let fetched_at = reading.fetched_at().map(str::to_owned);
-    let age = age_band(fetched_at.as_deref().and_then(parse_rfc3339_ms), now_ms);
+    let age = entry
+        .as_ref()
+        .map_or_else(|| age_band(None, now_ms), |entry| entry.age(now_ms));
 
     let routing_provider = reading.routing_provider();
     let identity = roster
@@ -1154,7 +1242,7 @@ fn account_view(
             reasons.push("fetchedAt is more than 60 s ahead of routing's clock".into())
         }
         AgeBand::Excluded => reasons.push(format!(
-            "reading is {} min old (20 min or more)",
+            "reading is {} min old (source age limit reached)",
             age.age_ms.unwrap_or_default() / 60_000
         )),
     }
@@ -1162,6 +1250,15 @@ fn account_view(
         reasons.push("no reported general windows".into());
     }
     for window in &general {
+        if entry.as_ref().is_some_and(|entry| entry.stale.is_some())
+            && window
+                .resets_at
+                .as_deref()
+                .and_then(parse_rfc3339_ms)
+                .is_some_and(|reset| reset <= now_ms)
+        {
+            reasons.push("reported general window reset has elapsed; usage is unknown".into());
+        }
         if !window.used_percent.is_finite()
             || !(0.0..=100.0).contains(&window.used_percent)
             || !window.window_minutes.is_some_and(|minutes| minutes > 0)
@@ -1177,12 +1274,29 @@ fn account_view(
         _ => {}
     }
     let cold_input_usable = reasons.is_empty();
-    let family_scopes = family_scope_views(
+    let mut family_scopes = family_scope_views(
         &reading.provider,
         scoped_listing,
         &scoped_windows,
         cold_input_usable,
     );
+    if entry.as_ref().is_some_and(|entry| entry.stale.is_some()) {
+        for scope in &mut family_scopes {
+            if scoped_windows.iter().any(|window| {
+                window.family == Some(scope.family)
+                    && window
+                        .resets_at
+                        .as_deref()
+                        .and_then(parse_rfc3339_ms)
+                        .is_some_and(|reset| reset <= now_ms)
+            }) {
+                scope.cold_input_usable = false;
+                scope
+                    .reasons
+                    .push("reported scoped window reset has elapsed; usage is unknown".into());
+            }
+        }
+    }
     let overage_pool = entry.as_ref().and_then(|entry| {
         entry
             .spend
@@ -1801,6 +1915,178 @@ mod tests {
             .unwrap_or_else(|| panic!("no view for {account}"))
     }
 
+    fn error_only(account: &str) -> Value {
+        json!({
+            "provider": "claude", "apiProvider": "anthropic", "account": account,
+            "error": "fetch failed after restart", "errorClass": "upstream_failed",
+        })
+    }
+
+    fn report_for_a(state: &AccountQuotaState, now: i64) -> AccountQuotaReport {
+        let roster = build_roster(
+            &listing(
+                &[("oauth:anthropic", "a", "e")],
+                &[("anthropic-native", "list")],
+            ),
+            None,
+            now,
+        );
+        build_report(
+            &state.readings,
+            Some(&roster),
+            &RosterPoll::Listed { at_ms: now },
+            now,
+        )
+    }
+
+    #[test]
+    fn error_only_poll_keeps_last_good_until_thirty_minutes_from_fetched_at() {
+        let mut state = AccountQuotaState::default();
+        let good = claude_entry("a", "2026-09-29T12:00:00Z");
+        poll(&mut state, vec![good.clone()], &["claude"], NOON_MS);
+        let first_failure = NOON_MS + 27 * 60_000;
+        poll(
+            &mut state,
+            vec![error_only("a")],
+            &["claude"],
+            first_failure,
+        );
+        let report = report_for_a(&state, first_failure);
+        let kept = view(&report, "a");
+        assert!(kept.cold_input_usable, "{:?}", kept.reasons);
+        assert_eq!(kept.age.age_ms, Some(27 * 60_000));
+        assert_eq!(
+            kept.stale.as_ref().unwrap().class.as_deref(),
+            Some("upstream_failed")
+        );
+        let entry = &state.readings.readings.values().next().unwrap().entry;
+        assert_eq!(entry["usage"], good["usage"]);
+        assert_eq!(entry["fetchedAt"], good["fetchedAt"]);
+
+        poll(
+            &mut state,
+            vec![error_only("a")],
+            &["claude"],
+            NOON_MS + LAST_GOOD_MAX_AGE_MS - 1,
+        );
+        let kept = report_for_a(&state, NOON_MS + LAST_GOOD_MAX_AGE_MS - 1);
+        assert!(view(&kept, "a").cold_input_usable);
+        assert_eq!(
+            view(&kept, "a").stale.as_ref().unwrap().since.as_deref(),
+            Some("2026-09-29T12:27:00Z")
+        );
+        // A retained last-good reading must stop admitting cold work at its
+        // source-age limit, even if no further poll arrives.
+        assert!(
+            !view(&report_for_a(&state, NOON_MS + LAST_GOOD_MAX_AGE_MS), "a").cold_input_usable
+        );
+        poll(
+            &mut state,
+            vec![error_only("a")],
+            &["claude"],
+            NOON_MS + LAST_GOOD_MAX_AGE_MS,
+        );
+        let expired = report_for_a(&state, NOON_MS + LAST_GOOD_MAX_AGE_MS);
+        assert!(!view(&expired, "a").cold_input_usable);
+        assert!(view(&expired, "a").general_windows.is_empty());
+    }
+
+    #[test]
+    fn error_only_poll_without_prior_good_reading_is_unknown() {
+        let mut state = AccountQuotaState::default();
+        poll(&mut state, vec![error_only("a")], &["claude"], NOON_MS);
+        let report = report_for_a(&state, NOON_MS);
+        let account = view(&report, "a");
+        assert!(!account.cold_input_usable);
+        assert!(account.general_windows.is_empty());
+        assert_eq!(account.error_class.as_deref(), Some("upstream_failed"));
+    }
+
+    #[test]
+    fn last_good_with_a_past_reset_is_unknown_not_free() {
+        let mut state = AccountQuotaState::default();
+        let mut good = claude_entry("a", "2026-09-29T12:00:00Z");
+        good["usage"]["primary"]["resetsAt"] = json!("2026-09-29T12:01:00Z");
+        poll(&mut state, vec![good], &["claude"], NOON_MS);
+        poll(
+            &mut state,
+            vec![error_only("a")],
+            &["claude"],
+            NOON_MS + 2 * 60_000,
+        );
+        let report = report_for_a(&state, NOON_MS + 2 * 60_000);
+        let account = view(&report, "a");
+        assert_eq!(account.five_hour.as_ref().unwrap().used_percent, 10.0);
+        assert!(!account.cold_input_usable);
+        assert!(account
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("reset has elapsed")));
+    }
+
+    #[test]
+    fn insula_staleness_is_not_added_to_source_age_or_restarted_by_routing() {
+        let mut state = AccountQuotaState::default();
+        let mut good = claude_entry("a", "2026-09-29T11:33:00Z");
+        good["stale"] = json!({"since": "2026-09-29T11:40:00Z", "class": "upstream_failed"});
+        poll(&mut state, vec![good], &["claude"], NOON_MS);
+        poll(&mut state, vec![error_only("a")], &["claude"], NOON_MS);
+        let report = report_for_a(&state, NOON_MS);
+        let account = view(&report, "a");
+        assert!(account.cold_input_usable, "{:?}", account.reasons);
+        assert_eq!(account.age.age_ms, Some(27 * 60_000));
+        assert_eq!(
+            account.stale.as_ref().unwrap().since.as_deref(),
+            Some("2026-09-29T11:40:00Z")
+        );
+        assert!(!view(&report_for_a(&state, NOON_MS + 3 * 60_000), "a").cold_input_usable);
+    }
+
+    #[test]
+    fn retained_windows_and_stale_disclosure_survive_store_restart() {
+        let dir = prefrontal_test_support::scratch_root().join(format!(
+            "prefrontal-routing-last-good-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db").to_string_lossy().into_owned();
+        let open = || {
+            SqliteRouteStateStore::open(&prefrontal_routing_store::dev_descriptor(
+                "prefrontal-routing",
+                path.clone(),
+            ))
+            .unwrap()
+        };
+        let mut state = AccountQuotaState::default();
+        let store = open();
+        let (rows, completeness) = apply_provider_reply(
+            &mut state,
+            "claude",
+            &reply(vec![claude_entry("a", "2026-09-29T12:00:00Z")], &["claude"]),
+            NOON_MS,
+        )
+        .unwrap();
+        store.put_account_quota_poll(&rows, &completeness).unwrap();
+        drop(store);
+        let store = open();
+        let mut restored = restore_account_state(&store);
+        let (rows, completeness) = apply_provider_reply(
+            &mut restored,
+            "claude",
+            &reply(vec![error_only("a")], &["claude"]),
+            NOON_MS + 27 * 60_000,
+        )
+        .unwrap();
+        store.put_account_quota_poll(&rows, &completeness).unwrap();
+        drop(store);
+        let store = open();
+        let again = restore_account_state(&store);
+        assert_eq!(again.readings, restored.readings);
+        assert!(view(&report_for_a(&again, NOON_MS + 29 * 60_000), "a").cold_input_usable);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn live_insula_reply_decodes_whole_envelope_with_every_account_field() {
         assert_eq!(
@@ -2163,7 +2449,7 @@ mod tests {
         assert!(excluded
             .reasons
             .iter()
-            .any(|reason| reason.contains("20 min or more")));
+            .any(|reason| reason.contains("source age limit reached")));
     }
 
     #[test]
