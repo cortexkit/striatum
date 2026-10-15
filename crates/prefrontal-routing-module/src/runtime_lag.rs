@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
 const TICK: Duration = Duration::from_millis(250);
 const LAG_THRESHOLD_MS: u64 = 500;
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -18,6 +21,8 @@ pub(crate) struct RuntimeLagProbe {
 #[derive(Default)]
 struct ProbeState {
     started: AtomicBool,
+    #[cfg(test)]
+    latest_lag_ms: AtomicU64,
 }
 
 impl RuntimeLagProbe {
@@ -33,6 +38,7 @@ impl RuntimeLagProbe {
         if self.inner.started.swap(true, Ordering::Relaxed) {
             return;
         }
+        let probe = self.clone();
         let report = Arc::new(report);
         let first_tick = Instant::now() + TICK;
         tokio::spawn(async move {
@@ -48,12 +54,24 @@ impl RuntimeLagProbe {
                     .saturating_duration_since(expected)
                     .as_millis()
                     .min(u64::MAX as u128) as u64;
-                expected += TICK;
+                // Start the next deadline from this wake-up so one stall does not persist.
+                expected = now + TICK;
+                probe.record(now, lag_ms);
                 if let Some(suppressed) = limiter.report(now, lag_ms) {
                     report(lag_line(runtime_name, lag_ms, suppressed));
                 }
             }
         });
+    }
+
+    #[cfg(test)]
+    fn latest_lag_ms(&self) -> u64 {
+        self.inner.latest_lag_ms.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, _now: Instant, _lag_ms: u64) {
+        #[cfg(test)]
+        self.inner.latest_lag_ms.store(_lag_ms, Ordering::Relaxed);
     }
 }
 
@@ -98,7 +116,7 @@ mod tests {
     use std::{sync::mpsc, thread};
 
     #[test]
-    fn synchronous_block_on_routing_worker_is_reported() {
+    fn routing_stall_logs_then_recovers_after_the_worker_becomes_idle() {
         let (tx, rx) = mpsc::channel();
         let probe = RuntimeLagProbe::default();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -112,11 +130,26 @@ mod tests {
             });
             tokio::time::sleep(Duration::from_millis(40)).await;
             // Blocking the only worker demonstrates the timer's scheduling delay.
-            tokio::spawn(async {
+            let blocker = tokio::spawn(async {
                 thread::sleep(Duration::from_millis(850));
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while probe.latest_lag_ms() <= LAG_THRESHOLD_MS {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             })
             .await
-            .unwrap();
+            .expect("the probe should observe the blocked routing worker");
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while probe.latest_lag_ms() > LAG_THRESHOLD_MS {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("lag should return under threshold after the routing worker becomes idle");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(probe.latest_lag_ms() <= LAG_THRESHOLD_MS);
         });
         let line = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(line.contains("scheduling lag"), "{line}");
@@ -127,6 +160,10 @@ mod tests {
             .and_then(|(lag, _)| lag.parse::<u64>().ok())
             .unwrap();
         assert!(lag_ms > LAG_THRESHOLD_MS, "{line}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a second lag line followed the idle period"
+        );
     }
 
     #[test]
