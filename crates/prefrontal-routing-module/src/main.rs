@@ -25,6 +25,7 @@ mod key_pool;
 mod model_resolution;
 mod quota_consumer;
 mod retention;
+mod runtime_lag;
 mod subscription_economics;
 mod winner_ladder;
 mod work_model_pin;
@@ -36,7 +37,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Once, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
@@ -704,6 +705,7 @@ impl ModuleConfig {
 }
 
 async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
+    runtime_lag::RuntimeLagProbe::default().start("routing runtime");
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
@@ -2656,6 +2658,150 @@ fn prepare_selection_inputs(
     })
 }
 
+struct RouteSelectTiming {
+    started: Instant,
+    is_select: std::cell::Cell<bool>,
+    live_config_check_ms: std::cell::Cell<u64>,
+    prepare_wait_ms: std::cell::Cell<u64>,
+    snapshot_closure_ms: std::cell::Cell<u64>,
+    selection_ms: std::cell::Cell<u64>,
+    reply_ms: std::cell::Cell<u64>,
+}
+
+impl RouteSelectTiming {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            is_select: std::cell::Cell::new(false),
+            live_config_check_ms: std::cell::Cell::new(0),
+            prepare_wait_ms: std::cell::Cell::new(0),
+            snapshot_closure_ms: std::cell::Cell::new(0),
+            selection_ms: std::cell::Cell::new(0),
+            reply_ms: std::cell::Cell::new(0),
+        }
+    }
+
+    fn add_live_config_check(&self, elapsed: Duration) {
+        self.live_config_check_ms.set(
+            self.live_config_check_ms
+                .get()
+                .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
+        );
+    }
+
+    fn record_prepare(&self, wait: Duration, snapshot: Duration) {
+        self.prepare_wait_ms
+            .set(wait.as_millis().min(u64::MAX as u128) as u64);
+        self.add_snapshot_closure(snapshot);
+    }
+
+    fn add_snapshot_closure(&self, elapsed: Duration) {
+        self.snapshot_closure_ms.set(
+            self.snapshot_closure_ms
+                .get()
+                .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
+        );
+    }
+
+    fn record_selection(&self, elapsed: Duration) {
+        self.selection_ms
+            .set(elapsed.as_millis().min(u64::MAX as u128) as u64);
+    }
+
+    fn record_reply(&self, elapsed: Duration) {
+        self.reply_ms
+            .set(elapsed.as_millis().min(u64::MAX as u128) as u64);
+    }
+
+    fn line_at(&self, now: Instant) -> Option<String> {
+        let total_ms = now
+            .saturating_duration_since(self.started)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        if !self.is_select.get() || total_ms <= 1_000 {
+            return None;
+        }
+        let live_config_check_ms = self.live_config_check_ms.get();
+        let prepare_wait_ms = self.prepare_wait_ms.get();
+        let snapshot_closure_ms = self.snapshot_closure_ms.get();
+        let selection_ms = self.selection_ms.get();
+        let reply_ms = self.reply_ms.get();
+        let unclassified_ms = total_ms.saturating_sub(
+            live_config_check_ms
+                .saturating_add(prepare_wait_ms)
+                .saturating_add(snapshot_closure_ms)
+                .saturating_add(selection_ms)
+                .saturating_add(reply_ms),
+        );
+        Some(format!(
+            "[routing] slow route.select total_ms={total_ms} wait_prepare_ms={prepare_wait_ms} live_config_check_ms={live_config_check_ms} snapshot_closure_ms={snapshot_closure_ms} selection_ms={selection_ms} reply_ms={reply_ms} unclassified_ms={unclassified_ms}"
+        ))
+    }
+}
+
+#[derive(Default)]
+struct RouteSelectLogLimiter {
+    last_report: Option<Instant>,
+    suppressed: u64,
+}
+
+fn rate_limit_route_select_line(
+    line: String,
+    now: Instant,
+    limiter: &mut RouteSelectLogLimiter,
+) -> Option<String> {
+    const WINDOW: Duration = Duration::from_secs(10);
+    if limiter
+        .last_report
+        .is_some_and(|last| now.saturating_duration_since(last) < WINDOW)
+    {
+        limiter.suppressed = limiter.suppressed.saturating_add(1);
+        return None;
+    }
+    limiter.last_report = Some(now);
+    let suppressed = std::mem::take(&mut limiter.suppressed);
+    Some(if suppressed == 0 {
+        line
+    } else {
+        format!("{line} (suppressed {suppressed} similar lines)")
+    })
+}
+
+fn emit_route_select_line(line: String) {
+    static LIMITER: OnceLock<Mutex<RouteSelectLogLimiter>> = OnceLock::new();
+    let now = Instant::now();
+    let Some(mut limiter) = LIMITER.get_or_init(Default::default).lock().ok() else {
+        return;
+    };
+    if let Some(line) = rate_limit_route_select_line(line, now, &mut limiter) {
+        eprintln!("{line}");
+    }
+}
+
+struct RouteSelectTimingGuard(RouteSelectTiming);
+
+impl RouteSelectTimingGuard {
+    fn new() -> Self {
+        Self(RouteSelectTiming::new())
+    }
+}
+
+impl std::ops::Deref for RouteSelectTimingGuard {
+    type Target = RouteSelectTiming;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for RouteSelectTimingGuard {
+    fn drop(&mut self) {
+        if let Some(line) = self.0.line_at(Instant::now()) {
+            emit_route_select_line(line);
+        }
+    }
+}
+
 async fn handle_select_request(
     mut frame: Frame,
     route_epoch: u32,
@@ -2668,12 +2814,15 @@ async fn handle_select_request(
     broca_credentials: &SharedBrocaCredentials,
     opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
+    let timing = RouteSelectTimingGuard::new();
+    let live_config_started = Instant::now();
     let channel = frame.header.channel;
     frame.header.epoch = route_epoch;
     let epoch = route_epoch;
     let corr = frame.header.corr;
     let ver = frame.header.ver;
     let live_config = config_overrides::live_config(routing_config_path);
+    let live_config_elapsed = live_config_started.elapsed();
 
     // Decode the method first: an unknown method must report `unknown_method` even
     // when params are absent/malformed (the params are method-specific).
@@ -2692,6 +2841,9 @@ async fn handle_select_request(
             .await;
         }
     };
+
+    timing.is_select.set(envelope.method == ROUTE_SELECT_OP);
+    timing.add_live_config_check(live_config_elapsed);
 
     if !handles(&envelope.method) {
         return send_route_error(
@@ -2907,11 +3059,14 @@ async fn handle_select_request(
         params.routing_policy.is_some() || !params.subscription_keys.is_empty(),
     );
     // The operator fence is read HERE, on the module side, for every selection.
+    let live_config_started = Instant::now();
     let operator_policy = if operator_config_path == routing_config_path {
         live_config.operator_policy()
     } else {
         config_overrides::read_operator_routing_policy(operator_config_path)
     };
+    timing.add_live_config_check(live_config_started.elapsed());
+    let snapshot_started = Instant::now();
     let availability = if is_broca_substrate(params.substrate.as_deref()) {
         match store.get_facts() {
             Ok(mut facts) => {
@@ -2945,6 +3100,7 @@ async fn handle_select_request(
     } else {
         SelectAvailability::host(std::mem::take(&mut params.available_models))
     };
+    timing.add_snapshot_closure(snapshot_started.elapsed());
     params.available_models = availability.models.clone();
     let resolved_request =
         match resolve_select_request(&params, &operator_policy, opencode_auth_path) {
@@ -2970,13 +3126,16 @@ async fn handle_select_request(
             }
         };
     let providers_without_prompt_cache = live_config.providers_without_prompt_cache();
+    let (prepared, prepare_wait, snapshot_closure) =
+        live_config.prepare_with_timing(|| prepare_selection_inputs(quota_cache, store));
+    timing.record_prepare(prepare_wait, snapshot_closure);
     let PreparedSelectionInputs {
         now,
         mut facts,
         snapshot,
         quota_signal_json,
         quota_note,
-    } = match live_config.prepare(|| prepare_selection_inputs(quota_cache, store)) {
+    } = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
@@ -3055,6 +3214,7 @@ async fn handle_select_request(
             .await;
         }
         let sub = subscription_keys.clone();
+        let selection_started = Instant::now();
         let selection = work_model_pin::select(
             pin,
             SelectModelRouteInput {
@@ -3078,6 +3238,7 @@ async fn handle_select_request(
             &routing_config,
             concurrency_slots.as_ref(),
         );
+        timing.record_selection(selection_started.elapsed());
         match selection {
             Ok(selected) => {
                 let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
@@ -3160,7 +3321,10 @@ async fn handle_select_request(
                     body,
                 )
                 .map_err(|error| ModuleError::Message(error.to_string()))?;
-                return send(writer, response).await;
+                let reply_started = Instant::now();
+                let reply = send(writer, response).await;
+                timing.record_reply(reply_started.elapsed());
+                return reply;
             }
             Err(refusal) => {
                 return send_route_error(
@@ -3206,6 +3370,7 @@ async fn handle_select_request(
     };
 
     // First attempt against the live snapshot.
+    let selection_started = Instant::now();
     let selection = match attempt(snapshot.clone()) {
         Ok(selected) => Ok(selected),
         Err(no_route) if no_route.reason == RouteFailureReason::QuotaOrCooldownExhausted => {
@@ -3255,6 +3420,7 @@ async fn handle_select_request(
         }
         Err(no_route) => Err(no_route),
     };
+    timing.record_selection(selection_started.elapsed());
 
     // Record the decision, then respond. The decisionID is returned ONLY after
     // record_decision commits (it is a single store txn that either commits or
@@ -3350,7 +3516,10 @@ async fn handle_select_request(
                         body,
                     )
                     .map_err(|e| ModuleError::Message(e.to_string()))?;
-                    send(writer, response).await
+                    let reply_started = Instant::now();
+                    let reply = send(writer, response).await;
+                    timing.record_reply(reply_started.elapsed());
+                    reply
                 }
                 Err(e) => {
                     send_route_error(
@@ -3414,7 +3583,10 @@ async fn handle_select_request(
                 Some(&policy_sources),
             );
             let _ = store.record_decision(&decision);
-            send_no_route(writer, ver, channel, epoch, corr, &no_route).await
+            let reply_started = Instant::now();
+            let reply = send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
+            timing.record_reply(reply_started.elapsed());
+            reply
         }
     }
 }
@@ -12724,5 +12896,65 @@ mod tests {
             .get_fact_by_route_key("openai/gpt-5.5-fast")
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod slow_route_select_timing_tests {
+    use super::*;
+
+    #[test]
+    fn injected_snapshot_delay_is_emitted_in_the_slow_select_breakdown() {
+        let timing = RouteSelectTiming::new();
+        timing.is_select.set(true);
+        let config = config_overrides::LiveConfig::default();
+        let (_, wait, snapshot) = config.prepare_with_timing(|| {
+            std::thread::sleep(Duration::from_millis(1_050));
+        });
+        timing.record_prepare(wait, snapshot);
+
+        let now = Instant::now();
+        let line = timing
+            .line_at(now)
+            .expect("the injected delay exceeds one second");
+        let emitted =
+            rate_limit_route_select_line(line, now, &mut RouteSelectLogLimiter::default())
+                .expect("the first slow select is emitted");
+        assert!(emitted.contains("slow route.select total_ms="), "{emitted}");
+        assert!(emitted.contains("wait_prepare_ms="), "{emitted}");
+        assert!(emitted.contains("live_config_check_ms="), "{emitted}");
+        assert!(
+            emitted.contains(&format!("snapshot_closure_ms={}", snapshot.as_millis())),
+            "{emitted}"
+        );
+        assert!(snapshot.as_millis() >= 1_000);
+        assert!(emitted.contains("selection_ms="), "{emitted}");
+        assert!(emitted.contains("reply_ms="), "{emitted}");
+    }
+
+    #[test]
+    fn slow_select_log_rate_limit_counts_suppressed_requests() {
+        let start = Instant::now();
+        let mut limiter = RouteSelectLogLimiter::default();
+        assert_eq!(
+            rate_limit_route_select_line("first".into(), start, &mut limiter),
+            Some("first".into())
+        );
+        assert_eq!(
+            rate_limit_route_select_line(
+                "suppressed".into(),
+                start + Duration::from_secs(1),
+                &mut limiter,
+            ),
+            None
+        );
+        assert_eq!(
+            rate_limit_route_select_line(
+                "next".into(),
+                start + Duration::from_secs(10),
+                &mut limiter,
+            ),
+            Some("next (suppressed 1 similar lines)".into())
+        );
     }
 }

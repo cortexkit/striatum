@@ -312,8 +312,17 @@ impl LiveConfig {
     /// cannot change settings halfway through. Release the lock before scoring
     /// or awaiting; the returned snapshots are independent copies.
     pub fn prepare<T>(&self, read_snapshot: impl FnOnce() -> T) -> T {
+        self.prepare_with_timing(read_snapshot).0
+    }
+
+    pub fn prepare_with_timing<T>(
+        &self,
+        read_snapshot: impl FnOnce() -> T,
+    ) -> (T, Duration, Duration) {
         static PREPARE: Mutex<()> = Mutex::new(());
+        let waiting = Instant::now();
         let _guard = PREPARE.lock().unwrap();
+        let wait = waiting.elapsed();
         let mut speeds = HashMap::new();
         let mut subsidies = self.config.model_routing.subscription_multipliers.clone();
         for (key, model) in &self.config.model_routing.models {
@@ -329,7 +338,9 @@ impl LiveConfig {
         prefrontal_routing_core::model_facts::set_keep_free_percent(
             self.config.model_routing.keep_free_percent.clone(),
         );
-        read_snapshot()
+        let snapshot_started = Instant::now();
+        let snapshot = read_snapshot();
+        (snapshot, wait, snapshot_started.elapsed())
     }
 
     pub fn apply(&self, facts: &mut Vec<ModelFact>) -> SelectionOverrideOutcome {
