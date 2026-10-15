@@ -13,6 +13,8 @@
 //! Wire decoding is isolated here and pinned to the producer-real fixture copied
 //! from `fusiform/crates/fusiform-module/fixtures/served-payloads.json` at Fusiform
 //! commit `7d604d1`; no other module should depend on these private wire structs.
+//! `catalog-paged.json` pins the paged request and response from the same producer
+//! fixture at Fusiform `245826d`.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,6 +37,7 @@ use crate::winner_ladder::{self, LadderSources};
 const FUSIFORM_MODULE_ID: &str = "fusiform";
 const CATALOG_GET: &str = "catalog.get";
 const CATALOG_STATUS: &str = "catalog.status";
+const MAX_CATALOG_RESTARTS: usize = 3;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(3);
@@ -43,6 +46,7 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 pub enum FusiformCatalogError {
     Message(String),
     Json(serde_json::Error),
+    Refused { code: String, message: String },
 }
 
 impl fmt::Display for FusiformCatalogError {
@@ -50,6 +54,7 @@ impl fmt::Display for FusiformCatalogError {
         match self {
             Self::Message(message) => formatter.write_str(message),
             Self::Json(error) => write!(formatter, "{error}"),
+            Self::Refused { code, message } => write!(formatter, "{code}: {message}"),
         }
     }
 }
@@ -68,7 +73,14 @@ struct CatalogGetArguments {
     /// upstream withdrew it: the whole kimi-for-coding provider went absent on
     /// 2026-09-18 and its scored seat kept being rostered while Broca refused
     /// every open. Retired models are requested so their absence is written.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     include_retired: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    paged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,6 +99,7 @@ impl CatalogGetRequest {
             name: CATALOG_GET,
             arguments: CatalogGetArguments {
                 include_retired: true,
+                paged: true,
                 ..Default::default()
             },
         }
@@ -111,6 +124,47 @@ struct CatalogGetReply {
     resolved_at_ms: i64,
     #[serde(default)]
     curated: Vec<CatalogCuratedModel>,
+}
+
+/// Keep disclosures with their model pages until the entire read is assembled.
+/// Only then can decoding and catalog application publish a coherent snapshot.
+#[derive(Debug, Deserialize, Serialize)]
+struct CatalogPage {
+    source: String,
+    catalog_version: i64,
+    resolved_at_ms: i64,
+    models: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_page_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    withheld: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    uncertain: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    curated: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliased: Vec<Value>,
+}
+
+impl CatalogPage {
+    fn append(&mut self, mut page: Self) -> Result<(), FusiformCatalogError> {
+        if self.source != page.source
+            || self.catalog_version != page.catalog_version
+            || self.resolved_at_ms != page.resolved_at_ms
+        {
+            return Err(error("Fusiform catalog page identity changed during read"));
+        }
+        if page.models.keys().any(|key| self.models.contains_key(key)) {
+            return Err(error("Fusiform catalog pages repeated a model"));
+        }
+        self.models.append(&mut page.models);
+        self.withheld.append(&mut page.withheld);
+        self.uncertain.append(&mut page.uncertain);
+        self.curated.append(&mut page.curated);
+        self.aliased.append(&mut page.aliased);
+        self.next_page_token = page.next_page_token;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -727,6 +781,19 @@ impl FusiformCatalogConsumer {
 
     async fn call(&mut self, body: Vec<u8>) -> Result<Vec<u8>, FusiformCatalogError> {
         let reply = self.call_frame(body).await?;
+        if let Ok(value) = unwrap_tool_result(&reply.body) {
+            let refusal = value
+                .get("error")
+                .or_else(|| (reply.header.ty == FrameType::Error).then_some(&value));
+            if let Some(refusal) = refusal {
+                if let Some(code) = refusal["code"].as_str() {
+                    return Err(FusiformCatalogError::Refused {
+                        code: code.to_string(),
+                        message: refusal["message"].as_str().unwrap_or_default().to_string(),
+                    });
+                }
+            }
+        }
         if reply.header.ty == FrameType::Error {
             return Err(error(String::from_utf8_lossy(&reply.body).to_string()));
         }
@@ -828,6 +895,7 @@ impl CatalogWire for FusiformCatalogConsumer {
                     include_retired: true,
                     provider_id: Some(provider_id.clone()),
                     auth_method: Some(auth_method.clone()),
+                    ..Default::default()
                 },
             })
             .map_err(FusiformCatalogError::Json)?;
@@ -851,10 +919,50 @@ impl CatalogWire for FusiformCatalogConsumer {
     }
 
     async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError> {
-        let body = serde_json::to_vec(&CatalogGetRequest::all_with_retired())
-            .map_err(FusiformCatalogError::Json)?;
-        let reply = self.call(body).await?;
-        decode_catalog_get(&reply)
+        for restart in 0..=MAX_CATALOG_RESTARTS {
+            let mut request = CatalogGetRequest::all_with_retired();
+            let mut whole: Option<CatalogPage> = None;
+            let mut tokens = BTreeSet::new();
+            loop {
+                let body = serde_json::to_vec(&request).map_err(FusiformCatalogError::Json)?;
+                let reply = match self.call(body).await {
+                    Err(FusiformCatalogError::Refused { code, .. })
+                        if code == "catalog_changed" && request.arguments.page_token.is_some() =>
+                    {
+                        if restart == MAX_CATALOG_RESTARTS {
+                            return Err(FusiformCatalogError::Refused {
+                                code,
+                                message: format!(
+                                    "whole-catalog read exhausted {MAX_CATALOG_RESTARTS} restarts"
+                                ),
+                            });
+                        }
+                        // catalog_changed invalidates this continuation token.
+                        // Discard the partial read and start from page one rather
+                        // than retrying the obsolete token or publishing its pages.
+                        break;
+                    }
+                    other => other?,
+                };
+                let page: CatalogPage = serde_json::from_value(unwrap_tool_result(&reply)?)
+                    .map_err(FusiformCatalogError::Json)?;
+                let next = page.next_page_token.clone();
+                if let Some(whole) = whole.as_mut() {
+                    whole.append(page)?;
+                } else {
+                    whole = Some(page);
+                }
+                let Some(token) = next else {
+                    let bytes = serde_json::to_vec(&whole).map_err(FusiformCatalogError::Json)?;
+                    return decode_catalog_get(&bytes);
+                };
+                if !tokens.insert(token.clone()) {
+                    return Err(error("Fusiform catalog repeated a page token"));
+                }
+                request.arguments.page_token = Some(token);
+            }
+        }
+        unreachable!("each exhausted catalog restart returns an error")
     }
 
     async fn catalog_status(&mut self) -> Result<CatalogStatusReply, FusiformCatalogError> {
@@ -1181,6 +1289,7 @@ pub async fn catalog_refresh_loop(
 
 #[cfg(test)]
 mod tests {
+    include!("fusiform_catalog_paging_tests.rs");
     use super::*;
     use sha2::{Digest, Sha256};
 
@@ -1936,6 +2045,7 @@ mod tests {
         let body: Value = serde_json::to_value(CatalogGetRequest::all_with_retired()).unwrap();
         assert_eq!(body["name"], json!("catalog.get"));
         assert_eq!(body["arguments"]["include_retired"], json!(true));
+        assert_eq!(body["arguments"]["paged"], json!(true));
     }
 
     #[test]
