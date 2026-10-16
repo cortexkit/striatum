@@ -23,6 +23,7 @@ mod config_policy;
 mod fusiform_catalog;
 mod key_pool;
 mod model_resolution;
+mod panel_policy;
 mod quota_consumer;
 mod retention;
 mod runtime_lag;
@@ -58,11 +59,11 @@ use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, Concurrency
 use prefrontal_routing_core::{
     derive_provider_key, fact_to_route, live_billing_wall_error, make_route_key,
     relax_earliest_reset, resolve_launch_requirements, resolve_routing_policy,
-    select_panel_with_config, validate_panel_spec, AvailabilitySubstrate, BreakGlassCandidate,
-    CatalogFactField, DecisionInput, DecisionOutcomeUpdate, ExclusionPolicy, ExclusionSpecs,
-    ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput, PanelRosterEntry,
-    PanelSelection, PanelSpec, RequestedModelRequirements, ResolvedRoutingPolicy, RouteOutcome,
-    RouteStateStore, RouteWallClass, SelectPanelInput, SelectedPanel,
+    AvailabilitySubstrate, BreakGlassCandidate, CatalogFactField, DecisionInput,
+    DecisionOutcomeUpdate, ExclusionPolicy, ExclusionSpecs, ModelFact, ModelRequirements,
+    ModelRoute, ModelRoutingPolicyInput, PanelSelection, RequestedModelRequirements,
+    ResolvedRoutingPolicy, RouteOutcome, RouteStateStore, RouteWallClass, SelectPanelInput,
+    SelectedPanel,
 };
 #[cfg(test)]
 use prefrontal_routing_core::{routing_config::DEFAULT_ROUTING_CONFIG, FailureBackoffConfig};
@@ -1421,16 +1422,16 @@ struct SelectPanelBody {
 struct SelectPanelParams {
     #[serde(default)]
     package_tokens: Option<usize>,
-    panel_spec: PanelSpec,
+    panel_spec: panel_policy::PanelRequestSpec,
     /// The substrate this panel's legs will dispatch on, resolved by the caller
     /// at launch. It decides which availability list the seats are judged
     /// against; absent or unknown keeps the caller's host provider list.
     #[serde(default)]
     substrate: Option<String>,
     #[serde(default)]
-    selection: PanelSelection,
+    selection: Option<PanelSelection>,
     #[serde(default)]
-    roster: Vec<PanelRosterEntry>,
+    roster: Vec<serde_json::Value>,
     #[serde(default)]
     available_models: Vec<String>,
     #[serde(default)]
@@ -1441,6 +1442,8 @@ struct SelectPanelParams {
     subscription_keys: Vec<String>,
     #[serde(default)]
     task_id: Option<String>,
+    #[serde(default)]
+    seed: Option<String>,
     #[serde(default)]
     parent_session_id: Option<String>,
     #[serde(default)]
@@ -3861,26 +3864,17 @@ async fn handle_select_panel(
             .await;
         }
     };
-    if let Err(e) = validate_panel_spec(&params.panel_spec) {
-        return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &e.0).await;
-    }
-    if params.selection == PanelSelection::Roster {
-        if let Some(refusal) = host_runner_pin_refusal(
-            &operator_policy,
-            params.substrate.as_deref(),
-            params.roster.iter().map(|entry| entry.model.as_str()),
-        ) {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                PROVIDER_REQUIRES_RUNNER_PIN,
-                &refusal,
-            )
-            .await;
-        }
+    if params.selection == Some(PanelSelection::Roster) || !params.roster.is_empty() {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "roster_removed",
+            "route.select_panel rosters are removed; configure model_routing.panels instead",
+        )
+        .await;
     }
     let mut prepared = match live_config.prepare(|| prepare_selection_inputs(quota_cache, store)) {
         Ok(prepared) => prepared,
@@ -3894,10 +3888,8 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
-    // Explicit roster pins bypass exclusions; automatic seats and replacements
-    // receive both the operator fence and this request's own exclusions, whether
-    // or not a package size was supplied. Subscription classification is owned by
-    // routing rather than the caller.
+    // Use the operator's score aliases and subscription coverage, never the
+    // caller's subscriptionKeys, to price and admit panel candidates.
     prefrontal_routing_core::score_alias::append_alias_rows(
         &mut prepared.facts,
         &operator_policy.score_alias,
@@ -3941,16 +3933,42 @@ async fn handle_select_panel(
             prepared.snapshot.clone(),
         );
     }
-    let mut panel = match select_panel_with_config(
+    let class = params.panel_spec.class;
+    let groups = live_config.exclude_groups();
+    let group = if class == prefrontal_routing_core::panel::PanelClass::Lab {
+        &groups.lab
+    } else {
+        &groups.athena
+    };
+    let operator_exclude_keys =
+        panel_policy::operator_exclusions(&prepared.facts, &operator_policy.exclude, group);
+    let policy = panel_policy::class_policy(live_config.panels(), class);
+    let context = prefrontal_routing_core::panel::PanelSelectionContext {
+        seed: params
+            .seed
+            .as_ref()
+            .or(params.task_id.as_ref())
+            .cloned()
+            .unwrap_or_default(),
+        pins: prefrontal_routing_core::panel::PanelPins {
+            synthesizer: live_config.pins().synthesizer.as_ref().map(|pin| {
+                prefrontal_routing_core::panel::PanelSynthesizerPin {
+                    model: pin.model.clone(),
+                    variant: pin.variant.clone(),
+                }
+            }),
+        },
+    };
+    let mut panel = match prefrontal_routing_core::panel::select_panel_with_policy_context(
         SelectPanelInput {
             package_tokens: params.package_tokens,
-            panel_spec: params.panel_spec.clone(),
-            selection: params.selection,
-            roster: params.roster.clone(),
+            panel_spec: params.panel_spec.selection_spec(),
+            selection: PanelSelection::NPick,
+            roster: Vec::new(),
             facts: prepared.facts,
             runtime_snapshot: Some(prepared.snapshot),
             exclude_route_keys: params.exclude_route_keys.clone(),
-            operator_exclude_keys: operator_policy.exclude.clone(),
+            operator_exclude_keys,
             explicit_only_providers: operator_policy.explicit_only_providers.clone(),
             required_capabilities: params.required_capabilities,
             available_models,
@@ -3961,6 +3979,8 @@ async fn handle_select_panel(
             })),
         },
         &routing_config,
+        &policy,
+        &context,
     ) {
         Ok(panel) => panel,
         Err(e) => {
@@ -3968,9 +3988,8 @@ async fn handle_select_panel(
                 .await;
         }
     };
-    // A roster seat on a provider that exists only as a vault credential mapping
-    // carries its launch target and pin in its prompt params, the same place a
-    // single route.select reply puts `runner` for core's durable payloads.
+    // Vault-mapped providers need the selected credential and launch target in
+    // promptParams.runner so core can persist and dispatch each member correctly.
     if is_broca_substrate(params.substrate.as_deref()) {
         for (slot, member) in panel.members.iter_mut().enumerate() {
             let Some((provider, model)) = member.route_key.split_once('/') else {
@@ -4088,27 +4107,14 @@ fn panel_decision_input(
         .iter()
         .map(|member| member.route_key.as_str())
         .collect();
-    let explanation = if params.selection == PanelSelection::NPick || panel.policy.is_some() {
-        json!({
-            "members": member_route_keys,
-            "causes": causes,
-            "selection": params.selection,
-            "policy": panel.policy,
-            "policySources": policy_sources,
-            "availability": availability.as_str(),
-        })
-    } else {
-        json!({
-            "members": member_route_keys,
-            "causes": causes,
-            // Recorded even though roster pins bypass exclusion, so a reader can
-            // see WHICH fence was in force when the pinned panel was seated.
-            "policySources": policy_sources,
-            // Which list the seats were judged against. A rejection names it too,
-            // but a panel that seated everyone has no rejection to carry it.
-            "availability": availability.as_str(),
-        })
-    };
+    let explanation = json!({
+        "members": member_route_keys,
+        "causes": causes,
+        "selection": "class_policy",
+        "policy": panel.policy,
+        "policySources": policy_sources,
+        "availability": availability.as_str(),
+    });
     DecisionInput {
         decision_id: None,
         decision_kind: "panel".into(),
@@ -5666,6 +5672,7 @@ impl Error for ModuleError {}
 #[cfg(test)]
 mod tests {
     include!("select_policy_tests.rs");
+    include!("panel_policy_tests.rs");
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10235,7 +10242,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_roster_wire_is_byte_identical_to_fixture() {
+    async fn legacy_roster_wire_is_refused_before_recording_a_decision() {
         let vectors = select_panel_wire_vectors();
         let request = vectors["legacyRoster"]["request"].as_str().unwrap();
         let request_value: serde_json::Value = serde_json::from_str(request).unwrap();
@@ -10248,30 +10255,25 @@ mod tests {
             .is_none());
 
         let (response, _rig, _store) = run_select_panel_wire_request("legacy-wire", request).await;
-        assert_eq!(response.header.ty, FrameType::Response);
+        assert_eq!(response.header.ty, FrameType::Error);
         let response_value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert!(response_value["result"].get("policy").is_none());
-        let decision_id = response_value["result"]["decisionID"].as_str().unwrap();
-        let expected = vectors["legacyRoster"]["reply"]
-            .as_str()
+        assert_eq!(response_value["code"], "roster_removed");
+        assert!(_store
+            .get_decisions_for_task("panel-wire-legacy")
             .unwrap()
-            .replace("$decisionID", decision_id);
-        assert_eq!(response.body, expected.as_bytes());
+            .is_empty());
     }
 
-    /// A roster seat is only real if whatever SENDS to it can resolve the route.
-    /// A spec campaign's seats send through Broca, but a campaign started from a
-    /// Pi host carried a provider list without Kimi's plan, so every round
-    /// rejected the pinned K3 seat `unavailable` with detail `host` although
-    /// Broca sends it. Availability follows the substrate that sends: the same
-    /// request seats the pin on Broca and is rejected only on the host.
+    /// Availability follows the substrate that sends, not the host that requested
+    /// the panel. Broca can seat a catalog route missing from the host's list.
     #[tokio::test]
-    async fn a_roster_pin_absent_from_the_host_list_seats_on_broca_and_is_rejected_on_the_host() {
+    async fn a_panel_route_absent_from_the_host_list_seats_on_broca_and_is_rejected_on_the_host() {
         let rig = Rig::new("panel-substrate");
         let store = Arc::new(rig.open_store());
-        store
-            .upsert_fact(&fact("kimi-code-plan-global", "k3"), FactSource::Override)
-            .expect("the catalog carries the route on its new plane");
+        let mut kimi = fact("kimi-code-plan-global", "k3");
+        kimi.family = Some("kimi".into());
+        kimi.scores.elo = 1700.0;
+        store.upsert_fact(&kimi, FactSource::Override).unwrap();
         let broca_credentials = mapped_broca_credentials("kimi-code-plan-global");
         let request = |substrate: &str| {
             json!({
@@ -10279,8 +10281,8 @@ mod tests {
                 "params": {
                     // The caller's host list lacks Kimi's plan entirely.
                     "availableModels": ["anthropic/claude-fable-5-1"],
-                    "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
-                    "roster": [{"model": "kimi-code-plan-global/k3"}],
+                    "excludeRouteKeys": ["anthropic", "openai", "google", "xai"],
+                    "panelSpec": {"class": "EXPLAIN", "diversity": "none", "iqFloor": 0, "size": 1},
                     "substrate": substrate,
                     "taskId": format!("panel-substrate-{substrate}"),
                 }
@@ -10306,30 +10308,33 @@ mod tests {
         let broca = run("broca").await;
         assert_eq!(
             broca["members"][0]["routeKey"], "kimi-code-plan-global/k3",
-            "the catalog serves the pinned route, so it sits on Broca whatever the host lists"
+            "the catalog serves the route, so it sits on Broca whatever the host lists"
         );
         assert!(broca.get("shortfall").is_none());
 
         let host = run("opencode").await;
         assert_eq!(host["members"], json!([]));
-        let cause = &host["shortfall"]["causes"][0];
+        let cause = host["shortfall"]["causes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cause| cause["model"] == "kimi-code-plan-global/k3")
+            .unwrap();
         assert_eq!(cause["model"], "kimi-code-plan-global/k3");
         assert_eq!(cause["reason"], "unavailable");
         assert_eq!(
             cause["detail"], "host",
             "the rejection names the list that was consulted"
         );
-        // The recorded decision carries the same cause, so the next reader of
-        // rejected_json does not have to reconstruct which list it was.
+        // The decision also records the sending substrate, even when its
+        // per-model rejection list is compacted by the store.
         let recorded = store
             .get_decision_by_id(host["decisionID"].as_str().unwrap())
             .unwrap()
             .expect("the panel decision is recorded");
-        assert!(
-            recorded.rejected_json.contains(r#""detail":"host""#),
-            "{}",
-            recorded.rejected_json
-        );
+        let explanation: serde_json::Value =
+            serde_json::from_str(recorded.explanation_json.as_ref().unwrap()).unwrap();
+        assert_eq!(explanation["availability"], "host");
     }
 
     /// Before a credential listing arrives, routing knows nothing about which
@@ -10341,9 +10346,10 @@ mod tests {
     async fn a_broca_panel_with_no_reachability_source_seats_a_catalog_route_and_says_so() {
         let rig = Rig::new("panel-substrate-unknown-reach");
         let store = Arc::new(rig.open_store());
-        store
-            .upsert_fact(&fact("livebroca", "m-new"), FactSource::Override)
-            .unwrap();
+        let mut live = fact("livebroca", "m-new");
+        live.family = Some("qwen".into());
+        live.scores.elo = 10_000.0;
+        store.upsert_fact(&live, FactSource::Override).unwrap();
         let broca_credentials = empty_broca_credentials();
         let response = run_route_wire_request_with_paths(
             &store,
@@ -10351,8 +10357,8 @@ mod tests {
                 "method": ROUTE_SELECT_PANEL_OP,
                 "params": {
                     "availableModels": [],
-                    "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
-                    "roster": [{"model": "livebroca/m-new"}],
+                    "excludeRouteKeys": ["anthropic", "openai", "google", "xai"],
+                    "panelSpec": {"class": "lab"},
                     "substrate": "broca",
                     "taskId": "panel-substrate-unknown-reach",
                 }
@@ -10424,7 +10430,6 @@ mod tests {
                 "params": {
                     "availableModels": ["uncredentialed/m1"],
                     "panelSpec": {"class": "SPEC", "diversity": "none", "iqFloor": 0, "size": 1},
-                    "roster": [{"model": "uncredentialed/m1"}],
                     "substrate": "broca",
                     "taskId": "panel-substrate-uncredentialed"
                 }
@@ -10692,19 +10697,19 @@ mod tests {
         );
         let explanation: serde_json::Value =
             serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
-        assert_eq!(explanation["selection"], "n_pick");
+        assert_eq!(explanation["selection"], "class_policy");
         assert_eq!(explanation["policy"]["selection"], "class_policy");
     }
 
     #[test]
-    fn package_tokens_are_typed_and_roster_decisions_retain_replacement_policy() {
+    fn package_tokens_are_typed_and_decisions_retain_policy_metadata() {
         let mut body: serde_json::Value = serde_json::from_str(
             select_panel_wire_vectors()["nPick"]["request"]
                 .as_str()
                 .unwrap(),
         )
         .unwrap();
-        body["params"]["selection"] = json!("roster");
+        body["params"]["selection"] = json!("n_pick");
         body["params"]["packageTokens"] = json!(227_000);
         let params = serde_json::from_value::<SelectPanelBody>(body.clone())
             .unwrap()
@@ -10743,7 +10748,7 @@ mod tests {
         );
         let explanation: serde_json::Value =
             serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
-        assert_eq!(explanation["selection"], "roster");
+        assert_eq!(explanation["selection"], "class_policy");
         assert_eq!(
             explanation["policy"]["replacements"][0]["replacementRouteKey"],
             "p/large"
@@ -10795,10 +10800,7 @@ mod tests {
                     "class": "AUDIT",
                     "temperatureSpread": [0.2]
                 },
-                "roster": [
-                    {"model": "openai/gpt-5.6-sol", "promptParams": {"variant": "xhigh"}},
-                    {"model": "openai/gpt-5.5", "promptParams": {"variant": "high"}}
-                ],
+                "selection": "n_pick",
                 "availableModels": ["openai/gpt-5.6-sol", "openai/gpt-5.5"],
                 "subscriptionKeys": ["openai/gpt-5.6-sol", "openai/gpt-5.5"],
                 "taskId": "panel-contract-task"
@@ -10842,7 +10844,12 @@ mod tests {
         assert!(result["runnerUp"][0].get("temperature").is_none());
         assert_eq!(result["members"][0]["promptParams"]["variant"], "xhigh");
         assert!(result["decisionID"].as_str().is_some());
-        assert!(result.get("shortfall").is_none());
+        assert_eq!(result["policy"]["selection"], "class_policy");
+        assert_eq!(result["policy"]["width"], 3);
+        assert!(
+            result.get("shortfall").is_some(),
+            "one family cannot fill width three"
+        );
 
         let decisions = store.get_decisions_for_task("panel-contract-task").unwrap();
         assert_eq!(decisions.len(), 1);
@@ -10850,11 +10857,9 @@ mod tests {
         assert_eq!(decisions[0].selected_route_key, None);
     }
 
-    /// Panel seats run as model calls that core's concurrency slots do not
-    /// admit, and a roster names its members explicitly. Slot counts on a panel
-    /// request must not move a pinned member off its route.
+    /// Legacy slot metadata cannot make a removed roster executable.
     #[tokio::test]
-    async fn select_panel_never_skips_a_pinned_roster_member_for_saturation() {
+    async fn select_panel_refuses_rosters_even_with_legacy_slot_metadata() {
         let rig = Rig::new("select-panel-pinned-saturated");
         let store = Arc::new(rig.open_store());
         let response = run_route_wire_request(
@@ -10882,16 +10887,9 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.header.ty, FrameType::Response);
+        assert_eq!(response.header.ty, FrameType::Error);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        let member = &body["result"]["members"][0];
-        assert!(
-            member["routeKey"]
-                .as_str()
-                .is_some_and(|key| key.starts_with("openai/gpt-5.6-sol")),
-            "the pinned first roster member keeps its seat: {body}"
-        );
-        assert_eq!(member["promptParams"]["variant"], "xhigh");
+        assert_eq!(body["code"], "roster_removed");
     }
 
     fn saturation_fact(provider: &str, model: &str, cost: f64) -> ModelFact {
@@ -11679,7 +11677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panels_seat_the_explicit_only_provider_only_from_a_roster_pin() {
+    async fn panels_refuse_explicit_only_providers_and_removed_roster_pins() {
         let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
         let panel = |label: &'static str, roster: serde_json::Value, selection: &'static str| {
             let credentials = credentials.clone();
@@ -11716,16 +11714,7 @@ mod tests {
             "roster",
         )
         .await;
-        let member = &pinned["result"]["members"][0];
-        assert_eq!(
-            member["routeKey"], "anthropic-platform/claude-opus-4-1",
-            "{pinned}"
-        );
-        assert_eq!(
-            member["promptParams"]["runner"]["auth"],
-            json!({"method": "apikey", "account": "work"}),
-            "{pinned}"
-        );
+        assert_eq!(pinned["code"], "roster_removed", "{pinned}");
     }
 
     #[test]
