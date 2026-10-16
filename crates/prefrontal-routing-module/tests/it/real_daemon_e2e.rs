@@ -200,6 +200,8 @@ async fn start_real_daemon() -> RealDaemon {
     assert_eq!(restarted["op"], "supervisor.ack");
     assert_eq!(restarted["applied"], true, "{restarted}");
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
+    // Catalog presence only proves registration. The credential and Fusiform
+    // refresh tasks start independently, so wait for their health metrics too.
     let deadline = tokio::time::Instant::now() + SETUP_TIMEOUT;
     loop {
         let frame = control_rpc(
@@ -211,12 +213,20 @@ async fn start_real_daemon() -> RealDaemon {
         )
         .await;
         let health: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
-        if health["status"] == "ok" {
+        let broca = &health["metrics"]["brocaReachability"];
+        let fixture_listing_reached =
+            broca["view"] == "routing-health-fixture-v1" && broca["lastReachedAtMs"].is_number();
+        let fusiform_reached = health["metrics"]["fusiformCatalog"]["reach"] == "reached";
+        if health["status"] == "ok" && fixture_listing_reached && fusiform_reached {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "routing did not consume fixture credential metadata: {health}"
+            "routing readiness timed out: fixture credential listing reached={fixture_listing_reached} \
+             (view={:?}, lastReachedAtMs={:?}), fusiform catalog reach={:?}; health={health}",
+            broca["view"],
+            broca["lastReachedAtMs"],
+            health["metrics"]["fusiformCatalog"]["reach"]
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
