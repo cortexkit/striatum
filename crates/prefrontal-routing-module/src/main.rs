@@ -2969,8 +2969,23 @@ async fn handle_select_request(
         config_overrides::read_operator_routing_policy(operator_config_path)
     };
     timing.add_live_config_check(live_config_started.elapsed());
+    // Host plugins do not choose the substrate for a mason launch. Provisionally
+    // admit only the pool route named by the model pin; core selects that pin
+    // again using its chosen substrate before recording the launch. This first
+    // pass does not lease a key.
+    let deferred_runner_pin = params.substrate.is_none()
+        && params.target_agent == "mason"
+        && params.model_pin.as_deref().is_some_and(|pin| {
+            pin.split_once('/')
+                .is_some_and(|(provider, _)| needs_runner_pin(&operator_policy, provider))
+        });
+    let availability_substrate = if deferred_runner_pin {
+        Some("broca")
+    } else {
+        params.substrate.as_deref()
+    };
     let snapshot_started = Instant::now();
-    let availability = if is_broca_substrate(params.substrate.as_deref()) {
+    let availability = if is_broca_substrate(availability_substrate) {
         match store.get_facts() {
             Ok(mut facts) => {
                 live_config.apply(&mut facts);
@@ -2981,7 +2996,7 @@ async fn handle_select_request(
                     &operator_policy.score_alias,
                 );
                 select_availability(
-                    params.substrate.as_deref(),
+                    availability_substrate,
                     std::mem::take(&mut params.available_models),
                     &facts,
                     broca_credentials,
@@ -3102,9 +3117,15 @@ async fn handle_select_request(
     let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
 
     if let Some(pin) = params.model_pin.as_deref() {
-        if let Some(refusal) =
-            host_runner_pin_refusal(&operator_policy, params.substrate.as_deref(), [pin])
-        {
+        if let Some(refusal) = host_runner_pin_refusal(
+            &operator_policy,
+            if deferred_runner_pin {
+                Some("broca")
+            } else {
+                params.substrate.as_deref()
+            },
+            [pin],
+        ) {
             return send_route_error(
                 writer,
                 ver,
@@ -3206,6 +3227,9 @@ async fn handle_select_request(
                     "selected": selected, "decisionID": decision_id,
                     "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities}
                 });
+                if deferred_runner_pin {
+                    result["requiredSubstrate"] = json!("broca");
+                }
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
                     if let Some(grant) = grant {
@@ -3591,8 +3615,8 @@ fn host_runner_pin_refusal<'a>(
         let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
         needs_runner_pin(policy, provider).then(|| {
             format!(
-                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, and this request names substrate {}. {provider} can be used through spec and Athena panel roster pins and core-side Broca launches; a `work run model=` launched through the host plugin cannot use it until the host plugin passes substrate \"broca\" to route.select",
-                requested_substrate.unwrap_or("none (the host plugin's launch path)")
+                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, and this request names substrate {}. Core must complete the pinned mason route with substrate broca before launch; non-Broca launches cannot carry this pin",
+                requested_substrate.unwrap_or("none")
             )
         })
     })
@@ -11124,6 +11148,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_host_mason_pin_is_provisional_until_core_completes_it_on_broca() {
+        let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
+        let (body, _rig, _store) = platform_select(
+            "platform-host-pin",
+            json!({"targetAgent":"mason", "requestedRequirements":{"iq":90,"eq":0},
+                   "availableModels":["anthropic/claude-opus-4-1"],
+                   "modelPin":"anthropic-platform/claude-opus-4-1"}),
+            &credentials,
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["result"]["selected"]["routeKey"], "anthropic-platform/claude-opus-4-1",
+            "{body}"
+        );
+        assert_eq!(body["result"]["requiredSubstrate"], "broca", "{body}");
+        assert!(
+            body["result"].get("runner").is_none(),
+            "no key before core admission: {body}"
+        );
+        assert!(body["result"].get("poolLease").is_none(), "{body}");
+    }
+
+    #[tokio::test]
     async fn the_key_pool_spreads_walls_keys_and_refuses_without_falling_back() {
         // Two keys of one workspace; the second key's label differs from its
         // workspace (`account_id`), and only the label goes in the pin.
@@ -11242,17 +11290,17 @@ mod tests {
         let host = call(
             "route.select",
             json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
-                   "availableModels": ["anthropic-platform/claude-opus-4-1"],
+                   "substrate": "opencode", "availableModels": ["anthropic-platform/claude-opus-4-1"],
                    "modelPin": "anthropic-platform/claude-opus-4-1"}),
         )
         .await;
         assert_eq!(host["code"], "provider_requires_runner_pin", "{host}");
         let message = host["message"].as_str().unwrap();
         for part in [
-            "spec and Athena panel",
-            "core-side Broca launches",
-            "work run model=",
-            "passes substrate",
+            "substrate opencode",
+            "Core must complete",
+            "substrate broca",
+            "non-Broca launches cannot carry this pin",
         ] {
             assert!(
                 message.contains(part),
