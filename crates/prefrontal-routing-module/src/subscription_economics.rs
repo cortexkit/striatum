@@ -1529,8 +1529,8 @@ mod tests {
             assert_eq!(pricing.head_reserve_points, Some(0.0));
         }
         let input = live_reset_input(Some("pi"), "athena");
-        let panel =
-            prefrontal_routing_core::select_panel(prefrontal_routing_core::SelectPanelInput {
+        let panel = prefrontal_routing_core::select_panel_with_policy(
+            prefrontal_routing_core::SelectPanelInput {
                 panel_spec: prefrontal_routing_core::PanelSpec {
                     size: 1,
                     iq_floor: 85.0,
@@ -1550,8 +1550,17 @@ mod tests {
                 operator_exclude_keys: Vec::new(),
                 explicit_only_providers: Vec::new(),
                 required_capabilities: None,
-            })
-            .unwrap();
+            },
+            &prefrontal_routing_core::RoutingConfig::default(),
+            &prefrontal_routing_core::ClassPanelPolicy {
+                top_k: 1,
+                by: prefrontal_routing_core::PanelOrder::Iq,
+                extra: 0,
+                extra_by: None,
+                floor: Some(85),
+            },
+        )
+        .unwrap();
         assert_eq!(panel.members.len(), 1);
         assert!(panel.shortfall.is_none());
     }
@@ -1747,8 +1756,8 @@ mod tests {
         // Use the high-pace variant because the corrected captured budget is
         // positive; the panel must still explain a genuinely binding reserve.
         let input = high_pace_incident_input(Some("opencode"), "mason", json!({"iq":70,"eq":0}));
-        let panel =
-            prefrontal_routing_core::select_panel(prefrontal_routing_core::SelectPanelInput {
+        let panel = prefrontal_routing_core::select_panel_with_policy(
+            prefrontal_routing_core::SelectPanelInput {
                 panel_spec: prefrontal_routing_core::PanelSpec {
                     size: 4,
                     iq_floor: 70.0,
@@ -1768,18 +1777,33 @@ mod tests {
                 operator_exclude_keys: Vec::new(),
                 explicit_only_providers: Vec::new(),
                 required_capabilities: None,
-            })
-            .unwrap();
+            },
+            &prefrontal_routing_core::RoutingConfig::default(),
+            &prefrontal_routing_core::ClassPanelPolicy {
+                top_k: 4,
+                by: prefrontal_routing_core::PanelOrder::Iq,
+                extra: 0,
+                extra_by: None,
+                floor: Some(70),
+            },
+        )
+        .unwrap();
         assert!(panel.members.is_empty());
         let causes = panel.shortfall.unwrap().causes;
-        assert_eq!(causes.len(), 1);
-        assert_eq!(causes[0].model, "anthropic/claude-opus-5-5");
+        // A four-seat policy adds three synthetic unfilled-slot causes; this test
+        // checks the single substantive subscription-quota cause.
+        let quota_causes = causes
+            .iter()
+            .filter(|cause| cause.model != "<unfilled-slot>")
+            .collect::<Vec<_>>();
+        assert_eq!(quota_causes.len(), 1);
+        assert_eq!(quota_causes[0].model, "anthropic/claude-opus-5-5");
         assert_eq!(
-            causes[0].reason,
+            quota_causes[0].reason,
             prefrontal_routing_core::PanelCauseReason::QuotaExhausted
         );
         assert_eq!(
-            causes[0].detail.as_deref(),
+            quota_causes[0].detail.as_deref(),
             Some("weekly headroom is reserved for heads")
         );
     }
