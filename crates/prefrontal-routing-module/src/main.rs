@@ -3239,7 +3239,7 @@ async fn handle_select_request(
                 providers_without_prompt_cache: HashSet::new(),
             };
             if let Some(refusal) =
-                host_runner_pin_refusal(&operator_policy, params.substrate.as_deref(), [pin])
+                host_runner_pin_refusal(&operator_policy, availability_substrate, [pin])
             {
                 Err(work_model_pin::Refusal {
                     code: PROVIDER_REQUIRES_RUNNER_PIN.into(),
