@@ -4441,7 +4441,18 @@ fn all_reserved_automatic_panel_reports_quota_before_iq_package_and_diversity() 
                 iq_floor,
             );
             input.package_tokens = package_tokens;
-            let panel = select_panel(input).unwrap();
+            let panel = prefrontal_routing_core::select_panel_with_policy(
+                input,
+                &prefrontal_routing_core::DEFAULT_ROUTING_CONFIG,
+                &prefrontal_routing_core::ClassPanelPolicy {
+                    top_k: 2,
+                    by: prefrontal_routing_core::PanelOrder::Iq,
+                    extra: 0,
+                    extra_by: None,
+                    floor: Some(80),
+                },
+            )
+            .unwrap();
             assert!(panel.members.is_empty());
             let shortfall = panel.shortfall.unwrap();
             assert_eq!(shortfall.code, PanelShortfallCode::SizeReduced);
