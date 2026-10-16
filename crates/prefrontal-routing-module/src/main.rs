@@ -10505,6 +10505,7 @@ mod tests {
                 variant: prefrontal_routing_core::SeatedSiblingVariant::Pro,
             }],
             sibling_collapses: Vec::new(),
+            ..Default::default()
         };
         let panel = SelectedPanel {
             members: Vec::new(),
@@ -10561,6 +10562,7 @@ mod tests {
                     replacement_route_key: "p/large".into(),
                     reason: "package 227000 tokens exceeds p/small ceiling 210000 tokens".into(),
                 }],
+                ..Default::default()
             }),
         };
         let decision = panel_decision_input(

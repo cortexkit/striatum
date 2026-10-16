@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::model_facts::{
     make_capacity_key, ModelFact, ModelRequirements, ModelRoute, FAST_SUFFIX,
@@ -84,14 +85,17 @@ pub enum PanelClass {
     Lab,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PanelOrder {
+    #[default]
     Iq,
     Eq,
     Cost,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PanelExtraOrder {
     Random,
     Iq,
@@ -214,7 +218,7 @@ pub struct PanelMember {
     pub context_window: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelRunnerUp {
     pub route_key: String,
@@ -224,6 +228,46 @@ pub struct PanelRunnerUp {
     pub max_output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    #[serde(default)]
+    pub phase: PanelPhase,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PanelPhase {
+    #[default]
+    #[serde(rename = "topK")]
+    TopK,
+    #[serde(rename = "extra")]
+    Extra,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelSeat {
+    pub slot: usize,
+    pub route_key: String,
+    pub reason: PanelPhase,
+    pub rank: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PanelSynthesizerPin {
+    pub model: String,
+    pub variant: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PanelPins {
+    pub synthesizer: Option<PanelSynthesizerPin>,
+}
+
+/// Request metadata for reproducible extra draws and the stored synthesizer pin.
+/// The request handler must supply the task ID when no explicit seed was sent,
+/// so retries of the same task draw the same routes from unchanged candidates.
+#[derive(Debug, Clone, Default)]
+pub struct PanelSelectionContext {
+    pub seed: String,
+    pub pins: PanelPins,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -300,10 +344,20 @@ pub struct SiblingCollapse {
     pub collapsed_route_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelPolicy {
     pub selection: String,
+    pub class: String,
+    pub top_k: usize,
+    pub by: PanelOrder,
+    pub extra: usize,
+    pub extra_by: Option<PanelExtraOrder>,
+    pub floor: Option<u8>,
+    pub width: usize,
+    pub seed: Option<String>,
+    pub seats: Vec<PanelSeat>,
+    pub pins: PanelPins,
     pub seated_variants: Vec<SeatedVariant>,
     pub sibling_collapses: Vec<SiblingCollapse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -386,12 +440,26 @@ pub fn select_panel_with_policy(
     config: &RoutingConfig,
     class_policy: &ClassPanelPolicy,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
+    select_panel_with_policy_context(
+        input,
+        config,
+        class_policy,
+        &PanelSelectionContext::default(),
+    )
+}
+
+pub fn select_panel_with_policy_context(
+    input: SelectPanelInput<'_>,
+    config: &RoutingConfig,
+    class_policy: &ClassPanelPolicy,
+    context: &PanelSelectionContext,
+) -> Result<SelectedPanel, InvalidPanelRequest> {
     class_policy.validate()?;
     if input.selection != PanelSelection::Roster || input.package_tokens.is_none() {
-        return select_panel_admitted(&input, config, class_policy);
+        return select_panel_admitted(&input, config, class_policy, context);
     }
     let tokens = input.package_tokens.unwrap();
-    let mut panel = select_panel_admitted(&input, config, class_policy)?;
+    let mut panel = select_panel_admitted(&input, config, class_policy, context)?;
     let oversized = panel
         .members
         .iter()
@@ -428,7 +496,7 @@ pub fn select_panel_with_policy(
         is_subscription_route: input.is_subscription_route,
         ..input
     };
-    let spares = select_panel_admitted(&automatic, config, class_policy)?;
+    let spares = select_panel_admitted(&automatic, config, class_policy, context)?;
     let mut policy = spares.policy.expect("automatic selection records policy");
     let mut candidates = spares
         .members
@@ -492,6 +560,7 @@ pub fn select_panel_with_policy(
             family: candidate.family,
             max_output_tokens: candidate.max_output_tokens,
             context_window: candidate.context_window,
+            phase: PanelPhase::TopK,
         })
         .collect();
     if unfilled {
@@ -554,6 +623,7 @@ fn select_panel_admitted(
     input: &SelectPanelInput<'_>,
     config: &RoutingConfig,
     class_policy: &ClassPanelPolicy,
+    context: &PanelSelectionContext,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
     // Class policy owns automatic panel width and quality, so panel_spec.size
     // and panel_spec.iq_floor cannot invalidate it. The family rule below also
@@ -766,22 +836,40 @@ fn select_panel_admitted(
         .filter(|candidate| clears_bar(candidate))
         .count();
     let mut selected = Vec::new();
+    let mut seats = Vec::new();
     let mut selected_families = HashSet::new();
-    for (index, candidate) in candidates.iter().enumerate() {
+    let top_k_candidates = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            if automatic && class_policy.by != PanelOrder::Iq && !clears_bar(candidate) {
+                causes.push(below_bar_cause(candidate));
+                None
+            } else {
+                Some(index)
+            }
+        })
+        .collect::<Vec<_>>();
+    for (rank, &index) in top_k_candidates.iter().enumerate() {
         if selected.len() == if automatic { class_policy.top_k } else { width } {
             break;
         }
-        if automatic && class_policy.by != PanelOrder::Iq && !clears_bar(candidate) {
-            causes.push(below_bar_cause(candidate));
-            continue;
-        }
+        let candidate = &candidates[index];
         if !enforce_family_diversity
             || selected_families.insert(candidate.route.fact.family.clone().unwrap())
         {
+            seats.push(PanelSeat {
+                slot: selected.len(),
+                route_key: candidate.route.route_key.clone(),
+                reason: PanelPhase::TopK,
+                rank: Some(rank + 1),
+            });
             selected.push(index);
         }
     }
 
+    let mut extra_candidates = Vec::new();
+    let mut random_drawn = false;
     if automatic && class_policy.extra > 0 {
         let mut extras = (0..candidates.len())
             .filter(|index| {
@@ -796,17 +884,30 @@ fn select_panel_admitted(
                 false
             }
         });
-        order_interim_extras(&mut extras, &candidates, class_policy.extra_by.unwrap());
+        let extra_order = class_policy.extra_by.unwrap();
+        order_extras(&mut extras, &candidates, extra_order);
+        let random = extra_order == PanelExtraOrder::Random;
+        if random {
+            extras = draw_extras(extras, &candidates, &context.seed);
+        }
         let mut seated_extras = 0;
-        for index in extras {
+        for (rank, &index) in extras.iter().enumerate() {
             if seated_extras == class_policy.extra {
                 break;
             }
             if selected_families.insert(candidates[index].route.fact.family.clone().unwrap()) {
+                seats.push(PanelSeat {
+                    slot: selected.len(),
+                    route_key: candidates[index].route.route_key.clone(),
+                    reason: PanelPhase::Extra,
+                    rank: (!random).then_some(rank + 1),
+                });
                 selected.push(index);
                 seated_extras += 1;
+                random_drawn |= random;
             }
         }
+        extra_candidates = extras;
     }
 
     if enforce_family_diversity && selected.len() < width {
@@ -826,37 +927,41 @@ fn select_panel_admitted(
 
     // Preserve phase order even when an extra ranks ahead of a topK seat under
     // a different ordering. Temperatures are assigned after slot order is fixed.
-    let mut ordered_members = Vec::new();
-    let mut runner_up = Vec::new();
-    for (index, candidate) in candidates.into_iter().enumerate() {
-        let context_window = context_window_tokens(&candidate.route.fact);
-        if let Some(slot) = selected.iter().position(|selected| *selected == index) {
-            ordered_members.push((
-                slot,
-                PanelMember {
-                    route_key: candidate.route.route_key,
-                    prompt_params: candidate.prompt_params,
-                    family: candidate.route.fact.family,
-                    temperature: None,
-                    max_output_tokens: candidate.route.fact.max_output_tokens,
-                    context_window,
-                },
-            ));
-        } else if !automatic || class_policy.by == PanelOrder::Iq || clears_bar(&candidate) {
-            runner_up.push(PanelRunnerUp {
-                context_window,
-                route_key: candidate.route.route_key,
-                prompt_params: candidate.prompt_params,
-                family: candidate.route.fact.family,
+    let mut members = selected
+        .iter()
+        .map(|&index| {
+            let candidate = &candidates[index];
+            PanelMember {
+                route_key: candidate.route.route_key.clone(),
+                prompt_params: candidate.prompt_params.clone(),
+                family: candidate.route.fact.family.clone(),
+                temperature: None,
                 max_output_tokens: candidate.route.fact.max_output_tokens,
-            });
-        }
-    }
-    ordered_members.sort_by_key(|(slot, _)| *slot);
-    let mut members = ordered_members
-        .into_iter()
-        .map(|(_, member)| member)
+                context_window: context_window_tokens(&candidate.route.fact),
+            }
+        })
         .collect::<Vec<_>>();
+    let runner_up = top_k_candidates
+        .into_iter()
+        .map(|index| (index, PanelPhase::TopK))
+        .chain(
+            extra_candidates
+                .into_iter()
+                .map(|index| (index, PanelPhase::Extra)),
+        )
+        .filter(|(index, _)| !selected.contains(index))
+        .map(|(index, phase)| {
+            let candidate = &candidates[index];
+            PanelRunnerUp {
+                route_key: candidate.route.route_key.clone(),
+                prompt_params: candidate.prompt_params.clone(),
+                family: candidate.route.fact.family.clone(),
+                max_output_tokens: candidate.route.fact.max_output_tokens,
+                context_window: context_window_tokens(&candidate.route.fact),
+                phase,
+            }
+        })
+        .collect();
     if let Some(spread) = &input.panel_spec.temperature_spread {
         for (member, temperature) in members.iter_mut().zip(spread.iter().copied()) {
             member.temperature = Some(temperature);
@@ -936,6 +1041,25 @@ fn select_panel_admitted(
         largest_package_ceiling,
         replacements: Vec::new(),
         selection: "class_policy".into(),
+        class: match input.panel_spec.class {
+            PanelClass::Audit => "audit",
+            PanelClass::DesignReview => "design_review",
+            PanelClass::Evaluate => "evaluate",
+            PanelClass::Diagnose => "diagnose",
+            PanelClass::Explain => "explain",
+            PanelClass::Spec => "spec",
+            PanelClass::Lab => "lab",
+        }
+        .into(),
+        top_k: class_policy.top_k,
+        by: class_policy.by,
+        extra: class_policy.extra,
+        extra_by: class_policy.extra_by.filter(|_| class_policy.extra > 0),
+        floor: class_policy.floor,
+        width,
+        seed: random_drawn.then(|| context.seed.clone()),
+        seats,
+        pins: context.pins.clone(),
         seated_variants: members
             .iter()
             .enumerate()
@@ -1098,9 +1222,7 @@ fn candidate_order(a: &Candidate, b: &Candidate, order: PanelOrder) -> Ordering 
     }
 }
 
-// Random extras temporarily use route-key order until the seeded draw is
-// integrated. Ranked extras already use the same total orders as topK.
-fn order_interim_extras(indices: &mut [usize], candidates: &[Candidate], order: PanelExtraOrder) {
+fn order_extras(indices: &mut [usize], candidates: &[Candidate], order: PanelExtraOrder) {
     indices.sort_by(|a, b| {
         let (a, b) = (&candidates[*a], &candidates[*b]);
         match order {
@@ -1110,6 +1232,22 @@ fn order_interim_extras(indices: &mut [usize], candidates: &[Candidate], order: 
             PanelExtraOrder::Cost => candidate_order(a, b, PanelOrder::Cost),
         }
     });
+}
+
+/// Draw both the initial extra seats and all their replacement spares now, so a
+/// resumed consult needs no random cursor. The pool arrives sorted by route key;
+/// removing every route in the winning family leaves the remaining order intact.
+fn draw_extras(mut pool: Vec<usize>, candidates: &[Candidate], seed: &str) -> Vec<usize> {
+    let mut draws = Vec::new();
+    while !pool.is_empty() {
+        let digest = Sha256::digest(format!("{seed}\n{}", draws.len()).as_bytes());
+        let value = u64::from_be_bytes(digest[..8].try_into().unwrap());
+        let winner = pool[(value % pool.len() as u64) as usize];
+        draws.push(winner);
+        let family = &candidates[winner].route.fact.family;
+        pool.retain(|index| &candidates[*index].route.fact.family != family);
+    }
+    draws
 }
 
 fn iq_cost_order(a: &Candidate, b: &Candidate) -> Ordering {

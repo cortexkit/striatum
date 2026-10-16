@@ -12,6 +12,7 @@ use prefrontal_routing_core::{
 use serde_json::{json, Map};
 
 mod policy_pipeline;
+mod policy_records;
 
 fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
     ModelFact {
