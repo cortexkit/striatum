@@ -2,13 +2,16 @@ use std::collections::{HashMap, HashSet};
 
 use prefrontal_routing_core::{
     demand_bar, make_capacity_key, make_route_key, model_facts_seed, select_model_route,
-    select_panel, AvailabilitySubstrate, Confidence, InvalidPanelRequest, ModelFact,
-    ModelPromptDefaults, ModelRequirements, ModelRouteStateSnapshot, ModelScores, PanelCauseReason,
-    PanelClass, PanelDiversity, PanelRosterEntry, PanelSelection, PanelSelectionPolicy,
-    PanelShortfallCode, PanelSpec, RequiredCapabilities, RouteRuntimeState, ScoreProvenance,
-    SeatedSiblingVariant, SelectModelRouteInput, SelectPanelInput, DEFAULT_DEMAND_EXPONENT,
+    select_panel, select_panel_with_policy, AvailabilitySubstrate, ClassPanelPolicy, Confidence,
+    InvalidPanelRequest, ModelFact, ModelPromptDefaults, ModelRequirements,
+    ModelRouteStateSnapshot, ModelScores, PanelCauseReason, PanelClass, PanelDiversity,
+    PanelExtraOrder, PanelOrder, PanelRosterEntry, PanelSelection, PanelShortfallCode, PanelSpec,
+    RequiredCapabilities, RouteRuntimeState, ScoreProvenance, SelectModelRouteInput,
+    SelectPanelInput, DEFAULT_DEMAND_EXPONENT, DEFAULT_ROUTING_CONFIG,
 };
 use serde_json::{json, Map};
+
+mod policy_pipeline;
 
 fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
     ModelFact {
@@ -223,7 +226,21 @@ fn package_substitution_obeys_exclusion_quota_and_iq_admission() {
             _ => {}
         }
         assert_eq!(
-            select_panel(input).unwrap().shortfall.unwrap().code,
+            select_panel_with_policy(
+                input,
+                &DEFAULT_ROUTING_CONFIG,
+                &ClassPanelPolicy {
+                    top_k: 2,
+                    by: PanelOrder::Eq,
+                    extra: 0,
+                    extra_by: None,
+                    floor: Some(80),
+                }
+            )
+            .unwrap()
+            .shortfall
+            .unwrap()
+            .code,
             PanelShortfallCode::PackageUnmeetable,
             "{blocker}"
         );
@@ -248,17 +265,6 @@ fn a_fitting_package_preserves_pins_and_automatic_runner_ups_fit() {
         .runner_up
         .iter()
         .all(|member| member.route_key != "p/small"));
-}
-
-fn openai_sibling(model: &str, elo: f64) -> ModelFact {
-    let mut fact = fact(model, elo, Some("openai-gpt"));
-    fact.provider_id = "openai".into();
-    fact.prompt_defaults = Some(ModelPromptDefaults {
-        variant: Some("xhigh".into()),
-        temperature: None,
-        reasoning_effort: None,
-    });
-    fact
 }
 
 #[test]
@@ -310,7 +316,18 @@ fn iq_floor_uses_the_request_elo_frontier() {
         fact("at-boundary", target, Some("a")),
         fact("just-below", target - 0.01, Some("b")),
     ];
-    let selected = select_panel(n_pick_input(facts, spec(3, 70.0, PanelDiversity::None))).unwrap();
+    let selected = select_panel_with_policy(
+        n_pick_input(facts, spec(3, 70.0, PanelDiversity::None)),
+        &DEFAULT_ROUTING_CONFIG,
+        &ClassPanelPolicy {
+            top_k: 3,
+            by: PanelOrder::Eq,
+            extra: 0,
+            extra_by: None,
+            floor: Some(70),
+        },
+    )
+    .unwrap();
     let routes: HashSet<_> = selected
         .members
         .iter()
@@ -319,16 +336,26 @@ fn iq_floor_uses_the_request_elo_frontier() {
     assert_eq!(routes, HashSet::from(["p/frontier", "p/at-boundary"]));
     assert_eq!(
         selected.shortfall.unwrap().code,
-        PanelShortfallCode::SizeReduced
+        PanelShortfallCode::DiversityUnmeetable
     );
 
-    let selected = select_panel(n_pick_input(
-        vec![
-            fact("frontier", top, Some("a")),
-            fact("too-low", top - 0.1, Some("b")),
-        ],
-        spec(2, 100.0, PanelDiversity::None),
-    ))
+    let selected = select_panel_with_policy(
+        n_pick_input(
+            vec![
+                fact("frontier", top, Some("a")),
+                fact("too-low", top - 0.1, Some("b")),
+            ],
+            spec(2, 100.0, PanelDiversity::None),
+        ),
+        &DEFAULT_ROUTING_CONFIG,
+        &ClassPanelPolicy {
+            top_k: 2,
+            by: PanelOrder::Eq,
+            extra: 0,
+            extra_by: None,
+            floor: Some(100),
+        },
+    )
     .unwrap();
     assert_eq!(selected.members.len(), 1);
     assert_eq!(selected.members[0].route_key, "p/frontier");
@@ -858,7 +885,7 @@ fn shortfall_precedence_and_empty_success() {
 }
 
 #[test]
-fn n_pick_reuses_elo_floor_and_fact_prompt_defaults() {
+fn policy_eq_reuses_elo_floor_and_fact_prompt_defaults() {
     let top = 1_838.0;
     let target = demand_bar(top, 70.0, DEFAULT_DEMAND_EXPONENT);
     let mut at_boundary = fact("at-boundary", target, Some("a"));
@@ -867,14 +894,24 @@ fn n_pick_reuses_elo_floor_and_fact_prompt_defaults() {
         temperature: Some(0.4),
         reasoning_effort: None,
     });
-    let selected = select_panel(n_pick_input(
-        vec![
-            fact("frontier", top, Some("frontier")),
-            at_boundary,
-            fact("below", target - 0.01, Some("b")),
-        ],
-        spec(3, 70.0, PanelDiversity::None),
-    ))
+    let selected = select_panel_with_policy(
+        n_pick_input(
+            vec![
+                fact("frontier", top, Some("frontier")),
+                at_boundary,
+                fact("below", target - 0.01, Some("b")),
+            ],
+            spec(3, 70.0, PanelDiversity::None),
+        ),
+        &DEFAULT_ROUTING_CONFIG,
+        &ClassPanelPolicy {
+            top_k: 3,
+            by: PanelOrder::Eq,
+            extra: 0,
+            extra_by: None,
+            floor: Some(70),
+        },
+    )
     .unwrap();
 
     assert_eq!(selected.members.len(), 2);
@@ -887,7 +924,7 @@ fn n_pick_reuses_elo_floor_and_fact_prompt_defaults() {
     assert_eq!(boundary.prompt_params["temperature"], 0.4);
     assert_eq!(
         selected.shortfall.unwrap().code,
-        PanelShortfallCode::SizeReduced
+        PanelShortfallCode::DiversityUnmeetable
     );
 }
 
@@ -911,119 +948,6 @@ fn curated_seed_contains_no_fast_model_ids() {
     assert!(model_facts_seed()
         .iter()
         .all(|fact| !fact.model_id.ends_with("-fast")));
-}
-
-#[test]
-fn audit_diagnose_mixed_and_explain_apply_distinct_rankings() {
-    let audit_facts = vec![
-        fact("a-best", 62.0, Some("a")),
-        fact("a-second", 61.0, Some("a")),
-        fact("b-best", 60.0, Some("b")),
-        fact("c-best", 59.0, Some("c")),
-    ];
-    let mut audit_spec = spec(3, 0.0, PanelDiversity::Family);
-    audit_spec.class = PanelClass::Audit;
-    let audit = select_panel(n_pick_input(audit_facts, audit_spec)).unwrap();
-    assert_eq!(
-        audit
-            .members
-            .iter()
-            .map(|member| member.route_key.as_str())
-            .collect::<Vec<_>>(),
-        ["p/a-best", "p/b-best", "p/c-best"]
-    );
-    assert_eq!(audit.runner_up[0].route_key, "p/a-second");
-    assert_eq!(
-        audit.policy.unwrap().selection,
-        PanelSelectionPolicy::DiversityFirst
-    );
-
-    let mut economical = fact("z-lineage", 61.0, Some("z"));
-    economical.cost_per_m_tok_out = Some(1.0);
-    let mut expensive = fact("a-lineage", 61.0, Some("a"));
-    expensive.cost_per_m_tok_out = Some(75.0);
-    let diagnose_facts = vec![economical, expensive, fact("lower", 60.0, Some("b"))];
-    let mut diagnose_spec = spec(1, 0.0, PanelDiversity::None);
-    diagnose_spec.class = PanelClass::Diagnose;
-    let diagnose = select_panel(n_pick_input(diagnose_facts, diagnose_spec)).unwrap();
-    assert_eq!(
-        diagnose.members[0].route_key, "p/z-lineage",
-        "equal-IQ candidates are ordered by the economic objective before family"
-    );
-    assert_eq!(
-        diagnose
-            .runner_up
-            .iter()
-            .map(|spare| spare.route_key.as_str())
-            .collect::<Vec<_>>(),
-        ["p/a-lineage", "p/lower"]
-    );
-    assert_eq!(
-        diagnose.policy.unwrap().selection,
-        PanelSelectionPolicy::TopIq
-    );
-
-    for class in [PanelClass::DesignReview, PanelClass::Evaluate] {
-        let mixed_facts = vec![
-            fact("top", 63.0, Some("a")),
-            fact("same-lineage", 62.0, Some("a")),
-            fact("other-lineage", 60.0, Some("b")),
-        ];
-        let mut mixed_spec = spec(2, 0.0, PanelDiversity::Family);
-        mixed_spec.class = class;
-        let mixed = select_panel(n_pick_input(mixed_facts, mixed_spec)).unwrap();
-        assert_eq!(
-            mixed
-                .members
-                .iter()
-                .map(|member| member.route_key.as_str())
-                .collect::<Vec<_>>(),
-            ["p/top", "p/other-lineage"]
-        );
-        assert_eq!(mixed.runner_up[0].route_key, "p/same-lineage");
-        assert_eq!(mixed.policy.unwrap().selection, PanelSelectionPolicy::Mixed);
-    }
-
-    let mut expensive = fact("expensive", 62.0, Some("a"));
-    expensive.cost_per_m_tok_out = Some(75.0);
-    let mut cheap = fact("cheap", 58.0, Some("b"));
-    cheap.cost_per_m_tok_out = Some(1.0);
-    let mut explain_spec = spec(1, 0.0, PanelDiversity::None);
-    explain_spec.class = PanelClass::Explain;
-    let explain = select_panel(n_pick_input(vec![expensive, cheap], explain_spec)).unwrap();
-    assert_eq!(explain.members[0].route_key, "p/cheap");
-    assert_eq!(explain.runner_up[0].route_key, "p/expensive");
-    assert_eq!(
-        explain.policy.unwrap().selection,
-        PanelSelectionPolicy::CheapestAdequate
-    );
-}
-
-#[test]
-fn pro_policy_requires_class_and_floor() {
-    fn select_sol(class: PanelClass, floor: f64) -> prefrontal_routing_core::SelectedPanel {
-        let facts = vec![
-            openai_sibling("gpt-5.6-sol", 69.5),
-            openai_sibling("gpt-5.6-sol-fast", 69.5),
-            openai_sibling("gpt-5.6-sol-pro", 69.5),
-        ];
-        let mut panel_spec = spec(1, floor, PanelDiversity::None);
-        panel_spec.class = class;
-        select_panel(n_pick_input(facts, panel_spec)).unwrap()
-    }
-
-    for class in [PanelClass::Diagnose, PanelClass::Audit] {
-        let selected = select_sol(class, 80.0);
-        assert_eq!(selected.members[0].route_key, "openai/gpt-5.6-sol-pro");
-        let policy = selected.policy.unwrap();
-        assert_eq!(policy.seated_variants[0].slot, 0);
-        assert_eq!(policy.seated_variants[0].variant, SeatedSiblingVariant::Pro);
-    }
-
-    for (class, floor) in [(PanelClass::Evaluate, 80.0), (PanelClass::Diagnose, 70.0)] {
-        let selected = select_sol(class, floor);
-        assert_eq!(selected.members[0].route_key, "openai/gpt-5.6-sol");
-    }
 }
 
 #[test]

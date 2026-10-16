@@ -79,10 +79,77 @@ pub enum PanelClass {
     Evaluate,
     Diagnose,
     Explain,
-    /// Adversarial spec-campaign rounds. Seat policy mirrors Audit: family
-    /// diversity is the point of a multi-seat spec panel, and pinned rosters
-    /// bypass exclusion exactly as they do for audits.
     Spec,
+    #[serde(alias = "lab")]
+    Lab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelOrder {
+    Iq,
+    Eq,
+    Cost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelExtraOrder {
+    Random,
+    Iq,
+    Eq,
+    Cost,
+}
+
+/// A complete class policy. Callers replace this value rather than merging fields
+/// into a built-in default; an absent floor means there is no quality bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassPanelPolicy {
+    pub top_k: usize,
+    pub by: PanelOrder,
+    pub extra: usize,
+    pub extra_by: Option<PanelExtraOrder>,
+    pub floor: Option<u8>,
+}
+
+impl ClassPanelPolicy {
+    pub fn default_for_class(class: PanelClass) -> Self {
+        use PanelClass::*;
+        use PanelExtraOrder as Extra;
+        use PanelOrder as By;
+        let (top_k, by, extra, extra_by, floor) = match class {
+            Audit => (2, By::Iq, 1, Some(Extra::Random), Some(80)),
+            Spec => (3, By::Iq, 1, Some(Extra::Random), Some(80)),
+            Diagnose => (3, By::Iq, 0, None, Some(80)),
+            DesignReview => (3, By::Eq, 0, None, None),
+            Evaluate => (2, By::Iq, 1, Some(Extra::Eq), None),
+            Explain => (1, By::Cost, 0, None, Some(50)),
+            Lab => (4, By::Iq, 0, None, None),
+        };
+        Self {
+            top_k,
+            by,
+            extra,
+            extra_by,
+            floor,
+        }
+    }
+
+    pub fn width(self) -> usize {
+        self.top_k + self.extra
+    }
+
+    fn validate(self) -> Result<(), InvalidPanelRequest> {
+        if self.top_k == 0
+            || self
+                .top_k
+                .checked_add(self.extra)
+                .is_none_or(|width| width > 8)
+            || (self.extra > 0 && self.extra_by.is_none())
+            || self.floor.is_some_and(|floor| floor > 100)
+        {
+            return Err(InvalidPanelRequest("invalid class panel policy".into()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -211,15 +278,6 @@ pub struct PanelShortfall {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PanelSelectionPolicy {
-    DiversityFirst,
-    TopIq,
-    Mixed,
-    CheapestAdequate,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeatedSiblingVariant {
     Base,
@@ -245,7 +303,7 @@ pub struct SiblingCollapse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelPolicy {
-    pub selection: PanelSelectionPolicy,
+    pub selection: String,
     pub seated_variants: Vec<SeatedVariant>,
     pub sibling_collapses: Vec<SiblingCollapse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,11 +377,21 @@ pub fn select_panel_with_config(
     input: SelectPanelInput<'_>,
     config: &RoutingConfig,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
+    let policy = ClassPanelPolicy::default_for_class(input.panel_spec.class);
+    select_panel_with_policy(input, config, &policy)
+}
+
+pub fn select_panel_with_policy(
+    input: SelectPanelInput<'_>,
+    config: &RoutingConfig,
+    class_policy: &ClassPanelPolicy,
+) -> Result<SelectedPanel, InvalidPanelRequest> {
+    class_policy.validate()?;
     if input.selection != PanelSelection::Roster || input.package_tokens.is_none() {
-        return select_panel_admitted(&input, config);
+        return select_panel_admitted(&input, config, class_policy);
     }
     let tokens = input.package_tokens.unwrap();
-    let mut panel = select_panel_admitted(&input, config)?;
+    let mut panel = select_panel_admitted(&input, config, class_policy)?;
     let oversized = panel
         .members
         .iter()
@@ -360,7 +428,7 @@ pub fn select_panel_with_config(
         is_subscription_route: input.is_subscription_route,
         ..input
     };
-    let spares = select_panel_admitted(&automatic, config)?;
+    let spares = select_panel_admitted(&automatic, config, class_policy)?;
     let mut policy = spares.policy.expect("automatic selection records policy");
     let mut candidates = spares
         .members
@@ -485,8 +553,20 @@ fn package_refusal(tokens: usize, largest: usize) -> String {
 fn select_panel_admitted(
     input: &SelectPanelInput<'_>,
     config: &RoutingConfig,
+    class_policy: &ClassPanelPolicy,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
-    validate_panel_spec(&input.panel_spec)?;
+    // Class policy owns automatic panel width and quality, so panel_spec.size
+    // and panel_spec.iq_floor cannot invalidate it. The family rule below also
+    // comes from class policy, not panel_spec.diversity. Legacy rosters still
+    // validate and use their requested settings.
+    let mut validated_spec = input.panel_spec.clone();
+    let automatic = input.selection == PanelSelection::NPick;
+    if automatic {
+        validated_spec.size = class_policy.width();
+        validated_spec.iq_floor = 0.0;
+    }
+    validate_panel_spec(&validated_spec)?;
+    let width = validated_spec.size;
 
     let mut prompt_params: HashMap<String, VecDeque<Map<String, Value>>> = HashMap::new();
     let mut causes = Vec::new();
@@ -591,34 +671,14 @@ fn select_panel_admitted(
         .collect::<Vec<_>>();
     let admitted_count = admitted.len();
 
-    // Zero means no IQ requirement, matching singular route selection. The floor
-    // governs AUTOMATIC (n_pick) admission only: an explicit roster is the
-    // operator's statement of who sits, and every generic filter that has been
-    // allowed to override a pin has produced a silent-downgrade incident
-    // (exclusion dropped pinned Kimi 2026-07-21, family diversity dropped Opus
-    // beside Fable 2026-07-16, and the floor halved a pinned 4-seat audit to
-    // sol+opus 2026-08-06). Pins bypass the floor exactly as they bypass both.
-    let iq_bar = (input.selection == PanelSelection::NPick && input.panel_spec.iq_floor > 0.0)
-        .then(|| {
-            demand_bar(
-                top_routable_elo,
-                input.panel_spec.iq_floor,
-                config.demand_exponent,
-            )
-        });
+    let iq_bar = class_policy
+        .floor
+        .filter(|_| automatic)
+        .map(|floor| demand_bar(top_routable_elo, f64::from(floor), config.demand_exponent));
     let mut candidates = Vec::new();
     let mut largest_package_ceiling = None;
     for (admitted, is_subscription) in admitted {
         let model = admitted.route.capacity_key.clone();
-        if iq_bar.is_some_and(|bar| admitted.route.fact.scores.elo < bar) {
-            causes.push(PanelCause {
-                model,
-                reason: PanelCauseReason::BelowIqFloor,
-                reset_at_ms: None,
-                detail: None,
-            });
-            continue;
-        }
         if input.selection == PanelSelection::NPick && input.package_tokens.is_some() {
             let ceiling = seat_package_ceiling(
                 &admitted.route.route_key,
@@ -667,32 +727,18 @@ fn select_panel_admitted(
             speed_score: objective.speed_score,
         });
     }
-    let iq_eligible_count = candidates.len();
-
     let (mut candidates, sibling_collapses) = if input.selection == PanelSelection::NPick {
         collapse_siblings(
             candidates,
             &considered_facts,
             input.panel_spec.class,
-            input.panel_spec.iq_floor,
+            f64::from(class_policy.floor.unwrap_or(0)),
         )
     } else {
         (candidates, Vec::new())
     };
 
-    let selection_policy = selection_policy(&input.panel_spec);
-    order_candidates(
-        &mut candidates,
-        input.selection,
-        selection_policy,
-        input.panel_spec.diversity,
-    );
-
-    // Family rules police the AUTOMATIC picker only. An explicit roster is the
-    // caller's own diversity decision: pinning two same-family models means two
-    // seats, and an unlabeled family must not eject a pin.
-    let enforce_family_diversity = input.panel_spec.diversity == PanelDiversity::Family
-        && input.selection == PanelSelection::NPick;
+    let enforce_family_diversity = automatic;
     if enforce_family_diversity {
         candidates.retain(|candidate| match candidate.route.fact.family.as_ref() {
             Some(_) => true,
@@ -708,22 +754,66 @@ fn select_panel_admitted(
         });
     }
 
-    let mut selected = HashSet::new();
+    if automatic {
+        order_candidates(&mut candidates, class_policy.by);
+    } else {
+        candidates.sort_by(iq_cost_order);
+    }
+    let clears_bar =
+        |candidate: &Candidate| iq_bar.is_none_or(|bar| candidate.route.fact.scores.elo >= bar);
+    let iq_eligible_count = candidates
+        .iter()
+        .filter(|candidate| clears_bar(candidate))
+        .count();
+    let mut selected = Vec::new();
     let mut selected_families = HashSet::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        if selected.len() == input.panel_spec.size {
+        if selected.len() == if automatic { class_policy.top_k } else { width } {
             break;
+        }
+        if automatic && class_policy.by != PanelOrder::Iq && !clears_bar(candidate) {
+            causes.push(below_bar_cause(candidate));
+            continue;
         }
         if !enforce_family_diversity
             || selected_families.insert(candidate.route.fact.family.clone().unwrap())
         {
-            selected.insert(index);
+            selected.push(index);
         }
     }
 
-    if enforce_family_diversity && selected.len() < input.panel_spec.size {
+    if automatic && class_policy.extra > 0 {
+        let mut extras = (0..candidates.len())
+            .filter(|index| {
+                !selected_families.contains(candidates[*index].route.fact.family.as_ref().unwrap())
+            })
+            .collect::<Vec<_>>();
+        extras.retain(|index| {
+            if clears_bar(&candidates[*index]) {
+                true
+            } else {
+                causes.push(below_bar_cause(&candidates[*index]));
+                false
+            }
+        });
+        order_interim_extras(&mut extras, &candidates, class_policy.extra_by.unwrap());
+        let mut seated_extras = 0;
+        for index in extras {
+            if seated_extras == class_policy.extra {
+                break;
+            }
+            if selected_families.insert(candidates[index].route.fact.family.clone().unwrap()) {
+                selected.push(index);
+                seated_extras += 1;
+            }
+        }
+    }
+
+    if enforce_family_diversity && selected.len() < width {
         for (index, candidate) in candidates.iter().enumerate() {
-            if !selected.contains(&index) {
+            if !selected.contains(&index)
+                && selected_families.contains(candidate.route.fact.family.as_ref().unwrap())
+            {
                 causes.push(PanelCause {
                     model: candidate.route.capacity_key.clone(),
                     reason: PanelCauseReason::FamilyDuplicate,
@@ -734,20 +824,25 @@ fn select_panel_admitted(
         }
     }
 
-    let mut members = Vec::new();
+    // Preserve phase order even when an extra ranks ahead of a topK seat under
+    // a different ordering. Temperatures are assigned after slot order is fixed.
+    let mut ordered_members = Vec::new();
     let mut runner_up = Vec::new();
     for (index, candidate) in candidates.into_iter().enumerate() {
         let context_window = context_window_tokens(&candidate.route.fact);
-        if selected.contains(&index) {
-            members.push(PanelMember {
-                route_key: candidate.route.route_key,
-                prompt_params: candidate.prompt_params,
-                family: candidate.route.fact.family,
-                temperature: None,
-                max_output_tokens: candidate.route.fact.max_output_tokens,
-                context_window,
-            });
-        } else {
+        if let Some(slot) = selected.iter().position(|selected| *selected == index) {
+            ordered_members.push((
+                slot,
+                PanelMember {
+                    route_key: candidate.route.route_key,
+                    prompt_params: candidate.prompt_params,
+                    family: candidate.route.fact.family,
+                    temperature: None,
+                    max_output_tokens: candidate.route.fact.max_output_tokens,
+                    context_window,
+                },
+            ));
+        } else if !automatic || class_policy.by == PanelOrder::Iq || clears_bar(&candidate) {
             runner_up.push(PanelRunnerUp {
                 context_window,
                 route_key: candidate.route.route_key,
@@ -757,6 +852,11 @@ fn select_panel_admitted(
             });
         }
     }
+    ordered_members.sort_by_key(|(slot, _)| *slot);
+    let mut members = ordered_members
+        .into_iter()
+        .map(|(_, member)| member)
+        .collect::<Vec<_>>();
     if let Some(spread) = &input.panel_spec.temperature_spread {
         for (member, temperature) in members.iter_mut().zip(spread.iter().copied()) {
             member.temperature = Some(temperature);
@@ -769,12 +869,12 @@ fn select_panel_admitted(
             format!(
                 "only {} of {} requested panel slots can be served",
                 members.len(),
-                input.panel_spec.size
+                width
             ),
         )
     };
     let shortfall_kind = if input.package_tokens.is_some()
-        && members.len() < input.panel_spec.size
+        && members.len() < width
         && causes
             .iter()
             .any(|cause| cause.reason == PanelCauseReason::PackageTooLarge)
@@ -788,28 +888,35 @@ fn select_panel_admitted(
         ))
     } else if admitted_count == 0 {
         Some(size_reduced())
-    } else if let Some(bar) = iq_bar.filter(|_| iq_eligible_count == 0) {
+    } else if let Some(bar) = iq_bar.filter(|_| iq_eligible_count == 0 && members.len() < width) {
         Some((
             PanelShortfallCode::IqFloorUnmeetable,
-            format!("no admitted roster model clears raw iq floor {bar:.2}"),
+            format!("no admitted model clears demand bar {bar:.2}"),
         ))
-    } else if enforce_family_diversity && members.len() < input.panel_spec.size {
+    } else if enforce_family_diversity && members.len() < width {
         Some((
             PanelShortfallCode::DiversityUnmeetable,
             format!(
                 "only {} distinct labeled families can fill {} requested slots",
                 members.len(),
-                input.panel_spec.size
+                width
             ),
         ))
-    } else if members.len() < input.panel_spec.size {
+    } else if members.len() < width {
         Some(size_reduced())
     } else {
         None
     };
 
     let shortfall = shortfall_kind.map(|(code, detail)| {
-        if causes.is_empty() {
+        let missing_causes = if automatic {
+            width
+                .saturating_sub(members.len())
+                .saturating_sub(causes.len())
+        } else {
+            usize::from(causes.is_empty())
+        };
+        for _ in 0..missing_causes {
             causes.push(PanelCause {
                 model: "<unfilled-slot>".into(),
                 reset_at_ms: None,
@@ -828,7 +935,7 @@ fn select_panel_admitted(
         package_tokens: input.package_tokens,
         largest_package_ceiling,
         replacements: Vec::new(),
-        selection: selection_policy,
+        selection: "class_policy".into(),
         seated_variants: members
             .iter()
             .enumerate()
@@ -964,83 +1071,45 @@ fn fact_prompt_params(fact: &ModelFact) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn selection_policy(spec: &PanelSpec) -> PanelSelectionPolicy {
-    match spec.class {
-        PanelClass::Audit | PanelClass::Spec if spec.diversity == PanelDiversity::Family => {
-            PanelSelectionPolicy::DiversityFirst
-        }
-        PanelClass::DesignReview | PanelClass::Evaluate
-            if spec.diversity == PanelDiversity::Family =>
-        {
-            PanelSelectionPolicy::Mixed
-        }
-        PanelClass::Explain => PanelSelectionPolicy::CheapestAdequate,
-        PanelClass::Audit
-        | PanelClass::Spec
-        | PanelClass::DesignReview
-        | PanelClass::Evaluate
-        | PanelClass::Diagnose => PanelSelectionPolicy::TopIq,
+fn below_bar_cause(candidate: &Candidate) -> PanelCause {
+    PanelCause {
+        model: candidate.route.capacity_key.clone(),
+        reason: PanelCauseReason::BelowIqFloor,
+        reset_at_ms: None,
+        detail: None,
     }
 }
 
-fn order_candidates(
-    candidates: &mut [Candidate],
-    mode: PanelSelection,
-    policy: PanelSelectionPolicy,
-    diversity: PanelDiversity,
-) {
-    if mode == PanelSelection::Roster {
-        candidates.sort_by(iq_cost_order);
-        return;
-    }
+fn order_candidates(candidates: &mut [Candidate], order: PanelOrder) {
+    candidates.sort_by(|a, b| candidate_order(a, b, order));
+}
 
-    match policy {
-        PanelSelectionPolicy::CheapestAdequate => candidates.sort_by(cost_primary_order),
-        PanelSelectionPolicy::TopIq => candidates.sort_by(iq_lineage_order),
-        PanelSelectionPolicy::DiversityFirst => diversity_first_order(candidates, false),
-        PanelSelectionPolicy::Mixed => diversity_first_order(candidates, true),
-    }
-
-    if diversity == PanelDiversity::None && policy == PanelSelectionPolicy::DiversityFirst {
-        candidates.sort_by(iq_lineage_order);
+fn candidate_order(a: &Candidate, b: &Candidate, order: PanelOrder) -> Ordering {
+    match order {
+        PanelOrder::Iq => iq_lineage_order(a, b),
+        PanelOrder::Eq => b
+            .route
+            .fact
+            .scores
+            .eq
+            .total_cmp(&a.route.fact.scores.eq)
+            .then_with(|| iq_lineage_order(a, b)),
+        PanelOrder::Cost => cost_primary_order(a, b),
     }
 }
 
-fn diversity_first_order(candidates: &mut [Candidate], preserve_top_slot: bool) {
-    candidates.sort_by(iq_lineage_order);
-    if candidates.len() < 2 {
-        return;
-    }
-
-    let mut ordered_indices = Vec::with_capacity(candidates.len());
-    let mut seen_families = HashSet::new();
-    if preserve_top_slot {
-        ordered_indices.push(0);
-        seen_families.insert(candidates[0].route.fact.family.clone());
-    }
-    for (index, candidate) in candidates.iter().enumerate() {
-        if preserve_top_slot && index == 0 {
-            continue;
+// Random extras temporarily use route-key order until the seeded draw is
+// integrated. Ranked extras already use the same total orders as topK.
+fn order_interim_extras(indices: &mut [usize], candidates: &[Candidate], order: PanelExtraOrder) {
+    indices.sort_by(|a, b| {
+        let (a, b) = (&candidates[*a], &candidates[*b]);
+        match order {
+            PanelExtraOrder::Random => a.route.route_key.cmp(&b.route.route_key),
+            PanelExtraOrder::Iq => candidate_order(a, b, PanelOrder::Iq),
+            PanelExtraOrder::Eq => candidate_order(a, b, PanelOrder::Eq),
+            PanelExtraOrder::Cost => candidate_order(a, b, PanelOrder::Cost),
         }
-        if seen_families.insert(candidate.route.fact.family.clone()) {
-            ordered_indices.push(index);
-        }
-    }
-    for index in 0..candidates.len() {
-        if !ordered_indices.contains(&index) {
-            ordered_indices.push(index);
-        }
-    }
-
-    let mut old_positions: Vec<usize> = (0..candidates.len()).collect();
-    for (new_position, &wanted_old_position) in ordered_indices.iter().enumerate() {
-        let current_position = old_positions
-            .iter()
-            .position(|position| *position == wanted_old_position)
-            .expect("candidate permutation is complete");
-        candidates.swap(new_position, current_position);
-        old_positions.swap(new_position, current_position);
-    }
+    });
 }
 
 fn iq_cost_order(a: &Candidate, b: &Candidate) -> Ordering {
