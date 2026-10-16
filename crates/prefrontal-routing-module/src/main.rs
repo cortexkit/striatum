@@ -10612,7 +10612,7 @@ mod tests {
             package_tokens: None,
             largest_package_ceiling: None,
             replacements: Vec::new(),
-            selection: prefrontal_routing_core::PanelSelectionPolicy::TopIq,
+            selection: "class_policy".into(),
             seated_variants: vec![prefrontal_routing_core::SeatedVariant {
                 slot: 0,
                 route_key: "openai/gpt-5.6-sol-pro".into(),
@@ -10640,7 +10640,7 @@ mod tests {
         let explanation: serde_json::Value =
             serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
         assert_eq!(explanation["selection"], "n_pick");
-        assert_eq!(explanation["policy"]["selection"], "top_iq");
+        assert_eq!(explanation["policy"]["selection"], "class_policy");
     }
 
     #[test]
@@ -10664,7 +10664,7 @@ mod tests {
             runner_up: Vec::new(),
             shortfall: None,
             policy: Some(prefrontal_routing_core::PanelPolicy {
-                selection: prefrontal_routing_core::PanelSelectionPolicy::DiversityFirst,
+                selection: "class_policy".into(),
                 seated_variants: Vec::new(),
                 sibling_collapses: Vec::new(),
                 package_tokens: Some(227_000),
