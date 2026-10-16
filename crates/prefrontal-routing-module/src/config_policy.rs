@@ -1,0 +1,250 @@
+//! Closed operator policy shapes. Consumer admission and panel selection read
+//! these values from the same immutable snapshot as the model overrides.
+
+use schemars::{JsonSchema, Schema};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn present_value<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExcludeGroups {
+    pub all: Vec<String>,
+    pub mason: Vec<String>,
+    pub sidekick: Vec<String>,
+    pub athena: Vec<String>,
+    pub lab: Vec<String>,
+    pub core: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Ranking {
+    Iq,
+    Eq,
+    Cost,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtraRanking {
+    Random,
+    Iq,
+    Eq,
+    Cost,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[schemars(transform = panel_constraints)]
+pub struct PanelPolicy {
+    #[serde(rename = "topK")]
+    #[schemars(range(min = 1, max = 8))]
+    pub top_k: u8,
+    pub by: Ranking,
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 7))]
+    pub extra: u8,
+    #[serde(
+        rename = "extraBy",
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "ExtraRanking", !default)]
+    pub extra_by: Option<ExtraRanking>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "u8", !default)]
+    #[schemars(range(min = 0, max = 100))]
+    pub floor: Option<u8>,
+}
+
+impl PanelPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.top_k == 0 || u16::from(self.top_k) + u16::from(self.extra) > 8 {
+            return Err("topK must be >= 1 and topK + extra must be <= 8".into());
+        }
+        if self.extra > 0 && self.extra_by.is_none() {
+            return Err("extraBy is required when extra > 0".into());
+        }
+        if self.floor.is_some_and(|floor| floor > 100) {
+            return Err("floor must be an integer from 0 to 100".into());
+        }
+        Ok(())
+    }
+}
+
+// JSON Schema cannot add two properties, so enumerate the eight possible
+// topK values to express the same width cap used by runtime validation.
+fn panel_constraints(schema: &mut Schema) {
+    let mut constraints = vec![serde_json::json!({
+        "if": {"required": ["extra"], "properties": {"extra": {"minimum": 1}}},
+        "then": {"required": ["extraBy"], "properties": {"extraBy": {"type": "string"}}}
+    })];
+    for top_k in 1..=8 {
+        constraints.push(serde_json::json!({
+            "if": {"properties": {"topK": {"const": top_k}}},
+            "then": {"properties": {"extra": {"maximum": 8 - top_k}}}
+        }));
+    }
+    schema.insert("allOf".into(), constraints.into());
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PanelPolicies {
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "PanelPolicy", !default)]
+    pub audit: Option<PanelPolicy>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "PanelPolicy", !default)]
+    pub design_review: Option<PanelPolicy>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "PanelPolicy", !default)]
+    pub diagnose: Option<PanelPolicy>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "PanelPolicy", !default)]
+    pub evaluate: Option<PanelPolicy>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "PanelPolicy", !default)]
+    pub explain: Option<PanelPolicy>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "PanelPolicy", !default)]
+    pub spec: Option<PanelPolicy>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "PanelPolicy", !default)]
+    pub lab: Option<PanelPolicy>,
+}
+
+impl PanelPolicies {
+    pub fn validate(&self) -> Result<(), String> {
+        for (class, policy) in [
+            ("audit", &self.audit),
+            ("design_review", &self.design_review),
+            ("diagnose", &self.diagnose),
+            ("evaluate", &self.evaluate),
+            ("explain", &self.explain),
+            ("spec", &self.spec),
+            ("lab", &self.lab),
+        ] {
+            if let Some(policy) = policy {
+                policy
+                    .validate()
+                    .map_err(|error| format!("model_routing.panels.{class}: {error}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SynthesizerPin {
+    #[schemars(regex(pattern = r"^[^/\s]+/[^\s]+$"))]
+    pub model: String,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "String", !default, regex(pattern = r"\S"))]
+    pub variant: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LabPlannerPin {
+    #[schemars(regex(pattern = r"^[^/\s]+/[^\s]+$"))]
+    pub model: String,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Pins {
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "SynthesizerPin", !default)]
+    pub synthesizer: Option<SynthesizerPin>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "LabPlannerPin", !default)]
+    pub lab_planner: Option<LabPlannerPin>,
+}
+
+impl Pins {
+    pub fn validate(&self) -> Result<(), String> {
+        for (slot, model) in [
+            (
+                "synthesizer",
+                self.synthesizer.as_ref().map(|pin| pin.model.as_str()),
+            ),
+            (
+                "lab_planner",
+                self.lab_planner.as_ref().map(|pin| pin.model.as_str()),
+            ),
+        ] {
+            if let Some(model) = model {
+                if !model
+                    .split_once('/')
+                    .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty())
+                    || model.chars().any(char::is_whitespace)
+                {
+                    return Err(format!(
+                        "model_routing.pins.{slot}.model must be provider/model"
+                    ));
+                }
+            }
+        }
+        if self
+            .synthesizer
+            .as_ref()
+            .and_then(|pin| pin.variant.as_ref())
+            .is_some_and(|variant| variant.trim().is_empty())
+        {
+            return Err("model_routing.pins.synthesizer.variant must be non-empty".into());
+        }
+        Ok(())
+    }
+}

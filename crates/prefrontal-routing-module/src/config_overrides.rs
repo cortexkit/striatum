@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::config_policy::{ExcludeGroups, PanelPolicies, Pins};
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
     make_capacity_key, make_route_key, FailureBackoffConfig, FamilySource, GrandFamily,
@@ -18,18 +19,23 @@ use prefrontal_routing_core::{
 };
 #[cfg(test)]
 use prefrontal_routing_core::{model_facts_seed, CatalogFactField, FactSource};
+use schemars::JsonSchema;
 use serde::de::{MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
-const CONFIG_RELATIVE_PATH: &str = "cortexkit/alfonso-routing.jsonc";
+const CONFIG_RELATIVE_PATH: &str = "cortexkit/prefrontal-routing.jsonc";
+const OLD_CONFIG_BASENAME: &str = "alfonso-routing.jsonc";
 pub const DEFAULT_AA_API_KEY_REF: &str = "apikey:artificial-analysis";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
 
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+mod contract_tests;
 
 /// A complete, validated document held for the lifetime of one selection. Model
 /// overrides are overlays, not store writes: withdrawing one exposes stored facts
@@ -42,9 +48,15 @@ pub struct LiveConfig {
 
 type FileStamp = Option<(SystemTime, u64)>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ConfigStamp {
+    current: FileStamp,
+    old: FileStamp,
+}
+
 struct LiveConfigCache {
-    stamp: FileStamp,
-    pending: Option<(FileStamp, Instant)>,
+    stamp: ConfigStamp,
+    pending: Option<(ConfigStamp, Instant)>,
     active: Arc<LiveConfig>,
 }
 
@@ -54,73 +66,137 @@ fn live_configs() -> &'static Mutex<HashMap<PathBuf, LiveConfigCache>> {
 }
 
 pub fn live_config(path: &Path) -> Arc<LiveConfig> {
-    live_config_at(path, Instant::now())
+    live_config_at(path, Instant::now()).unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// Refuse invalid operator settings before serving requests, so startup cannot
+/// silently allow models that the operator intended to exclude.
+pub fn initialize_config(path: &Path) -> Result<(), String> {
+    live_config_at(path, Instant::now()).map(|_| ())
 }
 
 #[cfg(test)]
 pub(crate) fn settle_live_config(path: &Path) -> Arc<LiveConfig> {
     let now = Instant::now();
-    live_config_at(path, now);
-    live_config_at(path, now + RELOAD_DEBOUNCE)
+    live_config_at(path, now).unwrap();
+    live_config_at(path, now + RELOAD_DEBOUNCE).unwrap()
 }
 
-fn live_config_at(path: &Path, now: Instant) -> Arc<LiveConfig> {
-    let mut caches = live_configs().lock().unwrap();
-    let stamp = match std::fs::metadata(path) {
-        Ok(metadata) => Some((
+fn file_stamp(path: &Path) -> Result<FileStamp, String> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((
             metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             metadata.len(),
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            eprintln!(
-                "[prefrontal-routing] routing-config-reload-rejected: {}: {error}",
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("reading {}: {error}", path.display())),
+    }
+}
+
+fn old_config_path(path: &Path) -> Option<PathBuf> {
+    (path.file_name()? == "prefrontal-routing.jsonc")
+        .then(|| path.with_file_name(OLD_CONFIG_BASENAME))
+}
+
+fn reject_old_config(path: &Path, stamp: ConfigStamp) -> Result<(), String> {
+    if stamp.old.is_some() {
+        let old = old_config_path(path).expect("old-name stamp has an old-name path");
+        return Err(if stamp.current.is_some() {
+            format!(
+                "config_renamed: delete {}; routing reads {}",
+                old.display(),
                 path.display()
-            );
-            return caches
-                .get(path)
-                .map(|cache| Arc::clone(&cache.active))
-                .unwrap_or_default();
+            )
+        } else {
+            format!(
+                "config_renamed: move {} to {}",
+                old.display(),
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
+    let json = jsonc_to_json(document)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    // Report the removed `aa` key with deletion guidance before checking unknown
+    // fields, including when its value is null.
+    if value.get("aa").is_some() {
+        return Err("config_key_removed: aa; delete this key".into());
+    }
+    if value
+        .get("model_routing")
+        .and_then(|section| section.get("exclude"))
+        .is_some_and(serde_json::Value::is_array)
+    {
+        return Err("exclude_shape: model_routing.exclude must be an object; move the array to model_routing.exclude.all".into());
+    }
+    // Parse the original text so ordered model_families rules retain their order.
+    let config: RoutingConfigFile =
+        serde_json::from_str(&json).map_err(|error| format!("invalid routing config: {error}"))?;
+    validate_live_config(&config)?;
+    Ok(config)
+}
+
+fn live_config_at(path: &Path, now: Instant) -> Result<Arc<LiveConfig>, String> {
+    live_config_at_with_reporter(path, now, |error| {
+        eprintln!("[prefrontal-routing] routing-config-reload-rejected: {}: {error}; keeping last good config", path.display());
+    })
+}
+
+fn live_config_at_with_reporter(
+    path: &Path,
+    now: Instant,
+    mut report_rejection: impl FnMut(&str),
+) -> Result<Arc<LiveConfig>, String> {
+    let mut caches = live_configs().lock().unwrap();
+    let stamp: Result<ConfigStamp, String> = (|| {
+        Ok(ConfigStamp {
+            current: file_stamp(path)?,
+            old: old_config_path(path)
+                .map(|old| file_stamp(&old))
+                .transpose()?
+                .flatten(),
+        })
+    })();
+    let stamp = match stamp {
+        Ok(stamp) => stamp,
+        Err(error) => {
+            let Some(cache) = caches.get(path) else {
+                return Err(error);
+            };
+            report_rejection(&error);
+            return Ok(Arc::clone(&cache.active));
         }
     };
     if let Some(cache) = caches.get_mut(path) {
         if cache.stamp == stamp {
             cache.pending = None;
-            return Arc::clone(&cache.active);
+            return Ok(Arc::clone(&cache.active));
         }
         match &cache.pending {
             Some((pending, since))
                 if *pending == stamp
                     && now.saturating_duration_since(*since) >= RELOAD_DEBOUNCE => {}
-            Some((pending, _)) if *pending == stamp => return Arc::clone(&cache.active),
+            Some((pending, _)) if *pending == stamp => return Ok(Arc::clone(&cache.active)),
             _ => {
                 cache.pending = Some((stamp, now));
-                return Arc::clone(&cache.active);
+                return Ok(Arc::clone(&cache.active));
             }
         }
     }
     let next = (|| {
+        reject_old_config(path, stamp)?;
         let document = match std::fs::read_to_string(path) {
             Ok(document) => Some(document),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.to_string()),
         };
         let config = match &document {
-            Some(document) => {
-                let json = jsonc_to_json(document)?;
-                let value: serde_json::Value =
-                    serde_json::from_str(&json).map_err(|error| error.to_string())?;
-                if value
-                    .get("aa")
-                    .is_some_and(|aa| aa.get("api_key").is_some())
-                {
-                    return Err("aa.api_key is forbidden; use aa.api_key_ref".into());
-                }
-                let config: RoutingConfigFile =
-                    serde_json::from_str(&json).map_err(|error| error.to_string())?;
-                validate_live_config(&config)?;
-                config
-            }
+            Some(document) => parse_config(document)?,
             None => RoutingConfigFile::default(),
         };
         Ok(LiveConfig { config, document })
@@ -128,11 +204,11 @@ fn live_config_at(path: &Path, now: Instant) -> Arc<LiveConfig> {
     let active = match next {
         Ok(config) => Arc::new(config),
         Err(error) => {
-            eprintln!("[prefrontal-routing] routing-config-reload-rejected: {}: {error}; keeping last good config", path.display());
-            caches
-                .get(path)
-                .map(|cache| Arc::clone(&cache.active))
-                .unwrap_or_default()
+            let Some(cache) = caches.get(path) else {
+                return Err(error);
+            };
+            report_rejection(&error);
+            Arc::clone(&cache.active)
         }
     };
     caches.insert(
@@ -143,7 +219,7 @@ fn live_config_at(path: &Path, now: Instant) -> Arc<LiveConfig> {
             active: Arc::clone(&active),
         },
     );
-    active
+    Ok(active)
 }
 
 fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
@@ -171,21 +247,8 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
     {
         return Err("elo_overrides must be positive".into());
     }
-    if config
-        .aa
-        .as_ref()
-        .is_some_and(|aa| aa.review_by_days == Some(0))
-    {
-        return Err("aa.review_by_days must be positive".into());
-    }
-    if config
-        .aa
-        .as_ref()
-        .and_then(|aa| aa.api_key_ref.as_ref())
-        .is_some_and(|reference| reference.trim().is_empty())
-    {
-        return Err("aa.api_key_ref must be a non-empty credential id".into());
-    }
+    section.panels.validate()?;
+    section.pins.validate()?;
     for (provider, value) in &section.subscription_multipliers {
         if provider.trim().is_empty() || !value.is_finite() || *value <= 0.0 {
             return Err(format!("invalid subscription_multiplier for {provider}"));
@@ -233,6 +296,18 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
 }
 
 impl LiveConfig {
+    pub fn exclude_groups(&self) -> &ExcludeGroups {
+        &self.config.model_routing.exclude
+    }
+
+    pub fn panels(&self) -> &PanelPolicies {
+        &self.config.model_routing.panels
+    }
+
+    pub fn pins(&self) -> &Pins {
+        &self.config.model_routing.pins
+    }
+
     pub fn policy_revision(&self) -> String {
         self.document
             .as_deref()
@@ -243,7 +318,7 @@ impl LiveConfig {
     pub fn operator_policy(&self) -> ModelRoutingPolicyInput {
         let section = &self.config.model_routing;
         ModelRoutingPolicyInput {
-            exclude: clean_spec_entries(section.exclude.clone()),
+            exclude: clean_spec_entries(section.exclude.all.clone()),
             subscription: clean_spec_entries(section.subscription.clone()),
             explicit_only_providers: clean_spec_entries(section.explicit_only_providers.clone()),
             score_alias: section.score_alias.clone(),
@@ -280,23 +355,7 @@ impl LiveConfig {
     }
 
     pub fn aa_config(&self) -> AaConfig {
-        self.config
-            .aa
-            .as_ref()
-            .map(|aa| AaConfig {
-                api_key_ref: Some(
-                    aa.api_key_ref
-                        .as_ref()
-                        .map(|reference| reference.trim().to_string())
-                        .unwrap_or_else(|| DEFAULT_AA_API_KEY_REF.into()),
-                ),
-                model_map: aa.model_map.clone(),
-                review_by_ms: aa
-                    .review_by_days
-                    .map(|days| days.saturating_mul(86_400_000).min(i64::MAX as u64) as i64)
-                    .unwrap_or(DEFAULT_AA_REVIEW_BY_MS),
-            })
-            .unwrap_or_default()
+        AaConfig::default()
     }
 
     pub fn providers_without_prompt_cache(&self) -> Vec<String> {
@@ -466,18 +525,18 @@ mod live_snapshot_tests {
         )
         .unwrap();
         let now = Instant::now();
-        let held = live_config_at(&path, now);
+        let held = live_config_at(&path, now).unwrap();
         std::fs::write(
             &path,
             r#"{"model_routing":{"explicit_only_providers":["other-provider"]}}"#,
         )
         .unwrap();
-        assert!(Arc::ptr_eq(&held, &live_config_at(&path, now)));
+        assert!(Arc::ptr_eq(&held, &live_config_at(&path, now).unwrap()));
         assert!(Arc::ptr_eq(
             &held,
-            &live_config_at(&path, now + RELOAD_DEBOUNCE / 2)
+            &live_config_at(&path, now + RELOAD_DEBOUNCE / 2).unwrap()
         ));
-        let published = live_config_at(&path, now + RELOAD_DEBOUNCE);
+        let published = live_config_at(&path, now + RELOAD_DEBOUNCE).unwrap();
         assert_eq!(
             published.operator_policy().explicit_only_providers,
             ["other-provider"]
@@ -487,9 +546,9 @@ mod live_snapshot_tests {
         std::fs::remove_file(&path).unwrap();
         assert!(Arc::ptr_eq(
             &published,
-            &live_config_at(&path, now + RELOAD_DEBOUNCE)
+            &live_config_at(&path, now + RELOAD_DEBOUNCE).unwrap()
         ));
-        let defaults = live_config_at(&path, now + RELOAD_DEBOUNCE * 2);
+        let defaults = live_config_at(&path, now + RELOAD_DEBOUNCE * 2).unwrap();
         assert!(defaults
             .operator_policy()
             .explicit_only_providers
@@ -521,23 +580,28 @@ pub fn default_providers_without_prompt_cache() -> Vec<String> {
     vec!["ollama-cloud".to_string()]
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RoutingConfigFile {
     #[serde(default)]
     model_routing: ModelRoutingSection,
     #[serde(default)]
     model_families: ModelFamilyRules,
     #[serde(default)]
-    aa: Option<AaSection>,
-    #[serde(default)]
     catalog: CatalogSection,
     #[serde(default)]
     account_selection: AccountSelectionFlags,
 }
 
+/// Regenerate with `cargo run -p prefrontal-routing-module --bin ck-prefrontal-routing -- --print-config-schema`.
+pub fn routing_config_schema() -> String {
+    serde_json::to_string_pretty(&schemars::schema_for!(RoutingConfigFile)).unwrap() + "\n"
+}
+
 /// The account-selection rollout flags (`"account_selection"` in the routing
 /// file). Both are off unless the file turns them on.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AccountSelectionFlags {
     /// Serve `route.account_for` and accept its reports. Off: every account
     /// operation refuses with `account_selection_disabled`.
@@ -555,9 +619,11 @@ pub fn account_selection_flags(path: &Path) -> AccountSelectionFlags {
     live_config(path).account_flags()
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CatalogSection {
     #[serde(default)]
+    #[schemars(range(min = 1))]
     poll_ms: Option<u64>,
 }
 
@@ -569,6 +635,31 @@ struct ModelFamilyRule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelFamilyRules(Vec<ModelFamilyRule>);
+
+impl Serialize for ModelFamilyRules {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for rule in &self.0 {
+            map.serialize_entry(&rule.family, &rule.globs)?;
+        }
+        map.end()
+    }
+}
+
+impl JsonSchema for ModelFamilyRules {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ModelFamilyRules".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let properties: serde_json::Map<String, serde_json::Value> = Self::default().0.iter().map(|rule| {
+            let family = serde_json::to_value(rule.family).unwrap().as_str().unwrap().to_owned();
+            (family, serde_json::json!({"type": "array", "items": {"type": "string", "pattern": "\\S"}}))
+        }).collect();
+        schemars::json_schema!({"type": "object", "additionalProperties": false, "properties": properties})
+    }
+}
 
 impl Default for ModelFamilyRules {
     fn default() -> Self {
@@ -647,43 +738,6 @@ impl<'de> Deserialize<'de> for ModelFamilyRules {
     }
 }
 
-/// Artificial Analysis ingest settings. Credential bytes stay in claustrum.
-///
-/// The operator-owned config uses explicit router-key-to-AA-slug entries because
-/// accepting approximate model names could attach a score to the wrong route:
-///
-/// ```jsonc
-/// aa: {
-///   api_key_ref: "apikey:artificial-analysis",
-///   model_map: {
-///     "google/gemini-3.8-flash": "gemini-3-8-flash",
-///     "ollama-cloud/glm-5.3": "glm-5-3",
-///     "ollama-cloud/glm-5.3-flash": "glm-5-3-flash",
-///   },
-/// }
-/// ```
-#[derive(Deserialize, Default, Clone)]
-pub struct AaSection {
-    #[serde(default)]
-    pub api_key_ref: Option<String>,
-    /// Explicit router key (`provider/model[/variant]`) → AA slug. No fuzzy join.
-    #[serde(default)]
-    pub model_map: HashMap<String, String>,
-    /// Days until an `aa_inferred` row is flagged past-due. Default 14.
-    #[serde(default)]
-    pub review_by_days: Option<u64>,
-}
-
-impl std::fmt::Debug for AaSection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AaSection")
-            .field("api_key_ref", &self.api_key_ref)
-            .field("model_map", &self.model_map)
-            .field("review_by_days", &self.review_by_days)
-            .finish()
-    }
-}
-
 /// Default review window for an AA-inferred score: two weeks.
 pub const DEFAULT_AA_REVIEW_BY_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 
@@ -714,62 +768,18 @@ impl Default for AaConfig {
     }
 }
 
-/// Read the AA ingest section. Missing file or section disables ingest. A
-/// present section defaults to the operator's claustrum credential ID.
-#[cfg(test)]
-pub fn read_aa_config(path: &Path) -> Result<AaConfig, String> {
-    let document = match std::fs::read_to_string(path) {
-        Ok(document) => document,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AaConfig::default());
-        }
-        Err(error) => return Err(format!("reading {}: {error}", path.display())),
-    };
-    let json = jsonc_to_json(&document)
-        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
-    let raw: serde_json::Value = serde_json::from_str(&json)
-        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
-    if raw
-        .get("aa")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|aa| aa.contains_key("api_key"))
-    {
-        return Err(
-            "aa.api_key is not accepted; set aa.api_key_ref and store the secret with `ck auth put --id apikey:artificial-analysis --kind api_key`"
-                .to_string(),
-        );
-    }
-    let config: RoutingConfigFile = serde_json::from_value(raw)
-        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
-    let Some(aa) = config.aa else {
-        return Ok(AaConfig::default());
-    };
-    let review_by_ms = match aa.review_by_days {
-        Some(days) if days > 0 => (days as i64).saturating_mul(24 * 60 * 60 * 1000),
-        Some(_) => {
-            return Err("aa.review_by_days must be a positive integer".to_string());
-        }
-        None => DEFAULT_AA_REVIEW_BY_MS,
-    };
-    let api_key_ref = match aa.api_key_ref {
-        Some(reference) if reference.trim().is_empty() => {
-            return Err("aa.api_key_ref must be a non-empty credential id".to_string());
-        }
-        Some(reference) => reference.trim().to_string(),
-        None => DEFAULT_AA_API_KEY_REF.to_string(),
-    };
-    Ok(AaConfig {
-        api_key_ref: Some(api_key_ref),
-        model_map: aa.model_map,
-        review_by_ms,
-    })
-}
-
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(transform = routing_schema_constraints)]
 struct ModelRoutingSection {
-    /// Providers and models excluded from every automatic routing pool.
+    /// Excluded providers or routes by consumer. The `all` list applies to every
+    /// consumer; a negated entry in another list cannot remove its exclusions.
     #[serde(default)]
-    exclude: Vec<String>,
+    exclude: ExcludeGroups,
+    #[serde(default)]
+    panels: PanelPolicies,
+    #[serde(default)]
+    pins: Pins,
     /// Providers and models priced as subscription-backed in addition to auth facts.
     #[serde(default)]
     subscription: Vec<String>,
@@ -790,6 +800,7 @@ struct ModelRoutingSection {
     elo_overrides: HashMap<String, f64>,
     /// Power-curve exponent mapping caller IQ demand to the request frontier.
     #[serde(default)]
+    #[schemars(transform = positive_number)]
     demand_exponent: Option<f64>,
     /// Over-qualification term added to selection cost for routes far above the
     /// request's iq demand. Absent fields take the routing-core defaults.
@@ -801,6 +812,7 @@ struct ModelRoutingSection {
     min_best_effort_adequacy: Option<f64>,
     /// Terminal send failures required before the route-local safety backoff starts.
     #[serde(default, alias = "consecutiveTerminalFailureThreshold")]
+    #[schemars(range(min = 1))]
     consecutive_terminal_failure_threshold: Option<u32>,
     /// Providers that do not expose prompt-cache reads or writes. Gather seats
     /// avoid these providers when a cache-capable adequate route exists.
@@ -821,6 +833,49 @@ struct ModelRoutingSection {
     keep_free_percent: HashMap<String, f64>,
 }
 
+// Schemars emits canonical names only; serde also accepts these aliases, but
+// refuses a document containing both names for the same field.
+fn routing_schema_constraints(schema: &mut schemars::Schema) {
+    let aliases = [
+        (
+            "consecutive_terminal_failure_threshold",
+            "consecutiveTerminalFailureThreshold",
+        ),
+        (
+            "providers_without_prompt_cache",
+            "providersWithoutPromptCache",
+        ),
+    ];
+    let properties = schema
+        .get_mut("properties")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    for (canonical, alias) in aliases {
+        properties.insert(alias.into(), properties[canonical].clone());
+    }
+    for field in ["elo_overrides", "subscription_multipliers"] {
+        properties[field]["additionalProperties"]["exclusiveMinimum"] = serde_json::json!(0);
+    }
+    for field in ["subscription_multipliers", "keep_free_percent"] {
+        properties[field]["propertyNames"] = serde_json::json!({"pattern": "\\S"});
+    }
+    properties["keep_free_percent"]["additionalProperties"]["minimum"] = serde_json::json!(0);
+    properties["keep_free_percent"]["additionalProperties"]["maximum"] = serde_json::json!(100);
+    schema.insert(
+        "allOf".into(),
+        aliases
+            .into_iter()
+            .map(|(canonical, alias)| serde_json::json!({"not": {"required": [canonical, alias]}}))
+            .collect::<Vec<_>>()
+            .into(),
+    );
+}
+
+fn positive_number(schema: &mut schemars::Schema) {
+    schema.insert("exclusiveMinimum".into(), serde_json::json!(0));
+}
+
 impl Default for ModelRoutingSection {
     fn default() -> Self {
         serde_json::from_str("{}").expect("empty model routing section")
@@ -831,11 +886,14 @@ impl Default for ModelRoutingSection {
 /// the iq demand (both on the 0..100 demand scale) is at most `threshold`, else
 /// `base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.
 /// `base: 0` switches the term off.
-#[derive(Debug, Deserialize, Default, Clone, Copy)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct OverqualificationSection {
+    #[schemars(range(min = 0))]
     threshold: Option<f64>,
+    #[schemars(transform = positive_number)]
     doubling: Option<f64>,
+    #[schemars(range(min = 0))]
     base: Option<f64>,
 }
 
@@ -861,23 +919,30 @@ impl OverqualificationSection {
 
 /// One per-model override. Every field is optional: a present field is operator-owned,
 /// while a withdrawn field returns to its non-override authority.
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ModelFactOverride {
     /// Outer None means absent; Some(None) means an explicit JSON null clears it.
     #[serde(default, deserialize_with = "deserialize_family_override")]
     family: Option<Option<String>>,
+    #[schemars(transform = positive_number)]
     elo: Option<f64>,
+    #[schemars(transform = positive_number)]
     eq: Option<f64>,
+    #[schemars(range(min = 0))]
     speed: Option<f64>,
+    #[schemars(range(min = 0))]
     cost_per_mtok_out: Option<f64>,
+    #[schemars(transform = positive_number)]
     context_window: Option<f64>,
     vision: Option<bool>,
+    #[schemars(range(max = 2), transform = positive_number)]
     speed_multiplier: Option<f64>,
     /// Subscription subsidy multiplier: divides the route's list price to yield its
     /// effective price. 1.0 (or absent) means "no subsidy known"; larger values make
     /// the route proportionally cheaper than list. Validated at load (must be finite
     /// and > 0); an invalid value is rejected and logged, not applied.
+    #[schemars(transform = positive_number)]
     subscription_multiplier: Option<f64>,
 }
 
@@ -1645,13 +1710,11 @@ fn parse_operator_routing_policy(
     path: &Path,
     document: &str,
 ) -> Result<ModelRoutingPolicyInput, String> {
-    let json = jsonc_to_json(document)
-        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
-    let config: RoutingConfigFile = serde_json::from_str(&json)
+    let config = parse_config(document)
         .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
     let section = config.model_routing;
     Ok(ModelRoutingPolicyInput {
-        exclude: clean_spec_entries(section.exclude),
+        exclude: clean_spec_entries(section.exclude.all),
         subscription: clean_spec_entries(section.subscription),
         explicit_only_providers: clean_spec_entries(section.explicit_only_providers),
         score_alias: section
@@ -1885,29 +1948,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plaintext_aa_api_key_is_refused_with_vault_cutover_guidance() {
-        let path = prefrontal_test_support::scratch_root().join(format!(
-            "prefrontal-routing-aa-config-{}.jsonc",
-            std::process::id()
-        ));
-        std::fs::write(&path, r#"{ "aa": { "api_key": "must-not-load" } }"#).unwrap();
-
-        let error = read_aa_config(&path).expect_err("plaintext credentials must be refused");
-
-        assert!(error.contains("api_key_ref"));
-        assert!(error.contains("ck auth put --id apikey:artificial-analysis --kind api_key"));
-
-        std::fs::write(&path, r#"{ "aa": {} }"#).unwrap();
-        assert_eq!(
-            read_aa_config(&path).unwrap().api_key_ref.as_deref(),
-            Some(DEFAULT_AA_API_KEY_REF)
-        );
-        std::fs::write(&path, r#"{ "model_routing": {} }"#).unwrap();
-        assert_eq!(read_aa_config(&path).unwrap().api_key_ref, None);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
     fn parses_provider_model_and_variant_keys() {
         assert_eq!(
             parse_model_key("openai/gpt-5.5"),
@@ -2001,7 +2041,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let db_path = root.join("store.sqlite");
-        let config_path = root.join("alfonso-routing.jsonc");
+        let config_path = root.join("prefrontal-routing.jsonc");
         let descriptor = dev_descriptor(label, db_path.to_string_lossy().into_owned());
         (
             root,
@@ -2239,7 +2279,15 @@ mod tests {
         let (root, _config_path, store) = family_rule_rig("example-coverage");
         let example = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets/alfonso-routing.example.jsonc");
-        apply_overrides_from_config(&store, &example).unwrap();
+        // Check that the example's model_families rules cover every catalog row
+        // without validating unrelated example settings.
+        #[derive(Deserialize)]
+        struct FamilyOnly {
+            model_families: ModelFamilyRules,
+        }
+        let document = jsonc_to_json(&std::fs::read_to_string(example).unwrap()).unwrap();
+        let families: FamilyOnly = serde_json::from_str(&document).unwrap();
+        apply_family_rules(&store, &families.model_families, &HashMap::new()).unwrap();
         let facts = store.get_facts().unwrap();
         let absent = facts.iter().filter(|fact| fact.family.is_none()).count();
         assert_eq!(
@@ -2294,7 +2342,7 @@ mod tests {
                 }
             }
         }"#;
-        let config_path = dir.join("alfonso-routing.jsonc");
+        let config_path = dir.join("prefrontal-routing.jsonc");
         std::fs::write(&config_path, config_content).unwrap();
 
         let outcome = apply_overrides_from_config(&store, &config_path).unwrap();
@@ -2404,7 +2452,7 @@ mod tests {
                 }
             }
         }"#;
-        let config_path = dir.join("alfonso-routing.jsonc");
+        let config_path = dir.join("prefrontal-routing.jsonc");
         std::fs::write(&config_path, config_content).unwrap();
 
         let outcome = apply_overrides_from_config(&store, &config_path).unwrap();
@@ -2593,7 +2641,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("alfonso-routing.jsonc");
+        let config_path = dir.join("prefrontal-routing.jsonc");
         std::fs::write(
             &config_path,
             r#"{"model_routing":{"subscription_multipliers":{"openai":33.0},"models":{"openai/gpt-5.5":{"speed_multiplier":0.5}}}}"#,
@@ -2755,7 +2803,7 @@ mod tests {
         );
 
         // File with the key → returns clamped value.
-        let config_path = dir.join("alfonso-routing.jsonc");
+        let config_path = dir.join("prefrontal-routing.jsonc");
         std::fs::write(
             &config_path,
             r#"{ "model_routing": { "min_best_effort_adequacy": 0.35 } }"#,
@@ -2801,7 +2849,7 @@ mod tests {
             vec!["ollama-cloud"]
         );
 
-        let path = dir.join("alfonso-routing.jsonc");
+        let path = dir.join("prefrontal-routing.jsonc");
         std::fs::write(
             &path,
             r#"{"model_routing":{"providers_without_prompt_cache":["ollama-cloud"," custom ","ollama-cloud"]}}"#,
@@ -2835,7 +2883,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("alfonso-routing.jsonc");
+        let path = dir.join("prefrontal-routing.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
@@ -2929,7 +2977,7 @@ mod tests {
             ModelRoutingPolicyInput::default()
         );
 
-        let path = dir.join("alfonso-routing.jsonc");
+        let path = dir.join("prefrontal-routing.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
@@ -2949,7 +2997,7 @@ mod tests {
             r#"{
               // routing fence
               "model_routing": {
-                "exclude": ["anthropic", " ollama-cloud/glm-5.1 ", ""],
+                "exclude": {"all": ["anthropic", " ollama-cloud/glm-5.1 ", ""]},
                 "subscription": ["kimi-for-coding"],
               },
             }"#,
@@ -2970,14 +3018,18 @@ mod tests {
         );
 
         // A live edit takes effect on the next read with no restart.
-        std::fs::write(&path, r#"{ "model_routing": { "exclude": ["xai"] } }"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "model_routing": { "exclude": {"all": ["xai"]} } }"#,
+        )
+        .unwrap();
         set_mtime(1_700_000_001);
         let reloaded = read_operator_routing_policy_with_reader(&path, read_file);
         assert_eq!(reloaded.exclude, vec!["xai"]);
         assert_eq!(reads.load(Ordering::Relaxed), 2, "changed mtime reparsed");
 
         // An absent model_routing block is an empty policy, not a parse failure.
-        std::fs::write(&path, r#"{ "push": { "enabled": true } }"#).unwrap();
+        std::fs::write(&path, r#"{}"#).unwrap();
         set_mtime(1_700_000_002);
         assert_eq!(
             read_operator_routing_policy_with_reader(&path, read_file),
@@ -3009,7 +3061,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("alfonso-routing.jsonc");
+        let path = dir.join("prefrontal-routing.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
@@ -3025,7 +3077,7 @@ mod tests {
 
         std::fs::write(
             &path,
-            r#"{ "model_routing": { "exclude": ["anthropic"] } }"#,
+            r#"{ "model_routing": { "exclude": {"all": ["anthropic"]} } }"#,
         )
         .unwrap();
         set_mtime(1_700_000_000);
@@ -3061,7 +3113,11 @@ mod tests {
         );
 
         // Repairing it is an edit, so the new policy is picked up.
-        std::fs::write(&path, r#"{ "model_routing": { "exclude": ["xai"] } }"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "model_routing": { "exclude": {"all": ["xai"]} } }"#,
+        )
+        .unwrap();
         set_mtime(1_700_000_002);
         assert_eq!(
             read_operator_routing_policy_with_reader(&path, read_file).exclude,
@@ -3083,7 +3139,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("alfonso-routing.jsonc");
+        let path = dir.join("prefrontal-routing.jsonc");
         let mut facts = model_facts_seed().to_vec();
         let sol = |facts: &[ModelFact]| {
             facts

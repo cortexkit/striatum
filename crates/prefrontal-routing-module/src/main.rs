@@ -20,6 +20,7 @@ mod account_selection;
 mod available_models_text;
 mod broca_credentials;
 mod config_overrides;
+mod config_policy;
 mod fusiform_catalog;
 mod key_pool;
 mod model_resolution;
@@ -624,6 +625,10 @@ async fn main() -> Result<(), ModuleError> {
     let _ = subc_os::launch_nonce();
     let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
         StartupMode::PrintManifest => return print_manifest_operations(),
+        StartupMode::PrintConfigSchema => {
+            print!("{}", config_overrides::routing_config_schema());
+            return Ok(());
+        }
         StartupMode::AccountQuotaDryRun {
             connection_file_path,
             capture_dir,
@@ -637,6 +642,7 @@ async fn main() -> Result<(), ModuleError> {
 #[derive(Debug, PartialEq, Eq)]
 enum StartupMode {
     PrintManifest,
+    PrintConfigSchema,
     /// Read Insula once as an ordinary consumer and print the account views it
     /// would produce. Writes no store and consults no vault.
     AccountQuotaDryRun {
@@ -705,6 +711,8 @@ impl ModuleConfig {
 }
 
 async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
+    config_overrides::initialize_config(&config_overrides::config_path())
+        .map_err(ModuleError::Message)?;
     runtime_lag::RuntimeLagProbe::default().start("routing runtime");
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
@@ -1616,7 +1624,7 @@ fn warn_ignored_caller_policy_once(sent: bool) {
     static WARNED: Once = Once::new();
     if claim_ignored_caller_policy_warning(sent, &WARNED) {
         eprintln!(
-            "[prefrontal-routing] ignoring caller-supplied model routing policy; configure model_routing in ~/.config/cortexkit/alfonso-routing.jsonc"
+            "[prefrontal-routing] ignoring caller-supplied model routing policy; configure model_routing in ~/.config/cortexkit/prefrontal-routing.jsonc"
         );
     }
 }
@@ -5532,6 +5540,14 @@ fn parse_startup_mode(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<StartupMode, ModuleError> {
     let args = args.into_iter().collect::<Vec<_>>();
+    if args.as_slice() == [OsString::from("--print-config-schema")] {
+        return Ok(StartupMode::PrintConfigSchema);
+    }
+    if args.iter().any(|arg| arg == "--print-config-schema") {
+        return Err(ModuleError::Message(
+            "--print-config-schema must be used without other arguments".into(),
+        ));
+    }
     if args.as_slice() == [OsString::from("--print-manifest")] {
         return Ok(StartupMode::PrintManifest);
     }
@@ -6176,7 +6192,7 @@ mod tests {
         run_route_wire_request_with_operator_config(
             store,
             request,
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
         )
         .await
     }
@@ -6298,7 +6314,7 @@ mod tests {
             &quota_cache,
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             operator_config_path,
             broca_credentials,
             &empty_opencode_auth(),
@@ -7459,10 +7475,10 @@ mod tests {
                 [],
             )
             .expect("stamp the stale exclusion column");
-        let operator_config = rig.dir.join("alfonso-routing.jsonc");
+        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
         std::fs::write(
             &operator_config,
-            r#"{ "model_routing": { "exclude": ["fixture/wire-only"] } }"#,
+            r#"{ "model_routing": { "exclude": {"all": ["fixture/wire-only"]} } }"#,
         )
         .unwrap();
 
@@ -7860,7 +7876,7 @@ mod tests {
             &rig,
             params,
             facts,
-            &PathBuf::from("/nonexistent/alfonso-routing.jsonc"),
+            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
         )
         .await;
         (response, rig)
@@ -7898,7 +7914,7 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             operator_config_path,
             &empty_broca_credentials(),
             &empty_opencode_auth(),
@@ -7943,8 +7959,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
@@ -8039,8 +8055,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
@@ -8696,8 +8712,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
@@ -8779,8 +8795,8 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
@@ -8884,8 +8900,8 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
                 &quota_decides_facts(),
             ))),
@@ -8964,8 +8980,8 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
@@ -9519,15 +9535,15 @@ mod tests {
             fact("anthropic", "claude-opus-4-8"),
             fact("openai", "gpt-5.5"),
         ];
-        let operator_config = rig.dir.join("alfonso-routing.jsonc");
+        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
         std::fs::write(
             &operator_config,
-            r#"{ "model_routing": { "exclude": ["anthropic"] } }"#,
+            r#"{ "model_routing": { "exclude": {"all": ["anthropic"]} } }"#,
         )
         .unwrap();
         std::fs::write(
             rig.dir.join("alfonso.jsonc"),
-            r#"{ "model_routing": { "exclude": ["openai"] } }"#,
+            r#"{ "model_routing": { "exclude": {"all": ["openai"]} } }"#,
         )
         .unwrap();
         set_config_mtime(&operator_config, 1_700_000_000);
@@ -9613,7 +9629,7 @@ mod tests {
         // Live edit: a new exclude list takes effect on the next selection, no restart.
         std::fs::write(
             &operator_config,
-            r#"{ "model_routing": { "exclude": ["openai"] } }"#,
+            r#"{ "model_routing": { "exclude": {"all": ["openai"]} } }"#,
         )
         .unwrap();
         set_config_mtime(&operator_config, 1_700_000_001);
@@ -9762,7 +9778,7 @@ mod tests {
                 "providerAuthTypes": { "openai": "oauth" }
             }),
             &[luna, sol],
-            &PathBuf::from("/nonexistent/alfonso-routing.jsonc"),
+            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
         )
         .await;
 
@@ -10138,8 +10154,8 @@ mod tests {
                 &quota_cache,
                 &store,
                 &min_band,
-                Path::new("/nonexistent/alfonso-routing.jsonc"),
-                Path::new("/nonexistent/alfonso-routing.jsonc"),
+                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                Path::new("/nonexistent/prefrontal-routing.jsonc"),
                 &empty_broca_credentials(),
                 &empty_opencode_auth(),
             )
@@ -10225,7 +10241,7 @@ mod tests {
                 let response = run_route_wire_request_with_paths(
                     &store,
                     request(substrate),
-                    Path::new("/nonexistent/alfonso-routing.jsonc"),
+                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
                     &broca_credentials,
                 )
                 .await;
@@ -10289,7 +10305,7 @@ mod tests {
                     "taskId": "panel-substrate-unknown-reach",
                 }
             }),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &broca_credentials,
         )
         .await;
@@ -10361,7 +10377,7 @@ mod tests {
                     "taskId": "panel-substrate-uncredentialed"
                 }
             }),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &mapped_broca_credentials("kimi-code-plan-global"),
         )
         .await;
@@ -10409,7 +10425,7 @@ mod tests {
             let response = run_route_wire_request_with_paths(
                 &store,
                 request,
-                Path::new("/nonexistent/alfonso-routing.jsonc"),
+                Path::new("/nonexistent/prefrontal-routing.jsonc"),
                 &broca_credentials,
             )
             .await;
@@ -10460,7 +10476,7 @@ mod tests {
                 let response = run_route_wire_request_with_paths(
                     &store,
                     broca_select_request(&["hostonly/m-old"], substrate),
-                    Path::new("/nonexistent/alfonso-routing.jsonc"),
+                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
                     &broca_credentials,
                 )
                 .await;
@@ -10517,7 +10533,7 @@ mod tests {
         let response = run_route_wire_request_with_paths(
             &store,
             broca_select_request(&[], Some("broca")),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &empty_broca_credentials(),
         )
         .await;
@@ -10751,8 +10767,8 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
             &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
@@ -11017,7 +11033,7 @@ mod tests {
     /// The routing file for the paid Anthropic API key: an explicit-only routing
     /// provider whose rows are borrowed from `anthropic`.
     fn platform_operator_config(rig: &Rig) -> PathBuf {
-        let path = rig.dir.join("alfonso-routing.jsonc");
+        let path = rig.dir.join("prefrontal-routing.jsonc");
         std::fs::write(
             &path,
             r#"{ "model_routing": {
@@ -11715,7 +11731,7 @@ mod tests {
             &rig,
             saturation_select_params(None),
             &saturation_facts(),
-            &PathBuf::from("/nonexistent/alfonso-routing.jsonc"),
+            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
         )
         .await;
         let next: serde_json::Value = serde_json::from_slice(&next.body).unwrap();
@@ -11775,7 +11791,7 @@ mod tests {
         for variant in [None, Some("thinking")] {
             let response = run_route_wire_request_with_paths(&store, json!({"method": ROUTE_MODEL_UPSERT_OP,
                 "params":{"providerID":"meta","modelID":"muse-wonder-1.0","variant":variant,"elo":1808,"eq":1600}
-            }), Path::new("/nonexistent/alfonso-routing.jsonc"), &credentials).await;
+            }), Path::new("/nonexistent/prefrontal-routing.jsonc"), &credentials).await;
             assert_eq!(
                 response.header.ty,
                 FrameType::Response,
@@ -11929,7 +11945,7 @@ mod tests {
                 store,
                 &Arc::new(Mutex::new(None)),
                 config_path,
-                Path::new("/nonexistent/alfonso-routing.jsonc"),
+                Path::new("/nonexistent/prefrontal-routing.jsonc"),
                 &empty_broca_credentials(),
                 &empty_opencode_auth(),
             )
@@ -11954,7 +11970,7 @@ mod tests {
         strong.cost_per_m_tok_out = Some(30.0);
         store.upsert_fact(&weak, FactSource::Override).unwrap();
         store.upsert_fact(&strong, FactSource::Override).unwrap();
-        let config_path = rig.dir.join("alfonso-routing.jsonc");
+        let config_path = rig.dir.join("prefrontal-routing.jsonc");
         std::fs::write(&config_path, r#"{"model_routing":{}}"#).unwrap();
         let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
 
@@ -12085,51 +12101,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_model_seed_aa_and_list_inferred_wire() {
+    async fn aa_seed_input_and_list_inferred_wire() {
         let rig = Rig::new("seed-aa-wire");
         let store = Arc::new(rig.open_store());
         store
             .replace_aa_index_table(&[("new-slug".into(), 60.0)], 1)
             .unwrap();
-        let config_path = rig.dir.join("alfonso-routing.jsonc");
-        std::fs::write(
-            &config_path,
-            r#"{ "aa": { "model_map": { "custom/wire-inferred": "new-slug" } } }"#,
-        )
-        .unwrap();
-
-        let frame = Frame::build(
-            FrameType::Request,
-            Flags::new(false, Priority::Interactive, false),
-            7,
-            1,
-            99,
-            serde_json::to_vec(&json!({
-                "method": ROUTE_MODEL_SEED_AA_OP,
-                "params": { "providerID": "custom", "modelID": "wire-inferred" }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let (tx, mut rx) = mpsc::channel(1);
-        handle_select_request(
-            frame,
-            1,
-            &tx,
-            &Arc::new(Mutex::new(QuotaCache::default())),
+        // Write an AA-inferred score using explicit test inputs: operator files
+        // no longer accept AA settings. The list response must expose that score.
+        let config = config_overrides::AaConfig {
+            model_map: HashMap::from([("custom/wire-inferred".into(), "new-slug".into())]),
+            ..Default::default()
+        };
+        aa_ingest::seed_aa(
             &store,
-            &Arc::new(Mutex::new(None)),
-            &config_path,
-            Path::new("/nonexistent/alfonso-routing.jsonc"),
-            &empty_broca_credentials(),
-            &empty_opencode_auth(),
+            &aa_ingest::SeedAaParams {
+                provider_id: "custom".into(),
+                model_id: "wire-inferred".into(),
+                variant: None,
+            },
+            &config,
+            1,
         )
-        .await
         .unwrap();
-        let response = rx.recv().await.unwrap();
-        assert_eq!(response.header.ty, FrameType::Response);
-        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(body["result"]["provenance"], "aa_inferred");
 
         let listed = run_route_wire_request(
             &store,
@@ -12248,8 +12242,8 @@ mod tests {
                 store.upsert_fact(row, FactSource::Override).unwrap();
             }
             let sources = winner_ladder::LadderSources {
-                routing_config: rig.dir.join("alfonso-routing.jsonc"),
-                operator_config: rig.dir.join("alfonso-routing.jsonc"),
+                routing_config: rig.dir.join("prefrontal-routing.jsonc"),
+                operator_config: rig.dir.join("prefrontal-routing.jsonc"),
                 observed: Arc::new(winner_ladder::ObservedSelections::default()),
             };
             Self {
@@ -12673,7 +12667,7 @@ mod tests {
         std::fs::write(
             &rig.sources.routing_config,
             serde_json::to_vec(&json!({
-                "model_routing": { "exclude": [rig.route("incumbent")] }
+                "model_routing": { "exclude": {"all": [rig.route("incumbent")]} }
             }))
             .unwrap(),
         )

@@ -439,7 +439,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("alfonso-routing.jsonc");
+        let path = dir.join("prefrontal-routing.jsonc");
         // `model_routing.demand_exponent` has the wrong type, which fails the
         // typed routing config; the retention block is still read.
         std::fs::write(

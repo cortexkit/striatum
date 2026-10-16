@@ -1,0 +1,850 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RoutingConfigFile",
+  "type": "object",
+  "properties": {
+    "account_selection": {
+      "$ref": "#/$defs/AccountSelectionFlags",
+      "default": {
+        "enabled": false,
+        "shadow": false
+      }
+    },
+    "catalog": {
+      "$ref": "#/$defs/CatalogSection",
+      "default": {
+        "poll_ms": null
+      }
+    },
+    "model_families": {
+      "$ref": "#/$defs/ModelFamilyRules",
+      "default": {
+        "claude": [
+          "*/claude-*",
+          "anthropic/*",
+          "google/antigravity-claude-*"
+        ],
+        "deepseek": [
+          "*/deepseek-*",
+          "deepseek/*"
+        ],
+        "gemini": [
+          "*/gemini-*",
+          "google/*"
+        ],
+        "glm": [
+          "*/glm-*",
+          "zai/*"
+        ],
+        "gpt": [
+          "openai/*",
+          "*/gpt-*",
+          "*/o1*",
+          "*/o3*",
+          "*/o4*"
+        ],
+        "grok": [
+          "*/grok-*",
+          "xai/*"
+        ],
+        "kimi": [
+          "*/kimi*",
+          "moonshotai/*",
+          "kimi-for-coding/*"
+        ],
+        "llama": [
+          "*/llama-*",
+          "meta/*"
+        ],
+        "minimax": [
+          "*/minimax-*",
+          "minimax/*"
+        ],
+        "mistral": [
+          "*/mistral-*",
+          "mistral/*"
+        ],
+        "other": [
+          "*"
+        ],
+        "qwen": [
+          "*/qwen*",
+          "alibaba-*/*"
+        ]
+      }
+    },
+    "model_routing": {
+      "$ref": "#/$defs/ModelRoutingSection",
+      "default": {
+        "consecutive_terminal_failure_threshold": null,
+        "demand_exponent": null,
+        "elo_overrides": {},
+        "exclude": {
+          "all": [],
+          "athena": [],
+          "core": [],
+          "lab": [],
+          "mason": [],
+          "sidekick": []
+        },
+        "explicit_only_providers": [],
+        "keep_free_percent": {},
+        "min_best_effort_adequacy": null,
+        "models": {},
+        "overqualification": {
+          "base": null,
+          "doubling": null,
+          "threshold": null
+        },
+        "panels": {},
+        "pins": {},
+        "providers_without_prompt_cache": [
+          "ollama-cloud"
+        ],
+        "score_alias": {},
+        "subscription": [],
+        "subscription_multipliers": {}
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "AccountSelectionFlags": {
+      "description": "The account-selection rollout flags (`\"account_selection\"` in the routing\nfile). Both are off unless the file turns them on.",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "description": "Serve `route.account_for` and accept its reports. Off: every account\noperation refuses with `account_selection_disabled`.",
+          "type": "boolean",
+          "default": false
+        },
+        "shadow": {
+          "description": "Compute account decisions without serving them and record them for\ncomparison: the step before `enabled`.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "CatalogSection": {
+      "type": "object",
+      "properties": {
+        "poll_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExcludeGroups": {
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "athena": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "core": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "lab": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "mason": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "sidekick": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExtraRanking": {
+      "type": "string",
+      "enum": [
+        "random",
+        "iq",
+        "eq",
+        "cost"
+      ]
+    },
+    "LabPlannerPin": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "pattern": "^[^/\\s]+/[^\\s]+$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model"
+      ]
+    },
+    "ModelFactOverride": {
+      "description": "One per-model override. Every field is optional: a present field is operator-owned,\nwhile a withdrawn field returns to its non-override authority.",
+      "type": "object",
+      "properties": {
+        "context_window": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "cost_per_mtok_out": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        },
+        "elo": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "eq": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "family": {
+          "description": "Outer None means absent; Some(None) means an explicit JSON null clears it.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "speed": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        },
+        "speed_multiplier": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0,
+          "maximum": 2
+        },
+        "subscription_multiplier": {
+          "description": "Subscription subsidy multiplier: divides the route's list price to yield its\neffective price. 1.0 (or absent) means \"no subsidy known\"; larger values make\nthe route proportionally cheaper than list. Validated at load (must be finite\nand > 0); an invalid value is rejected and logged, not applied.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "vision": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelFamilyRules": {
+      "type": "object",
+      "properties": {
+        "claude": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "deepseek": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "gemini": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "glm": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "gpt": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "grok": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "kimi": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "llama": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "minimax": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "mistral": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "other": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        },
+        "qwen": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "\\S"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelRoutingSection": {
+      "type": "object",
+      "properties": {
+        "consecutiveTerminalFailureThreshold": {
+          "description": "Terminal send failures required before the route-local safety backoff starts.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        },
+        "consecutive_terminal_failure_threshold": {
+          "description": "Terminal send failures required before the route-local safety backoff starts.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "minimum": 1
+        },
+        "demand_exponent": {
+          "description": "Power-curve exponent mapping caller IQ demand to the request frontier.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null,
+          "exclusiveMinimum": 0
+        },
+        "elo_overrides": {
+          "description": "Request-time capability overrides. Unknown keys are ignored and surfaced\nto the caller for warning logs.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double",
+            "exclusiveMinimum": 0
+          },
+          "default": {}
+        },
+        "exclude": {
+          "description": "Excluded providers or routes by consumer. The `all` list applies to every\nconsumer; a negated entry in another list cannot remove its exclusions.",
+          "$ref": "#/$defs/ExcludeGroups",
+          "default": {
+            "all": [],
+            "athena": [],
+            "core": [],
+            "lab": [],
+            "mason": [],
+            "sidekick": []
+          }
+        },
+        "explicit_only_providers": {
+          "description": "Providers routing admits only when a caller pins one of their routes by\nname; never an automatic, fallback or reroute candidate. Default empty.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "keep_free_percent": {
+          "description": "Percent of each weekly account window reserved from delegated workers;\nlong-lived head agents may spend that reserved share.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double",
+            "maximum": 100,
+            "minimum": 0
+          },
+          "default": {},
+          "propertyNames": {
+            "pattern": "\\S"
+          }
+        },
+        "min_best_effort_adequacy": {
+          "description": "Minimum adequacy for best-effort selection (sanity band). Default 0.6.\nClamped to [0, 1]; NaN is rejected loudly at parse time.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "models": {
+          "description": "Keyed by \"provider/model\" or \"provider/model/variant\".",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ModelFactOverride"
+          },
+          "default": {}
+        },
+        "overqualification": {
+          "description": "Over-qualification term added to selection cost for routes far above the\nrequest's iq demand. Absent fields take the routing-core defaults.",
+          "$ref": "#/$defs/OverqualificationSection",
+          "default": {
+            "base": null,
+            "doubling": null,
+            "threshold": null
+          }
+        },
+        "panels": {
+          "$ref": "#/$defs/PanelPolicies",
+          "default": {}
+        },
+        "pins": {
+          "$ref": "#/$defs/Pins",
+          "default": {}
+        },
+        "providersWithoutPromptCache": {
+          "description": "Providers that do not expose prompt-cache reads or writes. Gather seats\navoid these providers when a cache-capable adequate route exists.",
+          "type": "array",
+          "default": [
+            "ollama-cloud"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "providers_without_prompt_cache": {
+          "description": "Providers that do not expose prompt-cache reads or writes. Gather seats\navoid these providers when a cache-capable adequate route exists.",
+          "type": "array",
+          "default": [
+            "ollama-cloud"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "score_alias": {
+          "description": "Providers that borrow another provider's catalog rows, keyed alias to\ntarget: `{\"anthropic-platform\": \"anthropic\"}`. Default empty.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "subscription": {
+          "description": "Providers and models priced as subscription-backed in addition to auth facts.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "subscription_multipliers": {
+          "description": "Provider-keyed subscription subsidy multipliers (\"openai\": 40). The\nsubsidy is a property of the account serving the provider, so this is\nthe primary shape; a per-model `subscription_multiplier` in `models`\noverrides its provider's value for that route only.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double",
+            "exclusiveMinimum": 0
+          },
+          "default": {},
+          "propertyNames": {
+            "pattern": "\\S"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "not": {
+            "required": [
+              "consecutive_terminal_failure_threshold",
+              "consecutiveTerminalFailureThreshold"
+            ]
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "providers_without_prompt_cache",
+              "providersWithoutPromptCache"
+            ]
+          }
+        }
+      ]
+    },
+    "OverqualificationSection": {
+      "description": "`model_routing.overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.\n`base: 0` switches the term off.",
+      "type": "object",
+      "properties": {
+        "base": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        },
+        "doubling": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "threshold": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PanelPolicies": {
+      "type": "object",
+      "properties": {
+        "audit": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "design_review": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "diagnose": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "evaluate": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "explain": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "lab": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "spec": {
+          "$ref": "#/$defs/PanelPolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PanelPolicy": {
+      "type": "object",
+      "properties": {
+        "by": {
+          "$ref": "#/$defs/Ranking"
+        },
+        "extra": {
+          "type": "integer",
+          "format": "uint8",
+          "default": 0,
+          "maximum": 7,
+          "minimum": 0
+        },
+        "extraBy": {
+          "$ref": "#/$defs/ExtraRanking"
+        },
+        "floor": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 100,
+          "minimum": 0
+        },
+        "topK": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 8,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "extra": {
+                "minimum": 1
+              }
+            },
+            "required": [
+              "extra"
+            ]
+          },
+          "then": {
+            "properties": {
+              "extraBy": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "extraBy"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 7
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 2
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 6
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 3
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 5
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 4
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 4
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 5
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 3
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 6
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 2
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 7
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 8
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 0
+              }
+            }
+          }
+        }
+      ],
+      "required": [
+        "topK",
+        "by",
+        "extraBy",
+        "floor"
+      ]
+    },
+    "Pins": {
+      "type": "object",
+      "properties": {
+        "lab_planner": {
+          "$ref": "#/$defs/LabPlannerPin"
+        },
+        "synthesizer": {
+          "$ref": "#/$defs/SynthesizerPin"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Ranking": {
+      "type": "string",
+      "enum": [
+        "iq",
+        "eq",
+        "cost"
+      ]
+    },
+    "SynthesizerPin": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "pattern": "^[^/\\s]+/[^\\s]+$"
+        },
+        "variant": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "variant"
+      ]
+    }
+  }
+}

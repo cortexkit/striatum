@@ -408,9 +408,10 @@ pub async fn run_aa_ingest_cycle(
     resolver: &dyn CredentialResolver,
     credential_log_state: &mut AaCredentialLogState,
 ) {
+    let config = config_overrides::live_config(config_path).aa_config();
     run_aa_ingest_cycle_with(
         store,
-        config_path,
+        &config,
         resolver,
         credential_log_state,
         &LiveAaIndexFetcher,
@@ -421,13 +422,12 @@ pub async fn run_aa_ingest_cycle(
 
 async fn run_aa_ingest_cycle_with(
     store: &SqliteRouteStateStore,
-    config_path: &Path,
+    config: &AaConfig,
     resolver: &dyn CredentialResolver,
     credential_log_state: &mut AaCredentialLogState,
     fetcher: &dyn AaIndexFetcher,
     credential_logger: &dyn AaCredentialFailureLogger,
 ) {
-    let config = config_overrides::live_config(config_path).aa_config();
     let Some(api_key_ref) = config.api_key_ref.as_deref() else {
         log_aa_ingest_skipped();
         return;
@@ -579,10 +579,11 @@ mod tests {
         }
     }
 
-    fn write_enabled_config(dir: &tempfile_dir::Dir) -> PathBuf {
-        let path = dir.path.join("alfonso-routing.jsonc");
-        std::fs::write(&path, r#"{ "aa": {} }"#).unwrap();
-        path
+    fn enabled_config() -> AaConfig {
+        AaConfig {
+            api_key_ref: Some(DEFAULT_AA_API_KEY_REF.into()),
+            ..AaConfig::default()
+        }
     }
 
     #[test]
@@ -839,8 +840,8 @@ mod tests {
 
     #[tokio::test]
     async fn credential_absent_skips_all_http_calls_and_logs_once_until_class_changes() {
-        let (dir, store) = open_store();
-        let config_path = write_enabled_config(&dir);
+        let (_dir, store) = open_store();
+        let config = enabled_config();
         let resolver = ScriptedCredentialResolver::new(vec![
             Err(CredentialResolverError::new(
                 CredentialErrorClass::CredentialAbsent,
@@ -862,7 +863,7 @@ mod tests {
         for _ in 0..3 {
             run_aa_ingest_cycle_with(
                 &store,
-                &config_path,
+                &config,
                 &resolver,
                 &mut log_state,
                 &fetcher,
@@ -884,8 +885,8 @@ mod tests {
 
     #[tokio::test]
     async fn each_ingest_cycle_resolves_again_and_fetches_with_the_rotated_record() {
-        let (dir, store) = open_store();
-        let config_path = write_enabled_config(&dir);
+        let (_dir, store) = open_store();
+        let config = enabled_config();
         let resolver = ScriptedCredentialResolver::new(vec![
             Ok(ResolvedCredential::new(
                 b"first-key".to_vec(),
@@ -905,7 +906,7 @@ mod tests {
         for _ in 0..2 {
             run_aa_ingest_cycle_with(
                 &store,
-                &config_path,
+                &config,
                 &resolver,
                 &mut log_state,
                 &fetcher,
@@ -928,8 +929,8 @@ mod tests {
 
     #[tokio::test]
     async fn transport_failure_gets_one_redial_before_the_cycle_skips() {
-        let (dir, store) = open_store();
-        let config_path = write_enabled_config(&dir);
+        let (_dir, store) = open_store();
+        let config = enabled_config();
         let resolver = ScriptedCredentialResolver::new(vec![
             Err(CredentialResolverError::transport("first connection lost")),
             Err(CredentialResolverError::transport("redial failed")),
@@ -940,7 +941,7 @@ mod tests {
 
         run_aa_ingest_cycle_with(
             &store,
-            &config_path,
+            &config,
             &resolver,
             &mut log_state,
             &fetcher,
