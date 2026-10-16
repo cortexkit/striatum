@@ -27,7 +27,6 @@ use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/prefrontal-routing.jsonc";
 const OLD_CONFIG_BASENAME: &str = "alfonso-routing.jsonc";
-pub const DEFAULT_AA_API_KEY_REF: &str = "apikey:artificial-analysis";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 const OPENCODE_AUTH_RELATIVE_PATH: &str = "opencode/auth.json";
 
@@ -352,10 +351,6 @@ impl LiveConfig {
             .poll_ms
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_CATALOG_POLL_MS)
-    }
-
-    pub fn aa_config(&self) -> AaConfig {
-        AaConfig::default()
     }
 
     pub fn providers_without_prompt_cache(&self) -> Vec<String> {
@@ -735,36 +730,6 @@ impl<'de> Deserialize<'de> for ModelFamilyRules {
         }
 
         deserializer.deserialize_map(RulesVisitor)
-    }
-}
-
-/// Default review window for an AA-inferred score: two weeks.
-pub const DEFAULT_AA_REVIEW_BY_MS: i64 = 14 * 24 * 60 * 60 * 1000;
-
-#[derive(Clone)]
-pub struct AaConfig {
-    pub api_key_ref: Option<String>,
-    pub model_map: HashMap<String, String>,
-    pub review_by_ms: i64,
-}
-
-impl std::fmt::Debug for AaConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AaConfig")
-            .field("api_key_ref", &self.api_key_ref)
-            .field("model_map", &self.model_map)
-            .field("review_by_ms", &self.review_by_ms)
-            .finish()
-    }
-}
-
-impl Default for AaConfig {
-    fn default() -> Self {
-        Self {
-            api_key_ref: None,
-            model_map: HashMap::new(),
-            review_by_ms: DEFAULT_AA_REVIEW_BY_MS,
-        }
     }
 }
 

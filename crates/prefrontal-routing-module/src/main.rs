@@ -14,7 +14,6 @@
 //! caller passes the task's requirements + the set of available routes; the
 //! module runs the pure `prefrontal-routing-core` scorer and returns the selection.
 
-mod aa_ingest;
 mod account_quota;
 mod account_selection;
 mod available_models_text;
@@ -127,8 +126,6 @@ const QUOTA_STATUS_OP: &str = "route.quota_status";
 /// band, its vault join and why its reading can or cannot be used for cold work,
 /// plus roster gaps. Read-only; nothing selects an account from it yet.
 const ROUTE_ACCOUNT_QUOTA_STATUS_OP: &str = "route.account_quota_status";
-/// Seed a provisional AA-inferred score for one router key (management, primary-only).
-const ROUTE_MODEL_SEED_AA_OP: &str = "route.model_seed_aa";
 /// Operator worklist: every `aa_inferred` row plus unscored catalog rows.
 const ROUTE_LIST_INFERRED_OP: &str = "route.list_inferred";
 /// Focused alias for operators that only need never-scored Fusiform discoveries.
@@ -915,14 +912,6 @@ where
             Arc::clone(&broca_credentials),
         ));
     }
-    let aa_credential_resolver: Arc<dyn prefrontal_ckcred_client::CredentialResolver> =
-        Arc::new(prefrontal_ckcred_client::CkcredCredentialResolver::new(
-            config.connection_file_path.clone(),
-            std::env::current_dir().map_err(|error| {
-                ModuleError::Message(format!("resolve routing credential project root: {error}"))
-            })?,
-            DEFAULT_MODULE_ID,
-        ));
     // Every placement and config reload compares the winner ladder over the same
     // config a selection reads (the operator policy lives in the routing file)
     // and the availability live selections report.
@@ -930,11 +919,6 @@ where
         &config_overrides::config_path(),
         &config_overrides::config_path(),
     );
-    tokio::spawn(aa_ingest::aa_ingest_loop(
-        Arc::clone(&store),
-        config_overrides::config_path(),
-        aa_credential_resolver,
-    ));
 
     // Load a validated config snapshot before serving. The watcher publishes
     // replacements; model overrides remain request overlays so withdrawing one
@@ -1372,11 +1356,6 @@ struct ModelFactParams {
 #[derive(Debug, Deserialize)]
 struct ModelUpsertBody {
     params: ModelUpsertParams,
-}
-
-#[derive(Debug, Deserialize)]
-struct SeedAaBody {
-    params: aa_ingest::SeedAaParams,
 }
 
 /// Partial fact: absent fields keep the stored value on merge, and a NEW model
@@ -2027,98 +2006,20 @@ async fn handle_model_upsert(
     send(writer, response).await
 }
 
-async fn handle_model_seed_aa(
-    frame: Frame,
-    writer: &mpsc::Sender<Frame>,
-    store: &SharedStore,
-    routing_config_path: &Path,
-    ladder_sources: &winner_ladder::LadderSources,
-) -> Result<(), ModuleError> {
-    let (ver, channel, epoch, corr) = (
-        frame.header.ver,
-        frame.header.channel,
-        frame.header.epoch,
-        frame.header.corr,
-    );
-    let params = match serde_json::from_slice::<SeedAaBody>(&frame.body) {
-        Ok(body)
-            if !body.params.provider_id.trim().is_empty()
-                && !body.params.model_id.trim().is_empty() =>
-        {
-            body.params
-        }
-        Ok(_) => {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "invalid_request",
-                "model_seed_aa requires non-empty providerID and modelID",
-            )
-            .await;
-        }
-        Err(error) => {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "invalid_request",
-                &format!("model_seed_aa params not decodable: {error}"),
-            )
-            .await;
-        }
-    };
-    let aa_config = config_overrides::live_config(routing_config_path).aa_config();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    match aa_ingest::seed_aa(store, &params, &aa_config, now) {
-        Ok(ok) => {
-            winner_ladder::announce(
-                store.as_ref(),
-                ladder_sources,
-                &format!(
-                    "route.model_seed_aa {}",
-                    make_route_key(
-                        &params.provider_id,
-                        &params.model_id,
-                        params.variant.as_deref()
-                    )
-                ),
-            );
-            let body =
-                serde_json::to_vec(&json!({ "result": aa_ingest::seed_aa_result_json(&ok) }))
-                    .map_err(ModuleError::Json)?;
-            let response = Frame::build_with_version(
-                ver,
-                FrameType::Response,
-                Flags::new(false, Priority::Interactive, false),
-                channel,
-                epoch,
-                corr,
-                body,
-            )
-            .map_err(|error| ModuleError::Message(error.to_string()))?;
-            send(writer, response).await
-        }
-        Err(refusal) => {
-            send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                refusal.as_str(),
-                refusal.message(),
-            )
-            .await
-        }
-    }
+fn list_inferred_json(
+    store: &SqliteRouteStateStore,
+    now_ms: i64,
+) -> Result<serde_json::Value, String> {
+    let inferred = store
+        .list_inferred_rows(now_ms)
+        .map_err(|error| error.to_string())?;
+    let unscored = store
+        .list_unscored_rows()
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "inferred": inferred,
+        "unscored": unscored,
+    }))
 }
 
 async fn handle_list_inferred(
@@ -2136,7 +2037,7 @@ async fn handle_list_inferred(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    match aa_ingest::list_inferred_json(store, now) {
+    match list_inferred_json(store, now) {
         Ok(result) => {
             let body =
                 serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
@@ -2994,12 +2895,6 @@ async fn handle_select_request(
         let ladder_sources =
             winner_ladder::LadderSources::live(routing_config_path, operator_config_path);
         return handle_model_upsert(frame, writer, store, &ladder_sources, broca_credentials).await;
-    }
-    if envelope.method == ROUTE_MODEL_SEED_AA_OP {
-        let ladder_sources =
-            winner_ladder::LadderSources::live(routing_config_path, operator_config_path);
-        return handle_model_seed_aa(frame, writer, store, routing_config_path, &ladder_sources)
-            .await;
     }
     if envelope.method == ROUTE_LIST_INFERRED_OP {
         return handle_list_inferred(frame, writer, store).await;
@@ -5230,7 +5125,6 @@ fn handles(method: &str) -> bool {
             | model_resolution::AGENT_MODEL_REQUIREMENTS_OP
             | available_models_text::OP
             | ROUTE_MODEL_UPSERT_OP
-            | ROUTE_MODEL_SEED_AA_OP
             | ROUTE_LIST_INFERRED_OP
             | ROUTE_LIST_UNSCORED_OP
             | ROUTE_SELECT_PANEL_OP
@@ -5312,14 +5206,6 @@ fn served_operations() -> Vec<ManagementOperation> {
             name: ROUTE_MODEL_UPSERT_OP.to_string(),
             kind: ManagementOperationKind::Mutate,
             description: None,
-        },
-        ManagementOperation {
-            name: ROUTE_MODEL_SEED_AA_OP.to_string(),
-            kind: ManagementOperationKind::Mutate,
-            description: Some(
-                "Seed a provisional AA-inferred score for one router key (primary-only)"
-                    .to_string(),
-            ),
         },
         ManagementOperation {
             name: ROUTE_LIST_INFERRED_OP.to_string(),
@@ -12078,7 +11964,6 @@ mod tests {
                 operation.name
             );
         }
-        assert!(handles(ROUTE_MODEL_SEED_AA_OP));
         assert!(handles(ROUTE_LIST_INFERRED_OP));
         assert!(handles(ROUTE_LIST_UNSCORED_OP));
         assert!(!handles("route.unknown"));
@@ -12101,29 +11986,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aa_seed_input_and_list_inferred_wire() {
-        let rig = Rig::new("seed-aa-wire");
+    async fn removed_aa_seed_operation_is_not_served() {
+        let rig = Rig::new("removed-aa-seed");
         let store = Arc::new(rig.open_store());
-        store
-            .replace_aa_index_table(&[("new-slug".into(), 60.0)], 1)
-            .unwrap();
-        // Write an AA-inferred score using explicit test inputs: operator files
-        // no longer accept AA settings. The list response must expose that score.
-        let config = config_overrides::AaConfig {
-            model_map: HashMap::from([("custom/wire-inferred".into(), "new-slug".into())]),
-            ..Default::default()
-        };
-        aa_ingest::seed_aa(
+        assert!(!handles("route.model_seed_aa"));
+        assert!(served_operations()
+            .iter()
+            .all(|operation| operation.name != "route.model_seed_aa"));
+        let response = run_route_wire_request(
             &store,
-            &aa_ingest::SeedAaParams {
-                provider_id: "custom".into(),
-                model_id: "wire-inferred".into(),
-                variant: None,
-            },
-            &config,
-            1,
+            json!({
+                "method": "route.model_seed_aa",
+                "params": { "providerID": "custom", "modelID": "aa-live" }
+            }),
         )
-        .unwrap();
+        .await;
+        assert_eq!(response.header.ty, FrameType::Error);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["code"], "unknown_method");
+    }
+
+    #[tokio::test]
+    async fn aa_inferred_is_admitted_and_unscored_is_not_replayable() {
+        let rig = Rig::new("aa-inferred-admit");
+        let store = rig.open_store();
+        let mut inferred = fact("custom", "aa-live");
+        inferred.scores.elo = 1_800.0;
+        inferred.score_provenance = ScoreProvenance::AaInferred;
+        inferred.aa_index = Some(55.0);
+        inferred.review_by_ms = Some(1);
+        inferred.eq_source = Some("custom/curated-neighbor".into());
+        store
+            .upsert_fact(&inferred, FactSource::AaInferred)
+            .unwrap();
+        store
+            .replace_aa_index_table(&[("stored-slug".into(), 55.0)], 1)
+            .unwrap();
+        let mut unscored = fact("custom", "no-score");
+        unscored.scores.elo = 2_000.0;
+        unscored.score_provenance = ScoreProvenance::Unscored;
+        store.upsert_fact(&unscored, FactSource::Unscored).unwrap();
+        drop(store);
+
+        // Stored AA-inferred scores remain eligible after AA ingestion is removed,
+        // even when their operator-review deadline has passed.
+        let store = Arc::new(rig.open_store());
+        let facts = store.get_facts().unwrap();
+        let loaded = facts
+            .iter()
+            .find(|fact| fact.provider_id == "custom" && fact.model_id == "aa-live")
+            .expect("stored AA-inferred fact must survive reopening");
+        assert_eq!(loaded.score_provenance, ScoreProvenance::AaInferred);
+        assert_eq!(loaded.scores.elo, 1_800.0);
+        assert_eq!(loaded.aa_index, Some(55.0));
+        assert_eq!(loaded.review_by_ms, Some(1));
+        assert_eq!(loaded.eq_source.as_deref(), Some("custom/curated-neighbor"));
+        assert_eq!(store.get_aa_index("stored-slug").unwrap(), Some((55.0, 1)));
 
         let listed = run_route_wire_request(
             &store,
@@ -12132,31 +12050,12 @@ mod tests {
         .await;
         assert_eq!(listed.header.ty, FrameType::Response);
         let listed_body: serde_json::Value = serde_json::from_slice(&listed.body).unwrap();
-        assert_eq!(
-            listed_body["result"]["inferred"][0]["routeKey"],
-            "custom/wire-inferred"
-        );
-        assert!(listed_body["result"]["unscored"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn aa_inferred_is_admitted_and_unscored_is_not_replayable() {
-        let rig = Rig::new("aa-inferred-admit");
-        let store = Arc::new(rig.open_store());
-        let mut inferred = fact("custom", "aa-live");
-        inferred.scores.elo = 1_800.0;
-        inferred.score_provenance = ScoreProvenance::AaInferred;
-        inferred.aa_index = Some(55.0);
-        store
-            .upsert_fact(&inferred, FactSource::AaInferred)
-            .unwrap();
-        let mut unscored = fact("custom", "no-score");
-        unscored.scores.elo = 2_000.0;
-        unscored.score_provenance = ScoreProvenance::Unscored;
-        store.upsert_fact(&unscored, FactSource::Unscored).unwrap();
+        let inferred_rows = listed_body["result"]["inferred"].as_array().unwrap();
+        assert_eq!(inferred_rows.len(), 1);
+        assert_eq!(inferred_rows[0]["routeKey"], "custom/aa-live");
+        let unscored_rows = listed_body["result"]["unscored"].as_array().unwrap();
+        assert_eq!(unscored_rows.len(), 1);
+        assert_eq!(unscored_rows[0]["routeKey"], "custom/no-score");
 
         let request = json!({
             "method": ROUTE_SELECT_OP,
