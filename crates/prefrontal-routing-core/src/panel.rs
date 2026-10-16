@@ -569,6 +569,10 @@ pub fn select_panel_with_policy_context(
             .take()
             .map(|shortfall| shortfall.causes)
             .unwrap_or_default();
+        let too_small = package_causes
+            .iter()
+            .filter_map(|cause| cause.detail.clone())
+            .collect::<Vec<_>>();
         causes.extend(package_causes);
         let largest = policy.largest_package_ceiling.unwrap_or(0).max(
             panel
@@ -587,7 +591,7 @@ pub fn select_panel_with_policy_context(
         );
         panel.shortfall = Some(PanelShortfall {
             code: PanelShortfallCode::PackageUnmeetable,
-            detail: package_refusal(tokens, largest),
+            detail: package_refusal(tokens, largest, &too_small),
             causes,
         });
         // No oversized pin is a sendable seat, even on a refused decision.
@@ -615,8 +619,19 @@ pub fn select_panel_with_policy_context(
     Ok(panel)
 }
 
-fn package_refusal(tokens: usize, largest: usize) -> String {
-    format!("package {tokens} tokens cannot fill the panel; largest available adequate ceiling {largest} tokens. Narrow evidence or change the project athena.members roster setting; evidence was not truncated")
+/// Names each pinned seat whose ceiling the package exceeds. A seat with an
+/// unknown context window has ceiling 0, and without its name the refusal reads
+/// as if the package were too big for every model.
+fn package_refusal(tokens: usize, largest: usize, too_small: &[String]) -> String {
+    let seats = if too_small.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({}; no unused route of another family fits in its place)",
+            too_small.join("; ")
+        )
+    };
+    format!("package {tokens} tokens cannot fill the panel{seats}; largest available adequate ceiling {largest} tokens. Narrow evidence or change the project athena.members roster setting; evidence was not truncated")
 }
 
 fn select_panel_admitted(
@@ -989,6 +1004,7 @@ fn select_panel_admitted(
             package_refusal(
                 input.package_tokens.unwrap(),
                 largest_package_ceiling.unwrap_or(0),
+                &[],
             ),
         ))
     } else if admitted_count == 0 {

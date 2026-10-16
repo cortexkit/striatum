@@ -179,6 +179,11 @@ fn package_refusal_names_size_largest_ceiling_and_roster_remedy() {
     assert!(refusal
         .detail
         .contains("project athena.members roster setting"));
+    // The detail itself names each seat that is too small, so a seat with an
+    // unknown context window (ceiling 0) is visible without reading causes.
+    assert!(refusal
+        .detail
+        .contains("exceeds p/small ceiling 210000 tokens"));
     assert!(panel.members.is_empty());
     for (model, detail) in [
         (
