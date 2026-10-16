@@ -158,6 +158,7 @@ pub enum ExclusionSource {
 #[derive(Debug, Clone, Default)]
 pub struct ExclusionSpecs {
     operator: Vec<ParsedSpec>,
+    operator_group: Vec<ParsedSpec>,
     caller: Vec<ParsedSpec>,
     explicit_only: Vec<String>,
 }
@@ -166,6 +167,7 @@ impl ExclusionSpecs {
     pub fn parse(policy: ExclusionPolicy<'_>) -> Self {
         Self {
             operator: parse_spec_list(policy.operator),
+            operator_group: Vec::new(),
             caller: parse_spec_list(policy.caller),
             explicit_only: policy
                 .explicit_only
@@ -176,11 +178,20 @@ impl ExclusionSpecs {
         }
     }
 
+    /// Resolve the consumer's exclusion list separately from the machine-wide
+    /// list so negations in one cannot cancel exclusions in the other.
+    pub fn with_operator_group(mut self, group: &[String]) -> Self {
+        self.operator_group = parse_spec_list(group);
+        self
+    }
+
     /// The list that excludes `key`, if either does. The operator fence is checked
     /// first so a route that both lists name is reported as the standing policy
     /// decision it is, not as one attempt's local exclusion.
     pub fn source_for(&self, key: &str) -> Option<ExclusionSource> {
-        if resolve_spec(&self.operator, key, false) {
+        if resolve_spec(&self.operator, key, false)
+            || resolve_spec(&self.operator_group, key, false)
+        {
             return Some(ExclusionSource::Operator);
         }
         let provider = key_provider(key);
@@ -227,6 +238,51 @@ pub fn filter_excluded_keys_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumer_and_all_lists_are_independent_including_variant_exceptions() {
+        let all = vec![
+            "anthropic".into(),
+            "openai/pin".into(),
+            "-openai/pin/high".into(),
+        ];
+        let group = vec![
+            "-anthropic".into(),
+            "-openai/pin".into(),
+            "local".into(),
+            "-local/safe".into(),
+        ];
+        let policy = ExclusionSpecs::parse(ExclusionPolicy {
+            operator: &all,
+            caller: &[],
+            explicit_only: &[],
+        })
+        .with_operator_group(&group);
+        for key in [
+            "anthropic/one",
+            "anthropic/two/high",
+            "openai/pin",
+            "openai/pin/low",
+            "local/unsafe",
+        ] {
+            assert_eq!(
+                policy.source_for(key),
+                Some(ExclusionSource::Operator),
+                "{key}"
+            );
+        }
+        for key in ["openai/pin/high", "local/safe", "other/model"] {
+            assert_eq!(policy.source_for(key), None, "{key}");
+        }
+        let group = vec!["openai/pin/high".into()];
+        let policy = ExclusionSpecs::parse(ExclusionPolicy {
+            operator: &all,
+            caller: &[],
+            explicit_only: &[],
+        })
+        .with_operator_group(&group);
+        assert!(policy.excludes("openai/pin/high"));
+    }
 
     fn specs(list: &[&str]) -> Vec<ParsedSpec> {
         parse_spec_list(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>())

@@ -26,6 +26,7 @@ mod model_resolution;
 mod quota_consumer;
 mod retention;
 mod runtime_lag;
+mod select_policy;
 mod subscription_economics;
 mod winner_ladder;
 mod work_model_pin;
@@ -46,8 +47,8 @@ use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
 use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::model_router::{
-    select_model_route_with_slots, ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities,
-    RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
+    select_model_route_with_operator_group, ModelRouteStateSnapshot, NoRouteError,
+    RequiredCapabilities, RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::quota::quota_poll::record_reading_log_poll;
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
@@ -1274,6 +1275,12 @@ struct SelectBody {
 #[serde(rename_all = "camelCase")]
 struct SelectParams {
     #[serde(default)]
+    consumer: Option<select_policy::Consumer>,
+    #[serde(default)]
+    pin: Option<select_policy::Pin>,
+    #[serde(default, rename = "pin_fallback", alias = "pinFallback")]
+    pin_fallback: select_policy::PinFallback,
+    #[serde(default)]
     model_pin: Option<String>,
     #[serde(default = "default_target_agent")]
     target_agent: String,
@@ -1608,6 +1615,21 @@ fn warn_ignored_caller_policy_once(sent: bool) {
     }
 }
 
+fn warn_missing_consumer_once(target_agent: &str) -> bool {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let Ok(mut warned) = WARNED.get_or_init(|| Mutex::new(HashSet::new())).lock() else {
+        return false;
+    };
+    if !warned.insert(target_agent.to_owned()) {
+        return false;
+    }
+    tracing::warn!(
+        target_agent,
+        "route.select omitted consumer; applying exclude.all only"
+    );
+    true
+}
+
 fn no_route_error(
     reason: RouteFailureReason,
     message: String,
@@ -1636,7 +1658,23 @@ fn resolve_select_request(
             &params.target_agent,
             params.requested_requirements.as_ref(),
         ) {
-            Ok(resolved) => (resolved.requirements, resolved.required_capabilities),
+            Ok(resolved) => {
+                let capabilities =
+                    match (resolved.required_capabilities, params.required_capabilities) {
+                        (Some(mut defaults), Some(explicit)) => {
+                            if explicit.vision == Some(true) {
+                                defaults.vision = Some(true);
+                            }
+                            if let Some(min) = explicit.min_context {
+                                defaults.min_context =
+                                    Some(defaults.min_context.map_or(min, |value| value.max(min)));
+                            }
+                            Some(defaults)
+                        }
+                        (defaults, explicit) => explicit.or(defaults),
+                    };
+                (resolved.requirements, capabilities)
+            }
             Err(error) => {
                 return Err(no_route_error(
                     RouteFailureReason::InvalidRequirements,
@@ -1647,13 +1685,19 @@ fn resolve_select_request(
         }
     };
 
+    // Keep operator-excluded models in the available set when trying a pin,
+    // which may select them. Normal fallback still applies operator exclusions.
+    let mut availability_policy = operator_policy.clone();
+    if params.pin.is_some() {
+        availability_policy.exclude.clear();
+    }
     let policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
-        operator_policy,
+        &availability_policy,
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
     );
-    if params.model_pin.is_none() && policy.connected_model_count == 0 {
+    if params.model_pin.is_none() && params.pin.is_none() && policy.connected_model_count == 0 {
         return Err(no_route_error(
             RouteFailureReason::NoAvailableModel,
             format!(
@@ -1663,7 +1707,7 @@ fn resolve_select_request(
             requirements,
         ));
     }
-    if params.model_pin.is_none() && policy.available_models.is_empty() {
+    if params.model_pin.is_none() && params.pin.is_none() && policy.available_models.is_empty() {
         return Err(no_route_error(
             RouteFailureReason::NoAvailableModel,
             format!(
@@ -2961,13 +3005,29 @@ async fn handle_select_request(
     warn_ignored_caller_policy_once(
         params.routing_policy.is_some() || !params.subscription_keys.is_empty(),
     );
+    if params.consumer.is_none() {
+        warn_missing_consumer_once(&params.target_agent);
+    }
+    if params.pin.is_some() && params.model_pin.is_some() {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "pin and modelPin are mutually exclusive",
+        )
+        .await;
+    }
     // The operator fence is read HERE, on the module side, for every selection.
     let live_config_started = Instant::now();
-    let operator_policy = if operator_config_path == routing_config_path {
-        live_config.operator_policy()
+    let operator_config = if operator_config_path == routing_config_path {
+        Arc::clone(&live_config)
     } else {
-        config_overrides::read_operator_routing_policy(operator_config_path)
+        config_overrides::live_config(operator_config_path)
     };
+    let operator_policy = operator_config.operator_policy();
     timing.add_live_config_check(live_config_started.elapsed());
     let snapshot_started = Instant::now();
     let availability = if is_broca_substrate(params.substrate.as_deref()) {
@@ -3025,7 +3085,16 @@ async fn handle_select_request(
                     Some(&policy_sources_line(&operator_policy)),
                 );
                 let _ = store.record_decision(&decision);
-                return send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
+                return send_no_route(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    &no_route,
+                    params.pin.as_ref().map(|_| "invalid_requirements"),
+                )
+                .await;
             }
         };
     let providers_without_prompt_cache = live_config.providers_without_prompt_cache();
@@ -3093,6 +3162,8 @@ async fn handle_select_request(
     );
     exclude.extend(head_refusals.route_keys.iter().cloned());
     let operator_exclude = operator_policy.exclude.clone();
+    let consumer_exclude =
+        select_policy::consumer_exclusions(operator_config.exclude_groups(), params.consumer);
     let requirements = resolved_request.requirements;
     let required_capabilities = resolved_request.required_capabilities;
     let target_agent = params.target_agent.clone();
@@ -3101,26 +3172,20 @@ async fn handle_select_request(
     let min_best_effort_adequacy = live_config.min_band();
     let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
 
-    if let Some(pin) = params.model_pin.as_deref() {
-        if let Some(refusal) =
-            host_runner_pin_refusal(&operator_policy, params.substrate.as_deref(), [pin])
-        {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                PROVIDER_REQUIRES_RUNNER_PIN,
-                &refusal,
-            )
-            .await;
-        }
+    let admission_pin = params
+        .pin
+        .as_ref()
+        .and_then(|pin| pin.resolve(operator_config.pins()));
+    let mut pin_rejected = None;
+    if let Some(pin) = params
+        .model_pin
+        .as_deref()
+        .or_else(|| admission_pin.as_ref().map(|pin| pin.model.as_str()))
+    {
         let sub = subscription_keys.clone();
         let selection_started = Instant::now();
-        let selection = work_model_pin::select(
-            pin,
-            SelectModelRouteInput {
+        let selection = {
+            let input = SelectModelRouteInput {
                 target_agent: target_agent.clone(),
                 requirements,
                 available_models: available.clone(),
@@ -3137,29 +3202,73 @@ async fn handle_select_request(
                 min_best_effort_adequacy,
                 prefer_prompt_cache: false,
                 providers_without_prompt_cache: HashSet::new(),
-            },
-            &routing_config,
-            concurrency_slots.as_ref(),
-        );
+            };
+            if let Some(refusal) =
+                host_runner_pin_refusal(&operator_policy, params.substrate.as_deref(), [pin])
+            {
+                Err(work_model_pin::Refusal {
+                    code: PROVIDER_REQUIRES_RUNNER_PIN.into(),
+                    message: refusal,
+                })
+            } else if let Some(pin) = &admission_pin {
+                select_policy::select_pin(pin, input, &routing_config, concurrency_slots.as_ref())
+                    .map_err(|code| work_model_pin::Refusal {
+                        message: code.clone(),
+                        code,
+                    })
+            } else {
+                work_model_pin::select_with_operator_group(
+                    pin,
+                    input,
+                    &routing_config,
+                    concurrency_slots.as_ref(),
+                    consumer_exclude,
+                )
+            }
+        };
+        let selection = selection.and_then(|selected| {
+            let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+            let ctx = account_selection::Ctx {
+                store: store.as_ref(),
+                accounts: ACCOUNT_QUOTA.get(),
+                flags: live_config.account_flags(),
+                policy: &policy,
+                now_ms: now as i64,
+            };
+            account_selection::preflight_model(
+                &ctx,
+                &selected.model.provider_id,
+                &selected.model.model_id,
+            )
+            .map_err(|(code, message)| work_model_pin::Refusal { code, message })?;
+            // Resolve the Broca launch target and its credential mapping
+            // before recording a decision; an unusable mapping rejects the pin.
+            let runner = if is_broca_substrate(params.substrate.as_deref()) {
+                let session = pool_session(
+                    params.task_id.as_deref(),
+                    params.send_id.as_deref(),
+                    &format!("route.select:{}", now as i64),
+                );
+                Some(
+                    runner_for_route(
+                        &operator_policy,
+                        broca_credentials,
+                        store.as_ref(),
+                        &session,
+                        &selected.model.provider_id,
+                        &selected.model.model_id,
+                        selected.prompt_params.variant.as_deref(),
+                    )
+                    .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
+                )
+            } else {
+                None
+            };
+            Ok((selected, runner))
+        });
         timing.record_selection(selection_started.elapsed());
         match selection {
-            Ok(selected) => {
-                let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
-                let ctx = account_selection::Ctx {
-                    store: store.as_ref(),
-                    accounts: ACCOUNT_QUOTA.get(),
-                    flags: live_config.account_flags(),
-                    policy: &policy,
-                    now_ms: now as i64,
-                };
-                if let Err((code, message)) = account_selection::preflight_model(
-                    &ctx,
-                    &selected.model.provider_id,
-                    &selected.model.model_id,
-                ) {
-                    return send_route_error(writer, ver, channel, epoch, corr, &code, &message)
-                        .await;
-                }
+            Ok((selected, runner)) => {
                 let decision = decision_input_for(
                     &target_agent,
                     &requirements,
@@ -3169,36 +3278,6 @@ async fn handle_select_request(
                     Some(&provenance),
                     Some(&policy_sources_line(&operator_policy)),
                 );
-                // A pinned Broca launch carries its launch target. For a provider
-                // that exists only as a vault credential mapping this is the only
-                // place its credential pin is decided, so an unresolvable mapping
-                // refuses the pin before any decision is recorded.
-                let runner = if is_broca_substrate(params.substrate.as_deref()) {
-                    let session = pool_session(
-                        params.task_id.as_deref(),
-                        params.send_id.as_deref(),
-                        &format!("route.select:{}", now as i64),
-                    );
-                    match runner_for_route(
-                        &operator_policy,
-                        broca_credentials,
-                        store.as_ref(),
-                        &session,
-                        &selected.model.provider_id,
-                        &selected.model.model_id,
-                        selected.prompt_params.variant.as_deref(),
-                    ) {
-                        Ok(runner) => Some(runner),
-                        Err((code, message)) => {
-                            return send_route_error(
-                                writer, ver, channel, epoch, corr, &code, &message,
-                            )
-                            .await;
-                        }
-                    }
-                } else {
-                    None
-                };
                 let decision_id = store
                     .record_decision(&decision)
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
@@ -3206,6 +3285,9 @@ async fn handle_select_request(
                     "selected": selected, "decisionID": decision_id,
                     "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities}
                 });
+                if params.pin.is_some() {
+                    result["pin_rejected"] = serde_json::Value::Null;
+                }
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
                     if let Some(grant) = grant {
@@ -3230,23 +3312,44 @@ async fn handle_select_request(
                 return reply;
             }
             Err(refusal) => {
-                return send_route_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    &refusal.code,
-                    &refusal.message,
-                )
-                .await
+                if params.pin.is_some() {
+                    pin_rejected = Some(refusal.code);
+                    if params.pin_fallback == select_policy::PinFallback::None {
+                        let body = serde_json::to_vec(&json!({ "result": {
+                            "selected": null, "decisionID": null, "pin_rejected": pin_rejected,
+                        }}))
+                        .map_err(ModuleError::Json)?;
+                        let response = Frame::build_with_version(
+                            ver,
+                            FrameType::Response,
+                            Flags::new(false, Priority::Interactive, false),
+                            channel,
+                            epoch,
+                            corr,
+                            body,
+                        )
+                        .map_err(|error| ModuleError::Message(error.to_string()))?;
+                        return send(writer, response).await;
+                    }
+                } else {
+                    return send_route_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        &refusal.code,
+                        &refusal.message,
+                    )
+                    .await;
+                }
             }
         }
     }
 
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
         let sub = subscription_keys.clone();
-        select_model_route_with_slots(
+        select_model_route_with_operator_group(
             SelectModelRouteInput {
                 target_agent: target_agent.clone(),
                 requirements,
@@ -3269,6 +3372,7 @@ async fn handle_select_request(
             },
             &routing_config,
             concurrency_slots.as_ref(),
+            consumer_exclude,
         )
     };
 
@@ -3295,6 +3399,13 @@ async fn handle_select_request(
                 .iter()
                 .map(fact_to_route)
                 .filter(|route| hard_rejected_keys.contains(route.route_key.as_str()))
+                // Do not select a rejected pin by temporarily clearing its quota
+                // wall during the fallback retry.
+                .filter(|route| {
+                    !admission_pin.as_ref().is_some_and(|pin| {
+                        pin_rejected.is_some() && route.capacity_key == pin.model
+                    })
+                })
                 .map(|route| BreakGlassCandidate {
                     route_key: route.route_key,
                     capacity_key: route.capacity_key,
@@ -3380,6 +3491,9 @@ async fn handle_select_request(
                             }).collect::<std::collections::BTreeMap<_, _>>(),
                         }))).collect::<Vec<_>>(),
                     });
+                    if params.pin.is_some() {
+                        result["pin_rejected"] = json!(pin_rejected);
+                    }
                     if is_broca_substrate(params.substrate.as_deref()) {
                         // Automatic selection never admits an explicit-only provider, so this
                         // resolves to the ordinary provider translation. Going through
@@ -3487,7 +3601,16 @@ async fn handle_select_request(
             );
             let _ = store.record_decision(&decision);
             let reply_started = Instant::now();
-            let reply = send_no_route(writer, ver, channel, epoch, corr, &no_route).await;
+            let reply = send_no_route(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                &no_route,
+                pin_rejected.as_deref(),
+            )
+            .await;
             timing.record_reply(reply_started.elapsed());
             reply
         }
@@ -4924,6 +5047,7 @@ async fn send_no_route(
     epoch: u32,
     corr: u64,
     err: &NoRouteError,
+    pin_rejected: Option<&str>,
 ) -> Result<(), ModuleError> {
     let code = err.reason.as_str();
     let mut message = if err.reason == RouteFailureReason::AllRoutesInadequate {
@@ -4954,7 +5078,7 @@ async fn send_no_route(
     }
     // blockingCauses names why routes are blocked, and earliestResetRoute names
     // whose expiry earliestReset reports; clients need not parse the message.
-    let body_value = if matches!(
+    let mut body_value = if matches!(
         err.reason,
         RouteFailureReason::AllRoutesInadequate | RouteFailureReason::QuotaOrCooldownExhausted
     ) {
@@ -4978,6 +5102,9 @@ async fn send_no_route(
     } else {
         json!({ "code": code, "message": message })
     };
+    if let Some(reason) = pin_rejected {
+        body_value["pin_rejected"] = json!(reason);
+    }
     let body = serde_json::to_vec(&body_value).map_err(ModuleError::Json)?;
     let frame = Frame::build_with_version(
         ver,
@@ -5500,6 +5627,7 @@ impl Error for ModuleError {}
 
 #[cfg(test)]
 mod tests {
+    include!("select_policy_tests.rs");
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

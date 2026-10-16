@@ -5,7 +5,8 @@ use prefrontal_routing_core::model_resolution::{
     resolve_model_capabilities, ModelCapabilitiesInput,
 };
 use prefrontal_routing_core::model_router::{
-    admit_routes, select_model_route_with_slots, SelectModelRouteInput, SelectedModelRoute,
+    admit_routes_with_operator_group, select_model_route_with_operator_group,
+    SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::provider_model_spec::ExclusionPolicy;
 use prefrontal_routing_core::{ConcurrencySlots, RoutingConfig};
@@ -22,11 +23,22 @@ fn refuse(code: &str, message: String) -> Refusal {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn select(
+    pin: &str,
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    slots: Option<&ConcurrencySlots>,
+) -> Result<SelectedModelRoute, Refusal> {
+    select_with_operator_group(pin, input, config, slots, &[])
+}
+
+pub(crate) fn select_with_operator_group(
     pin: &str,
     mut input: SelectModelRouteInput<'_>,
     config: &RoutingConfig,
     slots: Option<&ConcurrencySlots>,
+    operator_group: &[String],
 ) -> Result<SelectedModelRoute, Refusal> {
     let (provider, requested_model) = pin.split_once('/').ok_or_else(|| {
         refuse(
@@ -134,7 +146,7 @@ pub(crate) fn select(
     // way an explicit-only provider is admitted. A caller that forwarded the operator's explicit-only list
     // must not turn the pin into a refusal.
     input.explicit_only_providers.clear();
-    let admission = admit_routes(
+    let admission = admit_routes_with_operator_group(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy {
@@ -142,6 +154,7 @@ pub(crate) fn select(
             caller: &input.exclude_route_keys,
             explicit_only: &[],
         },
+        operator_group,
         input.required_capabilities,
         &input.available_models,
         &input.requirements,
@@ -198,7 +211,7 @@ pub(crate) fn select(
         .get_or_insert_with(Default::default)
         .min_context
         .get_or_insert(0.0);
-    let mut selected = select_model_route_with_slots(input, config, slots)
+    let mut selected = select_model_route_with_operator_group(input, config, slots, operator_group)
         .map_err(|error| refuse(error.reason.as_str(), error.message))?;
     selected.score.adequacy = adequacy.adequacy;
     selected.score.raw_adequacy = adequacy.raw_adequacy;

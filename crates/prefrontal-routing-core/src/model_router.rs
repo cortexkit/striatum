@@ -656,8 +656,32 @@ pub fn admit_routes(
     requirements: &ModelRequirements,
     config: &RoutingConfig,
 ) -> AdmissionResult {
+    admit_routes_with_operator_group(
+        facts,
+        runtime_snapshot,
+        exclusions,
+        &[],
+        required_capabilities,
+        available_models,
+        requirements,
+        config,
+    )
+}
+
+/// Admit routes using both the operator's global exclusions and a consumer's
+/// exclusions. Each list is resolved separately, so neither can lift the other.
+pub fn admit_routes_with_operator_group(
+    facts: &[ModelFact],
+    runtime_snapshot: Option<&ModelRouteStateSnapshot>,
+    exclusions: ExclusionPolicy<'_>,
+    operator_group: &[String],
+    required_capabilities: Option<RequiredCapabilities>,
+    available_models: &HashSet<String>,
+    requirements: &ModelRequirements,
+    config: &RoutingConfig,
+) -> AdmissionResult {
     let now = runtime_snapshot.map(|s| s.now).unwrap_or_else(now_millis);
-    let exclusion_specs = ExclusionSpecs::parse(exclusions);
+    let exclusion_specs = ExclusionSpecs::parse(exclusions).with_operator_group(operator_group);
     let mut static_candidates = Vec::new();
     let mut top_routable = TopRoutableScores::default();
     let mut rejected = Vec::new();
@@ -1248,6 +1272,7 @@ fn admit_and_price_shortlist(
     config: &RoutingConfig,
     counters_producer: bool,
     class_producer: bool,
+    operator_group: &[String],
 ) -> Result<PricedAdmission, NoRouteError> {
     let requirements = input.requirements;
 
@@ -1289,7 +1314,7 @@ fn admit_and_price_shortlist(
         admitted: mut admissible,
         mut rejected,
         top_routable,
-    } = admit_routes(
+    } = admit_routes_with_operator_group(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy {
@@ -1297,6 +1322,7 @@ fn admit_and_price_shortlist(
             caller: &input.exclude_route_keys,
             explicit_only: &input.explicit_only_providers,
         },
+        operator_group,
         caps,
         &input.available_models,
         &requirements,
@@ -1509,7 +1535,7 @@ pub fn price_selection_shortlist(
     counters_producer: bool,
     class_producer: bool,
 ) -> Result<PricedShortlist, NoRouteError> {
-    let priced = admit_and_price_shortlist(&input, config, counters_producer, class_producer)?;
+    let priced = admit_and_price_shortlist(&input, config, counters_producer, class_producer, &[])?;
     Ok(PricedShortlist {
         use_basket: priced.use_basket,
         degraded_by: priced.degraded_by,
@@ -1548,6 +1574,17 @@ pub fn select_model_route_with_slots(
     config: &RoutingConfig,
     slots: Option<&ConcurrencySlots>,
 ) -> Result<SelectedModelRoute, NoRouteError> {
+    select_model_route_with_operator_group(input, config, slots, &[])
+}
+
+/// Select one route with global and consumer exclusions resolved separately.
+/// A negation in the consumer's list cannot cancel a global exclusion.
+pub fn select_model_route_with_operator_group(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    slots: Option<&ConcurrencySlots>,
+    operator_group: &[String],
+) -> Result<SelectedModelRoute, NoRouteError> {
     let PricedAdmission {
         admissible,
         mut rejected,
@@ -1557,7 +1594,13 @@ pub fn select_model_route_with_slots(
         best_effort,
         cleared_count,
         ..
-    } = admit_and_price_shortlist(&input, config, COUNTERS_PRODUCER, CLASS_PRODUCER)?;
+    } = admit_and_price_shortlist(
+        &input,
+        config,
+        COUNTERS_PRODUCER,
+        CLASS_PRODUCER,
+        operator_group,
+    )?;
 
     // Deterministic ordering. COST-PRIMARY lexicographic among adequate models.
     // Every key is a property of one route, computed once here, so the order is
