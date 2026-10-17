@@ -411,7 +411,16 @@ pub struct ModelFact {
     /// Flag indicating that `class_vector` is an overlay value.
     #[serde(skip)]
     pub class_vector_is_overlay: bool,
+    /// Fusiform's `model.status` for this route, as models.dev publishes it
+    /// (`deprecated`, `beta`, `alpha`), or `None` when no status is stated.
+    /// models.dev marks a model OpenCode has withdrawn as `deprecated` rather
+    /// than deleting it, so a deprecated route is no longer served upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<String>,
 }
+
+/// The `model.status` value that withdraws a route from routing.
+pub const UPSTREAM_STATUS_DEPRECATED: &str = "deprecated";
 
 /// The five-counter complete-case token profile for a workload class.
 /// Computed over the trailing 7-day window (now - 7d, now] on rows where
@@ -460,6 +469,13 @@ pub fn is_valid_grand_family_id(id: &str) -> bool {
 }
 
 impl ModelFact {
+    /// Whether the upstream catalog marks this route `deprecated`: the provider
+    /// no longer serves it, so routing must not offer it. `beta` and `alpha`
+    /// are ordinary routable statuses.
+    pub fn is_deprecated_upstream(&self) -> bool {
+        self.upstream_status.as_deref() == Some(UPSTREAM_STATUS_DEPRECATED)
+    }
+
     /// Grand families are curated catalog data and are never inferred from route names.
     pub fn grand_family_id(&self) -> Option<&str> {
         self.family

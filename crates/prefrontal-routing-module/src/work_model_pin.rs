@@ -146,6 +146,17 @@ pub(crate) fn select(
         .or_else(|| facts.iter().find(|fact| fact.variant.is_none()))
         .unwrap_or(&facts[0])
         .clone();
+    // A withdrawn model fails at the provider whatever else is true of it, so
+    // say so first rather than reporting a capability gap.
+    if fact.is_deprecated_upstream() {
+        return Err(refuse(
+            prefrontal_routing_core::REASON_DEPRECATED_UPSTREAM,
+            format!(
+                "{pin}: {} is marked deprecated upstream; the provider no longer serves it",
+                fact_to_route(&fact).route_key
+            ),
+        ));
+    }
     if fact.supports_tool_use != Some(true) {
         return Err(refuse(
             "missing_tool_support",

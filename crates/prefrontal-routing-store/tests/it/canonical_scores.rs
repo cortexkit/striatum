@@ -67,6 +67,7 @@ fn served(route: &str, canonical_id: Option<&str>) -> FusiformFactUpdate {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: canonical_id.map(str::to_string),
+        upstream_status: None,
     }
 }
 
@@ -365,4 +366,40 @@ fn reingest_carries_a_changed_canonical_id_and_null_clears_it() {
         facts["opencode/muse-spark-1.3-contributor-free"].scores.elo,
         1810.0
     );
+}
+
+#[test]
+fn upstream_status_survives_a_score_placement_and_reaches_new_variants() {
+    let rig = Rig::new("upstream-status");
+    let store = rig.open();
+    let mut catalog = live_catalog();
+    for row in &mut catalog {
+        if row.provider_id == "opencode" && row.model_id == "muse-spark-1.3-contributor-free" {
+            row.upstream_status = Some("deprecated".into());
+        }
+    }
+    ingest(&store, &catalog);
+    place(
+        &store,
+        "opencode/muse-spark-1.3-contributor-free",
+        1800.0,
+        1500.0,
+    );
+    let mut high = store
+        .get_fact_by_route_key("opencode/muse-spark-1.3-contributor-free")
+        .unwrap()
+        .unwrap();
+    high.variant = Some("high".into());
+    store.upsert_fact(&high, FactSource::Override).unwrap();
+    let facts = routed(&store);
+    for route in [
+        "opencode/muse-spark-1.3-contributor-free",
+        "opencode/muse-spark-1.3-contributor-free/high",
+    ] {
+        assert!(facts[route].is_deprecated_upstream(), "{route}");
+    }
+    assert!(!facts["meta/muse-spark-1.3"].is_deprecated_upstream());
+    assert!(!store.list_canonical_gaps().unwrap().iter().any(|row| row
+        .route_key
+        .starts_with("opencode/muse-spark-1.3-contributor-free")));
 }

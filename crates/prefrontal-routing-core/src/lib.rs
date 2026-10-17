@@ -87,8 +87,8 @@ pub use model_router::{
     BasketRoutePricing, BasketVectorSource, BelowFloorWarning, ModelRouteStateSnapshot,
     NoRouteError, ObjectiveBreakdown, PricingMode, PromptParams, RejectedCandidate, RejectedRoute,
     RequiredCapabilities, RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
-    SelectedModel, SelectedModelRoute, SelectedRouteScore, REASON_EXCLUDED,
-    REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
+    SelectedModel, SelectedModelRoute, SelectedRouteScore, REASON_DEPRECATED_UPSTREAM,
+    REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
 pub use panel::{
     select_panel, select_panel_with_config, select_panel_with_policy,

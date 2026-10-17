@@ -97,6 +97,7 @@ fn fact(b: FactBuilder) -> ModelFact {
         eq_source: None,
         class_vector: b.class_vector,
         class_vector_is_overlay: has_vector,
+        upstream_status: None,
     }
 }
 

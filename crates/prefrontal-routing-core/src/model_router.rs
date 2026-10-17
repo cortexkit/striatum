@@ -47,6 +47,11 @@ pub const REASON_EXCLUDED: &str = "excluded";
 /// set that was is a property of the caller, so consumers that can name it
 /// attach it as the rejection's detail.
 pub const REASON_NOT_AVAILABLE: &str = "not_available";
+/// A route the upstream catalog marks `deprecated` (Fusiform's `model.status`):
+/// the provider no longer serves it, so no selection, panel seat or pin may
+/// use it. Checked before every other fence, because no policy can make a
+/// withdrawn model servable.
+pub const REASON_DEPRECATED_UPSTREAM: &str = "deprecated_upstream";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteRuntimeState {
@@ -664,6 +669,17 @@ pub fn admit_routes_with_operator_group(
 
     for fact in facts {
         let route = fact_to_route(fact);
+        if fact.is_deprecated_upstream() {
+            rejected.push(RejectedRoute {
+                detail: Some(format!(
+                    "{} is marked deprecated upstream; the provider no longer serves it",
+                    route.route_key
+                )),
+                route_key: route.route_key,
+                reason: REASON_DEPRECATED_UPSTREAM.to_string(),
+            });
+            continue;
+        }
         if fact.score_provenance == ScoreProvenance::Unscored {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
@@ -2068,6 +2084,7 @@ mod abundance_tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
+            upstream_status: None,
         }
     }
 

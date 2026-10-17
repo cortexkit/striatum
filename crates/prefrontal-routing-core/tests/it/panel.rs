@@ -49,6 +49,7 @@ fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
+        upstream_status: None,
     }
 }
 

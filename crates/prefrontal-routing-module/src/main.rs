@@ -1835,6 +1835,7 @@ fn merge_model_upsert(
                 eq_source: None,
                 class_vector: None,
                 class_vector_is_overlay: false,
+                upstream_status: None,
             }
         }
     };
@@ -6560,6 +6561,7 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
+            upstream_status: None,
         }
     }
 
@@ -11583,6 +11585,7 @@ mod tests {
                     supports_tool_use: Some(true),
                     reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
                     canonical_id: None,
+                    upstream_status: None,
                 },
             )
             .collect::<Vec<_>>();
@@ -12600,6 +12603,7 @@ mod tests {
                 supports_tool_use: None,
                 reasoning_efforts: None,
                 canonical_id: canonical.map(str::to_string),
+                upstream_status: None,
             }
         };
         store
@@ -12641,6 +12645,92 @@ mod tests {
             "an alias row serves its target's model"
         );
         assert!(!ids.contains_key("opencode/muse-spark-1.3-contributor-free"));
+    }
+
+    /// Live specimen: OpenCode withdrew `muse-spark-1.3-contributor-free` and
+    /// models.dev marks it `deprecated`, yet routing kept seating it and the
+    /// seats failed at the provider. A deprecated route is refused for automatic
+    /// selection and for an explicit pin, naming the route; its `beta` sibling
+    /// is still offered.
+    #[tokio::test]
+    async fn deprecated_upstream_route_is_refused_and_its_beta_sibling_is_offered() {
+        const SPECIMEN: &str = "opencode/muse-spark-1.3-contributor-free";
+        const SIBLING: &str = "meta/muse-spark-1.3-contributor";
+        let rig = Rig::new("deprecated-upstream");
+        let store: SharedStore = Arc::new(rig.open_store());
+        for route in [SPECIMEN, SIBLING] {
+            let (provider, model) = route.split_once('/').unwrap();
+            store
+                .upsert_fact(&fact(provider, model), FactSource::Override)
+                .unwrap();
+        }
+        let served = |status: &str| {
+            json!({"existence": "present", "limit.context": 200000,
+                "capability.tool_call": true, "model.status": status})
+        };
+        let snapshot = fusiform_catalog::decode_catalog_get(
+            &serde_json::to_vec(&json!({
+                "catalog_version": 1, "resolved_at_ms": 1,
+                "models": { SPECIMEN: served("deprecated"), SIBLING: served("beta") }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (served_facts, cursor) = snapshot.parts();
+        store.apply_fusiform_catalog(served_facts, cursor).unwrap();
+        let stored = store.get_fact_by_route_key(SPECIMEN).unwrap().unwrap();
+        assert_eq!(stored.upstream_status.as_deref(), Some("deprecated"));
+
+        let select = |pin: Option<&str>| {
+            let mut params = json!({
+                "targetAgent": "mason", "requestedRequirements": {"iq": 10, "eq": 10},
+                "availableModels": [SPECIMEN, SIBLING],
+            });
+            if let Some(pin) = pin {
+                params["modelPin"] = json!(pin);
+            }
+            let store = store.clone();
+            async move {
+                let frame = run_route_wire_request(
+                    &store,
+                    json!({"method": "route.select", "params": params}),
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+
+        let pinned = select(Some(SPECIMEN)).await;
+        assert_eq!(
+            pinned["code"],
+            prefrontal_routing_core::REASON_DEPRECATED_UPSTREAM,
+            "{pinned}"
+        );
+        assert!(
+            pinned["message"].as_str().unwrap().contains(SPECIMEN),
+            "the refusal names the route: {pinned}"
+        );
+
+        let sibling = select(Some(SIBLING)).await;
+        assert_eq!(
+            sibling["result"]["selected"]["routeKey"], SIBLING,
+            "a beta sibling is unaffected: {sibling}"
+        );
+
+        let automatic = select(None).await;
+        assert_eq!(
+            automatic["result"]["selected"]["routeKey"], SIBLING,
+            "{automatic}"
+        );
+        assert!(
+            automatic["result"]["selected"]["rejected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rejected| rejected["routeKey"] == SPECIMEN
+                    && rejected["reason"] == prefrontal_routing_core::REASON_DEPRECATED_UPSTREAM),
+            "{automatic}"
+        );
     }
 
     #[tokio::test]

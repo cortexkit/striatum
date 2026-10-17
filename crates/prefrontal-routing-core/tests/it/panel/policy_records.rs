@@ -445,3 +445,83 @@ fn routes_with_one_canonical_id_never_share_a_panel() {
         ]
     );
 }
+
+/// The live specimen, `opencode/muse-spark-1.3-contributor-free`, is marked
+/// deprecated upstream (OpenCode withdrew it). It is never seated, in the top-k
+/// seats or by an extra draw, even as the highest-Elo route; its `beta` sibling
+/// is seated as usual.
+#[test]
+fn a_deprecated_upstream_route_is_never_seated() {
+    let routed = |provider: &str, model: &str, elo: f64, family: &str, status: Option<&str>| {
+        let mut row = fact(model, elo, Some(family));
+        row.provider_id = provider.into();
+        row.upstream_status = status.map(str::to_string);
+        row
+    };
+    let specimen = || {
+        routed(
+            "opencode",
+            "muse-spark-1.3-contributor-free",
+            2000.0,
+            "other",
+            Some("deprecated"),
+        )
+    };
+    let sibling = || {
+        routed(
+            "meta",
+            "muse-spark-1.3-contributor",
+            1990.0,
+            "llama",
+            Some("beta"),
+        )
+    };
+    let policy = ClassPanelPolicy {
+        top_k: 1,
+        by: PanelOrder::Iq,
+        extra: 1,
+        extra_by: Some(PanelExtraOrder::Iq),
+        floor: None,
+    };
+    let seated = |panel: &SelectedPanel| {
+        panel
+            .members
+            .iter()
+            .map(|member| member.route_key.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let panel = choose(
+        vec![
+            specimen(),
+            sibling(),
+            routed("openai", "gpt-a", 1980.0, "gpt", None),
+        ],
+        PanelClass::Spec,
+        policy,
+        &PanelSelectionContext::default(),
+    );
+    assert_eq!(
+        seated(&panel),
+        ["meta/muse-spark-1.3-contributor", "openai/gpt-a"]
+    );
+
+    let panel = choose(
+        vec![specimen(), sibling()],
+        PanelClass::Spec,
+        policy,
+        &PanelSelectionContext::default(),
+    );
+    assert_eq!(seated(&panel), ["meta/muse-spark-1.3-contributor"]);
+    let shortfall = panel.shortfall.expect("the extra seat cannot be filled");
+    let cause = shortfall
+        .causes
+        .iter()
+        .find(|cause| cause.model == "opencode/muse-spark-1.3-contributor-free")
+        .expect("the specimen's refusal is reported");
+    assert_eq!(cause.reason, PanelCauseReason::DeprecatedUpstream);
+    assert_eq!(
+        serde_json::to_value(cause.reason).unwrap(),
+        json!("deprecated_upstream")
+    );
+}

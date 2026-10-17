@@ -12,7 +12,8 @@ use crate::model_facts::{
 };
 use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, CostBasis, ModelRouteStateSnapshot,
-    RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
+    RequiredCapabilities, REASON_DEPRECATED_UPSTREAM, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
+    REASON_NOT_AVAILABLE,
 };
 use crate::package_ceiling::seat_package_ceiling;
 use crate::provider_model_spec::ExclusionPolicy;
@@ -289,6 +290,9 @@ pub enum PanelCauseReason {
     MissingFact,
     FamilyUnlabeled,
     FamilyDuplicate,
+    /// The upstream catalog marks the route deprecated: the provider no longer
+    /// serves it, so it is never seated.
+    DeprecatedUpstream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -717,6 +721,7 @@ fn select_panel_admitted(
             reason: match rejected.reason.as_str() {
                 REASON_EXCLUDED => PanelCauseReason::Excluded,
                 REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
+                REASON_DEPRECATED_UPSTREAM => PanelCauseReason::DeprecatedUpstream,
                 "quota_exhausted" | "cooldown_active" => PanelCauseReason::QuotaExhausted,
                 "backoff_active" => PanelCauseReason::BackoffActive,
                 "missing_vision" | "context_too_small" => PanelCauseReason::Capability,

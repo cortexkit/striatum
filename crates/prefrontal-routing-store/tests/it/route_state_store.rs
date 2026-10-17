@@ -93,6 +93,7 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
+        upstream_status: None,
     }
 }
 
@@ -2841,6 +2842,7 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
+        upstream_status: None,
     };
     store
         .apply_fusiform_catalog(
@@ -2947,6 +2949,7 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
+        upstream_status: None,
     };
     store
         .apply_fusiform_catalog(
@@ -2994,6 +2997,7 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
+        upstream_status: None,
     };
     store
         .apply_fusiform_catalog(
@@ -3051,6 +3055,7 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
+        upstream_status: None,
     };
     let routable_before = store.get_facts().unwrap().len();
     assert!(store.get_facts().unwrap().iter().any(|fact| make_route_key(

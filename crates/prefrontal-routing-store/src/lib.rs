@@ -179,8 +179,9 @@ const MIGRATION_049: &str = include_str!("../migrations/049_model_auth_methods.s
 /// Migration 50: the reasoning-effort values Fusiform publishes per model.
 const MIGRATION_050: &str = include_str!("../migrations/050_model_reasoning_efforts.sql");
 /// Migration 51: Fusiform's canonical model identity, shared by every route of
-/// one model so they can share one quality score.
-const MIGRATION_051: &str = include_str!("../migrations/051_model_canonical_id.sql");
+/// one model so they can share one quality score, and the upstream `model.status`
+/// that withdraws a deprecated route from routing.
+const MIGRATION_051: &str = include_str!("../migrations/051_model_identity_and_status.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -538,6 +539,9 @@ pub struct FusiformFactUpdate {
     /// Fusiform's `model.canonical_id`, verbatim. `None` when the catalog served
     /// `null` or no value: the upstream states no identity for this route.
     pub canonical_id: Option<String>,
+    /// Fusiform's `model.status` verbatim (`deprecated`, `beta`, `alpha`), or
+    /// `None` when the catalog states no status.
+    pub upstream_status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -569,13 +573,14 @@ struct CatalogFingerprintRow {
     auth_methods_json: Option<String>,
     reasoning_efforts_json: Option<String>,
     canonical_id: Option<String>,
+    upstream_status: Option<String>,
 }
 
 /// BLAKE3 over every routing-read `model_facts` column: route/capacity identity,
 /// provider/model/variant, family, Elo/EQ/speed, context and output limits, price
 /// data, vision/tool capability flags, allowed login methods, published
 /// reasoning efforts, canonical model identity (it decides which score a route
-/// borrows), prompt defaults,
+/// borrows), upstream status (a deprecated route is refused), prompt defaults,
 /// confidence, speed multiplier, and exclusion. Adding a routing-read column
 /// without extending this row is the defect this hash exists to catch. Query ordering—not insertion ordering—is the
 /// generation contract, so a no-op reseed or shuffled input cannot mint a different
@@ -594,7 +599,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
                 speed_multiplier, excluded, fusiform_present, auth_methods_json,
-                reasoning_efforts_json, canonical_id
+                reasoning_efforts_json, canonical_id, upstream_status
          FROM model_facts
          ORDER BY route_key",
     )?;
@@ -627,6 +632,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             auth_methods_json: row.get(24)?,
             reasoning_efforts_json: row.get(25)?,
             canonical_id: row.get(26)?,
+            upstream_status: row.get(27)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1058,7 +1064,8 @@ impl SqliteRouteStateStore {
 
     /// Every routable route key carrying an operator score whose catalog row
     /// states no canonical id. These routes neither lend nor borrow a shared
-    /// score; the list is what to ask Fusiform to identify.
+    /// score; the list is what to ask Fusiform to identify. Deprecated routes
+    /// are left out: they are never offered.
     pub fn list_canonical_gaps(&self) -> RouteStateResult<Vec<CanonicalGapRow>> {
         let rows = self
             .store
@@ -1070,6 +1077,7 @@ impl SqliteRouteStateStore {
                      WHERE (canonical_id IS NULL OR trim(canonical_id) = '')
                        AND source IN ('seed', 'override')
                        AND COALESCE(fusiform_present, 1) = 1
+                       AND COALESCE(upstream_status, '') != 'deprecated'
                      ORDER BY route_key",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -1226,7 +1234,7 @@ impl SqliteRouteStateStore {
                                max_output_tokens_source, cost_tier_source,
                                cost_per_mtok_out_source, supports_vision_source,
                                supports_tool_use_source, auth_methods_json,
-                               reasoning_efforts_json, canonical_id
+                               reasoning_efforts_json, canonical_id, upstream_status
                              ) VALUES (
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
                                ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
@@ -1234,7 +1242,7 @@ impl SqliteRouteStateStore {
                                NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
                                'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
-                               'fusiform', 'fusiform', ?18, ?19, ?20
+                               'fusiform', 'fusiform', ?18, ?19, ?20, ?21
                              )",
                             params![
                                 route_key,
@@ -1257,6 +1265,7 @@ impl SqliteRouteStateStore {
                                 auth_methods_json,
                                 reasoning_efforts_json,
                                 fact.canonical_id,
+                                fact.upstream_status,
                             ],
                         )?;
                         let provider_key = derive_provider_key(&fact.provider_id).ok_or_else(|| {
@@ -1321,7 +1330,7 @@ impl SqliteRouteStateStore {
                                facts_source = 'fusiform', fusiform_version = ?11,
                                fusiform_present = ?12, updated_at = ?13,
                                auth_methods_json = ?16, reasoning_efforts_json = ?17,
-                               canonical_id = ?18
+                               canonical_id = ?18, upstream_status = ?19
                              WHERE provider_id = ?14 AND model_id = ?15",
                             params![
                                 fact.context_window,
@@ -1342,6 +1351,7 @@ impl SqliteRouteStateStore {
                                 auth_methods_json,
                                 reasoning_efforts_json,
                                 fact.canonical_id,
+                                fact.upstream_status,
                             ],
                         )?;
                     }
@@ -1640,13 +1650,15 @@ impl SqliteRouteStateStore {
     }
 
     /// Routable catalog rows that still have no score after same-model sharing:
-    /// a route that borrows its model's placement is not awaiting one.
+    /// a route that borrows its model's placement is not awaiting one, and a
+    /// route the upstream marks deprecated will never be offered.
     pub fn list_unscored_rows(&self) -> RouteStateResult<Vec<UnscoredRow>> {
         let mut rows = self
             .read_resolved_facts()?
             .into_iter()
             .filter(|(fact, present)| {
                 *present
+                    && !fact.is_deprecated_upstream()
                     && fact.score_provenance
                         == prefrontal_routing_core::model_facts::ScoreProvenance::Unscored
             })
@@ -2040,6 +2052,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         eq_source: row.get::<_, Option<String>>("eq_source")?,
         class_vector: None,
         class_vector_is_overlay: false,
+        upstream_status: row.get::<_, Option<String>>("upstream_status")?,
     })
 }
 
@@ -2201,10 +2214,10 @@ impl RouteStateStore for SqliteRouteStateStore {
                         }
                     }
                 }
-                 // Login restrictions and the canonical model identity belong to
-                 // the served model, not its route variant. When upsert_fact places
-                 // a new variant's scores, it inherits both; updating scores
-                 // cannot erase either.
+                 // Login restrictions, the canonical model identity and the
+                 // upstream status belong to the served model, not its route
+                 // variant. When upsert_fact places a new variant's scores, it
+                 // inherits all three; updating scores cannot erase any of them.
                  tx.execute(
                      "INSERT INTO model_facts (
                        route_key, capacity_key, provider_id, model_id, variant, family, family_source,
@@ -2212,11 +2225,13 @@ impl RouteStateStore for SqliteRouteStateStore {
                          input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                          supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
                           source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json,
-                          canonical_id
+                          canonical_id, upstream_status
                          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,
                            (SELECT auth_methods_json FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
                            (SELECT canonical_id FROM model_facts
+                            WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
+                           (SELECT upstream_status FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1))
                       ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,

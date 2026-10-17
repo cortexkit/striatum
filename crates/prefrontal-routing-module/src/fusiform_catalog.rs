@@ -68,6 +68,10 @@ fn error(message: impl Into<String>) -> FusiformCatalogError {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct CatalogGetArguments {
+    // No fact filter is sent: Fusiform then serves every fact family, which
+    // routing needs, including the `model.` facts (`model.canonical_id`,
+    // `model.status`) beside `rate.`, `limit.` and `capability.`. A filter that
+    // listed only those three prefixes would silently drop identity and status.
     /// Fusiform serves only present models unless asked, and a model it has
     /// retired is then simply missing from the reply. A missing model updates
     /// nothing, so a fact row for it stayed present-and-routable after the
@@ -215,6 +219,10 @@ struct CatalogModelFacts {
     /// both mean the upstream states no identity.
     #[serde(rename = "model.canonical_id", default)]
     canonical_id: Option<String>,
+    /// models.dev's model status (`deprecated`, `beta`, `alpha`), passed
+    /// through by Fusiform. `null` and an unserved key both mean no status.
+    #[serde(rename = "model.status", default)]
+    status: Option<String>,
 }
 
 fn served_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -692,6 +700,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
             canonical_id: model
                 .canonical_id
                 .filter(|canonical_id| !canonical_id.trim().is_empty()),
+            upstream_status: model.status.filter(|status| !status.trim().is_empty()),
         });
     }
     Ok(CatalogSnapshot {
@@ -1437,6 +1446,39 @@ mod tests {
             served(None),
             None,
             "a catalog that does not serve the key leaves the row unread"
+        );
+    }
+
+    /// Routing's catalog reads carry no fact filter, so Fusiform serves every
+    /// fact family, the `model.` facts (identity and status) included. A filter
+    /// listing only `rate.`, `limit.` or `capability.` prefixes would drop them.
+    #[test]
+    fn catalog_reads_request_every_fact_family_including_model_facts() {
+        let arguments = serde_json::to_value(CatalogGetRequest::all_with_retired()).unwrap()
+            ["arguments"]
+            .clone();
+        let keys = arguments
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["include_retired", "paged"], "no fact filter is sent");
+
+        let mut reply: Value =
+            serde_json::from_slice(&get_reply("catalog.get — one model, current")).unwrap();
+        for facts in reply["models"].as_object_mut().unwrap().values_mut() {
+            facts["model.status"] = json!("deprecated");
+            facts["model.canonical_id"] = json!("acme/one-1");
+        }
+        let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
+        assert_eq!(
+            snapshot.facts[0].upstream_status.as_deref(),
+            Some("deprecated")
+        );
+        assert_eq!(
+            snapshot.facts[0].canonical_id.as_deref(),
+            Some("acme/one-1")
         );
     }
 

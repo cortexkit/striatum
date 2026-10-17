@@ -6,3 +6,8 @@
 ALTER TABLE model_facts ADD COLUMN canonical_id TEXT;
 CREATE INDEX model_facts_canonical_id_idx ON model_facts (canonical_id)
     WHERE canonical_id IS NOT NULL;
+-- Fusiform's `model.status`, as models.dev publishes it: 'deprecated', 'beta',
+-- 'alpha', or NULL when no status is stated. models.dev marks a model OpenCode
+-- has withdrawn as 'deprecated' instead of deleting it, so routing refuses a
+-- deprecated route while the row (and its score) stays in the catalog.
+ALTER TABLE model_facts ADD COLUMN upstream_status TEXT;
