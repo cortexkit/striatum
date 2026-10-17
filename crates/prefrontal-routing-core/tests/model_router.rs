@@ -3975,7 +3975,8 @@ fn free_rated(model: &str, speed: f64) -> ModelFact {
 fn free_route_without_cache_write_rate_prices_at_zero_in_basket_and_output_only() {
     use prefrontal_routing_core::{selection_cost, BasketDimension};
     let vector = mason_live_vector();
-    // Anti-vacuity: the workload writes cache, so the missing rate is used.
+    // Anti-vacuity: the workload writes cache and reasons, so the absent
+    // cache-write and reasoning rates are actually priced.
     assert!(vector.cache_write > 0.0 && vector.reasoning > 0.0);
     let free = free_rated("free", 90.0);
     assert!(free.states_free_rates());
@@ -3986,7 +3987,7 @@ fn free_route_without_cache_write_rate_prices_at_zero_in_basket_and_output_only(
     assert_eq!(selection_cost(&free, false, true), 0.0);
     assert_eq!(selection_cost(&free, false, false), 0.0);
 
-    // A missing cache-read rate is filled the same way.
+    // An absent cache-read rate also prices at zero on a free route.
     let mut no_cache_read = free.clone();
     no_cache_read.cache_read_rate = None;
     assert_eq!(no_cache_read.basket_price(&vector).cost, Some(0.0));

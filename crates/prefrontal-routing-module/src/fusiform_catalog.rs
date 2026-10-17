@@ -2015,7 +2015,9 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        // The fact columns mirror the live store row; the plane overrides them.
+        // The fact's own rate fields mirror the live store row (input, output and
+        // cache-read set, cache-write and reasoning absent). Once price_facts
+        // attaches a billing plane, basket_rate reads the plane's rates instead.
         let mut facts = vec![
             crate::tests::fact("opencode", "free"),
             crate::tests::fact("opencode", "paid"),
