@@ -518,9 +518,36 @@ impl ModelFact {
             && self.cache_write_rate.is_some()
     }
 
+    /// True when the rate source [`ModelFact::basket_rate`] reads states BOTH
+    /// the input and the output rate as exactly zero: the route is free. That
+    /// source is the billing plane when one is attached, otherwise the fact's
+    /// own catalog columns. Fusiform publishes OpenCode's free models this way
+    /// (`stated_zero` input and output) and serves no cache-write or reasoning
+    /// rate for them.
+    pub fn states_free_rates(&self) -> bool {
+        match &self.billing_plane {
+            Some(plane) => {
+                plane.rate("rate.input") == Some(0.0) && plane.rate("rate.output") == Some(0.0)
+            }
+            None => self.input_rate == Some(0.0) && self.cost_per_m_tok_out == Some(0.0),
+        }
+    }
+
     /// The catalog rate ($/Mtok) for one basket dimension. Reasoning tokens fall
     /// back to the output rate when no separate reasoning rate is served.
+    ///
+    /// An absent rate is not a free rate, with one exception: on a route whose
+    /// input and output are both stated as zero ([`ModelFact::states_free_rates`]),
+    /// an absent cache-read, cache-write or reasoning rate prices at zero. A
+    /// cached or reasoning token cannot cost more than the free input or output
+    /// token it stands in for, so leaving it unknown would only rank a free route
+    /// behind priced ones. A rate the plane explicitly marks unpriced stays
+    /// unknown even then; only a missing one is filled.
     pub fn basket_rate(&self, dimension: BasketDimension) -> Option<f64> {
+        let fills_with_zero = matches!(
+            dimension,
+            BasketDimension::Reasoning | BasketDimension::CachedRead | BasketDimension::CacheWrite
+        );
         if let Some(plane) = &self.billing_plane {
             // Reasoning is part of output unless the plane explicitly states
             // otherwise. An explicit unpriced reasoning rule must not borrow
@@ -530,15 +557,25 @@ impl ModelFact {
             {
                 return plane.rate("rate.output");
             }
+            if fills_with_zero
+                && !plane.rates.contains_key(dimension.fact_key())
+                && self.states_free_rates()
+            {
+                return Some(0.0);
+            }
             return plane.rate(dimension.fact_key());
         }
-        match dimension {
+        let rate = match dimension {
             BasketDimension::FreshInput => self.input_rate,
             BasketDimension::OutputExcludingReasoning => self.cost_per_m_tok_out,
             BasketDimension::Reasoning => self.reasoning_rate.or(self.cost_per_m_tok_out),
             BasketDimension::CachedRead => self.cache_read_rate,
             BasketDimension::CacheWrite => self.cache_write_rate,
+        };
+        if rate.is_none() && fills_with_zero && self.states_free_rates() {
+            return Some(0.0);
         }
+        rate
     }
 
     /// Prices one message of `vector`'s workload on this route, dimension by
@@ -550,8 +587,9 @@ impl ModelFact {
     /// rate would be (Codex runs record no cache-write tokens, so a catalog row
     /// without a cache-write rate still prices fully). A dimension with tokens
     /// and no usable rate makes the route unpriceable; `cost` is then `None` and
-    /// `unpriced` names every such dimension. The vector's sample floor is the
-    /// caller's concern.
+    /// `unpriced` names every such dimension. On a free route an absent cache or
+    /// reasoning rate is zero, not missing (see [`ModelFact::basket_rate`]). The
+    /// vector's sample floor is the caller's concern.
     pub fn basket_price(&self, vector: &ClassVector) -> BasketPrice {
         let multiplier = self
             .subscription_multiplier

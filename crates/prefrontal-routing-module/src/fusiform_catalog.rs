@@ -1970,6 +1970,104 @@ mod tests {
         assert_eq!(plane.rate("rate.reasoning"), Some(4.0));
     }
 
+    /// OpenCode's free models on the production path: Fusiform states input and
+    /// output as `stated_zero` and serves no cache-write rate, and price_facts
+    /// attaches an apikey plane built from those catalog rates before selection.
+    /// The free route must price at zero through that plane; a priced sibling
+    /// with the same missing cache-write rate stays unknown.
+    #[test]
+    fn free_route_prices_at_zero_through_the_plane_price_facts_attaches() {
+        use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
+        use prefrontal_routing_core::BasketDimension::CacheWrite;
+        let zero = json!({"state": "stated_zero"});
+        let half_dollar =
+            json!({"state": "priced", "currency": "USD", "units": 500_000_000_i64, "exponent": 9});
+        let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "opencode-apikey".into(),
+                credentials: vec![ListedCredential {
+                    id: "opencode-key".into(),
+                    categories: vec!["llm-provider".into()],
+                    provider_ids: vec!["opencode".into()],
+                    credential_type: "apikey".into(),
+                    state: "active".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            1,
+        );
+        credentials.billing_catalog = PlaneCatalog {
+            version: Some(1),
+            base: model_rates(&json!({
+                "opencode/free": {"rate.input": zero, "rate.output": zero, "rate.cache_read": zero},
+                "opencode/paid": {"rate.input": zero, "rate.output": half_dollar, "rate.cache_read": zero},
+            }))
+            .unwrap(),
+            pages: [(
+                ("opencode".into(), "apikey".into()),
+                PlaneReply::Refused {
+                    code: "no_coverage".into(),
+                    message: "undeclared".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        // The fact columns mirror the live store row; the plane overrides them.
+        let mut facts = vec![
+            crate::tests::fact("opencode", "free"),
+            crate::tests::fact("opencode", "paid"),
+        ];
+        for fact in &mut facts {
+            fact.input_rate = Some(0.0);
+            fact.cache_read_rate = Some(0.0);
+            fact.cache_write_rate = None;
+            fact.reasoning_rate = None;
+            fact.class_vector = Some(vector());
+        }
+        facts[0].cost_per_m_tok_out = Some(0.0);
+        facts[1].cost_per_m_tok_out = Some(0.5);
+        credentials.price_facts(&mut facts);
+
+        let free = &facts[0];
+        let plane = free.billing_plane.as_ref().unwrap();
+        assert_eq!(plane.auth_method, "apikey");
+        assert_eq!(plane.kind, "no_coverage fallback");
+        assert!(!plane.rates.contains_key("rate.cache_write"));
+        assert_eq!(free.basket_rate(CacheWrite), Some(0.0));
+        assert_eq!(free.basket_price(&vector()).cost, Some(0.0));
+        assert_eq!(
+            prefrontal_routing_core::selection_cost(free, false, true),
+            0.0
+        );
+        assert_eq!(
+            prefrontal_routing_core::selection_cost(free, false, false),
+            0.0
+        );
+
+        let paid = &facts[1];
+        assert_eq!(paid.basket_rate(CacheWrite), None);
+        assert_eq!(paid.basket_price(&vector()).unpriced, [CacheWrite]);
+        assert_eq!(
+            prefrontal_routing_core::selection_cost(paid, false, true),
+            1.0
+        );
+
+        // A cache-write rate the plane explicitly marks unpriced is a statement,
+        // not an absence: it stays unknown even on a free route.
+        let mut refused = free.clone();
+        refused
+            .billing_plane
+            .as_mut()
+            .unwrap()
+            .rates
+            .insert("rate.cache_write".into(), BillingRate::Unpriced);
+        assert_eq!(refused.basket_rate(CacheWrite), None);
+        assert_eq!(refused.basket_price(&vector()).cost, None);
+    }
+
     #[test]
     fn chatgpt_roster_with_an_apikey_also_listed_prices_on_chatgpt() {
         use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};

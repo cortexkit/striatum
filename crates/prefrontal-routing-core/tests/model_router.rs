@@ -3955,6 +3955,112 @@ fn mason_iq_band_keeps_one_pricing_mode_and_one_winner_across_the_grok_cutoff() 
     assert_eq!(grok_shortlisted, vec![60.0, 70.0, 75.0]);
 }
 
+// OpenCode's free models: Fusiform states input and output as zero and serves
+// no cache-write or reasoning rate. A cached or reasoning token cannot cost
+// more than a free input or output token, so the missing rates price at zero.
+fn free_rated(model: &str, speed: f64) -> ModelFact {
+    let mut f = live_rated(
+        "opencode",
+        model,
+        1_900.0,
+        speed,
+        (0.0, 0.0, 0.0, None),
+        None,
+    );
+    f.reasoning_rate = None;
+    f
+}
+
+#[test]
+fn free_route_without_cache_write_rate_prices_at_zero_in_basket_and_output_only() {
+    use prefrontal_routing_core::{selection_cost, BasketDimension};
+    let vector = mason_live_vector();
+    // Anti-vacuity: the workload writes cache, so the missing rate is used.
+    assert!(vector.cache_write > 0.0 && vector.reasoning > 0.0);
+    let free = free_rated("free", 90.0);
+    assert!(free.states_free_rates());
+    assert_eq!(free.basket_rate(BasketDimension::CacheWrite), Some(0.0));
+    let price = free.basket_price(&vector);
+    assert_eq!(price.cost, Some(0.0));
+    assert!(price.unpriced.is_empty());
+    assert_eq!(selection_cost(&free, false, true), 0.0);
+    assert_eq!(selection_cost(&free, false, false), 0.0);
+
+    // A missing cache-read rate is filled the same way.
+    let mut no_cache_read = free.clone();
+    no_cache_read.cache_read_rate = None;
+    assert_eq!(no_cache_read.basket_price(&vector).cost, Some(0.0));
+}
+
+#[test]
+fn priced_route_without_cache_write_rate_stays_unknown() {
+    use prefrontal_routing_core::{selection_cost, BasketDimension};
+    let vector = mason_live_vector();
+    // Priced output with free input, and priced input with free output: only
+    // both zero makes a route free.
+    for (out, inp) in [(0.5, 0.0), (0.0, 0.5)] {
+        let paid = live_rated(
+            "opencode",
+            "paid",
+            1_900.0,
+            90.0,
+            (out, inp, 0.0, None),
+            None,
+        );
+        assert!(!paid.states_free_rates());
+        assert_eq!(paid.basket_rate(BasketDimension::CacheWrite), None);
+        let price = paid.basket_price(&vector);
+        assert_eq!(price.cost, None, "out {out} in {inp}");
+        assert_eq!(price.unpriced, vec![BasketDimension::CacheWrite]);
+        assert_eq!(selection_cost(&paid, false, true), 1.0);
+    }
+}
+
+// The priced route is faster, so it would win every tie-break; only the free
+// route's zero cost can put it first. Before the free-route rule the free route
+// read as price_unknown and ranked after the priced one.
+#[test]
+fn ladder_with_an_adequate_free_route_and_an_adequate_priced_route_picks_the_free_one() {
+    let facts = || {
+        vec![
+            live_rated(
+                "acme",
+                "paid",
+                1_900.0,
+                200.0,
+                (10.0, 2.0, 0.10, Some(2.50)),
+                None,
+            ),
+            free_rated("free", 40.0),
+        ]
+    };
+    let selected = select_model_route(input(facts(), req(60.0, 0.0), Extra::default())).unwrap();
+    let explanation = selected.explanation.join("\n");
+    assert_eq!(selected.route_key, "opencode/free", "{explanation}");
+    assert_eq!(selected.score.pricing_mode, PricingMode::Basket);
+    assert!(!explanation.contains("price_unknown"), "{explanation}");
+
+    let priced = price_selection_shortlist(
+        input(facts(), req(60.0, 0.0), Extra::default()),
+        &DEFAULT_ROUTING_CONFIG,
+        COUNTERS_PRODUCER,
+        CLASS_PRODUCER,
+    )
+    .unwrap();
+    let free = priced
+        .routes
+        .iter()
+        .find(|route| route.route_key == "opencode/free")
+        .unwrap();
+    assert_eq!(free.cost, 0.0);
+    assert!(free
+        .basket_pricing
+        .as_ref()
+        .unwrap()
+        .unpriced_dimensions
+        .is_empty());
+}
+
 // Codex runs record no cache-write tokens. A route whose catalog row lacks a
 // cache-write rate is then fully priceable: the dimension contributes zero
 // whatever its rate would be.
