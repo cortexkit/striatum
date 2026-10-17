@@ -57,6 +57,7 @@ fn fact(provider: &str, model: &str, cost: f64) -> ModelFact {
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
+        upstream_status: None,
     }
 }
 

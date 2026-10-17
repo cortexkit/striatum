@@ -11,6 +11,7 @@
 
 use cortexkit_store::{open_sqlite, Migration, SqliteStore};
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+use prefrontal_routing_core::canonical_scores::resolve_canonical_scores;
 use prefrontal_routing_core::model_facts::{
     normalize_grand_family_id, ClassVector, Confidence, FamilySource, GrandFamily, ModelFact,
     ModelPromptDefaults, ModelScores, CLASS_VECTOR_TRAILING_WINDOW_DAYS,
@@ -175,9 +176,13 @@ const MIGRATION_048: &str = include_str!("../migrations/048_pool_keys.sql");
 const MIGRATION_049: &str = include_str!("../migrations/049_model_auth_methods.sql");
 /// Migration 50: the reasoning-effort values Fusiform publishes per model.
 const MIGRATION_050: &str = include_str!("../migrations/050_model_reasoning_efforts.sql");
-/// Migration 51: retire shadow mode's heartbeat index and add the indexes the
+/// Migration 51: Fusiform's canonical model identity, shared by every route of
+/// one model so they can share one quality score, and the upstream `model.status`
+/// that withdraws a deprecated route from routing.
+const MIGRATION_051: &str = include_str!("../migrations/051_model_identity_and_status.sql");
+/// Migration 52: retire shadow mode's heartbeat index and add the indexes the
 /// account-selection history retention walks.
-const MIGRATION_051: &str = include_str!("../migrations/051_retire_account_shadow.sql");
+const MIGRATION_052: &str = include_str!("../migrations/052_retire_account_shadow.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -221,7 +226,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 51] {
+fn route_state_migrations() -> [Migration; 52] {
     [
         Migration {
             version: 1,
@@ -427,6 +432,10 @@ fn route_state_migrations() -> [Migration; 51] {
             version: 51,
             statements: MIGRATION_051,
         },
+        Migration {
+            version: 52,
+            statements: MIGRATION_052,
+        },
     ]
 }
 
@@ -492,6 +501,14 @@ pub struct CatalogFact {
     pub fusiform_version: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fusiform_present: Option<bool>,
+    /// Fusiform's `model.canonical_id` for this route; absent when the catalog
+    /// states no identity.
+    #[serde(rename = "canonicalID", skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<String>,
+    /// The route whose operator score this row's Elo/EQ were read from, when the
+    /// row has no score of its own and shares a canonical id with one that does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_borrowed_from: Option<String>,
 }
 
 /// Durable cursor committed atomically with a Fusiform catalog snapshot.
@@ -524,6 +541,12 @@ pub struct FusiformFactUpdate {
     /// `None` only when the catalog did not serve the key at all, which leaves
     /// the row unread for reasoning purposes.
     pub reasoning_efforts: Option<Vec<String>>,
+    /// Fusiform's `model.canonical_id`, verbatim. `None` when the catalog served
+    /// `null` or no value: the upstream states no identity for this route.
+    pub canonical_id: Option<String>,
+    /// Fusiform's `model.status` verbatim (`deprecated`, `beta`, `alpha`), or
+    /// `None` when the catalog states no status.
+    pub upstream_status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -554,12 +577,15 @@ struct CatalogFingerprintRow {
     fusiform_present: Option<bool>,
     auth_methods_json: Option<String>,
     reasoning_efforts_json: Option<String>,
+    canonical_id: Option<String>,
+    upstream_status: Option<String>,
 }
 
 /// BLAKE3 over every routing-read `model_facts` column: route/capacity identity,
 /// provider/model/variant, family, Elo/EQ/speed, context and output limits, price
 /// data, vision/tool capability flags, allowed login methods, published
-/// reasoning efforts, prompt defaults,
+/// reasoning efforts, canonical model identity (it decides which score a route
+/// borrows), upstream status (a deprecated route is refused), prompt defaults,
 /// confidence, speed multiplier, and exclusion. Adding a routing-read column
 /// without extending this row is the defect this hash exists to catch. Query ordering—not insertion ordering—is the
 /// generation contract, so a no-op reseed or shuffled input cannot mint a different
@@ -578,7 +604,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
                 speed_multiplier, excluded, fusiform_present, auth_methods_json,
-                reasoning_efforts_json
+                reasoning_efforts_json, canonical_id, upstream_status
          FROM model_facts
          ORDER BY route_key",
     )?;
@@ -610,6 +636,8 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             fusiform_present: row.get::<_, Option<i64>>(23)?.map(|value| value != 0),
             auth_methods_json: row.get(24)?,
             reasoning_efforts_json: row.get(25)?,
+            canonical_id: row.get(26)?,
+            upstream_status: row.get(27)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -707,6 +735,9 @@ pub struct SqliteRouteStateStore {
     /// quiet and never serves a vector that predates a write.
     class_vectors: Mutex<HashMap<String, CachedClassVector>>,
     usage_generation: AtomicU64,
+    /// Same-model score disagreements already logged by this process, so a
+    /// read on every selection does not repeat the same warning.
+    reported_score_conflicts: Mutex<HashSet<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -838,6 +869,21 @@ pub struct UnscoredRow {
     pub route_key: String,
 }
 
+/// An operator-scored route whose catalog row states no canonical model id,
+/// so its score cannot be shared with other routes of the same model.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalGapRow {
+    pub route_key: String,
+    /// `curated` (migration seed) or `override` (operator write).
+    pub source: String,
+    pub elo: f64,
+    pub eq: f64,
+    /// Whether Fusiform serves this route at all. `false` means the catalog has
+    /// no row for it, so there is nothing for Fusiform to annotate yet.
+    pub fusiform_served: bool,
+}
+
 impl SqliteRouteStateStore {
     /// Open from a resolved descriptor, applying migrations. The single-writer
     /// lease location is derived by the lib from the descriptor's db path (one
@@ -864,6 +910,7 @@ impl SqliteRouteStateStore {
             store,
             class_vectors: Mutex::new(HashMap::new()),
             usage_generation: AtomicU64::new(0),
+            reported_score_conflicts: Mutex::new(HashSet::new()),
         })
     }
 
@@ -895,7 +942,8 @@ impl SqliteRouteStateStore {
     /// only needs capabilities, while read-only inventory consumers must not infer
     /// policy state from a missing capability or a filtered result.
     pub fn get_catalog_facts(&self) -> RouteStateResult<Vec<CatalogFact>> {
-        self.store
+        let mut rows = self
+            .store
             .with_conn(|connection: &Connection| {
                 let mut statement =
                     connection.prepare("SELECT * FROM model_facts ORDER BY route_key")?;
@@ -911,9 +959,171 @@ impl SqliteRouteStateStore {
                         fusiform_present: row
                             .get::<_, Option<i64>>("fusiform_present")?
                             .map(|value| value != 0),
+                        canonical_id: row.get("canonical_id")?,
+                        score_borrowed_from: None,
                     })
                 })?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)?;
+        // The inventory shows the Elo/EQ routing actually uses, and names the
+        // route a shared score came from.
+        let canonical_ids = rows
+            .iter()
+            .map(|row| row.canonical_id.clone())
+            .collect::<Vec<_>>();
+        let mut facts = rows.iter().map(|row| row.fact.clone()).collect::<Vec<_>>();
+        let borrowed_from = self.share_canonical_scores(&mut facts, &canonical_ids);
+        for ((row, fact), borrowed) in rows.iter_mut().zip(facts).zip(borrowed_from) {
+            row.fact = fact;
+            row.score_borrowed_from = borrowed;
+        }
+        Ok(rows)
+    }
+
+    /// Every stored fact paired with its canonical id, with shared scores
+    /// resolved across ALL rows (a withdrawn listing still carries the model's
+    /// placement for the routes that serve it), then filtered to rows Fusiform
+    /// has not withdrawn. The `bool` is whether the row is routable-present.
+    fn read_resolved_facts(&self) -> RouteStateResult<Vec<(ModelFact, bool)>> {
+        let rows = self
+            .store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(
+                    "SELECT *, COALESCE(fusiform_present, 1) = 1 AS present_now
+                     FROM model_facts",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row_to_fact(row)?,
+                        row.get::<_, Option<String>>("canonical_id")?,
+                        row.get::<_, bool>("present_now")?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)?;
+        let mut facts = Vec::with_capacity(rows.len());
+        let mut canonical_ids = Vec::with_capacity(rows.len());
+        let mut present = Vec::with_capacity(rows.len());
+        for (fact, canonical_id, present_now) in rows {
+            facts.push(fact);
+            canonical_ids.push(canonical_id);
+            present.push(present_now);
+        }
+        self.share_canonical_scores(&mut facts, &canonical_ids);
+        Ok(facts.into_iter().zip(present).collect())
+    }
+
+    /// Give routes without an operator score the score of a route serving the
+    /// same model (see `prefrontal_routing_core::canonical_scores`), and log each
+    /// distinct disagreement between same-model operator scores once per process.
+    /// Returns, per fact, the route key its score was borrowed from.
+    fn share_canonical_scores(
+        &self,
+        facts: &mut [ModelFact],
+        canonical_ids: &[Option<String>],
+    ) -> Vec<Option<String>> {
+        let resolution = resolve_canonical_scores(facts, canonical_ids);
+        if !resolution.conflicts.is_empty() {
+            if let Ok(mut reported) = self.reported_score_conflicts.lock() {
+                for conflict in &resolution.conflicts {
+                    if !reported.insert(conflict.signature()) {
+                        continue;
+                    }
+                    let scores = conflict
+                        .scores
+                        .iter()
+                        .map(|score| {
+                            format!("{} elo={} eq={}", score.route_key, score.elo, score.eq)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    tracing::warn!(
+                        canonical_id = %conflict.canonical_id,
+                        variant = conflict.variant.as_deref().unwrap_or(""),
+                        donor = %conflict.donor_route_key,
+                        scores = %scores,
+                        "routes serving the same model carry different operator scores; \
+                         each keeps its own, unscored routes borrow from the donor"
+                    );
+                }
+            }
+        }
+        resolution.borrowed_from
+    }
+
+    /// Every stored route key that carries a non-blank canonical model id.
+    pub fn canonical_ids_by_route_key(&self) -> RouteStateResult<HashMap<String, String>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(
+                    "SELECT route_key, canonical_id FROM model_facts
+                     WHERE canonical_id IS NOT NULL AND trim(canonical_id) != ''",
+                )?;
+                let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<rusqlite::Result<HashMap<String, String>>>()
+            })
+            .map_err(err)
+    }
+
+    /// Every routable route key carrying an operator score whose catalog row
+    /// states no canonical id. These routes neither lend nor borrow a shared
+    /// score; the list is what to ask Fusiform to identify. Deprecated routes
+    /// are left out: they are never offered.
+    pub fn list_canonical_gaps(&self) -> RouteStateResult<Vec<CanonicalGapRow>> {
+        let rows = self
+            .store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(
+                    "SELECT route_key, source, json_extract(scores_json, '$.elo'),
+                            json_extract(scores_json, '$.eq'), facts_source
+                     FROM model_facts
+                     WHERE (canonical_id IS NULL OR trim(canonical_id) = '')
+                       AND source IN ('seed', 'override')
+                       AND COALESCE(fusiform_present, 1) = 1
+                       AND COALESCE(upstream_status, '') != 'deprecated'
+                     ORDER BY route_key",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(CanonicalGapRow {
+                        route_key: row.get(0)?,
+                        source: FactSource::parse(&row.get::<_, String>(1)?)
+                            .provenance()
+                            .as_str()
+                            .to_string(),
+                        elo: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                        eq: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+                        fusiform_served: row.get::<_, Option<String>>(4)?.as_deref()
+                            == Some("fusiform"),
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)?;
+        // Same test as score sharing: a curated stamp with no Elo is not a score.
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.elo.is_finite() && row.elo > 0.0)
+            .collect())
+    }
+
+    /// Route keys of one model (all rows with this canonical id) at `variant`,
+    /// for a score placement that covers every route of the model.
+    pub fn route_keys_for_canonical_id(
+        &self,
+        canonical_id: &str,
+        variant: Option<&str>,
+    ) -> RouteStateResult<Vec<String>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(
+                    "SELECT route_key FROM model_facts
+                     WHERE canonical_id = ?1 AND variant IS ?2
+                     ORDER BY route_key",
+                )?;
+                let rows = stmt.query_map(params![canonical_id, variant], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<String>>>()
             })
             .map_err(err)
     }
@@ -1029,7 +1239,7 @@ impl SqliteRouteStateStore {
                                max_output_tokens_source, cost_tier_source,
                                cost_per_mtok_out_source, supports_vision_source,
                                supports_tool_use_source, auth_methods_json,
-                               reasoning_efforts_json
+                               reasoning_efforts_json, canonical_id, upstream_status
                              ) VALUES (
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
                                ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
@@ -1037,7 +1247,7 @@ impl SqliteRouteStateStore {
                                NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
                                'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
-                               'fusiform', 'fusiform', ?18, ?19
+                               'fusiform', 'fusiform', ?18, ?19, ?20, ?21
                              )",
                             params![
                                 route_key,
@@ -1059,6 +1269,8 @@ impl SqliteRouteStateStore {
                                 if fact.present { 1_i64 } else { 0_i64 },
                                 auth_methods_json,
                                 reasoning_efforts_json,
+                                fact.canonical_id,
+                                fact.upstream_status,
                             ],
                         )?;
                         let provider_key = derive_provider_key(&fact.provider_id).ok_or_else(|| {
@@ -1122,7 +1334,8 @@ impl SqliteRouteStateStore {
                                  THEN supports_tool_use_source ELSE 'fusiform' END,
                                facts_source = 'fusiform', fusiform_version = ?11,
                                fusiform_present = ?12, updated_at = ?13,
-                               auth_methods_json = ?16, reasoning_efforts_json = ?17
+                               auth_methods_json = ?16, reasoning_efforts_json = ?17,
+                               canonical_id = ?18, upstream_status = ?19
                              WHERE provider_id = ?14 AND model_id = ?15",
                             params![
                                 fact.context_window,
@@ -1142,6 +1355,8 @@ impl SqliteRouteStateStore {
                                 fact.model_id,
                                 auth_methods_json,
                                 reasoning_efforts_json,
+                                fact.canonical_id,
+                                fact.upstream_status,
                             ],
                         )?;
                     }
@@ -1439,24 +1654,29 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Catalog rows that exist without a score (Fusiform's later target).
+    /// Routable catalog rows that still have no score after same-model sharing:
+    /// a route that borrows its model's placement is not awaiting one, and a
+    /// route the upstream marks deprecated will never be offered.
     pub fn list_unscored_rows(&self) -> RouteStateResult<Vec<UnscoredRow>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(
-                    "SELECT route_key FROM model_facts
-                     WHERE source = 'unscored'
-                       AND COALESCE(fusiform_present, 1) = 1
-                     ORDER BY route_key",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok(UnscoredRow {
-                        route_key: row.get(0)?,
-                    })
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
+        let mut rows = self
+            .read_resolved_facts()?
+            .into_iter()
+            .filter(|(fact, present)| {
+                *present
+                    && !fact.is_deprecated_upstream()
+                    && fact.score_provenance
+                        == prefrontal_routing_core::model_facts::ScoreProvenance::Unscored
             })
-            .map_err(err)
+            .map(|(fact, _)| UnscoredRow {
+                route_key: prefrontal_routing_core::make_route_key(
+                    &fact.provider_id,
+                    &fact.model_id,
+                    fact.variant.as_deref(),
+                ),
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.route_key.cmp(&right.route_key));
+        Ok(rows)
     }
 
     /// Providers whose workers launched by `parent_session_id` were refused on
@@ -1837,6 +2057,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         eq_source: row.get::<_, Option<String>>("eq_source")?,
         class_vector: None,
         class_vector_is_overlay: false,
+        upstream_status: row.get::<_, Option<String>>("upstream_status")?,
     })
 }
 
@@ -1998,18 +2219,24 @@ impl RouteStateStore for SqliteRouteStateStore {
                         }
                     }
                 }
-                 // Login restrictions belong to the served model, not its route
+                 // Login restrictions, the canonical model identity and the
+                 // upstream status belong to the served model, not its route
                  // variant. When upsert_fact places a new variant's scores, it
-                 // inherits the model's policy; updating scores cannot erase it.
+                 // inherits all three; updating scores cannot erase any of them.
                  tx.execute(
                      "INSERT INTO model_facts (
                        route_key, capacity_key, provider_id, model_id, variant, family, family_source,
                        scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                          input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                          supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
-                          source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json
+                          source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json,
+                          canonical_id, upstream_status
                          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,
                            (SELECT auth_methods_json FROM model_facts
+                            WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
+                           (SELECT canonical_id FROM model_facts
+                            WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
+                           (SELECT upstream_status FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1))
                       ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
@@ -2271,16 +2498,14 @@ impl RouteStateStore for SqliteRouteStateStore {
     }
 
     fn get_facts(&self) -> RouteStateResult<Vec<ModelFact>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(
-                    "SELECT * FROM model_facts
-                     WHERE COALESCE(fusiform_present, 1) = 1",
-                )?;
-                let rows = stmt.query_map([], row_to_fact)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(err)
+        // Routes of one model share its operator score (keyed on Fusiform's
+        // canonical id). `get_fact_by_route_key` stays the raw row, so a write
+        // that merges over it never persists a borrowed score as the route's own.
+        Ok(self
+            .read_resolved_facts()?
+            .into_iter()
+            .filter_map(|(fact, present)| present.then_some(fact))
+            .collect())
     }
 
     fn get_fact_by_route_key(&self, route_key: &str) -> RouteStateResult<Option<ModelFact>> {
@@ -3904,7 +4129,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_051_retires_the_shadow_index_and_the_purge_removes_only_shadow_rows() {
+    fn migration_052_retires_the_shadow_index_and_the_purge_removes_only_shadow_rows() {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3924,7 +4149,7 @@ mod tests {
         let legacy = open_sqlite(&descriptor).unwrap();
         let migrations = route_state_migrations();
         legacy
-            .migrate(ROUTE_STATE_NAMESPACE, &migrations[..50])
+            .migrate(ROUTE_STATE_NAMESPACE, &migrations[..51])
             .unwrap();
         legacy
             .with_conn(|connection| {

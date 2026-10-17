@@ -1,4 +1,4 @@
--- Migration 51: retire account-selection shadow mode.
+-- Migration 52: retire account-selection shadow mode.
 --
 -- Shadow mode re-ran the allocator for nobody (on a timer, on every
 -- observation and on refused requests) and recorded each result as an

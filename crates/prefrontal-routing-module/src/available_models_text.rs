@@ -59,6 +59,8 @@ enum Include {
 #[derive(Debug)]
 struct Row {
     excluded: bool,
+    /// The upstream catalog marks the route deprecated; routing never offers it.
+    deprecated: bool,
 
     model_key: String,
     elo: Option<f64>,
@@ -200,6 +202,7 @@ fn render_text(
             });
             Row {
                 excluded: !allowed_keys.contains(model_key),
+                deprecated: fact.is_some_and(|value| value.is_deprecated_upstream()),
                 model_key: model_key.clone(),
                 elo: fact
                     .map(|value| value.scores.elo)
@@ -224,13 +227,14 @@ fn render_text(
     let query = params.query.to_lowercase();
     rows.retain(|row| {
         row.model_key.to_lowercase().contains(&query)
-            && (matches!(params.include, Include::All) || (!row.excluded && row.elo.is_some()))
+            && (matches!(params.include, Include::All)
+                || (!row.excluded && !row.deprecated && row.elo.is_some()))
     });
     rows.sort_by(compare_rows);
 
     let recommended = rows
         .iter()
-        .find(|row| !row.excluded && row.elo.is_some())
+        .find(|row| !row.excluded && !row.deprecated && row.elo.is_some())
         .map(|row| row.model_key.as_str());
     let count = rows.len();
     let page = rows
@@ -255,6 +259,9 @@ fn render_text(
         let mut reasons = Vec::new();
         if row.excluded {
             reasons.push("excluded by operator");
+        }
+        if row.deprecated {
+            reasons.push("deprecated upstream");
         }
         if row.elo.is_none() {
             reasons.push("no score");
@@ -483,6 +490,7 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
+            upstream_status: None,
         }
     }
 

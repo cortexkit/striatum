@@ -12,7 +12,8 @@ use crate::model_facts::{
 };
 use crate::model_router::{
     admit_routes, compute_objective, normalized_metered_cost, CostBasis, ModelRouteStateSnapshot,
-    RequiredCapabilities, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
+    RequiredCapabilities, REASON_DEPRECATED_UPSTREAM, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
+    REASON_NOT_AVAILABLE,
 };
 use crate::package_ceiling::seat_package_ceiling;
 use crate::provider_model_spec::ExclusionPolicy;
@@ -263,6 +264,11 @@ pub struct PanelPins {
 pub struct PanelSelectionContext {
     pub seed: String,
     pub pins: PanelPins,
+    /// Fusiform's canonical model id per route key. Routes with the same id
+    /// serve the same weights, so an automatic panel seats at most one of them
+    /// even when their `family` labels differ. Routes absent from the map have
+    /// no stated identity and are governed by the family rule alone.
+    pub canonical_ids: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -284,6 +290,9 @@ pub enum PanelCauseReason {
     MissingFact,
     FamilyUnlabeled,
     FamilyDuplicate,
+    /// The upstream catalog marks the route deprecated: the provider no longer
+    /// serves it, so it is never seated.
+    DeprecatedUpstream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -712,6 +721,7 @@ fn select_panel_admitted(
             reason: match rejected.reason.as_str() {
                 REASON_EXCLUDED => PanelCauseReason::Excluded,
                 REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
+                REASON_DEPRECATED_UPSTREAM => PanelCauseReason::DeprecatedUpstream,
                 "quota_exhausted" | "cooldown_active" => PanelCauseReason::QuotaExhausted,
                 "backoff_active" => PanelCauseReason::BackoffActive,
                 "missing_vision" | "context_too_small" => PanelCauseReason::Capability,
@@ -858,6 +868,20 @@ fn select_panel_admitted(
     let mut selected = Vec::new();
     let mut seats = Vec::new();
     let mut selected_families = HashSet::new();
+    // The canonical model ids already seated. Two routes of one model (a
+    // maker's listing and a reseller's, say) can carry different family labels,
+    // so the family rule alone could seat the same weights twice.
+    let mut selected_models: HashSet<&str> = HashSet::new();
+    let canonical_of = |candidate: &Candidate| {
+        context
+            .canonical_ids
+            .get(&candidate.route.route_key)
+            .map(String::as_str)
+            .filter(|id| !id.trim().is_empty())
+    };
+    let model_seated = |candidate: &Candidate, seated: &HashSet<&str>| {
+        canonical_of(candidate).is_some_and(|id| seated.contains(id))
+    };
     let top_k_candidates = candidates
         .iter()
         .enumerate()
@@ -875,9 +899,15 @@ fn select_panel_admitted(
             break;
         }
         let candidate = &candidates[index];
+        if enforce_family_diversity && model_seated(candidate, &selected_models) {
+            continue;
+        }
         if !enforce_family_diversity
             || selected_families.insert(candidate.route.fact.family.clone().unwrap())
         {
+            if enforce_family_diversity {
+                selected_models.extend(canonical_of(candidate));
+            }
             seats.push(PanelSeat {
                 slot: selected.len(),
                 route_key: candidate.route.route_key.clone(),
@@ -894,6 +924,7 @@ fn select_panel_admitted(
         let mut extras = (0..candidates.len())
             .filter(|index| {
                 !selected_families.contains(candidates[*index].route.fact.family.as_ref().unwrap())
+                    && !model_seated(&candidates[*index], &selected_models)
             })
             .collect::<Vec<_>>();
         extras.retain(|index| {
@@ -915,7 +946,11 @@ fn select_panel_admitted(
             if seated_extras == class_policy.extra {
                 break;
             }
+            if model_seated(&candidates[index], &selected_models) {
+                continue;
+            }
             if selected_families.insert(candidates[index].route.fact.family.clone().unwrap()) {
+                selected_models.extend(canonical_of(&candidates[index]));
                 seats.push(PanelSeat {
                     slot: selected.len(),
                     route_key: candidates[index].route.route_key.clone(),
@@ -932,14 +967,24 @@ fn select_panel_admitted(
 
     if enforce_family_diversity && selected.len() < width {
         for (index, candidate) in candidates.iter().enumerate() {
-            if !selected.contains(&index)
-                && selected_families.contains(candidate.route.fact.family.as_ref().unwrap())
-            {
+            if selected.contains(&index) {
+                continue;
+            }
+            if selected_families.contains(candidate.route.fact.family.as_ref().unwrap()) {
                 causes.push(PanelCause {
                     model: candidate.route.capacity_key.clone(),
                     reason: PanelCauseReason::FamilyDuplicate,
                     reset_at_ms: None,
                     detail: None,
+                });
+            } else if let Some(id) =
+                canonical_of(candidate).filter(|id| selected_models.contains(id))
+            {
+                causes.push(PanelCause {
+                    model: candidate.route.capacity_key.clone(),
+                    reason: PanelCauseReason::FamilyDuplicate,
+                    reset_at_ms: None,
+                    detail: Some(format!("same model as a seated route (canonical id {id})")),
                 });
             }
         }

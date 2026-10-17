@@ -572,6 +572,7 @@ impl LiveConfig {
                     eq_source: None,
                     class_vector: None,
                     class_vector_is_overlay: false,
+                    upstream_status: None,
                 });
             }
         }
@@ -1952,6 +1953,7 @@ fn apply_overrides<S: RouteStateStore>(
                 eq_source: None,
                 class_vector: None,
                 class_vector_is_overlay: false,
+                upstream_status: None,
             });
         // Score provenance does not distinguish config from route.model_upsert.
         // Preserving absent score fields avoids erasing an upsert placement on restart;
@@ -2085,6 +2087,7 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
+            upstream_status: None,
         };
         let ov = ModelFactOverride {
             vision: Some(true),

@@ -176,6 +176,7 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
                 variant: Some("high".into()),
             }),
         },
+        ..Default::default()
     };
     for (class, class_name, by, floor) in [
         (PanelClass::DesignReview, "design_review", "eq", json!(null)),
@@ -331,4 +332,196 @@ fn legacy_runner_up_defaults_to_topk_and_new_entries_serialize_phase() {
     let mut expected = legacy;
     expected["phase"] = json!("topK");
     assert_eq!(serde_json::to_value(spare).unwrap(), expected);
+}
+
+/// Live shape: a SPEC panel seated `opencode/muse-spark-1.3-contributor-free`
+/// and `meta/muse-spark-1.3-contributor` together because their family labels
+/// differ ("other" and "llama"). Both serve the same weights, so when both
+/// carry the same canonical id only one of them may be seated, in the top-k
+/// seats or by an extra draw. Without a canonical id the family rule alone
+/// decides, unchanged.
+#[test]
+fn routes_with_one_canonical_id_never_share_a_panel() {
+    const MUSE: &str = "meta/muse-spark-1.3";
+    let routed = |provider: &str, model: &str, elo: f64, family: &str| {
+        let mut row = fact(model, elo, Some(family));
+        row.provider_id = provider.into();
+        row
+    };
+    let muse_free = || {
+        routed(
+            "opencode",
+            "muse-spark-1.3-contributor-free",
+            2000.0,
+            "other",
+        )
+    };
+    let muse_contributor = || routed("meta", "muse-spark-1.3-contributor", 1990.0, "llama");
+    let field = || {
+        vec![
+            muse_free(),
+            muse_contributor(),
+            routed("openai", "gpt-a", 1980.0, "gpt"),
+            routed("google", "gemini-b", 1970.0, "gemini"),
+            routed("qwen", "qwen-c", 1960.0, "qwen"),
+        ]
+    };
+    let spec_policy = ClassPanelPolicy {
+        top_k: 3,
+        by: PanelOrder::Iq,
+        extra: 1,
+        extra_by: Some(PanelExtraOrder::Iq),
+        floor: None,
+    };
+    let same_model = PanelSelectionContext {
+        canonical_ids: HashMap::from([
+            (
+                "opencode/muse-spark-1.3-contributor-free".to_string(),
+                MUSE.to_string(),
+            ),
+            (
+                "meta/muse-spark-1.3-contributor".to_string(),
+                MUSE.to_string(),
+            ),
+        ]),
+        ..Default::default()
+    };
+    let seated = |panel: &SelectedPanel| {
+        panel
+            .members
+            .iter()
+            .map(|member| member.route_key.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let panel = choose(field(), PanelClass::Spec, spec_policy, &same_model);
+    assert_eq!(
+        seated(&panel),
+        [
+            "opencode/muse-spark-1.3-contributor-free",
+            "openai/gpt-a",
+            "google/gemini-b",
+            "qwen/qwen-c",
+        ],
+        "the second Muse route is skipped for top-k and for the extra draw"
+    );
+
+    // An extra draw is held to the same rule: with nothing else to draw, the
+    // extra seat stays empty rather than seating the same model twice.
+    let panel = choose(
+        vec![muse_free(), muse_contributor()],
+        PanelClass::Spec,
+        ClassPanelPolicy {
+            top_k: 1,
+            ..spec_policy
+        },
+        &same_model,
+    );
+    assert_eq!(seated(&panel), ["opencode/muse-spark-1.3-contributor-free"]);
+    let shortfall = panel.shortfall.expect("the extra seat cannot be filled");
+    assert!(shortfall.causes.iter().any(|cause| {
+        cause.model == "meta/muse-spark-1.3-contributor"
+            && cause.reason == PanelCauseReason::FamilyDuplicate
+            && cause
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(MUSE))
+    }));
+
+    // No stated identity: the family rule is the only rule, as before.
+    let panel = choose(
+        field(),
+        PanelClass::Spec,
+        spec_policy,
+        &PanelSelectionContext::default(),
+    );
+    assert_eq!(
+        seated(&panel),
+        [
+            "opencode/muse-spark-1.3-contributor-free",
+            "meta/muse-spark-1.3-contributor",
+            "openai/gpt-a",
+            "google/gemini-b",
+        ]
+    );
+}
+
+/// The live specimen, `opencode/muse-spark-1.3-contributor-free`, is marked
+/// deprecated upstream (OpenCode withdrew it). It is never seated, in the top-k
+/// seats or by an extra draw, even as the highest-Elo route; its `beta` sibling
+/// is seated as usual.
+#[test]
+fn a_deprecated_upstream_route_is_never_seated() {
+    let routed = |provider: &str, model: &str, elo: f64, family: &str, status: Option<&str>| {
+        let mut row = fact(model, elo, Some(family));
+        row.provider_id = provider.into();
+        row.upstream_status = status.map(str::to_string);
+        row
+    };
+    let specimen = || {
+        routed(
+            "opencode",
+            "muse-spark-1.3-contributor-free",
+            2000.0,
+            "other",
+            Some("deprecated"),
+        )
+    };
+    let sibling = || {
+        routed(
+            "meta",
+            "muse-spark-1.3-contributor",
+            1990.0,
+            "llama",
+            Some("beta"),
+        )
+    };
+    let policy = ClassPanelPolicy {
+        top_k: 1,
+        by: PanelOrder::Iq,
+        extra: 1,
+        extra_by: Some(PanelExtraOrder::Iq),
+        floor: None,
+    };
+    let seated = |panel: &SelectedPanel| {
+        panel
+            .members
+            .iter()
+            .map(|member| member.route_key.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let panel = choose(
+        vec![
+            specimen(),
+            sibling(),
+            routed("openai", "gpt-a", 1980.0, "gpt", None),
+        ],
+        PanelClass::Spec,
+        policy,
+        &PanelSelectionContext::default(),
+    );
+    assert_eq!(
+        seated(&panel),
+        ["meta/muse-spark-1.3-contributor", "openai/gpt-a"]
+    );
+
+    let panel = choose(
+        vec![specimen(), sibling()],
+        PanelClass::Spec,
+        policy,
+        &PanelSelectionContext::default(),
+    );
+    assert_eq!(seated(&panel), ["meta/muse-spark-1.3-contributor"]);
+    let shortfall = panel.shortfall.expect("the extra seat cannot be filled");
+    let cause = shortfall
+        .causes
+        .iter()
+        .find(|cause| cause.model == "opencode/muse-spark-1.3-contributor-free")
+        .expect("the specimen's refusal is reported");
+    assert_eq!(cause.reason, PanelCauseReason::DeprecatedUpstream);
+    assert_eq!(
+        serde_json::to_value(cause.reason).unwrap(),
+        json!("deprecated_upstream")
+    );
 }

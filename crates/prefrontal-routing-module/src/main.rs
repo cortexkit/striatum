@@ -133,6 +133,9 @@ const ROUTE_ACCOUNT_QUOTA_STATUS_OP: &str = "route.account_quota_status";
 const ROUTE_LIST_INFERRED_OP: &str = "route.list_inferred";
 /// Focused alias for operators that only need never-scored Fusiform discoveries.
 const ROUTE_LIST_UNSCORED_OP: &str = "route.list_unscored";
+/// Operator worklist for Fusiform: scored routes whose catalog row states no
+/// canonical model id, so their score is not shared across the model's routes.
+const ROUTE_LIST_CANONICAL_GAPS_OP: &str = "route.list_canonical_gaps";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
 /// How often the background task refreshes quota windows from insula.
@@ -1397,13 +1400,20 @@ struct ModelUpsertBody {
 
 /// Partial fact: absent fields keep the stored value on merge, and a NEW model
 /// requires elo + eq (the two judgment axes nothing can default honestly).
+///
+/// `canonicalID` instead of `providerID`/`modelID` places Elo and EQ on every
+/// stored route of one model (all rows whose Fusiform canonical id matches, at
+/// the given variant) in one write. Only `elo`, `eq`, `variant` and `notes`
+/// apply then: every other field describes one provider's listing.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelUpsertParams {
-    #[serde(rename = "providerID")]
+    #[serde(rename = "providerID", default)]
     provider_id: String,
-    #[serde(rename = "modelID")]
+    #[serde(rename = "modelID", default)]
     model_id: String,
+    #[serde(rename = "canonicalID", default)]
+    canonical_id: Option<String>,
     #[serde(default)]
     variant: Option<String>,
     #[serde(default)]
@@ -1820,6 +1830,7 @@ fn merge_model_upsert(
                 eq_source: None,
                 class_vector: None,
                 class_vector_is_overlay: false,
+                upstream_status: None,
             }
         }
     };
@@ -1888,6 +1899,16 @@ async fn handle_model_upsert(
         frame.header.corr,
     );
     let params: ModelUpsertParams = match serde_json::from_slice::<ModelUpsertBody>(&frame.body) {
+        Ok(body) if body.params.canonical_id.is_some() => {
+            return handle_canonical_model_upsert(
+                body.params,
+                (ver, channel, epoch, corr),
+                writer,
+                store,
+                ladder_sources,
+            )
+            .await;
+        }
         Ok(body)
             if !body.params.provider_id.trim().is_empty()
                 && !body.params.model_id.trim().is_empty() =>
@@ -1902,7 +1923,7 @@ async fn handle_model_upsert(
                 epoch,
                 corr,
                 "invalid_request",
-                "model_upsert requires non-empty providerID and modelID",
+                "model_upsert requires non-empty providerID and modelID, or canonicalID",
             )
             .await;
         }
@@ -2082,6 +2103,201 @@ async fn handle_model_upsert(
     )
     .map_err(|error| ModuleError::Message(error.to_string()))?;
     send(writer, response).await
+}
+
+/// The canonical form of route.model_upsert: one Elo/EQ placement written to
+/// every stored route of one model (rows whose Fusiform canonical id matches,
+/// at the requested variant). Each row is written as its own override, so the
+/// routes agree and none is left reading an older per-route score. Routes that
+/// Fusiform adds later with the same canonical id borrow it at read time.
+async fn handle_canonical_model_upsert(
+    params: ModelUpsertParams,
+    (ver, channel, epoch, corr): (u8, u16, u32, u64),
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+    ladder_sources: &winner_ladder::LadderSources,
+) -> Result<(), ModuleError> {
+    let invalid = |message: String| async move {
+        send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            &message,
+        )
+        .await
+    };
+    let canonical_id = params.canonical_id.clone().unwrap_or_default();
+    if canonical_id.trim().is_empty() {
+        return invalid("model_upsert canonicalID must be non-empty".into()).await;
+    }
+    if !params.provider_id.is_empty() || !params.model_id.is_empty() {
+        return invalid("model_upsert takes canonicalID or providerID/modelID, not both".into())
+            .await;
+    }
+    let per_route_fields = [
+        ("family", params.family.is_some()),
+        ("speed", params.speed.is_some()),
+        ("contextWindow", params.context_window.is_some()),
+        ("maxOutputTokens", params.max_output_tokens.is_some()),
+        ("costPerMTokOut", params.cost_per_m_tok_out.is_some()),
+        ("supportsVision", params.supports_vision.is_some()),
+        ("supportsToolUse", params.supports_tool_use.is_some()),
+        ("defaultVariant", params.default_variant.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect::<Vec<_>>();
+    if !per_route_fields.is_empty() {
+        return invalid(format!(
+            "model_upsert by canonicalID places only elo and eq; {} describe one route, use providerID/modelID",
+            per_route_fields.join(", ")
+        ))
+        .await;
+    }
+    let (Some(elo), Some(eq)) = (params.elo, params.eq) else {
+        return invalid("model_upsert by canonicalID requires both elo and eq".into()).await;
+    };
+    for (label, score) in [("elo", elo), ("eq", eq)] {
+        if !score.is_finite() || score <= 0.0 {
+            return invalid(format!(
+                "model_upsert {label} must be a positive finite number, got {score}"
+            ))
+            .await;
+        }
+    }
+    let store_error = |message: String| async move {
+        send_route_error(writer, ver, channel, epoch, corr, "store_error", &message).await
+    };
+    let route_keys =
+        match store.route_keys_for_canonical_id(&canonical_id, params.variant.as_deref()) {
+            Ok(route_keys) => route_keys,
+            Err(error) => return store_error(format!("model_upsert read: {error}")).await,
+        };
+    if route_keys.is_empty() {
+        return invalid(format!(
+            "model_upsert: no stored route carries canonical id {canonical_id}{}; \
+             place a route by providerID/modelID or wait for Fusiform to serve one",
+            params
+                .variant
+                .as_deref()
+                .map(|variant| format!(" at variant {variant}"))
+                .unwrap_or_default()
+        ))
+        .await;
+    }
+    for route_key in &route_keys {
+        let mut fact = match store.get_fact_by_route_key(route_key) {
+            Ok(Some(fact)) => fact,
+            Ok(None) => continue,
+            Err(error) => return store_error(format!("model_upsert read: {error}")).await,
+        };
+        fact.scores.elo = elo;
+        fact.scores.eq = eq;
+        // Placing both judgment scores confirms the row, as merge_model_upsert
+        // does for a per-route write: curated confidence lifts the unknown-fact
+        // adequacy penalty a Fusiform-discovered row starts with.
+        fact.confidence = Confidence::Curated;
+        fact.score_provenance = ScoreProvenance::Curated;
+        if params.notes.is_some() {
+            fact.notes = params.notes.clone();
+        }
+        if let Err(error) = store.upsert_fact(&fact, FactSource::Override) {
+            return store_error(format!("model_upsert write: {error}")).await;
+        }
+    }
+    winner_ladder::announce(
+        store.as_ref(),
+        ladder_sources,
+        &format!("route.model_upsert canonical {canonical_id}"),
+    );
+    let result = json!({
+        "canonicalID": canonical_id,
+        "variant": params.variant,
+        "routeKeys": route_keys,
+        "scores": { "elo": elo, "eq": eq },
+        "source": "override",
+    });
+    let body = serde_json::to_vec(&json!({ "result": result })).map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
+/// route.list_canonical_gaps: operator-scored routes whose catalog row states
+/// no canonical model id, so their score is not shared with the model's other
+/// routes. This is the list to send Fusiform for identification.
+async fn handle_list_canonical_gaps(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    match store.list_canonical_gaps() {
+        Ok(rows) => {
+            let body = serde_json::to_vec(&json!({ "result": rows })).map_err(ModuleError::Json)?;
+            let response = Frame::build_with_version(
+                ver,
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                corr,
+                body,
+            )
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
+            send(writer, response).await
+        }
+        Err(error) => {
+            send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("list_canonical_gaps: {error}"),
+            )
+            .await
+        }
+    }
+}
+
+/// The canonical model id of each panel candidate, so a panel never seats two
+/// routes of one model. A score-alias row serves its target provider's model,
+/// so it takes the target row's id.
+fn panel_canonical_ids(
+    store: &SqliteRouteStateStore,
+    facts: &[ModelFact],
+    aliases: &std::collections::BTreeMap<String, String>,
+) -> Result<HashMap<String, String>, prefrontal_routing_core::RouteStateStoreError> {
+    let stored = store.canonical_ids_by_route_key()?;
+    Ok(facts
+        .iter()
+        .filter_map(|fact| {
+            let route_key = fact_to_route(fact).route_key;
+            let catalog_key =
+                prefrontal_routing_core::score_alias::catalog_key(aliases, &route_key);
+            stored
+                .get(&catalog_key)
+                .map(|canonical_id| (route_key, canonical_id.clone()))
+        })
+        .collect())
 }
 
 fn list_inferred_json(
@@ -2977,6 +3193,9 @@ async fn handle_select_request(
     }
     if envelope.method == ROUTE_LIST_UNSCORED_OP {
         return handle_list_unscored(frame, writer, store).await;
+    }
+    if envelope.method == ROUTE_LIST_CANONICAL_GAPS_OP {
+        return handle_list_canonical_gaps(frame, writer, store).await;
     }
     if key_pool::handles(&envelope.method) {
         let policy = config_overrides::read_operator_routing_policy(operator_config_path);
@@ -4010,6 +4229,22 @@ async fn handle_select_panel(
     let operator_exclude_keys =
         panel_policy::operator_exclusions(&prepared.facts, &operator_policy.exclude, group);
     let policy = panel_policy::class_policy(live_config.panels(), class);
+    let canonical_ids =
+        match panel_canonical_ids(store, &prepared.facts, &operator_policy.score_alias) {
+            Ok(canonical_ids) => canonical_ids,
+            Err(e) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &format!("reading canonical model ids: {e}"),
+                )
+                .await;
+            }
+        };
     let context = prefrontal_routing_core::panel::PanelSelectionContext {
         seed: params
             .seed
@@ -4025,6 +4260,7 @@ async fn handle_select_panel(
                 }
             }),
         },
+        canonical_ids,
     };
     // Seats are matched back to their catalog model to apply variant overrides;
     // the facts move into the selection below.
@@ -5518,6 +5754,7 @@ fn handles(method: &str) -> bool {
             | ROUTE_MODEL_UPSERT_OP
             | ROUTE_LIST_INFERRED_OP
             | ROUTE_LIST_UNSCORED_OP
+            | ROUTE_LIST_CANONICAL_GAPS_OP
             | ROUTE_SELECT_PANEL_OP
             | ROUTE_SET_DECISION_OUTCOME_OP
             | ROUTE_RECORD_USAGE_OP
@@ -5609,6 +5846,13 @@ fn served_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Query,
             description: Some(
                 "List Fusiform-discovered catalog rows awaiting operator scores".to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: ROUTE_LIST_CANONICAL_GAPS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "List scored routes whose Fusiform row states no canonical model id".to_string(),
             ),
         },
         ManagementOperation {
@@ -6141,6 +6385,7 @@ mod tests {
         ModelUpsertParams {
             provider_id: provider.into(),
             model_id: model.into(),
+            canonical_id: None,
             variant: None,
             family: None,
             elo: None,
@@ -6302,6 +6547,7 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
+            upstream_status: None,
         }
     }
 
@@ -11324,6 +11570,8 @@ mod tests {
                     supports_vision: Some(true),
                     supports_tool_use: Some(true),
                     reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
+                    canonical_id: None,
+                    upstream_status: None,
                 },
             )
             .collect::<Vec<_>>();
@@ -12317,6 +12565,305 @@ mod tests {
             assert_eq!(fact.scores.elo, 1808.0);
             assert_eq!(fact.score_provenance, ScoreProvenance::Override);
         }
+    }
+
+    #[test]
+    fn panel_canonical_ids_follow_score_alias_rows_to_their_target() {
+        let rig = Rig::new("panel-canonical-ids");
+        let store = rig.open_store();
+        let served = |provider: &str, model: &str, canonical: Option<&str>| {
+            prefrontal_routing_store::FusiformFactUpdate {
+                provider_id: provider.into(),
+                model_id: model.into(),
+                auth_methods: None,
+                present: true,
+                context_window: Some(200_000.0),
+                max_output_tokens: None,
+                cost_tier: None,
+                cost_per_mtok_out: None,
+                input_rate: None,
+                cache_read_rate: None,
+                cache_write_rate: None,
+                reasoning_rate: None,
+                supports_vision: None,
+                supports_tool_use: None,
+                reasoning_efforts: None,
+                canonical_id: canonical.map(str::to_string),
+                upstream_status: None,
+            }
+        };
+        store
+            .apply_fusiform_catalog_for_providers(
+                &[
+                    served(
+                        "openrouter",
+                        "meta/muse-spark-1.3",
+                        Some("meta/muse-spark-1.3"),
+                    ),
+                    served("opencode", "muse-spark-1.3-contributor-free", None),
+                ],
+                prefrontal_routing_store::FusiformCatalogCursor {
+                    catalog_version: 1,
+                    resolved_at_ms: 1,
+                },
+                &["openrouter", "opencode"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            )
+            .unwrap();
+        let aliases = std::collections::BTreeMap::from([(
+            "openrouter-byok".to_string(),
+            "openrouter".to_string(),
+        )]);
+        let mut facts = store.get_facts().unwrap();
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &aliases);
+        let ids = panel_canonical_ids(&store, &facts, &aliases).unwrap();
+        assert_eq!(
+            ids.get("openrouter/meta/muse-spark-1.3")
+                .map(String::as_str),
+            Some("meta/muse-spark-1.3")
+        );
+        assert_eq!(
+            ids.get("openrouter-byok/meta/muse-spark-1.3")
+                .map(String::as_str),
+            Some("meta/muse-spark-1.3"),
+            "an alias row serves its target's model"
+        );
+        assert!(!ids.contains_key("opencode/muse-spark-1.3-contributor-free"));
+    }
+
+    /// Live specimen: OpenCode withdrew `muse-spark-1.3-contributor-free` and
+    /// models.dev marks it `deprecated`, yet routing kept seating it and the
+    /// seats failed at the provider. A deprecated route is refused for automatic
+    /// selection and for an explicit pin, naming the route; its `beta` sibling
+    /// is still offered.
+    #[tokio::test]
+    async fn deprecated_upstream_route_is_refused_and_its_beta_sibling_is_offered() {
+        const SPECIMEN: &str = "opencode/muse-spark-1.3-contributor-free";
+        const SIBLING: &str = "meta/muse-spark-1.3-contributor";
+        let rig = Rig::new("deprecated-upstream");
+        let store: SharedStore = Arc::new(rig.open_store());
+        for route in [SPECIMEN, SIBLING] {
+            let (provider, model) = route.split_once('/').unwrap();
+            store
+                .upsert_fact(&fact(provider, model), FactSource::Override)
+                .unwrap();
+        }
+        let served = |status: &str| {
+            json!({"existence": "present", "limit.context": 200000,
+                "capability.tool_call": true, "model.status": status})
+        };
+        let snapshot = fusiform_catalog::decode_catalog_get(
+            &serde_json::to_vec(&json!({
+                "catalog_version": 1, "resolved_at_ms": 1,
+                "models": { SPECIMEN: served("deprecated"), SIBLING: served("beta") }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (served_facts, cursor) = snapshot.parts();
+        store.apply_fusiform_catalog(served_facts, cursor).unwrap();
+        let stored = store.get_fact_by_route_key(SPECIMEN).unwrap().unwrap();
+        assert_eq!(stored.upstream_status.as_deref(), Some("deprecated"));
+
+        let select = |pin: Option<&str>| {
+            let mut params = json!({
+                "targetAgent": "mason", "requestedRequirements": {"iq": 10, "eq": 10},
+                "availableModels": [SPECIMEN, SIBLING],
+            });
+            if let Some(pin) = pin {
+                params["modelPin"] = json!(pin);
+            }
+            let store = store.clone();
+            async move {
+                let frame = run_route_wire_request(
+                    &store,
+                    json!({"method": "route.select", "params": params}),
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+
+        let pinned = select(Some(SPECIMEN)).await;
+        assert_eq!(
+            pinned["code"],
+            prefrontal_routing_core::REASON_DEPRECATED_UPSTREAM,
+            "{pinned}"
+        );
+        assert!(
+            pinned["message"].as_str().unwrap().contains(SPECIMEN),
+            "the refusal names the route: {pinned}"
+        );
+
+        let sibling = select(Some(SIBLING)).await;
+        assert_eq!(
+            sibling["result"]["selected"]["routeKey"], SIBLING,
+            "a beta sibling is unaffected: {sibling}"
+        );
+
+        let automatic = select(None).await;
+        assert_eq!(
+            automatic["result"]["selected"]["routeKey"], SIBLING,
+            "{automatic}"
+        );
+        assert!(
+            automatic["result"]["selected"]["rejected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rejected| rejected["routeKey"] == SPECIMEN
+                    && rejected["reason"] == prefrontal_routing_core::REASON_DEPRECATED_UPSTREAM),
+            "{automatic}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_upsert_scores_every_stored_route_of_the_model() {
+        const MUSE: &str = "meta/muse-spark-1.3";
+        let rig = Rig::new("canonical-upsert");
+        let store: SharedStore = Arc::new(rig.open_store());
+        let served = |canonical: Option<&str>| json!({"existence": "present", "limit.context": 200000, "model.canonical_id": canonical});
+        let snapshot = fusiform_catalog::decode_catalog_get(
+            &serde_json::to_vec(&json!({
+                "catalog_version": 1, "resolved_at_ms": 1,
+                "models": {
+                    "meta/muse-spark-1.3": served(Some(MUSE)),
+                    "meta/muse-spark-1.3-contributor": served(Some(MUSE)),
+                    "openrouter/meta/muse-spark-1.3": served(Some(MUSE)),
+                    "opencode/muse-spark-1.3-contributor-free": served(None),
+                    "opencode/unstated-1": {"existence": "present"},
+                    "opencode/blank-1": served(Some(" ")),
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (served_facts, cursor) = snapshot.parts();
+        let identities = served_facts
+            .iter()
+            .map(|fact| {
+                (
+                    format!("{}/{}", fact.provider_id, fact.model_id),
+                    fact.canonical_id.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            identities["openrouter/meta/muse-spark-1.3"].as_deref(),
+            Some(MUSE)
+        );
+        assert_eq!(identities["opencode/muse-spark-1.3-contributor-free"], None);
+        assert_eq!(
+            identities["opencode/unstated-1"], None,
+            "an unserved key states no identity"
+        );
+        assert_eq!(
+            identities["opencode/blank-1"], None,
+            "a blank id names no model"
+        );
+        let providers = ["meta", "openrouter", "opencode"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        store
+            .apply_fusiform_catalog_for_providers(served_facts, cursor, &providers)
+            .unwrap();
+
+        let response = run_route_wire_request(
+            &store,
+            json!({"method": ROUTE_MODEL_UPSERT_OP,
+                "params": {"canonicalID": MUSE, "elo": 1810, "eq": 1520}}),
+        )
+        .await;
+        assert_eq!(
+            response.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let result =
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"].clone();
+        assert_eq!(
+            result["routeKeys"],
+            json!([
+                "meta/muse-spark-1.3",
+                "meta/muse-spark-1.3-contributor",
+                "openrouter/meta/muse-spark-1.3"
+            ])
+        );
+        for route in [
+            "meta/muse-spark-1.3",
+            "meta/muse-spark-1.3-contributor",
+            "openrouter/meta/muse-spark-1.3",
+        ] {
+            let fact = store.get_fact_by_route_key(route).unwrap().unwrap();
+            assert_eq!(
+                (fact.scores.elo, fact.scores.eq),
+                (1810.0, 1520.0),
+                "{route}"
+            );
+            assert_eq!(fact.score_provenance, ScoreProvenance::Override, "{route}");
+            assert_eq!(
+                fact.context_window,
+                Some(200_000.0),
+                "{route} keeps its served facts"
+            );
+        }
+        let unidentified = store
+            .get_fact_by_route_key("opencode/muse-spark-1.3-contributor-free")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unidentified.score_provenance, ScoreProvenance::Unscored);
+
+        for (params, needle) in [
+            (
+                json!({"canonicalID": MUSE, "elo": 1810, "eq": 1520, "contextWindow": 1000}),
+                "contextWindow",
+            ),
+            (
+                json!({"canonicalID": MUSE, "elo": 1810}),
+                "requires both elo and eq",
+            ),
+            (
+                json!({"canonicalID": MUSE, "providerID": "meta", "modelID": "x", "elo": 1, "eq": 1}),
+                "not both",
+            ),
+            (
+                json!({"canonicalID": "acme/unknown-1", "elo": 1810, "eq": 1520}),
+                "no stored route carries canonical id acme/unknown-1",
+            ),
+        ] {
+            let refused = run_route_wire_request(
+                &store,
+                json!({"method": ROUTE_MODEL_UPSERT_OP, "params": params}),
+            )
+            .await;
+            assert_eq!(refused.header.ty, FrameType::Error, "{params}");
+            let body = String::from_utf8_lossy(&refused.body).into_owned();
+            assert!(body.contains(needle), "{params}: {body}");
+        }
+
+        let gaps = run_route_wire_request(
+            &store,
+            json!({"method": ROUTE_LIST_CANONICAL_GAPS_OP, "params": {}}),
+        )
+        .await;
+        assert_eq!(gaps.header.ty, FrameType::Response);
+        let gaps =
+            serde_json::from_slice::<serde_json::Value>(&gaps.body).unwrap()["result"].clone();
+        let keys = gaps
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["routeKey"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !keys.iter().any(|key| key.contains("muse-spark")),
+            "{keys:?}"
+        );
+        assert!(handles(ROUTE_LIST_CANONICAL_GAPS_OP));
     }
 
     #[tokio::test]

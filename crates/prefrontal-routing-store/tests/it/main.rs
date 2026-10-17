@@ -1,5 +1,6 @@
 mod account_quota;
 mod account_selection;
+mod canonical_scores;
 mod key_pool;
 mod observed_speed_query_plan;
 mod quota_reading_log;
