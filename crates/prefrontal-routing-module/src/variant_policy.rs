@@ -117,7 +117,7 @@ fn matching_entry<'a>(
 
 /// The catalog entry for a model, following a score alias to the provider
 /// whose rows it borrows (an alias has no catalog rows of its own).
-fn published<'a>(
+pub(crate) fn published<'a>(
     catalog: &'a ReasoningCatalog,
     aliases: &BTreeMap<String, String>,
     provider_id: &str,
@@ -130,7 +130,7 @@ fn published<'a>(
     })
 }
 
-fn render(values: &[String]) -> String {
+pub(crate) fn render(values: &[String]) -> String {
     if values.is_empty() {
         "none".into()
     } else {

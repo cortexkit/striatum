@@ -1,14 +1,16 @@
 //! Exact worker pins share hard admission, but never the quality/cost competition.
 
+use std::collections::BTreeMap;
+
 use prefrontal_routing_core::model_facts::{fact_to_route, ModelFact, ModelRequirements};
-use prefrontal_routing_core::model_resolution::{
-    resolve_model_capabilities, ModelCapabilitiesInput,
-};
 use prefrontal_routing_core::model_router::{
     admit_routes, select_model_route_with_slots, SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::provider_model_spec::ExclusionPolicy;
 use prefrontal_routing_core::{ConcurrencySlots, RoutingConfig};
+use prefrontal_routing_store::{PublishedEfforts, ReasoningCatalog};
+
+use crate::variant_policy;
 
 pub(crate) struct Refusal {
     pub code: String,
@@ -53,11 +55,21 @@ pub(crate) fn named_variant(pin: &str, facts: &[ModelFact]) -> Option<String> {
 /// Select the exact route a caller named. The operator's `exclude` lists (the
 /// `all` list and every consumer group) never apply here: they keep a route out
 /// of automatic choice only.
+///
+/// A named variant is checked against the reasoning efforts the catalog
+/// publishes for the model (Fusiform's `reasoning_options`, which Broca also
+/// admits by), following a score alias to the provider whose catalog rows it
+/// borrows, as the `model_routing.variants` check does. A variant outside a
+/// published list is refused. When the catalog has not been read for the model
+/// yet, or no catalog is attached, the pin is admitted with a warning and
+/// Broca decides.
 pub(crate) fn select(
     pin: &str,
     mut input: SelectModelRouteInput<'_>,
     config: &RoutingConfig,
     slots: Option<&ConcurrencySlots>,
+    catalog: Option<&ReasoningCatalog>,
+    aliases: &BTreeMap<String, String>,
 ) -> Result<SelectedModelRoute, Refusal> {
     let (provider, requested_model) = pin.split_once('/').ok_or_else(|| {
         refuse(
@@ -96,40 +108,37 @@ pub(crate) fn select(
     if facts.is_empty() {
         return Err(refuse("unknown_model", format!("unknown model {model:?} for provider {provider:?}; valid variants: none (unknown model)")));
     }
-    let mut tiers = resolve_model_capabilities(&ModelCapabilitiesInput {
-        provider_id: provider.into(),
-        model_id: model.into(),
-        ..Default::default()
-    })
-    .variants
-    .unwrap_or_default();
-    for fact in &facts {
-        if let Some(tier) = fact.variant.as_ref().or_else(|| {
-            fact.prompt_defaults
-                .as_ref()
-                .and_then(|defaults| defaults.variant.as_ref())
-        }) {
-            if matches!(tier.as_str(), "low" | "medium" | "high" | "xhigh" | "max")
-                && !tiers.contains(tier)
-            {
-                tiers.push(tier.clone());
+    let mut variant_warning = None;
+    if let Some(variant) = variant {
+        match catalog
+            .and_then(|catalog| variant_policy::published(catalog, aliases, provider, model))
+        {
+            Some(PublishedEfforts::Published(values)) => {
+                if !values.iter().any(|value| value == variant) {
+                    return Err(refuse(
+                        "invalid_model_variant",
+                        format!(
+                            "unknown variant {variant:?} for {identity}; valid variants: {}",
+                            variant_policy::render(values)
+                        ),
+                    ));
+                }
+            }
+            unknown => {
+                let why = match (catalog, unknown) {
+                    (None, _) => "no reasoning catalog is attached yet",
+                    (Some(_), Some(PublishedEfforts::Unread)) => {
+                        "the catalog has not been read for this model yet"
+                    }
+                    (Some(_), _) => "the catalog has no row for this model",
+                };
+                let warning = format!(
+                    "variant {variant} for {identity} not checked: {why}; the runner decides whether it is admitted"
+                );
+                eprintln!("[prefrontal-routing] WARN: {pin}: {warning}");
+                variant_warning = Some(warning);
             }
         }
-    }
-    tiers.retain(|tier| matches!(tier.as_str(), "low" | "medium" | "high" | "xhigh" | "max"));
-    if variant.is_some_and(|tier| !tiers.iter().any(|valid| valid == tier)) {
-        return Err(refuse(
-            "invalid_model_variant",
-            format!(
-                "unknown variant {:?} for {identity}; valid variants: {}",
-                variant.unwrap(),
-                if tiers.is_empty() {
-                    "none".into()
-                } else {
-                    tiers.join(", ")
-                }
-            ),
-        ));
     }
     let mut fact = facts
         .iter()
@@ -223,6 +232,7 @@ pub(crate) fn select(
     selected.score.metrics = adequacy.metrics;
     selected.below_floor = None;
     selected.explanation = vec![format!("model pinned by head: {pin}; hard admission only")];
+    selected.explanation.extend(variant_warning);
     Ok(selected)
 }
 
@@ -282,6 +292,8 @@ mod tests {
                     input,
                     &prefrontal_routing_core::DEFAULT_ROUTING_CONFIG,
                     None,
+                    None,
+                    &BTreeMap::new(),
                 ),
                 expected,
             ) {
@@ -290,6 +302,123 @@ mod tests {
                 (Ok(_), Some(code)) => panic!("expected {code}, but the pin was admitted"),
                 (Err(refusal), None) => panic!("{}: {}", refusal.code, refusal.message),
             }
+        }
+    }
+
+    fn pin_input(provider: &str, model: &str) -> SelectModelRouteInput<'static> {
+        SelectModelRouteInput {
+            target_agent: "mason".into(),
+            requirements: ModelRequirements { iq: 0.0, eq: 0.0 },
+            available_models: HashSet::from([format!("{provider}/{model}")]),
+            facts: vec![crate::tests::fact(provider, model)],
+            runtime_snapshot: None,
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            required_capabilities: None,
+            is_subscription_route: None,
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: HashSet::new(),
+        }
+    }
+
+    fn catalog(entries: &[(&str, Option<&[&str]>)]) -> ReasoningCatalog {
+        ReasoningCatalog {
+            models: entries
+                .iter()
+                .map(|(key, values)| {
+                    (
+                        (*key).to_string(),
+                        match values {
+                            None => PublishedEfforts::Unread,
+                            Some(values) => PublishedEfforts::Published(
+                                values.iter().map(|value| (*value).to_string()).collect(),
+                            ),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// A pinned variant is judged by the reasoning efforts the catalog
+    /// publishes, the same list Broca admits by: `xhigh` on an Opus route is
+    /// admitted when published, a variant outside the list is refused and the
+    /// refusal names the list, a score alias reads its target's catalog rows,
+    /// and a model the catalog has not been read for is admitted with a warning.
+    #[test]
+    fn pinned_variants_are_checked_against_the_published_reasoning_efforts() {
+        let published = catalog(&[
+            (
+                "anthropic/claude-opus-5-5",
+                Some(&["low", "medium", "high", "xhigh", "max"]),
+            ),
+            ("openai/gpt-6.1-sol", Some(&["low", "medium", "high"])),
+            ("google/gemini-4-argon", None),
+        ]);
+        let aliases = BTreeMap::from([("anthropic-platform".to_string(), "anthropic".to_string())]);
+        let run = |pin: &str, catalog: Option<&ReasoningCatalog>| {
+            let (provider, rest) = pin.split_once('/').unwrap();
+            let model = rest.split_once(':').map_or(rest, |(model, _)| model);
+            select(
+                pin,
+                pin_input(provider, model),
+                &prefrontal_routing_core::DEFAULT_ROUTING_CONFIG,
+                None,
+                catalog,
+                &aliases,
+            )
+        };
+        for pin in [
+            "anthropic/claude-opus-5-5:xhigh",
+            "anthropic-platform/claude-opus-5-5:xhigh",
+            "openai/gpt-6.1-sol:low",
+        ] {
+            let selected = run(pin, Some(&published))
+                .unwrap_or_else(|refusal| panic!("{pin}: {}: {}", refusal.code, refusal.message));
+            assert_eq!(
+                selected.explanation.len(),
+                1,
+                "{pin}: {:?}",
+                selected.explanation
+            );
+        }
+        for (pin, message) in [
+            (
+                "openai/gpt-6.1-sol:xhigh",
+                "unknown variant \"xhigh\" for openai/gpt-6.1-sol; valid variants: low, medium, high",
+            ),
+            (
+                "anthropic-platform/claude-opus-5-5:minimal",
+                "valid variants: low, medium, high, xhigh, max",
+            ),
+        ] {
+            let refusal = run(pin, Some(&published)).err().unwrap_or_else(|| panic!("{pin} was admitted"));
+            assert_eq!(refusal.code, "invalid_model_variant");
+            assert!(refusal.message.contains(message), "{pin}: {}", refusal.message);
+        }
+        for (pin, catalog, why) in [
+            (
+                "google/gemini-4-argon:ultra",
+                Some(&published),
+                "has not been read for this model yet",
+            ),
+            (
+                "openai/gpt-6.1-sol:xhigh",
+                None,
+                "no reasoning catalog is attached yet",
+            ),
+        ] {
+            let selected = run(pin, catalog)
+                .unwrap_or_else(|refusal| panic!("{pin}: {}: {}", refusal.code, refusal.message));
+            assert!(
+                selected
+                    .explanation
+                    .iter()
+                    .any(|line| line.contains("not checked") && line.contains(why)),
+                "{pin}: {:?}",
+                selected.explanation
+            );
         }
     }
 }

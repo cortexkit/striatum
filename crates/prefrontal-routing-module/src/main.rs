@@ -3303,7 +3303,14 @@ async fn handle_select_request(
                         code,
                     })
             } else {
-                work_model_pin::select(pin, input, &routing_config, concurrency_slots.as_ref())
+                work_model_pin::select(
+                    pin,
+                    input,
+                    &routing_config,
+                    concurrency_slots.as_ref(),
+                    config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
+                    operator_config.score_aliases(),
+                )
             }
         };
         let selection = selection.map(|mut selected| {
@@ -11283,7 +11290,11 @@ mod tests {
 
     #[tokio::test]
     async fn work_model_pin_bad_variant_names_valid_catalog_tiers() {
-        let (frame, _rig) = pinned_select("openai/gpt-5.5:absurd", false).await;
+        let (frame, _rig) = pinned_select_with_published_efforts(
+            "openai/gpt-5.5:absurd",
+            &[("openai", "gpt-5.5", &["low", "medium", "high", "xhigh"])],
+        )
+        .await;
         let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["code"], "invalid_model_variant", "{body}");
         let message = body["message"].as_str().unwrap();
@@ -11292,6 +11303,101 @@ mod tests {
                 && message.contains("valid variants: low, medium, high, xhigh"),
             "{message}"
         );
+    }
+
+    /// Run a pinned selection with the given reasoning efforts published for
+    /// each `(provider, model)` and the store's catalog attached to the
+    /// operator config path, as the module does once its store opens.
+    async fn pinned_select_with_published_efforts(
+        pin: &str,
+        published: &[(&str, &str, &[&str])],
+    ) -> (Frame, Rig) {
+        let rig = Rig::new("head-pin-published");
+        let store: SharedStore = Arc::new(rig.open_store());
+        for (provider, model, _) in published {
+            store
+                .upsert_fact(&fact(provider, model), FactSource::Override)
+                .unwrap();
+        }
+        let updates = published
+            .iter()
+            .map(
+                |(provider, model, efforts)| prefrontal_routing_store::FusiformFactUpdate {
+                    provider_id: (*provider).into(),
+                    model_id: (*model).into(),
+                    auth_methods: None,
+                    present: true,
+                    context_window: Some(200_000.0),
+                    max_output_tokens: None,
+                    cost_tier: Some(2.0),
+                    cost_per_mtok_out: Some(4.5),
+                    input_rate: None,
+                    cache_read_rate: None,
+                    cache_write_rate: None,
+                    reasoning_rate: None,
+                    supports_vision: Some(true),
+                    supports_tool_use: Some(true),
+                    reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
+                },
+            )
+            .collect::<Vec<_>>();
+        store
+            .apply_fusiform_catalog(
+                &updates,
+                prefrontal_routing_store::FusiformCatalogCursor {
+                    catalog_version: 1,
+                    resolved_at_ms: 1,
+                },
+            )
+            .unwrap();
+        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        let catalog_store = Arc::clone(&store);
+        config_overrides::attach_reasoning_catalog(
+            &operator_config,
+            Arc::new(move || {
+                catalog_store
+                    .reasoning_catalog()
+                    .map_err(|error| error.to_string())
+            }),
+        )
+        .unwrap();
+        let available = published
+            .iter()
+            .map(|(provider, model, _)| format!("{provider}/{model}"))
+            .collect::<Vec<_>>();
+        let frame = run_route_wire_request_with_operator_config(
+            &store,
+            json!({"method":"route.select","params":{
+                "targetAgent":"mason", "requestedRequirements":{"iq":100,"eq":90},
+                "availableModels": available, "modelPin":pin
+            }}),
+            &operator_config,
+        )
+        .await;
+        (frame, rig)
+    }
+
+    /// Broca admits `xhigh` on an Opus route when Fusiform publishes it, so a
+    /// pin naming it is admitted at that variant; a variant outside the
+    /// published list is refused.
+    #[tokio::test]
+    async fn work_model_pin_admits_a_variant_the_catalog_publishes() {
+        let opus: &[(&str, &str, &[&str])] = &[(
+            "anthropic",
+            "claude-opus-5-5",
+            &["low", "medium", "high", "xhigh", "max"],
+        )];
+        let (frame, _rig) =
+            pinned_select_with_published_efforts("anthropic/claude-opus-5-5:xhigh", opus).await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(
+            body["result"]["selected"]["promptParams"]["variant"], "xhigh",
+            "{body}"
+        );
+        let (frame, _rig) =
+            pinned_select_with_published_efforts("anthropic/claude-opus-5-5:minimal", opus).await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(body["code"], "invalid_model_variant", "{body}");
     }
 
     #[tokio::test]
