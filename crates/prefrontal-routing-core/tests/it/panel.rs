@@ -91,7 +91,6 @@ fn panel_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
-        explicit_only_providers: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
     }
@@ -109,7 +108,6 @@ fn n_pick_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInpu
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
-        explicit_only_providers: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
     }
@@ -412,7 +410,6 @@ fn admission_is_shared_not_reimplemented() {
         runtime_snapshot: Some(snapshot.clone()),
         exclude_route_keys: vec!["p/excluded".into()],
         operator_exclude_keys: Vec::new(),
-        explicit_only_providers: Vec::new(),
         required_capabilities: capabilities,
         is_subscription_route: None,
         min_best_effort_adequacy: None,
@@ -447,7 +444,6 @@ fn admission_is_shared_not_reimplemented() {
         // Provider-wide operator fence: if the standing policy leaked into a pinned
         // roster it would empty this panel outright, not merely drop one seat.
         operator_exclude_keys: vec!["p".into()],
-        explicit_only_providers: Vec::new(),
         required_capabilities: capabilities,
         available_models: available,
         availability_substrate: AvailabilitySubstrate::Host,
@@ -505,7 +501,6 @@ fn admission_is_shared_not_reimplemented() {
         }),
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
-        explicit_only_providers: Vec::new(),
         required_capabilities: None,
         availability_substrate: AvailabilitySubstrate::Host,
         is_subscription_route: None,
@@ -805,7 +800,6 @@ fn shortfall_precedence_and_empty_success() {
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),
-        explicit_only_providers: Vec::new(),
         required_capabilities: None,
         is_subscription_route: None,
     })

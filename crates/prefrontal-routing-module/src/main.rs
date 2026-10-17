@@ -1693,10 +1693,12 @@ fn resolve_select_request(
         }
     };
 
-    // Keep operator-excluded models in the available set when trying a pin,
-    // which may select them. Normal fallback still applies operator exclusions.
+    // A request that names its model (an admission pin or a work run's
+    // `model=`) keeps operator-excluded routes in the available set: `exclude`
+    // keeps a route out of automatic choice only. An admission pin's automatic
+    // fallback still applies the operator's exclusions during admission.
     let mut availability_policy = operator_policy.clone();
-    if params.pin.is_some() {
+    if params.pin.is_some() || params.model_pin.is_some() {
         availability_policy.exclude.clear();
     }
     let policy = resolve_routing_policy(
@@ -2197,11 +2199,9 @@ async fn handle_model_facts(
     // anything (it reads 0 on every row), so serving it raw told every inventory
     // consumer that nothing is excluded while routing was excluding 30+ routes.
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
-    // Explicit-only providers are not excluded: a pin still admits them.
     let exclusions = ExclusionSpecs::parse(ExclusionPolicy {
         operator: &operator_policy.exclude,
         caller: &[],
-        explicit_only: &[],
     });
     for fact in &mut facts {
         let route_key = make_route_key(
@@ -3170,10 +3170,26 @@ async fn handle_select_request(
     // substrate that sends. Keyed by the target agent as well because callers
     // of one substrate can hand it different lists, and a single slot flipped
     // between them on every alternation.
+    //
+    // A request that names its model keeps operator-excluded routes in
+    // `available` (see resolve_select_request). The ladder replays automatic
+    // selection, so it is handed the fenced list an unpinned request would see;
+    // otherwise pinned and unpinned launches of one class would record two lists
+    // and read as an availability change on every switch.
+    let ladder_fence = ExclusionSpecs::parse(ExclusionPolicy {
+        operator: &operator_policy.exclude,
+        caller: &[],
+    });
     winner_ladder::observed_selections().record(
         winner_ladder::LadderKey::new(availability.ladder_substrate, &params.target_agent),
-        available.iter().cloned(),
-        subscription_keys.iter().cloned(),
+        available
+            .iter()
+            .filter(|key| !ladder_fence.excludes(key))
+            .cloned(),
+        subscription_keys
+            .iter()
+            .filter(|key| !ladder_fence.excludes(key))
+            .cloned(),
         snapshot.clone(),
     );
     let mut exclude = params.exclude_route_keys.clone();
@@ -3236,8 +3252,6 @@ async fn handle_select_request(
                 runtime_snapshot: Some(snapshot.clone()),
                 exclude_route_keys: exclude.clone(),
                 operator_exclude_keys: operator_exclude.clone(),
-                // A pin is the explicit choice explicit-only providers wait for.
-                explicit_only_providers: Vec::new(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                     sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
@@ -3260,13 +3274,7 @@ async fn handle_select_request(
                         code,
                     })
             } else {
-                work_model_pin::select_with_operator_group(
-                    pin,
-                    input,
-                    &routing_config,
-                    concurrency_slots.as_ref(),
-                    consumer_exclude,
-                )
+                work_model_pin::select(pin, input, &routing_config, concurrency_slots.as_ref())
             }
         };
         let selection = selection.and_then(|selected| {
@@ -3404,7 +3412,6 @@ async fn handle_select_request(
                 runtime_snapshot: Some(snap),
                 exclude_route_keys: exclude.clone(),
                 operator_exclude_keys: operator_exclude.clone(),
-                explicit_only_providers: operator_policy.explicit_only_providers.clone(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                     sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
@@ -3541,9 +3548,10 @@ async fn handle_select_request(
                         result["pin_rejected"] = json!(pin_rejected);
                     }
                     if is_broca_substrate(params.substrate.as_deref()) {
-                        // Automatic selection never admits an explicit-only provider, so this
-                        // resolves to the ordinary provider translation. Going through
-                        // runner_for_route keeps one rule for every launch target.
+                        // An automatically chosen key-pool provider leases its key
+                        // here; any other provider resolves to the ordinary
+                        // translation. Going through runner_for_route keeps one
+                        // rule for every launch target.
                         let session = pool_session(
                             params.task_id.as_deref(),
                             params.send_id.as_deref(),
@@ -3693,7 +3701,7 @@ fn needs_runner_pin(policy: &ModelRoutingPolicyInput, provider: &str) -> bool {
 }
 
 /// The Broca launch target for a selected route: the plain translation for an
-/// ordinary provider. For an explicit-only key-pool provider it leases a key for
+/// ordinary provider. For a score-aliased key-pool provider it leases a key for
 /// `session` from the pool and returns the target that pins it, with the grant;
 /// a pool that cannot be resolved or has no admissible key refuses by name.
 fn runner_for_route(
@@ -3974,7 +3982,6 @@ async fn handle_select_panel(
             runtime_snapshot: Some(prepared.snapshot),
             exclude_route_keys: params.exclude_route_keys.clone(),
             operator_exclude_keys,
-            explicit_only_providers: operator_policy.explicit_only_providers.clone(),
             required_capabilities: params.required_capabilities,
             available_models,
             availability_substrate,
@@ -5721,6 +5728,24 @@ mod tests {
         let invalid_path = invalid.join("prefrontal-routing.jsonc");
         std::fs::write(&invalid_path, "{\"not_a_routing_setting\":true}").unwrap();
         assert!(check_config_at(&invalid_path).is_err());
+    }
+
+    #[test]
+    fn config_check_refuses_explicit_only_providers_and_names_the_exclude_remedy() {
+        let scratch = prefrontal_test_support::ScratchDir::new("routing-config-check-explicit");
+        let path = scratch.join("prefrontal-routing.jsonc");
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,
+        )
+        .unwrap();
+        let error = check_config_at(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("config_key_removed: model_routing.explicit_only_providers")
+                && error
+                    .contains("list the provider in model_routing.exclude.all; pins still work"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -11121,14 +11146,15 @@ mod tests {
         assert!(body.get("result").is_none());
     }
 
-    /// The routing file for the paid Anthropic API key: an explicit-only routing
-    /// provider whose rows are borrowed from `anthropic`.
+    /// The routing file for the paid Anthropic API key: a provider whose rows are
+    /// borrowed from `anthropic` and which `exclude.all` keeps out of automatic
+    /// choice. Naming one of its models still admits it.
     fn platform_operator_config(rig: &Rig) -> PathBuf {
         let path = rig.dir.join("prefrontal-routing.jsonc");
         std::fs::write(
             &path,
             r#"{ "model_routing": {
-                "explicit_only_providers": ["anthropic-platform"],
+                "exclude": { "all": ["anthropic-platform"] },
                 "score_alias": { "anthropic-platform": "anthropic" }
             } }"#,
         )
@@ -11175,10 +11201,27 @@ mod tests {
         credentials: &SharedBrocaCredentials,
         wall_subscription: bool,
     ) -> (serde_json::Value, Rig, SharedStore) {
+        platform_select_model(
+            label,
+            "claude-opus-4-1",
+            params,
+            credentials,
+            wall_subscription,
+        )
+        .await
+    }
+
+    async fn platform_select_model(
+        label: &str,
+        model: &str,
+        params: serde_json::Value,
+        credentials: &SharedBrocaCredentials,
+        wall_subscription: bool,
+    ) -> (serde_json::Value, Rig, SharedStore) {
         let rig = Rig::new(label);
         let store: SharedStore = Arc::new(rig.open_store());
         store
-            .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+            .upsert_fact(&fact("anthropic", model), FactSource::Override)
             .unwrap();
         if wall_subscription {
             // Every subscription route is quota-walled, so failover (and its
@@ -11224,7 +11267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_selection_never_returns_an_explicit_only_provider() {
+    async fn automatic_selection_never_returns_a_provider_excluded_in_all() {
         // Broca can reach only the paid key: the subscription login is absent.
         let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
         let (body, _rig, store) = platform_select(
@@ -11239,14 +11282,23 @@ mod tests {
             body.get("result").is_none(),
             "auto selection took the paid key: {body}"
         );
-        // The recorded rejections name the explicit-only restriction. Long lists
-        // are summarized by reason, so the reason is checked rather than one row.
-        let rejected = recorded_rejections(&store, "auto-only").to_string();
-        assert!(rejected.contains("explicit_only_provider"), "{rejected}");
+        // The paid key is the only reachable route and the operator excluded
+        // it, so the refusal names the operator's exclusion before any scoring.
+        assert!(
+            body.to_string().contains("excluded by operator policy"),
+            "{body}"
+        );
+        assert!(
+            store
+                .get_decision_by_send_id("auto-only")
+                .unwrap()
+                .is_some(),
+            "the refusal is recorded as a decision"
+        );
     }
 
     #[tokio::test]
-    async fn failover_and_reroute_never_fall_to_the_explicit_only_provider() {
+    async fn failover_and_reroute_never_fall_to_a_provider_excluded_in_all() {
         let credentials = platform_listing(&[
             ("oauth:anthropic:ysample", &["anthropic"]),
             ("apikey:anthropic", &["anthropic-platform"]),
@@ -11281,14 +11333,14 @@ mod tests {
         if walled.get("result").is_none() {
             let rejected = recorded_rejections(&store, "failover");
             assert!(
-                rejected.to_string().contains("explicit_only_provider"),
+                rejected.to_string().contains("excluded_by_operator"),
                 "{rejected}"
             );
         }
     }
 
     #[tokio::test]
-    async fn a_pinned_selection_admits_the_explicit_only_provider_with_its_key_pin() {
+    async fn a_pinned_selection_admits_a_provider_excluded_in_all_with_its_key_pin() {
         let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
         let (body, _rig, _store) = platform_select(
             "platform-pin",
@@ -11323,6 +11375,56 @@ mod tests {
         assert!(
             plane.is_null() || !plane.to_string().contains("oauth"),
             "{plane}"
+        );
+    }
+
+    /// The operator's own shape: `anthropic-platform` listed in `exclude.all` is
+    /// never chosen automatically for any consumer, yet a mason launch that names
+    /// `anthropic-platform/claude-opus-5-5` is admitted on its pool key.
+    #[tokio::test]
+    async fn a_provider_in_exclude_all_is_never_automatic_but_its_named_model_is_admitted() {
+        let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
+        for consumer in ["mason", "sidekick", "athena", "lab", "core"] {
+            let send_id = format!("opus-5-5-auto-{consumer}");
+            let (automatic, _rig, store) = platform_select_model(
+                &format!("platform-opus-5-5-auto-{consumer}"),
+                "claude-opus-5-5",
+                json!({"targetAgent": "explore", "consumer": consumer,
+                       "requirements": {"iq": 30, "eq": 0},
+                       "substrate": "broca", "sendID": send_id}),
+                &credentials,
+                false,
+            )
+            .await;
+            assert!(
+                automatic.get("result").is_none(),
+                "consumer={consumer}: automatic selection took the excluded provider: {automatic}"
+            );
+            assert!(
+                automatic
+                    .to_string()
+                    .contains("excluded by operator policy"),
+                "consumer={consumer}: {automatic}"
+            );
+            assert!(store.get_decision_by_send_id(&send_id).unwrap().is_some());
+        }
+        let (pinned, _rig, _store) = platform_select_model(
+            "platform-opus-5-5-pin",
+            "claude-opus-5-5",
+            json!({"targetAgent": "mason", "consumer": "mason",
+                   "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-5-5"}),
+            &credentials,
+            false,
+        )
+        .await;
+        assert_eq!(
+            pinned["result"]["selected"]["routeKey"], "anthropic-platform/claude-opus-5-5",
+            "{pinned}"
+        );
+        assert_eq!(
+            pinned["result"]["poolLease"]["credentialId"], "apikey:anthropic:work",
+            "{pinned}"
         );
     }
 
@@ -11716,7 +11818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panels_refuse_explicit_only_providers_and_removed_roster_pins() {
+    async fn panels_never_seat_a_provider_excluded_in_all_and_refuse_removed_roster_pins() {
         let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
         let panel = |label: &'static str, roster: serde_json::Value, selection: &'static str| {
             let credentials = credentials.clone();
@@ -11744,7 +11846,7 @@ mod tests {
         let automatic = panel("platform-panel-npick", json!([]), "n_pick").await;
         assert_eq!(automatic["result"]["members"], json!([]), "{automatic}");
         assert!(
-            automatic.to_string().contains("explicit_only_provider"),
+            automatic.to_string().contains("excluded_by_operator"),
             "an automatic seat names why the paid key was skipped: {automatic}"
         );
         let pinned = panel(
@@ -11917,7 +12019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_config_reloads_cost_and_explicit_only_atomically_and_keeps_last_good() {
+    async fn live_config_reloads_cost_and_exclusion_atomically_and_keeps_last_good() {
         let _guard = config_overrides::multiplier_map_guard();
         let rig = Rig::new("live-atomic-config");
         let store = Arc::new(rig.open_store());
@@ -11978,19 +12080,21 @@ mod tests {
         config_overrides::settle_live_config(&path);
         let cost_edit = select(&store, &credentials, &path).await;
         assert_eq!(cost_edit["result"]["selected"]["routeKey"], "b/reader");
-        std::fs::write(&path, r#"{"model_routing":{"explicit_only_providers":["b"],"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
+        std::fs::write(&path, r#"{"model_routing":{"exclude":{"all":["b"]},"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
         config_overrides::settle_live_config(&path);
         let fenced = select(&store, &credentials, &path).await;
         assert_eq!(fenced["result"]["selected"]["routeKey"], "a/reader");
         assert_eq!(
             rejection_reason(&fenced, "b/reader").as_deref(),
-            Some("explicit_only_provider")
+            Some("excluded_by_operator")
         );
         let good = config_overrides::live_config(&path);
         for invalid in [
             "{broken",
-            r#"{"model_routing":{"explicit_only_providers":["a"],"models":{"b/reader":{"cost_per_mtok_out":-1}}}}"#,
-            r#"{"aa":{"api_key_ref":" "},"model_routing":{"explicit_only_providers":["a"]}}"#,
+            r#"{"model_routing":{"exclude":{"all":["a"]},"models":{"b/reader":{"cost_per_mtok_out":-1}}}}"#,
+            r#"{"aa":{"api_key_ref":" "},"model_routing":{"exclude":{"all":["a"]}}}"#,
+            // The removed key is refused whole, so its exclusion is never applied.
+            r#"{"model_routing":{"explicit_only_providers":["a"]}}"#,
         ] {
             std::fs::write(&path, invalid).unwrap();
             let retained = config_overrides::settle_live_config(&path);
@@ -12525,7 +12629,6 @@ mod tests {
                 runtime_snapshot: Some(observation.snapshot.clone()),
                 exclude_route_keys: Vec::new(),
                 operator_exclude_keys: Vec::new(),
-                explicit_only_providers: Vec::new(),
                 required_capabilities: resolved.required_capabilities,
                 is_subscription_route: None,
                 min_best_effort_adequacy: None,

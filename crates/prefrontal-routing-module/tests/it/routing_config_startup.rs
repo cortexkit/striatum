@@ -119,6 +119,14 @@ fn config_key_removed_refuses_startup() {
 }
 
 #[test]
+fn explicit_only_providers_refuses_startup_with_the_exclude_remedy() {
+    invalid_startup(
+        r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,
+        "config_key_removed: model_routing.explicit_only_providers; list the provider in model_routing.exclude.all; pins still work",
+    );
+}
+
+#[test]
 fn unknown_key_refuses_startup() {
     invalid_startup(r#"{"model_routing":{"unknown":true}}"#, "unknown field");
 }

@@ -87,7 +87,6 @@
           "mason": [],
           "sidekick": []
         },
-        "explicit_only_providers": [],
         "keep_free_percent": {},
         "min_best_effort_adequacy": null,
         "models": {},
@@ -424,7 +423,7 @@
           "default": {}
         },
         "exclude": {
-          "description": "Excluded providers or routes by consumer. The `all` list applies to every\nconsumer; a negated entry in another list cannot remove its exclusions.",
+          "description": "Excluded providers or routes by consumer. The `all` list applies to every\nconsumer; a negated entry in another list cannot remove its exclusions.\nExclusion keeps a route out of automatic choice only: a request that names\nthe model (a work run's `model=`, a synthesizer or planner pin) is still\nadmitted when the route is otherwise servable.",
           "$ref": "#/$defs/ExcludeGroups",
           "default": {
             "all": [],
@@ -433,14 +432,6 @@
             "lab": [],
             "mason": [],
             "sidekick": []
-          }
-        },
-        "explicit_only_providers": {
-          "description": "Providers routing admits only when a caller pins one of their routes by\nname; never an automatic, fallback or reroute candidate. Default empty.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
           }
         },
         "keep_free_percent": {

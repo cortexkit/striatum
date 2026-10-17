@@ -5,8 +5,7 @@ use prefrontal_routing_core::model_resolution::{
     resolve_model_capabilities, ModelCapabilitiesInput,
 };
 use prefrontal_routing_core::model_router::{
-    admit_routes_with_operator_group, select_model_route_with_operator_group,
-    SelectModelRouteInput, SelectedModelRoute,
+    admit_routes, select_model_route_with_slots, SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::provider_model_spec::ExclusionPolicy;
 use prefrontal_routing_core::{ConcurrencySlots, RoutingConfig};
@@ -23,22 +22,14 @@ fn refuse(code: &str, message: String) -> Refusal {
     }
 }
 
-#[cfg(test)]
+/// Select the exact route a caller named. The operator's `exclude` lists (the
+/// `all` list and every consumer group) never apply here: they keep a route out
+/// of automatic choice only.
 pub(crate) fn select(
-    pin: &str,
-    input: SelectModelRouteInput<'_>,
-    config: &RoutingConfig,
-    slots: Option<&ConcurrencySlots>,
-) -> Result<SelectedModelRoute, Refusal> {
-    select_with_operator_group(pin, input, config, slots, &[])
-}
-
-pub(crate) fn select_with_operator_group(
     pin: &str,
     mut input: SelectModelRouteInput<'_>,
     config: &RoutingConfig,
     slots: Option<&ConcurrencySlots>,
-    operator_group: &[String],
 ) -> Result<SelectedModelRoute, Refusal> {
     let (provider, requested_model) = pin.split_once('/').ok_or_else(|| {
         refuse(
@@ -142,19 +133,15 @@ pub(crate) fn select_with_operator_group(
         defaults.reasoning_effort = None;
     }
     input.facts = vec![fact];
-    // The caller named this exact route (a work run's `model=`), which is the one
-    // way an explicit-only provider is admitted. A caller that forwarded the operator's explicit-only list
-    // must not turn the pin into a refusal.
-    input.explicit_only_providers.clear();
-    let admission = admit_routes_with_operator_group(
+    // The caller named this exact route (a work run's `model=`). A caller that
+    // forwarded the operator's exclude list must not turn the pin into a
+    // refusal. Per-attempt caller exclusions, availability, credentials,
+    // capability and quota walls still apply.
+    input.operator_exclude_keys.clear();
+    let admission = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),
-        ExclusionPolicy {
-            operator: &input.operator_exclude_keys,
-            caller: &input.exclude_route_keys,
-            explicit_only: &[],
-        },
-        operator_group,
+        ExclusionPolicy::caller_only(&input.exclude_route_keys),
         input.required_capabilities,
         &input.available_models,
         &input.requirements,
@@ -211,7 +198,7 @@ pub(crate) fn select_with_operator_group(
         .get_or_insert_with(Default::default)
         .min_context
         .get_or_insert(0.0);
-    let mut selected = select_model_route_with_operator_group(input, config, slots, operator_group)
+    let mut selected = select_model_route_with_slots(input, config, slots)
         .map_err(|error| refuse(error.reason.as_str(), error.message))?;
     selected.score.adequacy = adequacy.adequacy;
     selected.score.raw_adequacy = adequacy.raw_adequacy;
@@ -227,13 +214,16 @@ mod tests {
     use prefrontal_routing_core::model_router::RequiredCapabilities;
     use std::collections::HashSet;
 
+    /// The operator's exclude list is an automatic-selection fence only, so an
+    /// excluded route named by the head is admitted; hard admission (context,
+    /// tool support, availability) still refuses.
     #[test]
-    fn pinned_model_checks_context_tools_and_operator_fences_without_quality_selection() {
+    fn pinned_model_checks_context_and_tools_but_admits_an_operator_excluded_route() {
         for (tool_support, context, operator, available, expected) in [
             (true, 8192.0, false, true, None),
             (true, 300_000.0, false, true, Some("context_too_small")),
             (false, 8192.0, false, true, Some("missing_tool_support")),
-            (true, 8192.0, true, true, Some("excluded_by_operator")),
+            (true, 8192.0, true, true, None),
             (true, 8192.0, false, false, Some("not_available")),
         ] {
             let mut fact = crate::tests::fact("openai", "gpt-5.5");
@@ -259,7 +249,6 @@ mod tests {
                 } else {
                     Vec::new()
                 },
-                explicit_only_providers: Vec::new(),
                 required_capabilities: Some(RequiredCapabilities {
                     vision: None,
                     min_context: Some(context),

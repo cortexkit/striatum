@@ -157,6 +157,16 @@ refusal_case!(
 );
 refusal_case!(removed_aa_null, r#"{"aa":null}"#, "config_key_removed: aa");
 refusal_case!(
+    removed_explicit_only_providers,
+    r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"],"exclude":{"all":["xai"]}}}"#,
+    "config_key_removed: model_routing.explicit_only_providers; list the provider in model_routing.exclude.all; pins still work"
+);
+refusal_case!(
+    removed_explicit_only_providers_empty,
+    r#"{"model_routing":{"explicit_only_providers":[]}}"#,
+    "config_key_removed: model_routing.explicit_only_providers"
+);
+refusal_case!(
     unknown_root,
     r#"{"surprise":true}"#,
     "unknown field `surprise`"
@@ -356,7 +366,6 @@ fn preserved_keys_and_both_aliases_load_unchanged() {
         assert_eq!(active.exclude_groups().lab, ["google/gemini-4"]);
         assert_eq!(active.exclude_groups().core, ["deepseek"]);
         assert_eq!(section.subscription, ["openai", "-openai/metered"]);
-        assert_eq!(section.explicit_only_providers, ["anthropic-platform"]);
         assert_eq!(section.score_alias["anthropic-platform"], "anthropic");
         let model = &section.models["openai/gpt-6/high"];
         assert_eq!(model.family, Some(Some("gpt".into())));

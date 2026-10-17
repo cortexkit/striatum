@@ -111,7 +111,6 @@ pub(crate) fn select_pin(
     }
     input.facts = vec![fact];
     input.operator_exclude_keys.clear();
-    input.explicit_only_providers.clear();
     let admission = admit_routes(
         &input.facts,
         input.runtime_snapshot.as_ref(),

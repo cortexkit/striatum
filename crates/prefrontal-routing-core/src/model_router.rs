@@ -40,9 +40,6 @@ use crate::slot_saturation::{
 /// attempt skipped it". Both the producer and every consumer that maps rejection
 /// reasons use these constants, so renaming one cannot silently split the mapping.
 pub const REASON_EXCLUDED_BY_OPERATOR: &str = "excluded_by_operator";
-/// A route whose provider the operator listed in `explicit_only_providers`, met by
-/// an automatic selection. The route is still admitted when a caller pins it.
-pub const REASON_EXPLICIT_ONLY_PROVIDER: &str = "explicit_only_provider";
 /// A route the CALLER excluded for this attempt: the route that just failed on a
 /// reroute, or a consult's `exclude_route_keys`.
 pub const REASON_EXCLUDED: &str = "excluded";
@@ -132,12 +129,9 @@ pub struct SelectModelRouteInput<'a> {
     /// Per-attempt exclusions supplied by the caller (a route that just failed).
     pub exclude_route_keys: Vec<String>,
     /// The operator's standing exclude list, applied as the baseline under the
-    /// caller's. Union only: see [`ExclusionPolicy`].
+    /// caller's. Union only: see [`ExclusionPolicy`]. Automatic selection passes
+    /// the operator's list here; a selection that names its model passes none.
     pub operator_exclude_keys: Vec<String>,
-    /// Providers the operator admits only when a caller pins them by name (a
-    /// paid API key that must never absorb automatic overflow). Automatic
-    /// selection passes the operator's list here; a pinned selection passes none.
-    pub explicit_only_providers: Vec<String>,
     pub required_capabilities: Option<RequiredCapabilities>,
     pub is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
     /// Sanity band for best-effort selection. When no route clears the adequacy
@@ -449,7 +443,6 @@ impl NoRouteError {
             .map(|group| {
                 let label = match group.reason.as_str() {
                     "excluded_by_operator" => "excluded by operator",
-                    "explicit_only_provider" => "admitted only when pinned by name",
                     "subscription_reserve" => "below keep-free margin",
                     "quota_exhausted" => "out of credit",
                     "excluded" => "excluded for this item/caller",
@@ -688,7 +681,6 @@ pub fn admit_routes_with_operator_group(
                 reason: match source {
                     ExclusionSource::Operator => REASON_EXCLUDED_BY_OPERATOR.to_string(),
                     ExclusionSource::Caller => REASON_EXCLUDED.to_string(),
-                    ExclusionSource::ExplicitOnly => REASON_EXPLICIT_ONLY_PROVIDER.to_string(),
                 },
                 detail: None,
             });
@@ -1303,7 +1295,6 @@ fn admit_and_price_shortlist(
         ExclusionPolicy {
             operator: &input.operator_exclude_keys,
             caller: &input.exclude_route_keys,
-            explicit_only: &input.explicit_only_providers,
         },
         operator_group,
         caps,
@@ -2129,7 +2120,6 @@ mod abundance_tests {
                 }),
                 exclude_route_keys: options.exclude_route_keys,
                 operator_exclude_keys: Vec::new(),
-                explicit_only_providers: Vec::new(),
 
                 required_capabilities: None,
                 is_subscription_route: options.is_subscription_route,

@@ -13,7 +13,6 @@
       "core": ["deepseek"]
     },
     "subscription": ["openai", "-openai/metered"],
-    "explicit_only_providers": ["anthropic-platform"],
     "score_alias": {"anthropic-platform": "anthropic"},
     "models": {
       "openai/gpt-6/high": {

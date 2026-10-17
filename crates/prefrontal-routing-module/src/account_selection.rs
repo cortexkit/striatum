@@ -3049,7 +3049,6 @@ mod tests {
                 runtime_snapshot: Some(snapshot),
                 exclude_route_keys: vec![],
                 operator_exclude_keys: vec![],
-                explicit_only_providers: Vec::new(),
                 required_capabilities: None,
                 available_models: [route.to_string()].into_iter().collect(),
                 availability_substrate: prefrontal_routing_core::AvailabilitySubstrate::Broca,

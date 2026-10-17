@@ -106,21 +106,16 @@ pub fn resolve_launch_requirements(
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRoutingPolicyInput {
-    /// Routes this policy refuses. Every selection merges the operator's list with
-    /// the caller's as a UNION: the two lists are resolved independently and the
-    /// results OR-ed, so a negation here ("-anthropic") can only cancel an entry
-    /// in the SAME list. A caller can add an exclusion; it can never lift one the
-    /// operator wrote.
+    /// Routes this policy keeps out of automatic choice. Every automatic selection
+    /// merges the operator's list with the caller's as a UNION: the two lists are
+    /// resolved independently and the results OR-ed, so a negation here
+    /// ("-anthropic") can only cancel an entry in the SAME list. A caller can add
+    /// an exclusion; it can never lift one the operator wrote. A selection that
+    /// names its model does not apply the operator's list.
     #[serde(default)]
     pub exclude: Vec<String>,
     #[serde(default)]
     pub subscription: Vec<String>,
-    /// Providers admitted only when a caller pins a route on them by name (a
-    /// work run's `model=`, a panel roster entry). Automatic selection, n_pick
-    /// panel seats, fallback, failover and reroute never consider them. Unlike
-    /// `exclude`, this list does not refuse pins.
-    #[serde(default)]
-    pub explicit_only_providers: Vec<String>,
     /// Routing providers that have no catalog rows of their own and take their
     /// quality, capability, context and speed rows from another provider's
     /// route with the same model id: `{"anthropic-platform": "anthropic"}`.
@@ -157,13 +152,9 @@ pub fn resolve_routing_policy(
     let connected_model_count = connected.len();
     let filtered = filter_excluded_keys_with_policy(
         &connected,
-        // The explicit-only list is deliberately not applied to the available
-        // models: a pinned selection is admitted against the same available set,
-        // and a pin is how an explicit-only provider gets selected at all.
         ExclusionPolicy {
             operator: &operator.exclude,
             caller: &caller.exclude,
-            explicit_only: &[],
         },
     );
 

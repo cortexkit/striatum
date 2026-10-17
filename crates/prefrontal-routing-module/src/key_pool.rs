@@ -1,4 +1,4 @@
-//! The key pool of explicit-only API-key providers (`anthropic-platform`): the
+//! The key pool of score-aliased API-key providers (`anthropic-platform`): the
 //! routing operations core calls before every send that starts a run.
 //!
 //! - `route.pool_acquire` picks a key for one session's next run, sticking to
@@ -28,7 +28,7 @@ pub const POOL_RENEW_OP: &str = "route.pool_renew";
 pub const POOL_RELEASE_OP: &str = "route.pool_release";
 pub const POOL_WALL_OP: &str = "route.pool_wall";
 
-/// A provider that is not an explicit-only pool provider asked for a key.
+/// A provider that is not a key-pool provider asked for a key.
 pub const NOT_A_POOL_PROVIDER: &str = "not_a_pool_provider";
 
 /// How long a lease counts as a run in flight without a renewal. Core renews
@@ -61,17 +61,13 @@ fn refusal(code: &str, message: String) -> PoolRefusal {
     }
 }
 
-/// Whether `provider` is an explicit-only pool provider: listed in
-/// `explicit_only_providers` and borrowing another provider's rows through
-/// `score_alias`. Broca does not know such a name; it is reached only as one of
-/// the vault keys mapped to it, pinned on every send.
+/// Whether `provider` is a key-pool provider: one that borrows another
+/// provider's rows through `score_alias`. Broca does not know such a name; it
+/// is reached only as one of the vault keys mapped to it, pinned on every send.
+/// Whether automatic selection may choose it is a separate question, answered
+/// by `model_routing.exclude`.
 pub fn is_pool_provider(policy: &ModelRoutingPolicyInput, provider: &str) -> bool {
-    policy
-        .explicit_only_providers
-        .iter()
-        .any(|entry| entry == provider)
-        && prefrontal_routing_core::score_alias::alias_target(&policy.score_alias, provider)
-            .is_some()
+    prefrontal_routing_core::score_alias::alias_target(&policy.score_alias, provider).is_some()
 }
 
 /// One granted key and the launch target that pins it.
@@ -142,7 +138,7 @@ pub fn acquire(
     if !is_pool_provider(ctx.policy, provider) {
         return Err(refusal(
             NOT_A_POOL_PROVIDER,
-            format!("{provider} is not an explicit-only key-pool provider"),
+            format!("{provider} is not a key-pool provider (no model_routing.score_alias entry)"),
         ));
     }
     let target =

@@ -126,6 +126,15 @@ fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
     if value.get("aa").is_some() {
         return Err("config_key_removed: aa; delete this key".into());
     }
+    // `exclude` now keeps a route out of automatic choice only and a named model
+    // is always admitted, which is everything this key used to mean.
+    if value
+        .get("model_routing")
+        .and_then(|section| section.get("explicit_only_providers"))
+        .is_some()
+    {
+        return Err("config_key_removed: model_routing.explicit_only_providers; list the provider in model_routing.exclude.all; pins still work".into());
+    }
     if value
         .get("model_routing")
         .and_then(|section| section.get("exclude"))
@@ -319,7 +328,6 @@ impl LiveConfig {
         ModelRoutingPolicyInput {
             exclude: clean_spec_entries(section.exclude.all.clone()),
             subscription: clean_spec_entries(section.subscription.clone()),
-            explicit_only_providers: clean_spec_entries(section.explicit_only_providers.clone()),
             score_alias: section.score_alias.clone(),
         }
     }
@@ -514,16 +522,12 @@ mod live_snapshot_tests {
             .join(format!("routing-config-debounce-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing.jsonc");
-        std::fs::write(
-            &path,
-            r#"{"model_routing":{"explicit_only_providers":["meta"]}}"#,
-        )
-        .unwrap();
+        std::fs::write(&path, r#"{"model_routing":{"subscription":["meta"]}}"#).unwrap();
         let now = Instant::now();
         let held = live_config_at(&path, now).unwrap();
         std::fs::write(
             &path,
-            r#"{"model_routing":{"explicit_only_providers":["other-provider"]}}"#,
+            r#"{"model_routing":{"subscription":["other-provider"]}}"#,
         )
         .unwrap();
         assert!(Arc::ptr_eq(&held, &live_config_at(&path, now).unwrap()));
@@ -532,11 +536,8 @@ mod live_snapshot_tests {
             &live_config_at(&path, now + RELOAD_DEBOUNCE / 2).unwrap()
         ));
         let published = live_config_at(&path, now + RELOAD_DEBOUNCE).unwrap();
-        assert_eq!(
-            published.operator_policy().explicit_only_providers,
-            ["other-provider"]
-        );
-        assert_eq!(held.operator_policy().explicit_only_providers, ["meta"]);
+        assert_eq!(published.operator_policy().subscription, ["other-provider"]);
+        assert_eq!(held.operator_policy().subscription, ["meta"]);
         assert!(!Arc::ptr_eq(&held, &published));
         std::fs::remove_file(&path).unwrap();
         assert!(Arc::ptr_eq(
@@ -544,10 +545,7 @@ mod live_snapshot_tests {
             &live_config_at(&path, now + RELOAD_DEBOUNCE).unwrap()
         ));
         let defaults = live_config_at(&path, now + RELOAD_DEBOUNCE * 2).unwrap();
-        assert!(defaults
-            .operator_policy()
-            .explicit_only_providers
-            .is_empty());
+        assert!(defaults.operator_policy().subscription.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -739,6 +737,9 @@ impl<'de> Deserialize<'de> for ModelFamilyRules {
 struct ModelRoutingSection {
     /// Excluded providers or routes by consumer. The `all` list applies to every
     /// consumer; a negated entry in another list cannot remove its exclusions.
+    /// Exclusion keeps a route out of automatic choice only: a request that names
+    /// the model (a work run's `model=`, a synthesizer or planner pin) is still
+    /// admitted when the route is otherwise servable.
     #[serde(default)]
     exclude: ExcludeGroups,
     #[serde(default)]
@@ -748,10 +749,6 @@ struct ModelRoutingSection {
     /// Providers and models priced as subscription-backed in addition to auth facts.
     #[serde(default)]
     subscription: Vec<String>,
-    /// Providers routing admits only when a caller pins one of their routes by
-    /// name; never an automatic, fallback or reroute candidate. Default empty.
-    #[serde(default)]
-    explicit_only_providers: Vec<String>,
     /// Providers that borrow another provider's catalog rows, keyed alias to
     /// target: `{"anthropic-platform": "anthropic"}`. Default empty.
     #[serde(default)]
@@ -1681,7 +1678,6 @@ fn parse_operator_routing_policy(
     Ok(ModelRoutingPolicyInput {
         exclude: clean_spec_entries(section.exclude.all),
         subscription: clean_spec_entries(section.subscription),
-        explicit_only_providers: clean_spec_entries(section.explicit_only_providers),
         score_alias: section
             .score_alias
             .into_iter()
@@ -1713,12 +1709,12 @@ pub fn operator_policy_revision(policy: &ModelRoutingPolicyInput) -> String {
     for (label, entries) in [
         ("exclude", &policy.exclude),
         ("subscription", &policy.subscription),
-        ("explicit_only_providers", &policy.explicit_only_providers),
         ("score_alias", &aliases),
     ] {
-        // The two later lists are hashed only when set, so a policy that does
-        // not use them keeps the revision it had before they existed.
-        if entries.is_empty() && matches!(label, "explicit_only_providers" | "score_alias") {
+        // The alias list is hashed only when set: a config without aliases
+        // then hashes exactly as it did before `score_alias` existed, so its
+        // recorded policy revision (shown by `route.explain`) does not change.
+        if entries.is_empty() && label == "score_alias" {
             continue;
         }
         hasher.update(label.as_bytes());

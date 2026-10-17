@@ -207,11 +207,10 @@ mod consumer_and_pin {
     }
 
     #[tokio::test]
-    async fn admitted_pin_bypasses_operator_and_explicit_only_with_variant() {
+    async fn admitted_pin_bypasses_every_exclude_group_with_variant() {
         let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {
             "exclude": {"all": ["openai"], "lab": ["openai/pin"]},
-            "explicit_only_providers": ["openai"],
         }}));
         let mut params = rig.params();
         params["pin"] = json!({"model": "openai/pin", "variant": "high"});
@@ -398,30 +397,71 @@ mod consumer_and_pin {
         );
     }
 
+    /// `exclude` keeps a route out of automatic choice only. For every group, an
+    /// unpinned request from the fenced consumer never gets the route, while a
+    /// launch that names it with `model=` is admitted.
     #[tokio::test]
-    async fn launch_model_pin_skips_explicit_only_but_not_consumer_or_all_fences() {
+    async fn launch_model_pin_admits_a_route_every_exclude_group_fences_from_automatic_choice() {
         let _guard = crate::config_overrides::multiplier_map_guard();
-        for exclude in [json!({"mason": ["openai"]}), json!({"all": ["openai"]})] {
+        for group in ["all", "mason", "sidekick", "athena", "lab", "core"] {
             let rig = PolicyRig::new(json!({"model_routing": {
-                "explicit_only_providers": ["openai"], "exclude": exclude,
+                "exclude": {group: ["openai"]},
             }}));
-            for consumer in ["mason", "sidekick"] {
+            let consumers: &[&str] = if group == "all" {
+                &["mason", "sidekick", "athena", "lab", "core"]
+            } else {
+                &[group]
+            };
+            for consumer in consumers {
                 let mut params = rig.params();
                 params["consumer"] = json!(consumer);
+                let automatic = rig.select(params.clone()).await;
+                assert_eq!(
+                    automatic["result"]["selected"]["capacityKey"], "fallback/safe",
+                    "group={group} consumer={consumer}: {automatic}"
+                );
+                assert_eq!(
+                    rejection_reason(&automatic, "openai/pin").as_deref(),
+                    Some("excluded_by_operator"),
+                    "group={group} consumer={consumer}: {automatic}"
+                );
                 params["modelPin"] = json!("openai/pin");
-                let reply = rig.select(params).await;
-                if consumer == "mason" || exclude.get("all").is_some() {
-                    assert_eq!(reply["code"], "excluded_by_operator", "{reply}");
-                } else {
-                    assert_eq!(
-                        reply["result"]["selected"]["capacityKey"], "openai/pin",
-                        "{reply}"
-                    );
-                }
-                assert!(reply.get("pin_rejected").is_none(), "{reply}");
-                assert!(reply["result"].get("pin_rejected").is_none(), "{reply}");
+                let pinned = rig.select(params).await;
+                assert_eq!(
+                    pinned["result"]["selected"]["capacityKey"], "openai/pin",
+                    "group={group} consumer={consumer}: {pinned}"
+                );
+                assert!(pinned.get("pin_rejected").is_none(), "{pinned}");
+                assert!(pinned["result"].get("pin_rejected").is_none(), "{pinned}");
             }
         }
+    }
+
+    /// Lifting the exclude refusal for a named model leaves the real
+    /// availability and quota walls in place.
+    #[tokio::test]
+    async fn launch_model_pin_of_an_excluded_route_still_meets_availability_and_quota_walls() {
+        let _guard = crate::config_overrides::multiplier_map_guard();
+        let rig = PolicyRig::new(json!({"model_routing": {"exclude": {"all": ["openai"]}}}));
+        let mut params = rig.params();
+        params["consumer"] = json!("mason");
+        params["modelPin"] = json!("openai/pin");
+        params["availableModels"] = json!(["fallback/safe"]);
+        let unavailable = rig.select(params.clone()).await;
+        assert_eq!(unavailable["code"], "not_available", "{unavailable}");
+        params["availableModels"] = json!(["openai/pin", "fallback/safe"]);
+        rig.store
+            .update_route_state(
+                "openai/pin",
+                "openai/pin",
+                &prefrontal_routing_core::RouteStateUpdate {
+                    quota_exhausted_until: Some(now_ms() as f64 + 3_600_000.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let walled = rig.select(params).await;
+        assert_eq!(walled["code"], "quota_exhausted", "{walled}");
     }
 
     #[tokio::test]
