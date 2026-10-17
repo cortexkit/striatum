@@ -326,6 +326,16 @@ pub struct SeatedVariant {
     pub slot: usize,
     pub route_key: String,
     pub variant: SeatedSiblingVariant,
+    /// The reasoning variant the seat runs at, once the routing module has
+    /// applied the operator's variant overrides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_variant: Option<String>,
+    /// Which rule chose `reasoning_variant`: `pin`, `consumer`, `all` or `curated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_variant_source: Option<String>,
+    /// Overrides skipped because the catalog no longer publishes their variant.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_variant_fallbacks: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -605,6 +615,9 @@ pub fn select_panel_with_policy_context(
             slot,
             route_key: member.route_key.clone(),
             variant: sibling_variant(&member.route_key),
+            reasoning_variant: None,
+            reasoning_variant_source: None,
+            reasoning_variant_fallbacks: Vec::new(),
         })
         .collect();
     panel.policy = Some(policy);
@@ -1075,6 +1088,9 @@ fn select_panel_admitted(
                 slot,
                 route_key: member.route_key.clone(),
                 variant: sibling_variant(&member.route_key),
+                reasoning_variant: None,
+                reasoning_variant_source: None,
+                reasoning_variant_fallbacks: Vec::new(),
             })
             .collect(),
         sibling_collapses,

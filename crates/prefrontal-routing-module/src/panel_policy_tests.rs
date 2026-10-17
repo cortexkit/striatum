@@ -172,6 +172,64 @@ mod class_panel_policy {
         }
     }
 
+    /// Athena panels read `variants.athena` for every seat, the extra draw
+    /// included; lab panels read `variants.lab`. Each seat's variant and the
+    /// rule that chose it are recorded beside it in `seatedVariants`.
+    #[tokio::test]
+    async fn panel_seats_run_their_class_consumers_variants_including_the_extra_draw() {
+        let _guard = crate::config_overrides::multiplier_map_guard();
+        let rig = PanelRig::new(json!({"model_routing": {"variants": {
+            "all": {"anthropic": "low"},
+            "athena": {"openai/gpt-6-astra": "xhigh", "anthropic/a": "high"},
+            "lab": {"openai/gpt-6-astra": "medium"},
+            "mason": {"openai/gpt-6-astra": "max", "anthropic/a": "max"},
+        }}}));
+        let audit = rig.select(rig.params("AUDIT")).await;
+        assert_eq!(
+            routes(&audit),
+            ["openai/gpt-6-astra", "kimi-code-plan-global/k3", "anthropic/a"],
+            "{audit}"
+        );
+        let policy = &audit["result"]["policy"];
+        assert_eq!(policy["seats"][2]["reason"], "extra", "{policy}");
+        let members = audit["result"]["members"].as_array().unwrap();
+        for (slot, variant, source) in [
+            (0, Some("xhigh"), "consumer"),
+            (1, None, "curated"),
+            (2, Some("high"), "consumer"),
+        ] {
+            assert_eq!(
+                members[slot]["promptParams"]["variant"].as_str(),
+                variant,
+                "slot {slot}: {audit}"
+            );
+            let seated = &policy["seatedVariants"][slot];
+            assert_eq!(seated["slot"], slot);
+            assert_eq!(seated["reasoningVariant"].as_str(), variant, "{seated}");
+            assert_eq!(seated["reasoningVariantSource"], source, "{seated}");
+        }
+        // The recorded panel decision carries the same per-seat record.
+        let decisions = rig.store.get_decisions_for_task("audit-consult").unwrap();
+        let recorded: serde_json::Value =
+            serde_json::from_str(decisions[0].explanation_json.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            recorded["policy"]["seatedVariants"][0]["reasoningVariant"],
+            "xhigh"
+        );
+
+        let lab = rig.select(rig.params("lab")).await;
+        let lab_members = lab["result"]["members"].as_array().unwrap();
+        assert!(!lab_members.is_empty(), "{lab}");
+        for member in lab_members {
+            let expected = match member["routeKey"].as_str().unwrap() {
+                "openai/gpt-6-astra" => Some("medium"),
+                route if route.starts_with("anthropic/") => Some("low"),
+                _ => None,
+            };
+            assert_eq!(member["promptParams"]["variant"].as_str(), expected, "{lab}");
+        }
+    }
+
     #[tokio::test]
     async fn class_exclusions_follow_lab_or_athena_and_never_mason() {
         let _guard = crate::config_overrides::multiplier_map_guard();

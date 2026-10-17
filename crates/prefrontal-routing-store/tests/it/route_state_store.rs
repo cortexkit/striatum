@@ -2839,6 +2839,7 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
         reasoning_rate: Some(12.0),
         supports_vision: Some(vision),
         supports_tool_use: Some(true),
+        reasoning_efforts: None,
     };
     store
         .apply_fusiform_catalog(
@@ -2943,6 +2944,7 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
         reasoning_rate: None,
         supports_vision: Some(provider == "anthropic"),
         supports_tool_use: Some(true),
+        reasoning_efforts: None,
     };
     store
         .apply_fusiform_catalog(
@@ -2988,6 +2990,7 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
         reasoning_rate: None,
         supports_vision: Some(false),
         supports_tool_use: Some(true),
+        reasoning_efforts: None,
     };
     store
         .apply_fusiform_catalog(
@@ -3043,6 +3046,7 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
         reasoning_rate: None,
         supports_vision: Some(true),
         supports_tool_use: Some(true),
+        reasoning_efforts: None,
     };
     let routable_before = store.get_facts().unwrap().len();
     assert!(store.get_facts().unwrap().iter().any(|fact| make_route_key(

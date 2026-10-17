@@ -3,6 +3,7 @@
 
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 
 fn present_value<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
@@ -19,6 +20,60 @@ pub struct ExcludeGroups {
     pub athena: Vec<String>,
     pub lab: Vec<String>,
     pub core: Vec<String>,
+}
+
+/// Per-consumer reasoning-variant overrides, grouped like `model_routing.exclude`.
+/// Each key is a route spec in the exclusion grammar without negation
+/// (`provider`, `provider/model`, `provider/model/variant`); each value is a
+/// variant name the catalog publishes for the matched models.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct VariantGroups {
+    pub all: BTreeMap<String, String>,
+    pub mason: BTreeMap<String, String>,
+    pub sidekick: BTreeMap<String, String>,
+    pub athena: BTreeMap<String, String>,
+    pub lab: BTreeMap<String, String>,
+    pub core: BTreeMap<String, String>,
+}
+
+impl VariantGroups {
+    /// Every group with its config name, `all` first.
+    pub fn named(&self) -> [(&'static str, &BTreeMap<String, String>); 6] {
+        [
+            ("all", &self.all),
+            ("mason", &self.mason),
+            ("sidekick", &self.sidekick),
+            ("athena", &self.athena),
+            ("lab", &self.lab),
+            ("core", &self.core),
+        ]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.named().iter().all(|(_, group)| group.is_empty())
+    }
+
+    /// Shape checks that need no catalog: every key is a non-negated route spec
+    /// and every value is a single non-empty word.
+    pub fn validate(&self) -> Result<(), String> {
+        for (group, entries) in self.named() {
+            for (key, variant) in entries {
+                let spec = prefrontal_routing_core::provider_model_spec::parse_spec(key);
+                if key.trim() != key || spec.is_none() || spec.is_some_and(|spec| spec.negated) {
+                    return Err(format!(
+                        "model_routing.variants.{group}: key {key:?} must be provider, provider/model or provider/model/variant"
+                    ));
+                }
+                if variant.is_empty() || variant.chars().any(char::is_whitespace) {
+                    return Err(format!(
+                        "model_routing.variants.{group}.{key}: variant {variant:?} must be one non-empty word"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]

@@ -8,6 +8,7 @@
 //! | field group | default authority | operator override |
 //! | --- | --- | --- |
 //! | vision, tool use, context/output limits, rates/output tier | Fusiform | an explicit override of that same field wins |
+//! | published reasoning efforts (`capability.reasoning_options`) | Fusiform | none; the operator's `model_routing.variants` must name one of them |
 //! | Elo, EQ, speed, variants, exclusions, multipliers, prompt defaults | operator | always retained; Fusiform cannot represent them |
 //!
 //! Wire decoding is isolated here and pinned to the producer-real fixture copied
@@ -202,6 +203,47 @@ struct CatalogModelFacts {
     output_rate: Option<CatalogRate>,
     #[serde(rename = "rate.reasoning")]
     reasoning_rate: Option<CatalogRate>,
+    /// Outer `None`: the key was not served. Inner `None`: served as `null`.
+    #[serde(
+        rename = "capability.reasoning_options",
+        default,
+        deserialize_with = "served_value"
+    )]
+    reasoning_options: Option<Option<Vec<Value>>>,
+}
+
+fn served_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// The effort values Broca will admit for a model: the `values` of every
+/// `{"type": "effort"}` reasoning option, in first-seen order. Toggle and
+/// token-budget options carry no named variant. `None` when the catalog did
+/// not serve `capability.reasoning_options` at all.
+fn published_efforts(options: &Option<Option<Vec<Value>>>) -> Option<Vec<String>> {
+    let options = options.as_ref()?;
+    let mut efforts: Vec<String> = Vec::new();
+    for option in options.iter().flatten() {
+        if option.get("type").and_then(Value::as_str) != Some("effort") {
+            continue;
+        }
+        for value in option
+            .get("values")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !efforts.iter().any(|known| known == value) {
+                efforts.push(value.to_string());
+            }
+        }
+    }
+    Some(efforts)
 }
 
 /// Fusiform `RateValue`, tagged by `state` (fusiform-core lib.rs): `priced`
@@ -630,6 +672,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
             reasoning_rate,
             supports_vision,
             supports_tool_use: model.tool_call,
+            reasoning_efforts: published_efforts(&model.reasoning_options),
         });
     }
     Ok(CatalogSnapshot {
@@ -1329,6 +1372,53 @@ mod tests {
 
     fn get_reply(name: &str) -> Vec<u8> {
         serde_json::to_vec(&fixture()[name]["response"]).unwrap()
+    }
+
+    /// Only `effort` options name variants; toggles and token budgets do not,
+    /// and a served `null` or empty list publishes none. The served shapes are
+    /// the ones in the producer fixture, set on its current one-model reply.
+    #[test]
+    fn reasoning_options_decode_to_the_published_effort_values() {
+        let served = |options: Option<Value>| {
+            let mut reply: Value =
+                serde_json::from_slice(&get_reply("catalog.get — one model, current")).unwrap();
+            for facts in reply["models"].as_object_mut().unwrap().values_mut() {
+                let facts = facts.as_object_mut().unwrap();
+                match &options {
+                    Some(options) => {
+                        facts.insert("capability.reasoning_options".into(), options.clone());
+                    }
+                    None => {
+                        facts.remove("capability.reasoning_options");
+                    }
+                }
+            }
+            decode_catalog_get(&serde_json::to_vec(&reply).unwrap())
+                .unwrap()
+                .facts[0]
+                .reasoning_efforts
+                .clone()
+        };
+        let efforts = |values: &[&str]| Some(values.iter().map(|v| (*v).to_string()).collect());
+        assert_eq!(
+            served(Some(json!([
+                {"type": "toggle"},
+                {"type": "effort", "values": ["low", "medium", "high"]},
+                {"max": 127999, "min": 1024, "type": "budget_tokens"}
+            ]))),
+            efforts(&["low", "medium", "high"])
+        );
+        assert_eq!(
+            served(Some(json!([{"min": 1024, "type": "budget_tokens"}]))),
+            efforts(&[])
+        );
+        assert_eq!(served(Some(json!([]))), efforts(&[]));
+        assert_eq!(served(Some(Value::Null)), efforts(&[]));
+        assert_eq!(
+            served(None),
+            None,
+            "a catalog that does not serve the key leaves the row unread"
+        );
     }
 
     fn muse_reply() -> Value {

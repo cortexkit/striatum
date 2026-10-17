@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::config_policy::{ExcludeGroups, PanelPolicies, Pins};
+use crate::config_policy::{ExcludeGroups, PanelPolicies, Pins, VariantGroups};
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
     make_capacity_key, make_route_key, FailureBackoffConfig, FamilySource, GrandFamily,
@@ -19,6 +19,7 @@ use prefrontal_routing_core::{
 };
 #[cfg(test)]
 use prefrontal_routing_core::{model_facts_seed, CatalogFactField, FactSource};
+use prefrontal_routing_store::ReasoningCatalog;
 use schemars::JsonSchema;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -62,6 +63,115 @@ struct LiveConfigCache {
 fn live_configs() -> &'static Mutex<HashMap<PathBuf, LiveConfigCache>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, LiveConfigCache>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reads the reasoning efforts the catalog currently publishes.
+pub type ReasoningCatalogSource = Arc<dyn Fn() -> Result<ReasoningCatalog, String> + Send + Sync>;
+
+/// The catalog each config path's variant overrides are checked against. Absent
+/// until the routing store opens; config loaded before then gets only the shape
+/// checks, and the store's opening re-checks the active config.
+fn catalog_sources() -> &'static Mutex<HashMap<PathBuf, ReasoningCatalogSource>> {
+    static SOURCES: OnceLock<Mutex<HashMap<PathBuf, ReasoningCatalogSource>>> = OnceLock::new();
+    SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Attach the live catalog to `path`, then check the active config against it.
+/// Every later load or reload of `path` is checked the same way. An error means
+/// the active config names a variant the catalog does not publish.
+pub fn attach_reasoning_catalog(path: &Path, source: ReasoningCatalogSource) -> Result<(), String> {
+    catalog_sources()
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), source);
+    let active = live_config_at(path, Instant::now())?;
+    check_variants_against_catalog(path, &active.config)
+}
+
+/// The live catalog attached to `path`, read now. `None` before the store opens.
+pub fn reasoning_catalog_for(path: &Path) -> Option<ReasoningCatalog> {
+    let source = catalog_sources().lock().unwrap().get(path).cloned()?;
+    match source() {
+        Ok(catalog) => Some(catalog),
+        Err(error) => {
+            eprintln!(
+                "[prefrontal-routing] reading reasoning options for {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn check_variants_against_catalog(path: &Path, config: &RoutingConfigFile) -> Result<(), String> {
+    let section = &config.model_routing;
+    if section.variants.is_empty() {
+        return Ok(());
+    }
+    let Some(source) = catalog_sources().lock().unwrap().get(path).cloned() else {
+        return Ok(());
+    };
+    let catalog = source().map_err(|error| format!("variant_catalog_unreadable: {error}"))?;
+    report_variant_warnings(path, check_variants_with(config, &catalog)?);
+    Ok(())
+}
+
+/// Check one config's variant overrides against a catalog snapshot.
+fn check_variants_with(
+    config: &RoutingConfigFile,
+    catalog: &ReasoningCatalog,
+) -> Result<Vec<String>, String> {
+    let section = &config.model_routing;
+    crate::variant_policy::check_against_catalog(&section.variants, &section.score_alias, catalog)
+        .map_err(|error| format!("variant_not_published: {error}"))
+}
+
+fn report_variant_warnings(path: &Path, warnings: Vec<String>) {
+    for warning in warnings {
+        eprintln!("[prefrontal-routing] {}: {warning}", path.display());
+    }
+}
+
+/// Where the module's routing store lives when the daemon manages storage:
+/// `$XDG_DATA_HOME/cortexkit/prefrontal-routing/store.db`, defaulting
+/// `XDG_DATA_HOME` to `~/.local/share`.
+pub fn default_store_path() -> Option<PathBuf> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/share"))
+        })?;
+    Some(data_home.join("cortexkit/prefrontal-routing/store.db"))
+}
+
+/// Validate the config at `path` and check its variant overrides against the
+/// store at `store_path`, read-only. Returns one line describing the catalog
+/// check: passed, or skipped and why.
+pub fn check_config_offline(path: &Path, store_path: Option<&Path>) -> Result<String, String> {
+    initialize_config(path)?;
+    let active = live_config_at(path, Instant::now())?;
+    if active.config.model_routing.variants.is_empty() {
+        return Ok("catalog check: no model_routing.variants to check".into());
+    }
+    let Some(store_path) = store_path else {
+        return Ok(
+            "catalog check skipped: no routing store path (neither XDG_DATA_HOME nor HOME is set)"
+                .into(),
+        );
+    };
+    let catalog = match prefrontal_routing_store::read_reasoning_catalog_offline(store_path) {
+        Ok(catalog) => catalog,
+        Err(error) => return Ok(format!("catalog check skipped: {error}")),
+    };
+    let warnings = check_variants_with(&active.config, &catalog)?;
+    let mut report = format!("catalog check passed against {}", store_path.display());
+    for warning in warnings {
+        report.push_str(&format!("\nwarning: {warning}"));
+    }
+    Ok(report)
 }
 
 pub fn live_config(path: &Path) -> Arc<LiveConfig> {
@@ -207,6 +317,7 @@ fn live_config_at_with_reporter(
             Some(document) => parse_config(document)?,
             None => RoutingConfigFile::default(),
         };
+        check_variants_against_catalog(path, &config)?;
         Ok(LiveConfig { config, document })
     })();
     let active = match next {
@@ -257,6 +368,7 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
     }
     section.panels.validate()?;
     section.pins.validate()?;
+    section.variants.validate()?;
     for (provider, value) in &section.subscription_multipliers {
         if provider.trim().is_empty() || !value.is_finite() || *value <= 0.0 {
             return Err(format!("invalid subscription_multiplier for {provider}"));
@@ -306,6 +418,14 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
 impl LiveConfig {
     pub fn exclude_groups(&self) -> &ExcludeGroups {
         &self.config.model_routing.exclude
+    }
+
+    pub fn variant_groups(&self) -> &VariantGroups {
+        &self.config.model_routing.variants
+    }
+
+    pub fn score_aliases(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.config.model_routing.score_alias
     }
 
     pub fn panels(&self) -> &PanelPolicies {
@@ -742,6 +862,12 @@ struct ModelRoutingSection {
     /// admitted when the route is otherwise servable.
     #[serde(default)]
     exclude: ExcludeGroups,
+    /// Reasoning-variant overrides by consumer, grouped like `exclude`. A
+    /// selection runs at the caller's named variant, else `variants.<consumer>`,
+    /// else `variants.all`, else the route's curated default. Each value must
+    /// be an effort the catalog publishes for the matched models.
+    #[serde(default)]
+    variants: VariantGroups,
     #[serde(default)]
     panels: PanelPolicies,
     #[serde(default)]

@@ -22,6 +22,34 @@ fn refuse(code: &str, message: String) -> Refusal {
     }
 }
 
+/// Split the model part of a pin into the catalog model id and the reasoning
+/// tier the caller named, if any. A catalog id that itself contains a colon
+/// (for example a model size) is kept whole; only an additional suffix is a tier.
+fn split_model_and_variant<'a>(
+    provider: &str,
+    requested_model: &'a str,
+    facts: &[ModelFact],
+) -> (&'a str, Option<&'a str>) {
+    if facts
+        .iter()
+        .any(|fact| fact.provider_id == provider && fact.model_id == requested_model)
+    {
+        (requested_model, None)
+    } else {
+        requested_model
+            .rsplit_once(':')
+            .map_or((requested_model, None), |(id, tier)| (id, Some(tier)))
+    }
+}
+
+/// The reasoning tier a `provider/model:variant` pin names explicitly.
+pub(crate) fn named_variant(pin: &str, facts: &[ModelFact]) -> Option<String> {
+    let (provider, requested_model) = pin.split_once('/')?;
+    split_model_and_variant(provider, requested_model, facts)
+        .1
+        .map(str::to_string)
+}
+
 /// Select the exact route a caller named. The operator's `exclude` lists (the
 /// `all` list and every consumer group) never apply here: they keep a route out
 /// of automatic choice only.
@@ -57,17 +85,7 @@ pub(crate) fn select(
     }
     // Some catalog IDs contain a colon (for example a model size). Prefer a
     // complete catalog identity; only an additional suffix is a reasoning tier.
-    let (model, variant) = if input
-        .facts
-        .iter()
-        .any(|fact| fact.provider_id == provider && fact.model_id == requested_model)
-    {
-        (requested_model, None)
-    } else {
-        requested_model
-            .rsplit_once(':')
-            .map_or((requested_model, None), |(id, tier)| (id, Some(tier)))
-    };
+    let (model, variant) = split_model_and_variant(provider, requested_model, &input.facts);
     let identity = format!("{provider}/{model}");
     let facts: Vec<ModelFact> = input
         .facts

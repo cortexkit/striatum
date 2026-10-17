@@ -102,7 +102,15 @@
         ],
         "score_alias": {},
         "subscription": [],
-        "subscription_multipliers": {}
+        "subscription_multipliers": {},
+        "variants": {
+          "all": {},
+          "athena": {},
+          "core": {},
+          "lab": {},
+          "mason": {},
+          "sidekick": {}
+        }
       }
     }
   },
@@ -530,6 +538,18 @@
           "propertyNames": {
             "pattern": "\\S"
           }
+        },
+        "variants": {
+          "description": "Reasoning-variant overrides by consumer, grouped like `exclude`. A\nselection runs at the caller's named variant, else `variants.<consumer>`,\nelse `variants.all`, else the route's curated default. Each value must\nbe an effort the catalog publishes for the matched models.",
+          "$ref": "#/$defs/VariantGroups",
+          "default": {
+            "all": {},
+            "athena": {},
+            "core": {},
+            "lab": {},
+            "mason": {},
+            "sidekick": {}
+          }
         }
       },
       "additionalProperties": false,
@@ -836,6 +856,55 @@
         "model",
         "variant"
       ]
+    },
+    "VariantGroups": {
+      "description": "Per-consumer reasoning-variant overrides, grouped like `model_routing.exclude`.\nEach key is a route spec in the exclusion grammar without negation\n(`provider`, `provider/model`, `provider/model/variant`); each value is a\nvariant name the catalog publishes for the matched models.",
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "athena": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "core": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "lab": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "mason": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "sidekick": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

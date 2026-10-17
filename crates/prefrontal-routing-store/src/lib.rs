@@ -37,9 +37,11 @@ use std::sync::Mutex;
 
 mod account_selection;
 mod key_pool;
+mod reasoning_catalog;
 mod retention;
 
 pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
+pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
 pub use retention::{
     is_routine_decision, DecisionRetentionCursor, RetentionBatch, ROUTINE_REFUSAL_CODE,
 };
@@ -173,6 +175,8 @@ const MIGRATION_047: &str = include_str!("../migrations/047_retention_indexes.sq
 /// per-key walls and cooldowns, and session workspace affinity).
 const MIGRATION_048: &str = include_str!("../migrations/048_pool_keys.sql");
 const MIGRATION_049: &str = include_str!("../migrations/049_model_auth_methods.sql");
+/// Migration 50: the reasoning-effort values Fusiform publishes per model.
+const MIGRATION_050: &str = include_str!("../migrations/050_model_reasoning_efforts.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -216,7 +220,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 49] {
+fn route_state_migrations() -> [Migration; 50] {
     [
         Migration {
             version: 1,
@@ -414,6 +418,10 @@ fn route_state_migrations() -> [Migration; 49] {
             version: 49,
             statements: MIGRATION_049,
         },
+        Migration {
+            version: 50,
+            statements: MIGRATION_050,
+        },
     ]
 }
 
@@ -506,6 +514,11 @@ pub struct FusiformFactUpdate {
     pub reasoning_rate: Option<f64>,
     pub supports_vision: Option<bool>,
     pub supports_tool_use: Option<bool>,
+    /// Effort values from the model's `capability.reasoning_options`: an empty
+    /// list when the catalog serves the key with no effort entry (or `null`).
+    /// `None` only when the catalog did not serve the key at all, which leaves
+    /// the row unread for reasoning purposes.
+    pub reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -535,11 +548,13 @@ struct CatalogFingerprintRow {
     excluded: bool,
     fusiform_present: Option<bool>,
     auth_methods_json: Option<String>,
+    reasoning_efforts_json: Option<String>,
 }
 
 /// BLAKE3 over every routing-read `model_facts` column: route/capacity identity,
 /// provider/model/variant, family, Elo/EQ/speed, context and output limits, price
-/// data, vision/tool capability flags, allowed login methods, prompt defaults,
+/// data, vision/tool capability flags, allowed login methods, published
+/// reasoning efforts, prompt defaults,
 /// confidence, speed multiplier, and exclusion. Adding a routing-read column
 /// without extending this row is the defect this hash exists to catch. Query ordering—not insertion ordering—is the
 /// generation contract, so a no-op reseed or shuffled input cannot mint a different
@@ -557,7 +572,8 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                 input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
-                speed_multiplier, excluded, fusiform_present, auth_methods_json
+                speed_multiplier, excluded, fusiform_present, auth_methods_json,
+                reasoning_efforts_json
          FROM model_facts
          ORDER BY route_key",
     )?;
@@ -588,6 +604,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             excluded: row.get::<_, i64>(22)? != 0,
             fusiform_present: row.get::<_, Option<i64>>(23)?.map(|value| value != 0),
             auth_methods_json: row.get(24)?,
+            reasoning_efforts_json: row.get(25)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -858,6 +875,15 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    /// The reasoning-effort values the catalog publishes for every stored model.
+    pub fn reasoning_catalog(&self) -> RouteStateResult<ReasoningCatalog> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                reasoning_catalog::read_reasoning_catalog(connection)
+            })
+            .map_err(err)
+    }
+
     /// All durable catalog rows, including each row's routing-exclusion state.
     ///
     /// This is intentionally separate from `RouteStateStore::get_facts`: selection
@@ -948,6 +974,12 @@ impl SqliteRouteStateStore {
                         .map(serde_json::to_string)
                         .transpose()
                         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                    let reasoning_efforts_json = fact
+                        .reasoning_efforts
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
                     let route_key = prefrontal_routing_core::make_route_key(
                         &fact.provider_id,
                         &fact.model_id,
@@ -991,7 +1023,8 @@ impl SqliteRouteStateStore {
                                fusiform_present, context_window_source,
                                max_output_tokens_source, cost_tier_source,
                                cost_per_mtok_out_source, supports_vision_source,
-                               supports_tool_use_source, auth_methods_json
+                               supports_tool_use_source, auth_methods_json,
+                               reasoning_efforts_json
                              ) VALUES (
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
                                ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
@@ -999,7 +1032,7 @@ impl SqliteRouteStateStore {
                                NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
                                'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
-                               'fusiform', 'fusiform', ?18
+                               'fusiform', 'fusiform', ?18, ?19
                              )",
                             params![
                                 route_key,
@@ -1020,6 +1053,7 @@ impl SqliteRouteStateStore {
                                 cursor.catalog_version,
                                 if fact.present { 1_i64 } else { 0_i64 },
                                 auth_methods_json,
+                                reasoning_efforts_json,
                             ],
                         )?;
                         let provider_key = derive_provider_key(&fact.provider_id).ok_or_else(|| {
@@ -1083,7 +1117,7 @@ impl SqliteRouteStateStore {
                                  THEN supports_tool_use_source ELSE 'fusiform' END,
                                facts_source = 'fusiform', fusiform_version = ?11,
                                fusiform_present = ?12, updated_at = ?13,
-                               auth_methods_json = ?16
+                               auth_methods_json = ?16, reasoning_efforts_json = ?17
                              WHERE provider_id = ?14 AND model_id = ?15",
                             params![
                                 fact.context_window,
@@ -1102,6 +1136,7 @@ impl SqliteRouteStateStore {
                                 fact.provider_id,
                                 fact.model_id,
                                 auth_methods_json,
+                                reasoning_efforts_json,
                             ],
                         )?;
                     }

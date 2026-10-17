@@ -82,6 +82,12 @@ fn spec_matches_key(spec: &ParsedSpec, key: &str) -> bool {
     }
 }
 
+/// Whether one parsed spec names `key` (ignoring its negation). The variant
+/// overrides use this to match their keys exactly as exclusion entries match.
+pub fn spec_names_key(spec: &ParsedSpec, key: &str) -> bool {
+    spec_matches_key(spec, key)
+}
+
 /// Resolve a boolean for a key against parsed specs, starting from `base`.
 /// Provider-level matches apply first, then model-level (more specific) win.
 pub fn resolve_spec(specs: &[ParsedSpec], key: &str, base: bool) -> bool {

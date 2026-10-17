@@ -464,6 +464,202 @@ mod consumer_and_pin {
         assert_eq!(walled["code"], "quota_exhausted", "{walled}");
     }
 
+    /// Give `openai/pin` a curated default variant, the last rule a selection uses.
+    fn with_curated_variant(rig: &PolicyRig, variant: &str) {
+        let mut pin = fact("openai", "pin");
+        pin.cost_per_m_tok_out = Some(0.1);
+        pin.prompt_defaults = Some(prefrontal_routing_core::model_facts::ModelPromptDefaults {
+            variant: Some(variant.into()),
+            ..Default::default()
+        });
+        rig.store.upsert_fact(&pin, FactSource::Override).unwrap();
+    }
+
+    fn variant_of(reply: &serde_json::Value) -> (String, String) {
+        (
+            reply["result"]["selected"]["promptParams"]["variant"]
+                .as_str()
+                .unwrap_or("(none)")
+                .to_string(),
+            reply["result"]["variantSelection"]["source"]
+                .as_str()
+                .unwrap_or("(none)")
+                .to_string(),
+        )
+    }
+
+    /// A selection runs at the caller's named variant, else the consumer's
+    /// group, else `all`, else the route's curated default.
+    #[tokio::test]
+    async fn variant_precedence_runs_pin_then_consumer_then_all_then_curated() {
+        let _guard = crate::config_overrides::multiplier_map_guard();
+        let rig = PolicyRig::new(json!({"model_routing": {"variants": {
+            "all": {"openai/pin": "high"},
+            "mason": {"openai/pin": "xhigh"},
+        }}}));
+        with_curated_variant(&rig, "medium");
+        let select = |consumer: Option<&str>, pin: Option<serde_json::Value>| {
+            let mut params = rig.params();
+            match consumer {
+                Some(consumer) => params["consumer"] = json!(consumer),
+                None => {
+                    params.as_object_mut().unwrap().remove("consumer");
+                }
+            }
+            if let Some(pin) = pin {
+                params["pin"] = pin;
+                params["pin_fallback"] = json!("none");
+            }
+            rig.select(params)
+        };
+        let pinned = select(
+            Some("mason"),
+            Some(json!({"model": "openai/pin", "variant": "low"})),
+        )
+        .await;
+        assert_eq!(variant_of(&pinned), ("low".into(), "pin".into()), "{pinned}");
+        let consumer = select(Some("mason"), None).await;
+        assert_eq!(
+            variant_of(&consumer),
+            ("xhigh".into(), "consumer".into()),
+            "{consumer}"
+        );
+        // Neither a consumer without a group entry nor a request naming no
+        // consumer reads another consumer's group.
+        for other in [Some("sidekick"), None] {
+            let all = select(other, None).await;
+            assert_eq!(variant_of(&all), ("high".into(), "all".into()), "{all}");
+        }
+        // The decision log names the rule that chose the variant.
+        let mut params = rig.params();
+        params["consumer"] = json!("mason");
+        params["sendID"] = json!("variant-consumer");
+        rig.select(params).await;
+        let logged = rig
+            .store
+            .get_decision_by_send_id("variant-consumer")
+            .unwrap()
+            .unwrap()
+            .explanation_json
+            .unwrap();
+        assert!(
+            logged.contains(
+                "variant xhigh for openai/pin from model_routing.variants for the consumer"
+            ),
+            "{logged}"
+        );
+
+        let curated = PolicyRig::new(json!({"model_routing": {"variants": {
+            "athena": {"openai/pin": "xhigh"},
+        }}}));
+        with_curated_variant(&curated, "medium");
+        let mut params = curated.params();
+        params["consumer"] = json!("mason");
+        let reply = curated.select(params).await;
+        assert_eq!(
+            variant_of(&reply),
+            ("medium".into(), "curated".into()),
+            "{reply}"
+        );
+    }
+
+    /// The operator's own split: one route, two consumers, two variants.
+    #[tokio::test]
+    async fn the_same_route_runs_xhigh_for_athena_and_high_for_mason() {
+        let _guard = crate::config_overrides::multiplier_map_guard();
+        let rig = PolicyRig::new(json!({"model_routing": {"variants": {
+            "athena": {"openai/pin": "xhigh"},
+            "mason": {"openai/pin": "high"},
+        }}}));
+        for (consumer, expected) in [("athena", "xhigh"), ("mason", "high")] {
+            let mut params = rig.params();
+            params["consumer"] = json!(consumer);
+            let reply = rig.select(params).await;
+            assert_eq!(
+                variant_of(&reply),
+                (expected.into(), "consumer".into()),
+                "{consumer}: {reply}"
+            );
+        }
+    }
+
+    fn publish_efforts(store: &SharedStore, version: i64, efforts: &[&str]) {
+        store
+            .apply_fusiform_catalog(
+                &[prefrontal_routing_store::FusiformFactUpdate {
+                    provider_id: "openai".into(),
+                    model_id: "pin".into(),
+                    auth_methods: None,
+                    present: true,
+                    context_window: Some(200_000.0),
+                    max_output_tokens: None,
+                    cost_tier: Some(2.0),
+                    cost_per_mtok_out: Some(0.1),
+                    input_rate: None,
+                    cache_read_rate: None,
+                    cache_write_rate: None,
+                    reasoning_rate: None,
+                    supports_vision: Some(true),
+                    supports_tool_use: Some(true),
+                    reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
+                }],
+                prefrontal_routing_store::FusiformCatalogCursor {
+                    catalog_version: version,
+                    resolved_at_ms: version,
+                },
+            )
+            .unwrap();
+    }
+
+    /// A variant the catalog stops publishing after load does not fail the
+    /// selection: the next rule runs and the skip is in the reply and the log.
+    #[tokio::test]
+    async fn a_variant_the_catalog_drops_falls_back_and_is_logged() {
+        let _guard = crate::config_overrides::multiplier_map_guard();
+        let rig = PolicyRig::new(json!({"model_routing": {"variants": {
+            "all": {"openai/pin": "high"},
+            "mason": {"openai/pin": "xhigh"},
+        }}}));
+        publish_efforts(&rig.store, 1, &["low", "medium", "high", "xhigh"]);
+        let catalog_store = Arc::clone(&rig.store);
+        config_overrides::attach_reasoning_catalog(
+            &rig.path,
+            Arc::new(move || {
+                catalog_store
+                    .reasoning_catalog()
+                    .map_err(|error| error.to_string())
+            }),
+        )
+        .unwrap();
+        let mut params = rig.params();
+        params["consumer"] = json!("mason");
+        params["sendID"] = json!("before-drop");
+        let before = rig.select(params.clone()).await;
+        assert_eq!(variant_of(&before), ("xhigh".into(), "consumer".into()), "{before}");
+
+        publish_efforts(&rig.store, 2, &["low", "medium", "high"]);
+        params["sendID"] = json!("after-drop");
+        let after = rig.select(params).await;
+        assert_eq!(variant_of(&after), ("high".into(), "all".into()), "{after}");
+        let skipped = "model_routing.variants.mason.openai/pin = xhigh skipped for openai/pin: the catalog no longer publishes it (published: low, medium, high)";
+        assert_eq!(
+            after["result"]["variantSelection"]["fallbacks"],
+            json!([skipped]),
+            "{after}"
+        );
+        let logged = rig
+            .store
+            .get_decision_by_send_id("after-drop")
+            .unwrap()
+            .unwrap()
+            .explanation_json
+            .unwrap();
+        assert!(
+            logged.contains(&format!("variant fallback: {skipped}")),
+            "{logged}"
+        );
+    }
+
     #[tokio::test]
     async fn pin_cannot_spend_weekly_head_reserve() {
         let _guard = crate::config_overrides::multiplier_map_guard();

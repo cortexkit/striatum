@@ -29,6 +29,7 @@ mod retention;
 mod runtime_lag;
 mod select_policy;
 mod subscription_economics;
+mod variant_policy;
 mod winner_ladder;
 mod work_model_pin;
 
@@ -628,7 +629,15 @@ async fn main() -> Result<(), ModuleError> {
     let _ = subc_os::launch_nonce();
     let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
         StartupMode::PrintManifest => return print_manifest_operations(),
-        StartupMode::CheckConfig => return check_config_at(&config_overrides::config_path()),
+        StartupMode::CheckConfig => {
+            let report = config_overrides::check_config_offline(
+                &config_overrides::config_path(),
+                config_overrides::default_store_path().as_deref(),
+            )
+            .map_err(ModuleError::Message)?;
+            eprintln!("{report}");
+            return Ok(());
+        }
         StartupMode::PrintConfigSchema => {
             print!("{}", config_overrides::routing_config_schema());
             return Ok(());
@@ -857,6 +866,26 @@ where
     // 33-fact seed, once). The store backs route.select's facts + runtime snapshot.
     let descriptor = resolve_storage_descriptor(&ack.storage, &config.module_id)?;
     let store = open_route_state_store(&descriptor)?;
+    // Variant overrides name efforts the catalog must publish. Config loaded
+    // before the store opened got only shape checks; check it now, and every
+    // later reload, against the stored catalog.
+    {
+        let catalog_store = Arc::clone(&store);
+        config_overrides::attach_reasoning_catalog(
+            &config_overrides::config_path(),
+            Arc::new(move || {
+                catalog_store
+                    .reasoning_catalog()
+                    .map_err(|error| error.to_string())
+            }),
+        )
+        .map_err(|error| {
+            ModuleError::Message(format!(
+                "{}: {error}",
+                config_overrides::config_path().display()
+            ))
+        })?;
+    }
     // Seed the cache from the last persisted snapshot before anything can serve a
     // selection, so a restart does not select with no quota reading until the
     // first poll lands.
@@ -3277,7 +3306,21 @@ async fn handle_select_request(
                 work_model_pin::select(pin, input, &routing_config, concurrency_slots.as_ref())
             }
         };
-        let selection = selection.and_then(|selected| {
+        let selection = selection.map(|mut selected| {
+            let explicit = admission_pin.as_ref().map_or_else(
+                || work_model_pin::named_variant(pin, &facts),
+                |pin| pin.variant.clone(),
+            );
+            let choice = apply_variant_policy(
+                &mut selected,
+                &operator_config,
+                operator_config_path,
+                params.consumer,
+                explicit.as_deref(),
+            );
+            (selected, choice)
+        });
+        let selection = selection.and_then(|(selected, variant_choice)| {
             let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
             let ctx = account_selection::Ctx {
                 store: store.as_ref(),
@@ -3315,11 +3358,11 @@ async fn handle_select_request(
             } else {
                 None
             };
-            Ok((selected, runner))
+            Ok((selected, runner, variant_choice))
         });
         timing.record_selection(selection_started.elapsed());
         match selection {
-            Ok((selected, runner)) => {
+            Ok((selected, runner, variant_choice)) => {
                 let decision = decision_input_for(
                     &target_agent,
                     &requirements,
@@ -3334,7 +3377,8 @@ async fn handle_select_request(
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
                 let mut result = json!({
                     "selected": selected, "decisionID": decision_id,
-                    "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities}
+                    "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities},
+                    "variantSelection": variant_choice,
                 });
                 if params.pin.is_some() {
                     result["pin_rejected"] = serde_json::Value::Null;
@@ -3497,6 +3541,13 @@ async fn handle_select_request(
     let policy_sources = policy_sources_line(&operator_policy);
     match selection {
         Ok(mut selected) => {
+            let variant_choice = apply_variant_policy(
+                &mut selected,
+                &operator_config,
+                operator_config_path,
+                params.consumer,
+                None,
+            );
             selected.explanation.push(policy_sources.clone());
             if let Some(note) = &quota_note {
                 selected.explanation.push(note.clone());
@@ -3530,6 +3581,7 @@ async fn handle_select_request(
                         "selected": selected,
                         "decisionID": decision_id,
                         "resolvedInput": resolved_input,
+                        "variantSelection": variant_choice,
                         "billingPlanes": facts.iter().filter(|fact| {
                             let route = fact_to_route(fact);
                             available.contains(&route.route_key) || available.contains(&route.capacity_key)
@@ -3972,6 +4024,23 @@ async fn handle_select_panel(
             }),
         },
     };
+    // Seats are matched back to their catalog model to apply variant overrides;
+    // the facts move into the selection below.
+    let seat_models: HashMap<String, (String, String)> = if live_config.variant_groups().is_empty()
+    {
+        HashMap::new()
+    } else {
+        prepared
+            .facts
+            .iter()
+            .map(|fact| {
+                (
+                    fact_to_route(fact).route_key,
+                    (fact.provider_id.clone(), fact.model_id.clone()),
+                )
+            })
+            .collect()
+    };
     let mut panel = match prefrontal_routing_core::panel::select_panel_with_policy_context(
         SelectPanelInput {
             package_tokens: params.package_tokens,
@@ -4000,6 +4069,20 @@ async fn handle_select_panel(
                 .await;
         }
     };
+    // Every seat, the extra draws included, is an automatic choice for the
+    // class's consumer: lab panels read `variants.lab`, every other class
+    // `variants.athena`.
+    apply_panel_variant_policy(
+        &mut panel,
+        &live_config,
+        routing_config_path,
+        if class == prefrontal_routing_core::panel::PanelClass::Lab {
+            select_policy::Consumer::Lab
+        } else {
+            select_policy::Consumer::Athena
+        },
+        &seat_models,
+    );
     // Vault-mapped providers need the selected credential and launch target in
     // promptParams.runner so core can persist and dispatch each member correctly.
     if is_broca_substrate(params.substrate.as_deref()) {
@@ -4100,6 +4183,129 @@ async fn handle_select_panel(
     )
     .map_err(|e| ModuleError::Message(e.to_string()))?;
     send(writer, response).await
+}
+
+/// Run a selected route at the variant the operator's overrides choose, and
+/// record which rule chose it (and any override the catalog no longer
+/// publishes) in the selection's explanation, which the decision log keeps.
+fn apply_variant_policy(
+    selected: &mut SelectedModelRoute,
+    config: &config_overrides::LiveConfig,
+    config_path: &Path,
+    consumer: Option<select_policy::Consumer>,
+    explicit: Option<&str>,
+) -> variant_policy::VariantChoice {
+    let groups = config.variant_groups();
+    let catalog = if groups.is_empty() {
+        None
+    } else {
+        config_overrides::reasoning_catalog_for(config_path)
+    };
+    let curated = selected.prompt_params.variant.clone();
+    let choice = variant_policy::resolve(
+        groups,
+        config.score_aliases(),
+        catalog.as_ref(),
+        &variant_policy::VariantRequest {
+            route_key: &selected.route_key,
+            provider_id: &selected.model.provider_id,
+            model_id: &selected.model.model_id,
+            explicit,
+            curated: curated.as_deref(),
+            consumer,
+        },
+    );
+    if choice.variant != curated {
+        selected.prompt_params.variant = choice.variant.clone();
+        // Core launches a run from promptParams; a curated default effort left
+        // there would be sent beside the chosen variant and could contradict it,
+        // so it is dropped, as it is for an explicit pin.
+        selected.prompt_params.reasoning_effort = None;
+    }
+    // With no `model_routing.variants` entries the selection's explanation is
+    // left unchanged; otherwise the variant lines are appended. The reply's
+    // `variantSelection` names the rule either way.
+    if !groups.is_empty() {
+        selected
+            .explanation
+            .extend(choice.explanation_lines(&selected.route_key));
+    }
+    choice
+}
+
+/// Apply the variant overrides to every seated member and runner-up of an
+/// automatic panel, recording each seat's variant and rule beside its entry in
+/// the policy's `seatedVariants`.
+fn apply_panel_variant_policy(
+    panel: &mut SelectedPanel,
+    config: &config_overrides::LiveConfig,
+    config_path: &Path,
+    consumer: select_policy::Consumer,
+    seat_models: &HashMap<String, (String, String)>,
+) {
+    let groups = config.variant_groups();
+    if groups.is_empty() {
+        return;
+    }
+    let catalog = config_overrides::reasoning_catalog_for(config_path);
+    let choose = |route_key: &str,
+                  prompt_params: &mut serde_json::Map<String, serde_json::Value>| {
+        let (provider_id, model_id) = seat_models.get(route_key).cloned().unwrap_or_else(|| {
+            let (provider, model) = route_key.split_once('/').unwrap_or((route_key, ""));
+            (provider.to_string(), model.to_string())
+        });
+        let curated = prompt_params
+            .get("variant")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let choice = variant_policy::resolve(
+            groups,
+            config.score_aliases(),
+            catalog.as_ref(),
+            &variant_policy::VariantRequest {
+                route_key,
+                provider_id: &provider_id,
+                model_id: &model_id,
+                explicit: None,
+                curated: curated.as_deref(),
+                consumer: Some(consumer),
+            },
+        );
+        if choice.variant != curated {
+            match &choice.variant {
+                Some(variant) => {
+                    prompt_params.insert("variant".into(), json!(variant));
+                }
+                None => {
+                    prompt_params.remove("variant");
+                }
+            }
+            prompt_params.remove("reasoningEffort");
+        }
+        choice
+    };
+    let mut choices = Vec::with_capacity(panel.members.len());
+    for member in &mut panel.members {
+        choices.push(choose(&member.route_key, &mut member.prompt_params));
+    }
+    for runner_up in &mut panel.runner_up {
+        choose(&runner_up.route_key, &mut runner_up.prompt_params);
+    }
+    if let Some(policy) = &mut panel.policy {
+        for seated in &mut policy.seated_variants {
+            let Some(choice) = choices.get(seated.slot) else {
+                continue;
+            };
+            seated.reasoning_variant = choice.variant.clone();
+            seated.reasoning_variant_source = Some(
+                serde_json::to_value(choice.source)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+            );
+            seated.reasoning_variant_fallbacks = choice.fallbacks.clone();
+        }
+    }
 }
 
 fn panel_decision_input(
@@ -10738,6 +10944,9 @@ mod tests {
                 slot: 0,
                 route_key: "openai/gpt-5.6-sol-pro".into(),
                 variant: prefrontal_routing_core::SeatedSiblingVariant::Pro,
+                reasoning_variant: None,
+                reasoning_variant_source: None,
+                reasoning_variant_fallbacks: Vec::new(),
             }],
             sibling_collapses: Vec::new(),
             ..Default::default()
