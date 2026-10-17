@@ -4208,7 +4208,6 @@ fn subscription_plan(
                 account
             })
             .collect(),
-        head_points_per_hour: None,
     }
 }
 
@@ -4282,7 +4281,6 @@ fn subscription_scenario(
                     plans,
                     allow_banked: false,
                     now_ms: 1_000_000,
-                    head_pace: None,
                 })),
                 ..Default::default()
             },
@@ -4321,10 +4319,10 @@ fn subscription_margin_blocks_workers_but_not_heads() {
     assert_eq!(diagnostic["plans"][0]["headroomPoints"], 19.0);
     assert_eq!(diagnostic["plans"][0]["keepFreePoints"], 19.0);
     assert_eq!(diagnostic["plans"][0]["availablePoints"], 0.0);
-    assert_eq!(
-        diagnostic["plans"][0]["headReservePoints"],
-        serde_json::Value::Null
-    );
+    assert!(diagnostic["rule"]
+        .as_str()
+        .unwrap()
+        .contains("keep-free margin"));
     let head = select_model_route(subscription_scenario(&[81.0], 20.0, "alfonso")).unwrap();
     assert!(!head
         .rejected
@@ -4425,7 +4423,7 @@ fn all_reserved_pinned_roster_preserves_each_reserve_cause() {
             assert_eq!(cause.reason, PanelCauseReason::QuotaExhausted);
             assert_eq!(
                 cause.detail.as_deref(),
-                Some("weekly headroom is reserved for heads")
+                Some("no live account has weekly quota above its keep-free margin")
             );
         }
     }
@@ -4459,7 +4457,8 @@ fn all_reserved_automatic_panel_reports_quota_before_iq_package_and_diversity() 
             assert_eq!(shortfall.causes.len(), 2);
             assert!(shortfall.causes.iter().all(|cause| {
                 cause.reason == PanelCauseReason::QuotaExhausted
-                    && cause.detail.as_deref() == Some("weekly headroom is reserved for heads")
+                    && cause.detail.as_deref()
+                        == Some("no live account has weekly quota above its keep-free margin")
             }));
         }
     }
@@ -4489,11 +4488,9 @@ fn subscription_today_iq70_claude_wins_then_reserve_pressure_flips_to_sol() {
     assert_eq!(pricing.available_points, Some(210.0));
     assert_eq!(pricing.banked_resets_applied, 0);
     assert!((pricing.message_points - 0.03 / 28.4).abs() < 1e-12);
-    assert!(selected
-        .explanation
-        .iter()
-        .any(|line| line.contains("astrocyte 2026-10-09")
-            && line.contains("head reserve unavailable")));
+    assert!(selected.explanation.iter().any(
+        |line| line.contains("astrocyte 2026-10-09") && line.contains("keep-free margin 20.0%")
+    ));
     let selected = select_model_route(subscription_scenario(
         &[78.0, 78.0, 78.0, 78.0, 100.0],
         20.0,
@@ -4651,7 +4648,7 @@ fn no_route_refusal_groups_fences_and_attributes_xai_wall() {
     let message = error.refusal_message();
     for expected in [
         "excluded by operator: 10",
-        "reserved for heads: 1 (anthropic, until weekly reset in 133 h)",
+        "below keep-free margin: 1 (anthropic)",
         "out of credit: 1 (xai/grok-4.7, until_ms=1792081969000)",
         "excluded for this item/caller: 1 (openai)",
         "Earliest route wall expiry: xai/grok-4.7 (until_ms=1792081969000)",

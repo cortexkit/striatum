@@ -745,7 +745,9 @@ fn select_panel_admitted(
                 causes.push(PanelCause {
                     model: admitted.route.capacity_key.clone(),
                     reason: PanelCauseReason::QuotaExhausted,
-                    detail: Some("weekly headroom is reserved for heads".into()),
+                    detail: Some(
+                        "no live account has weekly quota above its keep-free margin".into(),
+                    ),
                     reset_at_ms: reserved_headroom_reset_at_ms(&admitted.runtime),
                 });
                 None
@@ -1137,7 +1139,6 @@ mod reset_tests {
                     fee_usd: 0.0,
                     fusiform_multiplier: None,
                     accounts: vec![account(2.0), account(1.0), account(f64::NAN)],
-                    head_points_per_hour: None,
                 }],
                 ..Default::default()
             })),
@@ -1146,13 +1147,16 @@ mod reset_tests {
         let cause = PanelCause {
             model: "anthropic/claude-opus-5-5".into(),
             reason: PanelCauseReason::QuotaExhausted,
-            detail: Some("weekly headroom is reserved for heads".into()),
+            detail: Some("no live account has weekly quota above its keep-free margin".into()),
             reset_at_ms: reserved_headroom_reset_at_ms(&runtime),
         };
         assert_eq!(cause.reset_at_ms, Some(1791686378812));
         let wire = serde_json::to_value(&cause).unwrap();
         assert_eq!(wire["reset_at_ms"], 1791686378812i64);
-        assert_eq!(wire["detail"], "weekly headroom is reserved for heads");
+        assert_eq!(
+            wire["detail"],
+            "no live account has weekly quota above its keep-free margin"
+        );
         let unknown = PanelCause {
             reset_at_ms: reserved_headroom_reset_at_ms(&Default::default()),
             ..cause

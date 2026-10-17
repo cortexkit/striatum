@@ -646,7 +646,6 @@ fn reserved_headroom_panel_cause_publishes_structured_reset_without_prose_timest
                         fee_usd: 0.0,
                         fusiform_multiplier: None,
                         accounts: vec![account(2.0), account(1.0)],
-                        head_points_per_hour: None,
                     }],
                     ..Default::default()
                 })),
@@ -669,7 +668,10 @@ fn reserved_headroom_panel_cause_publishes_structured_reset_without_prose_timest
     assert_eq!(cause.reset_at_ms, Some(1791686378812));
     let wire = serde_json::to_value(cause).unwrap();
     assert_eq!(wire["reset_at_ms"], 1791686378812i64);
-    assert_eq!(wire["detail"], "weekly headroom is reserved for heads");
+    assert_eq!(
+        wire["detail"],
+        "no live account has weekly quota above its keep-free margin"
+    );
 }
 
 #[test]

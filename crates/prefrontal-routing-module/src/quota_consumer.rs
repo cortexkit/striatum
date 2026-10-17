@@ -259,24 +259,6 @@ impl QuotaConsumer {
             .await
     }
 
-    /// Read registered management operation names from the daemon catalog.
-    /// The pace adapter calls an operation only when its name is advertised.
-    pub(crate) async fn management_operations(
-        &mut self,
-        module: &str,
-    ) -> Result<std::collections::HashSet<String>, QuotaConsumerError> {
-        let bytes = self
-            .operation_at(
-                0,
-                0,
-                serde_json::json!({"op":"catalog.list", "module_id":module}),
-            )
-            .await?;
-        let catalog: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(QuotaConsumerError::Json)?;
-        Ok(management_operation_names(&catalog, module))
-    }
-
     async fn operation_at(
         &mut self,
         channel: u16,
@@ -348,22 +330,6 @@ impl QuotaConsumer {
             }
         }
     }
-}
-
-fn management_operation_names(
-    catalog: &serde_json::Value,
-    module: &str,
-) -> std::collections::HashSet<String> {
-    catalog["modules"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|entry| entry["module_id"] == module)
-        .flat_map(|entry| entry["roles"].as_array().into_iter().flatten())
-        .filter(|role| role["role"] == "management_surface")
-        .flat_map(|role| role["operations"].as_array().into_iter().flatten())
-        .filter_map(|op| op["name"].as_str().map(str::to_string))
-        .collect()
 }
 
 #[cfg(test)]
@@ -601,27 +567,5 @@ mod tests {
         // is pinned here so a regression to the old name reddens a test by name instead
         // of surfacing as a silent quota-signal outage.
         assert_eq!(QUOTA_MODULE_ID, "insula");
-    }
-}
-
-#[cfg(test)]
-mod operation_discovery_tests {
-    use super::*;
-
-    #[test]
-    fn catalog_discovers_only_registered_management_operations() {
-        // Obtain provider roles through the protocol's manifest serializer, the
-        // same serialization used for the roles in daemon catalog entries.
-        let manifest = serde_json::to_value(crate::manifest("astrocyte")).unwrap();
-        let mut catalog = serde_json::json!({"op":"catalog.list","modules":[{"module_id":"astrocyte","roles":manifest["provides"]}]});
-        let ops = management_operation_names(&catalog, "astrocyte");
-        assert!(ops.contains("route.select"));
-        assert!(!ops.contains("spend.multiplier.pace"));
-        catalog["modules"][0]["roles"][0]["operations"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({"name":"spend.multiplier.pace","kind":"query"}));
-        assert!(management_operation_names(&catalog, "astrocyte").contains("spend.multiplier.pace"));
-        assert!(management_operation_names(&catalog, "absent").is_empty());
     }
 }

@@ -244,7 +244,7 @@ pub fn assess_reading(
             });
         }
     }
-    // Both head reserve and worker admission may use last-good for less than
+    // Both subscription budgeting and worker admission may use last-good for less than
     // 30 minutes from fetchedAt, never from stale.since or local receipt time.
     // Stale is a disclosure, not unknown quota; unrecognized classes still fail closed.
     let mut freshness_policy = policy.clone();

@@ -1180,14 +1180,13 @@ fn decision_rejections_retain_subscription_reserve_numbers_ahead_of_catalog_tail
     let store = rig.open();
     let pool = SubscriptionPool {
         provider: "openai".into(),
-        keep_free_percent: 0.0,
+        keep_free_percent: 20.0,
         plans: vec![SubscriptionPlan {
             tier: Some("pro_100".into()),
             fee_usd: 100.0,
             fusiform_multiplier: None,
-            head_points_per_hour: Some(1.0879052957757225),
             accounts: vec![QuotaAccount {
-                weekly_used: 10.0,
+                weekly_used: 81.0,
                 weekly_remaining_fraction: 0.99,
                 hours_to_reset: 166.74457583333333,
                 short_walled: false,
@@ -1198,16 +1197,13 @@ fn decision_rejections_retain_subscription_reserve_numbers_ahead_of_catalog_tail
         }],
         ..Default::default()
     };
-    let detail = pool.reserve_diagnostic(0.0, false);
+    let detail = pool.reserve_diagnostic(20.0, false);
     let numbers: serde_json::Value = serde_json::from_str(&detail).unwrap();
     assert_eq!(numbers["pool"], "openai");
     assert_eq!(numbers["unit"], "weekly_percentage_points_per_account");
-    assert_eq!(numbers["plans"][0]["headroomPoints"], 90.0);
-    assert_eq!(numbers["plans"][0]["keepFreePoints"], 0.0);
-    assert!(
-        (numbers["plans"][0]["headReservePoints"].as_f64().unwrap() - 181.40230709095988).abs()
-            < 1e-9
-    );
+    assert_eq!(numbers["plans"][0]["headroomPoints"], 19.0);
+    assert_eq!(numbers["plans"][0]["keepFreePoints"], 19.0);
+    assert_eq!(numbers["plans"][0]["availablePoints"], 0.0);
     let reserve = serde_json::json!({"routeKey":"openai/gpt-6.1-sol", "reason":"subscription_reserve", "detail":detail});
     let mut rejected: Vec<_> = (0..12)
         .map(|i| {

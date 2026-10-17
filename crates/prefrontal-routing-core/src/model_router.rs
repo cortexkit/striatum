@@ -121,7 +121,7 @@ pub(crate) fn capability_rejection_reason(
 /// subscription-policy coverage; a resolved quota-proxy billing plane also
 /// establishes coverage independently of the launching host's auth metadata.
 /// Covered routes use subscription economics when a runtime pool is available,
-/// including the head reserve for workers, rather than treating quota as free.
+/// including the fixed keep-free margin for workers, rather than treating quota as free.
 pub struct SelectModelRouteInput<'a> {
     pub target_agent: String,
     pub requirements: ModelRequirements,
@@ -437,7 +437,7 @@ impl NoRouteError {
             .collect()
     }
 
-    /// Report every reason selection is blocked. A head reserve or operator
+    /// Report every reason selection is blocked. A keep-free margin or operator
     /// exclusion can still prevent selection after a quota/cooldown wall expires.
     pub fn refusal_message(&self) -> String {
         if self.reason != RouteFailureReason::QuotaOrCooldownExhausted {
@@ -450,7 +450,7 @@ impl NoRouteError {
                 let label = match group.reason.as_str() {
                     "excluded_by_operator" => "excluded by operator",
                     "explicit_only_provider" => "admitted only when pinned by name",
-                    "subscription_reserve" => "reserved for heads",
+                    "subscription_reserve" => "below keep-free margin",
                     "quota_exhausted" => "out of credit",
                     "excluded" => "excluded for this item/caller",
                     "cooldown_active" => "cooldown active",
@@ -465,24 +465,7 @@ impl NoRouteError {
                         .next()
                         .unwrap_or(&route.route_key);
                     let mut detail = provider.to_string();
-                    if group.reason == "subscription_reserve" {
-                        if let Some(hours) = route
-                            .detail
-                            .as_deref()
-                            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                            .and_then(|value| {
-                                value["plans"].as_array().map(|plans| {
-                                    plans
-                                        .iter()
-                                        .filter_map(|plan| plan["resetHorizonHours"].as_f64())
-                                        .fold(0.0_f64, f64::max)
-                                })
-                            })
-                            .filter(|hours| *hours > 0.0)
-                        {
-                            detail.push_str(&format!(", until weekly reset in {hours:.0} h"));
-                        }
-                    } else if let Some(raw) = &route.detail {
+                    if let Some(raw) = &route.detail {
                         if let Some(until) = raw
                             .split("until_ms=")
                             .nth(1)
@@ -1063,7 +1046,7 @@ pub(crate) fn subscription_budget_available(runtime: &RouteRuntimeState, head: b
 
 /// A quota-proxy billing plane identifies the subscription credential that
 /// actually serves the route. A launching host's missing OAuth metadata must
-/// not turn that shared quota into metered capacity and bypass the head reserve.
+/// not turn that shared quota into metered capacity and bypass the keep-free margin.
 /// The policy predicate still covers subscriptions without a resolved plane.
 pub(crate) fn subscription_route_covered(
     route: &ModelRoute,

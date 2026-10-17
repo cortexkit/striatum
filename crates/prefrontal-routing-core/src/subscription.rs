@@ -1,9 +1,7 @@
 //! Subscription economics in pooled percentage points (one account-window percent).
 //! This module consumes snapshots only; selection never calls a quota service.
 
-use crate::model_resolution::map_agent_to_workload_class;
 use serde::Serialize;
-use std::collections::BTreeMap;
 
 pub const ASTRO_MAX_AGE_MS: i64 = 48 * 60 * 60 * 1000;
 pub const DEFAULT_PLAN_FEE_USD: f64 = 200.0;
@@ -26,26 +24,6 @@ pub struct SubscriptionPool {
     /// False while another available subscription plan has live, unreserved quota.
     pub allow_banked: bool,
     pub now_ms: i64,
-    /// How the provider-wide head pace was assembled from usage per work class.
-    /// Kept only so the reserve diagnostic can show what was counted and what
-    /// was left out; admission arithmetic reads each plan's share instead.
-    pub head_pace: Option<HeadPaceBreakdown>,
-}
-
-/// Provider-wide head demand split by the work class each usage event carried,
-/// in pooled points per hour over the measured window. Usage from classes that
-/// `is_delegated_role` names (workers, readers, reviewers) is reported
-/// separately and is not part of `head_points_per_hour`. Every other class
-/// counts as head demand, including unknown names and usage without a class
-/// (kept under the `unlabelled` key): such usage may come from a person's own
-/// session, and under-reserving for heads is the harmful direction.
-#[derive(Debug, Clone, PartialEq, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HeadPaceBreakdown {
-    pub window_hours: u32,
-    pub head_points_per_hour: f64,
-    pub head_by_work_class: BTreeMap<String, f64>,
-    pub excluded_worker_points_per_hour: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,9 +32,6 @@ pub struct SubscriptionPlan {
     pub fee_usd: f64,
     pub fusiform_multiplier: Option<f64>,
     pub accounts: Vec<QuotaAccount>,
-    /// This tier's share of provider-wide head demand in pooled points per hour.
-    /// Shares across the provider's tiers must sum to the measured provider pace.
-    pub head_points_per_hour: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,32 +55,6 @@ pub struct QuotaConstraint {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ReserveStep {
-    pub hours_from_now: f64,
-    pub phase: &'static str,
-    pub restored_headroom_points: f64,
-    pub headroom_points: f64,
-    pub keep_free_points: f64,
-    pub banked_points: f64,
-    pub projected_head_points: f64,
-    /// Signed budget before the admission floor, so deficits remain visible.
-    pub unreserved_points: f64,
-    pub available_points: f64,
-}
-
-struct ReserveProjection {
-    steps: Vec<ReserveStep>,
-    tightest_index: usize,
-}
-
-impl ReserveProjection {
-    fn tightest(&self) -> &ReserveStep {
-        &self.steps[self.tightest_index]
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SubscriptionPricing {
     pub value_per_point_usd: f64,
     pub value_source: String,
@@ -115,60 +64,9 @@ pub struct SubscriptionPricing {
     pub fee_per_point_usd: f64,
     pub plan_pressure: f64,
     pub keep_free_percent: f64,
-    /// Full-horizon demand; reset credits are included in available_points.
-    pub head_reserve_points: Option<f64>,
     pub available_points: Option<f64>,
-    pub head_reserve_steps: Option<Vec<ReserveStep>>,
-    pub tightest_point: Option<ReserveStep>,
     pub banked_resets_applied: u32,
     pub plan_tier: Option<String>,
-}
-
-/// Delegated role families that `map_agent_to_workload_class` does not cover.
-/// Each entry matches the name itself or any name continuing it after a
-/// separator, so `athena` covers `athena.panel_member` and `athena-panel`.
-/// The dotted names follow core's role inventory (`persona::role::inventory`).
-const DELEGATED_ROLE_FAMILIES: &[&str] = &[
-    "consult",
-    "athena",
-    "spec",
-    "comment.reviewer",
-    "wake.author",
-    "mint.planner",
-    // Background Claude Code sessions the harness module launches for delegated
-    // work. A user-launched Claude Code session is not one of these and stays a
-    // possible head.
-    "claude.code.worker",
-];
-
-/// True for agent or work-class names that only ever run delegated work:
-/// workers, readers, reviewers and panel members started on someone's behalf.
-/// Mason, explore, librarian and every sidekick lane come from routing's
-/// workload mapping (`map_agent_to_workload_class`: `ephemeral` or `gather`);
-/// the remaining families are listed in `DELEGATED_ROLE_FAMILIES`. Matching
-/// ignores case and treats `-`, `_` and spaces like `.`, because hosts spell
-/// the same role differently (`comment-reviewer`, `comment.reviewer`).
-///
-/// Anything not recognized returns false. Callers that protect head quota
-/// rely on that: an unknown name is treated as a possible head.
-pub fn is_delegated_role(name: &str) -> bool {
-    if matches!(
-        map_agent_to_workload_class(name),
-        Some("ephemeral" | "gather")
-    ) {
-        return true;
-    }
-    let normalized: String = name
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if matches!(c, '-' | '_' | ' ') { '.' } else { c })
-        .collect();
-    DELEGATED_ROLE_FAMILIES.iter().any(|family| {
-        normalized
-            .strip_prefix(family)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
-    })
 }
 
 pub fn is_head(agent: &str) -> bool {
@@ -217,100 +115,15 @@ pub fn plan_pressure(remaining_fraction: f64, headroom_share: f64) -> f64 {
 }
 
 impl SubscriptionPlan {
-    fn reserve_projection(
-        &self,
-        margin: f64,
-        pace: f64,
-        horizon_hours: f64,
-        banked_points: f64,
-    ) -> ReserveProjection {
-        let mut headroom: f64 = self
-            .accounts
-            .iter()
-            .filter(|a| !a.short_walled)
-            .map(|a| (100.0 - a.weekly_used).max(0.0))
-            .sum();
-        let mut after_margin: f64 = self
-            .accounts
-            .iter()
-            .filter(|a| !a.short_walled)
-            .map(|a| (100.0 - a.weekly_used - margin).max(0.0))
-            .sum();
-        let mut restored = 0.0;
-        let mut steps = Vec::new();
-        let mut record = |hours, phase, headroom, after_margin, restored| {
-            let projected = pace.max(0.0) * hours;
-            let unreserved: f64 = after_margin + banked_points - projected;
-            steps.push(ReserveStep {
-                hours_from_now: hours,
-                phase,
-                restored_headroom_points: restored,
-                headroom_points: headroom,
-                keep_free_points: headroom - after_margin,
-                banked_points,
-                projected_head_points: projected,
-                unreserved_points: unreserved,
-                available_points: unreserved.max(0.0),
-            });
-        };
-        record(0.0, "now", headroom, after_margin, restored);
-        let mut resets: Vec<_> = self
-            .accounts
-            .iter()
-            .filter(|a| {
-                // A weekly reset cannot clear a separate short-window wall.
-                !a.short_walled && a.hours_to_reset > 0.0 && a.hours_to_reset <= horizon_hours
-            })
-            .collect();
-        resets.sort_by(|a, b| a.hours_to_reset.total_cmp(&b.hours_to_reset));
-        let mut index = 0;
-        while index < resets.len() {
-            let hours = resets[index].hours_to_reset;
-            // Demand accumulates before capacity returns. Checking only after a
-            // reset would allow workers to spend quota needed to reach that reset.
-            record(hours, "before_reset", headroom, after_margin, restored);
-            while index < resets.len() && resets[index].hours_to_reset == hours {
-                let account = resets[index];
-                let current = (100.0 - account.weekly_used).max(0.0);
-                let current_after_margin = (current - margin).max(0.0);
-                let returned = 100.0 - current;
-                headroom += returned;
-                restored += returned;
-                // Preserve the per-account margin: a walled account adds no
-                // quota now and adds only 100 minus its margin when it resets.
-                after_margin += (100.0 - margin).max(0.0) - current_after_margin;
-                index += 1;
-            }
-            record(hours, "after_reset", headroom, after_margin, restored);
-        }
-        record(horizon_hours, "horizon", headroom, after_margin, restored);
-        let tightest_index = steps
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.unreserved_points.total_cmp(&b.unreserved_points))
-            .map(|(index, _)| index)
-            .unwrap();
-        ReserveProjection {
-            steps,
-            tightest_index,
-        }
-    }
-
     fn budget(
         &self,
         keep_free: f64,
         head: bool,
         allow_banked: bool,
         now_ms: i64,
-    ) -> (
-        Option<f64>,
-        f64,
-        Option<f64>,
-        u32,
-        Option<ReserveProjection>,
-    ) {
+    ) -> (Option<f64>, f64, u32) {
         if self.accounts.is_empty() {
-            return (None, 1.0, None, 0, None);
+            return (None, 1.0, 0);
         }
         let margin = if head { 0.0 } else { keep_free };
         let live: Vec<_> = self
@@ -322,20 +135,7 @@ impl SubscriptionPlan {
             .iter()
             .map(|a| (100.0 - a.weekly_used - margin).max(0.0))
             .sum();
-        let hours = self
-            .accounts
-            .iter()
-            .map(|a| a.hours_to_reset)
-            .fold(0.0, f64::max);
-        let reserve = self
-            .head_points_per_hour
-            .map(|pace| if head { 0.0 } else { pace.max(0.0) * hours });
-        let mut projection = (!head).then(|| {
-            self.reserve_projection(margin, self.head_points_per_hour.unwrap_or(0.0), hours, 0.0)
-        });
-        let mut points = projection
-            .as_ref()
-            .map_or(live_points, |p| p.tightest().available_points);
+        let mut points = live_points;
         // Keep paid capacity fixed as accounts wall. Dropping a walled account
         // from the denominator would make the remaining pool suddenly cheaper.
         let capacity = (self.accounts.len().max(1) * 100) as f64;
@@ -361,22 +161,7 @@ impl SubscriptionPlan {
                 .collect();
             reserves.sort_by_key(|a| a.banked_expires_at_ms.unwrap_or(i64::MAX));
             if let Some(account) = reserves.first() {
-                // One saved reset supplies 100 points minus the account margin
-                // immediately. Include that same credit at every reset-event
-                // checkpoint, subtracting the single pooled head demand once.
-                projection = (!head).then(|| {
-                    self.reserve_projection(
-                        margin,
-                        self.head_points_per_hour.unwrap_or(0.0),
-                        hours,
-                        100.0 - margin,
-                    )
-                });
-                points = projection
-                    .as_ref()
-                    .map_or(live_points + 100.0 - margin, |p| {
-                        p.tightest().available_points
-                    });
+                points = live_points + 100.0 - margin;
                 pressure = plan_pressure(account.weekly_remaining_fraction, points / capacity);
                 banked_applied = 1;
             }
@@ -394,13 +179,7 @@ impl SubscriptionPlan {
             .values()
             .map(|(points, time, count)| plan_pressure(*time, points / (*count as f64 * 100.0)))
             .fold(0.0, f64::max);
-        (
-            Some(points),
-            pressure.max(short),
-            reserve,
-            banked_applied,
-            projection,
-        )
+        (Some(points), pressure.max(short), banked_applied)
     }
 
     pub fn has_free_headroom(&self, keep_free: f64, head: bool, now_ms: i64) -> bool {
@@ -421,7 +200,7 @@ impl SubscriptionPool {
             let after_margin: f64 = plan.accounts.iter()
                 .filter(|a| !a.short_walled)
                 .map(|a| (100.0 - a.weekly_used - margin).max(0.0)).sum();
-            let (available, _, reserve, banked, projection) = plan.budget(
+            let (available, _, banked) = plan.budget(
                 keep_free, head, self.banked_for(index, keep_free, head), self.now_ms);
             serde_json::json!({
                 "tier": plan.tier,
@@ -430,20 +209,15 @@ impl SubscriptionPool {
                 "headroomPoints": headroom,
                 "keepFreePercentPerAccount": margin,
                 "keepFreePoints": headroom - after_margin,
-                "headPointsPerHour": plan.head_points_per_hour,
-                "headReservePoints": reserve,
                 "availablePoints": available,
                 "bankedResetsApplied": banked,
-                "resetHorizonHours": plan.accounts.iter().map(|a| a.hours_to_reset).fold(0.0, f64::max),
-                "headReserveSteps": projection.as_ref().map(|p| &p.steps),
-                "tightestPoint": projection.as_ref().map(|p| p.tightest()),
             })
         }).collect();
         serde_json::json!({
             "pool": self.provider,
             "unit": "weekly_percentage_points_per_account",
             "aggregation": "sum_within_tier",
-            "headPace": self.head_pace,
+            "rule": "workers may spend only live quota above the per-account keep-free margin; subscription_reserve means no account has quota above that margin",
             "plans": plans,
         })
         .to_string()
@@ -485,7 +259,7 @@ impl SubscriptionPool {
             .iter()
             .enumerate()
             .filter_map(|(index, plan)| {
-                let (points, pressure, reserve, banked, projection) = plan.budget(
+                let (points, pressure, banked) = plan.budget(
                     keep_free,
                     head,
                     self.banked_for(index, keep_free, head),
@@ -511,10 +285,7 @@ impl SubscriptionPool {
                     fee_per_point_usd: fee,
                     plan_pressure: pressure,
                     keep_free_percent: if head { 0.0 } else { keep_free },
-                    head_reserve_points: reserve,
                     available_points: points,
-                    tightest_point: projection.as_ref().map(|p| p.tightest().clone()),
-                    head_reserve_steps: projection.map(|p| p.steps),
                     banked_resets_applied: banked,
                     plan_tier: plan.tier.clone(),
                 })
@@ -529,62 +300,15 @@ impl SubscriptionPricing {
     }
 
     pub fn explanation(&self) -> String {
-        format!("subscription value ${:.4}/point ({}); {} {:.6} pooled points; plan pressure {:.4}; keep-free margin {:.1}%; {}; banked resets applied {}",
+        format!("subscription value ${:.4}/point ({}); {} {:.6} pooled points; plan pressure {:.4}; keep-free margin {:.1}%; banked resets applied {}",
             self.value_per_point_usd, self.value_source, self.price_unit, self.message_points, self.plan_pressure,
-            self.keep_free_percent, self.head_reserve_points.map_or_else(|| "head reserve unavailable".into(), |p| format!("head demand {p:.4} points projected across resets")), self.banked_resets_applied)
+            self.keep_free_percent, self.banked_resets_applied)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn delegated_roles_are_known_workers_and_everything_else_is_not() {
-        for role in [
-            "mason",
-            "Mason",
-            "explore",
-            "librarian",
-            "sidekick",
-            "sidekick.reader.answer",
-            "sidekick-research",
-            "consult",
-            "athena",
-            "athena-panel",
-            "athena.panel_member",
-            "spec.aggregator",
-            "spec-member",
-            "comment.reviewer",
-            "comment-reviewer",
-            "wake.author",
-            "wake_author",
-            "mint.planner",
-            "claude-code-worker",
-            "claude_code_worker",
-        ] {
-            assert!(is_delegated_role(role), "{role} is delegated work");
-        }
-        // Heads, OpenCode's built-in interactive agents, unlabelled usage and
-        // unknown names are not delegated, nor are names that merely share a
-        // prefix with a delegated family.
-        for name in [
-            "Alfonso",
-            "build",
-            "plan",
-            "pi",
-            "unlabelled",
-            "",
-            "night-shift",
-            "specialist",
-            "comment",
-            "consultant",
-            "claude-code",
-            "claude",
-        ] {
-            assert!(!is_delegated_role(name), "{name} may be a head");
-        }
-    }
 
     #[test]
     fn value_precedence_override_fresh_stale_and_absent() {
@@ -636,7 +360,6 @@ mod tests {
             tier: Some("pro_200".into()),
             fee_usd: 200.0,
             fusiform_multiplier: None,
-            head_points_per_hour: None,
             accounts: vec![QuotaAccount {
                 weekly_used: used,
                 weekly_remaining_fraction: 0.5,
@@ -652,101 +375,48 @@ mod tests {
     #[test]
     fn banked_resets_only_near_wall_without_another_free_plan() {
         let p = plan(73.0);
-        assert_eq!(p.budget(0.0, false, true, 1).3, 0);
+        assert_eq!(p.budget(0.0, false, true, 1).2, 0);
         let p = plan(95.0);
         let ordinary = p.budget(0.0, false, false, 1);
         let banked = p.budget(0.0, false, true, 1);
-        assert_eq!(ordinary.3, 0);
-        assert_eq!(banked.3, 1);
+        assert_eq!(ordinary.2, 0);
+        assert_eq!(banked.2, 1);
         assert!(banked.1 < ordinary.1);
         assert_eq!(p.budget(100.0, false, true, 1).0, Some(0.0));
-        assert_eq!(p.budget(0.0, false, true, 10_001).3, 0);
+        assert_eq!(p.budget(0.0, false, true, 10_001).2, 0);
     }
 
     #[test]
-    fn head_reserve_is_projected_until_reset_and_heads_ignore_it() {
-        let mut p = plan(75.0);
-        p.head_points_per_hour = Some(0.1);
-        let worker = p.budget(20.0, false, false, 1);
-        assert_eq!(worker.0, Some(0.0));
-        assert_eq!(worker.2, Some(8.4));
-        assert_eq!(p.budget(20.0, true, false, 1).0, Some(25.0));
+    fn fixed_margin_is_the_only_worker_reservation() {
+        let mut p = plan(0.0);
+        p.accounts = [100.0, 97.0, 3.0, 27.0, 17.0]
+            .into_iter()
+            .map(|used| plan(used).accounts.remove(0))
+            .collect();
+        assert_eq!(p.budget(0.0, false, false, 1).0, Some(256.0));
+        assert_eq!(p.budget(10.0, false, false, 1).0, Some(223.0));
+        assert_eq!(p.budget(20.0, false, false, 1).0, Some(193.0));
+        assert_eq!(p.budget(100.0, false, false, 1).0, Some(0.0));
+        assert_eq!(p.budget(20.0, true, false, 1).0, Some(256.0));
     }
 
     #[test]
-    fn banked_reset_subtracts_head_demand_once_from_combined_headroom() {
-        let mut p = plan(95.0);
-        p.head_points_per_hour = Some(1.2);
-        let worker = p.budget(0.0, false, true, 1);
-        assert_eq!(worker.3, 1);
-        assert!((worker.0.unwrap() - 4.2).abs() < 1e-12);
-        assert!((worker.2.unwrap() - 100.8).abs() < 1e-12);
-    }
-
-    #[test]
-    fn tightest_point_after_an_earlier_reset_still_blocks_workers() {
-        let mut p = plan(20.0);
-        p.accounts[0].hours_to_reset = 10.0;
-        let mut walled = plan(100.0).accounts.remove(0);
-        walled.hours_to_reset = 80.0;
-        p.accounts.push(walled);
-        p.head_points_per_hour = Some(3.0);
-        // Start with 60 spendable points. Before the first reset: 60 - 30 = 30.
-        // It returns only the 20 already spent, not another full account: at
-        // hour 80 the budget is 60 + 20 - 240 = -160, so workers must refuse.
-        let worker = p.budget(20.0, false, false, 1);
-        assert_eq!(worker.0, Some(0.0));
-        let tightest = worker.4.as_ref().unwrap().tightest();
-        assert_eq!(tightest.hours_from_now, 80.0);
-        assert_eq!(tightest.phase, "before_reset");
-        assert_eq!(tightest.restored_headroom_points, 20.0);
-        assert_eq!(tightest.unreserved_points, -160.0);
-        let head = p.budget(20.0, true, false, 1);
-        assert_eq!(head.0, Some(80.0));
-        assert_eq!(head.2, Some(0.0));
-    }
-
-    #[test]
-    fn walled_accounts_do_not_supply_capacity_before_resets_beyond_horizon() {
-        let mut p = plan(100.0);
-        p.head_points_per_hour = Some(1.0);
-        p.accounts[0].banked_resets = 0;
-        let projection = p.reserve_projection(20.0, 1.0, 24.0, 0.0);
-        assert_eq!(projection.steps.len(), 2);
-        assert_eq!(projection.tightest().restored_headroom_points, 0.0);
-        assert_eq!(projection.tightest().available_points, 0.0);
-        assert_eq!(p.budget(20.0, false, false, 1).0, Some(0.0));
-        // Heads do not reserve against themselves, but a real quota wall still
-        // requires a reset. The existing saved-reset allowance restores access.
-        assert_eq!(p.budget(20.0, true, false, 1).2, Some(0.0));
-        p.accounts[0].banked_resets = 1;
-        assert_eq!(p.budget(20.0, true, true, 1).0, Some(100.0));
-    }
-
-    #[test]
-    fn banked_credit_is_carried_once_through_the_unclamped_reset_walk() {
-        let mut p = plan(20.0);
-        p.accounts[0].hours_to_reset = 10.0;
+    fn fixed_margin_blocks_workers_at_boundary() {
+        let mut p = plan(80.0);
         p.accounts.push(plan(100.0).accounts.remove(0));
-        p.accounts[1].hours_to_reset = 80.0;
-        p.head_points_per_hour = Some(3.0);
-        let worker = p.budget(20.0, false, true, 1);
-        // The tightest raw budget is -160; one saved reset adds 80, which is
-        // still insufficient. Adding 80 to the clamped zero would admit workers.
-        assert_eq!(worker.3, 1);
-        assert_eq!(worker.0, Some(0.0));
-        let tightest = worker.4.as_ref().unwrap().tightest();
-        assert_eq!(tightest.banked_points, 80.0);
-        assert_eq!(tightest.unreserved_points, -80.0);
+        assert_eq!(p.budget(20.0, false, false, 1).0, Some(0.0));
+        assert_eq!(p.budget(20.0, true, false, 1).0, Some(20.0));
+        assert_eq!(p.budget(0.0, false, false, 1).0, Some(20.0));
     }
 
     #[test]
-    fn weekly_resets_never_credit_short_walled_accounts() {
-        let mut p = plan(100.0);
+    fn short_walled_accounts_supply_neither_live_nor_banked_headroom() {
+        let mut p = plan(95.0);
         p.accounts[0].short_walled = true;
-        let projection = p.reserve_projection(20.0, 1.0, 100.0, 0.0);
-        assert_eq!(projection.steps.len(), 2);
-        assert_eq!(projection.tightest().restored_headroom_points, 0.0);
-        assert_eq!(projection.tightest().available_points, 0.0);
+        assert_eq!(p.budget(0.0, false, true, 1).0, Some(0.0));
+        assert_eq!(p.budget(0.0, false, true, 1).2, 0);
+        p.accounts[0].short_walled = false;
+        assert_eq!(p.budget(0.0, false, true, 1).0, Some(105.0));
+        assert_eq!(p.budget(0.0, false, true, 1).2, 1);
     }
 }
