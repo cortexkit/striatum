@@ -870,7 +870,7 @@ fn select_panel_admitted(
     let mut selected_families = HashSet::new();
     // The canonical model ids already seated. Two routes of one model (a
     // maker's listing and a reseller's, say) can carry different family labels,
-    // so the family rule alone seated the same weights twice.
+    // so the family rule alone could seat the same weights twice.
     let mut selected_models: HashSet<&str> = HashSet::new();
     let canonical_of = |candidate: &Candidate| {
         context
