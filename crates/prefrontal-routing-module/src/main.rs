@@ -614,6 +614,10 @@ fn open_route_state_store(descriptor: &StorageDescriptor) -> Result<SharedStore,
     Ok(Arc::new(store))
 }
 
+fn check_config_at(path: &Path) -> Result<(), ModuleError> {
+    config_overrides::initialize_config(path).map_err(ModuleError::Message)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ModuleError> {
     // Read the launch nonce before anything else can spawn a process: until
@@ -623,6 +627,7 @@ async fn main() -> Result<(), ModuleError> {
     let _ = subc_os::launch_nonce();
     let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
         StartupMode::PrintManifest => return print_manifest_operations(),
+        StartupMode::CheckConfig => return check_config_at(&config_overrides::config_path()),
         StartupMode::PrintConfigSchema => {
             print!("{}", config_overrides::routing_config_schema());
             return Ok(());
@@ -640,6 +645,7 @@ async fn main() -> Result<(), ModuleError> {
 #[derive(Debug, PartialEq, Eq)]
 enum StartupMode {
     PrintManifest,
+    CheckConfig,
     PrintConfigSchema,
     /// Read Insula once as an ordinary consumer and print the account views it
     /// would produce. Writes no store and consults no vault.
@@ -709,8 +715,7 @@ impl ModuleConfig {
 }
 
 async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
-    config_overrides::initialize_config(&config_overrides::config_path())
-        .map_err(ModuleError::Message)?;
+    check_config_at(&config_overrides::config_path())?;
     runtime_lag::RuntimeLagProbe::default().start("routing runtime");
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
@@ -5591,6 +5596,15 @@ fn parse_startup_mode(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<StartupMode, ModuleError> {
     let args = args.into_iter().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--check-config") {
+        return if args.as_slice() == [OsString::from("--check-config")] {
+            Ok(StartupMode::CheckConfig)
+        } else {
+            Err(ModuleError::Message(
+                "--check-config must be used without other arguments".into(),
+            ))
+        };
+    }
     if args.as_slice() == [OsString::from("--print-config-schema")] {
         return Ok(StartupMode::PrintConfigSchema);
     }
@@ -5676,6 +5690,31 @@ mod tests {
     use prefrontal_routing_core::{FactSource, NativeUsageFacts, UsageObservation};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn config_check_uses_startup_loader_and_refuses_renamed_or_unknown_config() {
+        assert_eq!(
+            parse_startup_mode([OsString::from("--check-config")]).unwrap(),
+            StartupMode::CheckConfig
+        );
+        assert!(
+            parse_startup_mode([OsString::from("--check-config"), OsString::from("--subc=x")])
+                .is_err()
+        );
+        let scratch = prefrontal_test_support::ScratchDir::new("routing-config-check");
+        let path = scratch.join("prefrontal-routing.jsonc");
+        check_config_at(&path).unwrap();
+        let renamed = prefrontal_test_support::ScratchDir::new("routing-config-check-renamed");
+        std::fs::write(renamed.join("alfonso-routing.jsonc"), "{}").unwrap();
+        assert!(check_config_at(&renamed.join("prefrontal-routing.jsonc"))
+            .unwrap_err()
+            .to_string()
+            .contains("config_renamed"));
+        let invalid = prefrontal_test_support::ScratchDir::new("routing-config-check-invalid");
+        let invalid_path = invalid.join("prefrontal-routing.jsonc");
+        std::fs::write(&invalid_path, "{\"not_a_routing_setting\":true}").unwrap();
+        assert!(check_config_at(&invalid_path).is_err());
+    }
 
     #[test]
     fn record_cooldown_persists_typed_billing_and_quota_wall_classes() {
