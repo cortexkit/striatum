@@ -22,8 +22,8 @@ use std::{path::PathBuf, process::Stdio, time::Duration};
 use prefrontal_test_support::TestDaemon as Child;
 use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandle, ModuleHandler, RequestCtx};
 use subc_protocol::manifest::{
-    Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
-    TrustTier,
+    Concurrency, ExecutionMode, ManagementOperation, ManagementOperationKind, ModuleManifest,
+    ProviderRole, Tool, TrustTier,
 };
 
 use common::{
@@ -42,6 +42,147 @@ struct RealDaemon {
     data_home: PathBuf,
     _credentials: ModuleHandle,
     credential_service: tokio::task::JoinHandle<()>,
+    _catalog: ModuleHandle,
+    catalog_service: tokio::task::JoinHandle<()>,
+}
+
+struct FusiformCatalog;
+
+const FIXTURE_PROVIDERS: &[&str] = &["anthropic", "openai", "xai", "ollama-cloud"];
+
+impl FusiformCatalog {
+    fn seed_models() -> serde_json::Value {
+        let mut models = serde_json::Map::new();
+        for fact in prefrontal_routing_core::model_facts_seed() {
+            let mut model = serde_json::json!({
+                "existence":"present", "limit.context":fact.context_window.map(|n| n as u64),
+                "limit.output":fact.max_output_tokens, "capability.attachment":fact.supports_vision,
+                "capability.tool_call":fact.supports_tool_use,
+            });
+            if let Some(cost) = fact.cost_per_m_tok_out {
+                model["rate.output"] = serde_json::json!({
+                    "state":"priced", "currency":"USD", "units":(cost * 1_000_000_000.0).round() as i64, "exponent":9,
+                });
+            }
+            models.insert(format!("{}/{}", fact.provider_id, fact.model_id), model);
+        }
+        serde_json::Value::Object(models)
+    }
+
+    fn reply(request: &serde_json::Value) -> serde_json::Value {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/catalog-paged.json")).unwrap();
+        let mut page = golden["response"].clone();
+        match request["name"].as_str().unwrap() {
+            "catalog.get" => {
+                if request["arguments"].get("auth_method").is_some() {
+                    let provider = request["arguments"]["provider_id"].as_str().unwrap();
+                    assert!(FIXTURE_PROVIDERS.contains(&provider));
+                    assert_eq!(
+                        request["arguments"],
+                        serde_json::json!({"include_retired":true,"provider_id":provider,"auth_method":"apikey"})
+                    );
+                    // No credential-specific rates are served here. no_coverage
+                    // lets API-key routes use the catalog's ordinary model prices.
+                    return serde_json::json!({"code":"no_coverage","message":"No billing plane declared in the seed fixture"});
+                }
+                let token = request["arguments"]["page_token"].as_str();
+                let mut expected = serde_json::json!({"include_retired":true,"paged":true});
+                if let Some(token) = token {
+                    assert_eq!(token, page["next_page_token"].as_str().unwrap());
+                    expected["page_token"] = serde_json::json!(token);
+                    // Serve the seed's prices for selection. The first page's
+                    // 000-page/m must not repeat: the client rejects duplicate models.
+                    page["models"] = Self::seed_models();
+                    page.as_object_mut().unwrap().remove("next_page_token");
+                }
+                assert_eq!(request["arguments"], expected);
+                serde_json::json!({"result":page})
+            }
+            "catalog.status" => {
+                assert_eq!(request["arguments"], serde_json::json!({"polls":1}));
+                serde_json::json!({"result":{"catalog_version":page["catalog_version"]}})
+            }
+            other => panic!("unexpected Fusiform fixture tool: {other}"),
+        }
+    }
+}
+
+#[async_trait]
+impl ModuleHandler for FusiformCatalog {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        let request = serde_json::from_slice(&body).unwrap();
+        HandlerOutcome::Response(serde_json::to_vec(&Self::reply(&request)).unwrap())
+    }
+}
+
+async fn serve_fusiform_catalog(
+    connection_file: &std::path::Path,
+) -> (ModuleHandle, tokio::task::JoinHandle<()>) {
+    let tools = ["catalog.get", "catalog.status"]
+        .into_iter()
+        .map(|name| Tool {
+            name: name.into(),
+            description: None,
+            execution_mode: ExecutionMode::Pure,
+            schema: serde_json::json!({"type":"object"}),
+        })
+        .collect();
+    let manifest = ModuleManifest::builder("fusiform", "0.0.0")
+        .trust_tier(Some(TrustTier::FirstParty))
+        .protocol_ver(subc_protocol::PROTOCOL_VERSION)
+        .provides(vec![ProviderRole::ToolProvider {
+            tools,
+            identity_scope: Vec::new(),
+            concurrency: Concurrency::ModuleManaged,
+            emits_push: false,
+            sub_supervises: false,
+        }])
+        .build();
+    let (handle, serving) =
+        subc_client_rs::serve_with_handle(connection_file, manifest, FusiformCatalog)
+            .await
+            .expect("register fixture Fusiform catalog");
+    (
+        handle,
+        tokio::spawn(async move {
+            serving.await.expect("serve fixture Fusiform catalog");
+        }),
+    )
+}
+
+#[test]
+fn fusiform_fixture_serves_pinned_first_page_and_terminal_continuation() {
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("../../fixtures/catalog-paged.json")).unwrap();
+    let mut request =
+        serde_json::json!({"name":"catalog.get","arguments":{"include_retired":true,"paged":true}});
+    let first = FusiformCatalog::reply(&request);
+    assert_eq!(first["result"], golden["response"]);
+    request["arguments"]["page_token"] = first["result"]["next_page_token"].clone();
+    let last = FusiformCatalog::reply(&request);
+    assert!(last["result"].get("next_page_token").is_none());
+    assert!(last["result"]["models"].get("000-page/m").is_none());
+    assert_eq!(
+        last["result"]["models"]["anthropic/claude-opus-4-8"]["rate.output"]["units"],
+        25_000_000_000_i64
+    );
+    assert_eq!(
+        last["result"]["resolved_at_ms"],
+        first["result"]["resolved_at_ms"]
+    );
+    assert_eq!(
+        FusiformCatalog::reply(
+            &serde_json::json!({"name":"catalog.status","arguments":{"polls":1}})
+        )["result"]["catalog_version"],
+        first["result"]["catalog_version"]
+    );
+    assert_eq!(
+        FusiformCatalog::reply(
+            &serde_json::json!({"name":"catalog.get","arguments":{"include_retired":true,"provider_id":"anthropic","auth_method":"apikey"}})
+        )["code"],
+        "no_coverage"
+    );
 }
 
 struct CredentialMetadata;
@@ -52,20 +193,22 @@ impl ModuleHandler for CredentialMetadata {
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(request["method"], "credential.list_scoped");
         assert_eq!(request["params"], serde_json::json!({}));
+        let credentials: Vec<_> = FIXTURE_PROVIDERS
+            .iter()
+            .map(|provider| {
+                serde_json::json!({
+                    "id":format!("api:{provider}:routing-health-fixture"),
+                    "categories":["llm-provider"], "type":"api_key",
+                    "serves":[provider], "provider_ids":[provider], "state":"active",
+                    "record_version":1, "operations":["get"],
+                })
+            })
+            .collect();
         HandlerOutcome::Response(
             serde_json::to_vec(&serde_json::json!({
                 "result": {
                     "view": "routing-health-fixture-v1",
-                    "credentials": [{
-                        "id": "api:anthropic:routing-health-fixture",
-                        "categories": ["llm-provider"],
-                        "type": "api_key",
-                        "serves": ["anthropic"],
-                        "provider_ids": ["anthropic"],
-                        "state": "active",
-                        "record_version": 1,
-                        "operations": ["get"]
-                    }]
+                    "credentials": credentials
                 }
             }))
             .unwrap(),
@@ -115,6 +258,7 @@ impl RealDaemon {
 impl Drop for RealDaemon {
     fn drop(&mut self) {
         self.credential_service.abort();
+        self.catalog_service.abort();
         self.child.stop();
         let _ = std::fs::remove_dir_all(&self.rig);
     }
@@ -175,6 +319,7 @@ async fn start_real_daemon() -> RealDaemon {
     // Routing health requires a scoped credential listing for Broca reachability
     // (the health handler in src/main.rs). Supply metadata, never secret material.
     let (credentials, credential_service) = serve_credential_metadata(&connection_file).await;
+    let (catalog, catalog_service) = serve_fusiform_catalog(&connection_file).await;
     let daemon = RealDaemon {
         child,
         rig,
@@ -182,13 +327,15 @@ async fn start_real_daemon() -> RealDaemon {
         data_home,
         _credentials: credentials,
         credential_service,
+        _catalog: catalog,
+        catalog_service,
     };
     let mut consumer = connect_consumer(&daemon.connection_file).await;
     wait_for_catalog(&mut consumer, "claustrum", SETUP_TIMEOUT).await;
+    wait_for_catalog(&mut consumer, "fusiform", SETUP_TIMEOUT).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
-    // Routing can list credentials before the Claustrum fixture registers.
-    // Restart routing after Claustrum is ready so its first credential poll
-    // succeeds, rather than racing a periodic retry against the setup deadline.
+    // Restart after Claustrum and Fusiform register so the initial credential
+    // and catalog reads succeed instead of waiting for periodic retries.
     let restarted = control_rpc(
         &mut consumer,
         5899,
