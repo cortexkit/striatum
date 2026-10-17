@@ -167,6 +167,16 @@ refusal_case!(
     "config_key_removed: model_routing.explicit_only_providers"
 );
 refusal_case!(
+    removed_account_selection_shadow,
+    r#"{"account_selection":{"enabled":true,"shadow":false}}"#,
+    "config_key_removed: account_selection.shadow; delete it; account selection serves directly"
+);
+refusal_case!(
+    removed_account_selection_shadow_null,
+    r#"{"account_selection":{"shadow":null}}"#,
+    "config_key_removed: account_selection.shadow"
+);
+refusal_case!(
     unknown_root,
     r#"{"surprise":true}"#,
     "unknown field `surprise`"
@@ -554,10 +564,7 @@ fn preserved_keys_and_both_aliases_load_unchanged() {
         assert_eq!(active.catalog_poll_ms(), 12345);
         assert_eq!(
             active.account_flags(),
-            AccountSelectionFlags {
-                enabled: true,
-                shadow: true
-            }
+            AccountSelectionFlags { enabled: true }
         );
         assert_eq!(active.config.model_families.0.len(), 2);
         assert_eq!(active.config.model_families.0[0].family, GrandFamily::Gpt);

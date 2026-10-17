@@ -897,8 +897,8 @@ where
         Arc::clone(&quota_cache),
         Arc::clone(&store),
     ));
-    // Old audit, usage and shadow rows are deleted in small batches on their
-    // own timer. Each retention pass re-reads how long every table keeps its
+    // Old audit, usage and account-selection rows are deleted in small batches
+    // on their own timer. Each retention pass re-reads how long every table keeps its
     // rows from the routing file's `retention` block.
     tokio::spawn(retention::retention_loop(
         Arc::clone(&store),
@@ -935,11 +935,6 @@ where
                 })?,
                 DEFAULT_MODULE_ID,
             ));
-        tokio::spawn(account_selection::shadow_loop(
-            Arc::clone(&store),
-            Arc::clone(&account_state),
-            config_overrides::config_path(),
-        ));
         tokio::spawn(account_quota::account_quota_loop(
             config.connection_file_path.clone(),
             account_state,
@@ -5538,7 +5533,6 @@ fn handles(method: &str) -> bool {
             | account_selection::ACCOUNT_STATUS_OP
             | account_selection::ACCOUNT_OBSERVE_OP
             | account_selection::ACCOUNT_RELEASE_OP
-            | account_selection::ACCOUNT_SHADOW_STATUS_OP
     ) || key_pool::handles(method)
 }
 
@@ -5708,14 +5702,6 @@ fn served_operations() -> Vec<ManagementOperation> {
             kind: ManagementOperationKind::Mutate,
             description: Some(
                 "Release an unstarted admission or end a conversation lease".to_string(),
-            ),
-        },
-        ManagementOperation {
-            name: account_selection::ACCOUNT_SHADOW_STATUS_OP.to_string(),
-            kind: ManagementOperationKind::Query,
-            description: Some(
-                "Show the latest shadow account decisions and why they came out as they did"
-                    .to_string(),
             ),
         },
     ];

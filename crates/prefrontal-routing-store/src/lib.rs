@@ -42,16 +42,14 @@ mod retention;
 
 pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
 pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
-pub use retention::{
-    is_routine_decision, DecisionRetentionCursor, RetentionBatch, ROUTINE_REFUSAL_CODE,
-};
+pub use retention::AffinityRetentionBatch;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use account_selection::AccountServingCounts;
 pub use account_selection::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
     AccountExclusionRow, AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow,
-    AccountTx, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
+    AccountTx, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
 };
 
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
@@ -177,6 +175,9 @@ const MIGRATION_048: &str = include_str!("../migrations/048_pool_keys.sql");
 const MIGRATION_049: &str = include_str!("../migrations/049_model_auth_methods.sql");
 /// Migration 50: the reasoning-effort values Fusiform publishes per model.
 const MIGRATION_050: &str = include_str!("../migrations/050_model_reasoning_efforts.sql");
+/// Migration 51: retire shadow mode's heartbeat index and add the indexes the
+/// account-selection history retention walks.
+const MIGRATION_051: &str = include_str!("../migrations/051_retire_account_shadow.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -220,7 +221,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 50] {
+fn route_state_migrations() -> [Migration; 51] {
     [
         Migration {
             version: 1,
@@ -421,6 +422,10 @@ fn route_state_migrations() -> [Migration; 50] {
         Migration {
             version: 50,
             statements: MIGRATION_050,
+        },
+        Migration {
+            version: 51,
+            statements: MIGRATION_051,
         },
     ]
 }
@@ -3890,6 +3895,145 @@ mod tests {
             })
             .unwrap();
         assert!(!table_exists);
+        drop(migrated);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+    }
+
+    #[test]
+    fn migration_051_retires_the_shadow_index_and_the_purge_removes_only_shadow_rows() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = prefrontal_test_support::scratch_root().join(format!(
+            "prefrontal-routing-shadow-retirement-{}-{timestamp}.sqlite",
+            std::process::id()
+        ));
+        let descriptor = dev_descriptor(
+            "prefrontal-routing-shadow-retirement",
+            path.to_string_lossy(),
+        );
+
+        // A store as the previous binary left it: shadow decisions from the
+        // timer, observations and refused requests beside served history
+        // (a pinned admit with its admission and affinity, and a refusal).
+        let legacy = open_sqlite(&descriptor).unwrap();
+        let migrations = route_state_migrations();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &migrations[..50])
+            .unwrap();
+        legacy
+            .with_conn(|connection| {
+                let mut insert = connection.prepare(
+                    "INSERT INTO account_decision (decision_id, mode, trigger, principal, provider, \
+                       model, family, outcome, code, policy_version, decision_json, created_at) \
+                     VALUES (?1, ?2, ?3, 'reserved:broca', ?4, 'claude-opus-5-5', 'opus', ?5, ?6, 2, '{}', ?7)",
+                )?;
+                for index in 0..5_i64 {
+                    insert.execute(rusqlite::params![
+                        format!("shadow-timer-{index}"), "shadow", "timer", "anthropic",
+                        "admit", "cold_scored", 1_000 + index
+                    ])?;
+                }
+                insert.execute(rusqlite::params![
+                    "shadow-observation", "shadow", "observation", "xai", "refuse",
+                    "account_selection_unsupported", 2_000
+                ])?;
+                insert.execute(rusqlite::params![
+                    "shadow-request", "shadow", "request", "anthropic", "admit", "cold_scored", 3_000
+                ])?;
+                insert.execute(rusqlite::params![
+                    "serve-admit", "serve", "request", "anthropic", "admit", "cold_scored", 1_500
+                ])?;
+                insert.execute(rusqlite::params![
+                    "serve-refuse", "serve", "request", "anthropic", "refuse",
+                    "account_quota_unknown", 2_500
+                ])?;
+                connection.execute_batch(
+                    "INSERT INTO account_pin (pin_id, principal, conversation_hash, provider, \
+                       pin_generation, affinity_model, account_id, credential_id, pin_mode, \
+                       decision_id, created_at) \
+                     VALUES ('pin-1', 'reserved:broca', 'h', 'anthropic', 1, 'claude-opus-5-5', \
+                       'acct-a', 'oauth:a', 'run_frozen', 'serve-admit', 1500); \
+                     INSERT INTO account_affinity (principal, conversation_hash, provider, \
+                       affinity_model, pin_id, pin_generation, account_id, credential_id, \
+                       credential_binding_revision, policy_version, initial_demand_bytes, \
+                       created_at, last_used_at, expires_at, lease_valid_until) \
+                     VALUES ('reserved:broca', 'h', 'anthropic', 'claude-opus-5-5', 'pin-1', 1, \
+                       'acct-a', 'oauth:a', 1, 2, 10, 1500, 1500, 9000, 1620); \
+                     INSERT INTO account_admission (principal, admission_id, request_fingerprint, \
+                       request_mode, decision_id, conversation_hash, provider, model, account_id, \
+                       credential_id, pin_id, pin_generation, state, charged, request_bytes, \
+                       request_bytes_estimated, committed_at, admission_valid_until, \
+                       lease_valid_until, reply_json) \
+                     VALUES ('reserved:broca', 'adm-1', 'fp', 'admit', 'serve-admit', 'h', \
+                       'anthropic', 'claude-opus-5-5', 'acct-a', 'oauth:a', 'pin-1', 1, \
+                       'finished', 1, 10, 0, 1500, 1560, 1620, '{}');",
+                )
+            })
+            .unwrap();
+        drop(legacy);
+
+        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let indexes: Vec<String> = migrated
+            .store
+            .with_conn(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN \
+                     ('account_decision_latest', 'account_admission_by_committed', \
+                      'account_admission_by_pin', 'account_affinity_by_expiry', \
+                      'account_hold_by_created') ORDER BY name",
+                )?;
+                let names = statement.query_map([], |row| row.get(0))?;
+                names.collect()
+            })
+            .unwrap();
+        assert_eq!(
+            indexes,
+            vec![
+                "account_admission_by_committed",
+                "account_admission_by_pin",
+                "account_affinity_by_expiry",
+                "account_hold_by_created",
+            ],
+            "the shadow heartbeat index is dropped and the retention indexes exist"
+        );
+
+        let mut purged = 0;
+        loop {
+            let removed = migrated.purge_shadow_decisions(2).unwrap();
+            purged += removed;
+            if removed < 2 {
+                break;
+            }
+        }
+        assert_eq!(purged, 7);
+        let remaining = migrated
+            .store
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT group_concat(decision_id, ','), \
+                       (SELECT count(*) FROM account_pin), \
+                       (SELECT count(*) FROM account_affinity), \
+                       (SELECT count(*) FROM account_admission) \
+                     FROM (SELECT decision_id FROM account_decision ORDER BY decision_id)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(remaining, ("serve-admit,serve-refuse".to_string(), 1, 1, 1));
         drop(migrated);
 
         let _ = std::fs::remove_file(&path);

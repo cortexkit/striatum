@@ -1,6 +1,6 @@
 //! Bounded retention deletes for the routing store's append-only logs:
-//! account decisions, runner observations and per-message usage. (The
-//! route-decision ledger, `model_route_decisions`, is pruned through
+//! account-selection history, runner observations and per-message usage.
+//! (The route-decision ledger, `model_route_decisions`, is pruned through
 //! `RouteStateStore::delete_decisions_older_than`.)
 //!
 //! Every method here deletes at most `limit` rows in one short transaction
@@ -10,67 +10,38 @@
 //! shrink the database file: SQLite reuses the freed pages for new rows, and
 //! only a VACUUM gives the space back to the operating system.
 //!
-//! Which account decisions are kept, and why:
-//! - Serve decisions (`mode = 'serve'`) are never deleted here. Each served
-//!   admit or hold is referenced by an `account_admission`, `account_pin` or
-//!   `account_hold` row, nothing deletes those, and foreign keys are on. The
-//!   few serve refusals are kept with them as the served audit trail.
-//! - Shadow decisions are diagnostics nothing answers a caller with. The
-//!   only code readers are the timer heartbeat (the newest row per trigger,
-//!   provider and family) and `route.account_shadow_status` (the newest few
-//!   hundred rows). Routine shadow rows (admits, and the fixed
-//!   `account_selection_unsupported` refusal for a provider routing selects
-//!   no accounts for) are kept for the routine window. Holds and every other
-//!   refusal are kept for the longer notable window, because they are what
-//!   someone investigating a refusal looks for.
+//! Account-selection history, and what keeps a row:
+//! - Shadow decisions (`mode = 'shadow'`) came from the retired shadow mode,
+//!   which ran the allocator for nobody. Nothing writes or reads them any
+//!   more, so [`SqliteRouteStateStore::purge_shadow_decisions`] deletes them
+//!   all, oldest first. A long-running install holds over a million of them;
+//!   one delete of all of them took about 26 seconds on such a store, which is
+//!   why they go in batches rather than inside a migration.
+//! - Every other account row is served history, kept for the configured
+//!   window after its last activity and then deleted leaf first: an
+//!   admission once every time it carries is past the window; an affinity row
+//!   (with every pin generation of its conversation) once its idle expiry and
+//!   lease are past the window and no remaining admission names one of those
+//!   pins; a hold once it is past the window; a serve decision once it is past
+//!   the window and no pin, admission or hold references it. A conversation's
+//!   pins go together with its affinity row because the next pin for that
+//!   conversation starts again at generation 1, which must not collide with a
+//!   stored older generation.
 
 use prefrontal_routing_core::RouteStateResult;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
-use super::{err, SqliteRouteStateStore, DECISION_MODE_SHADOW};
+use super::{err, SqliteRouteStateStore, DECISION_MODE_SERVE};
 
-/// The refusal routing records for a provider it selects no accounts for.
-/// Its shape is identical every time, so it is retained like an admit.
-pub const ROUTINE_REFUSAL_CODE: &str = "account_selection_unsupported";
+/// `account_decision.mode` of the retired shadow decisions.
+const RETIRED_SHADOW_MODE: &str = "shadow";
 
-/// What one retention batch did. `examined` counts the rows the batch looked
-/// at, deleted or kept; a batch that examined fewer rows than its limit found
-/// nothing more past the window, so the caller can stop.
+/// What one affinity retention batch deleted: conversation affinity rows,
+/// and the pin generations that went with them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RetentionBatch {
-    pub deleted: usize,
-    pub examined: usize,
-}
-
-/// Where the account-decision scan of the band between the two windows
-/// resumes, as (created_at, rowid) of the last row it examined.
-///
-/// Rows older than both windows are deleted outright. Rows in the band
-/// between the two cutoffs are deleted only when their own class's window
-/// has passed; the others (the longer-window class) are kept and will be
-/// deleted once they fall below both cutoffs. Without a cursor every batch
-/// would re-read those kept rows from the start of the band; with it, each
-/// band row is examined once. Starting from the default re-examines the band
-/// once, which is always safe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecisionRetentionCursor {
-    created_at: i64,
-    rowid: i64,
-}
-
-impl Default for DecisionRetentionCursor {
-    fn default() -> Self {
-        Self {
-            created_at: i64::MIN,
-            rowid: i64::MIN,
-        }
-    }
-}
-
-/// True when a decision is retained for the routine window rather than the
-/// notable one.
-pub fn is_routine_decision(outcome: &str, code: &str) -> bool {
-    outcome == "admit" || code == ROUTINE_REFUSAL_CODE
+pub struct AffinityRetentionBatch {
+    pub affinities: usize,
+    pub pins: usize,
 }
 
 /// A decision still referenced by a pin, admission or hold cannot be deleted
@@ -87,115 +58,140 @@ fn limit_param(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
 }
 
-fn prune_account_decisions_tx(
-    tx: &Connection,
-    routine_before: i64,
-    notable_before: i64,
-    cursor: &mut DecisionRetentionCursor,
-    limit: usize,
-) -> rusqlite::Result<RetentionBatch> {
-    let older = routine_before.min(notable_before);
-    let newer = routine_before.max(notable_before);
-
-    // Every shadow row older than both cutoffs is past its window whatever
-    // its class.
-    let deleted_old = tx.execute(
-        &format!(
-            "DELETE FROM account_decision WHERE rowid IN ( \
-               SELECT rowid FROM account_decision INDEXED BY account_decision_by_mode_time \
-               WHERE mode = ?1 AND created_at < ?2 AND {DECISION_UNREFERENCED} \
-               ORDER BY created_at LIMIT ?3)"
-        ),
-        params![DECISION_MODE_SHADOW, older, limit_param(limit)],
-    )?;
-    let mut batch = RetentionBatch {
-        deleted: deleted_old,
-        examined: deleted_old,
-    };
-    let remaining = limit.saturating_sub(deleted_old);
-    if remaining == 0 || older == newer {
-        return Ok(batch);
-    }
-
-    // Rows created between the two cutoffs: only the class with the shorter
-    // window (routine, with the default windows) is past its window here; the
-    // other class is skipped and deleted later by the statement above.
-    let band_start = DecisionRetentionCursor {
-        created_at: older,
-        rowid: i64::MIN,
-    };
-    if (cursor.created_at, cursor.rowid) < (band_start.created_at, band_start.rowid) {
-        *cursor = band_start;
-    }
-    let candidates: Vec<(i64, i64, String, String)> = {
-        let mut statement = tx.prepare(
-            "SELECT rowid, created_at, outcome, code \
-             FROM account_decision INDEXED BY account_decision_by_mode_time \
-             WHERE mode = ?1 AND created_at >= ?2 AND (created_at > ?2 OR rowid > ?3) \
-               AND created_at < ?4 \
-             ORDER BY created_at, rowid LIMIT ?5",
-        )?;
-        let rows = statement.query_map(
-            params![
-                DECISION_MODE_SHADOW,
-                cursor.created_at,
-                cursor.rowid,
-                newer,
-                limit_param(remaining)
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    let mut delete = tx.prepare(&format!(
-        "DELETE FROM account_decision WHERE rowid = ?1 AND {DECISION_UNREFERENCED}"
-    ))?;
-    for (rowid, created_at, outcome, code) in candidates {
-        batch.examined += 1;
-        *cursor = DecisionRetentionCursor { created_at, rowid };
-        let before = if is_routine_decision(&outcome, &code) {
-            routine_before
-        } else {
-            notable_before
-        };
-        if created_at < before {
-            batch.deleted += delete.execute(params![rowid])?;
-        }
-    }
-    Ok(batch)
-}
-
 impl SqliteRouteStateStore {
-    /// Delete one bounded batch of shadow account decisions past their
-    /// window: routine rows created before `routine_before`, holds and other
-    /// refusals created before `notable_before` (both Unix milliseconds).
-    /// Examines at most `limit` rows in one transaction. `cursor` carries the
-    /// scan position between batches; see [`DecisionRetentionCursor`].
-    pub fn prune_account_decisions(
+    /// Delete at most `limit` retired shadow decisions, oldest first. A shadow
+    /// row never had a pin, admission or hold; one that somehow does is kept
+    /// rather than failing the batch.
+    pub fn purge_shadow_decisions(&self, limit: usize) -> RouteStateResult<usize> {
+        self.delete_unreferenced_decisions(RETIRED_SHADOW_MODE, i64::MAX, limit)
+    }
+
+    /// Delete at most `limit` serve decisions created before `created_before`
+    /// (Unix milliseconds), oldest first, skipping any a pin, admission or
+    /// hold still references.
+    pub fn prune_serve_decisions(
         &self,
-        routine_before: i64,
-        notable_before: i64,
-        cursor: &mut DecisionRetentionCursor,
+        created_before: i64,
         limit: usize,
-    ) -> RouteStateResult<RetentionBatch> {
+    ) -> RouteStateResult<usize> {
+        self.delete_unreferenced_decisions(DECISION_MODE_SERVE, created_before, limit)
+    }
+
+    fn delete_unreferenced_decisions(
+        &self,
+        mode: &str,
+        created_before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.execute(
+                    &format!(
+                        "DELETE FROM account_decision WHERE rowid IN ( \
+                           SELECT rowid FROM account_decision INDEXED BY account_decision_by_mode_time \
+                           WHERE mode = ?1 AND created_at < ?2 AND {DECISION_UNREFERENCED} \
+                           ORDER BY created_at LIMIT ?3)"
+                    ),
+                    params![mode, created_before, limit_param(limit)],
+                )
+            })
+            .map_err(err)
+    }
+
+    /// Delete at most `limit` admissions whose every time (commit, validity,
+    /// lease, start, release and finish) is before `before` (Unix
+    /// milliseconds), oldest first. Demand only counts an admission committed
+    /// after its account's latest reading, so an admission this old charges
+    /// nothing a fresh reading could still need.
+    pub fn prune_account_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.execute(
+                    "DELETE FROM account_admission WHERE rowid IN ( \
+                       SELECT rowid FROM account_admission \
+                         INDEXED BY account_admission_by_committed \
+                       WHERE committed_at < ?1 \
+                         AND admission_valid_until < ?1 AND lease_valid_until < ?1 \
+                         AND COALESCE(started_at, 0) < ?1 \
+                         AND COALESCE(released_at, 0) < ?1 \
+                         AND COALESCE(finished_at, 0) < ?1 \
+                       ORDER BY committed_at LIMIT ?2)",
+                    params![before, limit_param(limit)],
+                )
+            })
+            .map_err(err)
+    }
+
+    /// Delete at most `limit` holds created before `before` (Unix
+    /// milliseconds), oldest first. A hold is a retry answer that lapses
+    /// within minutes; only the decision row it names keeps any meaning.
+    pub fn prune_account_holds(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.execute(
+                    "DELETE FROM account_hold WHERE rowid IN ( \
+                       SELECT rowid FROM account_hold INDEXED BY account_hold_by_created \
+                       WHERE created_at < ?1 ORDER BY created_at LIMIT ?2)",
+                    params![before, limit_param(limit)],
+                )
+            })
+            .map_err(err)
+    }
+
+    /// Delete at most `limit` conversation affinity rows whose idle expiry and
+    /// lease are both before `before` (Unix milliseconds), together with every
+    /// pin generation of the same conversation, in one transaction. A
+    /// conversation is kept while any stored admission still names one of its
+    /// pins; [`Self::prune_account_admissions`] removes those first.
+    pub fn prune_account_affinities(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<AffinityRetentionBatch> {
         if limit == 0 {
-            return Ok(RetentionBatch::default());
+            return Ok(AffinityRetentionBatch::default());
         }
         self.store
             .with_conn(|conn: &Connection| {
                 let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-                // Scan on a copy so a rolled-back batch leaves the cursor where
-                // the last committed batch put it.
-                let mut next = *cursor;
-                let batch = prune_account_decisions_tx(
-                    &tx,
-                    routine_before,
-                    notable_before,
-                    &mut next,
-                    limit,
-                )?;
+                let keys: Vec<(String, String, String)> = {
+                    let mut statement = tx.prepare(
+                        "SELECT principal, conversation_hash, provider FROM account_affinity \
+                           INDEXED BY account_affinity_by_expiry \
+                         WHERE expires_at < ?1 AND COALESCE(lease_valid_until, 0) < ?1 \
+                           AND NOT EXISTS (SELECT 1 FROM account_pin p \
+                             JOIN account_admission a ON a.pin_id = p.pin_id \
+                             WHERE p.principal = account_affinity.principal \
+                               AND p.conversation_hash = account_affinity.conversation_hash \
+                               AND p.provider = account_affinity.provider) \
+                         ORDER BY expires_at LIMIT ?2",
+                    )?;
+                    let rows = statement.query_map(params![before, limit_param(limit)], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })?;
+                    rows.collect::<rusqlite::Result<_>>()?
+                };
+                let mut batch = AffinityRetentionBatch::default();
+                {
+                    let mut delete_pins = tx.prepare(
+                        "DELETE FROM account_pin \
+                         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
+                    )?;
+                    let mut delete_affinity = tx.prepare(
+                        "DELETE FROM account_affinity \
+                         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
+                    )?;
+                    for (principal, conversation_hash, provider) in &keys {
+                        batch.pins +=
+                            delete_pins.execute(params![principal, conversation_hash, provider])?;
+                        batch.affinities += delete_affinity.execute(params![
+                            principal,
+                            conversation_hash,
+                            provider
+                        ])?;
+                    }
+                }
                 tx.commit()?;
-                *cursor = next;
                 Ok(batch)
             })
             .map_err(err)

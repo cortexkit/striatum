@@ -2,7 +2,7 @@
   // Every preserved key, with the two accepted camel-case aliases.
   "model_families": {"gpt": ["openai/*"], "other": ["*"]},
   "catalog": {"poll_ms": 12345},
-  "account_selection": {"enabled": true, "shadow": true},
+  "account_selection": {"enabled": true},
   "model_routing": {
     "exclude": {
       "all": ["anthropic", "-anthropic/claude-5", "openai/gpt-6/high"],

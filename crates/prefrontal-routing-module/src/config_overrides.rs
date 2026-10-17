@@ -245,6 +245,16 @@ fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
     {
         return Err("config_key_removed: model_routing.explicit_only_providers; list the provider in model_routing.exclude.all; pins still work".into());
     }
+    // Shadow mode was the dry run before account selection served; with
+    // serving on it only re-ran the allocator for nobody. Named here, whatever
+    // its value, so the operator learns why the key went away.
+    if value
+        .get("account_selection")
+        .and_then(|section| section.get("shadow"))
+        .is_some()
+    {
+        return Err("config_key_removed: account_selection.shadow; delete it; account selection serves directly".into());
+    }
     if value
         .get("model_routing")
         .and_then(|section| section.get("exclude"))
@@ -711,8 +721,8 @@ pub fn routing_config_schema() -> String {
     serde_json::to_string_pretty(&schemars::schema_for!(RoutingConfigFile)).unwrap() + "\n"
 }
 
-/// The account-selection rollout flags (`"account_selection"` in the routing
-/// file). Both are off unless the file turns them on.
+/// The account-selection flag (`"account_selection"` in the routing file).
+/// Off unless the file turns it on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountSelectionFlags {
@@ -720,16 +730,6 @@ pub struct AccountSelectionFlags {
     /// operation refuses with `account_selection_disabled`.
     #[serde(default)]
     pub enabled: bool,
-    /// Compute account decisions without serving them and record them for
-    /// comparison: the step before `enabled`.
-    #[serde(default)]
-    pub shadow: bool,
-}
-
-/// Read account-selection flags from the active document. Without a valid
-/// document both are off; malformed edits retain the last accepted flags.
-pub fn account_selection_flags(path: &Path) -> AccountSelectionFlags {
-    live_config(path).account_flags()
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]

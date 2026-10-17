@@ -2,11 +2,16 @@
 //! append-only logs in small batches, off the request path.
 //!
 //! Who reads these rows, and how far back, decides the windows:
-//! - `account_decision` (shadow rows): the timer heartbeat reads the newest
-//!   row per trigger, provider and family (`account_selection::shadow_pass`),
-//!   and `route.account_shadow_status` reads the newest 800 shadow rows.
-//!   Nothing reads further back; the windows are for people auditing.
-//!   Serve rows are never deleted (see the store's `retention.rs`).
+//! - Account-selection history (`account_admission`, `account_affinity` with
+//!   its `account_pin` generations, `account_hold`, and serve
+//!   `account_decision` rows): admissions are read back for a duplicate
+//!   request, a runner's report and pending demand, all within minutes of the
+//!   commit; affinity is live for seven idle days; holds lapse within
+//!   minutes. A row is deleted once its last activity is past the
+//!   `account_selection_days` window and nothing still in the store
+//!   references it (see the store's `retention.rs`).
+//! - Shadow `account_decision` rows, left by the retired shadow mode, are
+//!   read by nothing and purged whatever their age.
 //! - `account_observation`: read back only to recognise a runner re-sending
 //!   the same event id, which happens within minutes.
 //! - `model_route_decisions`: `route.explain` looks a decision up by id or
@@ -24,21 +29,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use prefrontal_routing_core::RouteStateStore;
-use prefrontal_routing_store::{DecisionRetentionCursor, SqliteRouteStateStore};
+use prefrontal_routing_store::SqliteRouteStateStore;
 use serde_json::Value;
 
 use crate::config_overrides::read_routing_config_value;
 
 /// Time between retention passes.
 pub const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
-/// Most rows one batch deletes (or, for account decisions, examines). Each
-/// batch is one short transaction.
+/// Most rows one batch deletes. Each batch is one short transaction.
 pub const RETENTION_BATCH_ROWS: usize = 256;
 /// Most batches one pass runs per table. With the batch size and interval
 /// above, a pass can retire about 4,000 rows a minute per table, well above
-/// the roughly 260 shadow decisions a minute a busy install writes, so a
-/// backlog drains over a few hours without any single long delete.
+/// what serving writes, so a backlog drains without any single long delete.
 pub const RETENTION_MAX_BATCHES_PER_TABLE: usize = 16;
+/// Most batches one pass spends purging retired shadow decisions. On a copy
+/// of a 9 GB store holding 1.6 million of them, a batch of 256 took 19 ms on
+/// average over the whole purge, and up to about 300 ms while the machine was
+/// busy. At 32 batches a pass the purge holds the store for well under a
+/// second a minute on average, in short slices, and that backlog clears in
+/// about three and a half hours.
+pub const SHADOW_PURGE_MAX_BATCHES: usize = 32;
 /// Pause between batches so request handlers waiting for the store's single
 /// connection get it between deletes.
 const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(25);
@@ -50,10 +60,9 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 /// unit in its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionWindows {
-    /// Shadow admits and `account_selection_unsupported` refusals.
-    pub account_decision_routine_hours: u64,
-    /// Shadow holds and every other shadow refusal.
-    pub account_decision_notable_days: u64,
+    /// Served account-selection history, counted from each row's last
+    /// activity.
+    pub account_selection_days: u64,
     pub account_observation_days: u64,
     pub model_route_decisions_days: u64,
     pub model_route_usage_days: u64,
@@ -62,8 +71,7 @@ pub struct RetentionWindows {
 impl Default for RetentionWindows {
     fn default() -> Self {
         Self {
-            account_decision_routine_hours: 72,
-            account_decision_notable_days: 14,
+            account_selection_days: 30,
             account_observation_days: 7,
             model_route_decisions_days: 30,
             model_route_usage_days: 30,
@@ -79,16 +87,13 @@ struct WindowKey {
     field: fn(&mut RetentionWindows) -> &mut u64,
 }
 
-const WINDOW_KEYS: [WindowKey; 5] = [
+const WINDOW_KEYS: [WindowKey; 4] = [
     WindowKey {
-        key: "account_decision_routine_hours",
-        minimum: 1,
-        field: |w| &mut w.account_decision_routine_hours,
-    },
-    WindowKey {
-        key: "account_decision_notable_days",
-        minimum: 1,
-        field: |w| &mut w.account_decision_notable_days,
+        // A frozen run can report its finish days after its admission, and a
+        // conversation stays pinned for seven idle days; a week is the floor.
+        key: "account_selection_days",
+        minimum: 7,
+        field: |w| &mut w.account_selection_days,
     },
     WindowKey {
         key: "account_observation_days",
@@ -109,10 +114,18 @@ const WINDOW_KEYS: [WindowKey; 5] = [
     },
 ];
 
+/// Keys that configured the retired shadow-decision windows. They are named
+/// in their own warning, so an operator knows to delete them rather than
+/// suspect a typo.
+const REMOVED_WINDOW_KEYS: [&str; 2] = [
+    "account_decision_routine_hours",
+    "account_decision_notable_days",
+];
+
 /// Parse the routing file's `retention` block. An absent block or key keeps
 /// the default; a value that is not a whole number keeps the default, and one
-/// below its minimum is raised to the minimum. Each such correction, and each
-/// unknown key, is returned as a warning.
+/// below its minimum is raised to the minimum. Each such correction, each
+/// removed key and each unknown key is returned as a warning.
 pub fn retention_windows_from_value(block: Option<&Value>) -> (RetentionWindows, Vec<String>) {
     let mut windows = RetentionWindows::default();
     let mut warnings = Vec::new();
@@ -124,6 +137,13 @@ pub fn retention_windows_from_value(block: Option<&Value>) -> (RetentionWindows,
         return (windows, warnings);
     };
     for (key, value) in object {
+        if REMOVED_WINDOW_KEYS.contains(&key.as_str()) {
+            warnings.push(format!(
+                "retention.{key} was removed with account-selection shadow mode; delete it \
+                 (served history uses retention.account_selection_days)"
+            ));
+            continue;
+        }
         let Some(spec) = WINDOW_KEYS.iter().find(|spec| spec.key == key) else {
             warnings.push(format!("retention.{key} is not a known key; ignored"));
             continue;
@@ -173,6 +193,14 @@ pub fn retention_windows(path: &Path) -> RetentionWindows {
 /// inside its batch budget.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionPassReport {
+    /// Retired shadow decisions.
+    pub shadow_decisions: usize,
+    pub account_admissions: usize,
+    pub account_holds: usize,
+    pub account_affinities: usize,
+    /// Pin generations deleted with their conversation's affinity row.
+    pub account_pins: usize,
+    /// Serve decisions.
     pub account_decisions: usize,
     pub account_observations: usize,
     pub route_decisions: usize,
@@ -186,25 +214,25 @@ pub struct RetentionPassReport {
 
 impl RetentionPassReport {
     pub fn total(&self) -> usize {
-        self.account_decisions + self.account_observations + self.route_decisions + self.route_usage
+        self.shadow_decisions
+            + self.account_admissions
+            + self.account_holds
+            + self.account_affinities
+            + self.account_pins
+            + self.account_decisions
+            + self.account_observations
+            + self.route_decisions
+            + self.route_usage
     }
 }
 
-/// State carried from one pass to the next: the account-decision scan
-/// position, and the windows it was computed under (a change of windows
-/// restarts the scan, because rows it skipped may now be due).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RetentionState {
-    cursor: DecisionRetentionCursor,
-    windows: Option<RetentionWindows>,
-}
-
-/// The size of one pass: rows per batch, batches per table, and the pause
-/// between batches.
+/// The size of one pass: rows per batch, batches per table (and for the
+/// shadow purge), and the pause between batches.
 #[derive(Debug, Clone, Copy)]
 pub struct PassBudget {
     pub batch_rows: usize,
     pub max_batches_per_table: usize,
+    pub max_shadow_purge_batches: usize,
     pub pause: Duration,
 }
 
@@ -213,23 +241,25 @@ impl Default for PassBudget {
         Self {
             batch_rows: RETENTION_BATCH_ROWS,
             max_batches_per_table: RETENTION_MAX_BATCHES_PER_TABLE,
+            max_shadow_purge_batches: SHADOW_PURGE_MAX_BATCHES,
             pause: RETENTION_BATCH_PAUSE,
         }
     }
 }
 
-/// Run batches of one table until a batch comes back short (nothing more is
-/// due), a batch fails, or the budget is spent. `batch` returns (rows
-/// deleted, rows examined). Adds the batches it ran to `batches_so_far` and
-/// returns (rows deleted, drained).
+/// Run up to `max_batches` batches of one table until a batch comes back
+/// short (nothing more is due), a batch fails, or the budget is spent.
+/// `batch` returns (rows deleted, rows examined). Adds the batches it ran to
+/// `batches_so_far` and returns (rows deleted, drained).
 fn drain(
     table: &str,
     budget: &PassBudget,
+    max_batches: usize,
     batches_so_far: &mut usize,
     mut batch: impl FnMut() -> Result<(usize, usize), String>,
 ) -> (usize, bool) {
     let mut deleted = 0;
-    for round in 0..budget.max_batches_per_table {
+    for round in 0..max_batches {
         if round > 0 && !budget.pause.is_zero() {
             std::thread::sleep(budget.pause);
         }
@@ -261,70 +291,89 @@ fn window_ms(count: u64, unit_ms: i64) -> i64 {
 }
 
 /// One retention pass over every log, synchronous. Run it on a blocking
-/// thread: it sleeps between batches.
+/// thread: it sleeps between batches. Account-selection history goes leaf
+/// first (admissions, holds, then affinity with its pins, then the decisions
+/// they referenced), so one pass can retire a whole expired conversation.
 pub fn run_retention_pass(
     store: &SqliteRouteStateStore,
     windows: &RetentionWindows,
-    state: &mut RetentionState,
     now_ms: i64,
     budget: &PassBudget,
 ) -> RetentionPassReport {
-    if state.windows != Some(*windows) {
-        *state = RetentionState {
-            cursor: DecisionRetentionCursor::default(),
-            windows: Some(*windows),
-        };
-    }
     let rows = budget.batch_rows;
+    let per_table = budget.max_batches_per_table;
     let mut report = RetentionPassReport::default();
-    let routine_before = before(
-        now_ms,
-        window_ms(windows.account_decision_routine_hours, HOUR_MS),
+    let batches = &mut report.batches;
+    let counted = |result: Result<usize, prefrontal_routing_core::RouteStateStoreError>| {
+        result
+            .map(|deleted| (deleted, deleted))
+            .map_err(|error| error.0)
+    };
+
+    let (shadow, shadow_drained) = drain(
+        "account_decision (shadow)",
+        budget,
+        budget.max_shadow_purge_batches,
+        batches,
+        || counted(store.purge_shadow_decisions(rows)),
     );
-    let notable_before = before(
-        now_ms,
-        window_ms(windows.account_decision_notable_days, DAY_MS),
-    );
-    let cursor = &mut state.cursor;
-    let (decisions, decisions_drained) =
-        drain("account_decision", budget, &mut report.batches, || {
+    let history_before = before(now_ms, window_ms(windows.account_selection_days, DAY_MS));
+    let (admissions, admissions_drained) =
+        drain("account_admission", budget, per_table, batches, || {
+            counted(store.prune_account_admissions(history_before, rows))
+        });
+    let (holds, holds_drained) = drain("account_hold", budget, per_table, batches, || {
+        counted(store.prune_account_holds(history_before, rows))
+    });
+    let mut pins = 0;
+    let (affinities, affinities_drained) =
+        drain("account_affinity", budget, per_table, batches, || {
             store
-                .prune_account_decisions(routine_before, notable_before, cursor, rows)
-                .map(|batch| (batch.deleted, batch.examined))
+                .prune_account_affinities(history_before, rows)
+                .map(|batch| {
+                    pins += batch.pins;
+                    (batch.affinities, batch.affinities)
+                })
                 .map_err(|error| error.0)
+        });
+    let (decisions, decisions_drained) =
+        drain("account_decision", budget, per_table, batches, || {
+            counted(store.prune_serve_decisions(history_before, rows))
         });
     let observed_before = before(now_ms, window_ms(windows.account_observation_days, DAY_MS));
     let (observations, observations_drained) =
-        drain("account_observation", budget, &mut report.batches, || {
-            store
-                .prune_account_observations(observed_before, rows)
-                .map(|deleted| (deleted, deleted))
-                .map_err(|error| error.0)
+        drain("account_observation", budget, per_table, batches, || {
+            counted(store.prune_account_observations(observed_before, rows))
         });
     let decided_before = before(
         now_ms,
         window_ms(windows.model_route_decisions_days, DAY_MS),
     );
     let (route_decisions, route_decisions_drained) =
-        drain("model_route_decisions", budget, &mut report.batches, || {
-            store
-                .delete_decisions_older_than(decided_before, rows)
-                .map(|deleted| (deleted, deleted))
-                .map_err(|error| error.0)
+        drain("model_route_decisions", budget, per_table, batches, || {
+            counted(store.delete_decisions_older_than(decided_before, rows))
         });
     let usage_before = before(now_ms, window_ms(windows.model_route_usage_days, DAY_MS));
-    let (usage, usage_drained) = drain("model_route_usage", budget, &mut report.batches, || {
-        store
-            .prune_route_usage(usage_before, rows)
-            .map(|deleted| (deleted, deleted))
-            .map_err(|error| error.0)
+    let (usage, usage_drained) = drain("model_route_usage", budget, per_table, batches, || {
+        counted(store.prune_route_usage(usage_before, rows))
     });
+    report.shadow_decisions = shadow;
+    report.account_admissions = admissions;
+    report.account_holds = holds;
+    report.account_affinities = affinities;
+    report.account_pins = pins;
     report.account_decisions = decisions;
     report.account_observations = observations;
     report.route_decisions = route_decisions;
     report.route_usage = usage;
-    report.drained =
-        decisions_drained && observations_drained && route_decisions_drained && usage_drained;
+    report.drained = shadow_drained
+        && admissions_drained
+        && holds_drained
+        && affinities_drained
+        && decisions_drained
+        && observations_drained
+        && route_decisions_drained
+        && usage_drained;
     report
 }
 
@@ -332,7 +381,6 @@ pub fn run_retention_pass(
 /// routing file and runs on a blocking thread, so selection and admission
 /// never wait on it except for one short batch at a time.
 pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: PathBuf) {
-    let mut state = RetentionState::default();
     let mut last_warnings: Vec<String> = Vec::new();
     loop {
         // The first pass waits one interval, so it never competes with boot.
@@ -345,23 +393,24 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
             last_warnings = warnings;
         }
         let pass_store = Arc::clone(&store);
-        let mut pass_state = state;
         let outcome = tokio::task::spawn_blocking(move || {
-            let report = run_retention_pass(
+            run_retention_pass(
                 &pass_store,
                 &windows,
-                &mut pass_state,
                 crate::account_selection::now_ms(),
                 &PassBudget::default(),
-            );
-            (report, pass_state)
+            )
         })
         .await;
         match outcome {
-            Ok((report, next_state)) => {
-                state = next_state;
+            Ok(report) => {
                 if report.total() > 0 {
                     tracing::info!(
+                        shadow_decisions = report.shadow_decisions,
+                        account_admissions = report.account_admissions,
+                        account_holds = report.account_holds,
+                        account_affinities = report.account_affinities,
+                        account_pins = report.account_pins,
                         account_decisions = report.account_decisions,
                         account_observations = report.account_observations,
                         route_decisions = report.route_decisions,
@@ -380,7 +429,7 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prefrontal_routing_store::{dev_descriptor, AccountDecisionRecord, DECISION_MODE_SHADOW};
+    use prefrontal_routing_store::{dev_descriptor, AccountDecisionRecord};
     use serde_json::json;
 
     /// The test clock, 2026-10-12T00:00:00Z.
@@ -392,8 +441,7 @@ mod tests {
         assert_eq!(
             windows,
             RetentionWindows {
-                account_decision_routine_hours: 72,
-                account_decision_notable_days: 14,
+                account_selection_days: 30,
                 account_observation_days: 7,
                 model_route_decisions_days: 30,
                 model_route_usage_days: 30,
@@ -405,8 +453,7 @@ mod tests {
     #[test]
     fn configured_windows_apply_and_bad_values_fall_back_with_a_warning() {
         let block = json!({
-            "account_decision_routine_hours": 24,
-            "account_decision_notable_days": 0,
+            "account_selection_days": 3,
             "account_observation_days": "seven",
             "model_route_decisions_days": 45,
             "model_route_usage_days": 3,
@@ -416,9 +463,8 @@ mod tests {
         assert_eq!(
             windows,
             RetentionWindows {
-                account_decision_routine_hours: 24,
-                // Below the one-day minimum: raised to it.
-                account_decision_notable_days: 1,
+                // Below the seven-day minimum: raised to it.
+                account_selection_days: 7,
                 // Not a number: the default stays.
                 account_observation_days: 7,
                 model_route_decisions_days: 45,
@@ -430,6 +476,28 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("account_decision_days is not a known key")));
+    }
+
+    #[test]
+    fn the_retired_shadow_windows_are_named_as_removed_and_change_nothing() {
+        let block = json!({
+            "account_decision_routine_hours": 24,
+            "account_decision_notable_days": 2,
+        });
+        let (windows, warnings) = retention_windows_from_value(Some(&block));
+        assert_eq!(windows, RetentionWindows::default());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        for key in [
+            "account_decision_routine_hours",
+            "account_decision_notable_days",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| warning.starts_with(&format!(
+                    "retention.{key} was removed with account-selection shadow mode; delete it"
+                ))),
+                "{warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -447,20 +515,20 @@ mod tests {
             r#"{
                 // comment
                 "model_routing": { "demand_exponent": "steep" },
-                "retention": { "account_decision_routine_hours": 12 }
+                "retention": { "account_selection_days": 12 }
             }"#,
         )
         .unwrap();
         let windows = retention_windows(&path);
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(windows.account_decision_routine_hours, 12);
-        assert_eq!(windows.account_decision_notable_days, 14);
+        assert_eq!(windows.account_selection_days, 12);
+        assert_eq!(windows.account_observation_days, 7);
     }
 
     fn shadow_admit(id: String, created_at: i64) -> AccountDecisionRecord {
         AccountDecisionRecord {
             decision_id: id,
-            mode: DECISION_MODE_SHADOW.into(),
+            mode: "shadow".into(),
             trigger: "observation".into(),
             principal: "reserved:broca".into(),
             admission_id: None,
@@ -480,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn one_pass_deletes_at_most_its_batch_budget_and_the_next_continues() {
+    fn one_pass_purges_at_most_its_shadow_budget_and_the_next_continues() {
         let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-retention-pass-{}",
             std::process::id()
@@ -502,28 +570,26 @@ mod tests {
             .unwrap();
         let budget = PassBudget {
             batch_rows: 4,
-            max_batches_per_table: 3,
+            max_batches_per_table: 1,
+            max_shadow_purge_batches: 3,
             pause: Duration::ZERO,
         };
         let windows = RetentionWindows::default();
-        let mut state = RetentionState::default();
 
-        let first = run_retention_pass(&store, &windows, &mut state, NOW, &budget);
-        assert_eq!(first.account_decisions, 12);
+        // Shadow rows are purged whatever their age, so all 21 go: twelve in
+        // the first pass (three batches of four), the other nine in the second
+        // pass (batches of four, four and one).
+        let first = run_retention_pass(&store, &windows, NOW, &budget);
+        assert_eq!(first.shadow_decisions, 12);
         assert!(!first.drained);
 
-        let second = run_retention_pass(&store, &windows, &mut state, NOW, &budget);
-        assert_eq!(second.account_decisions, 8);
+        let second = run_retention_pass(&store, &windows, NOW, &budget);
+        assert_eq!(second.shadow_decisions, 9);
         assert!(second.drained);
 
-        let left: Vec<String> = store
-            .account_decisions(DECISION_MODE_SHADOW, 100)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.decision_id)
-            .collect();
+        let left = store.account_decisions("shadow", 100).unwrap();
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(left, vec!["young"]);
+        assert!(left.is_empty(), "{left:?}");
     }
 }

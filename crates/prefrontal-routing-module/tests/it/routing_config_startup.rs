@@ -119,6 +119,14 @@ fn config_key_removed_refuses_startup() {
 }
 
 #[test]
+fn account_selection_shadow_refuses_startup_with_the_delete_remedy() {
+    invalid_startup(
+        r#"{"account_selection":{"enabled":true,"shadow":true}}"#,
+        "config_key_removed: account_selection.shadow; delete it; account selection serves directly",
+    );
+}
+
+#[test]
 fn explicit_only_providers_refuses_startup_with_the_exclude_remedy() {
     invalid_startup(
         r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,

@@ -1,30 +1,24 @@
-//! Account selection over the wire: `route.account_for`, the runner reports
-//! that follow it (`route.account_observe`, `route.account_release`), shadow
-//! decisions and their readback (`route.account_shadow_status`).
+//! Account selection over the wire: `route.account_for` and the runner reports
+//! that follow it (`route.account_observe`, `route.account_release`).
 //! `route.account_status` reads quota headroom for cache warming without
-//! admissions, shadow decisions, store access or polling.
+//! admissions, decisions, store access or polling.
 //!
 //! Specification: `docs/designs/account-selection.md` ("Proposed protocol",
-//! "Affinity, persistence and freeze semantics", "Operator pins and rollout"
-//! step 3). The allocator is the pure `prefrontal_routing_core::accounts::decide`;
+//! "Affinity, persistence and freeze semantics", "Operator pins and rollout").
+//! The allocator is the pure `prefrontal_routing_core::accounts::decide`;
 //! this module builds its inputs (the roster joined from the vault listing and
 //! Insula readings, and the stored affinity, fences, exclusions and demand),
 //! commits its result in one store transaction and renders the reply.
 //!
-//! Two flags in the routing file gate everything (`account_selection.enabled`
-//! and `account_selection.shadow`), both off by default:
-//! * With `enabled` off, every account operation refuses with
-//!   `account_selection_disabled` and writes nothing to the serving tables.
-//! * With `shadow` on, routing runs the allocator on a timer (a synthetic new
-//!   cold session per model family), on each `route.account_for` it would
-//!   have been asked while serving is off, and on each observation report. It
-//!   records each decision and its explanation and answers nobody with it, and
-//!   it charges no demand, issues no pin and changes no fence.
+//! One flag in the routing file gates everything (`account_selection.enabled`,
+//! off by default): with it off, every account operation except
+//! `route.account_status` refuses with `account_selection_disabled` and
+//! writes nothing. Every decision routing records is one it answered a
+//! caller with (`mode = 'serve'`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use prefrontal_routing_core::accounts::eligibility::{assess_reading, reserve_for};
 use prefrontal_routing_core::accounts::evidence::{
@@ -44,7 +38,7 @@ use prefrontal_routing_core::{RouteStateResult, RouteStateStoreError};
 use prefrontal_routing_store::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountExclusionRow,
     AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, AccountTx,
-    SqliteRouteStateStore, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
+    SqliteRouteStateStore, DECISION_MODE_SERVE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -61,8 +55,6 @@ pub const ACCOUNT_STATUS_OP: &str = "route.account_status";
 pub const ACCOUNT_OBSERVE_OP: &str = "route.account_observe";
 /// Release an admission that never started, or end a conversation's lease.
 pub const ACCOUNT_RELEASE_OP: &str = "route.account_release";
-/// Read the latest shadow decisions and why they came out as they did.
-pub const ACCOUNT_SHADOW_STATUS_OP: &str = "route.account_shadow_status";
 
 /// The refusal every account operation answers while serving is off.
 pub const DISABLED_CODE: &str = "account_selection_disabled";
@@ -77,17 +69,9 @@ const AFFINITY_IDLE_MS: i64 = 7 * 24 * 60 * 60_000;
 const AFFINITY_TOUCH_MS: i64 = 60_000;
 /// The longest short hold a caller waits out when it does not say.
 const DEFAULT_HOLD_WAIT_S: u64 = 900;
-/// How often the shadow timer runs.
-pub const SHADOW_INTERVAL: Duration = Duration::from_secs(60);
-/// A timer shadow decision identical in outcome and exclusions to the last one
-/// recorded for its provider and family is recorded again only after this
-/// long, so an unchanged pool does not add three rows a minute forever.
-const SHADOW_HEARTBEAT_MS: i64 = 15 * 60_000;
-/// The principal shadow's synthetic requests are made under. No caller can
-/// hold it, so synthetic decisions never touch a real conversation.
-pub const SHADOW_PRINCIPAL: &str = "routing:shadow";
-/// Readback returns at most this many shadow decisions.
-const SHADOW_STATUS_MAX: usize = 200;
+/// The principal a worker-launch preflight decides under. No caller can hold
+/// it, so a preflight never reads or touches a real conversation.
+const PREFLIGHT_PRINCIPAL: &str = "routing:preflight";
 
 // ---------------------------------------------------------------------------
 // Replies
@@ -141,11 +125,7 @@ fn invalid(message: impl Into<String>) -> OpReply {
 pub fn handles(method: &str) -> bool {
     matches!(
         method,
-        ACCOUNT_FOR_OP
-            | ACCOUNT_STATUS_OP
-            | ACCOUNT_OBSERVE_OP
-            | ACCOUNT_RELEASE_OP
-            | ACCOUNT_SHADOW_STATUS_OP
+        ACCOUNT_FOR_OP | ACCOUNT_STATUS_OP | ACCOUNT_OBSERVE_OP | ACCOUNT_RELEASE_OP
     )
 }
 
@@ -291,7 +271,7 @@ fn conversation_hash(salt: &str, principal: &str, conversation_key: &str) -> Str
 /// candidates. The runner's credential read handles it like any revoked credential.
 /// This encoding was introduced before production enabled account serving
 /// (`account_selection.enabled`). With that flag off, handlers refuse admissions;
-/// shadow mode records hypothetical decisions but creates no admission rows.
+/// the former shadow mode recorded hypothetical decisions but created no admission rows.
 /// Thus production has no whole-request fingerprints to migrate. This relies on
 /// serving never having been enabled, not on the 60 s reservation start window:
 /// expired admission rows remain stored and would still use their old hash.
@@ -1056,22 +1036,15 @@ fn parse_account_for(params: &Value) -> Result<AccountForParams, OpReply> {
 /// Handle one account-selection operation. `body` is the whole request
 /// (`{"method", "params"}`); `principal` is the route's attested principal.
 pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpReply {
-    // This query must bypass both serving transactions and disabled-mode shadow
-    // recording. A warming check never reserves or charges quota.
+    // This query bypasses the serving transactions and answers even while
+    // serving is off. A warming check never reserves or charges quota.
     if method == ACCOUNT_STATUS_OP {
         return match decode_params(body) {
             Ok(params) => account_status(&params, ctx),
             Err(reply) => reply,
         };
     }
-    if method == ACCOUNT_SHADOW_STATUS_OP {
-        let params = decode_params(body).unwrap_or(Value::Null);
-        return shadow_status(&params, principal, ctx);
-    }
     if !ctx.flags.enabled {
-        if ctx.flags.shadow {
-            shadow_for_refused_op(method, body, principal, ctx);
-        }
         return OpReply::typed(
             DISABLED_CODE,
             format!("{method} is not served: account selection is disabled in routing policy"),
@@ -1084,15 +1057,7 @@ pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpRe
     };
     match method {
         ACCOUNT_FOR_OP => account_for(&params, principal, ctx),
-        ACCOUNT_OBSERVE_OP => {
-            let reply = observe(&params, principal, ctx);
-            if ctx.flags.shadow {
-                if let Err(error) = shadow_pass(ctx, ShadowTrigger::Observation(&params)) {
-                    tracing::warn!(error = %error.0, "shadow pass after an observation failed");
-                }
-            }
-            reply
-        }
+        ACCOUNT_OBSERVE_OP => observe(&params, principal, ctx),
         ACCOUNT_RELEASE_OP => release(&params, principal, ctx),
         other => OpReply::error("unknown_method", format!("unknown method '{other}'")),
     }
@@ -1316,27 +1281,6 @@ fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
         "warm_ok": matches!(reason, WarmReason::Headroom),
         "reason": reason,
     }))
-}
-
-/// With serving off and shadow on, a refused operation still feeds shadow:
-/// `route.account_for` is decided on the caller's own request, and an
-/// observation triggers a pass whose record carries it. Only shadow decision
-/// rows are written.
-fn shadow_for_refused_op(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) {
-    let Ok(params) = decode_params(body) else {
-        return;
-    };
-    let result = match method {
-        ACCOUNT_FOR_OP => match parse_account_for(&params) {
-            Ok(parsed) => shadow_request(ctx, principal, &parsed, &params).map(|_| ()),
-            Err(_) => Ok(()),
-        },
-        ACCOUNT_OBSERVE_OP => shadow_pass(ctx, ShadowTrigger::Observation(&params)).map(|_| ()),
-        _ => Ok(()),
-    };
-    if let Err(error) = result {
-        tracing::warn!(method, error = %error.0, "shadow decision not recorded");
-    }
 }
 
 fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
@@ -2325,32 +2269,14 @@ fn release(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
 }
 
 // ---------------------------------------------------------------------------
-// Shadow
+// Preflight request
 // ---------------------------------------------------------------------------
 
-/// What made shadow run.
-pub enum ShadowTrigger<'a> {
-    /// The periodic pass: a synthetic new cold session per model family.
-    Timer,
-    /// An observation report, carried whole into the record.
-    Observation(&'a Value),
-}
-
-/// One representative model per scoped family, in the policy's order, for the
-/// synthetic cold requests.
-fn representative_models(policy: &AllocatorPolicy) -> Vec<(ModelFamily, String)> {
-    let mut seen = BTreeSet::new();
-    policy
-        .model_families
-        .iter()
-        .filter(|mapping| seen.insert(mapping.family))
-        .map(|mapping| (mapping.family, mapping.model.clone()))
-        .collect()
-}
-
+/// A synthetic new cold session for `model`, decided by the worker-launch
+/// preflight (`preflight_model`) and never recorded.
 fn synthetic_request(provider: &str, model: &str, key: String) -> AccountRequest {
     AccountRequest {
-        principal: SHADOW_PRINCIPAL.to_string(),
+        principal: PREFLIGHT_PRINCIPAL.to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
         affinity_model: model.to_string(),
@@ -2366,336 +2292,6 @@ fn synthetic_request(provider: &str, model: &str, key: String) -> AccountRequest
         requested_account: None,
         preferred_existing_account: None,
         hold_wait_max_s: DEFAULT_HOLD_WAIT_S,
-    }
-}
-
-/// What makes two decisions "the same" for the timer's change-or-heartbeat
-/// rule: the outcome, the chosen account or refusal code, and every
-/// account's exclusion reasons. Weights and scores move every minute and are
-/// left out.
-fn decision_shape(decision: &Value) -> Value {
-    let accounts: Vec<Value> = decision["explanation"]["accounts"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|note| {
-            let reasons: Vec<Value> = note["exclusions"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|reason| reason["reason"].clone())
-                .collect();
-            json!([note["account_id"], reasons])
-        })
-        .collect();
-    let outcome = &decision["outcome"];
-    json!([
-        outcome["kind"],
-        outcome["account_id"],
-        outcome["credential_id"],
-        outcome["reason"],
-        outcome["code"],
-        accounts,
-    ])
-}
-
-/// Run shadow once for every tracked provider. The timer decides a synthetic
-/// new cold session per model family; an observation decides one synthetic
-/// session for the observed model (Opus when it names none) and carries the
-/// observation in the record. Returns the recorded decision ids.
-pub fn shadow_pass(ctx: &Ctx<'_>, trigger: ShadowTrigger<'_>) -> RouteStateResult<Vec<String>> {
-    // Resolve the in-memory rosters before opening the store transaction, so a
-    // diagnostic write never holds the store lock while acquiring the quota lock.
-    let mut passes = Vec::new();
-    for provider in tracked_providers(ctx) {
-        let provider = provider.as_str();
-        let models: Vec<(ModelFamily, String)> = match &trigger {
-            ShadowTrigger::Timer => representative_models(ctx.policy),
-            ShadowTrigger::Observation(observation) => {
-                let named = observation
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(normalize)
-                    .filter(|model| ctx.policy.family_for_model(model) != ModelFamily::Other);
-                let model = named.or_else(|| {
-                    representative_models(ctx.policy)
-                        .into_iter()
-                        .find(|(family, _)| *family == ModelFamily::Opus)
-                        .map(|(_, model)| model)
-                });
-                model
-                    .map(|model| vec![(ctx.policy.family_for_model(&model), model)])
-                    .unwrap_or_default()
-            }
-        };
-        for (family, model) in models {
-            let roster = roster_for_model(ctx, provider, Some(&model));
-            let trigger_name = match &trigger {
-                ShadowTrigger::Timer => "timer",
-                ShadowTrigger::Observation(_) => "observation",
-            };
-            let request = synthetic_request(
-                provider,
-                &model,
-                format!("shadow:{provider}:{}:{}", family_name(family), ctx.now_ms),
-            );
-            let observation = match &trigger {
-                ShadowTrigger::Observation(observation) => Some((*observation).clone()),
-                ShadowTrigger::Timer => None,
-            };
-            passes.push((
-                provider.to_owned(),
-                family,
-                model,
-                roster,
-                trigger_name,
-                request,
-                observation,
-            ));
-        }
-    }
-    // One observation fans out to several providers. Commit its diagnostic
-    // decisions together rather than flushing the same indexes once per row.
-    ctx.store.account_transaction(|tx| {
-        let mut recorded = Vec::new();
-        let mut fences_by_provider = BTreeMap::<String, Vec<Fence>>::new();
-        let mut demand_by_provider = BTreeMap::<String, Vec<AdmissionDemand>>::new();
-        for (provider, family, model, roster, trigger_name, request, observation) in passes {
-            let fences = match fences_by_provider.get(&provider) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let loaded = load_fences(tx, &provider)?;
-                    fences_by_provider.insert(provider.clone(), loaded.clone());
-                    loaded
-                }
-            };
-            let admissions = match demand_by_provider.get(&provider) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let loaded = load_demand(tx, &provider)?;
-                    demand_by_provider.insert(provider.clone(), loaded.clone());
-                    loaded
-                }
-            };
-            let provider = provider.as_str();
-            let id = (|| {
-                let state = AllocatorState {
-                    roster: roster.roster.clone(),
-                    affinity: None,
-                    fences,
-                    principal_exclusions: Vec::new(),
-                    admissions,
-                    operator_override: None,
-                    policy: ctx.policy.clone(),
-                };
-                let decision = decide(&request, &state, ctx.now_ms);
-                if matches!(trigger, ShadowTrigger::Timer) {
-                    if let Some(last) = tx.latest_decision(
-                        DECISION_MODE_SHADOW,
-                        trigger_name,
-                        provider,
-                        &family_name(family),
-                    )? {
-                        let last_value: Value =
-                            serde_json::from_str(&last.decision_json).unwrap_or(Value::Null);
-                        if ctx.now_ms - last.created_at < SHADOW_HEARTBEAT_MS
-                            && decision_shape(&last_value) == decision_shape(&wire(&decision))
-                        {
-                            return Ok(None);
-                        }
-                    }
-                }
-                let decision_id = new_id("acd");
-                tx.insert_decision(&decision_record(RecordInput {
-                    decision_id: &decision_id,
-                    mode: DECISION_MODE_SHADOW,
-                    trigger: trigger_name,
-                    principal: SHADOW_PRINCIPAL,
-                    admission_id: None,
-                    request_mode: Some("admit"),
-                    decision: &decision,
-                    context: json!({
-                        "synthetic": true,
-                        "request": { "model": model, "caller": "broca", "cold": true },
-                        "roster": roster.context,
-                        "observation": observation,
-                    }),
-                    now_ms: ctx.now_ms,
-                }))?;
-                Ok(Some(decision_id))
-            })()?;
-            recorded.extend(id);
-        }
-        Ok(recorded)
-    })
-}
-
-/// Shadow a caller's own `route.account_for` while serving is off: the
-/// caller's request and its stored affinity are read, nothing is written but
-/// the shadow decision.
-fn shadow_request(
-    ctx: &Ctx<'_>,
-    principal: &str,
-    params: &AccountForParams,
-    raw: &Value,
-) -> RouteStateResult<Option<String>> {
-    let provider = normalize(&params.provider);
-    let roster = roster_for_model(ctx, &provider, Some(&normalize(&params.model)));
-    if !roster
-        .roster
-        .as_ref()
-        .is_some_and(|roster| !roster.accounts.is_empty())
-    {
-        return Ok(None);
-    }
-    ctx.store.account_transaction(|tx| {
-        let affinity_row = match tx.existing_salt()? {
-            Some(salt) => tx.affinity(
-                principal,
-                &conversation_hash(&salt, principal, &params.conversation_key),
-                &provider,
-            )?,
-            None => None,
-        };
-        let state = AllocatorState {
-            roster: roster.roster.clone(),
-            affinity: affinity_row
-                .as_ref()
-                .map(|row| conversation_affinity(row, ctx.now_ms)),
-            fences: load_fences(tx, &provider)?,
-            principal_exclusions: load_exclusions(tx, principal, &params.admission_id)?,
-            admissions: load_demand(tx, &provider)?,
-            operator_override: None,
-            policy: ctx.policy.clone(),
-        };
-        let decision = decide(
-            &params.request(principal, affinity_row.is_none()),
-            &state,
-            ctx.now_ms,
-        );
-        let decision_id = new_id("acd");
-        tx.insert_decision(&decision_record(RecordInput {
-            decision_id: &decision_id,
-            mode: DECISION_MODE_SHADOW,
-            trigger: "request",
-            principal,
-            admission_id: Some(&params.admission_id),
-            request_mode: Some(params.mode.as_str()),
-            decision: &decision,
-            context: json!({ "synthetic": false, "request": raw, "roster": roster.context }),
-            now_ms: ctx.now_ms,
-        }))?;
-        Ok(Some(decision_id))
-    })
-}
-
-/// A one-line reason per account, derived from the recorded explanation.
-fn why(decision: &Value) -> Vec<String> {
-    decision["explanation"]["accounts"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|note| {
-            let account = note["account_id"].as_str().unwrap_or("?");
-            let reasons: Vec<String> = note["exclusions"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|reason| reason["reason"].as_str().map(str::to_owned))
-                .collect();
-            if reasons.is_empty() {
-                format!(
-                    "{account}: eligible, weight {}, pending {} bytes, score {}",
-                    note["weight"], note["pending_bytes"], note["score"]
-                )
-            } else {
-                format!("{account}: excluded ({})", reasons.join(", "))
-            }
-        })
-        .collect()
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ShadowStatusParams {
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// The latest shadow decisions and why. Synthetic decisions are routing's own
-/// and shown to any caller; a decision shadowed from a caller's own request
-/// is shown only to that caller's principal.
-fn shadow_status(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
-    let parsed: ShadowStatusParams = serde_json::from_value(params.clone()).unwrap_or_default();
-    let limit = parsed.limit.unwrap_or(20).clamp(1, SHADOW_STATUS_MAX);
-    let rows = match ctx
-        .store
-        .account_decisions(DECISION_MODE_SHADOW, SHADOW_STATUS_MAX * 4)
-    {
-        Ok(rows) => rows,
-        Err(error) => return store_error(error),
-    };
-    let decisions: Vec<Value> = rows
-        .into_iter()
-        .filter(|row| row.principal == SHADOW_PRINCIPAL || row.principal == principal)
-        .take(limit)
-        .map(|row| {
-            let decision: Value = serde_json::from_str(&row.decision_json).unwrap_or(Value::Null);
-            let context: Value = row
-                .context_json
-                .as_deref()
-                .and_then(|text| serde_json::from_str(text).ok())
-                .unwrap_or(Value::Null);
-            json!({
-                "decision_id": row.decision_id,
-                "created_at": rfc3339(row.created_at),
-                "trigger": row.trigger,
-                "principal": row.principal,
-                "provider": row.provider,
-                "model": row.model,
-                "family": row.family,
-                "outcome": row.outcome,
-                "code": row.code,
-                "account_id": row.account_id,
-                "credential_id": row.credential_id,
-                "policy_version": row.policy_version,
-                "why": why(&decision),
-                "decision": decision,
-                "context": context,
-            })
-        })
-        .collect();
-    OpReply::Result(json!({
-        "shadow_enabled": ctx.flags.shadow,
-        "serve_enabled": ctx.flags.enabled,
-        "decisions": decisions,
-    }))
-}
-
-/// The periodic shadow pass. It re-reads the flags every cycle, so turning
-/// shadow on or off in the routing file takes effect within one interval, and
-/// does nothing while shadow is off.
-pub async fn shadow_loop(
-    store: std::sync::Arc<SqliteRouteStateStore>,
-    accounts: SharedAccountQuota,
-    config_path: std::path::PathBuf,
-) {
-    let policy = AllocatorPolicy::default();
-    loop {
-        tokio::time::sleep(SHADOW_INTERVAL).await;
-        let flags = crate::config_overrides::account_selection_flags(&config_path);
-        if !flags.shadow {
-            continue;
-        }
-        let ctx = Ctx {
-            store: store.as_ref(),
-            accounts: Some(&accounts),
-            flags,
-            policy: &policy,
-            now_ms: now_ms(),
-        };
-        if let Err(error) = shadow_pass(&ctx, ShadowTrigger::Timer) {
-            tracing::warn!(error = %error.0, "account selection shadow pass failed");
-        }
     }
 }
 
@@ -2883,11 +2479,11 @@ mod tests {
             self.store = Some(open_store(&self.dir));
         }
 
-        fn ctx(&self, enabled: bool, shadow: bool, now_ms: i64) -> Ctx<'_> {
+        fn ctx(&self, enabled: bool, now_ms: i64) -> Ctx<'_> {
             Ctx {
                 store: self.store(),
                 accounts: Some(&self.accounts),
-                flags: AccountSelectionFlags { enabled, shadow },
+                flags: AccountSelectionFlags { enabled },
                 policy: &self.policy,
                 now_ms,
             }
@@ -2896,12 +2492,6 @@ mod tests {
         fn call(&self, ctx: &Ctx<'_>, method: &str, principal: &str, params: Value) -> OpReply {
             let body = serde_json::to_vec(&json!({ "method": method, "params": params })).unwrap();
             handle(method, &body, principal, ctx)
-        }
-
-        fn shadow_rows(&self) -> Vec<AccountDecisionRecord> {
-            self.store()
-                .account_decisions(DECISION_MODE_SHADOW, 1000)
-                .unwrap()
         }
 
         fn serve_rows(&self) -> Vec<AccountDecisionRecord> {
@@ -2943,7 +2533,7 @@ mod tests {
     fn account_exhaustion_fences_only_its_account_and_opus_seats_with_a_93_percent_sibling() {
         use prefrontal_routing_core::{RouteStateStore, RouteStateUpdate, RouteWallClass};
         let fixture = fixture("account-wall-versus-seat");
-        let ctx = fixture.ctx(true, false, NOW);
+        let ctx = fixture.ctx(true, NOW);
         let first = result(fixture.call(
             &ctx,
             ACCOUNT_FOR_OP,
@@ -3121,12 +2711,7 @@ mod tests {
         params["provider"] = json!("openai");
         params["model"] = json!("gpt-6");
         params["affinity_model"] = json!("gpt-6");
-        let admitted = result(rig.call(
-            &rig.ctx(true, false, NOW),
-            "route.account_for",
-            BROCA,
-            params,
-        ));
+        let admitted = result(rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params));
         assert_eq!(admitted["account"]["account_id"], ACCOUNT_B);
         assert_eq!(admitted["account"]["provider"], "openai");
         assert_eq!(admitted["account"]["refresh_adapter"], "openai");
@@ -3173,12 +2758,7 @@ mod tests {
         params["provider"] = json!("google");
         params["model"] = json!("antigravity-gemini-3.8-flash");
         params["affinity_model"] = params["model"].clone();
-        let admitted = result(rig.call(
-            &rig.ctx(true, false, NOW),
-            "route.account_for",
-            BROCA,
-            params,
-        ));
+        let admitted = result(rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params));
         assert_eq!(admitted["account"]["account_id"], ACCOUNT_B);
         assert_eq!(admitted["account"]["refresh_adapter"], "antigravity");
     }
@@ -3223,12 +2803,8 @@ mod tests {
         params["model"] = json!("gpt-6");
         params["affinity_model"] = json!("gpt-6");
         assert_eq!(
-            result(rig.call(
-                &rig.ctx(true, false, NOW),
-                "route.account_for",
-                BROCA,
-                params
-            ))["account"]["account_id"],
+            result(rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params))["account"]
+                ["account_id"],
             ACCOUNT_B
         );
     }
@@ -3265,7 +2841,7 @@ mod tests {
         params["model"] = json!("new-model");
         params["affinity_model"] = json!("new-model");
         let admitted = result(rig.call(
-            &rig.ctx(true, false, NOW),
+            &rig.ctx(true, NOW),
             "route.account_for",
             BROCA,
             params.clone(),
@@ -3274,13 +2850,8 @@ mod tests {
         assert_eq!(admitted["account"]["refresh_adapter"], "unrelated-adapter");
         params["provider"] = json!("untracked");
         assert_eq!(
-            rig.call(
-                &rig.ctx(true, false, NOW),
-                "route.account_for",
-                BROCA,
-                params
-            )
-            .code(),
+            rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params)
+                .code(),
             Some("account_selection_unsupported")
         );
     }
@@ -3376,13 +2947,8 @@ mod tests {
         params["model"] = json!("antigravity-gemini-3.8-flash");
         params["affinity_model"] = params["model"].clone();
         assert_eq!(
-            rig.call(
-                &rig.ctx(true, false, NOW),
-                "route.account_for",
-                BROCA,
-                params
-            )
-            .code(),
+            rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params)
+                .code(),
             Some("account_selection_unsupported")
         );
     }
@@ -3413,7 +2979,7 @@ mod tests {
             .unwrap()
             .identities
             .extend(gemini_roster.identities);
-        let ctx = rig.ctx(true, false, NOW);
+        let ctx = rig.ctx(true, NOW);
         let mut params = admit_params("gemini-cli-initial", "google-product-collision", "broca");
         params["provider"] = json!("google");
         params["model"] = json!("gemini-2.5-flash");
@@ -3501,7 +3067,7 @@ mod tests {
                 .unwrap()
                 .entry["usage"]["primary"]["usedPercent"] = json!(used);
             let reply = result(fixture.call(
-                &fixture.ctx(true, false, NOW),
+                &fixture.ctx(true, NOW),
                 ACCOUNT_STATUS_OP,
                 BROCA,
                 json!({ "provider": "openai", "account_id": ACCOUNT_A }),
@@ -3540,7 +3106,7 @@ mod tests {
         fixture.policy.reserve_five_hour = 10.0;
         fixture.policy.reserve_seven_day = 1.0;
         let reply = result(fixture.call(
-            &fixture.ctx(true, false, NOW),
+            &fixture.ctx(true, NOW),
             ACCOUNT_STATUS_OP,
             BROCA,
             json!({ "provider": "google", "account_id": ACCOUNT_A }),
@@ -3566,10 +3132,10 @@ mod tests {
         let fixture = fixture("status-headroom");
         assert_status_vector(
             &fixture,
-            &fixture.ctx(true, false, NOW),
+            &fixture.ctx(true, NOW),
             include_str!("../../../test-vectors/route-account-status-v1/warm_ok.json"),
         );
-        let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+        let reply = status(&fixture, &fixture.ctx(true, NOW), ACCOUNT_A);
         assert_eq!(reply["warm_ok"], true);
         assert_eq!(reply["reason"], json!({ "code": "headroom" }));
         assert_eq!(reply["provider"], "anthropic");
@@ -3603,7 +3169,7 @@ mod tests {
             .entry["usage"]["primary"]["usedPercent"] = json!(99.5);
         assert_status_vector(
             &fixture,
-            &fixture.ctx(true, false, NOW),
+            &fixture.ctx(true, NOW),
             include_str!("../../../test-vectors/route-account-status-v1/within_reserve.json"),
         );
         fixture.policy.reserve_five_hour = 12.0;
@@ -3643,7 +3209,7 @@ mod tests {
                 .get_mut(&("claude".into(), ACCOUNT_A.into()))
                 .unwrap()
                 .entry = entry;
-            let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+            let reply = status(&fixture, &fixture.ctx(true, NOW), ACCOUNT_A);
             assert_eq!(reply["warm_ok"], false, "{kind}");
             assert_eq!(
                 reply["reason"],
@@ -3670,7 +3236,7 @@ mod tests {
             .get_mut(&("claude".into(), ACCOUNT_A.into()))
             .unwrap()
             .entry = entry;
-        let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+        let reply = status(&fixture, &fixture.ctx(true, NOW), ACCOUNT_A);
         assert_eq!(reply["warm_ok"], true);
         assert_eq!(reply["windows"][0]["kind"], "producer_weekly");
         assert_eq!(reply["windows"][1]["kind"], "five_hour");
@@ -3682,7 +3248,7 @@ mod tests {
         let fixture = fixture("status-stale");
         // The reading was observed a minute before NOW: exactly the allocator's
         // excluded boundary, not a separate warming timeout.
-        let ctx = fixture.ctx(true, false, NOW - 60_000 + fixture.policy.excluded_band_ms);
+        let ctx = fixture.ctx(true, NOW - 60_000 + fixture.policy.excluded_band_ms);
         assert_status_vector(
             &fixture,
             &ctx,
@@ -3700,7 +3266,7 @@ mod tests {
         let mut fixture = fixture("status-freshness");
         fixture.policy.full_band_ms = 2 * 60_000;
         fixture.policy.excluded_band_ms = 10 * 60_000;
-        let discounted = fixture.ctx(true, false, NOW + 60_000);
+        let discounted = fixture.ctx(true, NOW + 60_000);
         let reply = status(&fixture, &discounted, ACCOUNT_A);
         assert_eq!(reply["age_band"], "discounted");
         assert_eq!(reply["warm_ok"], true);
@@ -3727,7 +3293,7 @@ mod tests {
                 .get_mut(&("claude".into(), ACCOUNT_A.into()))
                 .unwrap()
                 .entry = entry;
-            let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+            let reply = status(&fixture, &fixture.ctx(true, NOW), ACCOUNT_A);
             assert_eq!(reply["warm_ok"], expected, "{field}");
             assert_eq!(
                 reply["reason"]["code"],
@@ -3744,7 +3310,7 @@ mod tests {
     fn account_status_unknown_account_is_not_a_warming_target() {
         let fixture = fixture("status-unknown");
         for account in ["unknown", INSULA_ONLY] {
-            let reply = status(&fixture, &fixture.ctx(true, false, NOW), account);
+            let reply = status(&fixture, &fixture.ctx(true, NOW), account);
             assert_eq!(reply["warm_ok"], false);
             assert_eq!(reply["reason"], json!({ "code": "account_unknown" }));
             assert_eq!(reply["observed_at"], Value::Null);
@@ -3755,7 +3321,7 @@ mod tests {
     #[test]
     fn account_status_missing_or_invalid_windows_stop_warming() {
         let fixture = fixture("status-missing");
-        let reply = status(&fixture, &fixture.ctx(true, false, NOW), VAULT_ONLY);
+        let reply = status(&fixture, &fixture.ctx(true, NOW), VAULT_ONLY);
         assert_eq!(reply["warm_ok"], false);
         assert_eq!(reply["reason"]["code"], "reading_missing");
         for usage in [
@@ -3776,7 +3342,7 @@ mod tests {
                 .get_mut(&("claude".into(), ACCOUNT_A.into()))
                 .unwrap()
                 .entry = entry;
-            let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+            let reply = status(&fixture, &fixture.ctx(true, NOW), ACCOUNT_A);
             assert_eq!(reply["warm_ok"], false);
             assert_eq!(reply["reason"]["code"], "reading_missing");
         }
@@ -3789,7 +3355,7 @@ mod tests {
             .get_mut(&("claude".into(), ACCOUNT_A.into()))
             .unwrap()
             .tombstoned_at_ms = Some(NOW);
-        let reply = status(&fixture, &fixture.ctx(true, false, NOW), ACCOUNT_A);
+        let reply = status(&fixture, &fixture.ctx(true, NOW), ACCOUNT_A);
         assert_eq!(reply["warm_ok"], false);
         assert_eq!(reply["reason"]["code"], "reading_missing");
     }
@@ -3797,7 +3363,7 @@ mod tests {
     #[test]
     fn account_status_disabled_never_allows_warming() {
         let fixture = fixture("status-disabled");
-        let reply = status(&fixture, &fixture.ctx(false, true, NOW), ACCOUNT_A);
+        let reply = status(&fixture, &fixture.ctx(false, NOW), ACCOUNT_A);
         assert_eq!(reply["warm_ok"], false);
         assert_eq!(
             reply["reason"],
@@ -3806,7 +3372,7 @@ mod tests {
     }
 
     #[test]
-    fn account_status_writes_nothing_even_in_shadow_mode() {
+    fn account_status_writes_nothing_whether_serving_is_on_or_off() {
         let fixture = fixture("status-no-writes");
         // data_version on a separate connection changes for any committed write
         // on the store connection, including tables outside account serving.
@@ -3817,8 +3383,8 @@ mod tests {
                 .unwrap()
         };
         let before = version();
-        for (enabled, shadow) in [(true, false), (true, true), (false, true)] {
-            let ctx = fixture.ctx(enabled, shadow, NOW);
+        for enabled in [true, false] {
+            let ctx = fixture.ctx(enabled, NOW);
             for account in [ACCOUNT_A, VAULT_ONLY, "unknown"] {
                 status(&fixture, &ctx, account);
             }
@@ -3829,7 +3395,6 @@ mod tests {
             "a quota read must not commit any store writes"
         );
         assert_eq!(fixture.store().account_serving_counts().unwrap().total(), 0);
-        assert!(fixture.shadow_rows().is_empty());
         assert!(fixture.serve_rows().is_empty());
     }
 
@@ -3851,7 +3416,7 @@ mod tests {
                 .unwrap();
         };
         apply(&b);
-        let ctx = fixture.ctx(true, false, NOW);
+        let ctx = fixture.ctx(true, NOW);
         let (code, message) = preflight_model(&ctx, "anthropic", "claude-opus-5-5").unwrap_err();
         assert_eq!(code, "account_pool_reserve_limited");
         assert!(message.contains("until 2026-09-29T14:00:00Z"), "{message}");
@@ -3867,7 +3432,7 @@ mod tests {
     #[test]
     fn every_account_op_refuses_with_account_selection_disabled_and_writes_nothing() {
         let fixture = fixture("disabled");
-        let ctx = fixture.ctx(false, false, NOW);
+        let ctx = fixture.ctx(false, NOW);
         let calls = [
             (
                 ACCOUNT_FOR_OP,
@@ -3901,132 +3466,7 @@ mod tests {
         );
         assert_eq!(reply.code(), Some(DISABLED_CODE));
         assert_eq!(fixture.store().account_serving_counts().unwrap().total(), 0);
-        assert!(fixture.shadow_rows().is_empty());
         assert!(fixture.serve_rows().is_empty());
-    }
-
-    #[test]
-    fn a_shadow_pass_records_a_decision_with_an_explanation_and_serves_nothing() {
-        let fixture = fixture("shadow");
-        let ctx = fixture.ctx(false, true, NOW);
-        let recorded = shadow_pass(&ctx, ShadowTrigger::Timer).unwrap();
-        // One synthetic cold session per model family: Fable, Mythos, Opus.
-        assert_eq!(recorded.len(), 3);
-        let rows = fixture.shadow_rows();
-        assert_eq!(rows.len(), 3);
-        let opus = rows
-            .iter()
-            .find(|row| row.family == "opus")
-            .expect("opus decision");
-        assert_eq!(opus.principal, SHADOW_PRINCIPAL);
-        assert_eq!(opus.trigger, "timer");
-        assert_eq!(opus.outcome, "admit");
-        assert_eq!(opus.code, "cold_scored");
-        let decision: Value = serde_json::from_str(&opus.decision_json).unwrap();
-        let notes = decision["explanation"]["accounts"].as_array().unwrap();
-        let ids: Vec<&str> = notes
-            .iter()
-            .map(|note| note["account_id"].as_str().unwrap())
-            .collect();
-        assert!(ids.contains(&ACCOUNT_A) && ids.contains(&ACCOUNT_B) && ids.contains(&VAULT_ONLY));
-        let unread = notes
-            .iter()
-            .find(|note| note["account_id"] == VAULT_ONLY)
-            .unwrap();
-        assert_eq!(unread["exclusions"][0]["reason"], "quota_missing");
-        // Shadow charged no demand, issued no pin and admitted nothing.
-        assert_eq!(fixture.store().account_serving_counts().unwrap().total(), 0);
-
-        // An unchanged pool a minute later adds no rows; a caller's request
-        // while serving is off is refused, and shadowed.
-        let later = fixture.ctx(false, true, NOW + 60_000);
-        assert!(shadow_pass(&later, ShadowTrigger::Timer)
-            .unwrap()
-            .is_empty());
-        let reply = fixture.call(
-            &later,
-            ACCOUNT_FOR_OP,
-            BROCA,
-            admit_params("adm-9", "consult:c:s:1", "broca"),
-        );
-        assert_eq!(
-            reply.code(),
-            Some(DISABLED_CODE),
-            "shadow never answers with an account"
-        );
-        let OpReply::Error { detail, .. } = &reply else {
-            unreachable!()
-        };
-        assert!(detail.as_ref().unwrap().get("account").is_none());
-        let rows = fixture.shadow_rows();
-        let request_row = rows
-            .iter()
-            .find(|row| row.trigger == "request")
-            .expect("shadowed request");
-        assert_eq!(request_row.principal, BROCA);
-        assert_eq!(request_row.admission_id.as_deref(), Some("adm-9"));
-        assert_eq!(request_row.outcome, "admit");
-        assert_eq!(fixture.store().account_serving_counts().unwrap().total(), 0);
-        assert!(fixture.serve_rows().is_empty());
-
-        // Readback shows the shadow decisions and why.
-        let status = result(fixture.call(&later, ACCOUNT_SHADOW_STATUS_OP, "direct", json!({})));
-        assert_eq!(status["shadow_enabled"], true);
-        let decisions = status["decisions"].as_array().unwrap();
-        // The request-shadowed decision belongs to Broca's principal only.
-        assert_eq!(decisions.len(), 3);
-        assert!(decisions
-            .iter()
-            .all(|row| !row["why"].as_array().unwrap().is_empty()));
-        let broca_view = result(fixture.call(&later, ACCOUNT_SHADOW_STATUS_OP, BROCA, json!({})));
-        assert_eq!(broca_view["decisions"].as_array().unwrap().len(), 4);
-    }
-
-    #[test]
-    fn shadow_pass_batches_all_families_atomically() {
-        let fixture = fixture("shadow-atomic");
-        let conn = rusqlite::Connection::open(fixture.dir.join("store.db")).unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER reject_opus BEFORE INSERT ON account_decision
-            WHEN NEW.family = 'opus' BEGIN SELECT RAISE(ABORT, 'fixture refusal'); END",
-        )
-        .unwrap();
-        let ctx = fixture.ctx(false, true, NOW);
-        assert!(shadow_pass(&ctx, ShadowTrigger::Timer).is_err());
-        assert!(
-            fixture.shadow_rows().is_empty(),
-            "earlier families must roll back with the refused family"
-        );
-    }
-
-    #[test]
-    fn with_serving_off_an_observation_writes_one_shadow_record_carrying_it() {
-        let fixture = fixture("observe-shadow");
-        let ctx = fixture.ctx(false, true, NOW);
-        let observation = json!({
-            "event_id": "attempt-1",
-            "caller": { "runner": "broca" },
-            "kind": "account_limit_exhausted",
-            "admission_id": "adm-unknown",
-            "model": "claude-opus-5-5",
-            "limit_window": "seven_day",
-            "observed_at_ms": NOW - 1_000,
-        });
-        let reply = fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, observation.clone());
-        assert_eq!(reply.code(), Some(DISABLED_CODE));
-        let rows = fixture.shadow_rows();
-        assert_eq!(rows.len(), 1, "one shadow record per tracked provider");
-        assert_eq!(rows[0].trigger, "observation");
-        assert_eq!(rows[0].family, "opus");
-        let context: Value =
-            serde_json::from_str(rows[0].context_json.as_deref().unwrap()).unwrap();
-        assert_eq!(context["observation"], observation);
-        let counts = fixture.store().account_serving_counts().unwrap();
-        assert_eq!(
-            counts.total(),
-            0,
-            "no observation row, fence or exclusion: {counts:?}"
-        );
     }
 
     #[test]
@@ -4066,10 +3506,15 @@ mod tests {
             "emails stay hidden"
         );
 
-        // The shadow record carries the same gaps.
-        let ctx = fixture.ctx(false, true, NOW);
-        shadow_pass(&ctx, ShadowTrigger::Timer).unwrap();
-        let row = &fixture.shadow_rows()[0];
+        // The served decision's record carries the same gaps.
+        let ctx = fixture.ctx(true, NOW);
+        result(fixture.call(
+            &ctx,
+            ACCOUNT_FOR_OP,
+            BROCA,
+            admit_params("adm-gap", "k-gap", "broca"),
+        ));
+        let row = &fixture.serve_rows()[0];
         let context: Value = serde_json::from_str(row.context_json.as_deref().unwrap()).unwrap();
         assert_eq!(
             context["roster"]["gaps"]["insula_only"][0]["account_id"],
@@ -4083,7 +3528,7 @@ mod tests {
             allocator_roster(&guard, "anthropic", NOW + 24 * 60 * 60_000)
         };
         assert_eq!(old.context["past_max_age"], true);
-        let ctx = fixture.ctx(true, false, NOW + 24 * 60 * 60_000);
+        let ctx = fixture.ctx(true, NOW + 24 * 60 * 60_000);
         let reply = fixture.call(
             &ctx,
             ACCOUNT_FOR_OP,
@@ -4096,7 +3541,7 @@ mod tests {
     #[test]
     fn different_candidates_replay_the_stored_decision_without_charging() {
         let fixture = fixture("replay-candidates");
-        let ctx = fixture.ctx(true, false, NOW);
+        let ctx = fixture.ctx(true, NOW);
         let mut params = admit_params("adm-retry", "broca:retry", "broca");
         params["candidates"] = json!({
             "view_digest": "vault-before",
@@ -4212,7 +3657,7 @@ mod tests {
     #[test]
     fn a_served_pin_survives_a_reopen_and_renewal_compare_and_sets_on_it() {
         let mut fixture = fixture("serve");
-        let ctx = fixture.ctx(true, false, NOW);
+        let ctx = fixture.ctx(true, NOW);
         let params = admit_params("adm-1", "opencode:host:session-1", "anthropic-auth");
         let reply = result(fixture.call(&ctx, ACCOUNT_FOR_OP, BROCA, params.clone()));
         assert_eq!(
@@ -4248,7 +3693,7 @@ mod tests {
 
         fixture.reopen();
         let later = NOW + 30_000;
-        let ctx = fixture.ctx(true, false, later);
+        let ctx = fixture.ctx(true, later);
         let mut renew = admit_params("adm-2", "opencode:host:session-1", "anthropic-auth");
         renew["mode"] = json!("renew");
         renew["expected_pin"] = json!({ "id": pin_id, "generation": 1 });
@@ -4298,7 +3743,7 @@ mod tests {
     #[test]
     fn observations_and_releases_act_only_on_the_principals_own_admission() {
         let fixture = fixture("observe");
-        let ctx = fixture.ctx(true, false, NOW);
+        let ctx = fixture.ctx(true, NOW);
         let admitted = result(fixture.call(
             &ctx,
             ACCOUNT_FOR_OP,
@@ -4372,7 +3817,7 @@ mod tests {
             json!({ "admission_id": "adm-2" }),
         ));
         assert_eq!(second["release"]["released"], false);
-        let late = fixture.ctx(true, false, NOW + 120_000);
+        let late = fixture.ctx(true, NOW + 120_000);
         let started = result(fixture.call(
             &late,
             ACCOUNT_OBSERVE_OP,
@@ -4397,7 +3842,7 @@ mod tests {
     #[test]
     fn broca_raw_headers_preserve_unknowns_and_confirm_only_raw_exhaustion() {
         let fixture = fixture("raw-headers");
-        let ctx = fixture.ctx(true, false, NOW);
+        let ctx = fixture.ctx(true, NOW);
         result(fixture.call(
             &ctx,
             ACCOUNT_FOR_OP,
@@ -4453,7 +3898,7 @@ mod tests {
     #[test]
     fn broca_transport_failure_without_headers_records_no_quota_evidence() {
         let fixture = fixture("no-headers");
-        let ctx = fixture.ctx(true, false, NOW);
+        let ctx = fixture.ctx(true, NOW);
         result(fixture.call(
             &ctx,
             ACCOUNT_FOR_OP,
@@ -4480,7 +3925,7 @@ mod tests {
     #[test]
     fn broca_run_finished_ends_lease_and_later_release_is_noop() {
         let fixture = fixture("finish-lease");
-        let ctx = fixture.ctx(true, false, NOW);
+        let ctx = fixture.ctx(true, NOW);
         result(fixture.call(
             &ctx,
             ACCOUNT_FOR_OP,
@@ -4497,7 +3942,7 @@ mod tests {
             }),
         ));
         let finish_time = NOW + 10_000;
-        let ctx = fixture.ctx(true, false, finish_time);
+        let ctx = fixture.ctx(true, finish_time);
         let finish = json!({ "event_id": "lineage:5", "caller": { "runner": "broca" },
             "kind": "run_finished", "admission_id": "adm-finish", "run_id": "run-finish",
             "terminal_reason": "success", "upstream_origin": "upstream", "headers": {
@@ -4536,7 +3981,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let later = fixture.ctx(true, false, finish_time + 1000);
+        let later = fixture.ctx(true, finish_time + 1000);
         let mut new_finish = finish;
         new_finish["event_id"] = json!("lineage:6");
         new_finish.as_object_mut().unwrap().remove("headers");

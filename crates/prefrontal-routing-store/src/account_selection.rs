@@ -1,4 +1,4 @@
-//! Persistence for account selection: decisions (served and shadow),
+//! Persistence for account selection: served decisions,
 //! conversation affinity, pin generations, admissions and the demand they
 //! charge, short holds, runner observations, confirmed-exhaustion fences and
 //! per-admission refusal exclusions. Specification:
@@ -9,7 +9,7 @@
 //! fences, decide, write the result) inside [`SqliteRouteStateStore::account_transaction`],
 //! so concurrent admissions serialize and the reply is sent only after the
 //! commit. Nothing here deletes a row: expiry is a comparison with the clock.
-//! Old shadow decisions and runner observations are removed only by the
+//! Old account history and runner observations are removed only by the
 //! bounded retention batches in `retention.rs`.
 
 use prefrontal_routing_core::RouteStateResult;
@@ -17,11 +17,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, Transact
 
 use super::{err, SqliteRouteStateStore};
 
-/// `account_decision.mode` for a decision routing answered a caller with.
+/// `account_decision.mode` for a decision routing answered a caller with,
+/// the only mode routing writes. (The schema also allows `shadow`, from the
+/// retired shadow mode; retention purges those rows.)
 pub const DECISION_MODE_SERVE: &str = "serve";
-/// `account_decision.mode` for a decision computed and recorded but never
-/// returned to anyone.
-pub const DECISION_MODE_SHADOW: &str = "shadow";
 
 /// One recorded account decision. `decision_json` is the allocator's whole
 /// decision (outcome and explanation); `context_json` is what the caller of
@@ -233,14 +232,6 @@ const DECISION_COLUMNS: &str =
     "decision_id, mode, trigger, principal, admission_id, request_mode, \
      provider, model, family, outcome, code, account_id, credential_id, policy_version, \
      decision_json, context_json, created_at";
-
-fn latest_decision_sql() -> String {
-    format!(
-        "SELECT {DECISION_COLUMNS} FROM account_decision \
-         WHERE mode = ?1 AND trigger = ?2 AND provider = ?3 AND family = ?4 \
-         ORDER BY created_at DESC, rowid DESC LIMIT 1"
-    )
-}
 
 fn decision_from_row(row: &Row<'_>) -> rusqlite::Result<AccountDecisionRecord> {
     Ok(AccountDecisionRecord {
@@ -926,25 +917,6 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
-    /// The newest decision recorded in `mode` for this trigger, provider and
-    /// model family.
-    pub fn latest_decision(
-        &self,
-        mode: &str,
-        trigger: &str,
-        provider: &str,
-        family: &str,
-    ) -> RouteStateResult<Option<AccountDecisionRecord>> {
-        self.conn
-            .query_row(
-                &latest_decision_sql(),
-                params![mode, trigger, provider, family],
-                decision_from_row,
-            )
-            .optional()
-            .map_err(err)
-    }
-
     pub fn insert_observation(&self, row: &AccountObservationRow) -> RouteStateResult<()> {
         self.conn
             .execute(
@@ -967,37 +939,6 @@ impl AccountTx<'_> {
             )
             .map(|_| ())
             .map_err(err)
-    }
-}
-
-#[cfg(test)]
-mod io_tests {
-    use super::*;
-
-    #[test]
-    fn shadow_heartbeat_uses_an_exact_tuple_seek_without_sorting() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(crate::MIGRATION_044).unwrap();
-        conn.execute_batch(crate::MIGRATION_045).unwrap();
-        let sql = format!("EXPLAIN QUERY PLAN {}", latest_decision_sql());
-        let details = conn
-            .prepare(&sql)
-            .unwrap()
-            .query_map(params!["shadow", "timer", "anthropic", "opus"], |r| {
-                r.get::<_, String>(3)
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert!(
-            details.iter().any(|d| d.contains("account_decision_latest")
-                && d.contains("mode=? AND trigger=? AND provider=? AND family=?")),
-            "{details:?}"
-        );
-        assert!(
-            details.iter().all(|d| !d.contains("TEMP B-TREE")),
-            "{details:?}"
-        );
     }
 }
 

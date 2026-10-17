@@ -6,8 +6,7 @@
     "account_selection": {
       "$ref": "#/$defs/AccountSelectionFlags",
       "default": {
-        "enabled": false,
-        "shadow": false
+        "enabled": false
       }
     },
     "catalog": {
@@ -117,16 +116,11 @@
   "additionalProperties": false,
   "$defs": {
     "AccountSelectionFlags": {
-      "description": "The account-selection rollout flags (`\"account_selection\"` in the routing\nfile). Both are off unless the file turns them on.",
+      "description": "The account-selection flag (`\"account_selection\"` in the routing file).\nOff unless the file turns it on.",
       "type": "object",
       "properties": {
         "enabled": {
           "description": "Serve `route.account_for` and accept its reports. Off: every account\noperation refuses with `account_selection_disabled`.",
-          "type": "boolean",
-          "default": false
-        },
-        "shadow": {
-          "description": "Compute account decisions without serving them and record them for\ncomparison: the step before `enabled`.",
           "type": "boolean",
           "default": false
         }

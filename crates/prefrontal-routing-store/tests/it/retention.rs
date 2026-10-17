@@ -1,16 +1,15 @@
-//! Retention batches: each deletes only rows past their window, keeps
-//! notable account decisions (holds and refusals) longer than routine ones,
-//! never deletes serve decisions or rows something still references, and
-//! touches at most the requested number of rows per call.
+//! Retention batches: each deletes only rows past their window, purges the
+//! retired shadow decisions whatever their age, never deletes a row
+//! something still references, and touches at most the requested number of
+//! rows per call.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prefrontal_routing_core::{DecisionInput, RouteStateStore};
 use prefrontal_routing_store::{
-    dev_descriptor, AccountAdmissionRow, AccountDecisionRecord, AccountExclusionRow,
-    AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, DecisionRetentionCursor,
-    RetentionBatch, SqliteRouteStateStore, DECISION_MODE_SERVE, DECISION_MODE_SHADOW,
-    ROUTINE_REFUSAL_CODE,
+    dev_descriptor, AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord,
+    AccountExclusionRow, AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow,
+    AffinityRetentionBatch, SqliteRouteStateStore, DECISION_MODE_SERVE,
 };
 use rusqlite::{params, Connection};
 
@@ -20,9 +19,11 @@ const HOUR: i64 = 60 * 60_000;
 const DAY: i64 = 24 * HOUR;
 /// The test clock, 2026-10-12T00:00:00Z.
 const NOW: i64 = 1_791_763_200_000;
-/// The default windows: 72 hours for routine decisions, 14 days for notable.
-const ROUTINE_BEFORE: i64 = NOW - 72 * HOUR;
-const NOTABLE_BEFORE: i64 = NOW - 14 * DAY;
+/// The default account-selection window: 30 days.
+const BEFORE: i64 = NOW - 30 * DAY;
+/// The mode the retired shadow mode recorded its decisions under.
+const SHADOW: &str = "shadow";
+const PRINCIPAL: &str = "reserved:broca";
 
 struct Rig {
     dir: std::path::PathBuf,
@@ -48,6 +49,20 @@ impl Rig {
         SqliteRouteStateStore::open(&dev_descriptor("prefrontal-routing", path))
             .expect("open route-state store")
     }
+
+    /// The ids in `column` of `table`, sorted.
+    fn ids(&self, table: &str, column: &str) -> Vec<String> {
+        let connection = Connection::open(self.db_path()).unwrap();
+        let mut statement = connection
+            .prepare(&format!("SELECT {column} FROM {table} ORDER BY {column}"))
+            .unwrap();
+        let ids = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        ids
+    }
 }
 
 impl Drop for Rig {
@@ -66,8 +81,13 @@ fn decision(
     AccountDecisionRecord {
         decision_id: id.into(),
         mode: mode.into(),
-        trigger: "observation".into(),
-        principal: "reserved:broca".into(),
+        trigger: if mode == SHADOW {
+            "observation"
+        } else {
+            "request"
+        }
+        .into(),
+        principal: PRINCIPAL.into(),
         admission_id: None,
         request_mode: Some("admit".into()),
         provider: "anthropic".into(),
@@ -96,7 +116,7 @@ fn insert_decisions(store: &SqliteRouteStateStore, rows: &[AccountDecisionRecord
 }
 
 fn decision_ids(store: &SqliteRouteStateStore) -> Vec<String> {
-    let mut ids: Vec<String> = [DECISION_MODE_SHADOW, DECISION_MODE_SERVE]
+    let mut ids: Vec<String> = [SHADOW, DECISION_MODE_SERVE]
         .iter()
         .flat_map(|mode| store.account_decisions(mode, 10_000).unwrap())
         .map(|row| row.decision_id)
@@ -105,17 +125,14 @@ fn decision_ids(store: &SqliteRouteStateStore) -> Vec<String> {
     ids
 }
 
-/// Run batches until one comes back short, as the routing module's pass does.
-fn prune_all(store: &SqliteRouteStateStore, limit: usize) -> usize {
-    let mut cursor = DecisionRetentionCursor::default();
+/// Run `batch` until one comes back short, as the routing module's pass does.
+fn drain(limit: usize, mut batch: impl FnMut(usize) -> usize) -> usize {
     let mut deleted = 0;
     for _ in 0..1_000 {
-        let batch = store
-            .prune_account_decisions(ROUTINE_BEFORE, NOTABLE_BEFORE, &mut cursor, limit)
-            .unwrap();
-        assert!(batch.examined <= limit, "{batch:?}");
-        deleted += batch.deleted;
-        if batch.examined < limit {
+        let removed = batch(limit);
+        assert!(removed <= limit, "{removed} > {limit}");
+        deleted += removed;
+        if removed < limit {
             return deleted;
         }
     }
@@ -123,191 +140,134 @@ fn prune_all(store: &SqliteRouteStateStore, limit: usize) -> usize {
 }
 
 #[test]
-fn account_decision_retention_deletes_only_rows_past_their_window_and_keeps_refusals_longer() {
-    let rig = Rig::new("decision-windows");
+fn the_shadow_purge_deletes_every_shadow_decision_whatever_its_age_and_no_serve_row() {
+    let rig = Rig::new("shadow-purge");
     let store = rig.open();
-    let shadow = DECISION_MODE_SHADOW;
-    insert_decisions(
-        &store,
-        &[
-            // Routine shadow rows: due once older than 72 hours.
-            decision(
-                "admit-old",
-                shadow,
-                "admit",
-                "cold_scored",
-                ROUTINE_BEFORE - 1,
-            ),
-            decision(
-                "admit-at-cutoff",
-                shadow,
-                "admit",
-                "cold_scored",
-                ROUTINE_BEFORE,
-            ),
-            decision("admit-young", shadow, "admit", "cold_scored", NOW - HOUR),
-            decision(
-                "unsupported-old",
-                shadow,
-                "refuse",
-                ROUTINE_REFUSAL_CODE,
-                ROUTINE_BEFORE - 1,
-            ),
-            // Notable shadow rows: past 72 hours but kept until 14 days.
-            decision(
-                "refuse-4d",
-                shadow,
-                "refuse",
-                "account_quota_unknown",
-                NOW - 4 * DAY,
-            ),
-            decision("hold-4d", shadow, "hold", "account_hold", NOW - 4 * DAY),
-            decision(
-                "refuse-at-cutoff",
-                shadow,
-                "refuse",
-                "account_quota_unknown",
-                NOTABLE_BEFORE,
-            ),
-            decision(
-                "refuse-15d",
-                shadow,
-                "refuse",
-                "account_pool_reserve_limited",
-                NOW - 15 * DAY,
-            ),
-            decision("hold-15d", shadow, "hold", "account_hold", NOW - 15 * DAY),
-            // Serve rows are the served audit trail and are never deleted.
-            decision(
-                "serve-admit-old",
-                DECISION_MODE_SERVE,
-                "admit",
-                "cold_scored",
-                NOW - 60 * DAY,
-            ),
-            decision(
-                "serve-refuse-old",
-                DECISION_MODE_SERVE,
-                "refuse",
-                "account_quota_unknown",
-                NOW - 60 * DAY,
-            ),
-        ],
-    );
-
-    let deleted = prune_all(&store, 256);
-
-    assert_eq!(deleted, 4);
-    assert_eq!(
-        decision_ids(&store),
-        vec![
-            "admit-at-cutoff",
-            "admit-young",
-            "hold-4d",
-            "refuse-4d",
-            "refuse-at-cutoff",
-            "serve-admit-old",
-            "serve-refuse-old",
-        ]
-    );
-}
-
-#[test]
-fn account_decision_retention_is_bounded_per_batch() {
-    let rig = Rig::new("decision-bounded");
-    let store = rig.open();
-    // Ten rows older than both windows, which the batch deletes outright,
-    // and ten routine rows between the two cutoffs, which it deletes after
-    // checking their class. The bound must hold on both paths.
-    let rows: Vec<AccountDecisionRecord> = (0..10)
+    let mut rows: Vec<AccountDecisionRecord> = (0..7)
         .map(|index| {
             decision(
-                &format!("very-old-{index:02}"),
-                DECISION_MODE_SHADOW,
+                &format!("shadow-{index}"),
+                SHADOW,
                 "admit",
                 "cold_scored",
-                NOW - 20 * DAY + index,
+                // From sixty days old to one written this instant.
+                NOW - index * 10 * DAY,
             )
         })
-        .chain((0..10).map(|index| {
-            decision(
-                &format!("old-{index:02}"),
-                DECISION_MODE_SHADOW,
-                "admit",
-                "cold_scored",
-                NOW - 10 * DAY + index,
-            )
-        }))
         .collect();
+    rows.push(decision(
+        "shadow-refusal",
+        SHADOW,
+        "refuse",
+        "account_selection_unsupported",
+        NOW - HOUR,
+    ));
+    rows.push(decision(
+        "serve-old",
+        DECISION_MODE_SERVE,
+        "admit",
+        "cold_scored",
+        NOW - 60 * DAY,
+    ));
+    rows.push(decision(
+        "serve-young",
+        DECISION_MODE_SERVE,
+        "refuse",
+        "account_quota_unknown",
+        NOW,
+    ));
     insert_decisions(&store, &rows);
 
-    let mut cursor = DecisionRetentionCursor::default();
     let mut batches = Vec::new();
-    loop {
-        let batch = store
-            .prune_account_decisions(ROUTINE_BEFORE, NOTABLE_BEFORE, &mut cursor, 3)
-            .unwrap();
-        batches.push(batch);
-        if batch.examined < 3 {
-            break;
-        }
-    }
+    let deleted = drain(3, |limit| {
+        let removed = store.purge_shadow_decisions(limit).unwrap();
+        batches.push(removed);
+        removed
+    });
 
-    let deleted: Vec<usize> = batches.iter().map(|batch| batch.deleted).collect();
-    // The fourth batch finishes the very old rows and spends its remaining
-    // two rows on the band.
-    assert_eq!(deleted, vec![3, 3, 3, 3, 3, 3, 2]);
-    assert!(decision_ids(&store).is_empty());
-    assert_eq!(
-        store
-            .prune_account_decisions(ROUTINE_BEFORE, NOTABLE_BEFORE, &mut cursor, 0)
-            .unwrap(),
-        RetentionBatch::default()
-    );
+    assert_eq!(deleted, 8);
+    assert_eq!(batches, vec![3, 3, 2], "bounded per batch");
+    assert_eq!(decision_ids(&store), vec!["serve-old", "serve-young"]);
+    assert_eq!(store.purge_shadow_decisions(256).unwrap(), 0);
 }
 
-/// Between the two cutoffs, kept notable rows sit ahead of due routine rows
-/// in time order. A batch smaller than that run of kept rows must still reach
-/// the routine rows behind it on later batches instead of re-reading the same
-/// kept rows forever.
-#[test]
-fn routine_rows_behind_a_run_of_kept_refusals_are_still_reached() {
-    let rig = Rig::new("decision-band");
-    let store = rig.open();
-    let mut rows = Vec::new();
-    for index in 0..6 {
-        rows.push(decision(
-            &format!("kept-refusal-{index}"),
-            DECISION_MODE_SHADOW,
-            "refuse",
-            "account_quota_unknown",
-            NOW - 10 * DAY + index,
-        ));
+fn pin_row(pin_id: &str, conversation: &str, generation: u64, decision_id: &str) -> AccountPinRow {
+    AccountPinRow {
+        pin_id: pin_id.into(),
+        principal: PRINCIPAL.into(),
+        conversation_hash: conversation.into(),
+        provider: "anthropic".into(),
+        pin_generation: generation,
+        affinity_model: "claude-opus-5-5".into(),
+        account_id: "acct-a".into(),
+        credential_id: "oauth:anthropic".into(),
+        pin_mode: "run_frozen".into(),
+        previous_pin_id: None,
+        decision_id: decision_id.into(),
+        created_at: NOW - 60 * DAY,
     }
-    for index in 0..3 {
-        rows.push(decision(
-            &format!("due-admit-{index}"),
-            DECISION_MODE_SHADOW,
-            "admit",
-            "cold_scored",
-            NOW - 9 * DAY + index,
-        ));
-    }
-    insert_decisions(&store, &rows);
-
-    let deleted = prune_all(&store, 2);
-
-    assert_eq!(deleted, 3);
-    let kept = decision_ids(&store);
-    assert_eq!(kept.len(), 6, "{kept:?}");
-    assert!(
-        kept.iter().all(|id| id.starts_with("kept-refusal-")),
-        "{kept:?}"
-    );
 }
 
-/// The child table that keeps one shadow decision alive in the reference
-/// tests below.
+/// A finished admission whose every time is `at`.
+fn admission_row(
+    admission_id: &str,
+    decision_id: &str,
+    pin: &AccountPinRow,
+    at: i64,
+) -> AccountAdmissionRow {
+    AccountAdmissionRow {
+        principal: PRINCIPAL.into(),
+        admission_id: admission_id.into(),
+        request_fingerprint: "fp".into(),
+        request_mode: "admit".into(),
+        decision_id: decision_id.into(),
+        conversation_hash: pin.conversation_hash.clone(),
+        provider: "anthropic".into(),
+        model: "claude-opus-5-5".into(),
+        account_id: "acct-a".into(),
+        credential_id: "oauth:anthropic".into(),
+        pin_id: pin.pin_id.clone(),
+        pin_generation: pin.pin_generation,
+        state: "finished".into(),
+        charged: true,
+        request_bytes: 12_000,
+        request_bytes_estimated: false,
+        committed_at: at,
+        admission_valid_until: at,
+        lease_valid_until: at,
+        reply_json: "{}".into(),
+        run_id: None,
+        started_at: Some(at),
+        started_late: false,
+        released_at: None,
+        finished_at: Some(at),
+    }
+}
+
+fn affinity_row(conversation: &str, pin: &AccountPinRow, expires_at: i64) -> AccountAffinityRow {
+    AccountAffinityRow {
+        principal: PRINCIPAL.into(),
+        conversation_hash: conversation.into(),
+        provider: "anthropic".into(),
+        affinity_model: "claude-opus-5-5".into(),
+        pin_id: pin.pin_id.clone(),
+        pin_generation: pin.pin_generation,
+        account_id: "acct-a".into(),
+        credential_id: "oauth:anthropic".into(),
+        credential_binding_revision: 1,
+        policy_version: 2,
+        initial_demand_bytes: 12_000,
+        created_at: expires_at - 7 * DAY,
+        last_used_at: expires_at - 7 * DAY,
+        expires_at,
+        lease_valid_until: Some(expires_at - 7 * DAY),
+    }
+}
+
+/// An old serve decision referenced only by `child` survives; its
+/// unreferenced neighbours on both sides in time are deleted without a
+/// foreign-key error, with one large batch and with batches smaller than the
+/// run of rows. Young serve decisions are kept.
 #[derive(Debug, Clone, Copy)]
 enum DecisionChild {
     Pin,
@@ -315,78 +275,44 @@ enum DecisionChild {
     Hold,
 }
 
-fn pin_row(pin_id: &str, decision_id: &str) -> AccountPinRow {
-    AccountPinRow {
-        pin_id: pin_id.into(),
-        principal: "reserved:broca".into(),
-        conversation_hash: format!("conversation-{pin_id}"),
-        provider: "anthropic".into(),
-        pin_generation: 1,
-        affinity_model: "claude-opus-5-5".into(),
-        account_id: "acct-a".into(),
-        credential_id: "oauth:anthropic".into(),
-        pin_mode: "run_frozen".into(),
-        previous_pin_id: None,
-        decision_id: decision_id.into(),
-        created_at: NOW - 30 * DAY,
-    }
-}
-
-/// Make `child` the only row that references `decision_id`. An admission
-/// must name a pin, so its pin points at a separate serve decision, which
-/// retention never deletes.
 fn reference_decision(store: &SqliteRouteStateStore, child: DecisionChild, decision_id: &str) {
-    if let DecisionChild::Admission = child {
-        insert_decisions(
-            store,
-            &[decision(
-                &format!("anchor-{decision_id}"),
-                DECISION_MODE_SERVE,
-                "admit",
-                "cold_scored",
-                NOW - 30 * DAY,
-            )],
-        );
-    }
     store
         .account_transaction(|tx| match child {
-            DecisionChild::Pin => {
-                tx.insert_pin(&pin_row(&format!("pin-{decision_id}"), decision_id))
-            }
+            DecisionChild::Pin => tx.insert_pin(&pin_row(
+                &format!("pin-{decision_id}"),
+                &format!("conversation-{decision_id}"),
+                1,
+                decision_id,
+            )),
             DecisionChild::Admission => {
-                let pin_id = format!("pin-anchor-{decision_id}");
-                tx.insert_pin(&pin_row(&pin_id, &format!("anchor-{decision_id}")))?;
-                tx.insert_admission(&AccountAdmissionRow {
-                    principal: "reserved:broca".into(),
-                    admission_id: format!("admission-{decision_id}"),
-                    request_fingerprint: "fp".into(),
-                    request_mode: "admit".into(),
-                    decision_id: decision_id.into(),
-                    conversation_hash: format!("conversation-{pin_id}"),
-                    provider: "anthropic".into(),
-                    model: "claude-opus-5-5".into(),
-                    account_id: "acct-a".into(),
-                    credential_id: "oauth:anthropic".into(),
-                    pin_id,
-                    pin_generation: 1,
-                    state: "finished".into(),
-                    charged: true,
-                    request_bytes: 12_000,
-                    request_bytes_estimated: false,
-                    committed_at: NOW - 30 * DAY,
-                    admission_valid_until: NOW - 30 * DAY,
-                    lease_valid_until: NOW - 30 * DAY,
-                    reply_json: "{}".into(),
-                    run_id: None,
-                    started_at: None,
-                    started_late: false,
-                    released_at: None,
-                    finished_at: Some(NOW - 30 * DAY),
-                })
+                // An admission must name a pin; its pin points at a young
+                // anchor decision the window keeps anyway.
+                tx.insert_decision(&decision(
+                    &format!("anchor-{decision_id}"),
+                    DECISION_MODE_SERVE,
+                    "admit",
+                    "cold_scored",
+                    NOW,
+                ))?;
+                let pin = pin_row(
+                    &format!("pin-anchor-{decision_id}"),
+                    &format!("conversation-{decision_id}"),
+                    1,
+                    &format!("anchor-{decision_id}"),
+                );
+                tx.insert_pin(&pin)?;
+                // A young admission: the window keeps it, so it keeps the
+                // old decision it names.
+                tx.insert_admission(&admission_row(
+                    &format!("admission-{decision_id}"),
+                    decision_id,
+                    &pin,
+                    NOW,
+                ))
             }
             DecisionChild::Hold => tx.insert_hold(&AccountHoldRow {
                 decision_id: decision_id.into(),
-                principal: "reserved:broca".into(),
+                principal: PRINCIPAL.into(),
                 conversation_hash: "conversation".into(),
                 provider: "anthropic".into(),
                 pin_id: "pin-none".into(),
@@ -396,54 +322,51 @@ fn reference_decision(store: &SqliteRouteStateStore, child: DecisionChild, decis
                 basis: "five_hour".into(),
                 reset_at: NOW,
                 retry_after_s: 60,
-                created_at: NOW - 30 * DAY,
+                created_at: NOW,
             }),
         })
         .unwrap();
 }
 
-/// One old routine decision older than both windows and one between the
-/// cutoffs are each referenced only by `child`; unreferenced neighbours sit
-/// on both sides of them in time. Retention runs with foreign keys on, so
-/// deleting a referenced row would fail the batch: the referenced rows must
-/// be skipped, and every neighbour still deleted, both with one large batch
-/// and with batches smaller than the run of rows.
-fn a_decision_only_one_child_references_survives(child: DecisionChild) {
+fn an_old_serve_decision_only_one_child_references_survives(child: DecisionChild) {
     for limit in [256, 2] {
-        let rig = Rig::new(&format!("decision-child-{child:?}-{limit}"));
+        let rig = Rig::new(&format!("serve-decision-child-{child:?}-{limit}"));
         let store = rig.open();
         let mut rows = Vec::new();
-        for (prefix, base) in [("old", NOW - 30 * DAY), ("band", NOW - 10 * DAY)] {
-            for offset in [0, 2, 3] {
-                rows.push(decision(
-                    &format!("free-{prefix}-{offset}"),
-                    DECISION_MODE_SHADOW,
-                    "admit",
-                    "cold_scored",
-                    base + offset,
-                ));
-            }
+        for offset in [0, 2, 3] {
             rows.push(decision(
-                &format!("referenced-{prefix}"),
-                DECISION_MODE_SHADOW,
-                "admit",
-                "cold_scored",
-                base + 1,
+                &format!("free-{offset}"),
+                DECISION_MODE_SERVE,
+                "refuse",
+                "account_quota_unknown",
+                BEFORE - 10 + offset,
             ));
         }
+        rows.push(decision(
+            "referenced",
+            DECISION_MODE_SERVE,
+            "admit",
+            "cold_scored",
+            BEFORE - 9,
+        ));
+        rows.push(decision(
+            "at-cutoff",
+            DECISION_MODE_SERVE,
+            "refuse",
+            "account_quota_unknown",
+            BEFORE,
+        ));
         insert_decisions(&store, &rows);
-        reference_decision(&store, child, "referenced-old");
-        reference_decision(&store, child, "referenced-band");
+        reference_decision(&store, child, "referenced");
 
-        let deleted = prune_all(&store, limit);
+        let deleted = drain(limit, |limit| {
+            store.prune_serve_decisions(BEFORE, limit).unwrap()
+        });
 
-        assert_eq!(deleted, 6, "{child:?} limit {limit}");
-        let mut expected = vec!["referenced-band".to_string(), "referenced-old".to_string()];
+        assert_eq!(deleted, 3, "{child:?} limit {limit}");
+        let mut expected = vec!["at-cutoff".to_string(), "referenced".to_string()];
         if let DecisionChild::Admission = child {
-            expected.extend([
-                "anchor-referenced-band".into(),
-                "anchor-referenced-old".into(),
-            ]);
+            expected.push("anchor-referenced".into());
             expected.sort();
         }
         assert_eq!(decision_ids(&store), expected, "{child:?} limit {limit}");
@@ -451,18 +374,271 @@ fn a_decision_only_one_child_references_survives(child: DecisionChild) {
 }
 
 #[test]
-fn a_decision_only_a_pin_references_survives_and_its_neighbours_go() {
-    a_decision_only_one_child_references_survives(DecisionChild::Pin);
+fn an_old_serve_decision_only_a_pin_references_survives_and_its_neighbours_go() {
+    an_old_serve_decision_only_one_child_references_survives(DecisionChild::Pin);
 }
 
 #[test]
-fn a_decision_only_an_admission_references_survives_and_its_neighbours_go() {
-    a_decision_only_one_child_references_survives(DecisionChild::Admission);
+fn an_old_serve_decision_only_an_admission_references_survives_and_its_neighbours_go() {
+    an_old_serve_decision_only_one_child_references_survives(DecisionChild::Admission);
 }
 
 #[test]
-fn a_decision_only_a_hold_references_survives_and_its_neighbours_go() {
-    a_decision_only_one_child_references_survives(DecisionChild::Hold);
+fn an_old_serve_decision_only_a_hold_references_survives_and_its_neighbours_go() {
+    an_old_serve_decision_only_one_child_references_survives(DecisionChild::Hold);
+}
+
+#[test]
+fn admission_retention_waits_for_every_time_the_admission_carries() {
+    let rig = Rig::new("admissions");
+    let store = rig.open();
+    let old = BEFORE - DAY;
+    store
+        .account_transaction(|tx| {
+            tx.insert_decision(&decision(
+                "d",
+                DECISION_MODE_SERVE,
+                "admit",
+                "cold_scored",
+                old,
+            ))?;
+            let pin = pin_row("pin", "conversation", 1, "d");
+            tx.insert_pin(&pin)?;
+            for index in 0..3 {
+                tx.insert_admission(&admission_row(
+                    &format!("old-{index}"),
+                    "d",
+                    &pin,
+                    old + index,
+                ))?;
+            }
+            tx.insert_admission(&admission_row("at-cutoff", "d", &pin, BEFORE))?;
+            // Committed long ago, but one later time is still inside the
+            // window: a run that finished recently, a lease renewed, a
+            // reservation released, a late start.
+            let mut finished = admission_row("finished-recently", "d", &pin, old);
+            finished.finished_at = Some(NOW - DAY);
+            tx.insert_admission(&finished)?;
+            let mut leased = admission_row("leased-recently", "d", &pin, old);
+            leased.lease_valid_until = NOW;
+            tx.insert_admission(&leased)?;
+            let mut released = admission_row("released-recently", "d", &pin, old);
+            released.released_at = Some(NOW - DAY);
+            tx.insert_admission(&released)?;
+            let mut started = admission_row("started-recently", "d", &pin, old);
+            started.started_at = Some(NOW - DAY);
+            tx.insert_admission(&started)?;
+            let mut reserved = admission_row("valid-recently", "d", &pin, old);
+            reserved.admission_valid_until = NOW;
+            tx.insert_admission(&reserved)
+        })
+        .unwrap();
+
+    let mut batches = Vec::new();
+    let deleted = drain(2, |limit| {
+        let removed = store.prune_account_admissions(BEFORE, limit).unwrap();
+        batches.push(removed);
+        removed
+    });
+
+    assert_eq!(deleted, 3);
+    assert_eq!(batches, vec![2, 1]);
+    assert_eq!(
+        rig.ids("account_admission", "admission_id"),
+        vec![
+            "at-cutoff",
+            "finished-recently",
+            "leased-recently",
+            "released-recently",
+            "started-recently",
+            "valid-recently",
+        ]
+    );
+}
+
+#[test]
+fn hold_retention_deletes_only_old_holds_and_is_bounded() {
+    let rig = Rig::new("holds");
+    let store = rig.open();
+    store
+        .account_transaction(|tx| {
+            for (id, created_at) in [
+                ("old-0", BEFORE - 3),
+                ("old-1", BEFORE - 2),
+                ("old-2", BEFORE - 1),
+                ("at-cutoff", BEFORE),
+                ("young", NOW),
+            ] {
+                tx.insert_decision(&decision(
+                    id,
+                    DECISION_MODE_SERVE,
+                    "hold",
+                    "account_hold",
+                    created_at,
+                ))?;
+                tx.insert_hold(&AccountHoldRow {
+                    decision_id: id.into(),
+                    principal: PRINCIPAL.into(),
+                    conversation_hash: "conversation".into(),
+                    provider: "anthropic".into(),
+                    pin_id: "pin-none".into(),
+                    pin_generation: 1,
+                    account_id: "acct-a".into(),
+                    credential_id: "oauth:anthropic".into(),
+                    basis: "five_hour".into(),
+                    reset_at: created_at + HOUR,
+                    retry_after_s: 60,
+                    created_at,
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(store.prune_account_holds(BEFORE, 2).unwrap(), 2);
+    assert_eq!(store.prune_account_holds(BEFORE, 2).unwrap(), 1);
+    assert_eq!(store.prune_account_holds(BEFORE, 2).unwrap(), 0);
+    assert_eq!(
+        rig.ids("account_hold", "decision_id"),
+        vec!["at-cutoff", "young"]
+    );
+    // No hold references those decisions any more, so the serve-decision
+    // retention deletes them.
+    assert_eq!(store.prune_serve_decisions(BEFORE, 256).unwrap(), 3);
+}
+
+/// One conversation's affinity row and every pin generation it went through.
+fn insert_conversation(
+    store: &SqliteRouteStateStore,
+    conversation: &str,
+    generations: u64,
+    expires_at: i64,
+) -> AccountPinRow {
+    store
+        .account_transaction(|tx| {
+            let mut current = None;
+            for generation in 1..=generations {
+                let decision_id = format!("d-{conversation}-{generation}");
+                tx.insert_decision(&decision(
+                    &decision_id,
+                    DECISION_MODE_SERVE,
+                    "admit",
+                    "cold_scored",
+                    NOW - 60 * DAY,
+                ))?;
+                let pin = pin_row(
+                    &format!("pin-{conversation}-{generation}"),
+                    conversation,
+                    generation,
+                    &decision_id,
+                );
+                tx.insert_pin(&pin)?;
+                current = Some(pin);
+            }
+            let pin = current.expect("at least one generation");
+            assert!(tx.put_affinity(&affinity_row(conversation, &pin, expires_at), None)?);
+            Ok(pin)
+        })
+        .unwrap()
+}
+
+#[test]
+fn affinity_retention_deletes_a_long_expired_conversation_with_all_its_pins() {
+    let rig = Rig::new("affinity");
+    let store = rig.open();
+    // Expired more than the window ago, two generations: deleted.
+    insert_conversation(&store, "expired", 2, BEFORE - 1);
+    // Expired, but less than the window ago: kept.
+    insert_conversation(&store, "recent", 1, BEFORE);
+    // Still live: kept.
+    insert_conversation(&store, "live", 1, NOW + DAY);
+    // Expired long ago, but a stored admission still names its pin: kept
+    // until admission retention removes that admission.
+    let named = insert_conversation(&store, "named", 1, BEFORE - 1);
+    store
+        .account_transaction(|tx| {
+            tx.insert_admission(&admission_row(
+                "young-admission",
+                &named.decision_id,
+                &named,
+                NOW,
+            ))
+        })
+        .unwrap();
+    // Expired long ago, lease renewed inside the window: kept.
+    let leased = insert_conversation(&store, "leased", 1, BEFORE - 1);
+    store
+        .account_transaction(|tx| {
+            let mut row = affinity_row("leased", &leased, BEFORE - 1);
+            row.lease_valid_until = Some(NOW);
+            assert!(tx.put_affinity(&row, Some((&leased.pin_id, leased.pin_generation)))?);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.prune_account_affinities(BEFORE, 256).unwrap(),
+        AffinityRetentionBatch {
+            affinities: 1,
+            pins: 2
+        }
+    );
+    assert_eq!(
+        rig.ids("account_affinity", "conversation_hash"),
+        vec!["leased", "live", "named", "recent"]
+    );
+    assert!(rig
+        .ids("account_pin", "pin_id")
+        .iter()
+        .all(|pin| !pin.starts_with("pin-expired-")));
+    // No pin references those decisions any more, so the serve-decision
+    // retention deletes them.
+    assert_eq!(store.prune_serve_decisions(BEFORE, 256).unwrap(), 2);
+
+    // The conversation can start again at generation 1 without colliding
+    // with a stored older generation.
+    let restarted = insert_conversation(&store, "expired", 1, NOW + DAY);
+    assert_eq!(restarted.pin_generation, 1);
+
+    // With the young admission gone, the named conversation goes too.
+    let connection = Connection::open(rig.db_path()).unwrap();
+    connection
+        .execute(
+            "DELETE FROM account_admission WHERE admission_id = 'young-admission'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        store.prune_account_affinities(BEFORE, 256).unwrap(),
+        AffinityRetentionBatch {
+            affinities: 1,
+            pins: 1
+        }
+    );
+}
+
+#[test]
+fn affinity_retention_is_bounded_per_batch() {
+    let rig = Rig::new("affinity-bounded");
+    let store = rig.open();
+    for index in 0..5 {
+        insert_conversation(&store, &format!("expired-{index}"), 1, BEFORE - 10 + index);
+    }
+    let mut batches = Vec::new();
+    loop {
+        let batch = store.prune_account_affinities(BEFORE, 2).unwrap();
+        batches.push(batch.affinities);
+        if batch.affinities < 2 {
+            break;
+        }
+    }
+    assert_eq!(batches, vec![2, 2, 1]);
+    assert!(rig.ids("account_affinity", "conversation_hash").is_empty());
+    assert!(rig.ids("account_pin", "pin_id").is_empty());
+    assert_eq!(
+        store.prune_account_affinities(BEFORE, 0).unwrap(),
+        AffinityRetentionBatch::default()
+    );
 }
 
 fn observation(id: &str, received_at: i64) -> AccountObservationRow {
