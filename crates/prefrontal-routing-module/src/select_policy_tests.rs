@@ -602,6 +602,7 @@ mod consumer_and_pin {
                     supports_vision: Some(true),
                     supports_tool_use: Some(true),
                     reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
+                    canonical_id: None,
                 }],
                 prefrontal_routing_store::FusiformCatalogCursor {
                     catalog_version: version,

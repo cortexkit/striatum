@@ -15,6 +15,7 @@ pub mod account_wall;
 pub mod accounts;
 pub mod billing;
 pub mod break_glass;
+pub mod canonical_scores;
 pub mod failure_backoff;
 pub mod key_pool;
 pub mod launch_policy;

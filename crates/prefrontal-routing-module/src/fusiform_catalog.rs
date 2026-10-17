@@ -210,6 +210,11 @@ struct CatalogModelFacts {
         deserialize_with = "served_value"
     )]
     reasoning_options: Option<Option<Vec<Value>>>,
+    /// models.dev's `canonical_model_id`, passed through by Fusiform: routes
+    /// with the same value serve the same weights. `null` and an unserved key
+    /// both mean the upstream states no identity.
+    #[serde(rename = "model.canonical_id", default)]
+    canonical_id: Option<String>,
 }
 
 fn served_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -279,6 +284,15 @@ pub(crate) struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
     rates: BTreeMap<String, ModelRates>,
+}
+
+#[cfg(test)]
+impl CatalogSnapshot {
+    /// The decoded rows and cursor, for tests outside this module that apply a
+    /// snapshot to a store directly.
+    pub(crate) fn parts(&self) -> (&[FusiformFactUpdate], FusiformCatalogCursor) {
+        (&self.facts, self.cursor)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -673,6 +687,11 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
             supports_vision,
             supports_tool_use: model.tool_call,
             reasoning_efforts: published_efforts(&model.reasoning_options),
+            // A blank id names no model; keep it out so it cannot group
+            // unrelated routes together.
+            canonical_id: model
+                .canonical_id
+                .filter(|canonical_id| !canonical_id.trim().is_empty()),
         });
     }
     Ok(CatalogSnapshot {
