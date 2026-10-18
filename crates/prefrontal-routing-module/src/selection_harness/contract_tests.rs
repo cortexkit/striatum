@@ -266,6 +266,10 @@ async fn panel_seats_resolve_under_athena_and_only_use_broca() {
         "{}",
         row.rejected_json
     );
+    let explained = rig.explain(json!({"decisionID": row.id})).await;
+    assert_eq!(explained["selectedRoute"]["harness"], "broca");
+    assert!(explained["selectedRoute"]["workload"].is_null());
+    assert!(explained["provenance"]["harness"].is_null());
 }
 
 #[tokio::test]
@@ -348,4 +352,77 @@ async fn runner_auth_pin_mapped_off_broca_refuses_even_with_broca_substrate() {
         .as_str()
         .unwrap()
         .contains("harness_mismatch: task runs on broca"));
+}
+
+impl HarnessRig {
+    async fn explain(&self, key: serde_json::Value) -> serde_json::Value {
+        let body = self.call(ROUTE_EXPLAIN_OP, key, &empty_broca_credentials()).await;
+        assert!(body.get("result").is_some(), "{body}");
+        body["result"].clone()
+    }
+}
+
+#[tokio::test]
+async fn route_explain_reads_selected_execution_identity_for_fresh_and_pinned_launches() {
+    let rig = HarnessRig::new(json!({"all": {"opencode": "opencode"}}));
+    for (index, extra, harness, workload) in [
+        (0, json!({"harness": "opencode"}), "broca", Some("mason")),
+        (1, json!({"harness": "opencode", "availableModels": [CHEAP]}), "opencode", Some("mason")),
+        (2, json!({"harness": "opencode", "availableModels": [CHEAP], "modelPin": CHEAP}), "opencode", Some("mason")),
+        (3, json!({"harness": "opencode", "pin": {"model": PAID}}), "broca", Some("mason")),
+        (4, json!({"harness": "opencode", "targetAgent": "explore", "consumer": "sidekick"}), "broca", Some("sidekick.explore")),
+        (5, json!({"harness": "opencode", "targetAgent": "librarian", "consumer": "sidekick", "workload": "sidekick.comments"}), "broca", Some("sidekick.comments")),
+        (6, json!({"harness": "opencode", "targetAgent": "oracle"}), "broca", None),
+    ] {
+        let send_id = format!("readback-{index}");
+        let mut params = extra;
+        params["sendID"] = json!(send_id);
+        let selected = rig.select(params).await;
+        let id = selected["result"]["decisionID"].as_str().unwrap_or_else(|| panic!("{selected}"));
+        assert_eq!(selected["result"]["selected"]["harness"], harness, "{selected}");
+        let explained = rig.explain(json!({"decisionID": id})).await;
+        assert_eq!(explained["selectedRoute"]["harness"], harness, "{explained}");
+        assert_eq!(explained["selectedRoute"]["workload"], json!(workload), "{explained}");
+        assert_eq!(explained["selectedRoute"]["routeKey"], selected["result"]["selected"]["routeKey"]);
+        assert_eq!(explained["provenance"]["harness"], "opencode");
+        assert_eq!(rig.explain(json!({"sendID": send_id})).await, explained);
+    }
+}
+
+#[tokio::test]
+async fn executor_readback_keeps_workload_in_explanation_not_launch_identity() {
+    let rig = HarnessRig::new(json!({"all": {"opencode": "opencode"}}));
+    for (extra, line) in [
+        (json!({"substrate": "broca"}), "workload: none"),
+        (json!({"consumer": "athena", "workload": "sidekick.gather", "availableModels": [CHEAP, PAID]}), "workload: sidekick.gather"),
+        (json!({"pin": {"model": PAID}, "workload": "athena", "substrate": "broca"}), "workload: athena"),
+    ] {
+        let mut params = extra;
+        params["executor"] = json!("broca");
+        params["harness"] = json!("pi");
+        let selected = rig.select(params).await;
+        let explained = rig.explain(json!({"decisionID": selected["result"]["decisionID"]})).await;
+        assert_eq!(explained["selectedRoute"]["harness"], "broca", "{explained}");
+        assert_eq!(explained["selectedRoute"]["workload"], serde_json::Value::Null);
+        assert_eq!(explained["provenance"]["harness"], "pi");
+        assert!(explained["why"]["explanation"].as_array().unwrap().contains(&json!(line)), "{explained}");
+        assert!(selected["result"]["selected"]["explanation"].as_array().unwrap().contains(&json!(line)), "{selected}");
+    }
+}
+
+#[tokio::test]
+async fn route_explain_legacy_row_does_not_infer_execution_identity_from_caller() {
+    let rig = HarnessRig::new(json!({"all": {"default": "opencode"}}));
+    rusqlite::Connection::open(rig.rig.dir.join("store.db")).unwrap().execute(
+        "INSERT INTO model_route_decisions
+         (id, harness, target_agent, requirements_json, selected_route_key, selected_provider_id,
+          selected_model_id, score_json, rejected_json, anchor_version, created_at)
+         VALUES ('legacy', 'pi', 'mason', '{}', 'provider/model', 'provider', 'model', '{}', '[]', 1, 1)",
+        [],
+    ).unwrap();
+    let explained = rig.explain(json!({"decisionID": "legacy"})).await;
+    for field in ["harness", "workload"] {
+        assert!(explained["selectedRoute"].get(field).unwrap().is_null(), "{explained}");
+    }
+    assert_eq!(explained["provenance"]["harness"], "pi");
 }
