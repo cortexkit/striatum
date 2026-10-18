@@ -682,6 +682,120 @@ fn set_outcome(
 }
 
 #[test]
+fn ten_request_invalid_outcomes_leave_the_route_admissible_and_audited() {
+    const ROUTE: &str = "openai/request-invalid-test";
+    let rig = Rig::new("request-invalid-outcomes");
+    let store = rig.open();
+    let fact = fact("openai", "request-invalid-test");
+    store.upsert_fact(&fact, FactSource::Override).unwrap();
+    store
+        .update_route_state(ROUTE, ROUTE, &RouteStateUpdate::default())
+        .unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../../test-vectors/broca-request-invalid-v1/run_status.request_invalid_openai.json"
+    ))
+    .unwrap();
+    let error = &wire["error"];
+    let diagnostic = format!(
+        "class {}; provider code {}; provider subcode {}; HTTP {}; Broca said: {}",
+        error["class"].as_str().unwrap(),
+        error["provider_code"].as_str().unwrap(),
+        error["provider_subcode"].as_str().unwrap(),
+        error["status"],
+        error["message"].as_str().unwrap()
+    );
+    let conn = rusqlite::Connection::open(rig.db_path()).unwrap();
+    for attempt in 1..=10 {
+        let id = selected_decision(&store, &format!("dec-request-invalid-{attempt}"), ROUTE);
+        set_outcome(
+            &store,
+            &id,
+            RouteOutcome::SessionError,
+            Some(&diagnostic),
+            attempt,
+        );
+        let row = store.get_decision_by_id(&id).unwrap().unwrap();
+        assert_eq!(row.outcome.as_deref(), Some("session_error"));
+        let recorded_error: String = conn
+            .query_row(
+                "SELECT outcome_error FROM model_route_decisions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded_error, diagnostic);
+        assert!(recorded_error
+            .contains("provider code request_invalid; provider subcode invalid_json_schema;"));
+    }
+    let counters: (i64, i64) = conn.query_row(
+        "SELECT consecutive_terminal_failures, failure_count FROM model_route_state WHERE route_key=?1",
+        [ROUTE], |row| Ok((row.get(0)?, row.get(1)?))
+    ).unwrap();
+    assert_eq!(counters, (0, 0));
+    let snapshot = store.build_snapshot(11.0).unwrap();
+    let state = &snapshot.by_route[ROUTE];
+    assert_eq!(state.failure_backoff_until, None);
+    assert_eq!(state.failure_backoff_reason, None);
+    assert_eq!(state.quota_exhausted_until, None);
+    let admission = admit_routes(
+        &[fact],
+        Some(&snapshot),
+        ExclusionPolicy::default(),
+        None,
+        &[ROUTE.to_string()].into_iter().collect(),
+        &ModelRequirements { iq: 0.0, eq: 0.0 },
+        &RoutingConfig::default(),
+    );
+    assert!(admission.rejected.is_empty(), "{:?}", admission.rejected);
+    assert_eq!(admission.admitted.len(), 1);
+}
+
+#[test]
+fn request_invalid_does_not_reset_genuine_failures_or_existing_backoff() {
+    const ROUTE: &str = "openai/request-invalid-test";
+    let rig = Rig::new("request-invalid-preserves-streak");
+    let store = rig.open();
+    let conn = rusqlite::Connection::open(rig.db_path()).unwrap();
+    for attempt in 1..=3 {
+        let id = selected_decision(&store, &format!("dec-provider-error-{attempt}"), ROUTE);
+        set_outcome(
+            &store,
+            &id,
+            RouteOutcome::Error,
+            Some("HTTP 503 provider unavailable"),
+            attempt * 2,
+        );
+        let before: (i64, i64, Option<f64>, Option<String>) = conn.query_row(
+            "SELECT consecutive_terminal_failures, failure_count, failure_backoff_until, failure_backoff_reason FROM model_route_state WHERE route_key=?1",
+            [ROUTE], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        ).unwrap();
+        assert_eq!(before.0, attempt);
+        assert_eq!(before.1, attempt);
+        assert_eq!(before.2.is_some(), attempt == 3);
+        let id = selected_decision(
+            &store,
+            &format!("dec-invalid-between-failures-{attempt}"),
+            ROUTE,
+        );
+        set_outcome(
+            &store,
+            &id,
+            RouteOutcome::Error,
+            Some("request_invalid: invalid schema"),
+            attempt * 2 + 1,
+        );
+        let after = conn.query_row(
+            "SELECT consecutive_terminal_failures, failure_count, failure_backoff_until, failure_backoff_reason FROM model_route_state WHERE route_key=?1",
+            [ROUTE], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<f64>>(2)?, row.get::<_, Option<String>>(3)?))
+        ).unwrap();
+        assert_eq!(
+            before, after,
+            "request errors must neither reset nor increment route evidence"
+        );
+    }
+}
+
+#[test]
 fn three_consecutive_session_failures_cool_qwen_by_name_and_preserve_quota_wall() {
     const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
     const ERROR: &str =
