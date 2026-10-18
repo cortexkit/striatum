@@ -423,9 +423,16 @@ pub(crate) struct PlaneCatalog {
 }
 
 impl PlaneCatalog {
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.version.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn ordinary_test_catalog(facts: &[prefrontal_routing_core::ModelFact]) -> Self {
-        let mut catalog = Self::default();
+        let mut catalog = Self {
+            version: Some(0),
+            ..Self::default()
+        };
         for fact in facts {
             catalog.base.insert(
                 format!("{}/{}", fact.provider_id, fact.model_id),
@@ -985,7 +992,7 @@ impl CatalogWire for FusiformCatalogConsumer {
         credentials
             .lock()
             .map_err(|_| error("credential cache lock poisoned"))?
-            .billing_catalog = cache;
+            .publish_billing_catalog(cache);
         Ok(())
     }
 
@@ -1361,6 +1368,7 @@ pub async fn catalog_refresh_loop(
 #[cfg(test)]
 mod tests {
     include!("fusiform_catalog_paging_tests.rs");
+    include!("billing_readiness_tests.rs");
     use super::*;
     use sha2::{Digest, Sha256};
 
