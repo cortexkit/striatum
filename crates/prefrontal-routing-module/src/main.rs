@@ -10112,7 +10112,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            rig.dir.join("alfonso.jsonc"),
+            rig.dir.join("prefrontal.jsonc"),
             r#"{ "model_routing": { "exclude": {"all": ["openai"]} } }"#,
         )
         .unwrap();
