@@ -125,6 +125,35 @@ mod tests {
     }
 
     #[test]
+    fn committed_catalog_passes_engram_catalog_validation_contract() {
+        let catalog: Value = serde_json::from_slice(CATALOG_BYTES).expect("catalog JSON");
+        assert_eq!(catalog["schema_version"], 1);
+        assert_eq!(catalog["module_id"], "prefrontal-routing");
+        let entries = catalog["entries"].as_array().expect("entries array");
+        let mut ids = std::collections::HashSet::new();
+        for entry in entries {
+            let id = entry["entry_id"].as_str().expect("entry id");
+            assert!(ids.insert(id), "duplicate entry id {id}");
+            let class = entry["class"].as_str().expect("entry class");
+            assert!(matches!(class, "portable" | "device-local" | "excluded"));
+            let mechanism = entry["mechanism"].as_str().expect("mechanism");
+            assert!(matches!(mechanism, "whole-db" | "page-db" | "filetree"));
+            let path = entry["path"].as_str().expect("entry path");
+            assert!(!path.is_empty() && !Path::new(path).is_absolute());
+            assert!(path.split('/').all(|part| !matches!(part, "" | "." | "..")));
+            assert!(!path.contains('\\') && !path.contains(':'));
+            if class == "excluded" {
+                assert!(entry["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.trim().is_empty()));
+            }
+            if class == "portable" && mechanism == "page-db" {
+                assert_eq!(entry["writer_interaction"], "read-transaction-live");
+            }
+        }
+    }
+
+    #[test]
     fn catalog_database_path_matches_the_route_store_opener() {
         let path = entries(CATALOG_BYTES)
             .into_iter()
@@ -138,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_catalog_is_not_replaced() {
+    fn second_startup_preserves_committed_bytes_without_rewriting_the_file() {
         let directory = prefrontal_core_store::scratch_root().join(format!(
             "routing-engram-catalog-{}-{}",
             std::process::id(),
@@ -147,14 +176,28 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ));
+        let committed = include_bytes!("../engram-catalog.json");
+        assert_eq!(CATALOG_BYTES, committed);
         assert!(write_catalog_at(&directory, CATALOG_BYTES).expect("first catalog write"));
         let destination = directory.join(CATALOG_FILE_NAME);
-        let original = std::fs::read(&destination).expect("read first catalog");
-        assert!(!write_catalog_at(&directory, CATALOG_BYTES).expect("unchanged catalog"));
         assert_eq!(
-            std::fs::read(&destination).expect("read unchanged catalog"),
-            original
+            std::fs::read(&destination).expect("read first catalog"),
+            committed
         );
+        let before = std::fs::metadata(&destination).expect("stat first catalog");
+        let rewrote = write_catalog_at(&directory, committed).expect("second catalog write");
+        assert_eq!(
+            std::fs::read(&destination).expect("read second catalog"),
+            committed
+        );
+        let after = std::fs::metadata(&destination).expect("stat second catalog");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino(), "identical catalog was replaced");
+        }
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert!(!rewrote, "identical catalog reported a write");
         std::fs::remove_dir_all(directory).expect("remove catalog test directory");
     }
 }
