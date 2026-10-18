@@ -25,7 +25,9 @@ mod fusiform_catalog;
 mod key_pool;
 mod model_resolution;
 mod panel_policy;
+mod quota_bus;
 mod quota_consumer;
+mod quota_events;
 mod retention;
 mod runtime_lag;
 mod select_policy;
@@ -141,17 +143,12 @@ const ROUTE_LIST_UNSCORED_OP: &str = "route.list_unscored";
 const ROUTE_LIST_CANONICAL_GAPS_OP: &str = "route.list_canonical_gaps";
 const HELLO_CORR: u64 = 1;
 const EGRESS_BUFFER: usize = 64;
-/// How often the background task refreshes quota windows from insula.
-/// Windows change slowly, so a cached snapshot refreshed off the selection hot
-/// path keeps `route.select` from ever blocking on a live cross-module call.
-const QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-/// Backoff between quota-connect attempts when insula is absent/down.
-/// The module degrades gracefully (seed-only selection) until quota appears. Kept
-/// short so a sibling module that registers slightly later is picked up promptly.
+/// Retry bus attachment and failed fallback snapshots promptly during startup
+/// or an outage, without making quota availability a prerequisite for selection.
 const QUOTA_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Age past which the cached quota snapshot no longer steers selection. The
-/// refresh runs every minute, so a snapshot this old means refreshes have been
-/// failing (or hanging) for many cycles. Quota windows move within that time:
+/// backstop runs every ten minutes, so a snapshot this old has missed a backstop
+/// refresh. Quota windows move within that time:
 /// insula spends banked resets, five-hour windows roll over, and a wall read an
 /// hour ago is no evidence of a wall now. Past this bound selection treats quota
 /// as unknown (neutral pressure, no quota walls), each decision says so, and
@@ -162,7 +159,7 @@ const QUOTA_STALE_AFTER_MS: u64 = 15 * 60_000;
 /// `route.select` handlers (readers). The lock is NEVER held across an `.await`:
 /// the refresh task fetches outside the lock then takes it briefly to merge; a
 /// selection takes it only to clone the snapshot out.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct QuotaCache {
     windows: Vec<ProviderUsage>,
     refreshed_at_ms: u64,
@@ -176,6 +173,7 @@ struct QuotaCache {
     /// poll time at which that snapshot was accepted. Cleared by the first
     /// successful poll, which replaces the restored windows wholesale.
     restored_from_ms: Option<u64>,
+    consumer: quota_events::ConsumerHealth,
 }
 
 type SharedQuotaCache = Arc<Mutex<QuotaCache>>;
@@ -225,6 +223,7 @@ fn quota_health(cache: &QuotaCache, now_ms: u64) -> (Option<String>, serde_json:
         "staleAfterMs": QUOTA_STALE_AFTER_MS,
         "stale": stale_age.is_some(),
         "lastError": cache.last_error,
+        "consumer": cache.consumer,
     });
     let detail = stale_age.map(|age_ms| {
         let mut detail = format!(
@@ -411,25 +410,26 @@ fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
     }
 }
 
-/// Append every healthy entry of one poll to the quota reading log, the durable
-/// record the consumption estimate reads. Provider resolution is the overlay's:
-/// the published `apiProvider` slug first, the local wire-name map as fallback, an
-/// unmapped entry skipped, and capacity keys from the stored facts so the
-/// antigravity per-model windows carry the same window keys the overlay uses. A
-/// failed append is logged and never blocks the overlay: a missing sample costs
-/// one interval of the estimate, while a stalled overlay costs routing.
+#[cfg(test)]
 fn record_quota_readings(
     store: &SqliteRouteStateStore,
     fresh: &[ProviderUsage],
     observed_at_ms: u64,
 ) {
-    let facts = match store.get_facts() {
-        Ok(facts) => facts,
-        Err(error) => {
-            tracing::warn!(error = %error, "quota reading log: facts unavailable, poll not recorded");
-            return;
-        }
-    };
+    if let Err(error) = write_quota_readings(store, fresh, observed_at_ms) {
+        tracing::warn!(error, "quota reading log: sample not recorded");
+    }
+}
+
+/// Append healthy entries to the consumption estimate's reading log, resolving
+/// providers and per-model capacity keys the same way as the quota overlay.
+/// Return write failures so the delivery adapter leaves the event unacknowledged.
+fn write_quota_readings(
+    store: &SqliteRouteStateStore,
+    fresh: &[ProviderUsage],
+    observed_at_ms: u64,
+) -> Result<(), String> {
+    let facts = store.get_facts().map_err(|e| e.to_string())?;
     let mut caps_by_provider: HashMap<String, Vec<String>> = HashMap::new();
     for fact in &facts {
         caps_by_provider
@@ -438,9 +438,7 @@ fn record_quota_readings(
             .push(make_capacity_key(&fact.provider_id, &fact.model_id));
     }
     let name_map = quota_name_map();
-    let Ok(observed_at) = i64::try_from(observed_at_ms) else {
-        return;
-    };
+    let observed_at = i64::try_from(observed_at_ms).map_err(|e| e.to_string())?;
     let empty: Vec<String> = Vec::new();
     for entry in fresh {
         let provider_id = match entry.api_provider.as_deref() {
@@ -451,16 +449,10 @@ fn record_quota_readings(
             },
         };
         let capacity_keys = caps_by_provider.get(&provider_id).unwrap_or(&empty);
-        if let Err(error) =
-            record_reading_log_poll(store, entry, &provider_id, capacity_keys, observed_at)
-        {
-            tracing::warn!(
-                error = %error,
-                provider = %provider_id,
-                "quota reading log: poll not recorded"
-            );
-        }
+        record_reading_log_poll(store, entry, &provider_id, capacity_keys, observed_at)
+            .map_err(|e| e.to_string())?;
     }
+    Ok(())
 }
 
 fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observed_at_ms: u64) {
@@ -480,27 +472,31 @@ fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observ
     cache.last_error = None;
 }
 
-/// Persist the merged quota windows a selection now reads, so the next process
-/// can select with them from the moment it serves. A failed write is logged and
-/// never blocks the refresh: it costs only the restart window this closes.
+/// Test helper for writing a snapshot without a live delivery cursor.
+#[cfg(test)]
 fn persist_quota_snapshot(
     store: &SqliteRouteStateStore,
     windows: &[ProviderUsage],
     observed_at_ms: u64,
 ) {
-    let Ok(observed_at) = i64::try_from(observed_at_ms) else {
-        return;
-    };
-    let result = serde_json::to_string(windows)
+    if let Err(error) = write_quota_snapshot(store, windows, observed_at_ms) {
+        tracing::warn!(error, "quota snapshot not persisted");
+    }
+}
+
+fn write_quota_snapshot(
+    store: &SqliteRouteStateStore,
+    windows: &[ProviderUsage],
+    observed_at_ms: u64,
+) -> Result<(), String> {
+    let observed_at = i64::try_from(observed_at_ms).map_err(|e| e.to_string())?;
+    serde_json::to_string(windows)
         .map_err(|error| error.to_string())
         .and_then(|json| {
             store
                 .put_quota_snapshot(&json, observed_at)
                 .map_err(|error| error.to_string())
-        });
-    if let Err(error) = result {
-        tracing::warn!(error = %error, "quota snapshot not persisted");
-    }
+        })
 }
 
 /// Build the boot-time quota cache from the snapshot the previous process
@@ -533,6 +529,7 @@ fn restore_quota_cache(store: &SqliteRouteStateStore) -> QuotaCache {
         last_error: None,
         retained_degraded_keys: HashSet::new(),
         restored_from_ms: Some(observed_at_ms),
+        consumer: Default::default(),
     }
 }
 
@@ -739,11 +736,9 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let writer = tokio::spawn(drain_writer(write_half, rx));
 
-    // The quota cache is fed by SEPARATE short-lived outbound consumer connections
-    // to insula (the second, independent connection while a cycle runs).
-    // It refreshes off the selection hot path; route.select reads the cached snapshot,
-    // never blocking on a live cross-module call. Quota being absent is non-fatal
-    // (seed-only routing).
+    // Quota delivery runs off the selection hot path. Bus notices fetch bodies
+    // over independent outbound insula connections; route.select only reads the
+    // cache. A bus outage switches delivery to usage.get snapshots.
     let quota_cache: SharedQuotaCache = Arc::new(Mutex::new(QuotaCache::default()));
     let catalog_health: SharedCatalogHealth = Arc::new(Mutex::new(CatalogReachHealth::new(
         config_overrides::DEFAULT_CATALOG_POLL_MS,
@@ -767,74 +762,6 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
         (Ok(()), Ok(Ok(()))) => Ok(()),
         (Ok(()), Ok(Err(writer_err))) => Err(ModuleError::Message(writer_err.to_string())),
         (Ok(()), Err(join_err)) => Err(join_err),
-    }
-}
-
-/// Background task refreshing quota windows on an interval. Each cycle owns its
-/// outbound connection; the connection is never held across the refresh sleep. The
-/// fetch `.await` happens with NO lock held; the cache lock is taken only to merge
-/// the fresh poll, so a slow/blocked quota call can never stall `route.select`.
-async fn quota_refresh_loop(
-    connection_file_path: PathBuf,
-    cache: SharedQuotaCache,
-    store: SharedStore,
-) {
-    // The quota module is machine-global (ignores project_root), but route.open
-    // needs a valid identity. A stable per-process temp dir suffices.
-    let project_root = std::env::temp_dir().join("prefrontal-routing-quota-consumer");
-    let _ = std::fs::create_dir_all(&project_root);
-
-    loop {
-        let mut consumer = match QuotaConsumer::connect(&connection_file_path, &project_root).await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                // Quota module not up yet (or route.open failed). Degrade to
-                // seed-only routing and retry; do not crash the module. Record the
-                // error so route.quota_status can surface why quota is unavailable.
-                tracing::debug!(error = %e, "quota refresh cycle failed");
-                if let Ok(mut guard) = cache.lock() {
-                    record_quota_refresh_failure(&mut guard, "connect", &e);
-                }
-                tokio::time::sleep(QUOTA_RETRY_INTERVAL).await;
-                continue;
-            }
-        };
-
-        match consumer.usage_get().await {
-            Ok(windows) => {
-                // Replace healthy providers we just heard from, but retain providers absent
-                // from this poll and healthy windows whose fresh replacement degraded.
-                let observed_at_ms = now_ms();
-                record_quota_readings(store.as_ref(), &windows, observed_at_ms);
-                let merged = match cache.lock() {
-                    Ok(mut guard) => {
-                        apply_quota_refresh(&mut guard, windows, observed_at_ms);
-                        Some(guard.windows.clone())
-                    }
-                    Err(_) => None,
-                };
-                // Written outside the cache lock so a slow disk never stalls selection.
-                if let Some(merged) = merged {
-                    persist_quota_snapshot(store.as_ref(), &merged, observed_at_ms);
-                }
-                // `usage_get` sends GOODBYE and shuts down the stream on success;
-                // drop it before beginning the long idle interval as well.
-                drop(consumer);
-                tokio::time::sleep(QUOTA_REFRESH_INTERVAL).await;
-            }
-            Err(e) => {
-                // A failed cycle is expected during transient daemon restarts. Keep
-                // the last healthy windows, mark the live observation unavailable,
-                // and reconnect from scratch on the retry interval.
-                tracing::debug!(error = %e, "quota refresh cycle failed");
-                if let Ok(mut guard) = cache.lock() {
-                    record_quota_refresh_failure(&mut guard, "usage.get", &e);
-                }
-                drop(consumer);
-                tokio::time::sleep(QUOTA_RETRY_INTERVAL).await;
-            }
-        }
     }
 }
 
@@ -895,15 +822,10 @@ where
     }
     // Seed the cache from the last persisted snapshot before anything can serve a
     // selection, so a restart does not select with no quota reading until the
-    // first poll lands.
+    // first live quota update lands.
     if let Ok(mut guard) = quota_cache.lock() {
         *guard = restore_quota_cache(store.as_ref());
     }
-    tokio::spawn(quota_refresh_loop(
-        config.connection_file_path.clone(),
-        Arc::clone(&quota_cache),
-        Arc::clone(&store),
-    ));
     // Old audit, usage and account-selection rows are deleted in small batches
     // on their own timer. Each retention pass re-reads how long every table keeps its
     // rows from the routing file's `retention` block.
@@ -911,11 +833,16 @@ where
         Arc::clone(&store),
         config_overrides::config_path(),
     ));
-    // Per-account quota views: restored with their original source dates before
-    // the first poll, then refreshed on their own loop. Model selection does not
-    // read them.
+    // Restore per-account views before the shared quota delivery task starts.
+    // The roster has a separate refresh loop; readings share the event consumer.
     let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
         account_quota::restore_account_state(store.as_ref()),
+    ));
+    tokio::spawn(quota_events::run(
+        config.connection_file_path.clone(),
+        Arc::clone(&quota_cache),
+        Arc::clone(&account_state),
+        Arc::clone(&store),
     ));
     let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
     broca_credentials.lock().unwrap().connection_file_path =
@@ -3091,6 +3018,7 @@ async fn handle_select_request(
     }
 
     if envelope.method == QUOTA_STATUS_OP {
+        let consumer = quota_cache.lock().ok().map(|cache| cache.consumer.clone());
         let (available, refreshed_at_ms, providers, healthy, last_error, restored_from_ms) =
             match quota_cache.lock() {
                 Ok(g) => (
@@ -3112,6 +3040,7 @@ async fn handle_select_request(
             "restoredFromMs": restored_from_ms,
             "staleAfterMs": QUOTA_STALE_AFTER_MS,
             "staleAgeMs": stale_quota_age_ms(refreshed_at_ms, now_ms()),
+            "consumer": consumer,
         }}))
         .map_err(ModuleError::Json)?;
         let response = Frame::build_with_version(
