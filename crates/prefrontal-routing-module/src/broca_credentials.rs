@@ -34,6 +34,7 @@ pub struct BrocaCredentials {
     listed: Vec<ListedCredential>,
     serving: BTreeMap<String, ServingMethod>,
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
+    billing_loaded: Arc<tokio::sync::Notify>,
     pub(crate) catalog_snapshot: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
     pub(crate) catalog_wake: Arc<tokio::sync::Notify>,
     pub(crate) connection_file_path: Option<std::path::PathBuf>,
@@ -102,7 +103,46 @@ fn choose_method(roster: BTreeSet<String>, listed: BTreeSet<String>) -> ServingM
 
 pub type SharedBrocaCredentials = Arc<Mutex<BrocaCredentials>>;
 
+/// Wait for the first complete plane publication, not merely a catalog connection.
+/// Restored account identities can resolve a serving method before its rates arrive.
+pub(crate) async fn wait_for_billing_catalog(
+    credentials: &SharedBrocaCredentials,
+    bound: std::time::Duration,
+) -> bool {
+    let Ok(loaded) = credentials
+        .lock()
+        .map(|guard| Arc::clone(&guard.billing_loaded))
+    else {
+        return false;
+    };
+    tokio::time::timeout(bound, async {
+        loop {
+            let notified = loaded.notified();
+            tokio::pin!(notified);
+            // Register before checking readiness so publication cannot be missed.
+            notified.as_mut().enable();
+            if credentials
+                .lock()
+                .is_ok_and(|guard| guard.billing_catalog.is_loaded())
+            {
+                return;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 impl BrocaCredentials {
+    pub(crate) fn publish_billing_catalog(
+        &mut self,
+        catalog: crate::fusiform_catalog::PlaneCatalog,
+    ) {
+        self.billing_catalog = catalog;
+        self.billing_loaded.notify_waiters();
+    }
+
     #[cfg(test)]
     pub(crate) fn api_test_credentials(facts: &[ModelFact]) -> Self {
         let mut credentials = Self::default();

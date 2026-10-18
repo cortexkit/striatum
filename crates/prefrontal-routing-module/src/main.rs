@@ -1248,10 +1248,15 @@ async fn handle_control_request(
         ModuleControlRequest::HealthCheck {} => {
             // Unknown Broca reachability and stale quota snapshots can coexist.
             // Unmapped credential IDs remain in metrics without affecting status.
-            let mut report = broca_credentials
+            let (mut report, pricing_ready) = broca_credentials
                 .lock()
-                .map(|credentials| credentials.health_report(now_ms()))
-                .unwrap_or_else(|_| BrocaCredentials::default().health_report(now_ms()));
+                .map(|credentials| {
+                    (
+                        credentials.health_report(now_ms()),
+                        credentials.billing_catalog.is_loaded(),
+                    )
+                })
+                .unwrap_or_else(|_| (BrocaCredentials::default().health_report(now_ms()), false));
             let broca_metrics = report.metrics.take();
             let (quota_detail, quota_metrics) = match quota_cache.lock() {
                 Ok(cache) => quota_health(&cache, now_ms()),
@@ -1260,7 +1265,15 @@ async fn handle_control_request(
                     json!({ "lastError": "cache poisoned" }),
                 ),
             };
-            if let Some(detail) = quota_detail {
+            for detail in [
+                (!pricing_ready).then(|| {
+                    "routing pricing not ready: awaiting first billing-plane load".to_string()
+                }),
+                quota_detail,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 report.status = HealthStatus::Degraded;
                 report.detail = Some(match report.detail.take() {
                     Some(existing) => format!("{existing}; {detail}"),
@@ -1268,6 +1281,7 @@ async fn handle_control_request(
                 });
             }
             report.metrics = Some(json!({
+                "pricingReady": pricing_ready,
                 "brocaReachability": broca_metrics,
                 "fusiformCatalog": catalog_health
                     .lock()
@@ -3212,6 +3226,34 @@ async fn handle_select_request(
             },
         );
         return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
+    }
+    if matches!(
+        envelope.method.as_str(),
+        ROUTE_SELECT_OP | ROUTE_SELECT_PANEL_OP
+    ) && !broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
+        .await
+    {
+        let body = serde_json::to_vec(&ErrorBody {
+            code: "routing_not_ready".into(),
+            message: "routing pricing is awaiting its first billing-plane load; retry shortly"
+                .into(),
+            detail: Some(json!({"retryable": true, "retry_after_ms": 1000})),
+        })
+        .map_err(ModuleError::Json)?;
+        return send(
+            writer,
+            Frame::build_with_version(
+                ver,
+                FrameType::Error,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                corr,
+                body,
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?,
+        )
+        .await;
     }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(
@@ -6768,7 +6810,9 @@ mod tests {
     }
 
     fn empty_broca_credentials() -> SharedBrocaCredentials {
-        Arc::new(Mutex::new(BrocaCredentials::default()))
+        // These wire fixtures represent a completed catalog load with no supplied
+        // planes. Cold-start tests construct the uninitialized cache explicitly.
+        Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(&[])))
     }
 
     fn mapped_broca_credentials(provider: &str) -> SharedBrocaCredentials {
@@ -6859,7 +6903,7 @@ mod tests {
         .await
     }
 
-    async fn run_route_wire_request_with_paths(
+    pub(super) async fn run_route_wire_request_with_paths(
         store: &SharedStore,
         request: serde_json::Value,
         operator_config_path: &Path,
@@ -6918,6 +6962,7 @@ mod tests {
             .unwrap(),
         );
         let mut before = BrocaCredentials::default();
+        before.billing_catalog = fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[]);
         before.legacy_pricing_baseline = true;
         let before_credentials = Arc::new(Mutex::new(before));
         let state = account_quota::restore_account_state(&store);
@@ -9825,7 +9870,7 @@ mod tests {
         health_report_for_with_credentials(cache, &mapped_broca_credentials("anthropic")).await
     }
 
-    async fn health_report_for_with_credentials(
+    pub(super) async fn health_report_for_with_credentials(
         cache: QuotaCache,
         broca_credentials: &SharedBrocaCredentials,
     ) -> ModuleControlResponse {
