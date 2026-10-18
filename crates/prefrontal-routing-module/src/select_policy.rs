@@ -2,9 +2,7 @@
 
 use crate::config_policy::{ExcludeGroups, Pins, SynthesizerPin};
 use prefrontal_routing_core::model_facts::ModelRequirements;
-use prefrontal_routing_core::model_router::{
-    admit_routes, select_model_route_with_slots, SelectModelRouteInput, SelectedModelRoute,
-};
+use prefrontal_routing_core::model_router::{SelectModelRouteInput, SelectedModelRoute};
 use prefrontal_routing_core::provider_model_spec::ExclusionPolicy;
 use prefrontal_routing_core::{ConcurrencySlots, RoutingConfig};
 use serde::Deserialize;
@@ -71,11 +69,12 @@ pub(crate) enum PinFallback {
     None,
 }
 
-pub(crate) fn select_pin(
+pub(crate) fn select_pin_with_availability(
     pin: &SynthesizerPin,
     mut input: SelectModelRouteInput<'_>,
     config: &RoutingConfig,
     slots: Option<&ConcurrencySlots>,
+    availability_rejections: &std::collections::HashMap<String, String>,
 ) -> Result<SelectedModelRoute, String> {
     let (provider, model) = pin.model.split_once('/').ok_or("invalid_model_pin")?;
     if provider.is_empty()
@@ -111,14 +110,16 @@ pub(crate) fn select_pin(
     }
     input.facts = vec![fact];
     input.operator_exclude_keys.clear();
-    let admission = admit_routes(
+    let admission = prefrontal_routing_core::model_router::admit_routes_with_availability(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy::caller_only(&input.exclude_route_keys),
+        &[],
         input.required_capabilities,
         &input.available_models,
         &input.requirements,
         config,
+        availability_rejections,
     );
     let adequacy = admission
         .admitted
@@ -135,7 +136,14 @@ pub(crate) fn select_pin(
         .get_or_insert_with(Default::default)
         .min_context
         .get_or_insert(0.0);
-    let mut selected = select_model_route_with_slots(input, config, slots).map_err(|error| {
+    let mut selected = prefrontal_routing_core::model_router::select_model_route_with_availability(
+        input,
+        config,
+        slots,
+        &[],
+        availability_rejections,
+    )
+    .map_err(|error| {
         error.rejected.first().map_or_else(
             || error.reason.as_str().into(),
             |route| pin_rejection(&route.reason),

@@ -166,13 +166,19 @@ pub async fn route_close(stream: &mut TcpStream, route: TestRoute) {
     write_frame(stream, &frame).await.unwrap();
 }
 
-/// Send a `route.select` request on the route channel and return the decoded body.
+/// Send an executor selection using the fixture's availability list, unless the
+/// fixture explicitly supplies another executor value.
 pub async fn route_select(
     stream: &mut TcpStream,
     route: TestRoute,
     corr: u64,
-    params: Value,
+    mut params: Value,
 ) -> Value {
+    params
+        .as_object_mut()
+        .unwrap()
+        .entry("executor")
+        .or_insert(serde_json::json!("broca"));
     raw_route_request(
         stream,
         route,

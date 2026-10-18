@@ -574,14 +574,14 @@ async fn real_daemon_no_available_model_returns_typed_error() {
     std::fs::create_dir_all(&project_root).unwrap();
     let route_channel = route_open(&mut consumer, &project_root, 1).await;
 
-    // Empty availableModels → nothing admissible → typed no_available_model.
+    // An executor with no substrate uses the empty list, so nothing is admissible.
     let frame = raw_route_frame(
         &mut consumer,
         route_channel,
         2,
         serde_json::json!({
             "method": "route.select",
-            "params": { "requirements": { "iq": 50, "eq": 10 }, "availableModels": [] }
+            "params": { "executor": "broca", "requirements": { "iq": 50, "eq": 10 }, "availableModels": [] }
         }),
     )
     .await;

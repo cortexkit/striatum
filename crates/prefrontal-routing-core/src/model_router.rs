@@ -661,6 +661,35 @@ pub fn admit_routes_with_operator_group(
     requirements: &ModelRequirements,
     config: &RoutingConfig,
 ) -> AdmissionResult {
+    admit_routes_with_availability(
+        facts,
+        runtime_snapshot,
+        exclusions,
+        operator_group,
+        required_capabilities,
+        available_models,
+        requirements,
+        config,
+        &HashMap::new(),
+    )
+}
+
+/// The `availability_rejections` map uses exact route keys. A key in that map
+/// is rejected as `not_available` even when its route or capacity key is
+/// available; the map's value becomes the rejection detail.
+/// A capacity key covers every variant of a model, but a route-local refusal
+/// must still be able to deny one variant without denying its siblings.
+pub fn admit_routes_with_availability(
+    facts: &[ModelFact],
+    runtime_snapshot: Option<&ModelRouteStateSnapshot>,
+    exclusions: ExclusionPolicy<'_>,
+    operator_group: &[String],
+    required_capabilities: Option<RequiredCapabilities>,
+    available_models: &HashSet<String>,
+    requirements: &ModelRequirements,
+    config: &RoutingConfig,
+    availability_rejections: &HashMap<String, String>,
+) -> AdmissionResult {
     let now = runtime_snapshot.map(|s| s.now).unwrap_or_else(now_millis);
     let exclusion_specs = ExclusionSpecs::parse(exclusions).with_operator_group(operator_group);
     let mut static_candidates = Vec::new();
@@ -702,11 +731,13 @@ pub fn admit_routes_with_operator_group(
             });
             continue;
         }
-        if !is_route_available(&route, available_models) {
+        if availability_rejections.contains_key(&route.route_key)
+            || !is_route_available(&route, available_models)
+        {
             rejected.push(RejectedRoute {
+                detail: availability_rejections.get(&route.route_key).cloned(),
                 route_key: route.route_key,
                 reason: REASON_NOT_AVAILABLE.to_string(),
-                detail: None,
             });
             continue;
         }
@@ -1264,6 +1295,7 @@ fn admit_and_price_shortlist(
     counters_producer: bool,
     class_producer: bool,
     operator_group: &[String],
+    availability_rejections: &HashMap<String, String>,
 ) -> Result<PricedAdmission, NoRouteError> {
     let requirements = input.requirements;
 
@@ -1305,7 +1337,7 @@ fn admit_and_price_shortlist(
         admitted: mut admissible,
         mut rejected,
         top_routable,
-    } = admit_routes_with_operator_group(
+    } = admit_routes_with_availability(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy {
@@ -1317,6 +1349,7 @@ fn admit_and_price_shortlist(
         &input.available_models,
         &requirements,
         config,
+        availability_rejections,
     );
 
     admissible.retain(|a| {
@@ -1525,7 +1558,14 @@ pub fn price_selection_shortlist(
     counters_producer: bool,
     class_producer: bool,
 ) -> Result<PricedShortlist, NoRouteError> {
-    let priced = admit_and_price_shortlist(&input, config, counters_producer, class_producer, &[])?;
+    let priced = admit_and_price_shortlist(
+        &input,
+        config,
+        counters_producer,
+        class_producer,
+        &[],
+        &HashMap::new(),
+    )?;
     Ok(PricedShortlist {
         use_basket: priced.use_basket,
         degraded_by: priced.degraded_by,
@@ -1575,6 +1615,19 @@ pub fn select_model_route_with_operator_group(
     slots: Option<&ConcurrencySlots>,
     operator_group: &[String],
 ) -> Result<SelectedModelRoute, NoRouteError> {
+    select_model_route_with_availability(input, config, slots, operator_group, &HashMap::new())
+}
+
+/// Select with per-route availability refusals while preserving the ordinary
+/// exclusion, capability, scoring and quota gates. The refusal map follows
+/// [`admit_routes_with_availability`]'s exact-key and detail contract.
+pub fn select_model_route_with_availability(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    slots: Option<&ConcurrencySlots>,
+    operator_group: &[String],
+    availability_rejections: &HashMap<String, String>,
+) -> Result<SelectedModelRoute, NoRouteError> {
     let PricedAdmission {
         admissible,
         mut rejected,
@@ -1590,6 +1643,7 @@ pub fn select_model_route_with_operator_group(
         COUNTERS_PRODUCER,
         CLASS_PRODUCER,
         operator_group,
+        availability_rejections,
     )?;
 
     // Deterministic ordering. COST-PRIMARY lexicographic among adequate models.

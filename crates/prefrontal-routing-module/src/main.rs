@@ -29,6 +29,7 @@ mod quota_consumer;
 mod retention;
 mod runtime_lag;
 mod select_policy;
+mod selection_harness;
 mod subscription_economics;
 mod substrate_policy;
 mod variant_policy;
@@ -51,7 +52,7 @@ use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
 use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::model_router::{
-    select_model_route_with_operator_group, ModelRouteStateSnapshot, NoRouteError,
+    select_model_route_with_availability, ModelRouteStateSnapshot, NoRouteError,
     RequiredCapabilities, RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::quota::quota_poll::record_reading_log_poll;
@@ -1320,6 +1321,12 @@ struct SelectParams {
     model_pin: Option<String>,
     #[serde(default = "default_target_agent")]
     target_agent: String,
+    #[serde(default)]
+    workload: Option<selection_harness::Workload>,
+    #[serde(default)]
+    executor: Option<selection_harness::Executor>,
+    #[serde(default)]
+    required_harness: Option<substrate_policy::Harness>,
     /// Existing module callers may provide an already-resolved demand vector.
     #[serde(default)]
     requirements: Option<ModelRequirements>,
@@ -1353,10 +1360,9 @@ struct SelectParams {
     task_id: Option<String>,
     #[serde(default, alias = "parentSessionID")]
     parent_session_id: Option<String>,
-    /// The substrate that will send to the selected route. `broca` judges the
-    /// selection against what Broca can reach (see [`select_availability`])
-    /// instead of `availableModels`, which is a host's provider list; absent or
-    /// any other value keeps the caller's list.
+    /// For `executor: broca`, `substrate: broca` uses Broca's served routes;
+    /// absent or other values use `availableModels`. Launch selections ignore
+    /// this legacy field and use each route's mapped harness.
     #[serde(default)]
     substrate: Option<String>,
     /// The caller's harness, used to match the decision with recorded spend facts when provided.
@@ -1375,6 +1381,18 @@ struct SelectParams {
     /// limited by these slots) leaves the selection unchanged.
     #[serde(default)]
     concurrency_slots: Option<Vec<ConcurrencySlotState>>,
+}
+
+impl SelectParams {
+    fn resolved_workload(&self) -> Option<selection_harness::Workload> {
+        self.workload.or_else(|| {
+            if self.executor.is_none() {
+                selection_harness::Workload::for_agent(&self.target_agent)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1744,7 +1762,13 @@ fn resolve_select_request(
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
     );
-    if params.model_pin.is_none() && params.pin.is_none() && policy.connected_model_count == 0 {
+    let uses_host_availability =
+        params.executor.is_some() && !is_broca_substrate(params.substrate.as_deref());
+    if uses_host_availability
+        && params.model_pin.is_none()
+        && params.pin.is_none()
+        && policy.connected_model_count == 0
+    {
         return Err(no_route_error(
             RouteFailureReason::NoAvailableModel,
             format!(
@@ -1754,7 +1778,11 @@ fn resolve_select_request(
             requirements,
         ));
     }
-    if params.model_pin.is_none() && params.pin.is_none() && policy.available_models.is_empty() {
+    if uses_host_availability
+        && params.model_pin.is_none()
+        && params.pin.is_none()
+        && policy.available_models.is_empty()
+    {
         return Err(no_route_error(
             RouteFailureReason::NoAvailableModel,
             format!(
@@ -3241,7 +3269,7 @@ async fn handle_select_request(
         .await;
     }
 
-    let mut params: SelectParams = match serde_json::from_slice::<SelectBody>(&frame.body) {
+    let params: SelectParams = match serde_json::from_slice::<SelectBody>(&frame.body) {
         Ok(b) => b.params,
         Err(e) => {
             return send_route_error(
@@ -3283,57 +3311,32 @@ async fn handle_select_request(
     };
     let operator_policy = operator_config.operator_policy();
     timing.add_live_config_check(live_config_started.elapsed());
-    // Host plugins do not choose the substrate for a mason launch. Provisionally
-    // admit only the pool route named by the model pin; core selects that pin
-    // again using its chosen substrate before recording the launch. This first
-    // pass does not lease a key.
-    let deferred_runner_pin = params.substrate.is_none()
-        && params.target_agent == "mason"
-        && params.model_pin.as_deref().is_some_and(|pin| {
-            pin.split_once('/')
-                .is_some_and(|(provider, _)| needs_runner_pin(&operator_policy, provider))
-        });
-    let availability_substrate = if deferred_runner_pin {
-        Some("broca")
-    } else {
-        params.substrate.as_deref()
-    };
     let snapshot_started = Instant::now();
-    let availability = if is_broca_substrate(availability_substrate) {
-        match store.get_facts() {
-            Ok(mut facts) => {
-                live_config.apply(&mut facts);
-                // Aliased providers are reachable through their own credentials,
-                // so their borrowed rows join the served-route join.
-                prefrontal_routing_core::score_alias::append_alias_rows(
-                    &mut facts,
-                    &operator_policy.score_alias,
-                );
-                select_availability(
-                    availability_substrate,
-                    std::mem::take(&mut params.available_models),
-                    &facts,
-                    broca_credentials,
-                )
-            }
-            Err(e) => {
-                return send_route_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "store_error",
-                    &format!("reading facts from route-state store: {e}"),
-                )
-                .await;
-            }
+    let availability = match store.get_facts() {
+        Ok(mut facts) => {
+            live_config.apply(&mut facts);
+            // Aliased providers are reachable through their own credentials,
+            // so their borrowed rows join the served-route join.
+            prefrontal_routing_core::score_alias::append_alias_rows(
+                &mut facts,
+                &operator_policy.score_alias,
+            );
+            select_availability(Some("broca"), Vec::new(), &facts, broca_credentials)
         }
-    } else {
-        SelectAvailability::host(std::mem::take(&mut params.available_models))
+        Err(e) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("reading facts from route-state store: {e}"),
+            )
+            .await;
+        }
     };
     timing.add_snapshot_closure(snapshot_started.elapsed());
-    params.available_models = availability.models.clone();
     let resolved_request =
         match resolve_select_request(&params, &operator_policy, opencode_auth_path) {
             Ok(resolved) => resolved,
@@ -3400,22 +3403,45 @@ async fn handle_select_request(
     }
     live_config.apply(&mut facts);
 
-    let subscription_keys: HashSet<String> = resolved_request
-        .policy
-        .subscription_keys
-        .iter()
-        .cloned()
-        .collect();
-    let available: HashSet<String> = resolved_request
+    let host_models: HashSet<String> = resolved_request
         .policy
         .available_models
         .iter()
         .cloned()
         .collect();
-    // The winner ladder replays what this caller class was handed on the
-    // substrate that sends. Keyed by the target agent as well because callers
-    // of one substrate can hand it different lists, and a single slot flipped
-    // between them on every alternation.
+    let broca_models: HashSet<String> = availability.models.iter().cloned().collect();
+    let executor_models = if is_broca_substrate(params.substrate.as_deref()) {
+        &broca_models
+    } else {
+        &host_models
+    };
+    let harness_context = selection_harness::SelectionHarness {
+        groups: operator_config.substrate_groups(),
+        consumer: params.consumer,
+        workload: params.resolved_workload(),
+        executor: params.executor.is_some(),
+        required: params.required_harness,
+        caller: params.harness.as_deref(),
+        host_models: &host_models,
+        broca_models: &broca_models,
+        executor_models,
+    };
+    let mapped_availability = harness_context.availability(&facts);
+    let available = mapped_availability.models.clone();
+    let mut execution_operator_policy = operator_policy.clone();
+    if params.pin.is_some() || params.model_pin.is_some() {
+        execution_operator_policy.exclude.clear();
+    }
+    let execution_policy = resolve_routing_policy(
+        available.iter().cloned(),
+        &execution_operator_policy,
+        &ModelRoutingPolicyInput::default(),
+        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
+    );
+    let subscription_keys: HashSet<String> =
+        execution_policy.subscription_keys.into_iter().collect();
+    // Record on the winner's harness ladder, keeping other harnesses' routes
+    // out of its availability history. Target agents retain separate histories.
     //
     // A request that names its model keeps operator-excluded routes in
     // `available` (see resolve_select_request). The ladder replays automatic
@@ -3426,18 +3452,28 @@ async fn handle_select_request(
         operator: &operator_policy.exclude,
         caller: &[],
     });
-    winner_ladder::observed_selections().record(
-        winner_ladder::LadderKey::new(availability.ladder_substrate, &params.target_agent),
-        available
-            .iter()
-            .filter(|key| !ladder_fence.excludes(key))
-            .cloned(),
-        subscription_keys
-            .iter()
-            .filter(|key| !ladder_fence.excludes(key))
-            .cloned(),
-        snapshot.clone(),
-    );
+    let record_ladder = |harness: substrate_policy::Harness| {
+        winner_ladder::observed_selections().record(
+            winner_ladder::LadderKey::new(
+                if harness == substrate_policy::Harness::Broca {
+                    winner_ladder::SUBSTRATE_BROCA
+                } else {
+                    winner_ladder::SUBSTRATE_HOST
+                },
+                &params.target_agent,
+            ),
+            available
+                .iter()
+                .filter(|key| harness_context.mapped(key) == harness)
+                .filter(|key| !ladder_fence.excludes(key))
+                .cloned(),
+            subscription_keys
+                .iter()
+                .filter(|key| !ladder_fence.excludes(key))
+                .cloned(),
+            snapshot.clone(),
+        )
+    };
     let mut exclude = params.exclude_route_keys.clone();
     let head_refusals = head_content_policy_exclusions(
         store,
@@ -3467,15 +3503,29 @@ async fn handle_select_request(
         .as_deref()
         .or_else(|| admission_pin.as_ref().map(|pin| pin.model.as_str()))
     {
-        if let Some(refusal) = host_runner_pin_refusal(
-            &operator_policy,
-            if deferred_runner_pin {
-                Some("broca")
-            } else {
-                params.substrate.as_deref()
-            },
-            [pin],
-        ) {
+        let variant = admission_pin
+            .as_ref()
+            .and_then(|pin| pin.variant.clone())
+            .or_else(|| work_model_pin::named_variant(pin, &facts));
+        let (pin_key, pin_capacity) = work_model_pin::route_keys(pin, variant.as_deref(), &facts);
+        let mut pin_availability = mapped_availability.rejected.clone();
+        let mut pin_available = available.clone();
+        if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
+            pin_availability.insert(pin_key.clone(), detail);
+        } else {
+            pin_available.insert(pin_key.clone());
+        }
+        let pin_harness = harness_context.mapped(&pin_key);
+        if let Some(refusal) =
+            host_runner_pin_refusal(&operator_policy, Some(pin_harness.as_str()), [pin]).filter(
+                |_| {
+                    params.executor.is_none()
+                        && params
+                            .required_harness
+                            .is_none_or(|required| required == pin_harness)
+                },
+            )
+        {
             return send_route_error(
                 writer,
                 ver,
@@ -3493,7 +3543,7 @@ async fn handle_select_request(
             let input = SelectModelRouteInput {
                 target_agent: target_agent.clone(),
                 requirements,
-                available_models: available.clone(),
+                available_models: pin_available,
                 facts: facts.clone(),
                 runtime_snapshot: Some(snapshot.clone()),
                 exclude_route_keys: exclude.clone(),
@@ -3506,27 +3556,27 @@ async fn handle_select_request(
                 prefer_prompt_cache: false,
                 providers_without_prompt_cache: HashSet::new(),
             };
-            if let Some(refusal) =
-                host_runner_pin_refusal(&operator_policy, availability_substrate, [pin])
-            {
-                Err(work_model_pin::Refusal {
-                    code: PROVIDER_REQUIRES_RUNNER_PIN.into(),
-                    message: refusal,
+            if let Some(pin) = &admission_pin {
+                select_policy::select_pin_with_availability(
+                    pin,
+                    input,
+                    &routing_config,
+                    concurrency_slots.as_ref(),
+                    &pin_availability,
+                )
+                .map_err(|code| work_model_pin::Refusal {
+                    message: code.clone(),
+                    code,
                 })
-            } else if let Some(pin) = &admission_pin {
-                select_policy::select_pin(pin, input, &routing_config, concurrency_slots.as_ref())
-                    .map_err(|code| work_model_pin::Refusal {
-                        message: code.clone(),
-                        code,
-                    })
             } else {
-                work_model_pin::select(
+                work_model_pin::select_with_availability(
                     pin,
                     input,
                     &routing_config,
                     concurrency_slots.as_ref(),
                     config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
                     operator_config.score_aliases(),
+                    &pin_availability,
                 )
             }
         };
@@ -3561,7 +3611,7 @@ async fn handle_select_request(
             .map_err(|(code, message)| work_model_pin::Refusal { code, message })?;
             // Resolve the Broca launch target and its credential mapping
             // before recording a decision; an unusable mapping rejects the pin.
-            let runner = if is_broca_substrate(params.substrate.as_deref()) {
+            let runner = if pin_harness == substrate_policy::Harness::Broca {
                 let session = pool_session(
                     params.task_id.as_deref(),
                     params.send_id.as_deref(),
@@ -3587,6 +3637,7 @@ async fn handle_select_request(
         timing.record_selection(selection_started.elapsed());
         match selection {
             Ok((selected, runner, variant_choice)) => {
+                record_ladder(pin_harness);
                 let decision = decision_input_for(
                     &target_agent,
                     &requirements,
@@ -3604,11 +3655,9 @@ async fn handle_select_request(
                     "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities},
                     "variantSelection": variant_choice,
                 });
+                result["selected"]["harness"] = json!(pin_harness);
                 if params.pin.is_some() {
                     result["pin_rejected"] = serde_json::Value::Null;
-                }
-                if deferred_runner_pin {
-                    result["requiredSubstrate"] = json!("broca");
                 }
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
@@ -3633,7 +3682,12 @@ async fn handle_select_request(
                 timing.record_reply(reply_started.elapsed());
                 return reply;
             }
-            Err(refusal) => {
+            Err(mut refusal) => {
+                if let Some(detail) = pin_availability.get(&pin_key) {
+                    if !refusal.message.contains(detail) {
+                        refusal.message = format!("{} ({detail})", refusal.message);
+                    }
+                }
                 if params.pin.is_some() {
                     pin_rejected = Some(refusal.code);
                     if params.pin_fallback == select_policy::PinFallback::None {
@@ -3654,6 +3708,9 @@ async fn handle_select_request(
                         return send(writer, response).await;
                     }
                 } else {
+                    if refusal.code == "not_available" {
+                        refusal.code = "pinned_route_refused".into();
+                    }
                     return send_route_error(
                         writer,
                         ver,
@@ -3671,7 +3728,7 @@ async fn handle_select_request(
 
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
         let sub = subscription_keys.clone();
-        select_model_route_with_operator_group(
+        select_model_route_with_availability(
             SelectModelRouteInput {
                 target_agent: target_agent.clone(),
                 requirements,
@@ -3694,6 +3751,7 @@ async fn handle_select_request(
             &routing_config,
             concurrency_slots.as_ref(),
             consumer_exclude,
+            &mapped_availability.rejected,
         )
     };
 
@@ -3765,6 +3823,8 @@ async fn handle_select_request(
     let policy_sources = policy_sources_line(&operator_policy);
     match selection {
         Ok(mut selected) => {
+            let selected_harness = harness_context.mapped(&selected.route_key);
+            record_ladder(selected_harness);
             let variant_choice = apply_variant_policy(
                 &mut selected,
                 &operator_config,
@@ -3776,7 +3836,11 @@ async fn handle_select_request(
             if let Some(note) = &quota_note {
                 selected.explanation.push(note.clone());
             }
-            if let Some(note) = &availability.note {
+            if let Some(note) = availability.note.as_ref().filter(|_| {
+                selected_harness == substrate_policy::Harness::Broca
+                    && (params.executor.is_none()
+                        || is_broca_substrate(params.substrate.as_deref()))
+            }) {
                 selected.explanation.push(note.clone());
             }
             selected
@@ -3820,10 +3884,11 @@ async fn handle_select_request(
                             }).collect::<std::collections::BTreeMap<_, _>>(),
                         }))).collect::<Vec<_>>(),
                     });
+                    result["selected"]["harness"] = json!(selected_harness);
                     if params.pin.is_some() {
                         result["pin_rejected"] = json!(pin_rejected);
                     }
-                    if is_broca_substrate(params.substrate.as_deref()) {
+                    if selected_harness == substrate_policy::Harness::Broca {
                         // An automatically chosen key-pool provider leases its key
                         // here; any other provider resolves to the ordinary
                         // translation. Going through runner_for_route keeps one
@@ -3898,6 +3963,13 @@ async fn handle_select_request(
                 .map(|rejected| rejected.route_key.as_str())
                 .collect();
             let mut no_route_notes = head_refusals.notes.clone();
+            if no_route
+                .rejected
+                .iter()
+                .any(|route| route.reason == "excluded_by_operator")
+            {
+                no_route_notes.push("routes excluded by operator policy".into());
+            }
             no_route_notes.extend(availability.note.iter().cloned());
             no_route_notes.extend(facts.iter().filter_map(|fact| {
                 let route = fact_to_route(fact);
@@ -4031,7 +4103,7 @@ fn pool_session(task_id: Option<&str>, send_id: Option<&str>, fallback: &str) ->
 /// A pinned route on a provider that needs a per-send credential pin can only
 /// run on Broca: the host plugins send a model with no auth selection, so the
 /// send would silently land on the provider's default logins. Refuse such pins
-/// by name for every other substrate.
+/// by name for every other mapped harness.
 fn host_runner_pin_refusal<'a>(
     policy: &ModelRoutingPolicyInput,
     requested_substrate: Option<&str>,
@@ -4044,7 +4116,7 @@ fn host_runner_pin_refusal<'a>(
         let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
         needs_runner_pin(policy, provider).then(|| {
             format!(
-                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, and this request names substrate {}. Core must complete the pinned mason route with substrate broca before launch; non-Broca launches cannot carry this pin",
+                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, but this route maps to harness {}",
                 requested_substrate.unwrap_or("none")
             )
         })
@@ -4066,22 +4138,15 @@ fn broca_served_routes(
         .unwrap_or_else(|_| BrocaCredentials::default().served_routes(facts, now_ms()))
 }
 
-/// The list a single-route selection is judged against, the winner-ladder
-/// substrate it is recorded under, and a note for the decision's explanation
-/// when the list is not the caller's own.
+/// A substrate's served routes and the provenance of that availability list.
 struct SelectAvailability {
     models: Vec<String>,
-    ladder_substrate: &'static str,
     note: Option<String>,
 }
 
 impl SelectAvailability {
     fn host(models: Vec<String>) -> Self {
-        Self {
-            models,
-            ladder_substrate: winner_ladder::SUBSTRATE_HOST,
-            note: None,
-        }
+        Self { models, note: None }
     }
 }
 
@@ -4114,7 +4179,6 @@ fn select_availability(
     SelectAvailability {
         models,
         note: Some(note),
-        ladder_substrate: winner_ladder::SUBSTRATE_BROCA,
     }
 }
 
@@ -4133,11 +4197,12 @@ async fn handle_select_panel(
     let corr = frame.header.corr;
     let ver = frame.header.ver;
     let live_config = config_overrides::live_config(routing_config_path);
-    let operator_policy = if operator_config_path == routing_config_path {
-        live_config.operator_policy()
+    let operator_config = if operator_config_path == routing_config_path {
+        Arc::clone(&live_config)
     } else {
-        config_overrides::read_operator_routing_policy(operator_config_path)
+        config_overrides::live_config(operator_config_path)
     };
+    let operator_policy = operator_config.operator_policy();
     let params = match serde_json::from_slice::<SelectPanelBody>(&frame.body) {
         Ok(body) => body.params,
         Err(e) => {
@@ -4206,6 +4271,18 @@ async fn handle_select_panel(
         &prepared.facts,
         broca_credentials,
     );
+    let mapped_availability = selection_harness::SelectionHarness {
+        groups: operator_config.substrate_groups(),
+        consumer: None,
+        workload: Some(selection_harness::Workload::Athena),
+        executor: true,
+        required: None,
+        caller: params.harness.as_deref(),
+        host_models: &available_models,
+        broca_models: &available_models,
+        executor_models: &available_models,
+    }
+    .availability(&prepared.facts);
     // Broca legs have no route.select of their own, so their availability is
     // recorded here for the winner ladder. Host-list panels are not recorded:
     // the host's ladder follows route.select, whose list is already fenced by
@@ -4217,7 +4294,7 @@ async fn handle_select_panel(
                 winner_ladder::SUBSTRATE_BROCA,
                 winner_ladder::CALLER_CLASS_PANEL,
             ),
-            available_models.iter().cloned(),
+            mapped_availability.models.iter().cloned(),
             subscription_keys.iter().cloned(),
             prepared.snapshot.clone(),
         );
@@ -4282,7 +4359,7 @@ async fn handle_select_panel(
             })
             .collect()
     };
-    let mut panel = match prefrontal_routing_core::panel::select_panel_with_policy_context(
+    let mut panel = match prefrontal_routing_core::panel::select_panel_with_availability(
         SelectPanelInput {
             package_tokens: params.package_tokens,
             panel_spec: params.panel_spec.selection_spec(),
@@ -4293,7 +4370,7 @@ async fn handle_select_panel(
             exclude_route_keys: params.exclude_route_keys.clone(),
             operator_exclude_keys,
             required_capabilities: params.required_capabilities,
-            available_models,
+            available_models: mapped_availability.models,
             availability_substrate,
             is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
                 subscription_keys.contains(&route.route_key)
@@ -4303,6 +4380,7 @@ async fn handle_select_panel(
         &routing_config,
         &policy,
         &context,
+        &mapped_availability.rejected,
     ) {
         Ok(panel) => panel,
         Err(e) => {
@@ -4400,6 +4478,12 @@ async fn handle_select_panel(
         "runnerUp": &panel.runner_up,
         "decisionID": decision_id,
     });
+    for member in result["members"]
+        .as_array_mut()
+        .expect("panel members are an array")
+    {
+        member["harness"] = json!("broca");
+    }
     if let Some(shortfall) = &panel.shortfall {
         result
             .as_object_mut()
@@ -4556,11 +4640,16 @@ fn panel_decision_input(
     provenance: &DecisionProvenance,
     policy_sources: &str,
 ) -> DecisionInput {
-    let causes = panel
+    let mut causes = panel
         .shortfall
         .as_ref()
-        .map(|shortfall| shortfall.causes.as_slice())
-        .unwrap_or(&[]);
+        .map(|shortfall| shortfall.causes.clone())
+        .unwrap_or_default();
+    for cause in &panel.availability_rejections {
+        if !causes.iter().any(|existing| existing.model == cause.model) {
+            causes.push(cause.clone());
+        }
+    }
     let member_route_keys: Vec<&str> = panel
         .members
         .iter()
@@ -4598,7 +4687,7 @@ fn panel_decision_input(
         selected_model_id: None,
         selected_variant: None,
         score_json: "null".into(),
-        rejected_json: serde_json::to_string(causes).unwrap_or_else(|_| "[]".into()),
+        rejected_json: serde_json::to_string(&causes).unwrap_or_else(|_| "[]".into()),
         explanation_json: Some(serde_json::to_string(&explanation).unwrap_or_else(|_| "{}".into())),
         quota_signal_json: Some(provenance.quota_signal_json.clone()),
         policy_revision: Some(provenance.policy_revision.clone()),
@@ -6138,6 +6227,10 @@ impl Error for ModuleError {}
 
 #[cfg(test)]
 mod tests {
+    mod harness_selection {
+        use super::*;
+        include!("selection_harness/contract_tests.rs");
+    }
     include!("select_policy_tests.rs");
     include!("panel_policy_tests.rs");
     use super::*;
@@ -6862,10 +6955,19 @@ mod tests {
 
     async fn run_route_wire_request_with_paths(
         store: &SharedStore,
-        request: serde_json::Value,
+        mut request: serde_json::Value,
         operator_config_path: &Path,
         broca_credentials: &SharedBrocaCredentials,
     ) -> Frame {
+        // Legacy wire fixtures exercise executor availability from an explicit
+        // list or Broca substrate. Launch-mapping tests use their own fixture.
+        if request["method"] == ROUTE_SELECT_OP {
+            request["params"]
+                .as_object_mut()
+                .unwrap()
+                .entry("executor")
+                .or_insert(json!("broca"));
+        }
         let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let frame = Frame::build(
             FrameType::Request,
@@ -6959,7 +7061,7 @@ mod tests {
                 guard.mark_copy_listing_gap();
             }
             for iq in [70, 85] {
-                let request = json!({"method": ROUTE_SELECT_OP, "params": {
+                let request = json!({"method": ROUTE_SELECT_OP, "params": { "executor": "broca",
                     "targetAgent":"mason", "requirements":{"iq":iq,"eq":40},
                     "substrate":"broca", "availableModels":[], "taskId":format!("billing-dry-run-{phase}-{iq}")
                 }});
@@ -8457,10 +8559,15 @@ mod tests {
     /// operator config file the module reads (and edit it between selections).
     async fn run_select_against_rig(
         rig: &Rig,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
         facts: &[ModelFact],
         operator_config_path: &Path,
     ) -> Frame {
+        params
+            .as_object_mut()
+            .unwrap()
+            .entry("executor")
+            .or_insert(json!("broca"));
         let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let store = Arc::new(rig.open_store());
         for fact in facts {
@@ -8506,6 +8613,7 @@ mod tests {
         let request = json!({
             "method": ROUTE_SELECT_OP,
             "params": {
+                "executor": "broca",
                 "targetAgent": "mason",
                 "requirements": { "iq": 30, "eq": 0 },
                 "requiredCapabilities": { "vision": true },
@@ -8603,6 +8711,7 @@ mod tests {
         let request = json!({
             "method": ROUTE_SELECT_OP,
             "params": {
+                "executor": "broca",
                 "targetAgent": "mason",
                 "requirements": { "iq": 80, "eq": 20 },
                 "availableModels": [ROUTE],
@@ -8710,6 +8819,7 @@ mod tests {
             json!({
                 "method": ROUTE_SELECT_OP,
                 "params": {
+                    "executor": "broca",
                     "targetAgent": "mason",
                     "requirements": { "iq": 80, "eq": 20 },
                     "availableModels": [ROUTE],
@@ -8769,7 +8879,8 @@ mod tests {
         let select = |task: &str| {
             json!({
                 "method": ROUTE_SELECT_OP,
-                "params": { "targetAgent": "mason", "requirements": { "iq": 80, "eq": 20 },
+                "params": {
+                    "executor": "broca", "targetAgent": "mason", "requirements": { "iq": 80, "eq": 20 },
                     "availableModels": [ROUTE], "taskId": task },
             })
         };
@@ -9263,8 +9374,9 @@ mod tests {
     /// store, for tests that must read and write decisions between selections.
     async fn select_with_store(
         store: &Arc<SqliteRouteStateStore>,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
     ) -> serde_json::Value {
+        params["executor"] = json!("broca");
         let request = json!({ "method": ROUTE_SELECT_OP, "params": params });
         let frame = Frame::build(
             FrameType::Request,
@@ -9343,6 +9455,7 @@ mod tests {
         let request = json!({
             "method": ROUTE_SELECT_OP,
             "params": {
+                "executor": "broca",
                 "targetAgent": "explore",
                 "requirements": { "iq": 30, "eq": 0 },
                 "availableModels": ["openai/quota-present"],
@@ -9448,6 +9561,7 @@ mod tests {
         let request = json!({
             "method": ROUTE_SELECT_OP,
             "params": {
+                "executor": "broca",
                 "targetAgent": "explore",
                 "requirements": { "iq": 70, "eq": 0 },
                 "availableModels": ["openai/restart-luna", "anthropic/restart-opus"],
@@ -9524,6 +9638,7 @@ mod tests {
         let request = json!({
             "method": ROUTE_SELECT_OP,
             "params": {
+                "executor": "broca",
                 "targetAgent": "mason",
                 "requirements": { "iq": 70, "eq": 0 },
                 "availableModels": available,
@@ -10701,6 +10816,7 @@ mod tests {
             let request = json!({
                 "method": ROUTE_SELECT_OP,
                 "params": {
+                    "executor": "broca",
                     "targetAgent": "mason",
                     "requirements": { "iq": demand, "eq": 0 },
                     "availableModels": ["p/fact-53"]
@@ -10835,8 +10951,8 @@ mod tests {
         assert_eq!(cause["model"], "kimi-code-plan-global/k3");
         assert_eq!(cause["reason"], "unavailable");
         assert_eq!(
-            cause["detail"], "host",
-            "the rejection names the list that was consulted"
+            cause["detail"], "harness broca does not serve this route for this request",
+            "the rejection names the route's mapped harness"
         );
         // The decision also records the sending substrate, even when its
         // per-model rejection list is compacted by the store.
@@ -10956,7 +11072,10 @@ mod tests {
             body["result"]["shortfall"]["causes"][0]["reason"],
             "unavailable"
         );
-        assert_eq!(body["result"]["shortfall"]["causes"][0]["detail"], "broca");
+        assert_eq!(
+            body["result"]["shortfall"]["causes"][0]["detail"],
+            "harness broca does not serve this route for this request"
+        );
     }
 
     fn broca_select_request(
@@ -11005,7 +11124,11 @@ mod tests {
             );
         }
         assert_eq!(results[0]["selected"], results[1]["selected"]);
-        assert_eq!(results[0]["resolvedInput"], results[1]["resolvedInput"]);
+        assert_eq!(
+            results[0]["resolvedInput"]["availableModels"],
+            json!(["opencode-go/m-native-fast"])
+        );
+        assert_eq!(results[1]["resolvedInput"]["availableModels"], json!([]));
         assert_eq!(
             results[1]["runner"],
             json!({"provider":"opencode", "model":"m-native-fast"})
@@ -11062,11 +11185,11 @@ mod tests {
             .iter()
             .filter_map(serde_json::Value::as_str)
             .collect();
-        assert!(
-            available.contains(&"livebroca/m-new"),
-            "a served route the caller's list lacks is available to a Broca send: {available:?}"
+        assert_eq!(
+            available,
+            ["hostonly/m-old"],
+            "the reply retains only the caller's list"
         );
-        assert_eq!(available, ["livebroca/m-new"]);
         assert_eq!(broca["selected"]["routeKey"], "livebroca/m-new");
         assert!(!decision_explanation(&store, &broca).contains("availability unknown"));
 
@@ -11085,6 +11208,10 @@ mod tests {
     async fn a_broca_route_select_with_unknown_reach_routes_over_served_rows_and_says_so() {
         let rig = Rig::new("select-substrate-unknown");
         let store = Arc::new(rig.open_store());
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute("DELETE FROM model_facts", [])
+            .unwrap();
         store
             .upsert_fact(&fact("livebroca", "m-new"), FactSource::Override)
             .unwrap();
@@ -11115,12 +11242,11 @@ mod tests {
             .iter()
             .filter_map(serde_json::Value::as_str)
             .collect();
-        assert!(available.contains(&"livebroca/m-new"), "{available:?}");
         assert!(
-            !available.contains(&"retired/m-gone"),
-            "a withdrawn route is never available: {available:?}"
+            available.is_empty(),
+            "Broca-served routes never enter the caller's resolved list: {available:?}"
         );
-        assert_ne!(result["selected"]["routeKey"], "retired/m-gone");
+        assert_eq!(result["selected"]["routeKey"], "livebroca/m-new");
         assert!(decision_explanation(&store, &result)
             .contains("broca reachability unknown: credential listing unavailable"));
     }
@@ -11137,7 +11263,19 @@ mod tests {
             .as_str()
             .unwrap()
             .replace("$decisionID", decision_id);
-        assert_eq!(response.body, expected.as_bytes());
+        let mut expected: serde_json::Value = serde_json::from_str(&expected).unwrap();
+        for member in expected["result"]["members"].as_array_mut().unwrap() {
+            member["harness"] = json!("broca");
+        }
+        for cause in expected["result"]["shortfall"]["causes"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if cause["reason"] == "unavailable" {
+                cause["detail"] = json!("harness broca does not serve this route for this request");
+            }
+        }
+        assert_eq!(response_value, expected);
 
         let decisions = store.get_decisions_for_task("panel-wire-n-pick").unwrap();
         assert_eq!(decisions.len(), 1);
@@ -11194,6 +11332,7 @@ mod tests {
             ..Default::default()
         };
         let panel = SelectedPanel {
+            availability_rejections: Vec::new(),
             members: Vec::new(),
             runner_up: Vec::new(),
             shortfall: None,
@@ -11233,6 +11372,7 @@ mod tests {
         body["params"]["packageTokens"] = json!("227000");
         assert!(serde_json::from_value::<SelectPanelBody>(body).is_err());
         let panel = SelectedPanel {
+            availability_rejections: Vec::new(),
             members: Vec::new(),
             runner_up: Vec::new(),
             shortfall: None,
@@ -11690,7 +11830,7 @@ mod tests {
         )
         .await;
         let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(body["code"], "not_available", "{body}");
+        assert_eq!(body["code"], "pinned_route_refused", "{body}");
         assert!(body["message"]
             .as_str()
             .unwrap()
@@ -11981,11 +12121,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_host_mason_pin_is_provisional_until_core_completes_it_on_broca() {
+    async fn a_host_mason_pin_mapped_to_broca_is_admitted_with_its_runner() {
         let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
         let (body, _rig, _store) = platform_select(
             "platform-host-pin",
             json!({"targetAgent":"mason", "requestedRequirements":{"iq":90,"eq":0},
+                   "harness": "opencode", "substrate": "opencode", "executor": null,
                    "availableModels":["anthropic/claude-opus-4-1"],
                    "modelPin":"anthropic-platform/claude-opus-4-1"}),
             &credentials,
@@ -11996,12 +12137,10 @@ mod tests {
             body["result"]["selected"]["routeKey"], "anthropic-platform/claude-opus-4-1",
             "{body}"
         );
-        assert_eq!(body["result"]["requiredSubstrate"], "broca", "{body}");
-        assert!(
-            body["result"].get("runner").is_none(),
-            "no key before core admission: {body}"
-        );
-        assert!(body["result"].get("poolLease").is_none(), "{body}");
+        assert_eq!(body["result"]["selected"]["harness"], "broca", "{body}");
+        assert!(body["result"].get("requiredSubstrate").is_none(), "{body}");
+        assert!(body["result"].get("runner").is_some(), "{body}");
+        assert!(body["result"].get("poolLease").is_some(), "{body}");
     }
 
     #[tokio::test]
@@ -12119,7 +12258,8 @@ mod tests {
             "no fallback route: {pinned}"
         );
 
-        // A host substrate cannot carry the pin at all.
+        // A legacy substrate value cannot move a Broca-mapped pin off its pool
+        // or let it bypass the same exhausted keys.
         let host = call(
             "route.select",
             json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
@@ -12127,19 +12267,8 @@ mod tests {
                    "modelPin": "anthropic-platform/claude-opus-4-1"}),
         )
         .await;
-        assert_eq!(host["code"], "provider_requires_runner_pin", "{host}");
-        let message = host["message"].as_str().unwrap();
-        for part in [
-            "substrate opencode",
-            "Core must complete",
-            "substrate broca",
-            "non-Broca launches cannot carry this pin",
-        ] {
-            assert!(
-                message.contains(part),
-                "the refusal names {part:?}: {message}"
-            );
-        }
+        assert_eq!(host["code"], "explicit_provider_pool_exhausted", "{host}");
+        assert!(host.get("result").is_none(), "no fallback route: {host}");
     }
 
     /// The first real key, as CKCRED lists it: a labelled id, active,
@@ -12895,10 +13024,12 @@ mod tests {
                 7,
                 1,
                 99,
-                serde_json::to_vec(&json!({"method": ROUTE_SELECT_OP, "params": {
-                    "targetAgent": "explore", "requirements": {"iq": 30, "eq": 0},
-                    "availableModels": ["a/reader", "b/reader"]
-                }}))
+                serde_json::to_vec(
+                    &json!({"method": ROUTE_SELECT_OP, "params": { "executor": "broca",
+                        "targetAgent": "explore", "requirements": {"iq": 30, "eq": 0},
+                        "availableModels": ["a/reader", "b/reader"]
+                    }}),
+                )
                 .unwrap(),
             )
             .unwrap();
@@ -12983,6 +13114,7 @@ mod tests {
             let request = json!({
                 "method": ROUTE_SELECT_OP,
                 "params": {
+                    "executor": "broca",
                     "targetAgent": "mason",
                     "requirements": { "iq": 100, "eq": 0 },
                     "availableModels": ["p/weak", "p/strong"]
@@ -13235,6 +13367,7 @@ mod tests {
         let request = json!({
             "method": ROUTE_SELECT_OP,
             "params": {
+                "executor": "broca",
                 "targetAgent": "mason",
                 "requirements": { "iq": 20, "eq": 0 },
                 "availableModels": ["custom/aa-live", "custom/no-score"],
@@ -13276,6 +13409,7 @@ mod tests {
             json!({
                 "method": ROUTE_SELECT_OP,
                 "params": {
+                    "executor": "broca",
                     "targetAgent": "mason",
                     "requirements": { "iq": 20, "eq": 0 },
                     "availableModels": ["custom/no-score"],
