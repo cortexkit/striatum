@@ -3,7 +3,7 @@
   "module_id": "prefrontal-routing",
   "entries": [
     {
-      "entry_id": "prefrontal-routing/route-state-store",
+      "entry_id": "prefrontal-routing/store",
       "class": "portable",
       "mechanism": "page-db",
       "path": "store.db",
