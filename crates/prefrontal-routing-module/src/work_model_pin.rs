@@ -1,10 +1,11 @@
 //! Exact worker pins share hard admission, but never the quality/cost competition.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use prefrontal_routing_core::model_facts::{fact_to_route, ModelFact, ModelRequirements};
 use prefrontal_routing_core::model_router::{
-    admit_routes, select_model_route_with_slots, SelectModelRouteInput, SelectedModelRoute,
+    admit_routes_with_availability, select_model_route_with_availability, SelectModelRouteInput,
+    SelectedModelRoute,
 };
 use prefrontal_routing_core::provider_model_spec::ExclusionPolicy;
 use prefrontal_routing_core::{ConcurrencySlots, RoutingConfig};
@@ -52,6 +53,29 @@ pub(crate) fn named_variant(pin: &str, facts: &[ModelFact]) -> Option<String> {
         .map(str::to_string)
 }
 
+pub(crate) fn route_keys(
+    pin: &str,
+    explicit: Option<&str>,
+    facts: &[ModelFact],
+) -> (String, String) {
+    let Some((provider, requested_model)) = pin.split_once('/') else {
+        return (pin.into(), pin.into());
+    };
+    let (model, variant) = split_model_and_variant(provider, requested_model, facts);
+    let variant = explicit.or(variant);
+    let variant = variant.or_else(|| {
+        facts
+            .iter()
+            .filter(|fact| fact.provider_id == provider && fact.model_id == model)
+            .min_by_key(|fact| usize::from(fact.variant.is_some()))
+            .and_then(|fact| fact.variant.as_deref())
+    });
+    (
+        prefrontal_routing_core::make_route_key(provider, model, variant),
+        format!("{provider}/{model}"),
+    )
+}
+
 /// Select the exact route a caller named. The operator's `exclude` lists (the
 /// `all` list and every consumer group) never apply here: they keep a route out
 /// of automatic choice only.
@@ -63,13 +87,26 @@ pub(crate) fn named_variant(pin: &str, facts: &[ModelFact]) -> Option<String> {
 /// published list is refused. When the catalog has not been read for the model
 /// yet, or no catalog is attached, the pin is admitted with a warning and
 /// Broca decides.
+#[cfg(test)]
 pub(crate) fn select(
+    pin: &str,
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    slots: Option<&ConcurrencySlots>,
+    catalog: Option<&ReasoningCatalog>,
+    aliases: &BTreeMap<String, String>,
+) -> Result<SelectedModelRoute, Refusal> {
+    select_with_availability(pin, input, config, slots, catalog, aliases, &HashMap::new())
+}
+
+pub(crate) fn select_with_availability(
     pin: &str,
     mut input: SelectModelRouteInput<'_>,
     config: &RoutingConfig,
     slots: Option<&ConcurrencySlots>,
     catalog: Option<&ReasoningCatalog>,
     aliases: &BTreeMap<String, String>,
+    availability_rejections: &HashMap<String, String>,
 ) -> Result<SelectedModelRoute, Refusal> {
     let (provider, requested_model) = pin.split_once('/').ok_or_else(|| {
         refuse(
@@ -176,14 +213,16 @@ pub(crate) fn select(
     // refusal. Per-attempt caller exclusions, availability, credentials,
     // capability and quota walls still apply.
     input.operator_exclude_keys.clear();
-    let admission = admit_routes(
+    let admission = admit_routes_with_availability(
         &input.facts,
         input.runtime_snapshot.as_ref(),
         ExclusionPolicy::caller_only(&input.exclude_route_keys),
+        &[],
         input.required_capabilities,
         &input.available_models,
         &input.requirements,
         config,
+        availability_rejections,
     );
     let Some(admitted) = admission.admitted.first() else {
         let rejection = &admission.rejected[0];
@@ -236,8 +275,9 @@ pub(crate) fn select(
         .get_or_insert_with(Default::default)
         .min_context
         .get_or_insert(0.0);
-    let mut selected = select_model_route_with_slots(input, config, slots)
-        .map_err(|error| refuse(error.reason.as_str(), error.message))?;
+    let mut selected =
+        select_model_route_with_availability(input, config, slots, &[], availability_rejections)
+            .map_err(|error| refuse(error.reason.as_str(), error.message))?;
     selected.score.adequacy = adequacy.adequacy;
     selected.score.raw_adequacy = adequacy.raw_adequacy;
     selected.score.metrics = adequacy.metrics;

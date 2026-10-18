@@ -9,7 +9,11 @@ mod consumer_and_pin {
     }
 
     impl PolicyRig {
-        fn new(config: serde_json::Value) -> Self {
+        fn new(mut config: serde_json::Value) -> Self {
+            // These launch fixtures exercise caller-supplied `availableModels`.
+            // Map every route to OpenCode so that list, not Broca's served
+            // catalog, decides availability for these requests.
+            config["model_routing"]["substrates"] = json!({"all": {"default": "opencode"}});
             let rig = Rig::new("consumer-and-pin");
             let store = Arc::new(rig.open_store());
             let path = rig.dir.join("routing.jsonc");
@@ -30,6 +34,7 @@ mod consumer_and_pin {
         fn params(&self) -> serde_json::Value {
             json!({
                 "targetAgent": "oracle", "consumer": "lab",
+                "harness": "opencode",
                 "requirements": {"iq": 30, "eq": 0},
                 "availableModels": ["openai/pin", "fallback/safe"],
             })
@@ -448,7 +453,7 @@ mod consumer_and_pin {
         params["modelPin"] = json!("openai/pin");
         params["availableModels"] = json!(["fallback/safe"]);
         let unavailable = rig.select(params.clone()).await;
-        assert_eq!(unavailable["code"], "not_available", "{unavailable}");
+        assert_eq!(unavailable["code"], "pinned_route_refused", "{unavailable}");
         params["availableModels"] = json!(["openai/pin", "fallback/safe"]);
         rig.store
             .update_route_state(

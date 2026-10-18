@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config_policy::{ExcludeGroups, PanelPolicies, Pins, VariantGroups};
+use crate::substrate_policy::SubstrateGroups;
 use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::{
     make_capacity_key, make_route_key, FailureBackoffConfig, FamilySource, GrandFamily,
@@ -432,6 +433,10 @@ impl LiveConfig {
 
     pub fn variant_groups(&self) -> &VariantGroups {
         &self.config.model_routing.variants
+    }
+
+    pub(crate) fn substrate_groups(&self) -> &SubstrateGroups {
+        &self.config.model_routing.substrates
     }
 
     pub fn score_aliases(&self) -> &std::collections::BTreeMap<String, String> {
@@ -869,6 +874,11 @@ struct ModelRoutingSection {
     /// be an effort the catalog publishes for the matched models.
     #[serde(default)]
     variants: VariantGroups,
+    /// Route-to-harness mapping. Resolve the workload group, consumer group,
+    /// then `all`, taking each group's longest matching route key or default.
+    /// Routes not covered by any group run on Broca.
+    #[serde(default)]
+    substrates: SubstrateGroups,
     #[serde(default)]
     panels: PanelPolicies,
     #[serde(default)]

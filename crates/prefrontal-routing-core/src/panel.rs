@@ -11,9 +11,9 @@ use crate::model_facts::{
     make_capacity_key, ModelFact, ModelRequirements, ModelRoute, FAST_SUFFIX,
 };
 use crate::model_router::{
-    admit_routes, compute_objective, normalized_metered_cost, CostBasis, ModelRouteStateSnapshot,
-    RequiredCapabilities, REASON_DEPRECATED_UPSTREAM, REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR,
-    REASON_NOT_AVAILABLE,
+    admit_routes_with_availability, compute_objective, normalized_metered_cost, CostBasis,
+    ModelRouteStateSnapshot, RequiredCapabilities, REASON_DEPRECATED_UPSTREAM, REASON_EXCLUDED,
+    REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
 use crate::package_ceiling::seat_package_ceiling;
 use crate::provider_model_spec::ExclusionPolicy;
@@ -397,6 +397,9 @@ pub struct SelectedPanel {
     pub shortfall: Option<PanelShortfall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PanelPolicy>,
+    /// Route-local availability refusals survive even when every seat is filled.
+    #[serde(skip)]
+    pub availability_rejections: Vec<PanelCause>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,12 +468,35 @@ pub fn select_panel_with_policy_context(
     class_policy: &ClassPanelPolicy,
     context: &PanelSelectionContext,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
+    select_panel_with_availability(input, config, class_policy, context, &HashMap::new())
+}
+
+/// Panels share route-local availability refusals with singular selections.
+pub fn select_panel_with_availability(
+    input: SelectPanelInput<'_>,
+    config: &RoutingConfig,
+    class_policy: &ClassPanelPolicy,
+    context: &PanelSelectionContext,
+    availability_rejections: &HashMap<String, String>,
+) -> Result<SelectedPanel, InvalidPanelRequest> {
     class_policy.validate()?;
     if input.selection != PanelSelection::Roster || input.package_tokens.is_none() {
-        return select_panel_admitted(&input, config, class_policy, context);
+        return select_panel_admitted(
+            &input,
+            config,
+            class_policy,
+            context,
+            availability_rejections,
+        );
     }
     let tokens = input.package_tokens.unwrap();
-    let mut panel = select_panel_admitted(&input, config, class_policy, context)?;
+    let mut panel = select_panel_admitted(
+        &input,
+        config,
+        class_policy,
+        context,
+        availability_rejections,
+    )?;
     let oversized = panel
         .members
         .iter()
@@ -507,7 +533,13 @@ pub fn select_panel_with_policy_context(
         is_subscription_route: input.is_subscription_route,
         ..input
     };
-    let spares = select_panel_admitted(&automatic, config, class_policy, context)?;
+    let spares = select_panel_admitted(
+        &automatic,
+        config,
+        class_policy,
+        context,
+        availability_rejections,
+    )?;
     let mut policy = spares.policy.expect("automatic selection records policy");
     let mut candidates = spares
         .members
@@ -653,6 +685,7 @@ fn select_panel_admitted(
     config: &RoutingConfig,
     class_policy: &ClassPanelPolicy,
     context: &PanelSelectionContext,
+    availability_rejections: &HashMap<String, String>,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
     // Class policy owns automatic panel width and quality, so panel_spec.size
     // and panel_spec.iq_floor cannot invalidate it. The family rule below also
@@ -689,14 +722,16 @@ fn select_panel_admitted(
     };
     // Panel selection has no adequacy fallback. The zero requirements are only an
     // unused scoring input to the shared hard-admission implementation.
-    let admission = admit_routes(
+    let admission = admit_routes_with_availability(
         &considered_facts,
         input.runtime_snapshot.as_ref(),
         effective_exclusions,
+        &[],
         input.required_capabilities,
         &input.available_models,
         &ModelRequirements { iq: 0.0, eq: 0.0 },
         config,
+        availability_rejections,
     );
     let top_routable_elo = admission.top_routable.elo;
     let availability_substrate = input.availability_substrate;
@@ -731,7 +766,7 @@ fn select_panel_admitted(
             // Without it, a reader of a recorded rejection cannot tell a route the
             // sender genuinely cannot reach from one that is merely missing from the
             // caller's host list, and the two have different fixes.
-            detail: if rejected.reason == REASON_NOT_AVAILABLE {
+            detail: if rejected.reason == REASON_NOT_AVAILABLE && rejected.detail.is_none() {
                 Some(availability_substrate.as_str().to_string())
             } else {
                 rejected.detail
@@ -740,6 +775,14 @@ fn select_panel_admitted(
             reset_at_ms,
         }
     }));
+    let availability_causes = causes
+        .iter()
+        .filter(|cause| {
+            cause.reason == PanelCauseReason::Unavailable
+                && availability_rejections.contains_key(&cause.model)
+        })
+        .cloned()
+        .collect();
 
     // Reserved subscription headroom is an admission wall, not an IQ failure.
     // Apply it before counting survivors so an entirely reserved panel reports
@@ -1142,6 +1185,7 @@ fn select_panel_admitted(
     });
 
     Ok(SelectedPanel {
+        availability_rejections: availability_causes,
         members,
         runner_up,
         shortfall,

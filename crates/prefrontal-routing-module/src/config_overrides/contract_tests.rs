@@ -708,6 +708,7 @@ fn generated_schema_is_current_and_closed() {
         "OverqualificationSection",
         "ModelFamilyRules",
         "VariantGroups",
+        "SubstrateGroups",
     ] {
         assert_eq!(
             schema["$defs"][name]["additionalProperties"], false,
@@ -719,4 +720,170 @@ fn generated_schema_is_current_and_closed() {
         .get("consecutiveTerminalFailureThreshold")
         .is_some());
     assert!(properties.get("providersWithoutPromptCache").is_some());
+}
+
+#[test]
+fn substrate_mapping_loads_all_groups_and_matches_own_provider_not_score_alias() {
+    use crate::substrate_policy::{resolve, Harness};
+
+    let mut rig = Rig::new();
+    rig.write(
+        r#"{
+        "model_routing": {
+            "score_alias": {"alias": "vendor"},
+            "substrates": {
+                "all": {"default": "broca", "vendor": "opencode"},
+                "mason": {"vendor/special": "pi"},
+                "sidekick": {}, "athena": {}, "core": {},
+                "lab": {"default": "pi"},
+                "sidekick.explore": {},
+                "sidekick.librarian": {"default": "opencode"},
+                "sidekick.gather": {}, "sidekick.comments": {},
+                "hire": {}, "persona_seat": {}
+            }
+        }
+    }"#,
+    );
+    initialize_config(&rig.path).unwrap();
+    let config = live_config(&rig.path);
+    assert_eq!(config.score_aliases().get("alias").unwrap(), "vendor");
+    assert_eq!(
+        resolve(config.substrate_groups(), "alias/model/high", None, None),
+        Harness::Broca
+    );
+    assert_eq!(
+        resolve(config.substrate_groups(), "vendor/model/high", None, None),
+        Harness::Opencode
+    );
+    assert_eq!(
+        resolve(
+            config.substrate_groups(),
+            "unknown/future-model",
+            Some(crate::select_policy::Consumer::Lab),
+            None,
+        ),
+        Harness::Pi
+    );
+}
+
+#[test]
+fn substrate_mapping_invalid_keys_and_values_refuse_first_load_and_reload() {
+    for (substrates, diagnostic) in [
+        (
+            serde_json::json!({"unknown": {}}),
+            "model_routing.substrates.unknown",
+        ),
+        (
+            serde_json::json!({"lab": []}),
+            "model_routing.substrates.lab",
+        ),
+        (
+            serde_json::json!({"lab": null}),
+            "model_routing.substrates.lab",
+        ),
+        (
+            serde_json::json!({"all": {"vendor/model": "other"}}),
+            "key \"vendor/model\"",
+        ),
+        (
+            serde_json::json!({"all": {"vendor/model": 7}}),
+            "key \"vendor/model\"",
+        ),
+        (
+            serde_json::json!({"all": {"vendor/model": null}}),
+            "key \"vendor/model\"",
+        ),
+        (
+            serde_json::json!({"all": {"-vendor": "broca"}}),
+            "key \"-vendor\"",
+        ),
+        (serde_json::json!({"all": {"": "broca"}}), "key \"\""),
+        (
+            serde_json::json!({"all": {"/model": "broca"}}),
+            "key \"/model\"",
+        ),
+        (
+            serde_json::json!({"all": {"vendor/": "broca"}}),
+            "key \"vendor/\"",
+        ),
+        (
+            serde_json::json!({"all": {" vendor": "broca"}}),
+            "key \" vendor\"",
+        ),
+        (
+            serde_json::json!({"all": {"vendor ": "broca"}}),
+            "key \"vendor \"",
+        ),
+    ] {
+        let document = serde_json::json!({"model_routing": {"substrates": substrates}}).to_string();
+        first_load_refuses(&document, diagnostic);
+        reload_refuses(&document, diagnostic);
+    }
+}
+
+#[test]
+fn absent_substrate_mapping_and_withdrawn_groups_resolve_to_broca() {
+    use crate::substrate_policy::{resolve, Harness};
+
+    let mut rig = Rig::new();
+    initialize_config(&rig.path).unwrap();
+    let absent = live_config(&rig.path);
+    rig.write(r#"{"model_routing":{"substrates":{"all":{"default":"pi"}}}}"#);
+    let configured = settle_live_config(&rig.path);
+    assert_eq!(
+        resolve(configured.substrate_groups(), "vendor/model", None, None),
+        Harness::Pi
+    );
+    rig.write(r#"{"model_routing":{}}"#);
+    let withdrawn = settle_live_config(&rig.path);
+    for config in [absent, withdrawn] {
+        assert_eq!(
+            resolve(config.substrate_groups(), "vendor/model", None, None),
+            Harness::Broca
+        );
+    }
+    assert_eq!(
+        resolve(configured.substrate_groups(), "vendor/model", None, None),
+        Harness::Pi
+    );
+}
+
+#[test]
+fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
+    let schema: serde_json::Value = serde_json::from_str(&routing_config_schema()).unwrap();
+    let groups = &schema["$defs"]["SubstrateGroups"];
+    assert_eq!(groups["type"], "object");
+    assert_eq!(groups["additionalProperties"], false);
+    let names = [
+        "all",
+        "mason",
+        "sidekick",
+        "athena",
+        "lab",
+        "core",
+        "sidekick.explore",
+        "sidekick.librarian",
+        "sidekick.gather",
+        "sidekick.comments",
+        "hire",
+        "persona_seat",
+    ];
+    assert_eq!(groups["properties"].as_object().unwrap().len(), names.len());
+    for name in names {
+        let group = &groups["properties"][name];
+        assert_eq!(group["type"], "object", "{name}");
+        assert_eq!(group["additionalProperties"]["$ref"], "#/$defs/Harness");
+        assert_eq!(
+            group["propertyNames"],
+            serde_json::json!({"allOf": [
+                {"pattern": "^[^/]+(/[\\s\\S]+)?$"},
+                {"not": {"pattern": "^[-\\s]|\\s$"}}
+            ]})
+        );
+    }
+    assert_eq!(schema["$defs"]["Harness"]["type"], "string");
+    assert_eq!(
+        schema["$defs"]["Harness"]["enum"],
+        serde_json::json!(["broca", "opencode", "pi"])
+    );
 }

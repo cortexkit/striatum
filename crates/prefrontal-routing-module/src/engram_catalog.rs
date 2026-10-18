@@ -87,7 +87,7 @@ mod tests {
   "module_id": "prefrontal-routing",
   "entries": [
     {
-      "entry_id": "prefrontal-routing/route-state-store",
+      "entry_id": "prefrontal-routing/store",
       "class": "portable",
       "mechanism": "page-db",
       "path": "store.db",
@@ -124,6 +124,16 @@ mod tests {
         assert_eq!(CATALOG_BYTES, EXPECTED_CATALOG.as_bytes());
     }
 
+    // Engram keeps page-by-page backup state per entry id, so renaming the store's id
+    // makes it a new entry: the next capture uploads the whole database again and the
+    // old history drops out. The id must stay what it was first published as.
+    #[test]
+    fn store_entry_keeps_its_published_id() {
+        assert!(entries(CATALOG_BYTES)
+            .iter()
+            .any(|(id, path)| id == "prefrontal-routing/store" && path == "store.db"));
+    }
+
     #[test]
     fn committed_catalog_passes_engram_catalog_validation_contract() {
         let catalog: Value = serde_json::from_slice(CATALOG_BYTES).expect("catalog JSON");
@@ -158,7 +168,7 @@ mod tests {
         let path = entries(CATALOG_BYTES)
             .into_iter()
             .find_map(|(entry_id, path)| {
-                (entry_id == "prefrontal-routing/route-state-store").then_some(path)
+                (entry_id == "prefrontal-routing/store").then_some(path)
             })
             .expect("route-state entry");
         let opened_path = crate::config_overrides::default_store_path().expect("store path");
