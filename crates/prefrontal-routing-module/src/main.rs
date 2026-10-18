@@ -20,6 +20,7 @@ mod available_models_text;
 mod broca_credentials;
 mod config_overrides;
 mod config_policy;
+mod engram_catalog;
 mod fusiform_catalog;
 mod key_pool;
 mod model_resolution;
@@ -651,6 +652,7 @@ async fn main() -> Result<(), ModuleError> {
         } => return account_quota_dry_run(connection_file_path, capture_dir).await,
         StartupMode::Serve(connection_file_path) => connection_file_path,
     };
+    engram_catalog::write_startup_catalog();
     let config = ModuleConfig::from_env(connection_file_path)?;
     run(config).await
 }
