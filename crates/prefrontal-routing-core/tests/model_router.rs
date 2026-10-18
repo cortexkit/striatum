@@ -2487,7 +2487,7 @@ fn one_candidate_missing_a_used_rate_prices_at_max_and_the_selection_stays_on_th
     no_output.cost_per_m_tok_out = None;
 
     for (incomplete, unpriced) in [
-        (missing_cache, vec!["cached_read", "cache_write"]),
+        (missing_cache, vec!["cached_read"]),
         (no_input, vec!["fresh_input"]),
         (
             tier_only,
@@ -3904,13 +3904,9 @@ fn live_band_extra<'a>() -> Extra<'a> {
     }
 }
 
-// The reported flip: at mason iq 60-75 the Grok-shaped route (no cache-write
-// rate) sat in the shortlist and switched the whole selection to output-only
-// pricing, where Opus (20/18/30 = 0.037) and Sol (10/25/30 = 0.013) both sat in
-// the effectively-free bucket and Opus won on quota headroom. From iq 78 Grok
-// dropped out, the basket engaged, Opus priced at 0.061 (above the bucket) and
-// Sol at 0.022 won. Before this change: Opus at iq 60/70/75, Sol at iq 80.
-// Now every iq prices on the basket and Sol wins all four.
+// The shortlisted Grok route has no separate cache-write rate, but its write
+// tokens now use input pricing. The high rate still clamps its basket cost,
+// leaving Sol as the lower-cost winner across the cutoff.
 #[test]
 fn mason_iq_band_keeps_one_pricing_mode_and_one_winner_across_the_grok_cutoff() {
     let mut grok_shortlisted = Vec::new();
@@ -3939,9 +3935,13 @@ fn mason_iq_band_keeps_one_pricing_mode_and_one_winner_across_the_grok_cutoff() 
         if let Some(grok) = priced.routes.iter().find(|r| r.route_key == "xai/grok-5") {
             grok_shortlisted.push(iq);
             assert_eq!(grok.cost, 1.0, "iq {iq}");
-            assert_eq!(
-                grok.basket_pricing.as_ref().unwrap().unpriced_dimensions,
-                vec!["cache_write"]
+            assert!(
+                grok.basket_pricing
+                    .as_ref()
+                    .unwrap()
+                    .unpriced_dimensions
+                    .is_empty(),
+                "write tokens use input pricing at iq {iq}"
             );
         }
 
@@ -3953,6 +3953,47 @@ fn mason_iq_band_keeps_one_pricing_mode_and_one_winner_across_the_grok_cutoff() 
     }
     // Anti-vacuity: the fixture must straddle the cutoff the defect lived on.
     assert_eq!(grok_shortlisted, vec![60.0, 70.0, 75.0]);
+}
+
+#[test]
+fn muse_route_with_input_fallback_is_cheaper_than_luna_and_selected() {
+    let muse = live_rated(
+        "meta",
+        "muse-spark-1.3-contributor",
+        1_900.0,
+        90.0,
+        (0.2, 0.1, 0.002, None),
+        None,
+    );
+    let luna = live_rated(
+        "anthropic",
+        "luna",
+        1_900.0,
+        90.0,
+        (0.5, 0.1, 0.002, Some(0.125)),
+        None,
+    );
+    let vector = mason_live_vector();
+    assert!(muse.basket_cost().unwrap() < luna.basket_cost().unwrap());
+    let expected_raw = vector.fresh_input * 0.1
+        + vector.output_excluding_reasoning * 0.2
+        + vector.reasoning * 0.2
+        + vector.cached_read * 0.002
+        + vector.cache_write * 0.1;
+    let expected =
+        (expected_raw / 1_000_000.0 / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE)
+            .clamp(0.0, 1.0);
+    assert!((muse.basket_cost().unwrap() - expected).abs() < 1e-12);
+
+    let selected =
+        select_without_overqualification(input(vec![luna, muse], req(50.0, 0.0), Extra::default()))
+            .unwrap();
+    assert_eq!(selected.model.model_id, "muse-spark-1.3-contributor");
+    assert_eq!(selected.score.pricing_mode, PricingMode::Basket);
+    assert!(selected
+        .explanation
+        .join("\n")
+        .contains("cache-write rate taken from input"));
 }
 
 // OpenCode's free models: Fusiform states input and output as zero and serves
@@ -3994,27 +4035,79 @@ fn free_route_without_cache_write_rate_prices_at_zero_in_basket_and_output_only(
 }
 
 #[test]
-fn priced_route_without_cache_write_rate_stays_unknown() {
-    use prefrontal_routing_core::{selection_cost, BasketDimension};
+fn cache_write_rate_falls_back_to_input_when_missing() {
+    use prefrontal_routing_core::model_facts::BasketDimension;
+    use prefrontal_routing_core::selection_cost;
     let vector = mason_live_vector();
-    // Priced output with free input, and priced input with free output: only
-    // both zero makes a route free.
-    for (out, inp) in [(0.5, 0.0), (0.0, 0.5)] {
-        let paid = live_rated(
-            "opencode",
-            "paid",
-            1_900.0,
-            90.0,
-            (out, inp, 0.0, None),
-            None,
-        );
-        assert!(!paid.states_free_rates());
-        assert_eq!(paid.basket_rate(BasketDimension::CacheWrite), None);
-        let price = paid.basket_price(&vector);
-        assert_eq!(price.cost, None, "out {out} in {inp}");
-        assert_eq!(price.unpriced, vec![BasketDimension::CacheWrite]);
-        assert_eq!(selection_cost(&paid, false, true), 1.0);
-    }
+    let muse = live_rated(
+        "meta",
+        "muse-spark-1.3-contributor",
+        1_900.0,
+        90.0,
+        (0.2, 0.1, 0.002, None),
+        None,
+    );
+    assert_eq!(muse.basket_rate(BasketDimension::CacheWrite), Some(0.1));
+    let price = muse.basket_price(&vector);
+    let expected_raw = vector.fresh_input * 0.1
+        + vector.output_excluding_reasoning * 0.2
+        + vector.reasoning * 0.2
+        + vector.cached_read * 0.002
+        + vector.cache_write * 0.1;
+    let expected =
+        (expected_raw / 1_000_000.0 / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE)
+            .clamp(0.0, 1.0);
+    assert_eq!(price.unpriced, Vec::<BasketDimension>::new());
+    assert!((price.cost.unwrap() - expected).abs() < 1e-12);
+
+    let mut explicit_write_rate = muse.clone();
+    explicit_write_rate.cache_write_rate = Some(0.125);
+    assert_eq!(
+        explicit_write_rate.basket_rate(BasketDimension::CacheWrite),
+        Some(0.125)
+    );
+    let explicit_price = explicit_write_rate.basket_price(&vector);
+    let explicit_expected = (expected_raw - vector.cache_write * 0.1 + vector.cache_write * 0.125)
+        / 1_000_000.0
+        / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE;
+    assert!((explicit_price.cost.unwrap() - explicit_expected).abs() < 1e-12);
+
+    assert!((selection_cost(&muse, false, true) - expected).abs() < 1e-12);
+}
+
+#[test]
+fn billing_plane_cache_write_rate_falls_back_to_its_input_rate() {
+    use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
+    use prefrontal_routing_core::model_facts::BasketDimension;
+    let vector = mason_live_vector();
+    let mut fact = live_rated(
+        "meta",
+        "muse-spark-1.3-contributor",
+        1_900.0,
+        90.0,
+        (0.2, 99.0, 99.0, Some(99.0)),
+        None,
+    );
+    fact.billing_plane = Some(BillingPlane {
+        provider_id: "meta".into(),
+        auth_method: "oauth".into(),
+        kind: "test".into(),
+        selection_reason: "fixture".into(),
+        rates: [
+            ("rate.input".into(), BillingRate::Priced { rate: 0.1 }),
+            ("rate.output".into(), BillingRate::Priced { rate: 0.2 }),
+            (
+                "rate.cache_read".into(),
+                BillingRate::Priced { rate: 0.002 },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    });
+    assert_eq!(fact.basket_rate(BasketDimension::CacheWrite), Some(0.1));
+    let price = fact.basket_price(&vector);
+    assert!(price.cost.is_some());
+    assert!(price.unpriced.is_empty());
 }
 
 // The priced route is faster, so it would win every tie-break; only the free
@@ -4088,38 +4181,60 @@ fn route_without_cache_write_rate_stays_basket_priced_when_the_vector_writes_no_
         .is_empty());
 }
 
+// A missing cache-write rate falls back to input, so its route is basket priced
+// and the selection explanation records the rate source.
 #[test]
-fn route_with_cache_write_tokens_and_no_rate_prices_at_max_and_leaves_the_others_on_the_basket() {
+fn route_with_cache_write_tokens_uses_input_rate_when_separate_rate_is_absent() {
     let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
     let complete = make_complete_basket_fact("p", "complete", 100.0, Some(vec.clone()));
     let complete_basket = complete.basket_cost().unwrap();
     let mut no_cache_write = make_complete_basket_fact("q", "no_cache_write", 100.0, Some(vec));
     no_cache_write.cache_write_rate = None;
+    let expected = no_cache_write
+        .basket_cost()
+        .expect("cache-write tokens use the stated input rate");
 
     let priced = price_basket_selection(vec![complete, no_cache_write.clone()]);
     assert!(priced.use_basket);
     assert_eq!(priced_entry(&priced, "p/complete").cost, complete_basket);
     let entry = priced_entry(&priced, "q/no_cache_write");
-    assert_eq!(entry.cost, 1.0);
-    assert_eq!(
-        entry.basket_pricing.as_ref().unwrap().unpriced_dimensions,
-        vec!["cache_write"]
-    );
+    assert_eq!(entry.cost, expected);
+    assert!(entry.cost < 1.0);
+    assert!(entry
+        .basket_pricing
+        .as_ref()
+        .unwrap()
+        .unpriced_dimensions
+        .is_empty());
 
-    // Alone it wins (nothing else to pick) and its line says why it is at max.
-    let alone = select_without_overqualification(input(
+    let selected = select_without_overqualification(input(
         vec![no_cache_write],
         req(50.0, 0.0),
         Extra::default(),
     ))
     .unwrap();
-    let exp = alone.explanation.join("\n");
+    let explanation = selected.explanation.join("\n");
     assert!(
-        exp.contains(
-            "unpriceable, ranked as max (cache_write 50 tokens/message, no cache_write_rate)"
-        ),
-        "{exp}"
+        explanation.contains("cache-write rate taken from input"),
+        "{explanation}"
     );
+    assert!(!explanation.contains("price unknown"), "{explanation}");
+}
+
+#[test]
+fn missing_cache_write_rate_does_not_use_input_when_input_is_unpriced() {
+    use prefrontal_routing_core::model_facts::BasketDimension;
+    let vector = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
+    let mut no_input = make_complete_basket_fact("p", "no_input", 100.0, Some(vector));
+    no_input.input_rate = None;
+    no_input.cache_write_rate = None;
+
+    assert_eq!(no_input.basket_rate(BasketDimension::CacheWrite), None);
+    let selected =
+        select_without_overqualification(input(vec![no_input], req(50.0, 0.0), Extra::default()))
+            .unwrap();
+    assert!(selected.score.objective.price_unknown);
+    assert!(selected.explanation.join("\n").contains("price_unknown"));
 }
 
 fn own_vector(sample_count: u64) -> prefrontal_routing_core::ClassVector {

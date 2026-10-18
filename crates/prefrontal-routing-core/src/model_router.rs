@@ -883,6 +883,22 @@ pub fn selection_cost(fact: &ModelFact, is_subscription: bool, use_basket: bool)
     output_only_cost(fact, is_subscription)
 }
 
+/// Whether this route has no separate cache-write rate and can use its input rate
+/// instead. Billing-plane facts are authoritative, so a fact-column value cannot
+/// fill a missing rate when the attached plane omits it.
+fn cache_write_rate_uses_input(fact: &ModelFact) -> bool {
+    let write_rate_missing = match &fact.billing_plane {
+        Some(plane) => !plane
+            .rates
+            .contains_key(crate::model_facts::BasketDimension::CacheWrite.fact_key()),
+        None => fact.cache_write_rate.is_none(),
+    };
+    write_rate_missing
+        && fact
+            .basket_rate(crate::model_facts::BasketDimension::FreshInput)
+            .is_some_and(|rate| rate.is_finite())
+}
+
 pub(crate) fn compute_objective(
     route: &ModelRoute,
     runtime: &RouteRuntimeState,
@@ -931,6 +947,9 @@ pub(crate) fn compute_objective(
             detail.push_str(&format!(
                 ", price unknown, unpriceable, ranked as max ({missing})"
             ));
+        }
+        if vector.cache_write > 0.0 && cache_write_rate_uses_input(&route.fact) {
+            detail.push_str(", cache-write rate taken from input");
         }
         detail.push_str(&format!(
             ", {} vector ({} samples)",

@@ -534,11 +534,12 @@ impl ModelFact {
     }
 
     /// The catalog rate ($/Mtok) for one basket dimension. Reasoning tokens fall
-    /// back to the output rate when no separate reasoning rate is served.
+    /// back to the output rate, and cache-write tokens to the input rate, when no
+    /// separate rate is stated.
     ///
-    /// An absent rate is not a free rate, with one exception: on a route whose
-    /// input and output are both stated as zero ([`ModelFact::states_free_rates`]),
-    /// an absent cache-read, cache-write or reasoning rate prices at zero. A
+    /// An absent cache-read or reasoning rate is not a free rate, with one
+    /// exception: on a route whose input and output are both stated as zero
+    /// ([`ModelFact::states_free_rates`]), those dimensions price at zero. A
     /// cached or reasoning token cannot cost more than the free input or output
     /// token it stands in for, so leaving it unknown would only rank a free route
     /// behind priced ones. A rate the plane explicitly marks unpriced stays
@@ -557,6 +558,11 @@ impl ModelFact {
             {
                 return plane.rate("rate.output");
             }
+            if dimension == BasketDimension::CacheWrite
+                && !plane.rates.contains_key(dimension.fact_key())
+            {
+                return plane.rate(BasketDimension::FreshInput.fact_key());
+            }
             if fills_with_zero
                 && !plane.rates.contains_key(dimension.fact_key())
                 && self.states_free_rates()
@@ -570,7 +576,7 @@ impl ModelFact {
             BasketDimension::OutputExcludingReasoning => self.cost_per_m_tok_out,
             BasketDimension::Reasoning => self.reasoning_rate.or(self.cost_per_m_tok_out),
             BasketDimension::CachedRead => self.cache_read_rate,
-            BasketDimension::CacheWrite => self.cache_write_rate,
+            BasketDimension::CacheWrite => self.cache_write_rate.or(self.input_rate),
         };
         if rate.is_none() && fills_with_zero && self.states_free_rates() {
             return Some(0.0);
