@@ -40,13 +40,15 @@ pub enum FailureBackoffTransition {
 /// `NoDispatch` identifies launch failures before the host prompt reaches a provider;
 /// `ContentPolicy` identifies a provider refusing the REQUEST on policy grounds (the
 /// prompt, not the route, is what failed, and a reworded prompt succeeds on the same
-/// route). None of the three may charge an individual route's terminal-failure streak.
+/// route). `RequestInvalid` is Broca's typed request-shape refusal. None may charge
+/// an individual route's terminal-failure streak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureAttribution {
     RouteAttributable,
     LocalNetwork,
     NoDispatch,
     ContentPolicy,
+    RequestInvalid,
 }
 
 /// Only outcomes that prove the selected route could not complete its send count.
@@ -63,8 +65,9 @@ pub fn is_terminal_send_failure(outcome: RouteOutcome) -> bool {
 /// Classify the evidence feeding the route-local terminal-failure counter.
 ///
 /// Route-attributable evidence explicitly includes provider 5xx responses, non-quota
-/// provider 4xx responses, model refusals, stream errors after the first token, and
-/// timeouts after dispatch. Provider-specific quota handling remains separate. This
+/// provider 4xx responses other than typed request refusals, model refusals, stream
+/// errors after the first token, and timeouts after dispatch. Provider-specific quota
+/// handling remains separate. This
 /// generic safety net keeps other terminal provider-side errors attributable unless
 /// they match a host-local-network or pre-dispatch launch signature below.
 pub fn classify_failure_attribution(
@@ -72,6 +75,17 @@ pub fn classify_failure_attribution(
     last_error: Option<&str>,
 ) -> FailureAttribution {
     let error = last_error.unwrap_or_default().to_ascii_lowercase();
+    // Core renders Broca's typed code either as a caller error prefix or as a
+    // labelled field in the worker's terminal diagnostic. Do not inspect the raw
+    // provider body: it can mention request errors without classifying this run.
+    let diagnostic_fields = error.split("; broca said:").next().unwrap_or_default();
+    if error.starts_with("request_invalid:")
+        || diagnostic_fields
+            .split("; ")
+            .any(|field| field == "provider code request_invalid")
+    {
+        return FailureAttribution::RequestInvalid;
+    }
     if [
         "getaddrinfo",
         "enotfound",
@@ -135,8 +149,9 @@ pub fn classify_failure_attribution(
 
 /// Advance route-local failure backoff only for provider-attributable terminal evidence.
 ///
-/// The allow-list includes provider 5xx responses, non-quota provider 4xx responses,
-/// model refusals, stream errors after the first token, and timeouts after dispatch.
+/// The allow-list includes provider 5xx responses, non-quota provider 4xx responses
+/// other than typed request refusals, model refusals, stream errors after the first
+/// token, and timeouts after dispatch.
 /// Local network failures and pre-dispatch launch failures preserve the existing streak
 /// and backoff because they do not establish that this provider route was reached.
 pub fn failure_backoff_transition(
@@ -157,6 +172,7 @@ pub fn failure_backoff_transition(
         FailureAttribution::LocalNetwork => return FailureBackoffTransition::Unchanged,
         FailureAttribution::NoDispatch => return FailureBackoffTransition::Unchanged,
         FailureAttribution::ContentPolicy => return FailureBackoffTransition::Unchanged,
+        FailureAttribution::RequestInvalid => return FailureBackoffTransition::Unchanged,
     }
 
     let consecutive_failures = previous_consecutive_failures.saturating_add(1);
@@ -194,6 +210,45 @@ mod tests {
 
     /// Verbatim from the live routing store (openai/gpt-6-astra, 2026-09-06).
     const CONTENT_POLICY_SPECIMEN: &str = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
+
+    #[test]
+    fn typed_request_invalid_preserves_the_route_streak_and_backoff() {
+        for error in [
+            "request_invalid: provider openai: invalid schema",
+            "class permanent; provider code request_invalid; provider subcode invalid_json_schema; HTTP 400; Broca said: invalid schema",
+        ] {
+            assert_eq!(
+                classify_failure_attribution(RouteOutcome::SessionError, Some(error)),
+                FailureAttribution::RequestInvalid
+            );
+            for previous in [0, 2, 10] {
+                assert_eq!(
+                    failure_backoff_transition(previous, RouteOutcome::SessionError, Some(error), 1_000, FailureBackoffConfig::default()),
+                    FailureBackoffTransition::Unchanged
+                );
+            }
+        }
+        for error in [
+            "provider returned HTTP 503 after dispatch",
+            "provider code invalid_prompt; HTTP 400; Broca said: bad prompt",
+            "provider code provider_error; HTTP 503; Broca said: request_invalid",
+            "provider code provider_error; HTTP 503; Broca said: provider code request_invalid;",
+        ] {
+            assert!(matches!(
+                failure_backoff_transition(
+                    2,
+                    RouteOutcome::SessionError,
+                    Some(error),
+                    1_000,
+                    FailureBackoffConfig::default()
+                ),
+                FailureBackoffTransition::Failure {
+                    consecutive_failures: 3,
+                    ..
+                }
+            ));
+        }
+    }
 
     #[test]
     fn typed_provider_policy_refusal_does_not_charge_any_route_strike() {
