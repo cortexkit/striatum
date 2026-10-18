@@ -40,8 +40,6 @@ use prefrontal_routing_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::quota_consumer::QuotaConsumer;
-
 /// Length of Claude's five-hour general window, as Insula publishes it.
 pub const FIVE_HOUR_MINUTES: i64 = 300;
 /// Length of the seven-day general window and of the Fable scoped window.
@@ -1456,11 +1454,8 @@ pub fn build_report(
 // Live state, persistence and the refresh loop
 // ---------------------------------------------------------------------------
 
-/// How often account readings and the vault roster are refreshed. Insula
-/// refreshes each account every 60 s, so polling faster adds nothing.
+/// How often the vault roster and serving-method joins are refreshed.
 pub const ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-/// Retry delay after a failed Insula connection.
-const ACCOUNT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Everything the account views are built from, shared between the refresh
 /// loop (writer) and the status operation (reader). The lock is never held
@@ -1705,10 +1700,8 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Background task keeping the account state current: list the vault roster,
-/// then poll Insula's unfiltered feed, merging and persisting every provider.
-/// Every await happens without the state lock, and a failure on either
-/// side leaves what routing already holds in place.
+/// Refresh the vault roster and serving-method joins independently of quota delivery.
+/// Quota samples and fallback snapshots are written by the quota event consumer.
 pub async fn account_quota_loop(
     connection_file_path: PathBuf,
     state: SharedAccountQuota,
@@ -1750,41 +1743,6 @@ pub async fn account_quota_loop(
             }
         }
 
-        let replies = match QuotaConsumer::connect(&connection_file_path, &project_root).await {
-            Ok(mut consumer) => consumer.usage_get_raw().await,
-            Err(error) => Err(error),
-        };
-        let delay = match replies {
-            Ok(body) => {
-                let received_at_ms = now_ms();
-                let persisted = match state.lock() {
-                    Ok(mut guard) => match apply_usage_reply(&mut guard, &body, received_at_ms) {
-                        Ok(rows) => {
-                            guard.last_insula_error = None;
-                            Some(rows)
-                        }
-                        Err(error) => {
-                            guard.last_insula_error =
-                                Some(format!("usage reply rejected: {error}"));
-                            None
-                        }
-                    },
-                    Err(_) => None,
-                };
-                if let Some((rows, completeness)) = persisted {
-                    if let Err(error) = store.put_account_quota_poll(&rows, &completeness) {
-                        tracing::warn!(error = %error, "account quota poll not persisted");
-                    }
-                }
-                ACCOUNT_REFRESH_INTERVAL
-            }
-            Err(error) => {
-                if let Ok(mut guard) = state.lock() {
-                    guard.last_insula_error = Some(error.to_string());
-                }
-                ACCOUNT_RETRY_INTERVAL
-            }
-        };
         // Account selection and pricing must agree on the serving login. Build
         // the method map after both roster and readings have been refreshed.
         if let (Ok(guard), Ok(facts)) = (state.lock(), store.get_facts()) {
@@ -1806,7 +1764,7 @@ pub async fn account_quota_loop(
             listing.as_ref().ok(),
         )
         .await;
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(ACCOUNT_REFRESH_INTERVAL).await;
     }
 }
 

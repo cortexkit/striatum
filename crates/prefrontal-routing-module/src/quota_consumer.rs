@@ -87,9 +87,8 @@ pub(crate) fn decode_usage_result(
         .collect())
 }
 
-/// An outbound consumer connection to the daemon, used for one quota refresh cycle.
-/// The connection is closed after a successful `usage_get`; callers must create a
-/// new consumer for the next cycle.
+/// An outbound daemon connection for quota queries. The one-shot usage and event
+/// body methods close it after success; callers reconnect for the next query.
 pub struct QuotaConsumer {
     stream: TcpStream,
     route_channel: u16,
@@ -207,6 +206,7 @@ impl QuotaConsumer {
     }
 
     /// Call `usage.get` on the open quota route; returns the decoded `ProviderUsage[]`.
+    #[cfg(test)]
     pub async fn usage_get(
         &mut self,
     ) -> Result<Vec<prefrontal_routing_core::quota::ProviderUsage>, QuotaConsumerError> {
@@ -226,6 +226,19 @@ impl QuotaConsumer {
     /// envelope bytes so account consumers also see `completeProviders`.
     pub async fn usage_get_raw(&mut self) -> Result<Vec<u8>, QuotaConsumerError> {
         let body = self.usage_get_body(serde_json::json!({})).await?;
+        self.goodbye().await?;
+        Ok(body)
+    }
+
+    /// Preserve the raw body substring: the notice digest covers the producer's
+    /// bytes, not a consumer's reserialized JSON tree.
+    pub async fn events_get_raw(&mut self, event_key: &str) -> Result<Vec<u8>, QuotaConsumerError> {
+        let body = self
+            .operation_body(serde_json::json!({
+                "method": "events_get",
+                "params": {"event_key": event_key, "event_name": "quota_sampled"},
+            }))
+            .await?;
         self.goodbye().await?;
         Ok(body)
     }
@@ -460,6 +473,51 @@ mod tests {
         let decoded = consumer.usage_get().await;
         server.await.unwrap();
         decoded
+    }
+
+    #[tokio::test]
+    async fn events_get_requests_the_key_and_preserves_body_bytes() {
+        const REPLY: &[u8] = br#"{"result":{"body":{"provider":"codex","seq":9007199254740993,"epoch":"opaque"},"digest":"notice-digest"}}"#;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let key = "a".repeat(64);
+        let expected_key = key.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_frame(&mut stream).await.unwrap().unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "method": "events_get", "params": {"event_key": expected_key, "event_name": "quota_sampled"}
+                })
+            );
+            let response = Frame::build_with_version(
+                request.header.ver,
+                FrameType::Response,
+                request.header.flags,
+                request.header.channel,
+                request.header.epoch,
+                request.header.corr,
+                REPLY.to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &response).await.unwrap();
+            assert_eq!(
+                read_frame(&mut stream).await.unwrap().unwrap().header.ty,
+                FrameType::Goodbye
+            );
+        });
+        let mut consumer = QuotaConsumer {
+            stream: TcpStream::connect(address).await.unwrap(),
+            route_channel: 7,
+            route_epoch: 3,
+            next_corr: 1,
+        };
+        assert_eq!(consumer.events_get_raw(&key).await.unwrap(), REPLY);
+        server.await.unwrap();
     }
 
     /// The reply that stalled routing's quota refresh from 2026-10-02 16:56Z:
