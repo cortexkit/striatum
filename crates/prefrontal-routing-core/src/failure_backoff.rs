@@ -37,7 +37,8 @@ pub enum FailureBackoffTransition {
 /// Whether a terminal outcome is evidence about the selected provider route.
 ///
 /// `LocalNetwork` identifies failures that every route on this host would see;
-/// `NoDispatch` identifies launch failures before the host prompt reaches a provider;
+/// `NoDispatch` identifies failures before a request reaches a provider; `RunnerState`
+/// identifies Broca refusing a resume because its own run state is incompatible;
 /// `ContentPolicy` identifies a provider refusing the REQUEST on policy grounds (the
 /// prompt, not the route, is what failed, and a reworded prompt succeeds on the same
 /// route). `RequestInvalid` is Broca's typed request-shape refusal. None may charge
@@ -47,6 +48,7 @@ pub enum FailureAttribution {
     RouteAttributable,
     LocalNetwork,
     NoDispatch,
+    RunnerState,
     ContentPolicy,
     RequestInvalid,
 }
@@ -85,6 +87,19 @@ pub fn classify_failure_attribution(
             .any(|field| field == "provider code request_invalid")
     {
         return FailureAttribution::RequestInvalid;
+    }
+    // Only inspect the runner's diagnostic, not text it attributes to Broca's
+    // provider response. These markers describe a failed session.send admission,
+    // not an error returned by a provider after dispatch.
+    if is_pre_dispatch_runner_failure(diagnostic_fields) {
+        return FailureAttribution::NoDispatch;
+    }
+    // A refusal to resume because Broca's saved run state no longer matches its
+    // current renderer is not evidence against the provider route.
+    if diagnostic_fields.starts_with("resume refused:")
+        || diagnostic_fields.starts_with("renderer_version_drift:")
+    {
+        return FailureAttribution::RunnerState;
     }
     if [
         "getaddrinfo",
@@ -147,6 +162,15 @@ pub fn classify_failure_attribution(
     }
 }
 
+/// Recognize the concrete Broca send and runner-unavailable diagnostics that prove
+/// the provider was never given a request. A provider response body is removed by the
+/// caller before these structural markers are checked.
+fn is_pre_dispatch_runner_failure(diagnostic: &str) -> bool {
+    diagnostic.contains("llm_runner_unavailable:")
+        || diagnostic.contains("session.send: request not sent:")
+        || diagnostic.contains("route.open failed for target management_surface:broca:")
+}
+
 /// Advance route-local failure backoff only for provider-attributable terminal evidence.
 ///
 /// The allow-list includes provider 5xx responses, non-quota provider 4xx responses
@@ -171,6 +195,7 @@ pub fn failure_backoff_transition(
         FailureAttribution::RouteAttributable => {}
         FailureAttribution::LocalNetwork => return FailureBackoffTransition::Unchanged,
         FailureAttribution::NoDispatch => return FailureBackoffTransition::Unchanged,
+        FailureAttribution::RunnerState => return FailureBackoffTransition::Unchanged,
         FailureAttribution::ContentPolicy => return FailureBackoffTransition::Unchanged,
         FailureAttribution::RequestInvalid => return FailureBackoffTransition::Unchanged,
     }
@@ -248,6 +273,76 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn broca_restart_send_failures_preserve_the_route_streak() {
+        let specimens = [
+            (
+                RouteOutcome::Error,
+                6,
+                "no research part answered: send_failed: session.send: request not sent: route.open failed for target management_surface:broca: module_reloading (module_id 'broca' is reloading)",
+                FailureAttribution::NoDispatch,
+            ),
+            (
+                RouteOutcome::SessionError,
+                8,
+                "llm_runner_error: provider openai: session.send: request not sent: route.open failed for target management_surface:broca: module_reloading (module_id 'broca' is reloading)",
+                FailureAttribution::NoDispatch,
+            ),
+            (
+                RouteOutcome::SessionError,
+                4,
+                "llm_runner_error: provider openai: llm_runner_unavailable: Broca module is unavailable to the runner",
+                FailureAttribution::NoDispatch,
+            ),
+            (
+                RouteOutcome::SessionError,
+                7,
+                "resume refused: the provider renderer version differs from the version recorded at run start",
+                FailureAttribution::RunnerState,
+            ),
+        ];
+
+        for (outcome, previous, error, attribution) in specimens {
+            assert_eq!(
+                classify_failure_attribution(outcome, Some(error)),
+                attribution,
+                "{error}"
+            );
+            assert_eq!(
+                failure_backoff_transition(
+                    previous,
+                    outcome,
+                    Some(error),
+                    1_000,
+                    FailureBackoffConfig::default(),
+                ),
+                FailureBackoffTransition::Unchanged,
+                "runner failures must preserve the existing streak: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_503_after_dispatch_counts_even_when_body_mentions_module_reloading() {
+        let error = "class transient; provider code provider_error; HTTP 503; Broca said: provider body mentions module_reloading";
+        assert_eq!(
+            failure_backoff_transition(
+                2,
+                RouteOutcome::SessionError,
+                Some(error),
+                1_000,
+                FailureBackoffConfig::default(),
+            ),
+            FailureBackoffTransition::Failure {
+                consecutive_failures: 3,
+                cooldown_until: Some(1_000 + FAILURE_BACKOFF_INITIAL_MS),
+                reason: Some(format!(
+                    "consecutive terminal send failures: 3; last error: {error}"
+                )),
+            }
+        );
     }
 
     #[test]
