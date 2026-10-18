@@ -1973,8 +1973,8 @@ mod tests {
     /// OpenCode's free models on the production path: Fusiform states input and
     /// output as `stated_zero` and serves no cache-write rate, and price_facts
     /// attaches an apikey plane built from those catalog rates before selection.
-    /// The free route must price at zero through that plane; a priced sibling
-    /// with the same missing cache-write rate stays unknown.
+    /// The free route prices at zero; its priced sibling bills cache writes at
+    /// its stated input rate even though the plane has no separate write rate.
     #[test]
     fn free_route_prices_at_zero_through_the_plane_price_facts_attaches() {
         use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
@@ -2050,11 +2050,13 @@ mod tests {
         );
 
         let paid = &facts[1];
-        assert_eq!(paid.basket_rate(CacheWrite), None);
-        assert_eq!(paid.basket_price(&vector()).unpriced, [CacheWrite]);
+        assert_eq!(paid.basket_rate(CacheWrite), Some(0.0));
+        let paid_price = paid.basket_price(&vector());
+        assert!(paid_price.cost.is_some());
+        assert!(paid_price.unpriced.is_empty());
         assert_eq!(
             prefrontal_routing_core::selection_cost(paid, false, true),
-            1.0
+            paid_price.cost.unwrap()
         );
 
         // A cache-write rate the plane explicitly marks unpriced is a statement,
