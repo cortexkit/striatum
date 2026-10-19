@@ -382,7 +382,14 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
         .headers
         .get("epoch")
         .is_some_and(|epoch| state.retired.contains(epoch));
-    if far_behind || retired_epoch {
+    if retired_epoch {
+        // The newer epoch's own snapshot already replaced this sample's reading.
+        return cursor
+            .ack()
+            .await
+            .map_err(|e| ConsumeError::Bus(e.to_string()));
+    }
+    if far_behind {
         state.owe_snapshot = true;
         catch_up_snapshot(source, live, state).await;
         return cursor
