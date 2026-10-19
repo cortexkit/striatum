@@ -154,6 +154,7 @@ pub fn classify_failure_attribution(
             }
         }
         RouteOutcome::Completed => FailureAttribution::RouteAttributable,
+        RouteOutcome::ContractError => FailureAttribution::RouteAttributable,
         RouteOutcome::Error => FailureAttribution::RouteAttributable,
         RouteOutcome::SessionError => FailureAttribution::RouteAttributable,
         RouteOutcome::Cancelled => FailureAttribution::RouteAttributable,

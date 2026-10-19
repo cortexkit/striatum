@@ -5032,7 +5032,7 @@ struct SetDecisionOutcomeParams {
     // would expect `decisionId`, the lone casing drift that broke the round-trip.
     #[serde(rename = "decisionID")]
     decision_id: String,
-    /// completed | error | session_error | cancelled | interrupted | launch_failed | quota_exhausted
+    /// completed | contract_error | error | session_error | cancelled | interrupted | launch_failed | quota_exhausted
     outcome: String,
     /// Host-parsed reset delay for a quota_exhausted outcome.
     #[serde(default)]
@@ -5118,6 +5118,7 @@ struct RecordCooldownParams {
 fn parse_outcome(s: &str, retry_after_secs: Option<u64>) -> Option<RouteOutcome> {
     match s {
         "completed" => Some(RouteOutcome::Completed),
+        "contract_error" => Some(RouteOutcome::ContractError),
         "error" => Some(RouteOutcome::Error),
         "session_error" => Some(RouteOutcome::SessionError),
         "cancelled" => Some(RouteOutcome::Cancelled),
@@ -6572,6 +6573,14 @@ mod tests {
         assert!(!claim_ignored_caller_policy_warning(false, &warned));
         assert!(claim_ignored_caller_policy_warning(true, &warned));
         assert!(!claim_ignored_caller_policy_warning(true, &warned));
+    }
+
+    #[test]
+    fn contract_outcome_round_trips_without_a_quota_horizon() {
+        let outcome = RouteOutcome::ContractError;
+        assert_eq!(parse_outcome(outcome.as_str(), None), Some(outcome));
+        assert_eq!(outcome.retry_after_secs(), None);
+        assert!(!prefrontal_routing_core::is_terminal_send_failure(outcome));
     }
 
     #[test]

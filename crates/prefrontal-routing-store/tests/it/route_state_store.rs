@@ -682,6 +682,66 @@ fn set_outcome(
 }
 
 #[test]
+fn contract_errors_preserve_route_failures_and_record_contract_quality() {
+    const ROUTE: &str = "openai/contract-test";
+    const ERROR: &str = "reply_contract_error: prose verdict lacks a verbatim single-line quote from the judged sentence";
+    let rig = Rig::new("contract-preserves-streak");
+    let store = rig.open();
+    store
+        .update_route_state(ROUTE, ROUTE, &RouteStateUpdate::default())
+        .unwrap();
+    let conn = rusqlite::Connection::open(rig.db_path()).unwrap();
+    let route_state = || {
+        conn.query_row(
+        "SELECT consecutive_terminal_failures, failure_count, failure_backoff_until, failure_backoff_reason FROM model_route_state WHERE route_key=?1",
+        [ROUTE], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<f64>>(2)?, row.get::<_, Option<String>>(3)?))
+    ).unwrap()
+    };
+    for attempt in 0..=3 {
+        if attempt > 0 {
+            let id = selected_decision(&store, &format!("dec-provider-{attempt}"), ROUTE);
+            set_outcome(
+                &store,
+                &id,
+                RouteOutcome::Error,
+                Some("HTTP 503 provider unavailable"),
+                attempt * 2,
+            );
+        }
+        let before = route_state();
+        assert_eq!(before.0, attempt);
+        assert_eq!(before.1, attempt);
+        assert_eq!(before.2.is_some(), attempt == 3);
+        let id = selected_decision(&store, &format!("dec-contract-{attempt}"), ROUTE);
+        set_outcome(
+            &store,
+            &id,
+            RouteOutcome::ContractError,
+            Some(ERROR),
+            attempt * 2 + 1,
+        );
+        assert_eq!(route_state(), before);
+        assert_eq!(
+            store
+                .get_decision_by_id(&id)
+                .unwrap()
+                .unwrap()
+                .outcome
+                .as_deref(),
+            Some("contract_error")
+        );
+        let recorded: String = conn
+            .query_row(
+                "SELECT outcome_error FROM model_route_decisions WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, ERROR);
+    }
+}
+
+#[test]
 fn ten_request_invalid_outcomes_leave_the_route_admissible_and_audited() {
     const ROUTE: &str = "openai/request-invalid-test";
     let rig = Rig::new("request-invalid-outcomes");

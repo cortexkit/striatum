@@ -147,18 +147,24 @@ pub struct ProviderCooldownState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteOutcome {
     Completed,
+    /// The provider answered, but the reply failed the caller's output contract.
+    /// Kept distinct in the decision ledger without charging route availability.
+    ContractError,
     Error,
     SessionError,
     Cancelled,
     Interrupted,
     LaunchFailed,
-    QuotaExhausted { retry_after_secs: u64 },
+    QuotaExhausted {
+        retry_after_secs: u64,
+    },
 }
 
 impl RouteOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
             RouteOutcome::Completed => "completed",
+            RouteOutcome::ContractError => "contract_error",
             RouteOutcome::Error => "error",
             RouteOutcome::SessionError => "session_error",
             RouteOutcome::Cancelled => "cancelled",
