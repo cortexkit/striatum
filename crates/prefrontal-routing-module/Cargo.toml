@@ -14,6 +14,12 @@ path = "src/main.rs"
 sha2 = "0.10"
 
 [dependencies]
+async-nats = { version = "0.50", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
+base64 = "0.22"
+cortexkit-bus-naming = "=0.2.4"
+cortexkit-bus-nats = "0.3.0"
+cortexkit-bus-trait = "0.3.0"
+subc-client-rs = { workspace = true }
 prefrontal-ckcred-client = { path = "../prefrontal-ckcred-client" }
 prefrontal-routing-core = { path = "../prefrontal-routing-core" }
 prefrontal-routing-store = { path = "../prefrontal-routing-store" }
@@ -24,7 +30,7 @@ subc-transport = { workspace = true }
 subc-os = { workspace = true }
 subc-jsonc = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 schemars = "1"
 sha2 = "0.10"
 tokio = { workspace = true }
@@ -32,9 +38,10 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
+async-trait = "0.1"
+cortexkit-bus-inmemory = "0.3.0"
 prefrontal-routing-store = { path = "../prefrontal-routing-store", features = ["test-support"] }
 prefrontal-test-support = { path = "../prefrontal-test-support" }
-subc-client-rs = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # The real-daemon e2e tests spawn the daemon and module binaries; nothing else in
 # this package's graph turns on tokio's process feature any more.
