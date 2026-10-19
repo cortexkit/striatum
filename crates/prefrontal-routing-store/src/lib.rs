@@ -183,6 +183,7 @@ const MIGRATION_051: &str = include_str!("../migrations/051_model_identity_and_s
 /// Migration 52: retire shadow mode's heartbeat index and add the indexes the
 /// account-selection history retention walks.
 const MIGRATION_052: &str = include_str!("../migrations/052_retire_account_shadow.sql");
+const MIGRATION_053: &str = include_str!("../migrations/053_selected_harness_workload.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -226,7 +227,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 52] {
+fn route_state_migrations() -> [Migration; 53] {
     [
         Migration {
             version: 1,
@@ -435,6 +436,10 @@ fn route_state_migrations() -> [Migration; 52] {
         Migration {
             version: 52,
             statements: MIGRATION_052,
+        },
+        Migration {
+            version: 53,
+            statements: MIGRATION_053,
         },
     ]
 }
@@ -815,6 +820,8 @@ pub struct DecisionExplainRow {
     pub selected_provider_id: Option<String>,
     pub selected_model_id: Option<String>,
     pub selected_variant: Option<String>,
+    pub selected_harness: Option<String>,
+    pub selected_workload: Option<String>,
     pub score_json: String,
     pub rejected_json: String,
     pub explanation_json: Option<String>,
@@ -1720,6 +1727,64 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    /// Persist the resolved execution identity in the same insert as the audit row.
+    /// The generic store trait leaves these values unknown; routing supplies them
+    /// only after selection, without repurposing the caller's `input.harness`.
+    pub fn record_decision_with_selection(
+        &self,
+        input: &DecisionInput,
+        selected_harness: Option<&str>,
+        selected_workload: Option<&str>,
+    ) -> RouteStateResult<String> {
+        let id = input
+            .decision_id
+            .clone()
+            .unwrap_or_else(|| format!("dec_{}", short_id()));
+        let id_ret = id.clone();
+        let rejected_json = bound_rejected_json(&input.rejected_json);
+        self.store
+            .with_conn(|c: &Connection| {
+                let catalog_fingerprint = calculate_catalog_fingerprint(c)?;
+                c.execute(
+                     "INSERT INTO model_route_decisions (
+                         id, decision_kind, task_id, parent_session_id, harness, project_root, send_id,
+                         target_agent, requirements_json, selected_route_key, selected_provider_id,
+                         selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
+                         quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at,
+                         selected_harness, selected_workload
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                    params![
+                        id,
+                        if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
+                        input.task_id,
+                        input.parent_session_id,
+                        input.harness,
+                        input.project_root,
+                        input.send_id,
+                        input.target_agent,
+                        input.requirements_json,
+                        input.selected_route_key,
+                        input.selected_provider_id,
+                        input.selected_model_id,
+                        input.selected_variant,
+                        input.score_json,
+                        rejected_json,
+                        input.explanation_json,
+                        input.quota_signal_json,
+                        input.policy_revision,
+                        input.anchor_version,
+                        catalog_fingerprint,
+                        now_ms(),
+                        selected_harness,
+                        selected_workload,
+                    ],
+                )?;
+                Ok(())
+            })
+            .map_err(err)?;
+        Ok(id_ret)
+    }
+
     /// Look up one decision by its durable id for a diagnostic explanation.
     pub fn get_decision_by_id(
         &self,
@@ -1734,7 +1799,7 @@ impl SqliteRouteStateStore {
                                 selected_provider_id, selected_model_id, selected_variant, score_json,
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
-                                outcome_error
+                                outcome_error, selected_harness, selected_workload
                          FROM model_route_decisions
                          WHERE id=?1",
                         [decision_id],
@@ -1759,7 +1824,7 @@ impl SqliteRouteStateStore {
                                 selected_provider_id, selected_model_id, selected_variant, score_json,
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
-                                outcome_error
+                                outcome_error, selected_harness, selected_workload
                          FROM model_route_decisions
                          WHERE send_id=?1
                          ORDER BY created_at DESC, id DESC
@@ -1990,6 +2055,8 @@ fn decision_explain_row(row: &Row<'_>) -> rusqlite::Result<DecisionExplainRow> {
         outcome: row.get(21)?,
         outcome_at: row.get(22)?,
         outcome_error: row.get(23)?,
+        selected_harness: row.get(24)?,
+        selected_workload: row.get(25)?,
     })
 }
 
@@ -2904,50 +2971,7 @@ impl RouteStateStore for SqliteRouteStateStore {
     }
 
     fn record_decision(&self, input: &DecisionInput) -> RouteStateResult<String> {
-        let id = input
-            .decision_id
-            .clone()
-            .unwrap_or_else(|| format!("dec_{}", short_id()));
-        let id_ret = id.clone();
-        let rejected_json = bound_rejected_json(&input.rejected_json);
-        self.store
-            .with_conn(|c: &Connection| {
-                let catalog_fingerprint = calculate_catalog_fingerprint(c)?;
-                c.execute(
-                     "INSERT INTO model_route_decisions (
-                         id, decision_kind, task_id, parent_session_id, harness, project_root, send_id,
-                         target_agent, requirements_json, selected_route_key, selected_provider_id,
-                         selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
-                         quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at
-                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
-                    params![
-                        id,
-                        if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
-                        input.task_id,
-                        input.parent_session_id,
-                        input.harness,
-                        input.project_root,
-                        input.send_id,
-                        input.target_agent,
-                        input.requirements_json,
-                        input.selected_route_key,
-                        input.selected_provider_id,
-                        input.selected_model_id,
-                        input.selected_variant,
-                        input.score_json,
-                        rejected_json,
-                        input.explanation_json,
-                        input.quota_signal_json,
-                        input.policy_revision,
-                        input.anchor_version,
-                        catalog_fingerprint,
-                        now_ms(),
-                    ],
-                )?;
-                Ok(())
-            })
-            .map_err(err)?;
-        Ok(id_ret)
+        self.record_decision_with_selection(input, None, None)
     }
 
     fn set_decision_outcome(
@@ -4126,6 +4150,49 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
         let _ = std::fs::remove_file(path.with_extension("sqlite.lock"));
+    }
+
+    #[test]
+    fn migration_053_keeps_legacy_execution_identity_unknown() {
+        let scratch = prefrontal_test_support::scratch_root().join(format!(
+            "routing-selected-identity-{}-{}",
+            std::process::id(),
+            short_id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let descriptor = dev_descriptor(
+            "routing-selected-identity",
+            scratch.join("store.db").to_string_lossy(),
+        );
+        let legacy = open_sqlite(&descriptor).unwrap();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations()[..52])
+            .unwrap();
+        legacy.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO model_route_decisions
+                 (id, harness, send_id, target_agent, requirements_json, selected_route_key,
+                  selected_provider_id, selected_model_id, score_json, rejected_json, anchor_version, created_at)
+                 VALUES ('legacy', 'pi', 'legacy-send', 'explore', '{}', 'provider/model',
+                         'provider', 'model', '{}', '[]', 1, 1)",
+                [],
+            )
+        }).unwrap();
+        drop(legacy);
+
+        for _ in 0..2 {
+            let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+            let row = migrated.get_decision_by_id("legacy").unwrap().unwrap();
+            assert_eq!(row.harness.as_deref(), Some("pi"));
+            assert_eq!(row.selected_harness, None);
+            assert_eq!(row.selected_workload, None);
+            assert_eq!(row.selected_route_key.as_deref(), Some("provider/model"));
+            assert_eq!(
+                migrated.get_decision_by_send_id("legacy-send").unwrap(),
+                Some(row)
+            );
+        }
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[test]

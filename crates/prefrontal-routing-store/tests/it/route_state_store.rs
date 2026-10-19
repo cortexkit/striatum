@@ -1072,6 +1072,34 @@ fn migration_030_preserves_real_028_era_decision_rows_without_join_identity() {
 }
 
 #[test]
+fn selected_execution_identity_round_trips_independently_of_caller_provenance() {
+    let rig = Rig::new("selected-execution-identity");
+    let store = rig.open();
+    let input = DecisionInput {
+        harness: Some("opencode".into()),
+        send_id: Some("identity-send".into()),
+        selected_route_key: Some("provider/model".into()),
+        requirements_json: "{}".into(),
+        score_json: "{}".into(),
+        rejected_json: "[]".into(),
+        ..Default::default()
+    };
+    let id = store
+        .record_decision_with_selection(&input, Some("broca"), Some("sidekick.explore"))
+        .unwrap();
+    drop(store);
+    let store = rig.open();
+    let row = store.get_decision_by_id(&id).unwrap().unwrap();
+    assert_eq!(row.harness.as_deref(), Some("opencode"));
+    assert_eq!(row.selected_harness.as_deref(), Some("broca"));
+    assert_eq!(row.selected_workload.as_deref(), Some("sidekick.explore"));
+    assert_eq!(
+        store.get_decision_by_send_id("identity-send").unwrap(),
+        Some(row)
+    );
+}
+
+#[test]
 fn decision_read_queries_render_full_explanations_and_compact_lists() {
     let rig = Rig::new("decision-read-queries");
     let store = rig.open();

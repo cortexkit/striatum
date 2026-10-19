@@ -1362,6 +1362,17 @@ impl SelectParams {
             }
         })
     }
+
+    fn executor_workload_line(&self) -> Option<String> {
+        self.executor.as_ref().map(|_| {
+            format!(
+                "workload: {}",
+                self.resolved_workload()
+                    .map(selection_harness::Workload::as_str)
+                    .unwrap_or("none")
+            )
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3283,6 +3294,11 @@ async fn handle_select_request(
             .await;
         }
     };
+    let selected_workload = params
+        .resolved_workload()
+        .filter(|_| params.executor.is_none())
+        .map(selection_harness::Workload::as_str);
+    let executor_workload = params.executor_workload_line();
     warn_ignored_caller_policy_once(
         params.routing_policy.is_some() || !params.subscription_keys.is_empty(),
     );
@@ -3635,8 +3651,11 @@ async fn handle_select_request(
         });
         timing.record_selection(selection_started.elapsed());
         match selection {
-            Ok((selected, runner, variant_choice)) => {
+            Ok((mut selected, runner, variant_choice)) => {
                 record_ladder(pin_harness);
+                if let Some(line) = &executor_workload {
+                    selected.explanation.push(line.clone());
+                }
                 let decision = decision_input_for(
                     &target_agent,
                     &requirements,
@@ -3647,7 +3666,11 @@ async fn handle_select_request(
                     Some(&policy_sources_line(&operator_policy)),
                 );
                 let decision_id = store
-                    .record_decision(&decision)
+                    .record_decision_with_selection(
+                        &decision,
+                        Some(pin_harness.as_str()),
+                        selected_workload,
+                    )
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
                 let mut result = json!({
                     "selected": selected, "decisionID": decision_id,
@@ -3832,6 +3855,9 @@ async fn handle_select_request(
                 None,
             );
             selected.explanation.push(policy_sources.clone());
+            if let Some(line) = &executor_workload {
+                selected.explanation.push(line.clone());
+            }
             if let Some(note) = &quota_note {
                 selected.explanation.push(note.clone());
             }
@@ -3854,7 +3880,11 @@ async fn handle_select_request(
                 Some(&provenance),
                 Some(&policy_sources),
             );
-            match store.record_decision(&decision) {
+            match store.record_decision_with_selection(
+                &decision,
+                Some(selected_harness.as_str()),
+                selected_workload,
+            ) {
                 Ok(decision_id) => {
                     let mut resolved_input = json!({
                         "requirements": requirements,
@@ -4457,7 +4487,7 @@ async fn handle_select_panel(
         &provenance,
         &policy_sources_line(&operator_policy),
     );
-    let decision_id = match store.record_decision(&decision) {
+    let decision_id = match store.record_decision_with_selection(&decision, Some("broca"), None) {
         Ok(id) => id,
         Err(e) => {
             return send_route_error(
@@ -4661,6 +4691,7 @@ fn panel_decision_input(
         "policy": panel.policy,
         "policySources": policy_sources,
         "availability": availability.as_str(),
+        "workload": "workload: athena",
     });
     DecisionInput {
         decision_id: None,
@@ -4775,6 +4806,7 @@ fn decision_input_for(
                         "earliestResetRoute": failure.earliest_reset_route,
                         "blockingCauses": failure.blocking_causes(),
                         "policySources": policy_sources,
+                        "workload": params.executor_workload_line(),
                     }))
                     .unwrap_or_else(|_| "{}".into()),
                 ),
@@ -5278,6 +5310,8 @@ async fn handle_route_explain(
             "providerID": decision.selected_provider_id,
             "modelID": decision.selected_model_id,
             "variant": decision.selected_variant,
+            "harness": decision.selected_harness,
+            "workload": decision.selected_workload,
         },
         "why": {
             "requirements": recorded_json(&decision.requirements_json),
