@@ -112,7 +112,7 @@ fn rejection(body: &serde_json::Value, key: &str) -> serde_json::Value {
 async fn launch_availability_is_per_mapped_harness() {
     let rig = HarnessRig::new(json!({"all": {"opencode": "opencode"}}));
     let host = rig
-        .select(json!({"harness": "opencode", "availableModels": [CHEAP]}))
+        .select(json!({"workload": "mason", "harness": "opencode", "availableModels": [CHEAP]}))
         .await;
     assert_eq!(host["result"]["selected"]["routeKey"], CHEAP, "{host}");
     assert_eq!(host["result"]["selected"]["harness"], "opencode");
@@ -121,9 +121,9 @@ async fn launch_availability_is_per_mapped_harness() {
         json!([CHEAP])
     );
     for extra in [
-        json!({}),
-        json!({"harness": "pi", "availableModels": [CHEAP]}),
-        json!({"harness": "opencode"}),
+        json!({"workload": "mason"}),
+        json!({"workload": "mason", "harness": "pi", "availableModels": [CHEAP]}),
+        json!({"workload": "mason", "harness": "opencode"}),
     ] {
         let broca = rig.select(extra).await;
         assert_eq!(broca["result"]["selected"]["routeKey"], PAID, "{broca}");
@@ -136,13 +136,13 @@ async fn launch_availability_is_per_mapped_harness() {
     }
     let unmapped = HarnessRig::new(json!({}));
     let result = unmapped
-        .select(json!({"harness": "opencode", "availableModels": [CHEAP], "substrate": "opencode"}))
+        .select(json!({"workload": "mason", "harness": "opencode", "availableModels": [CHEAP], "substrate": "opencode"}))
         .await;
     assert_eq!(result["result"]["selected"]["routeKey"], PAID, "{result}");
     let fallback = unmapped
         .call(
             ROUTE_SELECT_OP,
-            json!({"targetAgent": "mason", "requirements": {"iq": 30, "eq": 0}}),
+            json!({"targetAgent": "mason", "workload": "mason", "requirements": {"iq": 30, "eq": 0}}),
             &empty_broca_credentials(),
         )
         .await;
@@ -150,16 +150,16 @@ async fn launch_availability_is_per_mapped_harness() {
 }
 
 #[tokio::test]
-async fn workload_is_validated_and_derived_from_target_agent() {
+async fn workload_is_validated_and_resolved_from_the_named_workload() {
     let rig = HarnessRig::new(
         json!({"sidekick.librarian": {"default": "opencode"}, "sidekick": {"default": "broca"}}),
     );
-    let librarian = rig.select(json!({"consumer": "sidekick", "targetAgent": "librarian", "harness": "opencode", "availableModels": [CHEAP]})).await;
+    let librarian = rig.select(json!({"consumer": "sidekick", "targetAgent": "librarian", "workload": "sidekick.librarian", "harness": "opencode", "availableModels": [CHEAP]})).await;
     assert_eq!(
         librarian["result"]["selected"]["harness"], "opencode",
         "{librarian}"
     );
-    let explore = rig.select(json!({"consumer": "sidekick", "targetAgent": "explore", "harness": "opencode", "availableModels": [CHEAP]})).await;
+    let explore = rig.select(json!({"consumer": "sidekick", "targetAgent": "explore", "workload": "sidekick.explore", "harness": "opencode", "availableModels": [CHEAP]})).await;
     assert_eq!(
         explore["result"]["selected"]["harness"], "broca",
         "{explore}"
@@ -276,10 +276,10 @@ async fn panel_seats_resolve_under_athena_and_only_use_broca() {
 async fn pins_use_the_mapped_harness_and_executor_pins_reject_off_broca() {
     let rig = HarnessRig::new(json!({"all": {"opencode": "opencode"}}));
     let pin = rig
-        .select(json!({"modelPin": CHEAP, "harness": "opencode", "availableModels": [CHEAP]}))
+        .select(json!({"workload": "mason", "modelPin": CHEAP, "harness": "opencode", "availableModels": [CHEAP]}))
         .await;
     assert_eq!(pin["result"]["selected"]["harness"], "opencode", "{pin}");
-    let absent = rig.select(json!({"modelPin": CHEAP})).await;
+    let absent = rig.select(json!({"workload": "mason", "modelPin": CHEAP})).await;
     assert_eq!(absent["code"], "pinned_route_refused", "{absent}");
     assert!(absent["message"]
         .as_str()
@@ -318,7 +318,7 @@ async fn runner_auth_pin_mapped_off_broca_refuses_even_with_broca_substrate() {
     config["model_routing"]["score_alias"] = json!({"anthropic-platform": "anthropic"});
     std::fs::write(&rig.config, config.to_string()).unwrap();
     let body = rig.call(ROUTE_SELECT_OP, json!({
-        "consumer": "mason", "targetAgent": "mason", "requirements": {"iq": 30, "eq": 0},
+        "consumer": "mason", "targetAgent": "mason", "workload": "mason", "requirements": {"iq": 30, "eq": 0},
         "modelPin": "anthropic-platform/claude-opus-5-5", "substrate": "broca", "harness": "opencode",
         "availableModels": ["anthropic-platform/claude-opus-5-5"]
     }), &platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])])).await;
@@ -366,13 +366,13 @@ impl HarnessRig {
 async fn route_explain_reads_selected_execution_identity_for_fresh_and_pinned_launches() {
     let rig = HarnessRig::new(json!({"all": {"opencode": "opencode"}}));
     for (index, extra, harness, workload) in [
-        (0, json!({"harness": "opencode"}), "broca", Some("mason")),
-        (1, json!({"harness": "opencode", "availableModels": [CHEAP]}), "opencode", Some("mason")),
-        (2, json!({"harness": "opencode", "availableModels": [CHEAP], "modelPin": CHEAP}), "opencode", Some("mason")),
-        (3, json!({"harness": "opencode", "pin": {"model": PAID}}), "broca", Some("mason")),
-        (4, json!({"harness": "opencode", "targetAgent": "explore", "consumer": "sidekick"}), "broca", Some("sidekick.explore")),
+        (0, json!({"harness": "opencode", "workload": "mason"}), "broca", Some("mason")),
+        (1, json!({"harness": "opencode", "workload": "mason", "availableModels": [CHEAP]}), "opencode", Some("mason")),
+        (2, json!({"harness": "opencode", "workload": "mason", "availableModels": [CHEAP], "modelPin": CHEAP}), "opencode", Some("mason")),
+        (3, json!({"harness": "opencode", "workload": "mason", "pin": {"model": PAID}}), "broca", Some("mason")),
+        (4, json!({"harness": "opencode", "targetAgent": "explore", "consumer": "sidekick", "workload": "sidekick.explore"}), "broca", Some("sidekick.explore")),
         (5, json!({"harness": "opencode", "targetAgent": "librarian", "consumer": "sidekick", "workload": "sidekick.comments"}), "broca", Some("sidekick.comments")),
-        (6, json!({"harness": "opencode", "targetAgent": "oracle"}), "broca", None),
+        (6, json!({"harness": "opencode", "targetAgent": "oracle", "requiredHarness": "broca"}), "broca", None),
     ] {
         let send_id = format!("readback-{index}");
         let mut params = extra;
@@ -425,4 +425,47 @@ async fn route_explain_legacy_row_does_not_infer_execution_identity_from_caller(
         assert!(explained["selectedRoute"].get(field).unwrap().is_null(), "{explained}");
     }
     assert_eq!(explained["provenance"]["harness"], "pi");
+}
+
+/// A selection that names no executor, workload or required harness comes from
+/// a host's own route resolver (an OpenCode or Pi head picking the model for a
+/// mason or explore subagent) or from core repeating such a selection. Core
+/// still decides where that worker runs, so routing judges the routes against
+/// the caller's own model list, or Broca's when the caller names substrate
+/// broca, and leaves the harness unrecorded. The route-to-harness mapping
+/// applies only once a caller names its workload.
+#[tokio::test]
+async fn host_run_selection_is_judged_on_the_callers_list_not_the_mapping() {
+    let rig = HarnessRig::new(json!({}));
+    for extra in [
+        json!({"consumer": "sidekick", "targetAgent": "explore", "harness": "opencode", "availableModels": [CHEAP]}),
+        json!({"harness": "pi", "availableModels": [CHEAP]}),
+        json!({"availableModels": [CHEAP]}),
+    ] {
+        let body = rig.select(extra.clone()).await;
+        assert_eq!(body["result"]["selected"]["routeKey"], CHEAP, "{extra}: {body}");
+        assert!(body["result"]["selected"].get("harness").is_none(), "{body}");
+        assert_eq!(rejection(&body, PAID)["reason"], "not_available");
+        assert!(rejection(&body, PAID).get("detail").is_none(), "{body}");
+        let explained = rig
+            .explain(json!({"decisionID": body["result"]["decisionID"]}))
+            .await;
+        assert!(explained["selectedRoute"]["harness"].is_null(), "{explained}");
+        assert!(explained["selectedRoute"]["workload"].is_null(), "{explained}");
+    }
+
+    let broca = rig
+        .select(json!({"substrate": "broca", "harness": "opencode", "availableModels": [CHEAP]}))
+        .await;
+    assert_eq!(broca["result"]["selected"]["routeKey"], PAID, "{broca}");
+    assert_eq!(broca["result"]["selected"]["harness"], "broca");
+
+    let empty = rig.select(json!({"harness": "opencode", "availableModels": []})).await;
+    assert_eq!(empty["code"], "no_available_model", "{empty}");
+
+    let named = rig
+        .select(json!({"consumer": "sidekick", "targetAgent": "explore", "workload": "sidekick.explore", "harness": "opencode", "availableModels": [CHEAP]}))
+        .await;
+    assert_eq!(named["result"]["selected"]["routeKey"], PAID, "{named}");
+    assert_eq!(named["result"]["selected"]["harness"], "broca");
 }
