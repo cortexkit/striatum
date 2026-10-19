@@ -184,6 +184,7 @@ const MIGRATION_051: &str = include_str!("../migrations/051_model_identity_and_s
 /// account-selection history retention walks.
 const MIGRATION_052: &str = include_str!("../migrations/052_retire_account_shadow.sql");
 const MIGRATION_053: &str = include_str!("../migrations/053_selected_harness_workload.sql");
+const MIGRATION_054: &str = include_str!("../migrations/054_parent_failure_index.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -214,7 +215,17 @@ pub const WORKLOAD_CLASS_USAGE_SAMPLES_SQL: &str = "SELECT input_tokens, output_
        AND output_tokens IS NOT NULL
        AND reasoning_tokens IS NOT NULL
        AND cached_read_tokens IS NOT NULL
-       AND cache_write_tokens IS NOT NULL";
+        AND cache_write_tokens IS NOT NULL";
+
+/// One head's failed decisions since a time, newest first, read from the
+/// narrow per-head copy through its (parent, outcome time) index. Every row in
+/// that table has an error, so it needs no `outcome_error IS NOT NULL` filter.
+pub const RECENT_PARENT_FAILURES_SQL: &str =
+    "SELECT selected_route_key, selected_provider_id, outcome_error, outcome_at
+     FROM model_route_parent_failures INDEXED BY model_route_parent_failures_by_parent
+     WHERE parent_session_id = ?1
+       AND outcome_at >= ?2
+     ORDER BY outcome_at DESC, decision_id DESC";
 
 #[derive(Debug, Clone, PartialEq)]
 struct ObservedSpeedAggregate {
@@ -227,7 +238,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 53] {
+fn route_state_migrations() -> [Migration; 54] {
     [
         Migration {
             version: 1,
@@ -440,6 +451,10 @@ fn route_state_migrations() -> [Migration; 53] {
         Migration {
             version: 53,
             statements: MIGRATION_053,
+        },
+        Migration {
+            version: 54,
+            statements: MIGRATION_054,
         },
     ]
 }
@@ -1699,6 +1714,11 @@ impl SqliteRouteStateStore {
     /// (2026-09-20). The refusal text is the classifier's own, matched by the
     /// caller against `classify_failure_attribution`; this read only narrows the
     /// rows to one head's recent failures.
+    ///
+    /// Every route.select that names a parent session runs this while holding
+    /// the store's single connection, so it reads the narrow, indexed
+    /// `model_route_parent_failures` copy (migration 054) rather than the
+    /// decision ledger, which has no index for it and cost a whole-ledger scan.
     pub fn recent_failed_decisions_for_parent(
         &self,
         parent_session_id: &str,
@@ -1706,14 +1726,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<Vec<ParentFailedDecision>> {
         self.store
             .with_conn(|connection: &Connection| {
-                let mut statement = connection.prepare(
-                    "SELECT selected_route_key, selected_provider_id, outcome_error, outcome_at
-                     FROM model_route_decisions
-                     WHERE parent_session_id = ?1
-                       AND outcome_at >= ?2
-                       AND outcome_error IS NOT NULL
-                     ORDER BY outcome_at DESC, id DESC",
-                )?;
+                let mut statement = connection.prepare(RECENT_PARENT_FAILURES_SQL)?;
                 let rows = statement.query_map(params![parent_session_id, since_ms], |row| {
                     Ok(ParentFailedDecision {
                         route_key: row.get(0)?,
@@ -4992,6 +5005,397 @@ mod tests {
             shipped_elapsed.as_secs_f64() * 1_000.0,
             bounded_elapsed.as_secs_f64() * 1_000.0,
         );
+
+        drop(store);
+        remove_observed_speed_test_store(&path);
+    }
+
+    /// The head-history query as it read the decision ledger before migration
+    /// 054: no index covers it, so it visits every ledger row. Kept here as the
+    /// oracle the narrow copy must agree with, and as the slow shape the
+    /// benchmark measures.
+    const LEDGER_PARENT_FAILURES_SQL: &str =
+        "SELECT selected_route_key, selected_provider_id, outcome_error, outcome_at
+         FROM model_route_decisions
+         WHERE parent_session_id = ?1
+           AND outcome_at >= ?2
+           AND outcome_error IS NOT NULL
+         ORDER BY outcome_at DESC, id DESC";
+
+    /// The test clock, 2026-10-19T00:00:00Z.
+    const HEAD_NOW: i64 = 1_792_368_000_000;
+
+    fn ledger_parent_failures(
+        connection: &Connection,
+        parent_session_id: &str,
+        since_ms: i64,
+    ) -> rusqlite::Result<Vec<ParentFailedDecision>> {
+        let mut statement = connection.prepare(LEDGER_PARENT_FAILURES_SQL)?;
+        let rows = statement.query_map(params![parent_session_id, since_ms], |row| {
+            Ok(ParentFailedDecision {
+                route_key: row.get(0)?,
+                provider_id: row.get(1)?,
+                outcome_error: row.get(2)?,
+                outcome_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Insert one ledger row the way an older routing build left it: a
+    /// `payload_bytes`-long score payload sits before the outcome columns, as
+    /// real score JSON does.
+    fn insert_ledger_row(
+        connection: &Connection,
+        id: &str,
+        parent_session_id: Option<&str>,
+        created_at: i64,
+        payload_bytes: i64,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "INSERT INTO model_route_decisions
+               (id, parent_session_id, target_agent, requirements_json, selected_route_key,
+                selected_provider_id, selected_model_id, score_json, rejected_json,
+                anchor_version, created_at)
+             VALUES (?1, ?2, 'mason', '{}', 'p/' || ?1, 'p', ?1,
+                     printf('%.*c', ?4, 'x'), '[]', 1, ?3)",
+            params![id, parent_session_id, created_at, payload_bytes],
+        )
+    }
+
+    fn fail_ledger_row(
+        connection: &Connection,
+        id: &str,
+        outcome_at: i64,
+        error: Option<&str>,
+    ) -> rusqlite::Result<usize> {
+        connection.execute(
+            "UPDATE model_route_decisions
+             SET outcome = 'session_error', outcome_at = ?2, outcome_error = ?3
+             WHERE id = ?1",
+            params![id, outcome_at, error],
+        )
+    }
+
+    /// Count SQLite virtual-machine steps on the store's connection while `f`
+    /// runs: a machine-independent measure of how many rows a read visited.
+    fn vm_steps_during<T>(store: &SqliteRouteStateStore, f: impl FnOnce() -> T) -> (T, u64) {
+        unsafe extern "C" fn count_step(counter: *mut std::ffi::c_void) -> std::ffi::c_int {
+            // SAFETY: `counter` is the AtomicU64 below, which outlives the
+            // handler because the handler is removed before it is dropped.
+            unsafe { &*(counter as *const AtomicU64) }.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        let counter = AtomicU64::new(0);
+        let counter_ptr = &counter as *const AtomicU64 as *mut std::ffi::c_void;
+        store
+            .store
+            .with_conn(|connection| {
+                // SAFETY: the handle belongs to the live connection guarded by
+                // the store mutex; the callback only touches `counter`.
+                unsafe {
+                    rusqlite::ffi::sqlite3_progress_handler(
+                        connection.handle(),
+                        1,
+                        Some(count_step),
+                        counter_ptr,
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        let out = f();
+        store
+            .store
+            .with_conn(|connection| {
+                // SAFETY: as above; passing no callback removes the handler.
+                unsafe {
+                    rusqlite::ffi::sqlite3_progress_handler(
+                        connection.handle(),
+                        0,
+                        None,
+                        std::ptr::null_mut(),
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        (out, counter.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn head_failure_history_answers_like_the_ledger_without_scanning_it() {
+        let (path, store) = observed_speed_test_store("head-failures");
+        let recent = HEAD_NOW - 10 * 60_000;
+        let created = HEAD_NOW - 60 * 60_000;
+        store
+            .store
+            .with_conn(|c| {
+                for (id, parent) in [
+                    ("a-recent", Some("head-a")),
+                    ("a-tie-1", Some("head-a")),
+                    ("a-tie-2", Some("head-a")),
+                    ("a-old", Some("head-a")),
+                    ("a-ok", Some("head-a")),
+                    ("a-pending", Some("head-a")),
+                    ("a-retracted", Some("head-a")),
+                    ("a-real", Some("head-a")),
+                    ("b-recent", Some("head-b")),
+                    ("n-recent", None),
+                ] {
+                    insert_ledger_row(c, id, parent, created, 64)?;
+                }
+                // Ancient, so the retention delete below removes it.
+                insert_ledger_row(c, "a-expired", Some("head-a"), 1, 64)?;
+                fail_ledger_row(c, "a-recent", recent, Some("content policy"))?;
+                fail_ledger_row(c, "a-tie-1", recent - 1, Some("refused"))?;
+                fail_ledger_row(c, "a-tie-2", recent - 1, Some("refused"))?;
+                fail_ledger_row(c, "a-old", HEAD_NOW - 2 * 60 * 60_000, Some("old"))?;
+                fail_ledger_row(c, "a-ok", recent, None)?;
+                fail_ledger_row(c, "a-retracted", recent, Some("refused"))?;
+                fail_ledger_row(c, "b-recent", recent, Some("refused"))?;
+                fail_ledger_row(c, "n-recent", recent, Some("refused"))?;
+                fail_ledger_row(c, "a-expired", recent, Some("refused"))?;
+                // A later change to the copied columns must reach the copy.
+                c.execute(
+                    "UPDATE model_route_decisions SET outcome_error = NULL WHERE id = 'a-retracted'",
+                    [],
+                )
+            })
+            .unwrap();
+        // The routing module's own outcome writer.
+        store
+            .set_decision_outcome(
+                "a-real",
+                &DecisionOutcomeUpdate {
+                    outcome: prefrontal_routing_core::RouteOutcome::SessionError,
+                    last_error: Some("blocked by the content policy".into()),
+                    observed_at_ms: recent + 1,
+                    failure_backoff: Default::default(),
+                },
+            )
+            .unwrap();
+        // The retention pass's delete.
+        assert_eq!(store.delete_decisions_older_than(1_000, 10).unwrap(), 1);
+
+        let since = HEAD_NOW - 60 * 60_000;
+        for (parent, since_ms) in [
+            ("head-a", since),
+            ("head-a", 0),
+            ("head-b", since),
+            ("head-c", 0),
+        ] {
+            let expected = store
+                .store
+                .with_conn(|c| ledger_parent_failures(c, parent, since_ms))
+                .unwrap();
+            let actual = store
+                .recent_failed_decisions_for_parent(parent, since_ms)
+                .unwrap();
+            assert_eq!(actual, expected, "{parent} since {since_ms}");
+        }
+        let head_a: Vec<String> = store
+            .recent_failed_decisions_for_parent("head-a", since)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.route_key)
+            .collect();
+        assert_eq!(head_a, ["p/a-real", "p/a-recent", "p/a-tie-2", "p/a-tie-1"]);
+
+        // Fill the ledger with other heads' decisions, a third of them failed.
+        // The ledger query visits all of them; the copy visits head-a's rows.
+        store
+            .store
+            .with_conn(|c| {
+                let tx = c.unchecked_transaction()?;
+                for index in 0..3_000 {
+                    let id = format!("filler-{index}");
+                    insert_ledger_row(
+                        &tx,
+                        &id,
+                        Some(&format!("head-{}", index % 50)),
+                        created,
+                        2_000,
+                    )?;
+                    if index % 3 == 0 {
+                        fail_ledger_row(&tx, &id, recent, Some("refused"))?;
+                    }
+                }
+                tx.commit()
+            })
+            .unwrap();
+        let (copy_rows, copy_steps) = vm_steps_during(&store, || {
+            store
+                .recent_failed_decisions_for_parent("head-a", since)
+                .unwrap()
+        });
+        let (ledger_rows, ledger_steps) = vm_steps_during(&store, || {
+            store
+                .store
+                .with_conn(|c| ledger_parent_failures(c, "head-a", since))
+                .unwrap()
+        });
+        assert_eq!(copy_rows, ledger_rows);
+        println!("head_failure_vm_steps ledger_rows=3011 copy={copy_steps} ledger={ledger_steps}");
+        assert!(
+            copy_steps < 500,
+            "the head-history read must visit only that head's failures, \
+             not the decision ledger: {copy_steps} VM steps"
+        );
+        assert!(
+            ledger_steps > 20 * copy_steps,
+            "the oracle must show the scan this test guards against: \
+             ledger {ledger_steps} vs copy {copy_steps} VM steps"
+        );
+
+        drop(store);
+        remove_observed_speed_test_store(&path);
+    }
+
+    #[test]
+    fn migration_054_copies_recent_failures_found_through_the_created_at_index() {
+        let scratch = prefrontal_test_support::scratch_root().join(format!(
+            "routing-parent-failures-{}-{}",
+            std::process::id(),
+            short_id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let descriptor = dev_descriptor(
+            "routing-parent-failures",
+            scratch.join("store.db").to_string_lossy(),
+        );
+        let now = now_ms();
+        let legacy = open_sqlite(&descriptor).unwrap();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations()[..53])
+            .unwrap();
+        legacy
+            .with_conn(|c| {
+                insert_ledger_row(c, "recent", Some("head"), now - 60 * 60_000, 64)?;
+                fail_ledger_row(c, "recent", now - 30 * 60_000, Some("refused"))?;
+                // Made thirty days ago, refused just now: outside the backfill's
+                // seven-day decision window, as the migration documents.
+                insert_ledger_row(c, "long-lived", Some("head"), now - 30 * 86_400_000, 64)?;
+                fail_ledger_row(c, "long-lived", now - 60_000, Some("refused"))?;
+                insert_ledger_row(c, "no-head", None, now - 60 * 60_000, 64)?;
+                fail_ledger_row(c, "no-head", now - 30 * 60_000, Some("refused"))
+            })
+            .unwrap();
+        drop(legacy);
+
+        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let rows = migrated
+            .recent_failed_decisions_for_parent("head", now - 60 * 60_000)
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.route_key.as_str())
+                .collect::<Vec<_>>(),
+            ["p/recent"]
+        );
+        drop(migrated);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    /// Reproduces the route.select stall: a selection's head-history read runs
+    /// while another thread keeps recording decisions, both through the store's
+    /// single connection, the way concurrent route.select requests share it.
+    /// Prints the reader's latency and the writer's worst wait for the ledger
+    /// query shape (before migration 054) and for the narrow copy (after).
+    /// `PREFRONTAL_ROUTING_STALL_ROWS` sets the ledger size (default 60,000).
+    #[test]
+    #[ignore = "prints a local latency comparison of the head-history read under a concurrent writer"]
+    fn head_failure_history_under_a_concurrent_writer_benchmark() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let rows: i64 = std::env::var("PREFRONTAL_ROUTING_STALL_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60_000);
+        let (path, store) = observed_speed_test_store("head-failure-stall");
+        let store = Arc::new(store);
+        let created = HEAD_NOW - 60 * 60_000;
+        store
+            .store
+            .with_conn(|c| {
+                let tx = c.unchecked_transaction()?;
+                for index in 0..rows {
+                    let id = format!("ledger-{index}");
+                    // Score payloads of a few kilobytes, like real selections.
+                    insert_ledger_row(
+                        &tx,
+                        &id,
+                        Some(&format!("head-{}", index % 200)),
+                        created,
+                        6_000,
+                    )?;
+                    if index % 10 == 0 {
+                        fail_ledger_row(&tx, &id, HEAD_NOW - 60_000, Some("refused"))?;
+                    }
+                }
+                tx.commit()
+            })
+            .unwrap();
+
+        let measure = |label: &str, read: &dyn Fn() -> Vec<ParentFailedDecision>| {
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let store = Arc::clone(&store);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut worst = Duration::ZERO;
+                    let mut writes = 0_u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let input = DecisionInput {
+                            parent_session_id: Some("writer-head".into()),
+                            target_agent: "mason".into(),
+                            requirements_json: "{}".into(),
+                            score_json: "{}".into(),
+                            rejected_json: "[]".into(),
+                            ..DecisionInput::default()
+                        };
+                        let started = Instant::now();
+                        store
+                            .record_decision_with_selection(&input, None, None)
+                            .unwrap();
+                        worst = worst.max(started.elapsed());
+                        writes += 1;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    (worst, writes)
+                })
+            };
+            let mut reads = Vec::new();
+            for _ in 0..10 {
+                let started = Instant::now();
+                assert!(!read().is_empty());
+                reads.push(started.elapsed());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stop.store(true, Ordering::Relaxed);
+            let (writer_worst, writes) = writer.join().unwrap();
+            let total: Duration = reads.iter().sum();
+            println!(
+                "head_failure_stall rows={rows} shape={label} read_avg_ms={:.3} read_max_ms={:.3} writer_max_wait_ms={:.3} writes={writes}",
+                total.as_secs_f64() * 1_000.0 / reads.len() as f64,
+                reads.iter().max().unwrap().as_secs_f64() * 1_000.0,
+                writer_worst.as_secs_f64() * 1_000.0,
+            );
+        };
+        let since = HEAD_NOW - 60 * 60_000;
+        measure("ledger", &|| {
+            store
+                .store
+                .with_conn(|c| ledger_parent_failures(c, "head-10", since))
+                .unwrap()
+        });
+        measure("copy", &|| {
+            store
+                .recent_failed_decisions_for_parent("head-10", since)
+                .unwrap()
+        });
 
         drop(store);
         remove_observed_speed_test_store(&path);
