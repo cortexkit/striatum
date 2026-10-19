@@ -342,7 +342,7 @@ async fn gap_and_opaque_epoch_change_recover_without_rolling_back_snapshot() {
 }
 
 #[tokio::test]
-async fn missing_body_takes_snapshot_but_does_not_ack_the_missing_event() {
+async fn missing_body_is_acknowledged_and_replaced_by_one_snapshot() {
     let (_scratch, live) = fixture();
     let bus = bus();
     let sample = body("epoch-z", 1, 10);
@@ -351,23 +351,52 @@ async fn missing_body_takes_snapshot_but_does_not_ack_the_missing_event() {
         ..Default::default()
     };
     let key = publish(&bus, &mut source, &sample).await;
-    source.replies.remove(&key);
+    // Insula's exact not-found reply: a normal response body, not an error frame.
+    source.replies.insert(
+        key.clone(),
+        br#"{"error":{"code":"event_not_found","message":"event expired or unknown; read usage.get"}}"#
+            .to_vec(),
+    );
     let mut cursor = Cursor::new(&bus, &live).await;
-    assert!(matches!(
-        consume_one(
-            &mut cursor,
-            &mut source,
-            &live,
-            &mut SequenceState::default(),
-            SUBJECT
-        )
-        .await,
-        Err(ConsumeError::Rejected(_))
-    ));
-    assert_eq!(cursor.acks, 0);
+    consume_one(
+        &mut cursor,
+        &mut source,
+        &live,
+        &mut SequenceState::default(),
+        SUBJECT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cursor.acks, 1, "an expired body never comes back, so retrying is a loop");
     assert_eq!(source.snapshots, 1);
     assert_eq!(used(&live), 80.0);
-    assert_eq!(cursor.inner.next().await.unwrap().unwrap().message.id, key);
+    assert!(cursor.inner.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn deep_backlog_is_acknowledged_unread_with_one_snapshot() {
+    let (_scratch, live) = fixture();
+    let bus = bus();
+    let mut source = Source {
+        snapshot: snapshot_body(&body("epoch-z", 50, 70)),
+        ..Default::default()
+    };
+    for seq in 1..=5 {
+        publish(&bus, &mut source, &body("epoch-z", seq, 10)).await;
+    }
+    live.cache.lock().unwrap().consumer.lag = Some(CATCH_UP_LAG + 1);
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let mut state = SequenceState::default();
+    // No body is fetched while far behind: a fetch error would surface here.
+    source.fetch_error = Some("fetched while catching up".into());
+    for _ in 0..5 {
+        consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT)
+            .await
+            .unwrap();
+    }
+    assert_eq!(cursor.acks, 5);
+    assert_eq!(source.snapshots, 1, "one snapshot stands in for the whole backlog");
+    assert_eq!(used(&live), 70.0);
 }
 
 #[tokio::test]
