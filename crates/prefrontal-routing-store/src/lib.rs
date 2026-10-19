@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 mod account_selection;
+pub mod backup;
 mod key_pool;
 mod reasoning_catalog;
 mod retention;
@@ -185,6 +186,81 @@ const MIGRATION_051: &str = include_str!("../migrations/051_model_identity_and_s
 const MIGRATION_052: &str = include_str!("../migrations/052_retire_account_shadow.sql");
 const MIGRATION_053: &str = include_str!("../migrations/053_selected_harness_workload.sql");
 const MIGRATION_054: &str = include_str!("../migrations/054_parent_failure_index.sql");
+/// Migration 55: the runner-event dedupe table that lets a backup restore the
+/// observation log empty. The foreign keys into the history logs are dropped
+/// by `drop_history_foreign_keys`, outside the migration chain.
+const MIGRATION_055: &str = include_str!("../migrations/055_restorable_history.sql");
+
+/// The foreign-key clauses, verbatim as migration 44 wrote them, that tie
+/// backed-up account tables to the two account-selection history logs.
+const HISTORY_FOREIGN_KEY_CLAUSES: [&str; 2] = [
+    " REFERENCES account_decision (decision_id)",
+    " REFERENCES account_observation (observation_id)",
+];
+
+/// The history logs no other table may reference by foreign key.
+const HISTORY_LOG_TABLES: [&str; 2] = ["account_decision", "account_observation"];
+
+/// Drop the foreign keys `account_pin`, `account_admission` and `account_hold`
+/// hold into `account_decision`, and those `account_fence` and
+/// `account_principal_exclusion` hold into `account_observation`.
+///
+/// A backup may restore those two logs empty while it keeps the referencing
+/// tables, which would leave every reference dangling; a backup tool also
+/// refuses to skip a table a kept table references. Nothing reads through
+/// these references, so the ids stay as plain columns naming a history row
+/// that may be gone.
+///
+/// SQLite cannot drop a constraint with ALTER TABLE, and rebuilding the five
+/// tables copied about 230 MB and took about 15 seconds on a copy of a live
+/// store. Removing a FOREIGN KEY clause changes nothing stored in the table,
+/// so this uses the procedure SQLite documents for exactly that change
+/// ("Making Other Kinds Of Table Schema Changes" in its ALTER TABLE page):
+/// in one transaction, edit the table's `CREATE TABLE` text in
+/// `sqlite_schema`, then set the schema version one higher so every
+/// connection, this one included, re-reads the schema. It runs on every open
+/// and changes nothing once no clause is left, and it fails the open if any
+/// foreign key into the logs remains afterwards.
+fn drop_history_foreign_keys(connection: &Connection) -> rusqlite::Result<()> {
+    let pending: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND (instr(sql, ?1) > 0 OR instr(sql, ?2) > 0)",
+        params![HISTORY_FOREIGN_KEY_CLAUSES[0], HISTORY_FOREIGN_KEY_CLAUSES[1]],
+        |row| row.get(0),
+    )?;
+    if pending > 0 {
+        let tx = connection.unchecked_transaction()?;
+        let version: i64 = tx.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        tx.pragma_update(None, "writable_schema", true)?;
+        let edited = tx.execute(
+            "UPDATE sqlite_schema SET sql = replace(replace(sql, ?1, ''), ?2, '') \
+             WHERE type = 'table' AND (instr(sql, ?1) > 0 OR instr(sql, ?2) > 0)",
+            params![HISTORY_FOREIGN_KEY_CLAUSES[0], HISTORY_FOREIGN_KEY_CLAUSES[1]],
+        );
+        // Switch schema editing off before anything else can fail, so an
+        // error never leaves this connection able to write sqlite_schema.
+        let disabled = tx.pragma_update(None, "writable_schema", false);
+        edited?;
+        disabled?;
+        tx.pragma_update(None, "schema_version", version + 1)?;
+        tx.commit()?;
+    }
+    let remaining: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema AS s, pragma_foreign_key_list(s.name) AS f \
+         WHERE s.type = 'table' AND f.\"table\" IN (?1, ?2)",
+        params![HISTORY_LOG_TABLES[0], HISTORY_LOG_TABLES[1]],
+        |row| row.get(0),
+    )?;
+    if remaining == 0 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+            Some(format!(
+                "{remaining} foreign key(s) into account_decision or account_observation remain"
+            )),
+        ))
+    }
+}
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -238,7 +314,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 54] {
+fn route_state_migrations() -> [Migration; 55] {
     [
         Migration {
             version: 1,
@@ -455,6 +531,10 @@ fn route_state_migrations() -> [Migration; 54] {
         Migration {
             version: 54,
             statements: MIGRATION_054,
+        },
+        Migration {
+            version: 55,
+            statements: MIGRATION_055,
         },
     ]
 }
@@ -928,6 +1008,9 @@ impl SqliteRouteStateStore {
             )));
         }
         validate_family_spellings(&store)?;
+        store
+            .with_conn(drop_history_foreign_keys)
+            .map_err(|error| err(format!("dropping history foreign keys: {error}")))?;
         Ok(Self {
             store,
             class_vectors: Mutex::new(HashMap::new()),
@@ -3005,17 +3088,36 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let tx = c.unchecked_transaction()?;
-                let (route_key, selected_provider_id, selected_model_id, prior_outcome): (
+                type DecisionRoute = (
                     Option<String>,
                     Option<String>,
                     Option<String>,
                     Option<String>,
-                ) = tx.query_row(
-                    "SELECT selected_route_key, selected_provider_id, selected_model_id, outcome
-                     FROM model_route_decisions WHERE id=?1",
-                    [decision_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )?;
+                );
+                let decision: Option<DecisionRoute> = tx
+                    .query_row(
+                        "SELECT selected_route_key, selected_provider_id, selected_model_id, outcome
+                         FROM model_route_decisions WHERE id=?1",
+                        [decision_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?;
+                // The decision ledger is history a backup may restore empty, and
+                // retention deletes its old rows. An outcome for a decision the
+                // ledger no longer holds cannot name its route, so it changes
+                // nothing; answering an error instead would only make the caller
+                // retry an outcome that can never land.
+                let Some((route_key, selected_provider_id, selected_model_id, prior_outcome)) =
+                    decision
+                else {
+                    tracing::warn!(
+                        decision_id,
+                        outcome = update.outcome.as_str(),
+                        "route outcome names a decision the ledger does not hold; \
+                         route health is left unchanged"
+                    );
+                    return Ok(());
+                };
 
                 // Outcome delivery is soft and may be retried after a lost ack. The first
                 // terminal write owns the counter transition; a replay must not count twice.
@@ -5294,6 +5396,168 @@ mod tests {
             ["p/recent"]
         );
         drop(migrated);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    fn history_foreign_keys(connection: &Connection) -> Vec<String> {
+        let mut statement = connection
+            .prepare(
+                "SELECT s.name || ' -> ' || f.\"table\" \
+                 FROM sqlite_schema AS s, pragma_foreign_key_list(s.name) AS f \
+                 WHERE s.type = 'table' ORDER BY 1",
+            )
+            .unwrap();
+        let rows = statement.query_map([], |row| row.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// A store at migration 54, with every account table populated while
+    /// foreign keys are enforced, opens with the foreign keys into the two
+    /// history logs gone: rows and the admission-to-pin key are untouched,
+    /// the database passes the integrity check, a second open changes
+    /// nothing, and migration 55 copied only the recent runner event's key.
+    #[test]
+    fn opening_drops_the_history_foreign_keys_in_place_and_keeps_every_row() {
+        let scratch = prefrontal_test_support::scratch_root().join(format!(
+            "routing-history-foreign-keys-{}-{}",
+            std::process::id(),
+            short_id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let descriptor = dev_descriptor(
+            "routing-history-foreign-keys",
+            scratch.join("store.db").to_string_lossy(),
+        );
+        let now = now_ms();
+        let legacy = open_sqlite(&descriptor).unwrap();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations()[..54])
+            .unwrap();
+        let (legacy_keys, legacy_version) = legacy
+            .with_conn(|c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO account_decision (decision_id, mode, trigger, principal, provider,
+                       model, family, outcome, code, policy_version, decision_json, created_at)
+                     VALUES ('dec-1', 'serve', 'request', 'p', 'anthropic', 'm', 'opus', 'admit',
+                       'cold_scored', 2, '{{}}', {now});
+                     INSERT INTO account_pin (pin_id, principal, conversation_hash, provider,
+                       pin_generation, affinity_model, account_id, credential_id, pin_mode,
+                       decision_id, created_at)
+                     VALUES ('pin-1', 'p', 'c', 'anthropic', 1, 'm', 'a', 'cred', 'run_frozen',
+                       'dec-1', {now});
+                     INSERT INTO account_admission (principal, admission_id, request_fingerprint,
+                       request_mode, decision_id, conversation_hash, provider, model, account_id,
+                       credential_id, pin_id, pin_generation, state, charged, request_bytes,
+                       request_bytes_estimated, committed_at, admission_valid_until,
+                       lease_valid_until, reply_json)
+                     VALUES ('p', 'adm-1', 'fp', 'admit', 'dec-1', 'c', 'anthropic', 'm', 'a',
+                       'cred', 'pin-1', 1, 'reserved', 1, 10, 0, {now}, {now}, {now}, '{{}}');
+                     INSERT INTO account_hold (decision_id, principal, conversation_hash, provider,
+                       pin_id, pin_generation, account_id, credential_id, basis, reset_at,
+                       retry_after_s, created_at)
+                     VALUES ('dec-1', 'p', 'c', 'anthropic', 'pin-1', 1, 'a', 'cred', 'five_hour',
+                       {now}, 60, {now});
+                     INSERT INTO account_observation (observation_id, principal, runner, event_id,
+                       kind, bound, observation_json, effects_json, received_at)
+                     VALUES ('aco-recent', 'p', 'broca', 'recent', 'attempt', 1, '{{}}',
+                       '[\"fence\"]', {recent}),
+                       ('aco-old', 'p', 'broca', 'old', 'attempt', 0, '{{}}', '[]', {old});
+                     INSERT INTO account_fence (fence_id, provider, account_id, scope_json,
+                       fence_json, source, observed_at, principal, observation_id, created_at)
+                     VALUES ('fence-1', 'anthropic', 'a', '{{}}', '{{}}', 'observation', {now},
+                       'p', 'aco-recent', {now});
+                     INSERT INTO account_principal_exclusion (principal, admission_id,
+                       credential_id, runner_view_digest, roster_view_digest, observation_id,
+                       recorded_at)
+                     VALUES ('p', 'adm-1', 'cred', 'r', 'v', 'aco-recent', {now});",
+                    recent = now - 60_000,
+                    old = now - 7 * 3_600_000,
+                ))?;
+                let version: i64 = c.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+                Ok((history_foreign_keys(c), version))
+            })
+            .unwrap();
+        drop(legacy);
+        assert_eq!(
+            legacy_keys,
+            [
+                "account_admission -> account_decision",
+                "account_admission -> account_pin",
+                "account_fence -> account_observation",
+                "account_hold -> account_decision",
+                "account_pin -> account_decision",
+                "account_principal_exclusion -> account_observation",
+            ]
+        );
+
+        let admission = |id: &str, decision: &str, pin: &str| {
+            format!(
+                "INSERT INTO account_admission (principal, admission_id, request_fingerprint,
+                   request_mode, decision_id, conversation_hash, provider, model, account_id,
+                   credential_id, pin_id, pin_generation, state, charged, request_bytes,
+                   request_bytes_estimated, committed_at, admission_valid_until,
+                   lease_valid_until, reply_json)
+                 VALUES ('p', '{id}', 'fp', 'admit', '{decision}', 'c', 'anthropic', 'm', 'a',
+                   'cred', '{pin}', 1, 'reserved', 1, 10, 0, 1, 1, 1, '{{}}')"
+            )
+        };
+        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let opened_version = migrated
+            .store
+            .with_conn(|c| {
+                assert_eq!(
+                    history_foreign_keys(c),
+                    ["account_admission -> account_pin"]
+                );
+                let integrity: String =
+                    c.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+                assert_eq!(integrity, "ok");
+                for (table, rows) in [
+                    ("account_decision", 1),
+                    ("account_pin", 1),
+                    ("account_admission", 1),
+                    ("account_hold", 1),
+                    ("account_observation", 2),
+                    ("account_fence", 1),
+                    ("account_principal_exclusion", 1),
+                ] {
+                    let count: i64 = c.query_row(
+                        &format!("SELECT COUNT(*) FROM {table}"),
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(count, rows, "{table}");
+                }
+                let keys: String = c.query_row(
+                    "SELECT group_concat(event_id || '=' || observation_id || ':' || bound
+                       || effects_json)
+                     FROM account_observation_event",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(keys, "recent=aco-recent:1[\"fence\"]");
+                // Enforcement is on, on this connection, and now ignores the
+                // history logs: an admission naming a decision that was never
+                // recorded is accepted; one naming an unknown pin is refused.
+                c.execute_batch(&admission("adm-2", "dec-gone", "pin-1"))?;
+                assert!(
+                    c.execute_batch(&admission("adm-3", "dec-1", "pin-missing"))
+                        .is_err(),
+                    "the pin foreign key must still hold"
+                );
+                c.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+            })
+            .unwrap();
+        assert!(opened_version > legacy_version);
+        drop(migrated);
+
+        let reopened = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let reopened_version = reopened
+            .store
+            .with_conn(|c| c.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0)))
+            .unwrap();
+        assert_eq!(reopened_version, opened_version, "a second open edits nothing");
+        drop(reopened);
         std::fs::remove_dir_all(scratch).unwrap();
     }
 

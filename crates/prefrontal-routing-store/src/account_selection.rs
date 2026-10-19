@@ -868,13 +868,22 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// The first report of a runner event, if routing already applied it.
+    ///
+    /// The observation log holds the verbatim report, but a backup may restore
+    /// that log empty. `account_observation_event` is the small backed-up
+    /// record of recent event keys with the answer routing gave (observation
+    /// id, binding and effects), so a replayed event is still recognised then.
+    /// A row rebuilt from it has an empty `kind` and `observation_json` and no
+    /// `admission_id`: the duplicate answer does not carry them.
     pub fn observation_by_event(
         &self,
         principal: &str,
         runner: &str,
         event_id: &str,
     ) -> RouteStateResult<Option<AccountObservationRow>> {
-        self.conn
+        let logged = self
+            .conn
             .query_row(
                 &format!(
                     "SELECT {OBSERVATION_COLUMNS} FROM account_observation \
@@ -882,6 +891,32 @@ impl AccountTx<'_> {
                 ),
                 params![principal, runner, event_id],
                 observation_from_row,
+            )
+            .optional()
+            .map_err(err)?;
+        if logged.is_some() {
+            return Ok(logged);
+        }
+        self.conn
+            .query_row(
+                "SELECT observation_id, bound, effects_json, received_at \
+                 FROM account_observation_event \
+                 WHERE principal = ?1 AND runner = ?2 AND event_id = ?3",
+                params![principal, runner, event_id],
+                |row| {
+                    Ok(AccountObservationRow {
+                        observation_id: row.get(0)?,
+                        principal: principal.to_string(),
+                        runner: runner.to_string(),
+                        event_id: event_id.to_string(),
+                        kind: String::new(),
+                        admission_id: None,
+                        bound: row.get::<_, i64>(1)? != 0,
+                        observation_json: String::new(),
+                        effects_json: row.get(2)?,
+                        received_at: row.get(3)?,
+                    })
+                },
             )
             .optional()
             .map_err(err)

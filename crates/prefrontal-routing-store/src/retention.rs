@@ -1,5 +1,6 @@
 //! Bounded retention deletes for the routing store's append-only logs:
-//! account-selection history, runner observations and per-message usage.
+//! account-selection history, runner observations and their event keys,
+//! per-message usage, and the per-head failure copy of the decision ledger.
 //! (The route-decision ledger, `model_route_decisions`, is pruned through
 //! `RouteStateStore::delete_decisions_older_than`.)
 //!
@@ -44,9 +45,10 @@ pub struct AffinityRetentionBatch {
     pub pins: usize,
 }
 
-/// A decision still referenced by a pin, admission or hold cannot be deleted
-/// while foreign keys are on; skipping it keeps one such row from failing a
-/// whole batch.
+/// A decision a pin, admission or hold still names is kept, so the history
+/// stays explainable while anything in the store points at it. (These names
+/// carry no foreign key: a backup may restore `account_decision` empty, so the
+/// referencing rows must not depend on it.)
 const DECISION_UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM account_pin p \
        WHERE p.decision_id = account_decision.decision_id) \
      AND NOT EXISTS (SELECT 1 FROM account_admission a \
@@ -218,6 +220,50 @@ impl SqliteRouteStateStore {
                            WHERE x.observation_id = account_observation.observation_id) \
                        ORDER BY received_at LIMIT ?2)",
                     params![received_before, limit_param(limit)],
+                )
+            })
+            .map_err(err)
+    }
+
+    /// Delete at most `limit` runner-event keys (`account_observation_event`)
+    /// received before `received_before` (Unix milliseconds), oldest first.
+    /// A key only has to outlive a runner's retry of the same event; it is
+    /// pruned on its own window, independently of the observation log.
+    pub fn prune_observation_events(
+        &self,
+        received_before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.execute(
+                    "DELETE FROM account_observation_event WHERE rowid IN ( \
+                       SELECT rowid FROM account_observation_event \
+                         INDEXED BY account_observation_event_by_received \
+                       WHERE received_at < ?1 ORDER BY received_at LIMIT ?2)",
+                    params![received_before, limit_param(limit)],
+                )
+            })
+            .map_err(err)
+    }
+
+    /// Delete at most `limit` rows of `model_route_parent_failures` whose
+    /// outcome is before `outcome_before` (Unix milliseconds). A trigger
+    /// removes a row together with its decision, but a decision ledger
+    /// restored empty from a backup leaves rows no ledger delete will ever
+    /// reach; this keeps the table bounded by the decision window either way.
+    pub fn prune_parent_failures(
+        &self,
+        outcome_before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.execute(
+                    "DELETE FROM model_route_parent_failures WHERE rowid IN ( \
+                       SELECT rowid FROM model_route_parent_failures \
+                       WHERE COALESCE(outcome_at, 0) < ?1 LIMIT ?2)",
+                    params![outcome_before, limit_param(limit)],
                 )
             })
             .map_err(err)

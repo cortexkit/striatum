@@ -3895,6 +3895,65 @@ mod tests {
         assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 1);
     }
 
+    /// A backup may restore the observation and decision logs empty. A runner
+    /// re-sending an event routing applied before the backup gets the first
+    /// report's answer back and the event is not applied again; a new event
+    /// is applied as usual.
+    #[test]
+    fn a_re_sent_event_is_not_applied_again_after_the_history_logs_are_restored_empty() {
+        let mut fixture = fixture("restored-observations");
+        let ctx = fixture.ctx(true, NOW);
+        result(fixture.call(
+            &ctx,
+            ACCOUNT_FOR_OP,
+            BROCA,
+            admit_params("adm-restored", "broca:restored", "broca"),
+        ));
+        let exhausted = |event: &str| {
+            json!({
+                "event_id": event,
+                "caller": { "runner": "broca" },
+                "kind": "attempt",
+                "admission_id": "adm-restored",
+                "upstream_origin": "upstream",
+                "observed_at_ms": NOW,
+                "view_digest": "credential-read-view",
+                "headers": {
+                    "anthropic-ratelimit-unified-5h-utilization": "1.0",
+                    "anthropic-ratelimit-unified-5h-reset": ((NOW + 3_600_000) / 1000).to_string()
+                }
+            })
+        };
+        let first = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, exhausted("restored:1")));
+        assert_eq!(first["observation"]["duplicate"], false);
+        assert_eq!(first["observation"]["effects"][0]["effect"], "fence");
+        assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 1);
+        drop(ctx);
+
+        fixture.store = None;
+        {
+            let connection = rusqlite::Connection::open(fixture.dir.join("store.db")).unwrap();
+            connection
+                .execute_batch("DELETE FROM account_observation; DELETE FROM account_decision;")
+                .unwrap();
+        }
+        fixture.reopen();
+        let ctx = fixture.ctx(true, NOW);
+        assert_eq!(fixture.store().account_serving_counts().unwrap().observations, 0);
+
+        let repeat = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, exhausted("restored:1")));
+        assert_eq!(repeat["observation"]["duplicate"], true);
+        assert_eq!(repeat["observation"]["id"], first["observation"]["id"]);
+        assert_eq!(repeat["observation"]["bound"], first["observation"]["bound"]);
+        assert_eq!(repeat["observation"]["effects"], first["observation"]["effects"]);
+        let counts = fixture.store().account_serving_counts().unwrap();
+        assert_eq!((counts.observations, counts.fences), (0, 1));
+
+        let next = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, exhausted("restored:2")));
+        assert_eq!(next["observation"]["duplicate"], false);
+        assert_eq!(fixture.store().account_serving_counts().unwrap().observations, 1);
+    }
+
     #[test]
     fn broca_transport_failure_without_headers_records_no_quota_evidence() {
         let fixture = fixture("no-headers");
