@@ -910,15 +910,12 @@ struct ModelRoutingSection {
     #[serde(default)]
     min_best_effort_adequacy: Option<f64>,
     /// Terminal send failures required before the route-local safety backoff starts.
-    #[serde(default, alias = "consecutiveTerminalFailureThreshold")]
+    #[serde(default)]
     #[schemars(range(min = 1))]
     consecutive_terminal_failure_threshold: Option<u32>,
     /// Providers that do not expose prompt-cache reads or writes. Gather seats
     /// avoid these providers when a cache-capable adequate route exists.
-    #[serde(
-        default = "default_providers_without_prompt_cache",
-        alias = "providersWithoutPromptCache"
-    )]
+    #[serde(default = "default_providers_without_prompt_cache")]
     providers_without_prompt_cache: Vec<String>,
     /// Provider-keyed subscription subsidy multipliers ("openai": 40). The
     /// subsidy is a property of the account serving the provider, so this is
@@ -932,27 +929,12 @@ struct ModelRoutingSection {
     keep_free_percent: HashMap<String, f64>,
 }
 
-// Schemars emits canonical names only; serde also accepts these aliases, but
-// refuses a document containing both names for the same field.
 fn routing_schema_constraints(schema: &mut schemars::Schema) {
-    let aliases = [
-        (
-            "consecutive_terminal_failure_threshold",
-            "consecutiveTerminalFailureThreshold",
-        ),
-        (
-            "providers_without_prompt_cache",
-            "providersWithoutPromptCache",
-        ),
-    ];
     let properties = schema
         .get_mut("properties")
         .unwrap()
         .as_object_mut()
         .unwrap();
-    for (canonical, alias) in aliases {
-        properties.insert(alias.into(), properties[canonical].clone());
-    }
     for field in ["elo_overrides", "subscription_multipliers"] {
         properties[field]["additionalProperties"]["exclusiveMinimum"] = serde_json::json!(0);
     }
@@ -961,14 +943,6 @@ fn routing_schema_constraints(schema: &mut schemars::Schema) {
     }
     properties["keep_free_percent"]["additionalProperties"]["minimum"] = serde_json::json!(0);
     properties["keep_free_percent"]["additionalProperties"]["maximum"] = serde_json::json!(100);
-    schema.insert(
-        "allOf".into(),
-        aliases
-            .into_iter()
-            .map(|(canonical, alias)| serde_json::json!({"not": {"required": [canonical, alias]}}))
-            .collect::<Vec<_>>()
-            .into(),
-    );
 }
 
 fn positive_number(schema: &mut schemars::Schema) {
