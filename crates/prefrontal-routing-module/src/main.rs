@@ -2870,14 +2870,45 @@ fn prepare_selection_inputs(
     })
 }
 
+/// Where one route.select spent its time, for the slow-request log line. Each
+/// stage is a separate bucket so `unclassified_ms` (total minus every bucket)
+/// stays near zero; a large remainder means a stage is missing a timer.
 struct RouteSelectTiming {
     started: Instant,
     is_select: std::cell::Cell<bool>,
     live_config_check_ms: std::cell::Cell<u64>,
+    /// Waiting for the first billing-plane load before pricing anything.
+    billing_wait_ms: std::cell::Cell<u64>,
+    /// Decoding the parameters and resolving requirements and the caller's
+    /// available models (reads the auth file).
+    resolve_ms: std::cell::Cell<u64>,
     prepare_wait_ms: std::cell::Cell<u64>,
     snapshot_closure_ms: std::cell::Cell<u64>,
+    /// Live overlays, score aliases and billing-plane pricing on the facts.
+    pricing_ms: std::cell::Cell<u64>,
+    /// Harness availability, subscription policy, exclusions and pin lookup.
+    policy_ms: std::cell::Cell<u64>,
+    /// Reading this head's recent failed launches from the route store.
+    head_history_ms: std::cell::Cell<u64>,
     selection_ms: std::cell::Cell<u64>,
+    /// Recording the selection on the winner ladder.
+    ladder_ms: std::cell::Cell<u64>,
+    /// Writing the decision row the returned decision id names.
+    decision_write_ms: std::cell::Cell<u64>,
+    /// Resolving the Broca launch target (and any key-pool lease).
+    runner_ms: std::cell::Cell<u64>,
+    /// Variant policy, explanation notes and building the response body.
+    finish_ms: std::cell::Cell<u64>,
     reply_ms: std::cell::Cell<u64>,
+}
+
+/// Add `elapsed` to one stage bucket of a [`RouteSelectTiming`].
+fn add_stage_ms(bucket: &std::cell::Cell<u64>, elapsed: Duration) {
+    bucket.set(
+        bucket
+            .get()
+            .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
+    );
 }
 
 impl RouteSelectTiming {
@@ -2886,9 +2917,18 @@ impl RouteSelectTiming {
             started: Instant::now(),
             is_select: std::cell::Cell::new(false),
             live_config_check_ms: std::cell::Cell::new(0),
+            billing_wait_ms: std::cell::Cell::new(0),
+            resolve_ms: std::cell::Cell::new(0),
             prepare_wait_ms: std::cell::Cell::new(0),
             snapshot_closure_ms: std::cell::Cell::new(0),
+            pricing_ms: std::cell::Cell::new(0),
+            policy_ms: std::cell::Cell::new(0),
+            head_history_ms: std::cell::Cell::new(0),
             selection_ms: std::cell::Cell::new(0),
+            ladder_ms: std::cell::Cell::new(0),
+            decision_write_ms: std::cell::Cell::new(0),
+            runner_ms: std::cell::Cell::new(0),
+            finish_ms: std::cell::Cell::new(0),
             reply_ms: std::cell::Cell::new(0),
         }
     }
@@ -2916,8 +2956,9 @@ impl RouteSelectTiming {
     }
 
     fn record_selection(&self, elapsed: Duration) {
-        self.selection_ms
-            .set(elapsed.as_millis().min(u64::MAX as u128) as u64);
+        // Adds rather than sets: a rejected pin with a fallback runs a second
+        // selection, and both count.
+        add_stage_ms(&self.selection_ms, elapsed);
     }
 
     fn record_reply(&self, elapsed: Duration) {
@@ -2934,19 +2975,40 @@ impl RouteSelectTiming {
             return None;
         }
         let live_config_check_ms = self.live_config_check_ms.get();
+        let billing_wait_ms = self.billing_wait_ms.get();
+        let resolve_ms = self.resolve_ms.get();
         let prepare_wait_ms = self.prepare_wait_ms.get();
         let snapshot_closure_ms = self.snapshot_closure_ms.get();
+        let pricing_ms = self.pricing_ms.get();
+        let policy_ms = self.policy_ms.get();
+        let head_history_ms = self.head_history_ms.get();
         let selection_ms = self.selection_ms.get();
+        let ladder_ms = self.ladder_ms.get();
+        let decision_write_ms = self.decision_write_ms.get();
+        let runner_ms = self.runner_ms.get();
+        let finish_ms = self.finish_ms.get();
         let reply_ms = self.reply_ms.get();
-        let unclassified_ms = total_ms.saturating_sub(
-            live_config_check_ms
-                .saturating_add(prepare_wait_ms)
-                .saturating_add(snapshot_closure_ms)
-                .saturating_add(selection_ms)
-                .saturating_add(reply_ms),
-        );
+        let classified_ms = [
+            live_config_check_ms,
+            billing_wait_ms,
+            resolve_ms,
+            prepare_wait_ms,
+            snapshot_closure_ms,
+            pricing_ms,
+            policy_ms,
+            head_history_ms,
+            selection_ms,
+            ladder_ms,
+            decision_write_ms,
+            runner_ms,
+            finish_ms,
+            reply_ms,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
+        let unclassified_ms = total_ms.saturating_sub(classified_ms);
         Some(format!(
-            "[routing] slow route.select total_ms={total_ms} wait_prepare_ms={prepare_wait_ms} live_config_check_ms={live_config_check_ms} snapshot_closure_ms={snapshot_closure_ms} selection_ms={selection_ms} reply_ms={reply_ms} unclassified_ms={unclassified_ms}"
+            "[routing] slow route.select total_ms={total_ms} wait_prepare_ms={prepare_wait_ms} live_config_check_ms={live_config_check_ms} snapshot_closure_ms={snapshot_closure_ms} selection_ms={selection_ms} reply_ms={reply_ms} billing_wait_ms={billing_wait_ms} resolve_ms={resolve_ms} pricing_ms={pricing_ms} policy_ms={policy_ms} head_history_ms={head_history_ms} ladder_ms={ladder_ms} decision_write_ms={decision_write_ms} runner_ms={runner_ms} finish_ms={finish_ms} unclassified_ms={unclassified_ms}"
         ))
     }
 }
@@ -3224,12 +3286,20 @@ async fn handle_select_request(
         );
         return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
     }
-    if matches!(
+    let billing_ready = if matches!(
         envelope.method.as_str(),
         ROUTE_SELECT_OP | ROUTE_SELECT_PANEL_OP
-    ) && !broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
-        .await
-    {
+    ) {
+        let billing_started = Instant::now();
+        let ready =
+            broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
+                .await;
+        add_stage_ms(&timing.billing_wait_ms, billing_started.elapsed());
+        ready
+    } else {
+        true
+    };
+    if !billing_ready {
         let body = serde_json::to_vec(&ErrorBody {
             code: "routing_not_ready".into(),
             message: "routing pricing is awaiting its first billing-plane load; retry shortly"
@@ -3279,6 +3349,7 @@ async fn handle_select_request(
         .await;
     }
 
+    let resolve_started = Instant::now();
     let params: SelectParams = match serde_json::from_slice::<SelectBody>(&frame.body) {
         Ok(b) => b.params,
         Err(e) => {
@@ -3317,6 +3388,7 @@ async fn handle_select_request(
         )
         .await;
     }
+    add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
     // The operator fence is read HERE, on the module side, for every selection.
     let live_config_started = Instant::now();
     let operator_config = if operator_config_path == routing_config_path {
@@ -3352,10 +3424,16 @@ async fn handle_select_request(
         }
     };
     timing.add_snapshot_closure(snapshot_started.elapsed());
+    let resolve_started = Instant::now();
     let resolved_request =
         match resolve_select_request(&params, &operator_policy, opencode_auth_path) {
-            Ok(resolved) => resolved,
+            Ok(resolved) => {
+                add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
+                resolved
+            }
             Err(mut no_route) => {
+                add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
+                let write_started = Instant::now();
                 if let Some(note) = &availability.note {
                     no_route.message = format!("{} ({note})", no_route.message);
                 }
@@ -3372,6 +3450,7 @@ async fn handle_select_request(
                     Some(&policy_sources_line(&operator_policy)),
                 );
                 let _ = store.record_decision(&decision);
+                add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
                 return send_no_route(
                     writer,
                     ver,
@@ -3400,6 +3479,7 @@ async fn handle_select_request(
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
         }
     };
+    let pricing_started = Instant::now();
     let outcome = live_config.apply(&mut facts);
     let (routing_config, policy_revision) = (outcome.routing_config, outcome.policy_revision);
     let provenance = DecisionProvenance {
@@ -3417,7 +3497,9 @@ async fn handle_select_request(
         credentials.price_facts(&mut facts);
     }
     live_config.apply(&mut facts);
+    add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
 
+    let policy_started = Instant::now();
     let host_models: HashSet<String> = resolved_request
         .policy
         .available_models
@@ -3490,12 +3572,16 @@ async fn handle_select_request(
         )
     };
     let mut exclude = params.exclude_route_keys.clone();
+    add_stage_ms(&timing.policy_ms, policy_started.elapsed());
+    let head_history_started = Instant::now();
     let head_refusals = head_content_policy_exclusions(
         store,
         params.parent_session_id.as_deref(),
         &facts,
         now as i64,
     );
+    add_stage_ms(&timing.head_history_ms, head_history_started.elapsed());
+    let mut policy_started = Instant::now();
     exclude.extend(head_refusals.route_keys.iter().cloned());
     let operator_exclude = operator_policy.exclude.clone();
     let consumer_exclude =
@@ -3553,6 +3639,7 @@ async fn handle_select_request(
             .await;
         }
         let sub = subscription_keys.clone();
+        add_stage_ms(&timing.policy_ms, policy_started.elapsed());
         let selection_started = Instant::now();
         let selection = {
             let input = SelectModelRouteInput {
@@ -3650,12 +3737,16 @@ async fn handle_select_request(
             Ok((selected, runner, variant_choice))
         });
         timing.record_selection(selection_started.elapsed());
+        policy_started = Instant::now();
         match selection {
             Ok((mut selected, runner, variant_choice)) => {
+                let ladder_started = Instant::now();
                 record_ladder(pin_harness);
+                add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
                 if let Some(line) = &executor_workload {
                     selected.explanation.push(line.clone());
                 }
+                let write_started = Instant::now();
                 let decision = decision_input_for(
                     &target_agent,
                     &requirements,
@@ -3672,6 +3763,8 @@ async fn handle_select_request(
                         selected_workload,
                     )
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
+                add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
+                let finish_started = Instant::now();
                 let mut result = json!({
                     "selected": selected, "decisionID": decision_id,
                     "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities},
@@ -3699,6 +3792,7 @@ async fn handle_select_request(
                     body,
                 )
                 .map_err(|error| ModuleError::Message(error.to_string()))?;
+                add_stage_ms(&timing.finish_ms, finish_started.elapsed());
                 let reply_started = Instant::now();
                 let reply = send(writer, response).await;
                 timing.record_reply(reply_started.elapsed());
@@ -3778,6 +3872,7 @@ async fn handle_select_request(
     };
 
     // First attempt against the live snapshot.
+    add_stage_ms(&timing.policy_ms, policy_started.elapsed());
     let selection_started = Instant::now();
     let selection = match attempt(snapshot.clone()) {
         Ok(selected) => Ok(selected),
@@ -3836,6 +3931,7 @@ async fn handle_select_request(
         Err(no_route) => Err(no_route),
     };
     timing.record_selection(selection_started.elapsed());
+    let finish_started = Instant::now();
 
     // Record the decision, then respond. The decisionID is returned ONLY after
     // record_decision commits (it is a single store txn that either commits or
@@ -3846,7 +3942,11 @@ async fn handle_select_request(
     match selection {
         Ok(mut selected) => {
             let selected_harness = harness_context.mapped(&selected.route_key);
+            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
+            let ladder_started = Instant::now();
             record_ladder(selected_harness);
+            add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
+            let finish_started = Instant::now();
             let variant_choice = apply_variant_policy(
                 &mut selected,
                 &operator_config,
@@ -3871,6 +3971,8 @@ async fn handle_select_request(
             selected
                 .explanation
                 .extend(head_refusals.notes.iter().cloned());
+            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
+            let write_started = Instant::now();
             let decision = decision_input_for(
                 &target_agent,
                 &requirements,
@@ -3880,12 +3982,15 @@ async fn handle_select_request(
                 Some(&provenance),
                 Some(&policy_sources),
             );
-            match store.record_decision_with_selection(
+            let recorded = store.record_decision_with_selection(
                 &decision,
                 Some(selected_harness.as_str()),
                 selected_workload,
-            ) {
+            );
+            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
+            match recorded {
                 Ok(decision_id) => {
+                    let finish_started = Instant::now();
                     let mut resolved_input = json!({
                         "requirements": requirements,
                         "availableModels": &resolved_request.policy.available_models,
@@ -3917,6 +4022,8 @@ async fn handle_select_request(
                     if params.pin.is_some() {
                         result["pin_rejected"] = json!(pin_rejected);
                     }
+                    add_stage_ms(&timing.finish_ms, finish_started.elapsed());
+                    let runner_started = Instant::now();
                     if selected_harness == substrate_policy::Harness::Broca {
                         // An automatically chosen key-pool provider leases its key
                         // here; any other provider resolves to the ordinary
@@ -3945,6 +4052,8 @@ async fn handle_select_request(
                             }
                         }
                     }
+                    add_stage_ms(&timing.runner_ms, runner_started.elapsed());
+                    let finish_started = Instant::now();
                     let body = serde_json::to_vec(&json!({ "result": result }))
                         .map_err(ModuleError::Json)?;
                     let response = Frame::build_with_version(
@@ -3957,6 +4066,7 @@ async fn handle_select_request(
                         body,
                     )
                     .map_err(|e| ModuleError::Message(e.to_string()))?;
+                    add_stage_ms(&timing.finish_ms, finish_started.elapsed());
                     let reply_started = Instant::now();
                     let reply = send(writer, response).await;
                     timing.record_reply(reply_started.elapsed());
@@ -4019,6 +4129,8 @@ async fn handle_select_request(
             if !no_route_notes.is_empty() {
                 no_route.message = format!("{} ({})", no_route.message, no_route_notes.join("; "));
             }
+            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
+            let write_started = Instant::now();
             // Best-effort failed-decision audit row (ignore a store error here: the
             // routing failure is the real result to surface).
             let decision = decision_input_for(
@@ -4031,6 +4143,7 @@ async fn handle_select_request(
                 Some(&policy_sources),
             );
             let _ = store.record_decision(&decision);
+            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
             let reply_started = Instant::now();
             let reply = send_no_route(
                 writer,
@@ -14260,6 +14373,45 @@ mod slow_route_select_timing_tests {
         assert!(snapshot.as_millis() >= 1_000);
         assert!(emitted.contains("selection_ms="), "{emitted}");
         assert!(emitted.contains("reply_ms="), "{emitted}");
+    }
+
+    #[test]
+    fn every_stage_bucket_is_named_and_subtracted_from_unclassified() {
+        let timing = RouteSelectTiming::new();
+        timing.is_select.set(true);
+        let stages = [
+            ("live_config_check_ms", &timing.live_config_check_ms),
+            ("billing_wait_ms", &timing.billing_wait_ms),
+            ("resolve_ms", &timing.resolve_ms),
+            ("wait_prepare_ms", &timing.prepare_wait_ms),
+            ("snapshot_closure_ms", &timing.snapshot_closure_ms),
+            ("pricing_ms", &timing.pricing_ms),
+            ("policy_ms", &timing.policy_ms),
+            ("head_history_ms", &timing.head_history_ms),
+            ("selection_ms", &timing.selection_ms),
+            ("ladder_ms", &timing.ladder_ms),
+            ("decision_write_ms", &timing.decision_write_ms),
+            ("runner_ms", &timing.runner_ms),
+            ("finish_ms", &timing.finish_ms),
+            ("reply_ms", &timing.reply_ms),
+        ];
+        for (index, (_, bucket)) in stages.iter().enumerate() {
+            add_stage_ms(bucket, Duration::from_millis(100 + index as u64));
+        }
+        let line = timing
+            .line_at(timing.started + Duration::from_millis(3_000))
+            .expect("three seconds is slow");
+        let classified: u64 = (0..stages.len() as u64).map(|index| 100 + index).sum();
+        for (index, (name, _)) in stages.iter().enumerate() {
+            assert!(
+                line.contains(&format!(" {name}={} ", 100 + index)),
+                "{name}: {line}"
+            );
+        }
+        assert!(
+            line.ends_with(&format!("unclassified_ms={}", 3_000 - classified)),
+            "{line}"
+        );
     }
 
     #[test]
