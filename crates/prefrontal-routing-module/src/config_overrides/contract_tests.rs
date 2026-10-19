@@ -489,20 +489,24 @@ fn check_config_offline_reads_the_store_or_says_why_it_skipped() {
 }
 
 #[test]
-fn preserved_keys_and_both_aliases_load_unchanged() {
+fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
     let document = include_str!("../../fixtures/preserved-routing.jsonc");
-    for document in [
-        document.to_owned(),
-        document
-            .replace(
-                "consecutiveTerminalFailureThreshold",
-                "consecutive_terminal_failure_threshold",
-            )
-            .replace(
-                "providersWithoutPromptCache",
-                "providers_without_prompt_cache",
-            ),
+    for camel in [
+        document.replace(
+            "consecutive_terminal_failure_threshold",
+            "consecutiveTerminalFailureThreshold",
+        ),
+        document.replace(
+            "providers_without_prompt_cache",
+            "providersWithoutPromptCache",
+        ),
     ] {
+        let mut rig = Rig::new();
+        rig.write(&camel);
+        assert!(initialize_config(&rig.path).is_err(), "{camel}");
+    }
+    {
+        let document = document.to_owned();
         let mut rig = Rig::new();
         rig.write(&document);
         initialize_config(&rig.path).unwrap();
@@ -718,8 +722,8 @@ fn generated_schema_is_current_and_closed() {
     let properties = &schema["$defs"]["ModelRoutingSection"]["properties"];
     assert!(properties
         .get("consecutiveTerminalFailureThreshold")
-        .is_some());
-    assert!(properties.get("providersWithoutPromptCache").is_some());
+        .is_none());
+    assert!(properties.get("providersWithoutPromptCache").is_none());
 }
 
 #[test]

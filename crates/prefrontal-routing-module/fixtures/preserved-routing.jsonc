@@ -1,5 +1,5 @@
 {
-  // Every preserved key, with the two accepted camel-case aliases.
+  // Every preserved key.
   "model_families": {"gpt": ["openai/*"], "other": ["*"]},
   "catalog": {"poll_ms": 12345},
   "account_selection": {"enabled": true},
@@ -25,8 +25,8 @@
     "demand_exponent": 1.5,
     "overqualification": {"threshold": 10, "doubling": 20, "base": 0.5},
     "min_best_effort_adequacy": 0.7,
-    "consecutiveTerminalFailureThreshold": 4,
-    "providersWithoutPromptCache": ["local", "xai"],
+    "consecutive_terminal_failure_threshold": 4,
+    "providers_without_prompt_cache": ["local", "xai"],
     "subscription_multipliers": {"openai": 40},
     "keep_free_percent": {"openai": 15},
   },
