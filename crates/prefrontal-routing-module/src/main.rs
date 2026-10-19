@@ -2893,7 +2893,7 @@ struct RouteSelectTiming {
     selection_ms: std::cell::Cell<u64>,
     /// Recording the selection on the winner ladder.
     ladder_ms: std::cell::Cell<u64>,
-    /// Writing the decision row the returned decision id names.
+    /// Writing the decision row whose id route.select returns to the caller.
     decision_write_ms: std::cell::Cell<u64>,
     /// Resolving the Broca launch target (and any key-pool lease).
     runner_ms: std::cell::Cell<u64>,
