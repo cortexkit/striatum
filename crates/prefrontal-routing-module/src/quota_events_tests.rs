@@ -4,7 +4,10 @@ use cortexkit_bus_trait::{BusResult, DurableOwner, Headers, Stream, StreamDelive
 use prefrontal_routing_core::RouteStateStore as _;
 use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
 use prefrontal_test_support::ScratchDir;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 const SUBJECT: &str = "ck.box_test.event.insula.quota_sampled.v1";
 const OWNER: DurableOwner<'_> = DurableOwner::Module("prefrontal-routing");
@@ -59,6 +62,92 @@ impl SampleSource for Source {
         }
         Ok(self.snapshot.clone())
     }
+}
+
+struct CountingConnector {
+    connects: Arc<AtomicUsize>,
+    fail_second_fetch: bool,
+}
+
+struct CountingRoute {
+    connection: usize,
+    fetches: usize,
+    fail_second_fetch: bool,
+}
+
+#[async_trait::async_trait]
+impl InsulaConnector for CountingConnector {
+    async fn connect(
+        &mut self,
+    ) -> Result<Box<dyn InsulaRoute>, crate::quota_consumer::QuotaConsumerError> {
+        let connection = self.connects.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(CountingRoute {
+            connection,
+            fetches: 0,
+            fail_second_fetch: self.fail_second_fetch,
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl InsulaRoute for CountingRoute {
+    async fn fetch(
+        &mut self,
+        key: &str,
+    ) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError> {
+        self.fetches += 1;
+        if self.fail_second_fetch && self.connection == 0 && self.fetches == 2 {
+            return Err(crate::quota_consumer::QuotaConsumerError::Route(
+                "route expired".into(),
+            ));
+        }
+        Ok(key.as_bytes().to_vec())
+    }
+
+    async fn snapshot(&mut self) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError> {
+        Ok(b"snapshot".to_vec())
+    }
+}
+
+#[tokio::test]
+async fn quota_insula_reuses_one_connection_for_events_and_snapshot() {
+    let connects = Arc::new(AtomicUsize::new(0));
+    let mut source = Insula::with_connector(Box::new(CountingConnector {
+        connects: connects.clone(),
+        fail_second_fetch: false,
+    }));
+
+    for key in ["event-1", "event-2", "event-3"] {
+        assert_eq!(source.fetch(key).await.unwrap(), key.as_bytes());
+    }
+    assert_eq!(source.snapshot().await.unwrap(), b"snapshot");
+
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quota_insula_reconnects_on_the_call_after_a_route_error() {
+    let connects = Arc::new(AtomicUsize::new(0));
+    let mut source = Insula::with_connector(Box::new(CountingConnector {
+        connects: connects.clone(),
+        fail_second_fetch: true,
+    }));
+
+    assert_eq!(source.fetch("event-1").await.unwrap(), b"event-1");
+    assert!(source
+        .fetch("event-2")
+        .await
+        .unwrap_err()
+        .contains("route expired"));
+    assert_eq!(
+        connects.load(Ordering::SeqCst),
+        1,
+        "no retry in the failed call"
+    );
+    assert_eq!(source.fetch("event-3").await.unwrap(), b"event-3");
+    assert_eq!(source.snapshot().await.unwrap(), b"snapshot");
+
+    assert_eq!(connects.load(Ordering::SeqCst), 2);
 }
 
 struct Cursor {
@@ -367,7 +456,10 @@ async fn missing_body_is_acknowledged_and_replaced_by_one_snapshot() {
     )
     .await
     .unwrap();
-    assert_eq!(cursor.acks, 1, "an expired body never comes back, so retrying is a loop");
+    assert_eq!(
+        cursor.acks, 1,
+        "an expired body never comes back, so retrying is a loop"
+    );
     assert_eq!(source.snapshots, 1);
     assert_eq!(used(&live), 80.0);
     assert!(cursor.inner.next().await.unwrap().is_none());
@@ -395,7 +487,10 @@ async fn deep_backlog_is_acknowledged_unread_with_one_snapshot() {
             .unwrap();
     }
     assert_eq!(cursor.acks, 5);
-    assert_eq!(source.snapshots, 1, "one snapshot stands in for the whole backlog");
+    assert_eq!(
+        source.snapshots, 1,
+        "one snapshot stands in for the whole backlog"
+    );
     assert_eq!(used(&live), 70.0);
 }
 

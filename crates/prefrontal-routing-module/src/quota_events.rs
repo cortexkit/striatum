@@ -185,26 +185,106 @@ trait SampleSource {
     async fn snapshot(&mut self) -> Result<Vec<u8>, String>;
 }
 
-struct Insula {
+#[async_trait::async_trait]
+trait InsulaRoute: Send {
+    async fn fetch(
+        &mut self,
+        key: &str,
+    ) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError>;
+    async fn snapshot(&mut self) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError>;
+}
+
+#[async_trait::async_trait]
+trait InsulaConnector: Send {
+    async fn connect(
+        &mut self,
+    ) -> Result<Box<dyn InsulaRoute>, crate::quota_consumer::QuotaConsumerError>;
+}
+
+struct DaemonInsulaConnector {
     connection_file: PathBuf,
     project_root: PathBuf,
 }
 
+#[async_trait::async_trait]
+impl InsulaConnector for DaemonInsulaConnector {
+    async fn connect(
+        &mut self,
+    ) -> Result<Box<dyn InsulaRoute>, crate::quota_consumer::QuotaConsumerError> {
+        Ok(Box::new(
+            QuotaConsumer::connect(&self.connection_file, &self.project_root).await?,
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl InsulaRoute for QuotaConsumer {
+    async fn fetch(
+        &mut self,
+        key: &str,
+    ) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError> {
+        self.events_get_raw_on_open_route(key).await
+    }
+
+    async fn snapshot(&mut self) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError> {
+        self.usage_get_raw_on_open_route().await
+    }
+}
+
+struct Insula {
+    connector: Box<dyn InsulaConnector>,
+    route: Option<Box<dyn InsulaRoute>>,
+}
+
+impl Insula {
+    fn new(connection_file: PathBuf, project_root: PathBuf) -> Self {
+        Self::with_connector(Box::new(DaemonInsulaConnector {
+            connection_file,
+            project_root,
+        }))
+    }
+
+    fn with_connector(connector: Box<dyn InsulaConnector>) -> Self {
+        Self {
+            connector,
+            route: None,
+        }
+    }
+
+    async fn ensure_route(&mut self) -> Result<(), crate::quota_consumer::QuotaConsumerError> {
+        if self.route.is_none() {
+            self.route = Some(self.connector.connect().await?);
+        }
+        Ok(())
+    }
+
+    fn invalidate_on_error(
+        &mut self,
+        result: &Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError>,
+    ) {
+        if result
+            .as_ref()
+            .is_err_and(crate::quota_consumer::QuotaConsumer::should_reconnect)
+        {
+            // Let the next request reconnect instead of retrying this operation in place.
+            self.route.take();
+        }
+    }
+}
+
 impl SampleSource for Insula {
     async fn fetch(&mut self, key: &str) -> Result<Vec<u8>, String> {
-        let mut consumer = QuotaConsumer::connect(&self.connection_file, &self.project_root)
-            .await
-            .map_err(|e| e.to_string())?;
-        consumer
-            .events_get_raw(key)
-            .await
-            .map_err(|e| e.to_string())
+        self.ensure_route().await.map_err(|e| e.to_string())?;
+        let result = self.route.as_mut().unwrap().fetch(key).await;
+        self.invalidate_on_error(&result);
+        result.map_err(|e| e.to_string())
     }
+
     async fn snapshot(&mut self) -> Result<Vec<u8>, String> {
-        let mut consumer = QuotaConsumer::connect(&self.connection_file, &self.project_root)
-            .await
-            .map_err(|e| e.to_string())?;
-        consumer.usage_get_raw().await.map_err(|e| e.to_string())
+        self.ensure_route().await.map_err(|e| e.to_string())?;
+        let result = self.route.as_mut().unwrap().snapshot().await;
+        self.invalidate_on_error(&result);
+        result.map_err(|e| e.to_string())
     }
 }
 
@@ -418,7 +498,10 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
                 state.owe_snapshot = true;
                 catch_up_snapshot(source, live, state).await;
             } else {
-                eprintln!("[prefrontal-routing] insula refused quota event {}: {code}", message.id);
+                eprintln!(
+                    "[prefrontal-routing] insula refused quota event {}: {code}",
+                    message.id
+                );
             }
             return Ok(());
         }
@@ -517,10 +600,7 @@ pub(super) async fn run(
     let project_root =
         prefrontal_core_store::scratch_root().join("prefrontal-routing-quota-consumer");
     let _ = std::fs::create_dir_all(&project_root);
-    let mut source = Insula {
-        connection_file: connection_file.clone(),
-        project_root,
-    };
+    let mut source = Insula::new(connection_file.clone(), project_root);
     let mut state = SequenceState::default();
     let mut bus = None::<quota_bus::AttachedBus>;
     let mut schedule = SnapshotSchedule::new(Instant::now());

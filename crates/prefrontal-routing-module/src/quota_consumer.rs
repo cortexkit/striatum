@@ -5,11 +5,11 @@
 //! socket/handshake, so one process holds two authenticated connections without
 //! conflation.
 //!
-//! Single-task-owned: only the background refresh task drives these short-lived
-//! connections, so there is no correlation mux: each request reads frames until
-//! its own `corr` reply. The refresh task awaits `usage_get` WITHOUT holding any lock that
-//! `route.select` needs (the cache lock is dropped before the await), so the
-//! outbound call can never deadlock the inbound serve loop.
+//! Single-task-owned: the quota event task owns its reusable route, while one-shot
+//! callers keep their connections local. There is no correlation mux: each request
+//! reads frames until its own `corr` reply. The refresh task awaits quota replies
+//! WITHOUT holding any lock that `route.select` needs, so outbound calls cannot
+//! deadlock the inbound serve loop.
 
 use std::path::Path;
 use std::time::Duration;
@@ -26,6 +26,8 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub enum QuotaConsumerError {
     Message(String),
+    Transport(String),
+    Route(String),
     Json(serde_json::Error),
 }
 
@@ -33,6 +35,8 @@ impl std::fmt::Display for QuotaConsumerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Message(m) => write!(f, "{m}"),
+            Self::Transport(m) => write!(f, "{m}"),
+            Self::Route(m) => write!(f, "{m}"),
             Self::Json(e) => write!(f, "json: {e}"),
         }
     }
@@ -42,6 +46,14 @@ impl std::error::Error for QuotaConsumerError {}
 
 fn msg(s: impl Into<String>) -> QuotaConsumerError {
     QuotaConsumerError::Message(s.into())
+}
+
+fn transport(s: impl Into<String>) -> QuotaConsumerError {
+    QuotaConsumerError::Transport(s.into())
+}
+
+fn route_error(s: impl Into<String>) -> QuotaConsumerError {
+    QuotaConsumerError::Route(s.into())
 }
 
 /// Decode the `usage.get` result array ENTRY BY ENTRY. Insula extends its
@@ -87,8 +99,8 @@ pub(crate) fn decode_usage_result(
         .collect())
 }
 
-/// An outbound daemon connection for quota queries. The one-shot usage and event
-/// body methods close it after success; callers reconnect for the next query.
+/// An outbound daemon connection for quota queries. Insula's event consumer keeps
+/// the route open; one-shot raw reads send `goodbye` after success.
 pub struct QuotaConsumer {
     stream: TcpStream,
     route_channel: u16,
@@ -97,6 +109,13 @@ pub struct QuotaConsumer {
 }
 
 impl QuotaConsumer {
+    pub(crate) fn should_reconnect(error: &QuotaConsumerError) -> bool {
+        matches!(
+            error,
+            QuotaConsumerError::Transport(_) | QuotaConsumerError::Route(_)
+        )
+    }
+
     /// Connect outbound, authenticate, and `route.open` the quota module's
     /// ManagementSurface. `project_root` is the bind identity's project root; the
     /// quota module is machine-global so it does not key on it, but the bind needs
@@ -184,10 +203,10 @@ impl QuotaConsumer {
         .map_err(|e| msg(e.to_string()))?;
         write_frame(&mut self.stream, &frame)
             .await
-            .map_err(|e| msg(e.to_string()))?;
+            .map_err(|e| transport(e.to_string()))?;
         let reply = self.read_reply(0, 0, corr).await?;
         if reply.header.ty == FrameType::Error {
-            return Err(msg(format!(
+            return Err(route_error(format!(
                 "route.open(insula) failed: {}",
                 String::from_utf8_lossy(&reply.body)
             )));
@@ -225,21 +244,37 @@ impl QuotaConsumer {
     /// Insula's unfiltered feed returns every served provider. Keep the exact
     /// envelope bytes so account consumers also see `completeProviders`.
     pub async fn usage_get_raw(&mut self) -> Result<Vec<u8>, QuotaConsumerError> {
-        let body = self.usage_get_body(serde_json::json!({})).await?;
+        let body = self.usage_get_raw_on_open_route().await?;
         self.goodbye().await?;
         Ok(body)
+    }
+
+    /// Read usage without closing the route so a long-lived consumer can reuse it.
+    pub(crate) async fn usage_get_raw_on_open_route(
+        &mut self,
+    ) -> Result<Vec<u8>, QuotaConsumerError> {
+        self.usage_get_body(serde_json::json!({})).await
     }
 
     /// Preserve the raw body substring: the notice digest covers the producer's
     /// bytes, not a consumer's reserialized JSON tree.
     pub async fn events_get_raw(&mut self, event_key: &str) -> Result<Vec<u8>, QuotaConsumerError> {
+        let body = self.events_get_raw_on_open_route(event_key).await?;
+        self.goodbye().await?;
+        Ok(body)
+    }
+
+    /// Read an event without closing the route so a long-lived consumer can reuse it.
+    pub(crate) async fn events_get_raw_on_open_route(
+        &mut self,
+        event_key: &str,
+    ) -> Result<Vec<u8>, QuotaConsumerError> {
         let body = self
             .operation_body(serde_json::json!({
                 "method": "events_get",
                 "params": {"event_key": event_key, "event_name": "quota_sampled"},
             }))
             .await?;
-        self.goodbye().await?;
         Ok(body)
     }
 
@@ -290,10 +325,10 @@ impl QuotaConsumer {
         .map_err(|e| msg(e.to_string()))?;
         write_frame(&mut self.stream, &frame)
             .await
-            .map_err(|e| msg(e.to_string()))?;
+            .map_err(|e| transport(e.to_string()))?;
         let reply = self.read_reply(channel, epoch, corr).await?;
         if reply.header.ty == FrameType::Error {
-            return Err(msg(format!(
+            return Err(route_error(format!(
                 "usage.get failed: {}",
                 String::from_utf8_lossy(&reply.body)
             )));
@@ -314,11 +349,11 @@ impl QuotaConsumer {
         .map_err(|e| msg(e.to_string()))?;
         write_frame(&mut self.stream, &frame)
             .await
-            .map_err(|e| msg(format!("sending quota connection goodbye: {e}")))?;
+            .map_err(|e| transport(format!("sending quota connection goodbye: {e}")))?;
         self.stream
             .shutdown()
             .await
-            .map_err(|e| msg(format!("closing quota connection: {e}")))
+            .map_err(|e| transport(format!("closing quota connection: {e}")))
     }
 
     /// Read frames until the terminal reply (Response or Error) for `(channel, corr)`.
@@ -331,9 +366,9 @@ impl QuotaConsumer {
         loop {
             let frame = tokio::time::timeout(READ_TIMEOUT, read_frame(&mut self.stream))
                 .await
-                .map_err(|_| msg("timed out awaiting quota reply"))?
-                .map_err(|e| msg(e.to_string()))?
-                .ok_or_else(|| msg("quota connection closed mid-request"))?;
+                .map_err(|_| transport("timed out awaiting quota reply"))?
+                .map_err(|e| transport(e.to_string()))?
+                .ok_or_else(|| transport("quota connection closed mid-request"))?;
             if frame.header.corr == corr
                 && frame.header.channel == channel
                 && frame.header.epoch == epoch

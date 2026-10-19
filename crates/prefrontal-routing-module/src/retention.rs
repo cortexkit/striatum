@@ -14,9 +14,14 @@
 //!   read by nothing and purged whatever their age.
 //! - `account_observation`: read back only to recognise a runner re-sending
 //!   the same event id, which happens within minutes.
+//! - `account_observation_event`: the small key-and-answer record of each
+//!   runner event, which recognises a re-sent event even when a backup
+//!   restored the observation log empty. Kept for
+//!   [`OBSERVATION_EVENT_KEY_WINDOW_MS`], not configurable.
 //! - `model_route_decisions`: `route.explain` looks a decision up by id or
 //!   send id, the decision list and per-task reads walk recent rows, and the
-//!   health sentinel scans the last day.
+//!   health sentinel scans the last day. `model_route_parent_failures`, its
+//!   per-head failure copy, follows the same window.
 //! - `model_route_usage`: observed speed and class token profiles read a
 //!   trailing seven-day window, so the usage window never goes below that.
 //!
@@ -55,6 +60,13 @@ const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(25);
 
 const HOUR_MS: i64 = 60 * 60_000;
 const DAY_MS: i64 = 24 * HOUR_MS;
+
+/// How long a runner-event key stays in `account_observation_event`. A runner
+/// re-sends an event within minutes of the first report, after a lost reply;
+/// six hours covers that many times over. Every backup carries this table; on
+/// a copy of a long-running install six hours of events came to about 65,000
+/// rows (18 MB), where the week the observation log keeps is about 520 MB.
+pub const OBSERVATION_EVENT_KEY_WINDOW_MS: i64 = 6 * HOUR_MS;
 
 /// How long each log keeps its rows. Every value is a whole number of the
 /// unit in its name.
@@ -203,7 +215,11 @@ pub struct RetentionPassReport {
     /// Serve decisions.
     pub account_decisions: usize,
     pub account_observations: usize,
+    /// Runner-event keys past [`OBSERVATION_EVENT_KEY_WINDOW_MS`].
+    pub observation_events: usize,
     pub route_decisions: usize,
+    /// Per-head failure copies whose decision is past the decision window.
+    pub parent_failures: usize,
     pub route_usage: usize,
     /// Batches run across all tables.
     pub batches: usize,
@@ -221,7 +237,9 @@ impl RetentionPassReport {
             + self.account_pins
             + self.account_decisions
             + self.account_observations
+            + self.observation_events
             + self.route_decisions
+            + self.parent_failures
             + self.route_usage
     }
 }
@@ -345,6 +363,14 @@ pub fn run_retention_pass(
         drain("account_observation", budget, per_table, batches, || {
             counted(store.prune_account_observations(observed_before, rows))
         });
+    let keys_before = before(now_ms, OBSERVATION_EVENT_KEY_WINDOW_MS);
+    let (observation_events, observation_events_drained) = drain(
+        "account_observation_event",
+        budget,
+        per_table,
+        batches,
+        || counted(store.prune_observation_events(keys_before, rows)),
+    );
     let decided_before = before(
         now_ms,
         window_ms(windows.model_route_decisions_days, DAY_MS),
@@ -353,6 +379,13 @@ pub fn run_retention_pass(
         drain("model_route_decisions", budget, per_table, batches, || {
             counted(store.delete_decisions_older_than(decided_before, rows))
         });
+    let (parent_failures, parent_failures_drained) = drain(
+        "model_route_parent_failures",
+        budget,
+        per_table,
+        batches,
+        || counted(store.prune_parent_failures(decided_before, rows)),
+    );
     let usage_before = before(now_ms, window_ms(windows.model_route_usage_days, DAY_MS));
     let (usage, usage_drained) = drain("model_route_usage", budget, per_table, batches, || {
         counted(store.prune_route_usage(usage_before, rows))
@@ -364,7 +397,9 @@ pub fn run_retention_pass(
     report.account_pins = pins;
     report.account_decisions = decisions;
     report.account_observations = observations;
+    report.observation_events = observation_events;
     report.route_decisions = route_decisions;
+    report.parent_failures = parent_failures;
     report.route_usage = usage;
     report.drained = shadow_drained
         && admissions_drained
@@ -372,7 +407,9 @@ pub fn run_retention_pass(
         && affinities_drained
         && decisions_drained
         && observations_drained
+        && observation_events_drained
         && route_decisions_drained
+        && parent_failures_drained
         && usage_drained;
     report
 }
@@ -413,7 +450,9 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
                         account_pins = report.account_pins,
                         account_decisions = report.account_decisions,
                         account_observations = report.account_observations,
+                        observation_events = report.observation_events,
                         route_decisions = report.route_decisions,
+                        parent_failures = report.parent_failures,
                         route_usage = report.route_usage,
                         batches = report.batches,
                         drained = report.drained,
@@ -429,7 +468,7 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prefrontal_routing_store::{dev_descriptor, AccountDecisionRecord};
+    use prefrontal_routing_store::{dev_descriptor, AccountDecisionRecord, AccountObservationRow};
     use serde_json::json;
 
     /// The test clock, 2026-10-12T00:00:00Z.
@@ -591,5 +630,78 @@ mod tests {
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// The pass prunes runner-event keys on their six-hour window (the
+    /// observation log keeps its week) and per-head failure copies whose
+    /// decision a restore left out of the ledger, on the decision window.
+    #[test]
+    fn a_pass_prunes_old_event_keys_and_orphaned_parent_failures() {
+        let dir = prefrontal_test_support::scratch_root().join(format!(
+            "prefrontal-routing-retention-keys-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let store = SqliteRouteStateStore::open(&dev_descriptor(
+            "prefrontal-routing",
+            path.to_string_lossy().into_owned(),
+        ))
+        .expect("open store");
+        let observation = |id: &str, received_at: i64| AccountObservationRow {
+            observation_id: id.into(),
+            principal: "reserved:broca".into(),
+            runner: "broca".into(),
+            event_id: id.into(),
+            kind: "attempt".into(),
+            admission_id: None,
+            bound: false,
+            observation_json: "{}".into(),
+            effects_json: "[]".into(),
+            received_at,
+        };
+        store
+            .account_transaction(|tx| {
+                tx.insert_observation(&observation("seven-hours", NOW - 7 * HOUR_MS))?;
+                tx.insert_observation(&observation("one-hour", NOW - HOUR_MS))
+            })
+            .unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO model_route_parent_failures \
+                   (decision_id, parent_session_id, outcome_at, selected_route_key, \
+                    selected_provider_id, outcome_error) \
+                 VALUES ('orphan-old', 'head', {old}, 'p/m', 'p', 'refused'), \
+                        ('orphan-young', 'head', {young}, 'p/m', 'p', 'refused')",
+                old = NOW - 40 * DAY_MS,
+                young = NOW - HOUR_MS,
+            ))
+            .unwrap();
+
+        let report = run_retention_pass(
+            &store,
+            &RetentionWindows::default(),
+            NOW,
+            &PassBudget {
+                pause: Duration::ZERO,
+                ..PassBudget::default()
+            },
+        );
+        assert_eq!(report.observation_events, 1);
+        assert_eq!(report.account_observations, 0);
+        assert_eq!(report.parent_failures, 1);
+        let young = store.recent_failed_decisions_for_parent("head", 0).unwrap();
+        let seven_hours = store
+            .account_transaction(|tx| {
+                tx.observation_by_event("reserved:broca", "broca", "seven-hours")
+            })
+            .unwrap();
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(young.len(), 1);
+        assert_eq!(young[0].outcome_at, NOW - HOUR_MS);
+        // The observation itself is still in its week-long log.
+        assert!(seven_hours.is_some());
     }
 }

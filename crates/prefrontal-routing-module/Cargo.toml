@@ -15,6 +15,7 @@ sha2 = "0.10"
 
 [dependencies]
 async-nats = { version = "0.50", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
+async-trait = "0.1"
 base64 = "0.22"
 cortexkit-bus-naming = "=0.2.4"
 cortexkit-bus-nats = "0.3.0"
@@ -38,7 +39,6 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
-async-trait = "0.1"
 cortexkit-bus-inmemory = "0.3.0"
 prefrontal-routing-store = { path = "../prefrontal-routing-store", features = ["test-support"] }
 prefrontal-test-support = { path = "../prefrontal-test-support" }
