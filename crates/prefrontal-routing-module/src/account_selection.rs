@@ -3939,19 +3939,39 @@ mod tests {
         }
         fixture.reopen();
         let ctx = fixture.ctx(true, NOW);
-        assert_eq!(fixture.store().account_serving_counts().unwrap().observations, 0);
+        assert_eq!(
+            fixture
+                .store()
+                .account_serving_counts()
+                .unwrap()
+                .observations,
+            0
+        );
 
         let repeat = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, exhausted("restored:1")));
         assert_eq!(repeat["observation"]["duplicate"], true);
         assert_eq!(repeat["observation"]["id"], first["observation"]["id"]);
-        assert_eq!(repeat["observation"]["bound"], first["observation"]["bound"]);
-        assert_eq!(repeat["observation"]["effects"], first["observation"]["effects"]);
+        assert_eq!(
+            repeat["observation"]["bound"],
+            first["observation"]["bound"]
+        );
+        assert_eq!(
+            repeat["observation"]["effects"],
+            first["observation"]["effects"]
+        );
         let counts = fixture.store().account_serving_counts().unwrap();
         assert_eq!((counts.observations, counts.fences), (0, 1));
 
         let next = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, exhausted("restored:2")));
         assert_eq!(next["observation"]["duplicate"], false);
-        assert_eq!(fixture.store().account_serving_counts().unwrap().observations, 1);
+        assert_eq!(
+            fixture
+                .store()
+                .account_serving_counts()
+                .unwrap()
+                .observations,
+            1
+        );
     }
 
     #[test]

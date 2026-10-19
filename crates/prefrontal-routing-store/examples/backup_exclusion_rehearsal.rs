@@ -68,7 +68,10 @@ fn main() {
     }
     let started = Instant::now();
     drop(open(&upgraded));
-    println!("open with migration 55 and foreign-key drop: {:?}", started.elapsed());
+    println!(
+        "open with migrations 55-56 and foreign-key drop: {:?}",
+        started.elapsed()
+    );
 
     let conn = Connection::open(&upgraded).unwrap();
     let started = Instant::now();
@@ -135,7 +138,9 @@ fn main() {
         let tx = conn.transaction().unwrap();
         for (table, _) in BACKUP_EXCLUDABLE_TABLES {
             let triggers: Vec<(String, String)> = tx
-                .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ?1")
+                .prepare(
+                    "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = ?1",
+                )
                 .unwrap()
                 .query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))
                 .unwrap()
@@ -163,7 +168,10 @@ fn main() {
     println!("open of the restored store: {:?}", started.elapsed());
     if let Some(head) = head {
         let failed = store.recent_failed_decisions_for_parent(&head, 0).unwrap();
-        println!("head {head}: {} failed decisions still visible", failed.len());
+        println!(
+            "head {head}: {} failed decisions still visible",
+            failed.len()
+        );
         assert!(!failed.is_empty());
     }
     if let Some(id) = in_flight {

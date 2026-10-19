@@ -364,10 +364,13 @@ pub fn run_retention_pass(
             counted(store.prune_account_observations(observed_before, rows))
         });
     let keys_before = before(now_ms, OBSERVATION_EVENT_KEY_WINDOW_MS);
-    let (observation_events, observation_events_drained) =
-        drain("account_observation_event", budget, per_table, batches, || {
-            counted(store.prune_observation_events(keys_before, rows))
-        });
+    let (observation_events, observation_events_drained) = drain(
+        "account_observation_event",
+        budget,
+        per_table,
+        batches,
+        || counted(store.prune_observation_events(keys_before, rows)),
+    );
     let decided_before = before(
         now_ms,
         window_ms(windows.model_route_decisions_days, DAY_MS),
@@ -376,10 +379,13 @@ pub fn run_retention_pass(
         drain("model_route_decisions", budget, per_table, batches, || {
             counted(store.delete_decisions_older_than(decided_before, rows))
         });
-    let (parent_failures, parent_failures_drained) =
-        drain("model_route_parent_failures", budget, per_table, batches, || {
-            counted(store.prune_parent_failures(decided_before, rows))
-        });
+    let (parent_failures, parent_failures_drained) = drain(
+        "model_route_parent_failures",
+        budget,
+        per_table,
+        batches,
+        || counted(store.prune_parent_failures(decided_before, rows)),
+    );
     let usage_before = before(now_ms, window_ms(windows.model_route_usage_days, DAY_MS));
     let (usage, usage_drained) = drain("model_route_usage", budget, per_table, batches, || {
         counted(store.prune_route_usage(usage_before, rows))
@@ -673,19 +679,23 @@ mod tests {
             ))
             .unwrap();
 
-        let report =
-            run_retention_pass(&store, &RetentionWindows::default(), NOW, &PassBudget {
+        let report = run_retention_pass(
+            &store,
+            &RetentionWindows::default(),
+            NOW,
+            &PassBudget {
                 pause: Duration::ZERO,
                 ..PassBudget::default()
-            });
+            },
+        );
         assert_eq!(report.observation_events, 1);
         assert_eq!(report.account_observations, 0);
         assert_eq!(report.parent_failures, 1);
-        let young = store
-            .recent_failed_decisions_for_parent("head", 0)
-            .unwrap();
+        let young = store.recent_failed_decisions_for_parent("head", 0).unwrap();
         let seven_hours = store
-            .account_transaction(|tx| tx.observation_by_event("reserved:broca", "broca", "seven-hours"))
+            .account_transaction(|tx| {
+                tx.observation_by_event("reserved:broca", "broca", "seven-hours")
+            })
             .unwrap();
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);

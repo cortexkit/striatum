@@ -89,7 +89,9 @@ impl Rig {
 
     fn count(&self, table: &str) -> i64 {
         self.connection()
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .unwrap()
     }
 
@@ -117,7 +119,10 @@ impl Drop for Rig {
 }
 
 fn excludable() -> Vec<&'static str> {
-    BACKUP_EXCLUDABLE_TABLES.iter().map(|(name, _)| *name).collect()
+    BACKUP_EXCLUDABLE_TABLES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect()
 }
 
 fn user_tables(connection: &Connection) -> Vec<String> {
@@ -503,7 +508,11 @@ fn routing_with_the_decision_ledger_restored_empty_keeps_withholding_and_drops_l
     store
         .set_decision_outcome(
             "dec-in-flight",
-            &outcome(RouteOutcome::Error, Some("HTTP 503 provider unavailable"), NOW),
+            &outcome(
+                RouteOutcome::Error,
+                Some("HTTP 503 provider unavailable"),
+                NOW,
+            ),
         )
         .expect("an outcome for a decision the ledger lost is accepted");
     drop(store);
@@ -524,7 +533,9 @@ fn parent_failure_copies_left_by_a_restore_are_pruned_on_the_decision_window() {
             .enumerate()
         {
             let id = format!("dec-{index}");
-            store.record_decision(&decision_input(&id, "head-a")).unwrap();
+            store
+                .record_decision(&decision_input(&id, "head-a"))
+                .unwrap();
             store
                 .set_decision_outcome(&id, &outcome(RouteOutcome::Error, Some(CONTENT_POLICY), at))
                 .unwrap();

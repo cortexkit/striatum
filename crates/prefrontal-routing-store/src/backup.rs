@@ -42,10 +42,6 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
         "which catalog snapshot was applied; a missing cursor makes the next refresh fetch \
          the whole catalog",
     ),
-    (
-        "aa_index_cache",
-        "retired AA index ingest; read by nothing",
-    ),
 ];
 
 /// Tables every backup must carry, each with the reason.
@@ -103,14 +99,8 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "account_selection_salt",
         "salt for conversation keys; a new salt changes every affinity",
     ),
-    (
-        "account_affinity",
-        "current account pin per conversation",
-    ),
-    (
-        "account_pin",
-        "pin generations; admissions reference them",
-    ),
+    ("account_affinity", "current account pin per conversation"),
+    ("account_pin", "pin generations; admissions reference them"),
     (
         "account_admission",
         "committed duplicate-request replies, charged demand and lease lifecycle",
@@ -119,28 +109,13 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "account_hold",
         "client-visible retry answers within their window",
     ),
-    (
-        "account_fence",
-        "confirmed account exhaustion fences",
-    ),
+    ("account_fence", "confirmed account exhaustion fences"),
     (
         "account_principal_exclusion",
         "scoped credential exclusions",
     ),
-    (
-        "pool_key_state",
-        "key-pool walls",
-    ),
-    (
-        "pool_key_lease",
-        "live key leases",
-    ),
-    (
-        "pool_session_affinity",
-        "session-to-key binding",
-    ),
-    (
-        "cortexkit_schema_version",
-        "migration ledger",
-    ),
+    ("pool_key_state", "key-pool walls"),
+    ("pool_key_lease", "live key leases"),
+    ("pool_session_affinity", "session-to-key binding"),
+    ("cortexkit_schema_version", "migration ledger"),
 ];

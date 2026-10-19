@@ -13694,9 +13694,6 @@ mod tests {
         store
             .upsert_fact(&inferred, FactSource::AaInferred)
             .unwrap();
-        store
-            .replace_aa_index_table(&[("stored-slug".into(), 55.0)], 1)
-            .unwrap();
         let mut unscored = fact("custom", "no-score");
         unscored.scores.elo = 2_000.0;
         unscored.score_provenance = ScoreProvenance::Unscored;
@@ -13716,8 +13713,6 @@ mod tests {
         assert_eq!(loaded.aa_index, Some(55.0));
         assert_eq!(loaded.review_by_ms, Some(1));
         assert_eq!(loaded.eq_source.as_deref(), Some("custom/curated-neighbor"));
-        assert_eq!(store.get_aa_index("stored-slug").unwrap(), Some((55.0, 1)));
-
         let listed = run_route_wire_request(
             &store,
             json!({ "method": ROUTE_LIST_INFERRED_OP, "params": {} }),

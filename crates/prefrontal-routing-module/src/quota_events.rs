@@ -233,6 +233,49 @@ struct SequenceState {
     epoch: Option<String>,
     retired: HashSet<String>,
     sequences: HashMap<AccountKey, u64>,
+    /// Set when samples were acknowledged without their bodies; one `usage.get`
+    /// snapshot then stands in for everything they carried.
+    owe_snapshot: bool,
+    last_catch_up_attempt: Option<Instant>,
+}
+
+/// Insula keeps only its newest samples per account and none from before its
+/// own restart, so past this many pending events the backlog is acknowledged
+/// unread and replaced by one snapshot instead of fetched event by event.
+const CATCH_UP_LAG: u64 = 64;
+/// Snapshot attempts while catching up, so a failing `usage.get` can't turn a
+/// backlog into one route open per event.
+const CATCH_UP_SNAPSHOT_EVERY: Duration = Duration::from_secs(30);
+
+async fn catch_up_snapshot<S: SampleSource>(
+    source: &mut S,
+    live: &LiveQuota,
+    state: &mut SequenceState,
+) {
+    let now = Instant::now();
+    if !state.owe_snapshot
+        || state
+            .last_catch_up_attempt
+            .is_some_and(|at| now.duration_since(at) < CATCH_UP_SNAPSHOT_EVERY)
+    {
+        return;
+    }
+    state.last_catch_up_attempt = Some(now);
+    if snapshot(source, live).await {
+        state.owe_snapshot = false;
+    }
+}
+
+/// Insula answers a refused `events_get` with a normal reply body
+/// `{"error":{"code":..}}` rather than an error frame.
+fn insula_error_code(bytes: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    value.get("result").is_none().then_some(())?;
+    value
+        .get("error")?
+        .get("code")?
+        .as_str()
+        .map(str::to_string)
 }
 
 impl SequenceState {
@@ -329,20 +372,56 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
         return Ok(());
     };
     let message = delivery.message;
+    let far_behind = live
+        .cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.consumer.lag)
+        .is_some_and(|lag| lag > CATCH_UP_LAG);
+    let retired_epoch = message
+        .headers
+        .get("epoch")
+        .is_some_and(|epoch| state.retired.contains(epoch));
+    if retired_epoch {
+        // The newer epoch's own snapshot already replaced this sample's reading.
+        return cursor
+            .ack()
+            .await
+            .map_err(|e| ConsumeError::Bus(e.to_string()));
+    }
+    if far_behind {
+        state.owe_snapshot = true;
+        catch_up_snapshot(source, live, state).await;
+        return cursor
+            .ack()
+            .await
+            .map_err(|e| ConsumeError::Bus(e.to_string()));
+    }
+    catch_up_snapshot(source, live, state).await;
     let result = async {
         if message.subject != subject {
             return Err("unexpected insula event subject".into());
         }
         let bytes = match source.fetch(&message.id).await {
             Ok(bytes) => bytes,
-            Err(error) => {
-                if error.contains("event_not_found") {
-                    cursor.in_progress().await.map_err(|e| e.to_string())?;
-                    live.store(&source.snapshot().await?, false)?;
-                }
-                return Err(error);
+            Err(error) if error.contains("event_not_found") => {
+                state.owe_snapshot = true;
+                catch_up_snapshot(source, live, state).await;
+                return Ok(());
             }
+            Err(error) => return Err(error),
         };
+        // A refusal is final for this event: retrying returns the same answer,
+        // so acknowledge it. An expired body is replaced by one snapshot.
+        if let Some(code) = insula_error_code(&bytes) {
+            if code == "event_not_found" {
+                state.owe_snapshot = true;
+                catch_up_snapshot(source, live, state).await;
+            } else {
+                eprintln!("[prefrontal-routing] insula refused quota event {}: {code}", message.id);
+            }
+            return Ok(());
+        }
         let (sample, body) = verify(&message, &bytes)?;
         if !state.stale(&sample) {
             let covered = live.covered_by_snapshot(&body)?;

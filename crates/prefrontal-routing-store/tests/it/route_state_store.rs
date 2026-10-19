@@ -3004,21 +3004,6 @@ fn unscored_rows_retain_provenance_in_the_fact_loader() {
 }
 
 #[test]
-fn aa_index_cache_replace_is_wholesale() {
-    let rig = Rig::new("aa-index-cache");
-    let store = rig.open();
-    store
-        .replace_aa_index_table(&[("slug-a".into(), 40.0), ("slug-b".into(), 50.0)], 10)
-        .unwrap();
-    assert_eq!(store.get_aa_index("slug-a").unwrap(), Some((40.0, 10)));
-    store
-        .replace_aa_index_table(&[("slug-c".into(), 12.0)], 20)
-        .unwrap();
-    assert_eq!(store.get_aa_index("slug-a").unwrap(), None);
-    assert_eq!(store.get_aa_index("slug-c").unwrap(), Some((12.0, 20)));
-}
-
-#[test]
 fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_overrides() {
     let rig = Rig::new("fusiform-precedence");
     let store = rig.open();

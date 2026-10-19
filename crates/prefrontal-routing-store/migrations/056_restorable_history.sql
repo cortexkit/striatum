@@ -1,4 +1,4 @@
--- Migration 55: recognise a re-sent runner event without the observation log.
+-- Migration 56: recognise a re-sent runner event without the observation log.
 --
 -- A backup may skip a table and restore it empty while every other table
 -- keeps its rows. `account_observation`, the verbatim runner observation log

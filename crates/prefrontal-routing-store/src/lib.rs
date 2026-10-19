@@ -186,10 +186,11 @@ const MIGRATION_051: &str = include_str!("../migrations/051_model_identity_and_s
 const MIGRATION_052: &str = include_str!("../migrations/052_retire_account_shadow.sql");
 const MIGRATION_053: &str = include_str!("../migrations/053_selected_harness_workload.sql");
 const MIGRATION_054: &str = include_str!("../migrations/054_parent_failure_index.sql");
-/// Migration 55: the runner-event dedupe table that lets a backup restore the
+const MIGRATION_055: &str = include_str!("../migrations/055_drop_aa_index_cache.sql");
+/// Migration 56: the runner-event dedupe table that lets a backup restore the
 /// observation log empty. The foreign keys into the history logs are dropped
 /// by `drop_history_foreign_keys`, outside the migration chain.
-const MIGRATION_055: &str = include_str!("../migrations/055_restorable_history.sql");
+const MIGRATION_056: &str = include_str!("../migrations/056_restorable_history.sql");
 
 /// The foreign-key clauses, verbatim as migration 44 wrote them, that tie
 /// backed-up account tables to the two account-selection history logs.
@@ -234,7 +235,10 @@ fn drop_history_foreign_keys(connection: &Connection) -> rusqlite::Result<()> {
         let edited = tx.execute(
             "UPDATE sqlite_schema SET sql = replace(replace(sql, ?1, ''), ?2, '') \
              WHERE type = 'table' AND (instr(sql, ?1) > 0 OR instr(sql, ?2) > 0)",
-            params![HISTORY_FOREIGN_KEY_CLAUSES[0], HISTORY_FOREIGN_KEY_CLAUSES[1]],
+            params![
+                HISTORY_FOREIGN_KEY_CLAUSES[0],
+                HISTORY_FOREIGN_KEY_CLAUSES[1]
+            ],
         );
         // Switch schema editing off before anything else can fail, so an
         // error never leaves this connection able to write sqlite_schema.
@@ -314,7 +318,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 55] {
+fn route_state_migrations() -> [Migration; 56] {
     [
         Migration {
             version: 1,
@@ -535,6 +539,10 @@ fn route_state_migrations() -> [Migration; 55] {
         Migration {
             version: 55,
             statements: MIGRATION_055,
+        },
+        Migration {
+            version: 56,
+            statements: MIGRATION_056,
         },
     ]
 }
@@ -1481,29 +1489,6 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Replace the AA index cache in one transaction. A failed fetch must not
-    /// call this, so the previous table survives (fail-open).
-    pub fn replace_aa_index_table(
-        &self,
-        rows: &[(String, f64)],
-        fetched_at: i64,
-    ) -> RouteStateResult<()> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
-                tx.execute("DELETE FROM aa_index_cache", [])?;
-                for (slug, index) in rows {
-                    tx.execute(
-                        "INSERT INTO aa_index_cache (aa_slug, aa_index, fetched_at)
-                         VALUES (?1, ?2, ?3)",
-                        params![slug, index, fetched_at],
-                    )?;
-                }
-                tx.commit()
-            })
-            .map_err(err)
-    }
-
     /// The last announced route-winner ladder as the routing module serialized
     /// it, or `None` before the first ladder was ever recorded.
     pub fn route_winner_baseline(&self) -> RouteStateResult<Option<String>> {
@@ -1714,20 +1699,6 @@ impl SqliteRouteStateStore {
                     params![roster.view, roster.roster_json, roster.fetched_at],
                 )
                 .map(|_| ())
-            })
-            .map_err(err)
-    }
-
-    /// Latest cached AA intelligence index for an AA slug, plus when it was fetched.
-    pub fn get_aa_index(&self, slug: &str) -> RouteStateResult<Option<(f64, i64)>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                c.query_row(
-                    "SELECT aa_index, fetched_at FROM aa_index_cache WHERE aa_slug = ?1",
-                    [slug],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
             })
             .map_err(err)
     }
@@ -5411,11 +5382,11 @@ mod tests {
         rows.collect::<rusqlite::Result<_>>().unwrap()
     }
 
-    /// A store at migration 54, with every account table populated while
+    /// A store at migration 55, with every account table populated while
     /// foreign keys are enforced, opens with the foreign keys into the two
     /// history logs gone: rows and the admission-to-pin key are untouched,
     /// the database passes the integrity check, a second open changes
-    /// nothing, and migration 55 copied only the recent runner event's key.
+    /// nothing, and migration 56 copied only the recent runner event's key.
     #[test]
     fn opening_drops_the_history_foreign_keys_in_place_and_keeps_every_row() {
         let scratch = prefrontal_test_support::scratch_root().join(format!(
@@ -5431,7 +5402,7 @@ mod tests {
         let now = now_ms();
         let legacy = open_sqlite(&descriptor).unwrap();
         legacy
-            .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations()[..54])
+            .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations()[..55])
             .unwrap();
         let (legacy_keys, legacy_version) = legacy
             .with_conn(|c| {
@@ -5521,11 +5492,10 @@ mod tests {
                     ("account_fence", 1),
                     ("account_principal_exclusion", 1),
                 ] {
-                    let count: i64 = c.query_row(
-                        &format!("SELECT COUNT(*) FROM {table}"),
-                        [],
-                        |row| row.get(0),
-                    )?;
+                    let count: i64 =
+                        c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })?;
                     assert_eq!(count, rows, "{table}");
                 }
                 let keys: String = c.query_row(
@@ -5556,7 +5526,10 @@ mod tests {
             .store
             .with_conn(|c| c.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0)))
             .unwrap();
-        assert_eq!(reopened_version, opened_version, "a second open edits nothing");
+        assert_eq!(
+            reopened_version, opened_version,
+            "a second open edits nothing"
+        );
         drop(reopened);
         std::fs::remove_dir_all(scratch).unwrap();
     }
