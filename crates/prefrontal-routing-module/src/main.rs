@@ -166,8 +166,8 @@ struct QuotaCache {
     available: bool,
     /// Last connect/fetch error (observability: surfaced via route.quota_status).
     last_error: Option<String>,
-    /// Provider/account keys whose most recent refresh degraded while a healthy window is retained.
-    retained_degraded_keys: HashSet<String>,
+    /// First degraded time for each provider/account whose healthy window is retained.
+    retained_degraded_since_ms: HashMap<String, u64>,
     /// Set when `windows` came from the snapshot persisted before the last
     /// restart rather than from a poll made by this process: the Unix-millisecond
     /// poll time at which that snapshot was accepted. Cleared by the first
@@ -296,8 +296,25 @@ fn quota_cache_key(window: &ProviderUsage) -> String {
 fn merge_quota_windows(
     existing: &mut Vec<ProviderUsage>,
     fresh: Vec<ProviderUsage>,
-    retained_degraded_keys: &mut HashSet<String>,
+    retained_degraded_since_ms: &mut HashMap<String, u64>,
+    now_ms: u64,
 ) {
+    // Successful events for other accounts advance the cache-wide refresh time,
+    // so expire retained windows against the first degraded reading for each key.
+    let expired_keys: HashSet<String> = retained_degraded_since_ms
+        .iter()
+        .filter_map(|(key, first_degraded_at_ms)| {
+            (now_ms.saturating_sub(*first_degraded_at_ms) > QUOTA_STALE_AFTER_MS)
+                .then(|| key.clone())
+        })
+        .collect();
+    if !expired_keys.is_empty() {
+        existing.retain(|window| !expired_keys.contains(&quota_cache_key(window)));
+        for key in expired_keys {
+            retained_degraded_since_ms.remove(&key);
+        }
+    }
+
     let mut fresh_by_key: std::collections::HashMap<String, ProviderUsage> = fresh
         .into_iter()
         .map(|window| (quota_cache_key(&window), window))
@@ -317,37 +334,43 @@ fn merge_quota_windows(
             // healthy window routed workers to a dead subscription for a day
             // before this arm learned the class). Drop retention for all three
             // and take the degraded entry as the truth. Every other class keeps
-            // retention: decode_failed self-recovers, upstream/rejected age out
-            // via the freshness map.
+            // its last healthy window only until that key's degraded age reaches
+            // the stale bound; refreshes for other keys cannot extend its lifetime.
             let dead_credential = replacement.error_class.as_deref().is_some_and(|class| {
                 class == "credential_absent"
                     || class == "credential_unusable"
                     || class == "no_quota_reported"
             });
             if window.is_healthy() && !replacement.is_healthy() && !dead_credential {
-                if retained_degraded_keys.insert(key.clone()) {
-                    let reason = replacement
-                        .error
-                        .as_deref()
-                        .filter(|reason| !reason.is_empty())
-                        .unwrap_or("no usable quota windows");
-                    let provider = match replacement
-                        .account
-                        .as_deref()
-                        .filter(|account| !account.is_empty())
-                    {
-                        Some(account) => format!("{} account {}", replacement.provider, account),
-                        None => replacement.provider.clone(),
-                    };
-                    eprintln!(
-                        "[prefrontal-routing] retaining last healthy quota window for {provider} after degraded refresh: {reason}"
-                    );
+                let first_degraded_at_ms = *retained_degraded_since_ms
+                    .entry(key.clone())
+                    .or_insert_with(|| {
+                        let reason = replacement
+                            .error
+                            .as_deref()
+                            .filter(|reason| !reason.is_empty())
+                            .unwrap_or("no usable quota windows");
+                        let provider = match replacement
+                            .account
+                            .as_deref()
+                            .filter(|account| !account.is_empty())
+                        {
+                            Some(account) => format!("{} account {}", replacement.provider, account),
+                            None => replacement.provider.clone(),
+                        };
+                        eprintln!(
+                            "[prefrontal-routing] retaining last healthy quota window for {provider} after degraded refresh: {reason}"
+                        );
+                        now_ms
+                    });
+                if now_ms.saturating_sub(first_degraded_at_ms) > QUOTA_STALE_AFTER_MS {
+                    retained_degraded_since_ms.remove(&key);
+                    merged.push(replacement);
+                } else {
+                    merged.push(window);
                 }
-                merged.push(window);
             } else {
-                if replacement.is_healthy() {
-                    retained_degraded_keys.remove(&key);
-                }
+                retained_degraded_since_ms.remove(&key);
                 merged.push(replacement);
             }
         } else {
@@ -356,7 +379,7 @@ fn merge_quota_windows(
     }
     for (key, window) in fresh_by_key {
         if window.is_healthy() {
-            retained_degraded_keys.remove(&key);
+            retained_degraded_since_ms.remove(&key);
         }
         merged.push(window);
     }
@@ -464,9 +487,14 @@ fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observ
     // were persisted, so nothing restored outlives the first fresh reading.
     if cache.restored_from_ms.take().is_some() {
         cache.windows.clear();
-        cache.retained_degraded_keys.clear();
+        cache.retained_degraded_since_ms.clear();
     }
-    merge_quota_windows(&mut cache.windows, fresh, &mut cache.retained_degraded_keys);
+    merge_quota_windows(
+        &mut cache.windows,
+        fresh,
+        &mut cache.retained_degraded_since_ms,
+        observed_at_ms,
+    );
     cache.refreshed_at_ms = observed_at_ms;
     cache.available = true;
     cache.last_error = None;
@@ -527,7 +555,7 @@ fn restore_quota_cache(store: &SqliteRouteStateStore) -> QuotaCache {
         refreshed_at_ms: observed_at_ms,
         available: false,
         last_error: None,
-        retained_degraded_keys: HashSet::new(),
+        retained_degraded_since_ms: HashMap::new(),
         restored_from_ms: Some(observed_at_ms),
         consumer: Default::default(),
     }
@@ -1177,10 +1205,15 @@ async fn handle_control_request(
         ModuleControlRequest::HealthCheck {} => {
             // Unknown Broca reachability and stale quota snapshots can coexist.
             // Unmapped credential IDs remain in metrics without affecting status.
-            let mut report = broca_credentials
+            let (mut report, pricing_ready) = broca_credentials
                 .lock()
-                .map(|credentials| credentials.health_report(now_ms()))
-                .unwrap_or_else(|_| BrocaCredentials::default().health_report(now_ms()));
+                .map(|credentials| {
+                    (
+                        credentials.health_report(now_ms()),
+                        credentials.billing_catalog.is_loaded(),
+                    )
+                })
+                .unwrap_or_else(|_| (BrocaCredentials::default().health_report(now_ms()), false));
             let broca_metrics = report.metrics.take();
             let (quota_detail, quota_metrics) = match quota_cache.lock() {
                 Ok(cache) => quota_health(&cache, now_ms()),
@@ -1189,7 +1222,15 @@ async fn handle_control_request(
                     json!({ "lastError": "cache poisoned" }),
                 ),
             };
-            if let Some(detail) = quota_detail {
+            for detail in [
+                (!pricing_ready).then(|| {
+                    "routing pricing not ready: awaiting first billing-plane load".to_string()
+                }),
+                quota_detail,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 report.status = HealthStatus::Degraded;
                 report.detail = Some(match report.detail.take() {
                     Some(existing) => format!("{existing}; {detail}"),
@@ -1197,6 +1238,7 @@ async fn handle_control_request(
                 });
             }
             report.metrics = Some(json!({
+                "pricingReady": pricing_ready,
                 "brocaReachability": broca_metrics,
                 "fusiformCatalog": catalog_health
                     .lock()
@@ -2781,7 +2823,7 @@ fn prepare_selection_inputs(
             (!guard.windows.is_empty()).then(|| guard.windows.clone()),
             guard.available,
             guard.refreshed_at_ms,
-            guard.retained_degraded_keys.len(),
+            guard.retained_degraded_since_ms.len(),
             guard.last_error.clone(),
             guard.restored_from_ms,
         ),
@@ -3170,6 +3212,34 @@ async fn handle_select_request(
             },
         );
         return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
+    }
+    if matches!(
+        envelope.method.as_str(),
+        ROUTE_SELECT_OP | ROUTE_SELECT_PANEL_OP
+    ) && !broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
+        .await
+    {
+        let body = serde_json::to_vec(&ErrorBody {
+            code: "routing_not_ready".into(),
+            message: "routing pricing is awaiting its first billing-plane load; retry shortly"
+                .into(),
+            detail: Some(json!({"retryable": true, "retry_after_ms": 1000})),
+        })
+        .map_err(ModuleError::Json)?;
+        return send(
+            writer,
+            Frame::build_with_version(
+                ver,
+                FrameType::Error,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                corr,
+                body,
+            )
+            .map_err(|e| ModuleError::Message(e.to_string()))?,
+        )
+        .await;
     }
     if envelope.method == ROUTE_SELECT_PANEL_OP {
         return handle_select_panel(
@@ -6791,7 +6861,9 @@ mod tests {
     }
 
     fn empty_broca_credentials() -> SharedBrocaCredentials {
-        Arc::new(Mutex::new(BrocaCredentials::default()))
+        // These wire fixtures represent a completed catalog load with no supplied
+        // planes. Cold-start tests construct the uninitialized cache explicitly.
+        Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(&[])))
     }
 
     fn mapped_broca_credentials(provider: &str) -> SharedBrocaCredentials {
@@ -6882,7 +6954,7 @@ mod tests {
         .await
     }
 
-    async fn run_route_wire_request_with_paths(
+    pub(super) async fn run_route_wire_request_with_paths(
         store: &SharedStore,
         mut request: serde_json::Value,
         operator_config_path: &Path,
@@ -6950,6 +7022,7 @@ mod tests {
             .unwrap(),
         );
         let mut before = BrocaCredentials::default();
+        before.billing_catalog = fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[]);
         before.legacy_pricing_baseline = true;
         let before_credentials = Arc::new(Mutex::new(before));
         let state = account_quota::restore_account_state(&store);
@@ -8198,8 +8271,8 @@ mod tests {
             "usage": { "primary": { "usedPercent": 40.0, "resetsAt": "2031-01-01T00:00:00Z" } }
         }))];
 
-        let mut retained_degraded_keys = HashSet::new();
-        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+        let mut retained_degraded_since_ms = HashMap::new();
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_since_ms, 0);
 
         let codex = cached
             .iter()
@@ -8236,9 +8309,9 @@ mod tests {
             "provider": "codex",
             "error": "quota source timeout"
         }))];
-        let mut retained_degraded_keys = HashSet::new();
+        let mut retained_degraded_since_ms = HashMap::new();
 
-        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_since_ms, 0);
 
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].provider, "codex");
@@ -8254,7 +8327,100 @@ mod tests {
                 .map(|window| window.used_percent),
             Some(97.0)
         );
-        assert!(retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+        assert!(retained_degraded_since_ms.contains_key(&quota_cache_key(&cached[0])));
+    }
+
+    #[test]
+    fn retained_degraded_quota_window_expires_despite_recurring_degraded_and_unrelated_successful_refreshes(
+    ) {
+        let first_reading_at_ms = 1_000;
+        let first_degraded_at_ms = first_reading_at_ms + 1;
+        let repeated_degraded_at_ms = first_degraded_at_ms + QUOTA_STALE_AFTER_MS / 2;
+        let unrelated_refresh_at_ms = first_degraded_at_ms + QUOTA_STALE_AFTER_MS + 1;
+        let mut cache = QuotaCache::default();
+
+        apply_quota_refresh(
+            &mut cache,
+            vec![usage(serde_json::json!({
+                "provider": "codex",
+                "usage": { "primary": { "usedPercent": 97.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+            }))],
+            first_reading_at_ms,
+        );
+        apply_quota_refresh(
+            &mut cache,
+            vec![usage(serde_json::json!({
+                "provider": "codex",
+                "error": "quota source timeout"
+            }))],
+            first_degraded_at_ms,
+        );
+        apply_quota_refresh(
+            &mut cache,
+            vec![usage(serde_json::json!({
+                "provider": "codex",
+                "error": "quota source timeout"
+            }))],
+            repeated_degraded_at_ms,
+        );
+
+        let codex_key = quota_cache_key(&cache.windows[0]);
+        assert_eq!(
+            cache.windows[0].error, None,
+            "the last healthy window is retained temporarily"
+        );
+        assert_eq!(
+            cache.retained_degraded_since_ms.get(&codex_key),
+            Some(&first_degraded_at_ms),
+            "repeated failures must not restart the retention clock"
+        );
+
+        apply_quota_refresh(
+            &mut cache,
+            vec![usage(serde_json::json!({
+                "provider": "grok",
+                "usage": { "primary": { "usedPercent": 40.0, "resetsAt": "2031-01-01T00:00:00Z" } }
+            }))],
+            unrelated_refresh_at_ms,
+        );
+
+        assert!(
+            cache
+                .windows
+                .iter()
+                .all(|window| window.provider != "codex"),
+            "another account's fresh reading must not keep codex's degraded window alive"
+        );
+        assert!(cache.retained_degraded_since_ms.is_empty());
+        assert!(quota_health(&cache, unrelated_refresh_at_ms).0.is_none());
+
+        apply_quota_refresh(
+            &mut cache,
+            vec![usage(serde_json::json!({
+                "provider": "codex",
+                "usage": { "primary": { "usedPercent": 12.0, "resetsAt": "2031-01-01T00:00:00Z" } }
+            }))],
+            unrelated_refresh_at_ms + 1,
+        );
+
+        let recovered = cache
+            .windows
+            .iter()
+            .find(|window| window.provider == "codex")
+            .expect("a fresh healthy reading restores the account");
+        assert!(recovered.error.is_none());
+        assert_eq!(
+            recovered
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(12.0)
+        );
+        assert!(cache.retained_degraded_since_ms.is_empty());
+        assert!(quota_health(&cache, unrelated_refresh_at_ms + 1)
+            .0
+            .is_none());
     }
 
     #[test]
@@ -8272,9 +8438,9 @@ mod tests {
             "error": "invalid_grant: token revoked",
             "errorClass": "credential_unusable"
         }))];
-        let mut retained_degraded_keys = HashSet::new();
+        let mut retained_degraded_since_ms = HashMap::new();
 
-        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_since_ms, 0);
 
         assert_eq!(cached.len(), 1);
         assert!(
@@ -8286,7 +8452,7 @@ mod tests {
             Some("credential_unusable")
         );
         assert!(
-            retained_degraded_keys.is_empty(),
+            retained_degraded_since_ms.is_empty(),
             "no retention record for a revoked account"
         );
     }
@@ -8307,9 +8473,9 @@ mod tests {
             "error": "qwen-cloud: the account has no token plan (gateway affirmed success and reported no plan block)",
             "errorClass": "no_quota_reported"
         }))];
-        let mut retained_degraded_keys = HashSet::new();
+        let mut retained_degraded_since_ms = HashMap::new();
 
-        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_since_ms, 0);
 
         assert_eq!(cached.len(), 1);
         assert!(
@@ -8318,7 +8484,7 @@ mod tests {
         );
         assert_eq!(cached[0].error_class.as_deref(), Some("no_quota_reported"));
         assert!(
-            retained_degraded_keys.is_empty(),
+            retained_degraded_since_ms.is_empty(),
             "no retention record for a provider that does not exist here"
         );
     }
@@ -8338,9 +8504,9 @@ mod tests {
             "error": "no credential configured",
             "errorClass": "credential_absent"
         }))];
-        let mut retained_degraded_keys = HashSet::new();
+        let mut retained_degraded_since_ms = HashMap::new();
 
-        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_since_ms, 0);
 
         assert_eq!(cached.len(), 1);
         assert!(
@@ -8349,7 +8515,7 @@ mod tests {
         );
         assert_eq!(cached[0].error_class.as_deref(), Some("credential_absent"));
         assert!(
-            retained_degraded_keys.is_empty(),
+            retained_degraded_since_ms.is_empty(),
             "no retention record for a provider that does not exist here"
         );
     }
@@ -8368,9 +8534,9 @@ mod tests {
             "error": "novel failure",
             "errorClass": "some_future_class"
         }))];
-        let mut retained_degraded_keys = HashSet::new();
+        let mut retained_degraded_since_ms = HashMap::new();
 
-        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_since_ms, 0);
 
         assert_eq!(cached.len(), 1);
         assert!(
@@ -8389,9 +8555,9 @@ mod tests {
             "provider": "codex",
             "usage": {}
         }))];
-        let mut retained_degraded_keys = HashSet::new();
+        let mut retained_degraded_since_ms = HashMap::new();
 
-        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_since_ms, 0);
 
         assert_eq!(
             cached[0]
@@ -8401,7 +8567,7 @@ mod tests {
                 .map(|window| window.used_percent),
             Some(88.0)
         );
-        assert!(retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+        assert!(retained_degraded_since_ms.contains_key(&quota_cache_key(&cached[0])));
     }
 
     #[test]
@@ -9870,7 +10036,7 @@ mod tests {
         health_report_for_with_credentials(cache, &mapped_broca_credentials("anthropic")).await
     }
 
-    async fn health_report_for_with_credentials(
+    pub(super) async fn health_report_for_with_credentials(
         cache: QuotaCache,
         broca_credentials: &SharedBrocaCredentials,
     ) -> ModuleControlResponse {
@@ -13115,9 +13281,9 @@ mod tests {
             "provider": "codex",
             "usage": { "primary": { "usedPercent": 12.0, "resetsAt": "2031-01-01T00:00:00Z" } }
         }))];
-        let mut retained_degraded_keys = HashSet::from([quota_cache_key(&cached[0])]);
+        let mut retained_degraded_since_ms = HashMap::from([(quota_cache_key(&cached[0]), 0)]);
 
-        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_keys);
+        merge_quota_windows(&mut cached, fresh, &mut retained_degraded_since_ms, 0);
 
         assert_eq!(cached.len(), 1);
         assert!(cached[0].error.is_none());
@@ -13129,7 +13295,7 @@ mod tests {
                 .map(|window| window.used_percent),
             Some(12.0)
         );
-        assert!(!retained_degraded_keys.contains(&quota_cache_key(&cached[0])));
+        assert!(!retained_degraded_since_ms.contains_key(&quota_cache_key(&cached[0])));
     }
 
     #[tokio::test]
