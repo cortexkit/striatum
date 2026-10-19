@@ -1063,6 +1063,8 @@ pub struct CatalogReachHealth {
     poll_ms: u64,
     last_reached_at_ms: Option<u64>,
     last_error: Option<String>,
+    unserved_routes: Vec<String>,
+    reported_unserved_routes: BTreeSet<String>,
 }
 
 impl CatalogReachHealth {
@@ -1071,6 +1073,8 @@ impl CatalogReachHealth {
             poll_ms,
             last_reached_at_ms: None,
             last_error: None,
+            unserved_routes: Vec::new(),
+            reported_unserved_routes: BTreeSet::new(),
         }
     }
 
@@ -1087,12 +1091,24 @@ impl CatalogReachHealth {
         self.last_error = Some(reason.to_string());
     }
 
+    fn note_unserved_routes(&mut self, routes: Vec<String>) -> Vec<String> {
+        self.unserved_routes = routes;
+        let mut newly_reported = Vec::new();
+        for route in &self.unserved_routes {
+            if self.reported_unserved_routes.insert(route.clone()) {
+                newly_reported.push(route.clone());
+            }
+        }
+        newly_reported
+    }
+
     pub fn snapshot(&self, now_ms: u64) -> Value {
         let stale_after_ms = self.poll_ms.saturating_mul(2);
         match self.last_reached_at_ms {
             None => json!({
                 "reach": "never-reached",
                 "lastError": self.last_error,
+                "unservedRoutes": self.unserved_routes,
             }),
             Some(reached_at_ms) => {
                 let age_ms = now_ms.saturating_sub(reached_at_ms);
@@ -1106,6 +1122,7 @@ impl CatalogReachHealth {
                     "ageMs": age_ms,
                     "lastReachedAtMs": reached_at_ms,
                     "lastError": self.last_error,
+                    "unservedRoutes": self.unserved_routes,
                 })
             }
         }
@@ -1153,6 +1170,25 @@ fn apply_catalog_snapshot(
     Ok(())
 }
 
+fn report_unserved_routes(
+    store: &SqliteRouteStateStore,
+    health: &SharedCatalogHealth,
+) -> Result<(), FusiformCatalogError> {
+    let routes = store
+        .prune_unserved_unpicked_facts()
+        .map_err(|reason| error(format!("list and prune absent routes: {reason}")))?;
+    if let Ok(mut health) = health.lock() {
+        let newly_reported = health.note_unserved_routes(routes);
+        if !newly_reported.is_empty() {
+            eprintln!(
+                "[prefrontal-routing] Fusiform does not serve these routes: {}",
+                newly_reported.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn apply_mapped_catalog(
     store: &SqliteRouteStateStore,
     snapshot: &CatalogSnapshot,
@@ -1166,7 +1202,7 @@ fn apply_mapped_catalog(
         providers.insert(provider.to_string());
     }
     store
-        .apply_fusiform_catalog_for_providers(&snapshot.facts, snapshot.cursor, &providers)
+        .apply_fusiform_catalog_snapshot_for_providers(&snapshot.facts, snapshot.cursor, &providers)
         .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
     if let Some(credentials) = credentials {
         credentials
@@ -1243,6 +1279,7 @@ async fn bootstrap_cycle<C: CatalogWire>(
         client.credentials().as_ref(),
         "catalog.get",
     )?;
+    report_unserved_routes(store, health)?;
     if let Ok(mut health) = health.lock() {
         health.note_reached(now_ms());
     }
@@ -1278,6 +1315,7 @@ async fn poll_cycle<C: CatalogWire>(
             client.credentials().as_ref(),
             "catalog replay",
         )?;
+        report_unserved_routes(store, health)?;
         1
     } else {
         client.refresh_planes(None).await?;
@@ -2632,5 +2670,79 @@ mod tests {
             "reached"
         );
         assert_eq!(wire.get_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_lists_unserved_overrides_and_reports_each_route_once() {
+        use prefrontal_routing_core::{FactSource, RouteStateStore as _};
+
+        let rig = Rig::new("health-unserved-override");
+        let store = rig.store();
+        store
+            .upsert_fact(
+                &crate::tests::fact("test", "unserved-override"),
+                FactSource::Override,
+            )
+            .unwrap();
+        let initial = decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
+        let health = Arc::new(Mutex::new(CatalogReachHealth::new(600_000)));
+        let mut bootstrap = FakeWire {
+            status: CatalogStatusReply { catalog_version: 0 },
+            snapshot: initial.clone(),
+            get_calls: 0,
+            closed: false,
+        };
+        bootstrap_cycle(&mut bootstrap, &store, &health, None, None)
+            .await
+            .unwrap();
+
+        let snapshot = health.lock().unwrap().snapshot(now_ms());
+        assert!(snapshot["unservedRoutes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("test/unserved-override")));
+        let reported_before = health
+            .lock()
+            .unwrap()
+            .reported_unserved_routes
+            .len();
+        assert!(reported_before > 0);
+        assert!(health
+            .lock()
+            .unwrap()
+            .reported_unserved_routes
+            .contains("test/unserved-override"));
+
+        let mut advanced = initial;
+        let next_version = advanced.cursor.catalog_version + 1;
+        advanced.cursor.catalog_version = next_version;
+        let mut poll = FakeWire {
+            status: CatalogStatusReply {
+                catalog_version: next_version,
+            },
+            snapshot: advanced,
+            get_calls: 0,
+            closed: false,
+        };
+        poll_cycle(&mut poll, &store, &health, None, None)
+            .await
+            .unwrap();
+        assert_eq!(poll.get_calls, 1);
+        assert_eq!(
+            health
+                .lock()
+                .unwrap()
+                .reported_unserved_routes
+                .len(),
+            reported_before,
+            "a continuing stale route is logged only once"
+        );
+        assert!(health
+            .lock()
+            .unwrap()
+            .snapshot(now_ms())["unservedRoutes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("test/unserved-override")));
     }
 }

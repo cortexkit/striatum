@@ -4263,3 +4263,245 @@ fn migration_041_removes_fast_facts_and_route_state_without_touching_history() {
         .count();
     assert_eq!(violations, 0);
 }
+
+
+#[test]
+fn migration_057_prunes_unserved_unpicked_facts_but_preserves_overrides_and_decisions() {
+    use rusqlite::{params, Connection};
+
+    let rig = Rig::new("migration-057-fusiform-prune");
+    let store = rig.open();
+    for (provider, model, source) in [
+        ("test", "old-unpicked", FactSource::Seed),
+        ("test", "recent-picked", FactSource::Seed),
+        ("test", "old-pick", FactSource::Seed),
+        ("test", "override-unserved", FactSource::Override),
+        ("test", "unknown-presence", FactSource::Seed),
+        (
+            "google",
+            "antigravity-gemini-4-argon-high",
+            FactSource::Override,
+        ),
+        (
+            "google",
+            "antigravity-gemini-4-argon-low",
+            FactSource::Override,
+        ),
+    ] {
+        store.upsert_fact(&fact(provider, model), source).unwrap();
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let ten_days_ago = now_ms - 10 * 24 * 60 * 60 * 1000;
+    let thirty_one_days_ago = now_ms - 31 * 24 * 60 * 60 * 1000;
+    let connection = Connection::open(rig.db_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE model_facts SET fusiform_present = 0, facts_source = 'fusiform'
+             WHERE route_key IN (
+               'test/old-unpicked', 'test/recent-picked', 'test/old-pick',
+               'test/override-unserved',
+               'google/antigravity-gemini-4-argon-high',
+               'google/antigravity-gemini-4-argon-low'
+             )",
+            [],
+        )
+        .unwrap();
+    let add_decision = |id: &str, route_key: &str, created_at: i64| {
+        connection
+            .execute(
+                "INSERT INTO model_route_decisions (
+                   id, target_agent, requirements_json, selected_route_key, score_json,
+                   rejected_json, anchor_version, created_at
+                 ) VALUES (?1, 'explore', '{}', ?2, '{}', '[]', 1, ?3)",
+                params![id, route_key, created_at],
+            )
+            .unwrap();
+    };
+    add_decision("recent-picked", "test/recent-picked", ten_days_ago);
+    add_decision("old-pick", "test/old-pick", thirty_one_days_ago);
+    add_decision(
+        "argon-high-pick",
+        "google/antigravity-gemini-4-argon-high",
+        ten_days_ago,
+    );
+    add_decision(
+        "argon-low-pick",
+        "google/antigravity-gemini-4-argon-low",
+        ten_days_ago,
+    );
+
+    connection
+        .execute_batch(include_str!("../../migrations/057_prune_absent_fusiform_facts.sql"))
+        .unwrap();
+
+    let row_count = |route_key: &str| {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM model_facts WHERE route_key = ?1",
+                [route_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(row_count("test/old-unpicked"), 0);
+    assert_eq!(row_count("test/old-pick"), 0);
+    assert_eq!(row_count("test/recent-picked"), 1);
+    assert_eq!(row_count("test/override-unserved"), 1);
+    assert_eq!(row_count("test/unknown-presence"), 1);
+    assert_eq!(row_count("google/antigravity-gemini-4-argon-high"), 0);
+    assert_eq!(row_count("google/antigravity-gemini-4-argon-low"), 0);
+
+    let decisions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM model_route_decisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(decisions, 4, "cleanup must not erase score or decision history");
+    let unserved_overrides: Vec<String> = connection
+        .prepare(
+            "SELECT route_key FROM model_facts
+             WHERE source = 'override' AND COALESCE(fusiform_present, 0) != 1
+             ORDER BY route_key",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(unserved_overrides, ["test/override-unserved"]);
+}
+
+#[test]
+fn absent_fusiform_facts_are_filtered_unless_the_operator_overrode_the_score() {
+    use rusqlite::Connection;
+
+    let rig = Rig::new("fusiform-absence-override-selection");
+    let store = rig.open();
+    store
+        .upsert_fact(&fact("test", "retired-seed"), FactSource::Seed)
+        .unwrap();
+    store
+        .upsert_fact(&fact("test", "retired-override"), FactSource::Override)
+        .unwrap();
+    Connection::open(rig.db_path())
+        .unwrap()
+        .execute(
+            "UPDATE model_facts SET fusiform_present = 0, facts_source = 'fusiform'
+             WHERE route_key IN ('test/retired-seed', 'test/retired-override')",
+            [],
+        )
+        .unwrap();
+
+    let routable = store.get_facts().unwrap();
+    assert!(routable.iter().all(|fact| fact.model_id != "retired-seed"));
+    assert!(routable.iter().any(|fact| fact.model_id == "retired-override"));
+    assert_eq!(
+        store.unserved_override_route_keys().unwrap(),
+        ["test/retired-override"]
+    );
+}
+
+#[test]
+fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
+    use rusqlite::{params, Connection};
+    use std::collections::HashSet;
+
+    let rig = Rig::new("complete-catalog-sync-prune");
+    let store = rig.open();
+    for (model, source) in [
+        ("catalog-served", FactSource::Seed),
+        ("recently-retired", FactSource::Seed),
+        ("unpicked-retired", FactSource::Seed),
+        ("operator-retired", FactSource::Override),
+    ] {
+        store.upsert_fact(&fact("test", model), source).unwrap();
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    Connection::open(rig.db_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO model_route_decisions (
+               id, target_agent, requirements_json, selected_route_key, score_json,
+               rejected_json, anchor_version, created_at
+             ) VALUES ('recent-retired-pick', 'explore', '{}', 'test/recently-retired', '{}', '[]', 1, ?1)",
+            params![now_ms - 10 * 24 * 60 * 60 * 1000],
+        )
+        .unwrap();
+
+    let served = FusiformFactUpdate {
+        auth_methods: None,
+        provider_id: "test".into(),
+        model_id: "catalog-served".into(),
+        present: true,
+        context_window: Some(16_384.0),
+        max_output_tokens: Some(2_048),
+        cost_tier: Some(1.0),
+        cost_per_mtok_out: Some(1.0),
+        input_rate: None,
+        cache_read_rate: None,
+        cache_write_rate: None,
+        reasoning_rate: None,
+        supports_vision: Some(false),
+        supports_tool_use: Some(true),
+        reasoning_efforts: None,
+        canonical_id: None,
+        upstream_status: None,
+    };
+    store
+        .apply_fusiform_catalog_snapshot_for_providers(
+            &[served],
+            FusiformCatalogCursor {
+                catalog_version: 100,
+                resolved_at_ms: now_ms,
+            },
+            &HashSet::new(),
+        )
+        .unwrap();
+    let absent_before_cleanup = store.prune_unserved_unpicked_facts().unwrap();
+
+    assert!(absent_before_cleanup.contains(&"test/recently-retired".to_string()));
+    assert!(absent_before_cleanup.contains(&"test/unpicked-retired".to_string()));
+    assert!(absent_before_cleanup.contains(&"test/operator-retired".to_string()));
+    assert_eq!(
+        store
+            .get_fact_by_route_key("test/catalog-served")
+            .unwrap()
+            .unwrap()
+            .supports_vision,
+        Some(false)
+    );
+    assert!(store
+        .get_fact_by_route_key("test/unpicked-retired")
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_fact_by_route_key("test/recently-retired")
+        .unwrap()
+        .is_some());
+    let routable = store.get_facts().unwrap();
+    assert!(routable.iter().any(|fact| fact.model_id == "catalog-served"));
+    assert!(routable.iter().any(|fact| fact.model_id == "operator-retired"));
+    assert!(routable.iter().all(|fact| fact.model_id != "recently-retired"));
+    assert_eq!(
+        store.unserved_override_route_keys().unwrap(),
+        ["test/operator-retired"]
+    );
+    let history_count: i64 = Connection::open(rig.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM model_route_decisions
+             WHERE selected_route_key = 'test/recently-retired'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(history_count, 1, "score history remains in the decision log");
+}

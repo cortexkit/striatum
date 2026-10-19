@@ -10530,6 +10530,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retired_argon_alias_cannot_route_from_stale_host_availability_after_cleanup() {
+        let rig = Rig::new("retired-argon-alias");
+        let store = Arc::new(rig.open_store());
+        let route = fact("google", "antigravity-gemini-4-argon-high");
+        store.upsert_fact(&route, FactSource::Override).unwrap();
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute(
+                "UPDATE model_facts SET fusiform_present = 0, facts_source = 'fusiform'
+                 WHERE route_key = 'google/antigravity-gemini-4-argon-high'",
+                [],
+            )
+            .unwrap();
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../prefrontal-routing-store/migrations/057_prune_absent_fusiform_facts.sql"
+            ))
+            .unwrap();
+        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        std::fs::write(
+            &operator_config,
+            r#"{ "model_routing": { "exclude": { "all": ["google/antigravity-gemini-4-argon"] } } }"#,
+        )
+        .unwrap();
+        let frame = run_route_wire_request_with_operator_config(
+            &store,
+            json!({
+                "method": ROUTE_SELECT_OP,
+                "params": {
+                    "targetAgent": "explore",
+                    "requirements": {"iq": 30, "eq": 0},
+                    "availableModels": ["google/antigravity-gemini-4-argon-high"],
+                    "providerAuthTypes": {}
+                }
+            }),
+            &operator_config,
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert!(
+            body.pointer("/result/selected").is_none(),
+            "a stale alias cannot bypass the canonical model exclusion: {body}"
+        );
+    }
+
     /// Point a config file's mtime at a fixed second so a live-edit test does not
     /// depend on the filesystem clock's resolution.
     fn set_config_mtime(path: &Path, seconds: u64) {

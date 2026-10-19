@@ -174,12 +174,9 @@ async fn paged_three_pages_apply_together_with_retired_models_and_curated_auth()
             .present
     );
     let rows = store.get_catalog_facts().unwrap();
-    assert_eq!(
-        rows.iter()
-            .find(|r| r.fact.provider_id == "beta")
-            .unwrap()
-            .fusiform_present,
-        Some(false)
+    assert!(
+        rows.iter().all(|row| row.fact.provider_id != "beta"),
+        "an absent route with no recent decision is pruned after the full snapshot"
     );
     assert!(store
         .get_facts()

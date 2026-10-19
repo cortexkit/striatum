@@ -186,6 +186,8 @@ const MIGRATION_052: &str = include_str!("../migrations/052_retire_account_shado
 const MIGRATION_053: &str = include_str!("../migrations/053_selected_harness_workload.sql");
 const MIGRATION_054: &str = include_str!("../migrations/054_parent_failure_index.sql");
 const MIGRATION_055: &str = include_str!("../migrations/055_drop_aa_index_cache.sql");
+/// Migration 57: prune unserved, unpicked facts while retaining decision history.
+const MIGRATION_057: &str = include_str!("../migrations/057_prune_absent_fusiform_facts.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -239,7 +241,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 55] {
+fn route_state_migrations() -> [Migration; 56] {
     [
         Migration {
             version: 1,
@@ -460,6 +462,10 @@ fn route_state_migrations() -> [Migration; 55] {
         Migration {
             version: 55,
             statements: MIGRATION_055,
+        },
+        Migration {
+            version: 57,
+            statements: MIGRATION_057,
         },
     ]
 }
@@ -1008,16 +1014,84 @@ impl SqliteRouteStateStore {
         Ok(rows)
     }
 
+    /// Override score rows that Fusiform does not currently list. Operator
+    /// overrides remain routable, so catalog refresh reports these instead of
+    /// deleting or silently hiding them.
+    pub fn unserved_override_route_keys(&self) -> RouteStateResult<Vec<String>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                let mut statement = connection.prepare(
+                    "SELECT route_key FROM model_facts
+                     WHERE source = 'override' AND COALESCE(fusiform_present, 0) != 1
+                     ORDER BY route_key",
+                )?;
+                let routes = statement.query_map([], |row| row.get(0))?;
+                routes.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)
+    }
+
+    /// List every absent route before pruning unpicked non-overrides whose last
+    /// selection is older than 30 days. Decision history is deliberately kept.
+    pub fn prune_unserved_unpicked_facts(&self) -> RouteStateResult<Vec<String>> {
+        self.store
+            .with_conn(|connection: &Connection| {
+                let tx = connection.unchecked_transaction()?;
+                let mut statement = tx.prepare(
+                    "SELECT route_key FROM model_facts
+                     WHERE fusiform_present = 0 ORDER BY route_key",
+                )?;
+                let unserved = statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                drop(statement);
+                tx.execute(
+                    "DELETE FROM model_route_state
+                     WHERE route_key IN (
+                       SELECT route_key FROM model_facts
+                       WHERE fusiform_present = 0
+                         AND source <> 'override'
+                         AND NOT EXISTS (
+                           SELECT 1 FROM model_route_decisions
+                           WHERE model_route_decisions.selected_route_key = model_facts.route_key
+                             AND model_route_decisions.created_at >=
+                               CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                               - 30 * 24 * 60 * 60 * 1000
+                         )
+                     )",
+                    [],
+                )?;
+                tx.execute(
+                    "DELETE FROM model_facts
+                     WHERE fusiform_present = 0
+                       AND source <> 'override'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM model_route_decisions
+                         WHERE model_route_decisions.selected_route_key = model_facts.route_key
+                           AND model_route_decisions.created_at >=
+                             CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                             - 30 * 24 * 60 * 60 * 1000
+                       )",
+                    [],
+                )?;
+                tx.commit()?;
+                Ok(unserved)
+            })
+            .map_err(err)
+    }
+
     /// Every stored fact paired with its canonical id, with shared scores
     /// resolved across ALL rows (a withdrawn listing still carries the model's
     /// placement for the routes that serve it), then filtered to rows Fusiform
-    /// has not withdrawn. The `bool` is whether the row is routable-present.
+    /// has not withdrawn unless the operator explicitly overrode the score.
+    /// The `bool` is whether the row is routable-present.
     fn read_resolved_facts(&self) -> RouteStateResult<Vec<(ModelFact, bool)>> {
         let rows = self
             .store
             .with_conn(|c: &Connection| {
                 let mut stmt = c.prepare(
-                    "SELECT *, COALESCE(fusiform_present, 1) = 1 AS present_now
+                    "SELECT *,
+                            (COALESCE(fusiform_present, 1) = 1 OR source = 'override') AS present_now
                      FROM model_facts",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -1176,7 +1250,10 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Apply one complete Fusiform snapshot and advance its cursor atomically.
+    /// Apply a batch of Fusiform facts and advance its cursor atomically. The
+    /// catalog refresh loop uses `apply_fusiform_catalog_snapshot_for_providers`
+    /// when it has a complete snapshot, so rows omitted from that snapshot are
+    /// marked absent before they are considered for cleanup.
     /// Matching is always the exact `(provider_id, model_id)` pair; variants of
     /// that pair receive the same external facts without changing variant policy.
     pub fn apply_fusiform_catalog(
@@ -1196,10 +1273,39 @@ impl SqliteRouteStateStore {
         cursor: FusiformCatalogCursor,
         mapped_providers: &HashSet<String>,
     ) -> RouteStateResult<()> {
+        self.apply_fusiform_catalog_for_providers_inner(facts, cursor, mapped_providers, false)
+    }
+
+    /// Apply a complete catalog snapshot, treating existing rows omitted from
+    /// it as absent before applying the served facts.
+    pub fn apply_fusiform_catalog_snapshot_for_providers(
+        &self,
+        facts: &[FusiformFactUpdate],
+        cursor: FusiformCatalogCursor,
+        mapped_providers: &HashSet<String>,
+    ) -> RouteStateResult<()> {
+        self.apply_fusiform_catalog_for_providers_inner(facts, cursor, mapped_providers, true)
+    }
+
+    fn apply_fusiform_catalog_for_providers_inner(
+        &self,
+        facts: &[FusiformFactUpdate],
+        cursor: FusiformCatalogCursor,
+        mapped_providers: &HashSet<String>,
+        complete_snapshot: bool,
+    ) -> RouteStateResult<()> {
         let scores_json = serde_json::to_string(&ModelScores::default()).map_err(err)?;
         self.store
             .with_conn(|connection: &Connection| {
                 let tx = connection.unchecked_transaction()?;
+                if complete_snapshot {
+                    tx.execute(
+                        "UPDATE model_facts
+                         SET facts_source = 'fusiform', fusiform_version = ?1,
+                             fusiform_present = 0, updated_at = ?2",
+                        params![cursor.catalog_version, now_ms()],
+                    )?;
+                }
                 for fact in facts {
                     if fact.model_id.ends_with("-fast") {
                         // The request service rejects -fast IDs at admission, so routing must not retain them.
