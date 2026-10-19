@@ -188,83 +188,12 @@ const MIGRATION_053: &str = include_str!("../migrations/053_selected_harness_wor
 const MIGRATION_054: &str = include_str!("../migrations/054_parent_failure_index.sql");
 const MIGRATION_055: &str = include_str!("../migrations/055_drop_aa_index_cache.sql");
 /// Migration 56: the runner-event dedupe table that lets a backup restore the
-/// observation log empty. The foreign keys into the history logs are dropped
-/// by `drop_history_foreign_keys`, outside the migration chain.
+/// observation log empty.
 const MIGRATION_056: &str = include_str!("../migrations/056_restorable_history.sql");
-
-/// The foreign-key clauses, verbatim as migration 44 wrote them, that tie
-/// backed-up account tables to the two account-selection history logs.
-const HISTORY_FOREIGN_KEY_CLAUSES: [&str; 2] = [
-    " REFERENCES account_decision (decision_id)",
-    " REFERENCES account_observation (observation_id)",
-];
-
-/// The history logs no other table may reference by foreign key.
-const HISTORY_LOG_TABLES: [&str; 2] = ["account_decision", "account_observation"];
-
-/// Drop the foreign keys `account_pin`, `account_admission` and `account_hold`
-/// hold into `account_decision`, and those `account_fence` and
-/// `account_principal_exclusion` hold into `account_observation`.
-///
-/// A backup may restore those two logs empty while it keeps the referencing
-/// tables, which would leave every reference dangling; a backup tool also
-/// refuses to skip a table a kept table references. Nothing reads through
-/// these references, so the ids stay as plain columns naming a history row
-/// that may be gone.
-///
-/// SQLite cannot drop a constraint with ALTER TABLE, and rebuilding the five
-/// tables copied about 230 MB and took about 15 seconds on a copy of a live
-/// store. Removing a FOREIGN KEY clause changes nothing stored in the table,
-/// so this uses the procedure SQLite documents for exactly that change
-/// ("Making Other Kinds Of Table Schema Changes" in its ALTER TABLE page):
-/// in one transaction, edit the table's `CREATE TABLE` text in
-/// `sqlite_schema`, then set the schema version one higher so every
-/// connection, this one included, re-reads the schema. It runs on every open
-/// and changes nothing once no clause is left, and it fails the open if any
-/// foreign key into the logs remains afterwards.
-fn drop_history_foreign_keys(connection: &Connection) -> rusqlite::Result<()> {
-    let pending: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND (instr(sql, ?1) > 0 OR instr(sql, ?2) > 0)",
-        params![HISTORY_FOREIGN_KEY_CLAUSES[0], HISTORY_FOREIGN_KEY_CLAUSES[1]],
-        |row| row.get(0),
-    )?;
-    if pending > 0 {
-        let tx = connection.unchecked_transaction()?;
-        let version: i64 = tx.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
-        tx.pragma_update(None, "writable_schema", true)?;
-        let edited = tx.execute(
-            "UPDATE sqlite_schema SET sql = replace(replace(sql, ?1, ''), ?2, '') \
-             WHERE type = 'table' AND (instr(sql, ?1) > 0 OR instr(sql, ?2) > 0)",
-            params![
-                HISTORY_FOREIGN_KEY_CLAUSES[0],
-                HISTORY_FOREIGN_KEY_CLAUSES[1]
-            ],
-        );
-        // Switch schema editing off before anything else can fail, so an
-        // error never leaves this connection able to write sqlite_schema.
-        let disabled = tx.pragma_update(None, "writable_schema", false);
-        edited?;
-        disabled?;
-        tx.pragma_update(None, "schema_version", version + 1)?;
-        tx.commit()?;
-    }
-    let remaining: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema AS s, pragma_foreign_key_list(s.name) AS f \
-         WHERE s.type = 'table' AND f.\"table\" IN (?1, ?2)",
-        params![HISTORY_LOG_TABLES[0], HISTORY_LOG_TABLES[1]],
-        |row| row.get(0),
-    )?;
-    if remaining == 0 {
-        Ok(())
-    } else {
-        Err(rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some(format!(
-                "{remaining} foreign key(s) into account_decision or account_observation remain"
-            )),
-        ))
-    }
-}
+/// Migration 58: rebuild the five account tables that held foreign keys into
+/// the history logs, without those keys. Runs with foreign-key enforcement
+/// suspended (see `SqliteRouteStateStore::open`).
+const MIGRATION_058: &str = include_str!("../migrations/058_drop_history_foreign_keys.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -318,7 +247,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 56] {
+fn route_state_migrations() -> [Migration; 57] {
     [
         Migration {
             version: 1,
@@ -543,6 +472,10 @@ fn route_state_migrations() -> [Migration; 56] {
         Migration {
             version: 56,
             statements: MIGRATION_056,
+        },
+        Migration {
+            version: 58,
+            statements: MIGRATION_058,
         },
     ]
 }
@@ -1000,13 +933,33 @@ impl SqliteRouteStateStore {
     /// lease per database, by construction), so there is no lease-dir to pass.
     pub fn open(descriptor: &StorageDescriptor) -> RouteStateResult<Self> {
         let store = open_sqlite(descriptor).map_err(err)?;
+        // Migration 58 rebuilds `account_pin` while `account_admission` holds a
+        // foreign key to it; with enforcement on, dropping the old table would
+        // first delete every pin and fail on the admissions that name them.
+        // SQLite ignores `PRAGMA foreign_keys` inside a transaction and the
+        // shared runner opens one per migration, so enforcement is suspended
+        // around the whole run here and switched back on before serving. The
+        // migration checks its own result with `foreign_key_check`.
+        store
+            .with_conn(|conn| conn.pragma_update(None, "foreign_keys", "OFF"))
+            .map_err(err)?;
         // A store written by a longer chain than this binary carries used to
         // migrate as a silent no-op and then serve a schema the binary cannot
         // query. The route-state chain rebuilds tables and re-keys facts, so an
         // ahead store is refused here, naming both versions.
-        let outcome = store
-            .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations())
-            .map_err(err)?;
+        let migration = store.migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations());
+        store
+            .with_conn(|conn| {
+                conn.pragma_update(None, "foreign_keys", "ON")?;
+                let enabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+                if enabled == 1 {
+                    Ok(())
+                } else {
+                    Err(rusqlite::Error::InvalidQuery)
+                }
+            })
+            .map_err(|error| err(format!("re-enabling foreign keys after migration: {error}")))?;
+        let outcome = migration.map_err(err)?;
         if outcome.store_ahead() {
             return Err(err(format!(
                 "store_ahead: namespace {ROUTE_STATE_NAMESPACE} is at version {} but this binary's chain ends at {}; \
@@ -1016,9 +969,6 @@ impl SqliteRouteStateStore {
             )));
         }
         validate_family_spellings(&store)?;
-        store
-            .with_conn(drop_history_foreign_keys)
-            .map_err(|error| err(format!("dropping history foreign keys: {error}")))?;
         Ok(Self {
             store,
             class_vectors: Mutex::new(HashMap::new()),
@@ -5382,13 +5332,132 @@ mod tests {
         rows.collect::<rusqlite::Result<_>>().unwrap()
     }
 
+    /// The tables migration 58 rebuilds.
+    const REBUILT_TABLES: [&str; 5] = [
+        "account_pin",
+        "account_admission",
+        "account_hold",
+        "account_fence",
+        "account_principal_exclusion",
+    ];
+
+    /// Everything about the rebuilt tables a rebuild must keep: every column
+    /// (name, type, NOT NULL, default, key position) and every index and
+    /// trigger on them (name and SQL with whitespace collapsed; autoindexes,
+    /// which have no SQL, by name).
+    fn rebuilt_table_shape(connection: &Connection) -> Vec<String> {
+        let mut shape = Vec::new();
+        for table in REBUILT_TABLES {
+            let mut columns = connection
+                .prepare(
+                    "SELECT name, type, \"notnull\", COALESCE(dflt_value, ''), pk \
+                     FROM pragma_table_xinfo(?1) ORDER BY cid",
+                )
+                .unwrap();
+            let rows = columns
+                .query_map([table], |row| {
+                    Ok(format!(
+                        "{table} column {} {} notnull={} default={} pk={}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?
+                    ))
+                })
+                .unwrap();
+            shape.extend(rows.map(Result::unwrap));
+            let mut objects = connection
+                .prepare(
+                    "SELECT type, name, COALESCE(sql, '') FROM sqlite_schema \
+                     WHERE tbl_name = ?1 AND type IN ('index', 'trigger') ORDER BY type, name",
+                )
+                .unwrap();
+            let rows = objects
+                .query_map([table], |row| {
+                    let sql: String = row.get(2)?;
+                    Ok(format!(
+                        "{table} {} {} {}",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+                    ))
+                })
+                .unwrap();
+            shape.extend(rows.map(Result::unwrap));
+        }
+        shape
+    }
+
+    fn populate_account_tables(c: &Connection, now: i64) -> rusqlite::Result<()> {
+        c.execute_batch(&format!(
+            "INSERT INTO account_decision (decision_id, mode, trigger, principal, provider,
+               model, family, outcome, code, policy_version, decision_json, created_at)
+             VALUES ('dec-1', 'serve', 'request', 'p', 'anthropic', 'm', 'opus', 'admit',
+               'cold_scored', 2, '{{}}', {now});
+             INSERT INTO account_pin (pin_id, principal, conversation_hash, provider,
+               pin_generation, affinity_model, account_id, credential_id, pin_mode,
+               decision_id, created_at)
+             VALUES ('pin-1', 'p', 'c', 'anthropic', 1, 'm', 'a', 'cred', 'run_frozen',
+               'dec-1', {now});
+             INSERT INTO account_admission (principal, admission_id, request_fingerprint,
+               request_mode, decision_id, conversation_hash, provider, model, account_id,
+               credential_id, pin_id, pin_generation, state, charged, request_bytes,
+               request_bytes_estimated, committed_at, admission_valid_until,
+               lease_valid_until, reply_json)
+             VALUES ('p', 'adm-1', 'fp', 'admit', 'dec-1', 'c', 'anthropic', 'm', 'a',
+               'cred', 'pin-1', 1, 'reserved', 1, 10, 0, {now}, {now}, {now}, '{{}}');
+             INSERT INTO account_hold (decision_id, principal, conversation_hash, provider,
+               pin_id, pin_generation, account_id, credential_id, basis, reset_at,
+               retry_after_s, created_at)
+             VALUES ('dec-1', 'p', 'c', 'anthropic', 'pin-1', 1, 'a', 'cred', 'five_hour',
+               {now}, 60, {now});
+             INSERT INTO account_observation (observation_id, principal, runner, event_id,
+               kind, bound, observation_json, effects_json, received_at)
+             VALUES ('aco-recent', 'p', 'broca', 'recent', 'attempt', 1, '{{}}',
+               '[\"fence\"]', {recent}),
+               ('aco-old', 'p', 'broca', 'old', 'attempt', 0, '{{}}', '[]', {old});
+             INSERT INTO account_fence (fence_id, provider, account_id, scope_json,
+               fence_json, source, observed_at, principal, observation_id, created_at)
+             VALUES ('fence-1', 'anthropic', 'a', '{{}}', '{{}}', 'observation', {now},
+               'p', 'aco-recent', {now});
+             INSERT INTO account_principal_exclusion (principal, admission_id,
+               credential_id, runner_view_digest, roster_view_digest, observation_id,
+               recorded_at)
+             VALUES ('p', 'adm-1', 'cred', 'r', 'v', 'aco-recent', {now});",
+            recent = now - 60_000,
+            old = now - 7 * 3_600_000,
+        ))
+    }
+
+    fn admission_insert(id: &str, decision: &str, pin: &str) -> String {
+        format!(
+            "INSERT INTO account_admission (principal, admission_id, request_fingerprint,
+               request_mode, decision_id, conversation_hash, provider, model, account_id,
+               credential_id, pin_id, pin_generation, state, charged, request_bytes,
+               request_bytes_estimated, committed_at, admission_valid_until,
+               lease_valid_until, reply_json)
+             VALUES ('p', '{id}', 'fp', 'admit', '{decision}', 'c', 'anthropic', 'm', 'a',
+               'cred', '{pin}', 1, 'reserved', 1, 10, 0, 1, 1, 1, '{{}}')"
+        )
+    }
+
+    fn route_state_version(c: &Connection) -> rusqlite::Result<i64> {
+        c.query_row(
+            "SELECT MAX(version) FROM cortexkit_schema_version WHERE namespace = ?1",
+            [ROUTE_STATE_NAMESPACE],
+            |row| row.get(0),
+        )
+    }
+
     /// A store at migration 55, with every account table populated while
-    /// foreign keys are enforced, opens with the foreign keys into the two
-    /// history logs gone: rows and the admission-to-pin key are untouched,
-    /// the database passes the integrity check, a second open changes
-    /// nothing, and migration 56 copied only the recent runner event's key.
+    /// foreign keys are enforced, opens through migrations 56 and 58: the
+    /// foreign keys into the two history logs are gone, the admission-to-pin
+    /// key holds, every row, column, index and trigger of the rebuilt tables
+    /// is kept, the integrity check passes, and migration 56 copied only the
+    /// recent runner event's key.
     #[test]
-    fn opening_drops_the_history_foreign_keys_in_place_and_keeps_every_row() {
+    fn migration_058_rebuilds_the_account_tables_without_history_foreign_keys() {
         let scratch = prefrontal_test_support::scratch_root().join(format!(
             "routing-history-foreign-keys-{}-{}",
             std::process::id(),
@@ -5404,48 +5473,11 @@ mod tests {
         legacy
             .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations()[..55])
             .unwrap();
-        let (legacy_keys, legacy_version) = legacy
+        let (legacy_keys, legacy_shape) = legacy
             .with_conn(|c| {
-                c.execute_batch(&format!(
-                    "INSERT INTO account_decision (decision_id, mode, trigger, principal, provider,
-                       model, family, outcome, code, policy_version, decision_json, created_at)
-                     VALUES ('dec-1', 'serve', 'request', 'p', 'anthropic', 'm', 'opus', 'admit',
-                       'cold_scored', 2, '{{}}', {now});
-                     INSERT INTO account_pin (pin_id, principal, conversation_hash, provider,
-                       pin_generation, affinity_model, account_id, credential_id, pin_mode,
-                       decision_id, created_at)
-                     VALUES ('pin-1', 'p', 'c', 'anthropic', 1, 'm', 'a', 'cred', 'run_frozen',
-                       'dec-1', {now});
-                     INSERT INTO account_admission (principal, admission_id, request_fingerprint,
-                       request_mode, decision_id, conversation_hash, provider, model, account_id,
-                       credential_id, pin_id, pin_generation, state, charged, request_bytes,
-                       request_bytes_estimated, committed_at, admission_valid_until,
-                       lease_valid_until, reply_json)
-                     VALUES ('p', 'adm-1', 'fp', 'admit', 'dec-1', 'c', 'anthropic', 'm', 'a',
-                       'cred', 'pin-1', 1, 'reserved', 1, 10, 0, {now}, {now}, {now}, '{{}}');
-                     INSERT INTO account_hold (decision_id, principal, conversation_hash, provider,
-                       pin_id, pin_generation, account_id, credential_id, basis, reset_at,
-                       retry_after_s, created_at)
-                     VALUES ('dec-1', 'p', 'c', 'anthropic', 'pin-1', 1, 'a', 'cred', 'five_hour',
-                       {now}, 60, {now});
-                     INSERT INTO account_observation (observation_id, principal, runner, event_id,
-                       kind, bound, observation_json, effects_json, received_at)
-                     VALUES ('aco-recent', 'p', 'broca', 'recent', 'attempt', 1, '{{}}',
-                       '[\"fence\"]', {recent}),
-                       ('aco-old', 'p', 'broca', 'old', 'attempt', 0, '{{}}', '[]', {old});
-                     INSERT INTO account_fence (fence_id, provider, account_id, scope_json,
-                       fence_json, source, observed_at, principal, observation_id, created_at)
-                     VALUES ('fence-1', 'anthropic', 'a', '{{}}', '{{}}', 'observation', {now},
-                       'p', 'aco-recent', {now});
-                     INSERT INTO account_principal_exclusion (principal, admission_id,
-                       credential_id, runner_view_digest, roster_view_digest, observation_id,
-                       recorded_at)
-                     VALUES ('p', 'adm-1', 'cred', 'r', 'v', 'aco-recent', {now});",
-                    recent = now - 60_000,
-                    old = now - 7 * 3_600_000,
-                ))?;
-                let version: i64 = c.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
-                Ok((history_foreign_keys(c), version))
+                assert_eq!(route_state_version(c)?, 55);
+                populate_account_tables(c, now)?;
+                Ok((history_foreign_keys(c), rebuilt_table_shape(c)))
             })
             .unwrap();
         drop(legacy);
@@ -5460,29 +5492,24 @@ mod tests {
                 "account_principal_exclusion -> account_observation",
             ]
         );
+        assert!(legacy_shape.iter().any(|line| line.contains(" index ")));
 
-        let admission = |id: &str, decision: &str, pin: &str| {
-            format!(
-                "INSERT INTO account_admission (principal, admission_id, request_fingerprint,
-                   request_mode, decision_id, conversation_hash, provider, model, account_id,
-                   credential_id, pin_id, pin_generation, state, charged, request_bytes,
-                   request_bytes_estimated, committed_at, admission_valid_until,
-                   lease_valid_until, reply_json)
-                 VALUES ('p', '{id}', 'fp', 'admit', '{decision}', 'c', 'anthropic', 'm', 'a',
-                   'cred', '{pin}', 1, 'reserved', 1, 10, 0, 1, 1, 1, '{{}}')"
-            )
-        };
         let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
-        let opened_version = migrated
+        migrated
             .store
             .with_conn(|c| {
-                assert_eq!(
-                    history_foreign_keys(c),
-                    ["account_admission -> account_pin"]
-                );
+                assert_eq!(route_state_version(c)?, 58);
+                assert_eq!(history_foreign_keys(c), ["account_admission -> account_pin"]);
+                assert_eq!(rebuilt_table_shape(c), legacy_shape);
                 let integrity: String =
                     c.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
                 assert_eq!(integrity, "ok");
+                let leftovers: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE '%_rebuilt'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(leftovers, 0);
                 for (table, rows) in [
                     ("account_decision", 1),
                     ("account_pin", 1),
@@ -5492,10 +5519,11 @@ mod tests {
                     ("account_fence", 1),
                     ("account_principal_exclusion", 1),
                 ] {
-                    let count: i64 =
-                        c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                            row.get(0)
-                        })?;
+                    let count: i64 = c.query_row(
+                        &format!("SELECT COUNT(*) FROM {table}"),
+                        [],
+                        |row| row.get(0),
+                    )?;
                     assert_eq!(count, rows, "{table}");
                 }
                 let keys: String = c.query_row(
@@ -5506,31 +5534,65 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(keys, "recent=aco-recent:1[\"fence\"]");
-                // Enforcement is on, on this connection, and now ignores the
+                // Enforcement is back on for serving, and now ignores the
                 // history logs: an admission naming a decision that was never
                 // recorded is accepted; one naming an unknown pin is refused.
-                c.execute_batch(&admission("adm-2", "dec-gone", "pin-1"))?;
+                c.execute_batch(&admission_insert("adm-2", "dec-gone", "pin-1"))?;
                 assert!(
-                    c.execute_batch(&admission("adm-3", "dec-1", "pin-missing"))
+                    c.execute_batch(&admission_insert("adm-3", "dec-1", "pin-missing"))
                         .is_err(),
                     "the pin foreign key must still hold"
                 );
-                c.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                Ok(())
             })
             .unwrap();
-        assert!(opened_version > legacy_version);
         drop(migrated);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
 
-        let reopened = SqliteRouteStateStore::open(&descriptor).unwrap();
-        let reopened_version = reopened
-            .store
-            .with_conn(|c| c.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0)))
-            .unwrap();
-        assert_eq!(
-            reopened_version, opened_version,
-            "a second open edits nothing"
+    /// Migration 58 checks its own result: a store whose admission names a
+    /// pin that does not exist fails the foreign-key check, the migration
+    /// rolls back whole, and the store stays at migration 56 with its tables
+    /// and their foreign keys as they were.
+    #[test]
+    fn migration_058_refuses_a_store_with_a_dangling_pin_reference() {
+        let scratch = prefrontal_test_support::scratch_root().join(format!(
+            "routing-history-foreign-keys-dangling-{}-{}",
+            std::process::id(),
+            short_id()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let descriptor = dev_descriptor(
+            "routing-history-foreign-keys-dangling",
+            scratch.join("store.db").to_string_lossy(),
         );
-        drop(reopened);
+        let now = now_ms();
+        let legacy = open_sqlite(&descriptor).unwrap();
+        legacy
+            .migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations()[..55])
+            .unwrap();
+        legacy
+            .with_conn(|c| {
+                populate_account_tables(c, now)?;
+                c.pragma_update(None, "foreign_keys", "OFF")?;
+                c.execute_batch(&admission_insert("adm-dangling", "dec-1", "pin-missing"))?;
+                c.pragma_update(None, "foreign_keys", "ON")
+            })
+            .unwrap();
+        drop(legacy);
+
+        let refused = SqliteRouteStateStore::open(&descriptor)
+            .err()
+            .expect("open refused");
+        assert!(refused.0.contains("migration 58"), "{}", refused.0);
+        let connection = Connection::open(scratch.join("store.db")).unwrap();
+        assert_eq!(route_state_version(&connection).unwrap(), 56);
+        assert_eq!(history_foreign_keys(&connection).len(), 6);
+        let admissions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM account_admission", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(admissions, 2);
+        drop(connection);
         std::fs::remove_dir_all(scratch).unwrap();
     }
 

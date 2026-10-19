@@ -69,7 +69,7 @@ fn main() {
     let started = Instant::now();
     drop(open(&upgraded));
     println!(
-        "open with migrations 55-56 and foreign-key drop: {:?}",
+        "open applying the pending migrations (through 58): {:?}",
         started.elapsed()
     );
 

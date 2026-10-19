@@ -7,12 +7,9 @@
 -- below keeps just what that needs, for a short window, so it is small enough
 -- for every backup to carry.
 --
--- The other half of making the account-selection history logs skippable is
+-- The other half of making the account-selection history logs skippable,
 -- dropping the foreign keys other tables hold into `account_decision` and
--- `account_observation`. That is not done here: rebuilding the referencing
--- tables copies about 230 MB and took about 15 seconds on a copy of a live
--- store, all of it before routing can answer anyone. The store's `open` drops
--- those constraints in place instead (see `drop_history_foreign_keys`).
+-- `account_observation`, is migration 58.
 
 -- Which runner events routing already applied, and what it answered.
 --
