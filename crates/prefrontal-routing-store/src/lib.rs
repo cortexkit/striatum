@@ -185,6 +185,7 @@ const MIGRATION_051: &str = include_str!("../migrations/051_model_identity_and_s
 const MIGRATION_052: &str = include_str!("../migrations/052_retire_account_shadow.sql");
 const MIGRATION_053: &str = include_str!("../migrations/053_selected_harness_workload.sql");
 const MIGRATION_054: &str = include_str!("../migrations/054_parent_failure_index.sql");
+const MIGRATION_055: &str = include_str!("../migrations/055_drop_aa_index_cache.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -238,7 +239,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 54] {
+fn route_state_migrations() -> [Migration; 55] {
     [
         Migration {
             version: 1,
@@ -455,6 +456,10 @@ fn route_state_migrations() -> [Migration; 54] {
         Migration {
             version: 54,
             statements: MIGRATION_054,
+        },
+        Migration {
+            version: 55,
+            statements: MIGRATION_055,
         },
     ]
 }
@@ -1398,29 +1403,6 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Replace the AA index cache in one transaction. A failed fetch must not
-    /// call this, so the previous table survives (fail-open).
-    pub fn replace_aa_index_table(
-        &self,
-        rows: &[(String, f64)],
-        fetched_at: i64,
-    ) -> RouteStateResult<()> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
-                tx.execute("DELETE FROM aa_index_cache", [])?;
-                for (slug, index) in rows {
-                    tx.execute(
-                        "INSERT INTO aa_index_cache (aa_slug, aa_index, fetched_at)
-                         VALUES (?1, ?2, ?3)",
-                        params![slug, index, fetched_at],
-                    )?;
-                }
-                tx.commit()
-            })
-            .map_err(err)
-    }
-
     /// The last announced route-winner ladder as the routing module serialized
     /// it, or `None` before the first ladder was ever recorded.
     pub fn route_winner_baseline(&self) -> RouteStateResult<Option<String>> {
@@ -1631,20 +1613,6 @@ impl SqliteRouteStateStore {
                     params![roster.view, roster.roster_json, roster.fetched_at],
                 )
                 .map(|_| ())
-            })
-            .map_err(err)
-    }
-
-    /// Latest cached AA intelligence index for an AA slug, plus when it was fetched.
-    pub fn get_aa_index(&self, slug: &str) -> RouteStateResult<Option<(f64, i64)>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                c.query_row(
-                    "SELECT aa_index, fetched_at FROM aa_index_cache WHERE aa_slug = ?1",
-                    [slug],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
             })
             .map_err(err)
     }
