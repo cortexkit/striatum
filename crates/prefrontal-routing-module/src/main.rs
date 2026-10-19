@@ -1353,6 +1353,19 @@ struct SelectParams {
 }
 
 impl SelectParams {
+    /// A selection that names no executor, no workload and no required harness
+    /// comes from a host's own route resolver (an OpenCode or Pi head choosing
+    /// the model for a mason or explore subagent it launches) or from core
+    /// re-running such a selection after a failed attempt. Core still decides
+    /// where those workers run, from its own substrate settings, so the host's
+    /// model list (or Broca's, when the caller names substrate `broca`) stays
+    /// authoritative and the route-to-harness mapping is not consulted. Only
+    /// callers that name a workload, an executor or a required harness are
+    /// judged by the mapped harness.
+    fn is_host_run(&self) -> bool {
+        self.executor.is_none() && self.workload.is_none() && self.required_harness.is_none()
+    }
+
     fn resolved_workload(&self) -> Option<selection_harness::Workload> {
         self.workload.or_else(|| {
             if self.executor.is_none() {
@@ -1742,8 +1755,8 @@ fn resolve_select_request(
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
     );
-    let uses_host_availability =
-        params.executor.is_some() && !is_broca_substrate(params.substrate.as_deref());
+    let uses_host_availability = (params.executor.is_some() || params.is_host_run())
+        && !is_broca_substrate(params.substrate.as_deref());
     if uses_host_availability
         && params.model_pin.is_none()
         && params.pin.is_none()
@@ -2870,14 +2883,45 @@ fn prepare_selection_inputs(
     })
 }
 
+/// Where one route.select spent its time, for the slow-request log line. Each
+/// stage is a separate bucket so `unclassified_ms` (total minus every bucket)
+/// stays near zero; a large remainder means a stage is missing a timer.
 struct RouteSelectTiming {
     started: Instant,
     is_select: std::cell::Cell<bool>,
     live_config_check_ms: std::cell::Cell<u64>,
+    /// Waiting for the first billing-plane load before pricing anything.
+    billing_wait_ms: std::cell::Cell<u64>,
+    /// Decoding the parameters and resolving requirements and the caller's
+    /// available models (reads the auth file).
+    resolve_ms: std::cell::Cell<u64>,
     prepare_wait_ms: std::cell::Cell<u64>,
     snapshot_closure_ms: std::cell::Cell<u64>,
+    /// Live overlays, score aliases and billing-plane pricing on the facts.
+    pricing_ms: std::cell::Cell<u64>,
+    /// Harness availability, subscription policy, exclusions and pin lookup.
+    policy_ms: std::cell::Cell<u64>,
+    /// Reading this head's recent failed launches from the route store.
+    head_history_ms: std::cell::Cell<u64>,
     selection_ms: std::cell::Cell<u64>,
+    /// Recording the selection on the winner ladder.
+    ladder_ms: std::cell::Cell<u64>,
+    /// Writing the decision row whose id route.select returns to the caller.
+    decision_write_ms: std::cell::Cell<u64>,
+    /// Resolving the Broca launch target (and any key-pool lease).
+    runner_ms: std::cell::Cell<u64>,
+    /// Variant policy, explanation notes and building the response body.
+    finish_ms: std::cell::Cell<u64>,
     reply_ms: std::cell::Cell<u64>,
+}
+
+/// Add `elapsed` to one stage bucket of a [`RouteSelectTiming`].
+fn add_stage_ms(bucket: &std::cell::Cell<u64>, elapsed: Duration) {
+    bucket.set(
+        bucket
+            .get()
+            .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
+    );
 }
 
 impl RouteSelectTiming {
@@ -2886,9 +2930,18 @@ impl RouteSelectTiming {
             started: Instant::now(),
             is_select: std::cell::Cell::new(false),
             live_config_check_ms: std::cell::Cell::new(0),
+            billing_wait_ms: std::cell::Cell::new(0),
+            resolve_ms: std::cell::Cell::new(0),
             prepare_wait_ms: std::cell::Cell::new(0),
             snapshot_closure_ms: std::cell::Cell::new(0),
+            pricing_ms: std::cell::Cell::new(0),
+            policy_ms: std::cell::Cell::new(0),
+            head_history_ms: std::cell::Cell::new(0),
             selection_ms: std::cell::Cell::new(0),
+            ladder_ms: std::cell::Cell::new(0),
+            decision_write_ms: std::cell::Cell::new(0),
+            runner_ms: std::cell::Cell::new(0),
+            finish_ms: std::cell::Cell::new(0),
             reply_ms: std::cell::Cell::new(0),
         }
     }
@@ -2916,8 +2969,9 @@ impl RouteSelectTiming {
     }
 
     fn record_selection(&self, elapsed: Duration) {
-        self.selection_ms
-            .set(elapsed.as_millis().min(u64::MAX as u128) as u64);
+        // Adds rather than sets: a rejected pin with a fallback runs a second
+        // selection, and both count.
+        add_stage_ms(&self.selection_ms, elapsed);
     }
 
     fn record_reply(&self, elapsed: Duration) {
@@ -2934,19 +2988,40 @@ impl RouteSelectTiming {
             return None;
         }
         let live_config_check_ms = self.live_config_check_ms.get();
+        let billing_wait_ms = self.billing_wait_ms.get();
+        let resolve_ms = self.resolve_ms.get();
         let prepare_wait_ms = self.prepare_wait_ms.get();
         let snapshot_closure_ms = self.snapshot_closure_ms.get();
+        let pricing_ms = self.pricing_ms.get();
+        let policy_ms = self.policy_ms.get();
+        let head_history_ms = self.head_history_ms.get();
         let selection_ms = self.selection_ms.get();
+        let ladder_ms = self.ladder_ms.get();
+        let decision_write_ms = self.decision_write_ms.get();
+        let runner_ms = self.runner_ms.get();
+        let finish_ms = self.finish_ms.get();
         let reply_ms = self.reply_ms.get();
-        let unclassified_ms = total_ms.saturating_sub(
-            live_config_check_ms
-                .saturating_add(prepare_wait_ms)
-                .saturating_add(snapshot_closure_ms)
-                .saturating_add(selection_ms)
-                .saturating_add(reply_ms),
-        );
+        let classified_ms = [
+            live_config_check_ms,
+            billing_wait_ms,
+            resolve_ms,
+            prepare_wait_ms,
+            snapshot_closure_ms,
+            pricing_ms,
+            policy_ms,
+            head_history_ms,
+            selection_ms,
+            ladder_ms,
+            decision_write_ms,
+            runner_ms,
+            finish_ms,
+            reply_ms,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
+        let unclassified_ms = total_ms.saturating_sub(classified_ms);
         Some(format!(
-            "[routing] slow route.select total_ms={total_ms} wait_prepare_ms={prepare_wait_ms} live_config_check_ms={live_config_check_ms} snapshot_closure_ms={snapshot_closure_ms} selection_ms={selection_ms} reply_ms={reply_ms} unclassified_ms={unclassified_ms}"
+            "[routing] slow route.select total_ms={total_ms} wait_prepare_ms={prepare_wait_ms} live_config_check_ms={live_config_check_ms} snapshot_closure_ms={snapshot_closure_ms} selection_ms={selection_ms} reply_ms={reply_ms} billing_wait_ms={billing_wait_ms} resolve_ms={resolve_ms} pricing_ms={pricing_ms} policy_ms={policy_ms} head_history_ms={head_history_ms} ladder_ms={ladder_ms} decision_write_ms={decision_write_ms} runner_ms={runner_ms} finish_ms={finish_ms} unclassified_ms={unclassified_ms}"
         ))
     }
 }
@@ -3224,12 +3299,20 @@ async fn handle_select_request(
         );
         return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
     }
-    if matches!(
+    let billing_ready = if matches!(
         envelope.method.as_str(),
         ROUTE_SELECT_OP | ROUTE_SELECT_PANEL_OP
-    ) && !broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
-        .await
-    {
+    ) {
+        let billing_started = Instant::now();
+        let ready =
+            broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
+                .await;
+        add_stage_ms(&timing.billing_wait_ms, billing_started.elapsed());
+        ready
+    } else {
+        true
+    };
+    if !billing_ready {
         let body = serde_json::to_vec(&ErrorBody {
             code: "routing_not_ready".into(),
             message: "routing pricing is awaiting its first billing-plane load; retry shortly"
@@ -3279,6 +3362,7 @@ async fn handle_select_request(
         .await;
     }
 
+    let resolve_started = Instant::now();
     let params: SelectParams = match serde_json::from_slice::<SelectBody>(&frame.body) {
         Ok(b) => b.params,
         Err(e) => {
@@ -3294,9 +3378,10 @@ async fn handle_select_request(
             .await;
         }
     };
+    let host_run = params.is_host_run();
     let selected_workload = params
         .resolved_workload()
-        .filter(|_| params.executor.is_none())
+        .filter(|_| params.executor.is_none() && !host_run)
         .map(selection_harness::Workload::as_str);
     let executor_workload = params.executor_workload_line();
     warn_ignored_caller_policy_once(
@@ -3317,6 +3402,7 @@ async fn handle_select_request(
         )
         .await;
     }
+    add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
     // The operator fence is read HERE, on the module side, for every selection.
     let live_config_started = Instant::now();
     let operator_config = if operator_config_path == routing_config_path {
@@ -3326,8 +3412,25 @@ async fn handle_select_request(
     };
     let operator_policy = operator_config.operator_policy();
     timing.add_live_config_check(live_config_started.elapsed());
+    // A host does not choose the substrate of the mason it launches. A host's
+    // mason pin on a provider that needs a per-send credential pin is admitted
+    // provisionally against Broca's routes, without leasing a key; core selects
+    // the pin again with substrate broca before it records the launch.
+    let deferred_runner_pin = host_run
+        && params.substrate.is_none()
+        && params.target_agent == "mason"
+        && params.model_pin.as_deref().is_some_and(|pin| {
+            pin.split_once('/')
+                .is_some_and(|(provider, _)| needs_runner_pin(&operator_policy, provider))
+        });
+    // The harness a host-run selection is judged on: Broca's served routes when
+    // the caller names substrate broca (or for a deferred runner pin), otherwise
+    // the caller's own list, which has no harness of routing's choosing.
+    let host_run_harness = (host_run
+        && (deferred_runner_pin || is_broca_substrate(params.substrate.as_deref())))
+    .then_some(substrate_policy::Harness::Broca);
     let snapshot_started = Instant::now();
-    let availability = match store.get_facts() {
+    let mut availability = match store.get_facts() {
         Ok(mut facts) => {
             live_config.apply(&mut facts);
             // Aliased providers are reachable through their own credentials,
@@ -3352,10 +3455,21 @@ async fn handle_select_request(
         }
     };
     timing.add_snapshot_closure(snapshot_started.elapsed());
+    // A host-run selection judged on the caller's own list never consulted
+    // Broca's routes, so its explanation must not describe them.
+    if host_run && host_run_harness.is_none() {
+        availability.note = None;
+    }
+    let resolve_started = Instant::now();
     let resolved_request =
         match resolve_select_request(&params, &operator_policy, opencode_auth_path) {
-            Ok(resolved) => resolved,
+            Ok(resolved) => {
+                add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
+                resolved
+            }
             Err(mut no_route) => {
+                add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
+                let write_started = Instant::now();
                 if let Some(note) = &availability.note {
                     no_route.message = format!("{} ({note})", no_route.message);
                 }
@@ -3372,6 +3486,7 @@ async fn handle_select_request(
                     Some(&policy_sources_line(&operator_policy)),
                 );
                 let _ = store.record_decision(&decision);
+                add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
                 return send_no_route(
                     writer,
                     ver,
@@ -3400,6 +3515,7 @@ async fn handle_select_request(
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
         }
     };
+    let pricing_started = Instant::now();
     let outcome = live_config.apply(&mut facts);
     let (routing_config, policy_revision) = (outcome.routing_config, outcome.policy_revision);
     let provenance = DecisionProvenance {
@@ -3417,7 +3533,9 @@ async fn handle_select_request(
         credentials.price_facts(&mut facts);
     }
     live_config.apply(&mut facts);
+    add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
 
+    let policy_started = Instant::now();
     let host_models: HashSet<String> = resolved_request
         .policy
         .available_models
@@ -3441,8 +3559,29 @@ async fn handle_select_request(
         broca_models: &broca_models,
         executor_models,
     };
-    let mapped_availability = harness_context.availability(&facts);
+    let mapped_availability = if host_run {
+        selection_harness::MappedAvailability {
+            models: if host_run_harness.is_some() {
+                broca_models.clone()
+            } else {
+                host_models.clone()
+            },
+            rejected: HashMap::new(),
+        }
+    } else {
+        harness_context.availability(&facts)
+    };
     let available = mapped_availability.models.clone();
+    // The harness a route selected here runs on, as far as routing knows: the
+    // mapped harness, or for a host-run selection Broca when it was judged on
+    // Broca's routes and unknown otherwise.
+    let run_harness = |route_key: &str| {
+        if host_run {
+            host_run_harness
+        } else {
+            Some(harness_context.mapped(route_key))
+        }
+    };
     let mut execution_operator_policy = operator_policy.clone();
     if params.pin.is_some() || params.model_pin.is_some() {
         execution_operator_policy.exclude.clear();
@@ -3467,10 +3606,10 @@ async fn handle_select_request(
         operator: &operator_policy.exclude,
         caller: &[],
     });
-    let record_ladder = |harness: substrate_policy::Harness| {
+    let record_ladder = |harness: Option<substrate_policy::Harness>| {
         winner_ladder::observed_selections().record(
             winner_ladder::LadderKey::new(
-                if harness == substrate_policy::Harness::Broca {
+                if harness == Some(substrate_policy::Harness::Broca) {
                     winner_ladder::SUBSTRATE_BROCA
                 } else {
                     winner_ladder::SUBSTRATE_HOST
@@ -3479,7 +3618,7 @@ async fn handle_select_request(
             ),
             available
                 .iter()
-                .filter(|key| harness_context.mapped(key) == harness)
+                .filter(|key| host_run || harness == Some(harness_context.mapped(key)))
                 .filter(|key| !ladder_fence.excludes(key))
                 .cloned(),
             subscription_keys
@@ -3490,12 +3629,16 @@ async fn handle_select_request(
         )
     };
     let mut exclude = params.exclude_route_keys.clone();
+    add_stage_ms(&timing.policy_ms, policy_started.elapsed());
+    let head_history_started = Instant::now();
     let head_refusals = head_content_policy_exclusions(
         store,
         params.parent_session_id.as_deref(),
         &facts,
         now as i64,
     );
+    add_stage_ms(&timing.head_history_ms, head_history_started.elapsed());
+    let mut policy_started = Instant::now();
     exclude.extend(head_refusals.route_keys.iter().cloned());
     let operator_exclude = operator_policy.exclude.clone();
     let consumer_exclude =
@@ -3525,22 +3668,43 @@ async fn handle_select_request(
         let (pin_key, pin_capacity) = work_model_pin::route_keys(pin, variant.as_deref(), &facts);
         let mut pin_availability = mapped_availability.rejected.clone();
         let mut pin_available = available.clone();
-        if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
-            pin_availability.insert(pin_key.clone(), detail);
-        } else {
-            pin_available.insert(pin_key.clone());
+        // A host-run pin is judged on the same list as the host's automatic
+        // selections; it is not added to that list.
+        if !host_run {
+            if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
+                pin_availability.insert(pin_key.clone(), detail);
+            } else {
+                pin_available.insert(pin_key.clone());
+            }
         }
-        let pin_harness = harness_context.mapped(&pin_key);
-        if let Some(refusal) =
-            host_runner_pin_refusal(&operator_policy, Some(pin_harness.as_str()), [pin]).filter(
-                |_| {
-                    params.executor.is_none()
-                        && params
-                            .required_harness
-                            .is_none_or(|required| required == pin_harness)
+        let pin_harness = run_harness(&pin_key);
+        let runner_pin_refusal = if host_run {
+            host_runner_pin_refusal(
+                &operator_policy,
+                if deferred_runner_pin {
+                    Some("broca")
+                } else {
+                    params.substrate.as_deref()
                 },
+                "this request names substrate",
+                [pin],
             )
-        {
+        } else {
+            let mapped = harness_context.mapped(&pin_key);
+            host_runner_pin_refusal(
+                &operator_policy,
+                Some(mapped.as_str()),
+                "this route maps to harness",
+                [pin],
+            )
+            .filter(|_| {
+                params.executor.is_none()
+                    && params
+                        .required_harness
+                        .is_none_or(|required| required == mapped)
+            })
+        };
+        if let Some(refusal) = runner_pin_refusal {
             return send_route_error(
                 writer,
                 ver,
@@ -3553,6 +3717,7 @@ async fn handle_select_request(
             .await;
         }
         let sub = subscription_keys.clone();
+        add_stage_ms(&timing.policy_ms, policy_started.elapsed());
         let selection_started = Instant::now();
         let selection = {
             let input = SelectModelRouteInput {
@@ -3626,36 +3791,42 @@ async fn handle_select_request(
             .map_err(|(code, message)| work_model_pin::Refusal { code, message })?;
             // Resolve the Broca launch target and its credential mapping
             // before recording a decision; an unusable mapping rejects the pin.
-            let runner = if pin_harness == substrate_policy::Harness::Broca {
-                let session = pool_session(
-                    params.task_id.as_deref(),
-                    params.send_id.as_deref(),
-                    &format!("route.select:{}", now as i64),
-                );
-                Some(
-                    runner_for_route(
-                        &operator_policy,
-                        broca_credentials,
-                        store.as_ref(),
-                        &session,
-                        &selected.model.provider_id,
-                        &selected.model.model_id,
-                        selected.prompt_params.variant.as_deref(),
+            // A deferred runner pin leases nothing until core completes it.
+            let runner =
+                if pin_harness == Some(substrate_policy::Harness::Broca) && !deferred_runner_pin {
+                    let session = pool_session(
+                        params.task_id.as_deref(),
+                        params.send_id.as_deref(),
+                        &format!("route.select:{}", now as i64),
+                    );
+                    Some(
+                        runner_for_route(
+                            &operator_policy,
+                            broca_credentials,
+                            store.as_ref(),
+                            &session,
+                            &selected.model.provider_id,
+                            &selected.model.model_id,
+                            selected.prompt_params.variant.as_deref(),
+                        )
+                        .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
                     )
-                    .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
-                )
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             Ok((selected, runner, variant_choice))
         });
         timing.record_selection(selection_started.elapsed());
+        policy_started = Instant::now();
         match selection {
             Ok((mut selected, runner, variant_choice)) => {
+                let ladder_started = Instant::now();
                 record_ladder(pin_harness);
+                add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
                 if let Some(line) = &executor_workload {
                     selected.explanation.push(line.clone());
                 }
+                let write_started = Instant::now();
                 let decision = decision_input_for(
                     &target_agent,
                     &requirements,
@@ -3668,18 +3839,25 @@ async fn handle_select_request(
                 let decision_id = store
                     .record_decision_with_selection(
                         &decision,
-                        Some(pin_harness.as_str()),
+                        pin_harness.map(substrate_policy::Harness::as_str),
                         selected_workload,
                     )
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
+                add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
+                let finish_started = Instant::now();
                 let mut result = json!({
                     "selected": selected, "decisionID": decision_id,
                     "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities},
                     "variantSelection": variant_choice,
                 });
-                result["selected"]["harness"] = json!(pin_harness);
+                if let Some(harness) = pin_harness {
+                    result["selected"]["harness"] = json!(harness);
+                }
                 if params.pin.is_some() {
                     result["pin_rejected"] = serde_json::Value::Null;
+                }
+                if deferred_runner_pin {
+                    result["requiredSubstrate"] = json!("broca");
                 }
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
@@ -3699,6 +3877,7 @@ async fn handle_select_request(
                     body,
                 )
                 .map_err(|error| ModuleError::Message(error.to_string()))?;
+                add_stage_ms(&timing.finish_ms, finish_started.elapsed());
                 let reply_started = Instant::now();
                 let reply = send(writer, response).await;
                 timing.record_reply(reply_started.elapsed());
@@ -3730,7 +3909,7 @@ async fn handle_select_request(
                         return send(writer, response).await;
                     }
                 } else {
-                    if refusal.code == "not_available" {
+                    if refusal.code == "not_available" && !host_run {
                         refusal.code = "pinned_route_refused".into();
                     }
                     return send_route_error(
@@ -3778,6 +3957,7 @@ async fn handle_select_request(
     };
 
     // First attempt against the live snapshot.
+    add_stage_ms(&timing.policy_ms, policy_started.elapsed());
     let selection_started = Instant::now();
     let selection = match attempt(snapshot.clone()) {
         Ok(selected) => Ok(selected),
@@ -3836,6 +4016,7 @@ async fn handle_select_request(
         Err(no_route) => Err(no_route),
     };
     timing.record_selection(selection_started.elapsed());
+    let finish_started = Instant::now();
 
     // Record the decision, then respond. The decisionID is returned ONLY after
     // record_decision commits (it is a single store txn that either commits or
@@ -3845,8 +4026,12 @@ async fn handle_select_request(
     let policy_sources = policy_sources_line(&operator_policy);
     match selection {
         Ok(mut selected) => {
-            let selected_harness = harness_context.mapped(&selected.route_key);
+            let selected_harness = run_harness(&selected.route_key);
+            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
+            let ladder_started = Instant::now();
             record_ladder(selected_harness);
+            add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
+            let finish_started = Instant::now();
             let variant_choice = apply_variant_policy(
                 &mut selected,
                 &operator_config,
@@ -3862,7 +4047,7 @@ async fn handle_select_request(
                 selected.explanation.push(note.clone());
             }
             if let Some(note) = availability.note.as_ref().filter(|_| {
-                selected_harness == substrate_policy::Harness::Broca
+                selected_harness == Some(substrate_policy::Harness::Broca)
                     && (params.executor.is_none()
                         || is_broca_substrate(params.substrate.as_deref()))
             }) {
@@ -3871,6 +4056,8 @@ async fn handle_select_request(
             selected
                 .explanation
                 .extend(head_refusals.notes.iter().cloned());
+            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
+            let write_started = Instant::now();
             let decision = decision_input_for(
                 &target_agent,
                 &requirements,
@@ -3880,12 +4067,15 @@ async fn handle_select_request(
                 Some(&provenance),
                 Some(&policy_sources),
             );
-            match store.record_decision_with_selection(
+            let recorded = store.record_decision_with_selection(
                 &decision,
-                Some(selected_harness.as_str()),
+                selected_harness.map(substrate_policy::Harness::as_str),
                 selected_workload,
-            ) {
+            );
+            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
+            match recorded {
                 Ok(decision_id) => {
+                    let finish_started = Instant::now();
                     let mut resolved_input = json!({
                         "requirements": requirements,
                         "availableModels": &resolved_request.policy.available_models,
@@ -3913,11 +4103,15 @@ async fn handle_select_request(
                             }).collect::<std::collections::BTreeMap<_, _>>(),
                         }))).collect::<Vec<_>>(),
                     });
-                    result["selected"]["harness"] = json!(selected_harness);
+                    if let Some(harness) = selected_harness {
+                        result["selected"]["harness"] = json!(harness);
+                    }
                     if params.pin.is_some() {
                         result["pin_rejected"] = json!(pin_rejected);
                     }
-                    if selected_harness == substrate_policy::Harness::Broca {
+                    add_stage_ms(&timing.finish_ms, finish_started.elapsed());
+                    let runner_started = Instant::now();
+                    if selected_harness == Some(substrate_policy::Harness::Broca) {
                         // An automatically chosen key-pool provider leases its key
                         // here; any other provider resolves to the ordinary
                         // translation. Going through runner_for_route keeps one
@@ -3945,6 +4139,8 @@ async fn handle_select_request(
                             }
                         }
                     }
+                    add_stage_ms(&timing.runner_ms, runner_started.elapsed());
+                    let finish_started = Instant::now();
                     let body = serde_json::to_vec(&json!({ "result": result }))
                         .map_err(ModuleError::Json)?;
                     let response = Frame::build_with_version(
@@ -3957,6 +4153,7 @@ async fn handle_select_request(
                         body,
                     )
                     .map_err(|e| ModuleError::Message(e.to_string()))?;
+                    add_stage_ms(&timing.finish_ms, finish_started.elapsed());
                     let reply_started = Instant::now();
                     let reply = send(writer, response).await;
                     timing.record_reply(reply_started.elapsed());
@@ -4019,6 +4216,8 @@ async fn handle_select_request(
             if !no_route_notes.is_empty() {
                 no_route.message = format!("{} ({})", no_route.message, no_route_notes.join("; "));
             }
+            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
+            let write_started = Instant::now();
             // Best-effort failed-decision audit row (ignore a store error here: the
             // routing failure is the real result to surface).
             let decision = decision_input_for(
@@ -4031,6 +4230,7 @@ async fn handle_select_request(
                 Some(&policy_sources),
             );
             let _ = store.record_decision(&decision);
+            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
             let reply_started = Instant::now();
             let reply = send_no_route(
                 writer,
@@ -4136,6 +4336,7 @@ fn pool_session(task_id: Option<&str>, send_id: Option<&str>, fallback: &str) ->
 fn host_runner_pin_refusal<'a>(
     policy: &ModelRoutingPolicyInput,
     requested_substrate: Option<&str>,
+    substrate_source: &str,
     pinned_routes: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
     if is_broca_substrate(requested_substrate) {
@@ -4145,7 +4346,7 @@ fn host_runner_pin_refusal<'a>(
         let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
         needs_runner_pin(policy, provider).then(|| {
             format!(
-                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, but this route maps to harness {}",
+                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, but {substrate_source} {}",
                 requested_substrate.unwrap_or("none")
             )
         })
@@ -12249,12 +12450,41 @@ mod tests {
         );
     }
 
+    /// A host's own mason pin (no workload named) on a key-pool provider is
+    /// admitted against Broca's routes without a key; core selects the pin
+    /// again with substrate broca before launch, and that selection leases.
     #[tokio::test]
-    async fn a_host_mason_pin_mapped_to_broca_is_admitted_with_its_runner() {
+    async fn a_host_mason_pin_is_provisional_until_core_completes_it_on_broca() {
         let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
         let (body, _rig, _store) = platform_select(
             "platform-host-pin",
             json!({"targetAgent":"mason", "requestedRequirements":{"iq":90,"eq":0},
+                   "harness": "opencode", "executor": null,
+                   "availableModels":["anthropic/claude-opus-4-1"],
+                   "modelPin":"anthropic-platform/claude-opus-4-1"}),
+            &credentials,
+            false,
+        )
+        .await;
+        assert_eq!(
+            body["result"]["selected"]["routeKey"], "anthropic-platform/claude-opus-4-1",
+            "{body}"
+        );
+        assert_eq!(body["result"]["requiredSubstrate"], "broca", "{body}");
+        assert!(
+            body["result"].get("runner").is_none(),
+            "no key before core admission: {body}"
+        );
+        assert!(body["result"].get("poolLease").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_mason_launch_pin_mapped_to_broca_is_admitted_with_its_runner() {
+        let credentials = platform_listing(&[("apikey:anthropic:work", &["anthropic-platform"])]);
+        let (body, _rig, _store) = platform_select(
+            "platform-host-pin",
+            json!({"targetAgent":"mason", "requestedRequirements":{"iq":90,"eq":0},
+                   "workload": "mason",
                    "harness": "opencode", "substrate": "opencode", "executor": null,
                    "availableModels":["anthropic/claude-opus-4-1"],
                    "modelPin":"anthropic-platform/claude-opus-4-1"}),
@@ -14260,6 +14490,45 @@ mod slow_route_select_timing_tests {
         assert!(snapshot.as_millis() >= 1_000);
         assert!(emitted.contains("selection_ms="), "{emitted}");
         assert!(emitted.contains("reply_ms="), "{emitted}");
+    }
+
+    #[test]
+    fn every_stage_bucket_is_named_and_subtracted_from_unclassified() {
+        let timing = RouteSelectTiming::new();
+        timing.is_select.set(true);
+        let stages = [
+            ("live_config_check_ms", &timing.live_config_check_ms),
+            ("billing_wait_ms", &timing.billing_wait_ms),
+            ("resolve_ms", &timing.resolve_ms),
+            ("wait_prepare_ms", &timing.prepare_wait_ms),
+            ("snapshot_closure_ms", &timing.snapshot_closure_ms),
+            ("pricing_ms", &timing.pricing_ms),
+            ("policy_ms", &timing.policy_ms),
+            ("head_history_ms", &timing.head_history_ms),
+            ("selection_ms", &timing.selection_ms),
+            ("ladder_ms", &timing.ladder_ms),
+            ("decision_write_ms", &timing.decision_write_ms),
+            ("runner_ms", &timing.runner_ms),
+            ("finish_ms", &timing.finish_ms),
+            ("reply_ms", &timing.reply_ms),
+        ];
+        for (index, (_, bucket)) in stages.iter().enumerate() {
+            add_stage_ms(bucket, Duration::from_millis(100 + index as u64));
+        }
+        let line = timing
+            .line_at(timing.started + Duration::from_millis(3_000))
+            .expect("three seconds is slow");
+        let classified: u64 = (0..stages.len() as u64).map(|index| 100 + index).sum();
+        for (index, (name, _)) in stages.iter().enumerate() {
+            assert!(
+                line.contains(&format!(" {name}={} ", 100 + index)),
+                "{name}: {line}"
+            );
+        }
+        assert!(
+            line.ends_with(&format!("unclassified_ms={}", 3_000 - classified)),
+            "{line}"
+        );
     }
 
     #[test]
