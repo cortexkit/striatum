@@ -39,7 +39,7 @@ mod winner_ladder;
 mod work_model_pin;
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     error::Error,
     ffi::OsString,
     fmt,
@@ -387,44 +387,94 @@ fn merge_quota_windows(
 }
 
 #[derive(Default)]
-struct UnsupportedFundingWarnings {
+struct QuotaRefreshWarnings {
     reported_value_sets: BTreeSet<BTreeSet<String>>,
+    providers_walled_with_funds: BTreeSet<String>,
 }
 
-impl UnsupportedFundingWarnings {
-    fn warning_for(&mut self, fresh: &[ProviderUsage]) -> Option<String> {
+impl QuotaRefreshWarnings {
+    fn warnings_for(&mut self, fresh: &[ProviderUsage]) -> Vec<String> {
+        let mut warnings = Vec::new();
         let unsupported: BTreeSet<String> = fresh
             .iter()
             .flat_map(|entry| entry.spend.iter())
             .filter(|pool| !pool.has_known_funding())
             .map(|pool| pool.funding.clone())
             .collect();
-        if unsupported.is_empty() || !self.reported_value_sets.insert(unsupported.clone()) {
-            return None;
+        if !unsupported.is_empty() && self.reported_value_sets.insert(unsupported.clone()) {
+            warnings.push(format!(
+                "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {unsupported:?}"
+            ));
         }
-        Some(format!(
-            "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {unsupported:?}"
-        ))
+
+        let mut wall_details_by_provider = BTreeMap::<String, BTreeSet<String>>::new();
+        // A positive balance in non-spendable pools cannot prevent a wall when
+        // every spend-authorized pool is empty. Name that policy when the
+        // provider enters this state so the visible balance is not mistaken for
+        // a quota bug; re-arm the warning only after the state clears.
+        for entry in fresh {
+            if entry.spend.is_empty() {
+                continue;
+            }
+            let all_spendable_empty = entry
+                .spend
+                .iter()
+                .filter(|pool| pool.has_supported_funding())
+                .all(|pool| pool.is_known_empty());
+            if !all_spendable_empty {
+                continue;
+            }
+            let withheld: BTreeSet<String> = entry
+                .spend
+                .iter()
+                .filter(|pool| !pool.has_supported_funding())
+                .filter_map(|pool| {
+                    pool.remaining
+                        .as_ref()
+                        .filter(|remaining| !remaining.is_non_positive())
+                        .map(|remaining| format!("{} ({})", remaining.render(), pool.funding))
+                })
+                .collect();
+            if !withheld.is_empty() {
+                wall_details_by_provider
+                    .entry(entry.provider.clone())
+                    .or_default()
+                    .extend(withheld);
+            }
+        }
+
+        let currently_walled: BTreeSet<String> = wall_details_by_provider.keys().cloned().collect();
+        for provider in currently_walled.difference(&self.providers_walled_with_funds) {
+            let withheld = wall_details_by_provider
+                .get(provider)
+                .expect("active provider has a withheld-balance description");
+            warnings.push(format!(
+                "[prefrontal-routing] provider {provider} walled on empty spendable pools while non-spendable pools hold {} - policy, not a quota bug (only granted/subscription funding may spend)",
+                withheld.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        self.providers_walled_with_funds = currently_walled;
+        warnings
     }
 }
 
-fn log_unknown_spend_funding_with(
+fn log_quota_refresh_warnings_with(
     fresh: &[ProviderUsage],
-    reported: &mut UnsupportedFundingWarnings,
+    reported: &mut QuotaRefreshWarnings,
     mut emit: impl FnMut(&str),
 ) {
-    if let Some(warning) = reported.warning_for(fresh) {
+    for warning in reported.warnings_for(fresh) {
         emit(&warning);
     }
 }
 
-fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
-    static REPORTED_VALUE_SETS: OnceLock<Mutex<UnsupportedFundingWarnings>> = OnceLock::new();
-    let mut reported = REPORTED_VALUE_SETS
+fn log_quota_refresh_warnings(fresh: &[ProviderUsage]) {
+    static REPORTED: OnceLock<Mutex<QuotaRefreshWarnings>> = OnceLock::new();
+    let mut reported = REPORTED
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    log_unknown_spend_funding_with(fresh, &mut reported, |warning| eprintln!("{warning}"));
+    log_quota_refresh_warnings_with(fresh, &mut reported, |warning| eprintln!("{warning}"));
 }
 
 #[cfg(test)]
@@ -473,9 +523,11 @@ fn write_quota_readings(
 }
 
 fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observed_at_ms: u64) {
-    // Insula extends funding additively. Log only unrecognized kinds, and only
-    // once for each distinct set during this process; all remain not spendable.
-    log_unknown_spend_funding(&fresh);
+    // The quota producer can add funding labels over time. Unrecognized labels are
+    // logged once per distinct set; a provider wall caused by empty spendable
+    // balances and positive non-spendable balances is logged when it begins, then
+    // again only if it clears and returns.
+    log_quota_refresh_warnings(&fresh);
     // A restored snapshot only bridges the gap between boot and the first poll.
     // That poll starts from an empty cache, exactly as it did before snapshots
     // were persisted, so nothing restored outlives the first fresh reading.
@@ -6688,14 +6740,14 @@ mod tests {
             "spend": [{ "id": "future", "label": "Future", "funding": "issuer_credit_v3", "basis": "reported" }]
         }]))
         .unwrap();
-        let mut reported = UnsupportedFundingWarnings::default();
+        let mut reported = QuotaRefreshWarnings::default();
         let mut emitted = Vec::new();
 
-        log_unknown_spend_funding_with(&known, &mut reported, |warning| {
+        log_quota_refresh_warnings_with(&known, &mut reported, |warning| {
             emitted.push(warning.to_string())
         });
         assert!(emitted.is_empty(), "known wire values must not log");
-        log_unknown_spend_funding_with(&first_unrecognized_refresh, &mut reported, |warning| {
+        log_quota_refresh_warnings_with(&first_unrecognized_refresh, &mut reported, |warning| {
             emitted.push(warning.to_string())
         });
         assert_eq!(emitted, [
@@ -6703,14 +6755,91 @@ mod tests {
         ]);
         // A second refresh with the same value set, even on another provider,
         // produces no log line.
-        log_unknown_spend_funding_with(&repeated_unrecognized_refresh, &mut reported, |warning| {
+        log_quota_refresh_warnings_with(&repeated_unrecognized_refresh, &mut reported, |warning| {
             emitted.push(warning.to_string())
         });
         assert_eq!(emitted.len(), 1);
-        log_unknown_spend_funding_with(&different_unrecognized_refresh, &mut reported, |warning| {
+        log_quota_refresh_warnings_with(
+            &different_unrecognized_refresh,
+            &mut reported,
+            |warning| emitted.push(warning.to_string()),
+        );
+        assert_eq!(emitted.len(), 2);
+    }
+
+    #[test]
+    fn walled_with_funds_warning_logs_once_until_the_shape_clears() {
+        let walled_reading = |provider: &str, grant_minor| {
+            usage(json!({
+                "provider": provider,
+                "spend": [
+                    {
+                        "id": "grant",
+                        "label": "Granted balance",
+                        "funding": "granted",
+                        "remaining": { "minor": grant_minor, "exponent": 2, "unit": "USD" },
+                        "basis": "reported"
+                    },
+                    {
+                        "id": "purchased",
+                        "label": "Purchased credits",
+                        "funding": "purchased",
+                        "remaining": { "minor": 250, "exponent": 2, "unit": "USD" },
+                        "basis": "reported"
+                    }
+                ]
+            }))
+        };
+        let deepseek_wall = walled_reading("deepseek", 0);
+        let deepseek_clear = walled_reading("deepseek", 100);
+        let openai_wall = walled_reading("openai", 0);
+        let openai_clear = walled_reading("openai", 100);
+        let both_walls = [deepseek_wall.clone(), openai_wall.clone()];
+        let mut warnings = QuotaRefreshWarnings::default();
+        let mut emitted = Vec::new();
+
+        log_quota_refresh_warnings_with(&both_walls, &mut warnings, |warning| {
             emitted.push(warning.to_string())
         });
         assert_eq!(emitted.len(), 2);
+        assert!(emitted
+            .iter()
+            .any(|line| line.contains("provider deepseek walled")));
+        assert!(emitted
+            .iter()
+            .any(|line| line.contains("provider openai walled")));
+
+        log_quota_refresh_warnings_with(&both_walls, &mut warnings, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert_eq!(emitted.len(), 2, "a repeated wall shape must be silent");
+
+        let deepseek_cleared = [deepseek_clear, openai_wall.clone()];
+        log_quota_refresh_warnings_with(&deepseek_cleared, &mut warnings, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert_eq!(
+            emitted.len(),
+            2,
+            "clearing one provider's shape does not warn"
+        );
+
+        log_quota_refresh_warnings_with(&both_walls, &mut warnings, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert_eq!(emitted.len(), 3, "the returned DeepSeek wall warns again");
+        assert!(emitted[2].contains("provider deepseek walled"));
+
+        let openai_cleared = [deepseek_wall, openai_clear];
+        log_quota_refresh_warnings_with(&openai_cleared, &mut warnings, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert_eq!(emitted.len(), 3);
+        log_quota_refresh_warnings_with(&both_walls, &mut warnings, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert_eq!(emitted.len(), 4, "the returned OpenAI wall warns again");
+        assert!(emitted[3].contains("provider openai walled"));
     }
 
     #[test]
