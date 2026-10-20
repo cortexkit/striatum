@@ -810,6 +810,84 @@ async fn connect_to_subc(connection_file_path: &PathBuf) -> Result<TcpStream, Mo
     Ok(stream)
 }
 
+/// The long-lived background loops one serving connection starts: retention,
+/// quota events, the account roster, config refresh, catalog refresh and the
+/// winner-ladder watch. Each is written to run until the process exits, so one
+/// that finishes, by panicking or by returning, has silently stopped a duty
+/// route.select depends on (quota readings, catalog facts, config reloads).
+/// The serving loop watches this set and turns the first stop into a module
+/// error: the process exits non-zero, and the subc daemon's crash-restart
+/// policy starts a fresh module that restores its caches from the store and
+/// runs every loop again. Dropping the set aborts the remaining loops.
+#[derive(Default)]
+struct BackgroundLoops {
+    tasks: tokio::task::JoinSet<()>,
+    names: HashMap<tokio::task::Id, &'static str>,
+}
+
+impl BackgroundLoops {
+    fn spawn<F>(&mut self, name: &'static str, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = self.tasks.spawn(task);
+        self.names.insert(handle.id(), name);
+    }
+
+    /// Wait until one loop stops and describe which one and how. Stays pending
+    /// while every loop runs, including when no loop was started.
+    async fn next_stop(&mut self) -> ModuleError {
+        let Some(joined) = self.tasks.join_next_with_id().await else {
+            return std::future::pending().await;
+        };
+        let (id, how) = match joined {
+            Ok((id, ())) => (id, "returned".to_string()),
+            Err(error) if error.is_panic() => {
+                let id = error.id();
+                (
+                    id,
+                    format!("panicked: {}", panic_message(error.into_panic().as_ref())),
+                )
+            }
+            Err(error) => (error.id(), "was cancelled".to_string()),
+        };
+        let name = self.names.remove(&id).unwrap_or("unnamed");
+        ModuleError::Message(format!(
+            "routing background loop `{name}` stopped unexpectedly ({how}); \
+             exiting so the daemon restarts the module"
+        ))
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Read the next frame from subc unless a background loop stops first. A stop
+/// is printed to stderr, so the module's output names the loop, and returned
+/// as the error that ends the process.
+async fn next_frame_or_loop_stop<R>(
+    read_half: &mut R,
+    loops: &mut BackgroundLoops,
+) -> Result<Option<Frame>, ModuleError>
+where
+    R: AsyncRead + Unpin,
+{
+    tokio::select! {
+        frame = read_frame(read_half) => frame.map_err(|e| ModuleError::Message(e.to_string())),
+        stopped = loops.next_stop() => {
+            eprintln!("[prefrontal-routing] background-loop-stopped: {stopped}");
+            Err(stopped)
+        }
+    }
+}
+
 async fn module_loop<R>(
     read_half: &mut R,
     writer: mpsc::Sender<Frame>,
@@ -857,21 +935,25 @@ where
     // Old audit, usage and account-selection rows are deleted in small batches
     // on their own timer. Each retention pass re-reads how long every table keeps its
     // rows from the routing file's `retention` block.
-    tokio::spawn(retention::retention_loop(
-        Arc::clone(&store),
-        config_overrides::config_path(),
-    ));
+    let mut loops = BackgroundLoops::default();
+    loops.spawn(
+        "retention",
+        retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
+    );
     // Restore per-account views before the shared quota delivery task starts.
     // The roster has a separate refresh loop; readings share the event consumer.
     let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
         account_quota::restore_account_state(store.as_ref()),
     ));
-    tokio::spawn(quota_events::run(
-        config.connection_file_path.clone(),
-        Arc::clone(&quota_cache),
-        Arc::clone(&account_state),
-        Arc::clone(&store),
-    ));
+    loops.spawn(
+        "quota events",
+        quota_events::run(
+            config.connection_file_path.clone(),
+            Arc::clone(&quota_cache),
+            Arc::clone(&account_state),
+            Arc::clone(&store),
+        ),
+    );
     let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
     broca_credentials.lock().unwrap().connection_file_path =
         Some(config.connection_file_path.clone());
@@ -897,13 +979,16 @@ where
                 })?,
                 DEFAULT_MODULE_ID,
             ));
-        tokio::spawn(account_quota::account_quota_loop(
-            config.connection_file_path.clone(),
-            account_state,
-            Arc::clone(&store),
-            roster_resolver,
-            Arc::clone(&broca_credentials),
-        ));
+        loops.spawn(
+            "account roster",
+            account_quota::account_quota_loop(
+                config.connection_file_path.clone(),
+                account_state,
+                Arc::clone(&store),
+                roster_resolver,
+                Arc::clone(&broca_credentials),
+            ),
+        );
     }
     // Every placement and config reload compares the winner ladder over the same
     // config a selection reads (the operator policy lives in the routing file)
@@ -922,10 +1007,13 @@ where
     // OpenCode owns this file; routing reads only each provider's auth kind.
     let opencode_auth_path = config_overrides::auth_json_path();
     config_overrides::live_config(&override_path);
-    tokio::spawn(config_overrides::config_refresh_loop(
-        override_path.clone(),
-        Arc::clone(&broca_credentials.lock().unwrap().catalog_wake),
-    ));
+    loops.spawn(
+        "config refresh",
+        config_overrides::config_refresh_loop(
+            override_path.clone(),
+            Arc::clone(&broca_credentials.lock().unwrap().catalog_wake),
+        ),
+    );
 
     // Seed catalog health with the active polling cadence; reloads wake the
     // catalog loop, which updates both its cadence and the health threshold.
@@ -933,21 +1021,24 @@ where
     if let Ok(mut health) = catalog_health.lock() {
         health.set_poll_ms(catalog_poll_ms);
     }
-    tokio::spawn(fusiform_catalog::catalog_refresh_loop(
-        config.connection_file_path.clone(),
-        Arc::clone(&store),
-        Arc::clone(&catalog_health),
-        catalog_poll_ms,
-        ladder_sources.clone(),
-        Arc::clone(&broca_credentials),
-    ));
+    loops.spawn(
+        "catalog refresh",
+        fusiform_catalog::catalog_refresh_loop(
+            config.connection_file_path.clone(),
+            Arc::clone(&store),
+            Arc::clone(&catalog_health),
+            catalog_poll_ms,
+            ladder_sources.clone(),
+            Arc::clone(&broca_credentials),
+        ),
+    );
     // Compares a ladder when a config file the ladder reads changed or live
     // selection reported a different availability set (including the first one
     // after boot, which is compared with the ladder stored before the restart).
-    tokio::spawn(winner_ladder::config_reload_watch_loop(
-        Arc::clone(&store),
-        ladder_sources,
-    ));
+    loops.spawn(
+        "winner ladder watch",
+        winner_ladder::config_reload_watch_loop(Arc::clone(&store), ladder_sources),
+    );
 
     let min_band: SharedMinBand = Arc::new(std::sync::Mutex::new(
         config_overrides::live_config(&override_path).min_band(),
@@ -955,10 +1046,7 @@ where
 
     let mut route_epochs = RouteEpochs::new();
     loop {
-        let Some(frame) = read_frame(read_half)
-            .await
-            .map_err(|e| ModuleError::Message(e.to_string()))?
-        else {
+        let Some(frame) = next_frame_or_loop_stop(read_half, &mut loops).await? else {
             return Ok(()); // clean EOF: subc closed the connection.
         };
         if !handle_frame(
@@ -14606,5 +14694,86 @@ mod slow_route_select_timing_tests {
             ),
             Some("next (suppressed 1 similar lines)".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod background_loop_supervision_tests {
+    use super::*;
+
+    /// Long enough for any spawned loop in these tests to finish; a wait that
+    /// outlives it means a stopped loop went unnoticed.
+    const STOP_NOTICE_LIMIT: Duration = Duration::from_secs(5);
+
+    async fn wait_for_frame_or_stop(
+        loops: &mut BackgroundLoops,
+        read_half: &mut tokio::io::DuplexStream,
+    ) -> Result<Option<Frame>, ModuleError> {
+        tokio::time::timeout(STOP_NOTICE_LIMIT, next_frame_or_loop_stop(read_half, loops))
+            .await
+            .expect("the serving loop must notice a stopped background loop")
+    }
+
+    #[tokio::test]
+    async fn a_panicking_background_loop_ends_serving_with_its_name() {
+        // The other half stays open, so subc never sends EOF: only the
+        // stopped loop can end the wait.
+        let (_subc, mut module) = tokio::io::duplex(1024);
+        let mut loops = BackgroundLoops::default();
+        loops.spawn("catalog refresh", std::future::pending());
+        loops.spawn("quota events", async { panic!("quota bus gone") });
+
+        let error = wait_for_frame_or_stop(&mut loops, &mut module)
+            .await
+            .expect_err("a panicked loop must end serving with an error");
+        let message = error.to_string();
+        assert!(message.contains("`quota events`"), "{message}");
+        assert!(message.contains("panicked: quota bus gone"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_returning_background_loop_ends_serving_with_its_name() {
+        let (_subc, mut module) = tokio::io::duplex(1024);
+        let mut loops = BackgroundLoops::default();
+        loops.spawn("retention", async {});
+
+        let error = wait_for_frame_or_stop(&mut loops, &mut module)
+            .await
+            .expect_err("a loop that returns must end serving with an error");
+        let message = error.to_string();
+        assert!(message.contains("`retention`"), "{message}");
+        assert!(message.contains("returned"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn frames_and_eof_are_served_while_background_loops_run() {
+        let (mut subc, mut module) = tokio::io::duplex(1024);
+        let mut loops = BackgroundLoops::default();
+        loops.spawn("winner ladder watch", std::future::pending());
+        let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 7, Vec::new()).unwrap();
+        write_frame(&mut subc, &ping).await.unwrap();
+
+        let frame = wait_for_frame_or_stop(&mut loops, &mut module)
+            .await
+            .unwrap()
+            .expect("the written frame");
+        assert_eq!(frame.header.corr, 7);
+
+        drop(subc);
+        assert!(wait_for_frame_or_stop(&mut loops, &mut module)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_loop_set_never_reports_a_stop() {
+        let (subc, mut module) = tokio::io::duplex(1024);
+        let mut loops = BackgroundLoops::default();
+        drop(subc);
+        assert!(wait_for_frame_or_stop(&mut loops, &mut module)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
