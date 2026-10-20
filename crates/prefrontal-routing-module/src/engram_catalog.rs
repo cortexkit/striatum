@@ -91,7 +91,15 @@ mod tests {
       "class": "portable",
       "mechanism": "page-db",
       "path": "store.db",
-      "writer_interaction": "read-transaction-live"
+      "writer_interaction": "read-transaction-live",
+      "exclude_tables": [
+        "model_route_decisions",
+        "account_observation",
+        "account_decision",
+        "quota_reading_log",
+        "route_winner_baseline",
+        "fusiform_catalog_cursor"
+      ]
     },
     {
       "entry_id": "prefrontal-routing/engram-catalog",
@@ -119,6 +127,22 @@ mod tests {
             .collect()
     }
 
+    fn excluded_tables(bytes: &[u8]) -> Vec<String> {
+        let catalog: Value = serde_json::from_slice(bytes).expect("valid catalog JSON");
+        catalog["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .flat_map(|entry| {
+                entry["exclude_tables"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|table| table.as_str().expect("excluded table name").to_owned())
+            })
+            .collect()
+    }
+
     #[test]
     fn catalog_bytes_are_pinned() {
         assert_eq!(CATALOG_BYTES, EXPECTED_CATALOG.as_bytes());
@@ -132,6 +156,75 @@ mod tests {
         assert!(entries(CATALOG_BYTES)
             .iter()
             .any(|(id, path)| id == "prefrontal-routing/store" && path == "store.db"));
+    }
+
+    #[test]
+    fn catalog_excluded_tables_exist_in_the_migrated_routing_store_schema() {
+        let mut excluded = excluded_tables(CATALOG_BYTES);
+        let mut backup_excluded: Vec<String> =
+            prefrontal_routing_store::backup::BACKUP_EXCLUDABLE_TABLES
+                .iter()
+                .map(|(table, _)| (*table).to_owned())
+                .collect();
+        excluded.sort();
+        backup_excluded.sort();
+        assert_eq!(excluded, backup_excluded);
+
+        let scratch = prefrontal_core_store::ScratchDir::new("routing-engram-catalog-schema");
+        let database = scratch.path().join("store.db");
+        let store = prefrontal_routing_store::SqliteRouteStateStore::open(
+            &prefrontal_routing_store::dev_descriptor(
+                "routing-engram-catalog-schema",
+                database.to_string_lossy().into_owned(),
+            ),
+        )
+        .expect("open store after migrations");
+        drop(store);
+
+        let connection = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open migrated store read-only");
+        for table in &excluded {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("query migrated schema");
+            assert!(exists, "catalog excludes missing routing table {table}");
+        }
+
+        let tables: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .expect("prepare migrated tables query")
+            .query_map([], |row| row.get(0))
+            .expect("query migrated tables")
+            .collect::<rusqlite::Result<_>>()
+            .expect("read migrated table names");
+        for table in tables {
+            if excluded.contains(&table) {
+                continue;
+            }
+            let parents: Vec<String> = connection
+                .prepare("SELECT \"table\" FROM pragma_foreign_key_list(?1)")
+                .expect("prepare foreign key query")
+                .query_map([&table], |row| row.get(0))
+                .expect("query foreign keys")
+                .collect::<rusqlite::Result<_>>()
+                .expect("read foreign keys");
+            for parent in parents {
+                assert!(
+                    !excluded.contains(&parent),
+                    "retained routing table {table} references excluded table {parent}"
+                );
+            }
+        }
     }
 
     #[test]

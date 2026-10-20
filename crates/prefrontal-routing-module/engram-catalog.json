@@ -7,7 +7,15 @@
       "class": "portable",
       "mechanism": "page-db",
       "path": "store.db",
-      "writer_interaction": "read-transaction-live"
+      "writer_interaction": "read-transaction-live",
+      "exclude_tables": [
+        "model_route_decisions",
+        "account_observation",
+        "account_decision",
+        "quota_reading_log",
+        "route_winner_baseline",
+        "fusiform_catalog_cursor"
+      ]
     },
     {
       "entry_id": "prefrontal-routing/engram-catalog",
