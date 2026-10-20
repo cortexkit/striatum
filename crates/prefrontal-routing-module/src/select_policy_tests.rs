@@ -403,8 +403,8 @@ mod consumer_and_pin {
         );
     }
 
-    /// The designer's request as Spec Campaigns V2 sends it: the
-    /// `spec_designer` slot, no fallback route.
+    /// The Spec Campaigns V2 designer's route request: the `spec_designer`
+    /// pin slot with no fallback route, from the athena consumer.
     fn designer_params(rig: &PolicyRig) -> serde_json::Value {
         let mut params = rig.params();
         params["consumer"] = json!("athena");
