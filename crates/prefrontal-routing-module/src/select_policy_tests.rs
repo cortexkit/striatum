@@ -464,7 +464,10 @@ mod consumer_and_pin {
         let mut params = designer_params(&rig);
         params["excludeRouteKeys"] = json!(["fallback/safe"]);
         let reply = rig.select(params).await;
-        assert_eq!(reply["result"]["pin_rejected"], "caller_excluded", "{reply}");
+        assert_eq!(
+            reply["result"]["pin_rejected"], "caller_excluded",
+            "{reply}"
+        );
         assert_eq!(
             reply["result"]["selected"],
             serde_json::Value::Null,
