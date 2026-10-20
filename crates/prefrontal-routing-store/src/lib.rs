@@ -196,6 +196,7 @@ const MIGRATION_057: &str = include_str!("../migrations/057_prune_absent_fusifor
 /// the history logs, without those keys. Runs with foreign-key enforcement
 /// suspended (see `SqliteRouteStateStore::open`).
 const MIGRATION_058: &str = include_str!("../migrations/058_drop_history_foreign_keys.sql");
+const MIGRATION_059: &str = include_str!("../migrations/059_provider_reset_fences.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -249,7 +250,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 58] {
+fn route_state_migrations() -> [Migration; 59] {
     [
         Migration {
             version: 1,
@@ -482,6 +483,10 @@ fn route_state_migrations() -> [Migration; 58] {
         Migration {
             version: 58,
             statements: MIGRATION_058,
+        },
+        Migration {
+            version: 59,
+            statements: MIGRATION_059,
         },
     ]
 }
@@ -1852,6 +1857,59 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    /// Live provider-confirmed resets for one consumer, excluding expired fences.
+    pub fn provider_reset_fences(
+        &self,
+        consumer: &str,
+        now: i64,
+    ) -> RouteStateResult<Vec<prefrontal_routing_core::route_state_store::ProviderResetFence>> {
+        self.store.with_conn(|c: &Connection| {
+            let mut stmt = c.prepare("SELECT route_key, account_ref, credential_id, resets_at_ms FROM provider_reset_fences WHERE consumer=?1 AND resets_at_ms>?2")?;
+            let rows = stmt.query_map(params![consumer, now], |row| Ok(prefrontal_routing_core::route_state_store::ProviderResetFence {
+                route_key: row.get(0)?, account_ref: row.get(1)?, credential_id: row.get(2)?, resets_at_ms: row.get(3)?,
+            }))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        }).map_err(err)
+    }
+
+    pub fn set_decision_provider_identity(
+        &self,
+        decision_id: &str,
+        identity: &prefrontal_routing_core::route_state_store::ProviderOutcome,
+    ) -> RouteStateResult<()> {
+        let json =
+            serde_json::to_string(identity).map_err(|e| RouteStateStoreError(e.to_string()))?;
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "UPDATE model_route_decisions SET provider_identity_json=?1 WHERE id=?2",
+                    params![json, decision_id],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
+    pub fn decision_provider_identity(
+        &self,
+        decision_id: &str,
+    ) -> RouteStateResult<Option<prefrontal_routing_core::route_state_store::ProviderOutcome>> {
+        let json: Option<String> = self
+            .store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT provider_identity_json FROM model_route_decisions WHERE id=?1",
+                    [decision_id],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .map_err(err)?
+            .flatten();
+        json.map(|raw| serde_json::from_str(&raw).map_err(|e| RouteStateStoreError(e.to_string())))
+            .transpose()
+    }
+
     /// Persist the resolved execution identity in the same insert as the audit row.
     /// The generic store trait leaves these values unknown; routing supplies them
     /// only after selection, without repurposing the caller's `input.harness`.
@@ -1876,8 +1934,8 @@ impl SqliteRouteStateStore {
                          target_agent, requirements_json, selected_route_key, selected_provider_id,
                          selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
                          quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at,
-                         selected_harness, selected_workload
-                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                         selected_harness, selected_workload, consumer
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
@@ -1902,6 +1960,7 @@ impl SqliteRouteStateStore {
                         now_ms(),
                         selected_harness,
                         selected_workload,
+                        input.consumer,
                     ],
                 )?;
                 Ok(())
@@ -3106,7 +3165,8 @@ impl RouteStateStore for SqliteRouteStateStore {
     ) -> RouteStateResult<()> {
         // Retain the full error in the audit, but treat an explicitly account-
         // scoped failure as neutral model-health evidence. This closes both the
-        // quota-horizon writer and the terminal-failure backoff writer.
+        // route-global quota writer and the terminal-failure backoff writer. The
+        // request-class provider reset below is independent of both.
         let mut normalized = update.clone();
         if prefrontal_routing_core::account_wall::account_scoped_error(
             update.last_error.as_deref().unwrap_or(""),
@@ -3153,6 +3213,25 @@ impl RouteStateStore for SqliteRouteStateStore {
                 if prior_outcome.is_some() {
                     tx.commit()?;
                     return Ok(());
+                }
+
+                if let Some(provider) = update.provider_outcome.as_ref().filter(|p| !p.account_ref.trim().is_empty()) {
+                    let scope: (Option<String>, Option<String>, Option<String>, Option<String>) = tx.query_row(
+                        "SELECT consumer, selected_provider_id, selected_model_id, selected_variant FROM model_route_decisions WHERE id=?1",
+                        [decision_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+                    if let (Some(consumer), Some(provider_id), Some(model_id), variant) = scope {
+                        let executed_route = prefrontal_routing_core::make_route_key(&provider_id, &model_id, variant.as_deref());
+                        if update.outcome == prefrontal_routing_core::RouteOutcome::Completed {
+                            tx.execute("DELETE FROM provider_reset_fences WHERE route_key=?1 AND consumer=?2 AND (account_ref=?3 OR (credential_id IS NOT NULL AND credential_id=?5)) AND observed_at_ms<=?4",
+                                params![executed_route, consumer, provider.account_ref, update.observed_at_ms, provider.credential_id])?;
+                        } else if let Some(reset) = provider.resets_at_ms.filter(|at| *at > update.observed_at_ms) {
+                            tx.execute("INSERT INTO provider_reset_fences (route_key,consumer,account_ref,credential_id,resets_at_ms,observed_at_ms)
+                                VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(route_key,consumer,account_ref) DO UPDATE SET
+                                credential_id=excluded.credential_id, resets_at_ms=MAX(provider_reset_fences.resets_at_ms,excluded.resets_at_ms),
+                                observed_at_ms=MAX(provider_reset_fences.observed_at_ms,excluded.observed_at_ms)",
+                                params![executed_route,consumer,provider.account_ref,provider.credential_id,reset,update.observed_at_ms])?;
+                        }
+                    }
                 }
 
                 tx.execute(
@@ -4120,6 +4199,7 @@ mod tests {
                 .set_decision_outcome(
                     &decision,
                     &DecisionOutcomeUpdate {
+                        provider_outcome: None,
                         outcome: prefrontal_routing_core::RouteOutcome::QuotaExhausted {
                             retry_after_secs: 279100,
                         },
@@ -5299,6 +5379,7 @@ mod tests {
             .set_decision_outcome(
                 "a-real",
                 &DecisionOutcomeUpdate {
+                    provider_outcome: None,
                     outcome: prefrontal_routing_core::RouteOutcome::SessionError,
                     last_error: Some("blocked by the content policy".into()),
                     observed_at_ms: recent + 1,
@@ -5606,8 +5687,11 @@ mod tests {
         migrated
             .store
             .with_conn(|c| {
-                assert_eq!(route_state_version(c)?, 58);
-                assert_eq!(history_foreign_keys(c), ["account_admission -> account_pin"]);
+                assert_eq!(route_state_version(c)?, 59);
+                assert_eq!(
+                    history_foreign_keys(c),
+                    ["account_admission -> account_pin"]
+                );
                 assert_eq!(rebuilt_table_shape(c), legacy_shape);
                 let integrity: String =
                     c.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -5627,11 +5711,10 @@ mod tests {
                     ("account_fence", 1),
                     ("account_principal_exclusion", 1),
                 ] {
-                    let count: i64 = c.query_row(
-                        &format!("SELECT COUNT(*) FROM {table}"),
-                        [],
-                        |row| row.get(0),
-                    )?;
+                    let count: i64 =
+                        c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })?;
                     assert_eq!(count, rows, "{table}");
                 }
                 let keys: String = c.query_row(
@@ -5697,7 +5780,9 @@ mod tests {
         assert_eq!(route_state_version(&connection).unwrap(), 57);
         assert_eq!(history_foreign_keys(&connection).len(), 6);
         let admissions: i64 = connection
-            .query_row("SELECT COUNT(*) FROM account_admission", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM account_admission", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(admissions, 2);
         drop(connection);

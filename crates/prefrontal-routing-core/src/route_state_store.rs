@@ -184,10 +184,30 @@ impl RouteOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionOutcomeUpdate {
+    pub provider_outcome: Option<ProviderOutcome>,
     pub outcome: RouteOutcome,
     pub last_error: Option<String>,
     pub observed_at_ms: i64,
     pub failure_backoff: crate::failure_backoff::FailureBackoffConfig,
+}
+
+/// Provider identity and optional absolute quota reset for one executed request.
+/// Kept separate from model health: a large request can exhaust an allowance while
+/// smaller requests on the same model and credential still succeed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderOutcome {
+    pub account_ref: String,
+    pub credential_id: Option<String>,
+    pub resets_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderResetFence {
+    pub route_key: String,
+    pub account_ref: String,
+    pub credential_id: Option<String>,
+    pub resets_at_ms: i64,
 }
 
 /// The route-local failure-backoff fields before an operator clears them.
@@ -211,6 +231,8 @@ pub struct CooldownState {
 /// trait free of the scorer's wire shape.
 #[derive(Debug, Clone, Default)]
 pub struct DecisionInput {
+    /// Request class supplied by the launcher, independent of the target agent.
+    pub consumer: Option<String>,
     pub decision_id: Option<String>,
     /// `single` keeps the historical shape; panel rows leave singular columns null.
     pub decision_kind: String,

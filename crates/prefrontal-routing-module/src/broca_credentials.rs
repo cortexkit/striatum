@@ -135,6 +135,19 @@ pub(crate) async fn wait_for_billing_catalog(
 }
 
 impl BrocaCredentials {
+    pub(crate) fn serving_identities(&self, fact: &ModelFact) -> Vec<(String, Option<String>)> {
+        if self
+            .reached_at_ms
+            .is_none_or(|at| crate::now_ms().saturating_sub(at) > MAX_AGE_MS)
+        {
+            return Vec::new();
+        }
+        self.listed
+            .iter()
+            .filter(|row| credential_serves_fact(row, fact))
+            .map(|row| (row.id.clone(), row.account_id.clone()))
+            .collect()
+    }
     pub(crate) fn publish_billing_catalog(
         &mut self,
         catalog: crate::fusiform_catalog::PlaneCatalog,

@@ -61,6 +61,9 @@ pub struct RouteRuntimeState {
     pub cooldown_until: Option<f64>,
     /// Confirmed quota exhaustion until this time (ms epoch).
     pub quota_exhausted_until: Option<f64>,
+    /// Provider reset for this selection's consumer and serving identity. Unlike
+    /// quota telemetry this cannot be bypassed by a speculative break-glass probe.
+    pub provider_reset_until: Option<f64>,
     /// Typed cause of the hard wall. None preserves legacy/unclassified behavior.
     pub wall_class: Option<crate::route_state_store::RouteWallClass>,
     /// Last provider error associated with the wall, retained for no-route diagnostics.
@@ -594,6 +597,10 @@ pub(crate) fn merged_runtime_state(
             merged.quota_exhausted_until,
             route_state.quota_exhausted_until,
         );
+        merged.provider_reset_until = latest_deadline(
+            merged.provider_reset_until,
+            route_state.provider_reset_until,
+        );
         merged.failure_backoff_until = route_state.failure_backoff_until;
         merged.failure_backoff_reason = route_state.failure_backoff_reason.clone();
         // Soft telemetry remains route-specific when present.
@@ -768,7 +775,10 @@ pub fn admit_routes_with_availability(
             });
             continue;
         }
-        if let Some(until) = runtime.quota_exhausted_until.filter(|until| *until > now) {
+        if let Some(until) =
+            latest_deadline(runtime.quota_exhausted_until, runtime.provider_reset_until)
+                .filter(|until| *until > now)
+        {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "quota_exhausted".to_string(),

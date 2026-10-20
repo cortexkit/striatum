@@ -25,6 +25,7 @@ mod fusiform_catalog;
 mod key_pool;
 mod model_resolution;
 mod panel_policy;
+mod provider_resets;
 mod quota_bus;
 mod quota_consumer;
 mod quota_events;
@@ -3603,7 +3604,7 @@ async fn handle_select_request(
     let PreparedSelectionInputs {
         now,
         mut facts,
-        snapshot,
+        mut snapshot,
         quota_signal_json,
         quota_note,
     } = match prepared {
@@ -3630,6 +3631,16 @@ async fn handle_select_request(
         credentials.price_facts(&mut facts);
     }
     live_config.apply(&mut facts);
+    apply_provider_resets(
+        &mut snapshot,
+        &facts,
+        store,
+        broca_credentials,
+        &operator_config,
+        operator_config_path,
+        params.consumer,
+        None,
+    )?;
     add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
 
     let policy_started = Instant::now();
@@ -3763,6 +3774,25 @@ async fn handle_select_request(
             .and_then(|pin| pin.variant.clone())
             .or_else(|| work_model_pin::named_variant(pin, &facts));
         let (pin_key, pin_capacity) = work_model_pin::route_keys(pin, variant.as_deref(), &facts);
+        let mut pin_snapshot = snapshot.clone();
+        for state in pin_snapshot.by_route.values_mut() {
+            state.provider_reset_until = None;
+        }
+        let pin_facts: Vec<_> = facts
+            .iter()
+            .filter(|f| format!("{}/{}", f.provider_id, f.model_id) == pin_capacity)
+            .cloned()
+            .collect();
+        apply_provider_resets(
+            &mut pin_snapshot,
+            &pin_facts,
+            store,
+            broca_credentials,
+            &operator_config,
+            operator_config_path,
+            params.consumer,
+            variant.as_deref(),
+        )?;
         let mut pin_availability = mapped_availability.rejected.clone();
         let mut pin_available = available.clone();
         // A host-run pin is judged on the same list as the host's automatic
@@ -3822,7 +3852,7 @@ async fn handle_select_request(
                 requirements,
                 available_models: pin_available,
                 facts: facts.clone(),
-                runtime_snapshot: Some(snapshot.clone()),
+                runtime_snapshot: Some(pin_snapshot),
                 exclude_route_keys: exclude.clone(),
                 operator_exclude_keys: operator_exclude.clone(),
                 required_capabilities,
@@ -3905,6 +3935,7 @@ async fn handle_select_request(
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
+                            variant_policy::consumer_group(params.consumer),
                         )
                         .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
                     )
@@ -3940,6 +3971,9 @@ async fn handle_select_request(
                         selected_workload,
                     )
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
+                if pin_harness == Some(substrate_policy::Harness::Broca) {
+                    remember_provider_identity(store, &decision_id, &selected, broca_credentials)?;
+                }
                 add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
                 let finish_started = Instant::now();
                 let mut result = json!({
@@ -4172,6 +4206,14 @@ async fn handle_select_request(
             add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
             match recorded {
                 Ok(decision_id) => {
+                    if selected_harness == Some(substrate_policy::Harness::Broca) {
+                        remember_provider_identity(
+                            store,
+                            &decision_id,
+                            &selected,
+                            broca_credentials,
+                        )?;
+                    }
                     let finish_started = Instant::now();
                     let mut resolved_input = json!({
                         "requirements": requirements,
@@ -4226,6 +4268,7 @@ async fn handle_select_request(
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
+                            variant_policy::consumer_group(params.consumer),
                         ) {
                             Ok((runner, _)) => result["runner"] = json!(runner),
                             Err((code, message)) => {
@@ -4386,6 +4429,7 @@ fn runner_for_route(
     provider: &str,
     model: &str,
     variant: Option<&str>,
+    consumer: Option<&str>,
 ) -> Result<
     (
         prefrontal_routing_core::runner::RunnerModel,
@@ -4394,6 +4438,34 @@ fn runner_for_route(
     (String, String),
 > {
     if !needs_runner_pin(policy, provider) {
+        if let Some(consumer) = consumer {
+            let fences = store
+                .provider_reset_fences(consumer, now_ms() as i64)
+                .map_err(|e| ("store_error".into(), e.to_string()))?;
+            let key = prefrontal_routing_core::make_route_key(provider, model, variant);
+            let fences: Vec<_> = fences.into_iter().filter(|f| f.route_key == key).collect();
+            if !fences.is_empty() {
+                let facts = store
+                    .get_facts()
+                    .map_err(|e| ("store_error".into(), e.to_string()))?;
+                let identities = facts
+                    .iter()
+                    .find(|f| f.provider_id == provider && f.model_id == model)
+                    .and_then(|fact| credentials.lock().ok().map(|c| c.serving_identities(fact)))
+                    .unwrap_or_default();
+                if let Some(id) = provider_resets::healthy_credential(&fences, &identities) {
+                    if let Some(runner) =
+                        prefrontal_routing_core::runner::RunnerModel::pinned(&id, model, variant)
+                    {
+                        return Ok((runner, None));
+                    }
+                }
+                return Err((
+                    "quota_exhausted".into(),
+                    format!("provider reset for {consumer} on {key}"),
+                ));
+            }
+        }
         return Ok((
             prefrontal_routing_core::runner::RunnerModel::broca(provider, model, variant),
             None,
@@ -4762,6 +4834,7 @@ async fn handle_select_panel(
                 provider,
                 model,
                 variant.as_deref(),
+                Some("athena"),
             ) {
                 Ok((runner, grant)) => {
                     member.prompt_params.insert("runner".into(), json!(runner));
@@ -4885,6 +4958,113 @@ fn apply_variant_policy(
     choice
 }
 
+fn apply_provider_resets(
+    snapshot: &mut ModelRouteStateSnapshot,
+    facts: &[ModelFact],
+    store: &SharedStore,
+    credentials: &SharedBrocaCredentials,
+    config: &config_overrides::LiveConfig,
+    path: &Path,
+    consumer: Option<select_policy::Consumer>,
+    explicit: Option<&str>,
+) -> Result<(), ModuleError> {
+    let Some(group) = variant_policy::consumer_group(consumer) else {
+        return Ok(());
+    };
+    let fences = store
+        .provider_reset_fences(group, snapshot.now as i64)
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+    if fences.is_empty() {
+        return Ok(());
+    }
+    let catalog = config_overrides::reasoning_catalog_for(path);
+    for fact in facts {
+        let route = prefrontal_routing_core::fact_to_route(fact);
+        let curated = fact
+            .prompt_defaults
+            .as_ref()
+            .and_then(|d| d.variant.as_deref())
+            .or(fact.variant.as_deref());
+        let variant = variant_policy::resolve(
+            config.variant_groups(),
+            config.score_aliases(),
+            catalog.as_ref(),
+            &variant_policy::VariantRequest {
+                route_key: &route.route_key,
+                provider_id: &fact.provider_id,
+                model_id: &fact.model_id,
+                explicit,
+                curated,
+                consumer,
+            },
+        )
+        .variant;
+        let key = prefrontal_routing_core::make_route_key(
+            &fact.provider_id,
+            &fact.model_id,
+            variant.as_deref(),
+        );
+        let matching: Vec<_> = fences
+            .iter()
+            .filter(|f| f.route_key == key)
+            .cloned()
+            .collect();
+        let identities = credentials
+            .lock()
+            .ok()
+            .map(|c| c.serving_identities(fact))
+            .unwrap_or_default();
+        if let Some(until) = provider_resets::blocked_until(&matching, &identities) {
+            snapshot
+                .by_route
+                .entry(route.route_key)
+                .or_default()
+                .provider_reset_until = Some(until as f64);
+            // Explicit pins can synthesize a variant route from a base catalog
+            // fact. Admission must see the fence under that executed key too.
+            snapshot
+                .by_route
+                .entry(key)
+                .or_default()
+                .provider_reset_until = Some(until as f64);
+        }
+    }
+    Ok(())
+}
+
+fn remember_provider_identity(
+    store: &SharedStore,
+    decision_id: &str,
+    selected: &SelectedModelRoute,
+    credentials: &SharedBrocaCredentials,
+) -> Result<(), ModuleError> {
+    let facts = store
+        .get_facts()
+        .map_err(|e| ModuleError::Message(e.to_string()))?;
+    if let Some(fact) = facts.iter().find(|f| {
+        f.provider_id == selected.model.provider_id && f.model_id == selected.model.model_id
+    }) {
+        let identities = credentials
+            .lock()
+            .ok()
+            .map(|c| c.serving_identities(fact))
+            .unwrap_or_default();
+        if let [(credential, account)] = identities.as_slice() {
+            store
+                .set_decision_provider_identity(
+                    decision_id,
+                    &prefrontal_routing_core::route_state_store::ProviderOutcome {
+                        account_ref: account.clone().unwrap_or_else(|| credential.clone()),
+                        credential_id: Some(credential.clone()),
+                        resets_at_ms: None,
+                    },
+                )
+                .map_err(|e| ModuleError::Message(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Apply the variant overrides to every seated member and runner-up of an
 /// automatic panel, recording each seat's variant and rule beside its entry in
 /// the policy's `seatedVariants`.
@@ -4992,6 +5172,7 @@ fn panel_decision_input(
         "workload": "workload: athena",
     });
     DecisionInput {
+        consumer: Some("athena".into()),
         decision_id: None,
         decision_kind: "panel".into(),
         task_id: params.task_id.clone(),
@@ -5038,6 +5219,7 @@ fn decision_input_for(
     let policy_revision = provenance.map(|value| value.policy_revision.clone());
     match selected {
         Some(sel) => DecisionInput {
+            consumer: variant_policy::consumer_group(params.consumer).map(str::to_string),
             decision_id: None,
             decision_kind: "single".into(),
             task_id: params.task_id.clone(),
@@ -5058,7 +5240,7 @@ fn decision_input_for(
             selected_route_key: Some(sel.route_key.clone()),
             selected_provider_id: Some(sel.model.provider_id.clone()),
             selected_model_id: Some(sel.model.model_id.clone()),
-            selected_variant: sel.model.variant.clone(),
+            selected_variant: sel.prompt_params.variant.clone(),
             score_json: serde_json::to_string(&sel.score).unwrap_or_else(|_| "null".into()),
             rejected_json: serde_json::to_string(&sel.rejected).unwrap_or_else(|_| "[]".into()),
             explanation_json: Some(
@@ -5071,6 +5253,7 @@ fn decision_input_for(
         None => {
             let failure = no_route.expect("a refusal decision must preserve its routing failure");
             DecisionInput {
+                consumer: variant_policy::consumer_group(params.consumer).map(str::to_string),
                 decision_id: None,
                 decision_kind: "single".into(),
                 task_id: params.task_id.clone(),
@@ -5124,6 +5307,8 @@ struct MethodParamsBody<P> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetDecisionOutcomeParams {
+    #[serde(default)]
+    provider_outcome: Option<prefrontal_routing_core::route_state_store::ProviderOutcome>,
     // The wire field is `decisionID` (capital ID) to match what route.select RETURNS
     // (json!{ "decisionID": ... }) and what every TS caller sends: camelCase alone
     // would expect `decisionId`, the lone casing drift that broke the round-trip.
@@ -5302,7 +5487,29 @@ async fn handle_set_decision_outcome(
         .await;
     };
     let failure_backoff = config_overrides::live_config(routing_config_path).failure_backoff();
+    let mut provider_outcome = params.provider_outcome;
+    if let Some(provider) = provider_outcome
+        .as_mut()
+        .filter(|p| p.credential_id.is_none())
+    {
+        // The provider may name its account differently from the vault. The
+        // sole serving identity frozen for this decision resolves that alias.
+        if let Some(identity) = store
+            .decision_provider_identity(&params.decision_id)
+            .map_err(|e| ModuleError::Message(e.to_string()))?
+        {
+            provider.credential_id = identity.credential_id;
+        }
+    }
+    if outcome == RouteOutcome::Completed && provider_outcome.is_none() {
+        // Use the unambiguous serving identity recorded at selection, never
+        // today's roster: an account may have changed while the run was active.
+        provider_outcome = store
+            .decision_provider_identity(&params.decision_id)
+            .map_err(|e| ModuleError::Message(e.to_string()))?;
+    }
     let update = DecisionOutcomeUpdate {
+        provider_outcome,
         outcome,
         last_error: params.last_error,
         observed_at_ms: now_ms() as i64,
@@ -6823,6 +7030,249 @@ mod tests {
         );
         assert_eq!(parse_outcome("quota_exhausted", None), None);
         assert_eq!(parse_outcome("quota_exhausted", Some(0)), None);
+    }
+
+    #[tokio::test]
+    async fn provider_reset_75h_skips_only_the_failed_consumer_then_expires() {
+        use prefrontal_routing_core::route_state_store::ProviderOutcome;
+        let now = now_ms() as i64;
+        for (age_hours, has_reset) in [(0, true), (76, true), (0, false)] {
+            let rig = Rig::new("provider-reset-75h");
+            let mut primary = fact("google", "antigravity-gemini-3.8-flash");
+            primary.prompt_defaults =
+                Some(prefrontal_routing_core::model_facts::ModelPromptDefaults {
+                    variant: Some("high".into()),
+                    ..Default::default()
+                });
+            let fallback = fact("z-provider", "adequate-fallback");
+            let facts = [primary, fallback];
+            let params = |consumer: &str| {
+                json!({"consumer":consumer,"targetAgent":"mason",
+                "requirements":{"iq":30,"eq":0},"availableModels":["google/antigravity-gemini-3.8-flash","google/antigravity-gemini-3.8-flash/high","z-provider/adequate-fallback"]})
+            };
+            let path = Path::new("/nonexistent/provider-reset-routing.jsonc");
+            let selected: serde_json::Value = serde_json::from_slice(
+                &run_select_against_rig(&rig, params("mason"), &facts, path)
+                    .await
+                    .body,
+            )
+            .unwrap();
+            assert_eq!(
+                selected["result"]["selected"]["model"]["providerID"], "google",
+                "{selected}"
+            );
+            let decision = selected["result"]["decisionID"].as_str().unwrap();
+            let observed = now - age_hours * 3_600_000;
+            let reset = observed + 75 * 3_600_000;
+            let store = rig.open_store();
+            store
+                .set_decision_outcome(
+                    decision,
+                    &DecisionOutcomeUpdate {
+                        outcome: RouteOutcome::Interrupted,
+                        last_error: Some(
+                            "account_limit_exhausted: class transient; HTTP 429".into(),
+                        ),
+                        observed_at_ms: observed,
+                        failure_backoff: Default::default(),
+                        provider_outcome: Some(ProviderOutcome {
+                            account_ref: "quota-account".into(),
+                            credential_id: Some("antigravity:google".into()),
+                            resets_at_ms: has_reset.then_some(reset),
+                        }),
+                    },
+                )
+                .unwrap();
+            drop(store);
+            let next: serde_json::Value = serde_json::from_slice(
+                &run_select_against_rig(&rig, params("mason"), &facts, path)
+                    .await
+                    .body,
+            )
+            .unwrap();
+            assert_eq!(
+                next["result"]["selected"]["model"]["providerID"],
+                if age_hours == 0 && has_reset {
+                    "z-provider"
+                } else {
+                    "google"
+                },
+                "{next}"
+            );
+            let smaller: serde_json::Value = serde_json::from_slice(
+                &run_select_against_rig(&rig, params("sidekick"), &facts, path)
+                    .await
+                    .body,
+            )
+            .unwrap();
+            assert_eq!(
+                smaller["result"]["selected"]["model"]["providerID"], "google",
+                "{smaller}"
+            );
+            if age_hours == 0 && has_reset {
+                let mut pin = params("mason");
+                pin["pin"] =
+                    json!({"model":"google/antigravity-gemini-3.8-flash","variant":"high"});
+                pin["pin_fallback"] = json!("none");
+                let refused: serde_json::Value = serde_json::from_slice(
+                    &run_select_against_rig(&rig, pin.clone(), &facts, path)
+                        .await
+                        .body,
+                )
+                .unwrap();
+                assert!(refused["result"]["selected"].is_null(), "{refused}");
+                pin["pin"]["variant"] = json!("low");
+                let mut low = facts[0].clone();
+                low.variant = Some("low".into());
+                let pin_facts = [facts[0].clone(), facts[1].clone(), low];
+                pin["availableModels"] = json!([
+                    "google/antigravity-gemini-3.8-flash/high",
+                    "google/antigravity-gemini-3.8-flash/low",
+                    "z-provider/adequate-fallback"
+                ]);
+                let other_variant: serde_json::Value = serde_json::from_slice(
+                    &run_select_against_rig(&rig, pin, &pin_facts, path)
+                        .await
+                        .body,
+                )
+                .unwrap();
+                assert_eq!(
+                    other_variant["result"]["selected"]["promptParams"]["variant"], "low",
+                    "{other_variant}"
+                );
+                let store = rig.open_store();
+                assert_eq!(
+                    store.provider_reset_fences("mason", now).unwrap()[0].resets_at_ms,
+                    reset
+                );
+                let success = |consumer: &str, account: &str| {
+                    let id = store
+                        .record_decision(&DecisionInput {
+                            consumer: Some(consumer.into()),
+                            selected_provider_id: Some("google".into()),
+                            selected_model_id: Some("antigravity-gemini-3.8-flash".into()),
+                            selected_route_key: Some(
+                                "google/antigravity-gemini-3.8-flash/high".into(),
+                            ),
+                            selected_variant: Some("high".into()),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    store
+                        .set_decision_outcome(
+                            &id,
+                            &DecisionOutcomeUpdate {
+                                outcome: RouteOutcome::Completed,
+                                last_error: None,
+                                observed_at_ms: now + 1,
+                                failure_backoff: Default::default(),
+                                provider_outcome: Some(ProviderOutcome {
+                                    account_ref: account.into(),
+                                    credential_id: None,
+                                    resets_at_ms: None,
+                                }),
+                            },
+                        )
+                        .unwrap();
+                };
+                success("sidekick", "quota-account");
+                success("mason", "other-account");
+                assert_eq!(store.provider_reset_fences("mason", now).unwrap().len(), 1);
+                success("mason", "quota-account");
+                drop(store);
+                let recovered: serde_json::Value = serde_json::from_slice(
+                    &run_select_against_rig(&rig, params("mason"), &facts, path)
+                        .await
+                        .body,
+                )
+                .unwrap();
+                assert_eq!(
+                    recovered["result"]["selected"]["model"]["providerID"], "google",
+                    "{recovered}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_outcome_wire_uses_the_reset_and_frozen_success_identity() {
+        use prefrontal_routing_core::route_state_store::ProviderOutcome;
+        let rig = Rig::new("provider-reset-wire");
+        let store = Arc::new(rig.open_store());
+        let make_decision = || {
+            store
+                .record_decision(&DecisionInput {
+                    consumer: Some("mason".into()),
+                    selected_provider_id: Some("google".into()),
+                    selected_model_id: Some("antigravity-gemini-3.8-flash".into()),
+                    selected_variant: Some("high".into()),
+                    selected_route_key: Some("google/antigravity-gemini-3.8-flash/high".into()),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let failed = make_decision();
+        let recovery = make_decision();
+        store
+            .set_decision_provider_identity(
+                &failed,
+                &ProviderOutcome {
+                    account_ref: "vault-account".into(),
+                    credential_id: Some("antigravity:google".into()),
+                    resets_at_ms: None,
+                },
+            )
+            .unwrap();
+        store
+            .set_decision_provider_identity(
+                &recovery,
+                &ProviderOutcome {
+                    account_ref: "quota-account".into(),
+                    credential_id: Some("antigravity:google".into()),
+                    resets_at_ms: None,
+                },
+            )
+            .unwrap();
+        let reset = now_ms() as i64 + 75 * 3_600_000;
+        for params in [
+            json!({"decisionID":failed,"outcome":"interrupted","lastError":"account_limit_exhausted: transient HTTP 429",
+                "providerOutcome":{"accountRef":"provider-email","resetsAtMs":reset}}),
+            json!({"decisionID":recovery,"outcome":"completed"}),
+        ] {
+            let completing = params["outcome"] == "completed";
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(
+                    &json!({"method":ROUTE_SET_DECISION_OUTCOME_OP,"params":params}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            handle_set_decision_outcome(
+                frame,
+                &tx,
+                &store,
+                Path::new("/nonexistent/provider-reset-wire.jsonc"),
+            )
+            .await
+            .unwrap();
+            let ack: serde_json::Value =
+                serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+            assert_eq!(ack["result"]["ok"], true, "{ack}");
+            let fences = store
+                .provider_reset_fences("mason", now_ms() as i64)
+                .unwrap();
+            if completing {
+                assert!(fences.is_empty());
+            } else {
+                assert_eq!(fences[0].resets_at_ms, reset);
+            }
+        }
     }
 
     #[test]
@@ -9268,6 +9718,7 @@ mod tests {
                 .set_decision_outcome(
                     &decision_id,
                     &DecisionOutcomeUpdate {
+                        provider_outcome: None,
                         outcome: RouteOutcome::SessionError,
                         last_error: Some(LAST_ERROR.into()),
                         observed_at_ms: now_ms() as i64,
@@ -9357,6 +9808,7 @@ mod tests {
                 .set_decision_outcome(
                     &decision_id,
                     &DecisionOutcomeUpdate {
+                        provider_outcome: None,
                         outcome: RouteOutcome::Error,
                         last_error: Some(LAST_ERROR.into()),
                         observed_at_ms: now_ms() as i64,
@@ -9437,6 +9889,7 @@ mod tests {
             .set_decision_outcome(
                 &decision_id,
                 &DecisionOutcomeUpdate {
+                    provider_outcome: None,
                     outcome: RouteOutcome::Error,
                     last_error: Some("provider HTTP 503".into()),
                     observed_at_ms: now_ms() as i64,
@@ -9719,12 +10172,10 @@ mod tests {
         store
             .set_decision_outcome(
                 &decision_id,
-                &DecisionOutcomeUpdate {
-                    outcome: RouteOutcome::SessionError,
-                    last_error: Some("This content was flagged for possible cybersecurity risk. If you believe this is an error, contact us via the Trusted Access for Cyber program.".into()),
-                    observed_at_ms: now_ms() as i64,
-                    failure_backoff: FailureBackoffConfig::default(),
-                },
+                &DecisionOutcomeUpdate { provider_outcome: None, outcome: RouteOutcome::SessionError,
+                last_error: Some("This content was flagged for possible cybersecurity risk. If you believe this is an error, contact us via the Trusted Access for Cyber program.".into()),
+                observed_at_ms: now_ms() as i64,
+                failure_backoff: FailureBackoffConfig::default(), },
             )
             .unwrap();
 
@@ -9800,6 +10251,7 @@ mod tests {
             .set_decision_outcome(
                 &decision.id,
                 &DecisionOutcomeUpdate {
+                    provider_outcome: None,
                     outcome: RouteOutcome::SessionError,
                     last_error: Some(
                         "provider_policy_refusal: provider openai: content_filter".into(),
@@ -9856,6 +10308,7 @@ mod tests {
                 .set_decision_outcome(
                     &decision_id,
                     &DecisionOutcomeUpdate {
+                        provider_outcome: None,
                         outcome: RouteOutcome::SessionError,
                         last_error: Some(error.to_string()),
                         observed_at_ms: now_ms() as i64,
