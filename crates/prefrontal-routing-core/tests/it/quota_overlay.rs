@@ -568,6 +568,14 @@ fn spend_pools_decode_additively_and_unknown_funding_cannot_spend() {
                 "total": { "minor": 100, "exponent": 2, "unit": "USD" },
                 "basis": "reported",
                 "spendable": true
+            },
+            {
+                "id": "purchased-credits",
+                "label": "Purchased credits",
+                "funding": "purchased",
+                "remaining": { "minor": 250, "exponent": 2, "unit": "USD" },
+                "basis": "reported",
+                "spendable": true
             }
         ]
     }));
@@ -579,15 +587,27 @@ fn spend_pools_decode_additively_and_unknown_funding_cannot_spend() {
     assert_eq!(entry.spend[0].funding, "issuer_credit_v2");
     assert_eq!(entry.spend[0].basis, "reported");
     assert!(
+        !entry.spend[0].has_known_funding(),
+        "future funding values remain unrecognized"
+    );
+    assert!(
         !entry.spend[0].has_supported_funding(),
         "unknown funding must remain not-granted-do-not-spend"
     );
     assert_eq!(entry.spend[1].funding, "unknown");
+    assert!(entry.spend[1].has_known_funding());
     assert!(
         !entry.spend[1].has_supported_funding(),
         "the literal \"unknown\" (codex banked credits) must be not-spendable through the same path"
     );
     assert!(entry.spend[2].has_supported_funding());
+    assert!(entry.spend[2].has_known_funding());
+    assert_eq!(entry.spend[3].funding, "purchased");
+    assert!(entry.spend[3].has_known_funding());
+    assert!(
+        !entry.spend[3].has_supported_funding(),
+        "purchased credits are known but do not authorize free routing headroom"
+    );
 }
 
 #[test]

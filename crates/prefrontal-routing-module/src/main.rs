@@ -386,51 +386,45 @@ fn merge_quota_windows(
     *existing = merged;
 }
 
-fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
-    let unknown: BTreeSet<&str> = fresh
-        .iter()
-        .flat_map(|entry| entry.spend.iter())
-        .filter(|pool| !pool.has_supported_funding())
-        .map(|pool| pool.funding.as_str())
-        .collect();
-    if !unknown.is_empty() {
-        eprintln!(
-            "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {unknown:?}"
-        );
-    }
-    // A provider whose spendable pools are all empty walls even when other
-    // pools hold funds (producer fact: deepseek carries 0 granted beside a
-    // positive purchased balance). Rendered undistinguished, that wall reads
-    // as a quota bug to anyone who can see the account balance, so name the
-    // withheld funds explicitly whenever the wall-with-funds shape occurs.
-    for entry in fresh {
-        if entry.spend.is_empty() {
-            continue;
-        }
-        let all_spendable_empty = entry
-            .spend
+#[derive(Default)]
+struct UnsupportedFundingWarnings {
+    reported_value_sets: BTreeSet<BTreeSet<String>>,
+}
+
+impl UnsupportedFundingWarnings {
+    fn warning_for(&mut self, fresh: &[ProviderUsage]) -> Option<String> {
+        let unsupported: BTreeSet<String> = fresh
             .iter()
-            .filter(|pool| pool.has_supported_funding())
-            .all(|pool| pool.is_known_empty());
-        let withheld: Vec<String> = entry
-            .spend
-            .iter()
-            .filter(|pool| !pool.has_supported_funding())
-            .filter_map(|pool| {
-                pool.remaining
-                    .as_ref()
-                    .filter(|remaining| !remaining.is_non_positive())
-                    .map(|remaining| format!("{} ({})", remaining.render(), pool.funding))
-            })
+            .flat_map(|entry| entry.spend.iter())
+            .filter(|pool| !pool.has_known_funding())
+            .map(|pool| pool.funding.clone())
             .collect();
-        if all_spendable_empty && !withheld.is_empty() {
-            eprintln!(
-                "[prefrontal-routing] provider {} walled on empty spendable pools while non-spendable pools hold {} - policy, not a quota bug (only granted/subscription funding may spend)",
-                entry.provider,
-                withheld.join(", ")
-            );
+        if unsupported.is_empty() || !self.reported_value_sets.insert(unsupported.clone()) {
+            return None;
         }
+        Some(format!(
+            "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {unsupported:?}"
+        ))
     }
+}
+
+fn log_unknown_spend_funding_with(
+    fresh: &[ProviderUsage],
+    reported: &mut UnsupportedFundingWarnings,
+    mut emit: impl FnMut(&str),
+) {
+    if let Some(warning) = reported.warning_for(fresh) {
+        emit(&warning);
+    }
+}
+
+fn log_unknown_spend_funding(fresh: &[ProviderUsage]) {
+    static REPORTED_VALUE_SETS: OnceLock<Mutex<UnsupportedFundingWarnings>> = OnceLock::new();
+    let mut reported = REPORTED_VALUE_SETS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    log_unknown_spend_funding_with(fresh, &mut reported, |warning| eprintln!("{warning}"));
 }
 
 #[cfg(test)]
@@ -479,8 +473,8 @@ fn write_quota_readings(
 }
 
 fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observed_at_ms: u64) {
-    // Insula extends funding additively. Report unsupported values once per poll,
-    // while the core policy treats each corresponding pool as not granted.
+    // Insula extends funding additively. Log only unrecognized kinds, and only
+    // once for each distinct set during this process; all remain not spendable.
     log_unknown_spend_funding(&fresh);
     // A restored snapshot only bridges the gap between boot and the first poll.
     // That poll starts from an empty cache, exactly as it did before snapshots
@@ -6661,6 +6655,62 @@ mod tests {
         assert!(!claim_ignored_caller_policy_warning(false, &warned));
         assert!(claim_ignored_caller_policy_warning(true, &warned));
         assert!(!claim_ignored_caller_policy_warning(true, &warned));
+    }
+
+    #[test]
+    fn quota_refresh_logs_only_unrecognized_funding_once_per_distinct_set() {
+        let known: Vec<ProviderUsage> = serde_json::from_value(json!([{
+            "provider": "deepseek",
+            "spend": [
+                { "id": "purchased", "label": "Purchased credits", "funding": "purchased", "basis": "reported" },
+                { "id": "unknown", "label": "Prepaid credits", "funding": "unknown", "basis": "reported" }
+            ]
+        }]))
+        .unwrap();
+        let first_unrecognized_refresh: Vec<ProviderUsage> = serde_json::from_value(json!([{
+            "provider": "provider-a",
+            "spend": [{ "id": "future", "label": "Future", "funding": "issuer_credit_v2", "basis": "reported" }]
+        }]))
+        .unwrap();
+        let repeated_unrecognized_refresh: Vec<ProviderUsage> = serde_json::from_value(json!([
+            {
+                "provider": "provider-a",
+                "spend": [{ "id": "future", "label": "Future", "funding": "issuer_credit_v2", "basis": "reported" }]
+            },
+            {
+                "provider": "provider-b",
+                "spend": [{ "id": "future", "label": "Future", "funding": "issuer_credit_v2", "basis": "reported" }]
+            }
+        ]))
+        .unwrap();
+        let different_unrecognized_refresh: Vec<ProviderUsage> = serde_json::from_value(json!([{
+            "provider": "provider-a",
+            "spend": [{ "id": "future", "label": "Future", "funding": "issuer_credit_v3", "basis": "reported" }]
+        }]))
+        .unwrap();
+        let mut reported = UnsupportedFundingWarnings::default();
+        let mut emitted = Vec::new();
+
+        log_unknown_spend_funding_with(&known, &mut reported, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert!(emitted.is_empty(), "known wire values must not log");
+        log_unknown_spend_funding_with(&first_unrecognized_refresh, &mut reported, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert_eq!(emitted, [
+            "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {\"issuer_credit_v2\"}"
+        ]);
+        // A second refresh with the same value set, even on another provider,
+        // produces no log line.
+        log_unknown_spend_funding_with(&repeated_unrecognized_refresh, &mut reported, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert_eq!(emitted.len(), 1);
+        log_unknown_spend_funding_with(&different_unrecognized_refresh, &mut reported, |warning| {
+            emitted.push(warning.to_string())
+        });
+        assert_eq!(emitted.len(), 2);
     }
 
     #[test]

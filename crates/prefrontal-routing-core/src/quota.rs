@@ -144,6 +144,15 @@ impl SpendPool {
         matches!(self.funding.as_str(), "granted" | "subscription")
     }
 
+    /// Whether Insula has named this funding class. `unknown` is an explicit
+    /// wire value, but it still does not authorize routing spend.
+    pub fn has_known_funding(&self) -> bool {
+        matches!(
+            self.funding.as_str(),
+            "granted" | "subscription" | "purchased" | "unknown"
+        )
+    }
+
     /// The producer's flag with the contract's absence rule applied: absent is
     /// "the provider does not say", which must not close a pool - only a
     /// literal `false` walls it.
