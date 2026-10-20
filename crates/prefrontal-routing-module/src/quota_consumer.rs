@@ -20,6 +20,7 @@ use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 const QUOTA_MODULE_ID: &str = "insula";
 const USAGE_GET_OP: &str = "usage.get";
+const USAGE_OBSERVE_OP: &str = "usage.observe";
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -54,6 +55,37 @@ fn transport(s: impl Into<String>) -> QuotaConsumerError {
 
 fn route_error(s: impl Into<String>) -> QuotaConsumerError {
     QuotaConsumerError::Route(s.into())
+}
+
+fn catalog_has_operation(modules: &[serde_json::Value], module: &str, operation: &str) -> bool {
+    modules.iter().any(|entry| {
+        entry.get("module_id").and_then(serde_json::Value::as_str) == Some(module)
+            && entry
+                .get("roles")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|roles| {
+                    roles.iter().any(|role| {
+                        role.get("operations")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|operations| {
+                                operations.iter().any(|item| {
+                                    item.as_str() == Some(operation)
+                                        || item.get("name").and_then(serde_json::Value::as_str)
+                                            == Some(operation)
+                                })
+                            })
+                    })
+                })
+    })
+}
+
+fn usage_observe_body(
+    observations: &[crate::usage_observe::UsageObservation],
+) -> serde_json::Value {
+    serde_json::json!({
+        "method": "usage.observe",
+        "params": { "observations": observations },
+    })
 }
 
 /// Decode the `usage.get` result array ENTRY BY ENTRY. Insula extends its
@@ -256,6 +288,42 @@ impl QuotaConsumer {
         self.usage_get_body(serde_json::json!({})).await
     }
 
+    pub(crate) async fn usage_observe_advertised_on_open_route(
+        &mut self,
+    ) -> Result<bool, QuotaConsumerError> {
+        let modules = self.catalog_modules().await?;
+        Ok(catalog_has_operation(
+            &modules,
+            QUOTA_MODULE_ID,
+            USAGE_OBSERVE_OP,
+        ))
+    }
+
+    /// Send one coalesced header batch on the already-open Insula route.
+    pub(crate) async fn usage_observe_on_open_route(
+        &mut self,
+        observations: &[crate::usage_observe::UsageObservation],
+    ) -> Result<serde_json::Value, QuotaConsumerError> {
+        let bytes = self
+            .operation_body(usage_observe_body(observations))
+            .await?;
+        let value = serde_json::from_slice(&bytes).map_err(QuotaConsumerError::Json)?;
+        Ok(value)
+    }
+
+    async fn catalog_modules(&mut self) -> Result<Vec<serde_json::Value>, QuotaConsumerError> {
+        let bytes = self
+            .operation_at(0, 0, serde_json::json!({ "op": "catalog.list" }))
+            .await?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(QuotaConsumerError::Json)?;
+        Ok(value
+            .get("modules")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Preserve the raw body substring: the notice digest covers the producer's
     /// bytes, not a consumer's reserialized JSON tree.
     pub async fn events_get_raw(&mut self, event_key: &str) -> Result<Vec<u8>, QuotaConsumerError> {
@@ -328,8 +396,13 @@ impl QuotaConsumer {
             .map_err(|e| transport(e.to_string()))?;
         let reply = self.read_reply(channel, epoch, corr).await?;
         if reply.header.ty == FrameType::Error {
+            let operation = body
+                .get("method")
+                .or_else(|| body.get("op"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("operation");
             return Err(route_error(format!(
-                "usage.get failed: {}",
+                "{operation} failed: {}",
                 String::from_utf8_lossy(&reply.body)
             )));
         }
@@ -660,5 +733,68 @@ mod tests {
         // is pinned here so a regression to the old name reddens a test by name instead
         // of surfacing as a silent quota-signal outage.
         assert_eq!(QUOTA_MODULE_ID, "insula");
+    }
+
+    #[test]
+    fn usage_observe_requires_an_insula_manifest_operation() {
+        let module = serde_json::json!({
+            "module_id": "insula",
+            "roles": [{
+                "role": "management_surface",
+                "operations": [{ "name": "usage.observe" }]
+            }]
+        });
+        assert!(catalog_has_operation(
+            std::slice::from_ref(&module),
+            QUOTA_MODULE_ID,
+            USAGE_OBSERVE_OP
+        ));
+        assert!(!catalog_has_operation(
+            &[serde_json::json!({
+                "module_id": "insula",
+                "roles": [{
+                    "operations": [{ "name": "usage.get" }]
+                }]
+            })],
+            QUOTA_MODULE_ID,
+            USAGE_OBSERVE_OP
+        ));
+        assert!(!catalog_has_operation(
+            &[serde_json::json!({
+                "module_id": "another-module",
+                "roles": [{
+                    "operations": [{ "name": "usage.observe" }]
+                }]
+            })],
+            QUOTA_MODULE_ID,
+            USAGE_OBSERVE_OP
+        ));
+    }
+
+    #[test]
+    fn usage_observe_request_preserves_account_time_and_header_strings() {
+        let observation = crate::usage_observe::UsageObservation {
+            provider: "claude",
+            account: "vault-account-1".into(),
+            observed_at_ms: 1_234,
+            headers: std::collections::BTreeMap::from([(
+                "anthropic-ratelimit-unified-5h-utilization".into(),
+                "0.456".into(),
+            )]),
+        };
+        assert_eq!(
+            usage_observe_body(&[observation]),
+            serde_json::json!({
+                "method": "usage.observe",
+                "params": { "observations": [{
+                    "provider": "claude",
+                    "account": "vault-account-1",
+                    "observedAtMs": 1234,
+                    "headers": {
+                        "anthropic-ratelimit-unified-5h-utilization": "0.456"
+                    }
+                }] }
+            })
+        );
     }
 }

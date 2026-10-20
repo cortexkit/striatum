@@ -183,6 +183,12 @@ impl LiveQuota {
 trait SampleSource {
     async fn fetch(&mut self, key: &str) -> Result<Vec<u8>, String>;
     async fn snapshot(&mut self) -> Result<Vec<u8>, String>;
+    async fn usage_observe(
+        &mut self,
+        _observations: &[crate::usage_observe::UsageObservation],
+    ) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
 }
 
 #[async_trait::async_trait]
@@ -192,6 +198,13 @@ trait InsulaRoute: Send {
         key: &str,
     ) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError>;
     async fn snapshot(&mut self) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError>;
+    async fn advertises_usage_observe(
+        &mut self,
+    ) -> Result<bool, crate::quota_consumer::QuotaConsumerError>;
+    async fn usage_observe(
+        &mut self,
+        observations: &[crate::usage_observe::UsageObservation],
+    ) -> Result<Value, crate::quota_consumer::QuotaConsumerError>;
 }
 
 #[async_trait::async_trait]
@@ -228,6 +241,19 @@ impl InsulaRoute for QuotaConsumer {
 
     async fn snapshot(&mut self) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError> {
         self.usage_get_raw_on_open_route().await
+    }
+
+    async fn advertises_usage_observe(
+        &mut self,
+    ) -> Result<bool, crate::quota_consumer::QuotaConsumerError> {
+        self.usage_observe_advertised_on_open_route().await
+    }
+
+    async fn usage_observe(
+        &mut self,
+        observations: &[crate::usage_observe::UsageObservation],
+    ) -> Result<Value, crate::quota_consumer::QuotaConsumerError> {
+        self.usage_observe_on_open_route(observations).await
     }
 }
 
@@ -284,6 +310,27 @@ impl SampleSource for Insula {
         self.ensure_route().await.map_err(|e| e.to_string())?;
         let result = self.route.as_mut().unwrap().snapshot().await;
         self.invalidate_on_error(&result);
+        result.map_err(|e| e.to_string())
+    }
+
+    async fn usage_observe(
+        &mut self,
+        observations: &[crate::usage_observe::UsageObservation],
+    ) -> Result<Option<Value>, String> {
+        self.ensure_route().await.map_err(|e| e.to_string())?;
+        let result = async {
+            let route = self.route.as_mut().unwrap();
+            if !route.advertises_usage_observe().await? {
+                return Ok(None);
+            }
+            route.usage_observe(observations).await.map(Some)
+        }
+        .await;
+        if let Err(error) = &result {
+            if crate::quota_consumer::QuotaConsumer::should_reconnect(error) {
+                self.route.take();
+            }
+        }
         result.map_err(|e| e.to_string())
     }
 }
@@ -437,6 +484,7 @@ enum ConsumeError {
     Rejected(String),
 }
 
+#[cfg(test)]
 async fn consume_one<C: StreamCursor, S: SampleSource>(
     cursor: &mut C,
     source: &mut S,
@@ -444,10 +492,49 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
     state: &mut SequenceState,
     subject: &str,
 ) -> Result<(), ConsumeError> {
-    let delivery = cursor
-        .next()
-        .await
-        .map_err(|e| ConsumeError::Bus(e.to_string()))?;
+    consume_one_inner(cursor, source, live, state, subject, None).await
+}
+
+async fn consume_one_with_usage<C: StreamCursor, S: SampleSource>(
+    cursor: &mut C,
+    source: &mut S,
+    live: &LiveQuota,
+    state: &mut SequenceState,
+    subject: &str,
+    usage_observe: &crate::usage_observe::SharedUsageObserve,
+) -> Result<(), ConsumeError> {
+    consume_one_inner(cursor, source, live, state, subject, Some(usage_observe)).await
+}
+
+async fn consume_one_inner<C: StreamCursor, S: SampleSource>(
+    cursor: &mut C,
+    source: &mut S,
+    live: &LiveQuota,
+    state: &mut SequenceState,
+    subject: &str,
+    usage_observe: Option<&crate::usage_observe::SharedUsageObserve>,
+) -> Result<(), ConsumeError> {
+    let delivery = if let Some(usage_observe) = usage_observe {
+        let due = usage_observe
+            .next_due()
+            .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(24 * 60 * 60));
+        tokio::select! {
+            delivery = cursor.next() => delivery.map_err(|e| ConsumeError::Bus(e.to_string()))?,
+            _ = usage_observe.notified() => {
+                flush_usage_observations(source, usage_observe).await;
+                return Ok(());
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {
+                flush_usage_observations(source, usage_observe).await;
+                return Ok(());
+            }
+        }
+    } else {
+        cursor
+            .next()
+            .await
+            .map_err(|e| ConsumeError::Bus(e.to_string()))?
+    };
     let Some(delivery) = delivery else {
         return Ok(());
     };
@@ -538,6 +625,32 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
         .map_err(|e| ConsumeError::Bus(e.to_string()))
 }
 
+async fn flush_usage_observations<S: SampleSource>(
+    source: &mut S,
+    usage_observe: &crate::usage_observe::SharedUsageObserve,
+) {
+    let batch = usage_observe.take_due_at(Instant::now());
+    if batch.is_empty() {
+        return;
+    }
+    match source.usage_observe(&batch).await {
+        Ok(Some(reply)) => {
+            let result = reply.get("result").unwrap_or(&reply);
+            for (account, reason) in crate::usage_observe::ignored_observations(result) {
+                if usage_observe.log_ignored_once(&account, &reason, Instant::now()) {
+                    eprintln!(
+                        "[prefrontal-routing] Insula ignored usage observation for account {account}: {reason}"
+                    );
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("[prefrontal-routing] dropped Insula usage observation batch: {error}")
+        }
+    }
+}
+
 async fn snapshot<S: SampleSource>(source: &mut S, live: &LiveQuota) -> bool {
     let result = match source.snapshot().await {
         Ok(body) => live.store(&body, false),
@@ -590,6 +703,7 @@ pub(super) async fn run(
     cache: SharedQuotaCache,
     accounts: account_quota::SharedAccountQuota,
     store: SharedStore,
+    usage_observe: crate::usage_observe::SharedUsageObserve,
 ) {
     let live = LiveQuota {
         cache,
@@ -622,7 +736,18 @@ pub(super) async fn run(
         }
         poll_if_due(&mut source, &live, &mut schedule, Instant::now()).await;
         let Some(attached) = bus.as_mut() else {
-            tokio::time::sleep_until(next_attach.into()).await;
+            let next_observe = usage_observe
+                .next_due()
+                .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(24 * 60 * 60));
+            tokio::select! {
+                _ = tokio::time::sleep_until(next_attach.into()) => {}
+                _ = usage_observe.notified() => {
+                    flush_usage_observations(&mut source, &usage_observe).await;
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_observe)) => {
+                    flush_usage_observations(&mut source, &usage_observe).await;
+                }
+            }
             continue;
         };
         let mut down = None;
@@ -639,12 +764,13 @@ pub(super) async fn run(
             next_lag = Instant::now() + Duration::from_secs(10);
         }
         if down.is_none() {
-            match consume_one(
+            match consume_one_with_usage(
                 &mut attached.cursor,
                 &mut source,
                 &live,
                 &mut state,
                 &attached.subject,
+                &usage_observe,
             )
             .await
             {

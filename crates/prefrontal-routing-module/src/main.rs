@@ -34,6 +34,7 @@ mod select_policy;
 mod selection_harness;
 mod subscription_economics;
 mod substrate_policy;
+mod usage_observe;
 mod variant_policy;
 mod winner_ladder;
 mod work_model_pin;
@@ -245,6 +246,7 @@ fn quota_health(cache: &QuotaCache, now_ms: u64) -> (Option<String>, serde_json:
 /// `route.account_quota_status` operation reads it; `None` until boot restores it.
 static ACCOUNT_QUOTA: std::sync::OnceLock<account_quota::SharedAccountQuota> =
     std::sync::OnceLock::new();
+static USAGE_OBSERVE: OnceLock<usage_observe::SharedUsageObserve> = OnceLock::new();
 
 /// The route-state store, shared by the select handler (reader). Single-writer:
 /// this module holds the store's lease for its lifetime.
@@ -979,6 +981,9 @@ where
     let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
         account_quota::restore_account_state(store.as_ref()),
     ));
+    let usage_observe = USAGE_OBSERVE
+        .get_or_init(usage_observe::SharedUsageObserve::default)
+        .clone();
     loops.spawn(
         "quota events",
         quota_events::run(
@@ -986,6 +991,7 @@ where
             Arc::clone(&quota_cache),
             Arc::clone(&account_state),
             Arc::clone(&store),
+            usage_observe.clone(),
         ),
     );
     let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
@@ -3312,6 +3318,14 @@ async fn handle_select_request(
             now_ms: account_selection::now_ms(),
         };
         let reply = account_selection::handle(&envelope.method, &frame.body, &principal, &ctx);
+        if envelope.method == account_selection::ACCOUNT_OBSERVE_OP {
+            if let (Some(shared), Some(observation)) = (
+                USAGE_OBSERVE.get(),
+                account_selection::usage_observation(&frame.body, &principal, &ctx),
+            ) {
+                shared.record(observation);
+            }
+        }
         return send_account_reply(writer, ver, channel, epoch, corr, reply).await;
     }
 
