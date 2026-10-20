@@ -403,6 +403,76 @@ mod consumer_and_pin {
         );
     }
 
+    /// The designer's request as Spec Campaigns V2 sends it: the
+    /// `spec_designer` slot, no fallback route.
+    fn designer_params(rig: &PolicyRig) -> serde_json::Value {
+        let mut params = rig.params();
+        params["consumer"] = json!("athena");
+        params["pin"] = json!({"slot": "spec_designer"});
+        params["pin_fallback"] = json!("none");
+        params
+    }
+
+    /// Unpinned, this rig selects `openai/pin`; each pin below names
+    /// `fallback/safe` so a pinned answer is distinguishable from a normal one.
+    #[tokio::test]
+    async fn spec_designer_pin_wins_with_its_variant() {
+        let _guard = crate::config_overrides::multiplier_map_guard();
+        let rig = PolicyRig::new(json!({"model_routing": {"pins": {
+            "spec_designer": {"model": "fallback/safe", "variant": "high"},
+        }}}));
+        let reply = rig.select(designer_params(&rig)).await;
+        assert_eq!(
+            reply["result"]["selected"]["capacityKey"], "fallback/safe",
+            "{reply}"
+        );
+        assert_eq!(
+            reply["result"]["selected"]["promptParams"]["variant"], "high",
+            "{reply}"
+        );
+        assert_eq!(
+            reply["result"].get("pin_rejected"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(rig.decisions(), 1);
+    }
+
+    #[tokio::test]
+    async fn unset_spec_designer_pin_routes_normally_and_ignores_the_synthesizer_pin() {
+        let _guard = crate::config_overrides::multiplier_map_guard();
+        let rig = PolicyRig::new(json!({"model_routing": {"pins": {
+            "synthesizer": {"model": "fallback/safe", "variant": "high"},
+        }}}));
+        let reply = rig.select(designer_params(&rig)).await;
+        assert_eq!(
+            reply["result"]["selected"]["capacityKey"], "openai/pin",
+            "{reply}"
+        );
+        assert_eq!(
+            reply["result"].get("pin_rejected"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(rig.decisions(), 1);
+    }
+
+    #[tokio::test]
+    async fn excluded_spec_designer_pin_is_refused_by_name_without_a_fallback() {
+        let _guard = crate::config_overrides::multiplier_map_guard();
+        let rig = PolicyRig::new(json!({"model_routing": {"pins": {
+            "spec_designer": {"model": "fallback/safe"},
+        }}}));
+        let mut params = designer_params(&rig);
+        params["excludeRouteKeys"] = json!(["fallback/safe"]);
+        let reply = rig.select(params).await;
+        assert_eq!(reply["result"]["pin_rejected"], "caller_excluded", "{reply}");
+        assert_eq!(
+            reply["result"]["selected"],
+            serde_json::Value::Null,
+            "{reply}"
+        );
+        assert_eq!(rig.decisions(), 0);
+    }
+
     /// `exclude` keeps a route out of automatic choice only. For every group, an
     /// unpinned request from the fenced consumer never gets the route, while a
     /// launch that names it with `model=` is admitted.

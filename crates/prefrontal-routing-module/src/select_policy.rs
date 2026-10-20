@@ -45,9 +45,12 @@ pub(crate) struct PinSlotRequest {
 #[serde(rename_all = "snake_case")]
 enum PinSlot {
     LabPlanner,
+    SpecDesigner,
 }
 
 impl Pin {
+    /// The pin a request names, or `None` when it names a slot the operator
+    /// left unset; the request is then selected like an unpinned one.
     pub(crate) fn resolve(&self, pins: &Pins) -> Option<SynthesizerPin> {
         match self {
             Self::Slot(PinSlotRequest {
@@ -56,6 +59,11 @@ impl Pin {
                 model: pin.model.clone(),
                 variant: None,
             }),
+            // Only the designer's own pin: a configured synthesizer pin is
+            // Athena's choice and never routes the designer.
+            Self::Slot(PinSlotRequest {
+                slot: PinSlot::SpecDesigner,
+            }) => pins.spec_designer.clone(),
             Self::Model(pin) => Some(pin.clone()),
         }
     }

@@ -796,6 +796,9 @@
         "lab_planner": {
           "$ref": "#/$defs/LabPlannerPin"
         },
+        "spec_designer": {
+          "$ref": "#/$defs/SynthesizerPin"
+        },
         "synthesizer": {
           "$ref": "#/$defs/SynthesizerPin"
         }

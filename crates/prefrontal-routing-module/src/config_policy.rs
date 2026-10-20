@@ -266,6 +266,16 @@ pub struct Pins {
     )]
     #[schemars(with = "LabPlannerPin", !default)]
     pub lab_planner: Option<LabPlannerPin>,
+    // The Spec Campaigns V2 designer's model, requested on `route.select` as
+    // the `spec_designer` pin slot. It has the synthesizer pin's shape: a
+    // `provider/model` and an optional variant the designer then runs at.
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "SynthesizerPin", !default)]
+    pub spec_designer: Option<SynthesizerPin>,
 }
 
 impl Pins {
@@ -278,6 +288,10 @@ impl Pins {
             (
                 "lab_planner",
                 self.lab_planner.as_ref().map(|pin| pin.model.as_str()),
+            ),
+            (
+                "spec_designer",
+                self.spec_designer.as_ref().map(|pin| pin.model.as_str()),
             ),
         ] {
             if let Some(model) = model {
@@ -292,13 +306,19 @@ impl Pins {
                 }
             }
         }
-        if self
-            .synthesizer
-            .as_ref()
-            .and_then(|pin| pin.variant.as_ref())
-            .is_some_and(|variant| variant.trim().is_empty())
-        {
-            return Err("model_routing.pins.synthesizer.variant must be non-empty".into());
+        for (slot, pin) in [
+            ("synthesizer", &self.synthesizer),
+            ("spec_designer", &self.spec_designer),
+        ] {
+            if pin
+                .as_ref()
+                .and_then(|pin| pin.variant.as_ref())
+                .is_some_and(|variant| variant.trim().is_empty())
+            {
+                return Err(format!(
+                    "model_routing.pins.{slot}.variant must be non-empty"
+                ));
+            }
         }
         Ok(())
     }

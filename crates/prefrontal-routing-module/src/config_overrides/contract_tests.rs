@@ -341,6 +341,42 @@ refusal_case!(
     r#"{"model_routing":{"pins":{"lab_planner":{"model":"p/m","variant":"high"}}}}"#,
     "unknown field `variant`"
 );
+// The designer pin is checked exactly as the synthesizer pin is.
+refusal_case!(
+    spec_designer_null,
+    r#"{"model_routing":{"pins":{"spec_designer":null}}}"#,
+    "invalid type"
+);
+refusal_case!(
+    spec_designer_variant_null,
+    r#"{"model_routing":{"pins":{"spec_designer":{"model":"p/m","variant":null}}}}"#,
+    "invalid type"
+);
+refusal_case!(
+    spec_designer_unknown_key,
+    r#"{"model_routing":{"pins":{"spec_designer":{"model":"p/m","temperature":1}}}}"#,
+    "unknown field `temperature`"
+);
+refusal_case!(
+    spec_designer_model_required,
+    r#"{"model_routing":{"pins":{"spec_designer":{"variant":"high"}}}}"#,
+    "missing field `model`"
+);
+refusal_case!(
+    spec_designer_model_shape,
+    r#"{"model_routing":{"pins":{"spec_designer":{"model":"bare"}}}}"#,
+    "model_routing.pins.spec_designer.model must be provider/model"
+);
+refusal_case!(
+    spec_designer_variant_type,
+    r#"{"model_routing":{"pins":{"spec_designer":{"model":"p/m","variant":1}}}}"#,
+    "invalid type"
+);
+refusal_case!(
+    spec_designer_variant_empty,
+    r#"{"model_routing":{"pins":{"spec_designer":{"model":"p/m","variant":" "}}}}"#,
+    "model_routing.pins.spec_designer.variant must be non-empty"
+);
 refusal_case!(
     unknown_variant_group,
     r#"{"model_routing":{"variants":{"surprise":{"openai/gpt-6":"high"}}}}"#,
@@ -611,7 +647,8 @@ fn valid_panel_boundaries_all_classes_and_strict_pins() {
         "explain":{"topK":1,"by":"cost","extraBy":"cost"},
         "spec":{"topK":3,"by":"iq","extra":1,"extraBy":"iq"},
         "lab":{"topK":4,"by":"iq"}},
-        "pins":{"synthesizer":{"model":"p/m","variant":"high"},"lab_planner":{"model":"q/n"}}}}"#,
+        "pins":{"synthesizer":{"model":"p/m","variant":"high"},"lab_planner":{"model":"q/n"},
+            "spec_designer":{"model":"r/o","variant":"xhigh"}}}}"#,
     );
     initialize_config(&rig.path).unwrap();
     let active = live_config(&rig.path);
@@ -623,6 +660,11 @@ fn valid_panel_boundaries_all_classes_and_strict_pins() {
     assert_eq!(active.panels().diagnose.as_ref().unwrap().floor, Some(0));
     assert_eq!(active.panels().evaluate.as_ref().unwrap().floor, Some(100));
     assert_eq!(active.pins().lab_planner.as_ref().unwrap().model, "q/n");
+    let designer = active.pins().spec_designer.as_ref().unwrap();
+    assert_eq!(
+        (designer.model.as_str(), designer.variant.as_deref()),
+        ("r/o", Some("xhigh"))
+    );
     assert_eq!(
         active
             .pins()
