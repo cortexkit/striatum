@@ -1031,6 +1031,24 @@
               }
             ]
           }
+        },
+        "sidekick.planner": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
         }
       },
       "additionalProperties": false

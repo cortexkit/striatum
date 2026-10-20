@@ -22,6 +22,10 @@ pub(crate) enum Workload {
     Gather,
     #[serde(rename = "sidekick.comments")]
     Comments,
+    /// Sidekick v2's single planner session: plans research or reviews
+    /// comments itself through core's changed_text tool.
+    #[serde(rename = "sidekick.planner")]
+    Planner,
     #[serde(rename = "athena")]
     Athena,
     #[serde(rename = "hire")]
@@ -38,6 +42,7 @@ impl Workload {
             Self::Librarian => "sidekick.librarian",
             Self::Gather => "sidekick.gather",
             Self::Comments => "sidekick.comments",
+            Self::Planner => "sidekick.planner",
             Self::Athena => "athena",
             Self::Hire => "hire",
             Self::PersonaSeat => "persona_seat",
