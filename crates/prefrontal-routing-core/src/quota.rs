@@ -204,16 +204,11 @@ pub struct SavedResets {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderUsage {
-    /// The quota module's provider name (e.g. "codex"); routing maps it to its own id.
+    /// The quota module's provider name (e.g. "codex").
     pub provider: String,
-    /// The canonical models.dev slug, published by the quota module precisely so
-    /// consumers do not hand-maintain a copy of its local-name table. Null for
-    /// roughly a third of entries, so `provider` + the local map stays as the
-    /// fallback. Keying on this first is load-bearing: QTA's namespace has
-    /// near-collisions (provider="alibaba" is the CODING plan, degraded on this
-    /// host, while provider="qwen-cloud" is the token plan we route), so a local
-    /// map that guesses lands on a real-but-dead entry and reads a confident
-    /// "no signal" for a provider that is serving.
+    /// The canonical models.dev slug, published when a catalog counterpart exists.
+    /// Entries without one are not inferred from their provider name, except for
+    /// Antigravity's separately scoped Code Assist pools.
     #[serde(default)]
     pub api_provider: Option<String>,
     #[serde(default)]
@@ -422,9 +417,10 @@ fn record_capacity_signal(
 }
 
 /// Merge quota windows and provider-scoped spend pools onto an existing store-built
-/// route-state snapshot using the provider mapping, capacity extraction, reset
+/// route-state snapshot using the published provider slug, capacity extraction, reset
 /// handling, pressure projection, and exhaustion rules below:
-///   - the wire name is mapped to a routing providerID via `name_map`;
+///   - `apiProvider` joins entries to routing provider IDs; only Antigravity's
+///     un-slugged Code Assist pools use the narrow exception below;
 ///   - each provider's windows are EXTRACTED per its topology (account-wide pools
 ///     vs antigravity's pooled `extra_rate_windows` → the capacities of the
 ///     models that draw on that pool);
@@ -454,13 +450,11 @@ pub fn merge_quota_overlay(
     snapshot: &mut ModelRouteStateSnapshot,
     windows: &[ProviderUsage],
     facts: &[ModelFact],
-    name_map: &HashMap<String, String>,
 ) {
     merge_quota_overlay_with(
         snapshot,
         windows,
         facts,
-        name_map,
         now_default(snapshot),
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
@@ -473,12 +467,80 @@ fn now_default(snapshot: &ModelRouteStateSnapshot) -> f64 {
     snapshot.now
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaRouteJoin<'a> {
+    pub provider_id: &'a str,
+    pub antigravity_family_only: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExceptionalQuotaJoin {
+    insula_provider: &'static str,
+    route_provider: &'static str,
+    route_model_prefix: &'static str,
+}
+
+/// Insula deliberately omits `apiProvider` for Antigravity: its pools are Google
+/// Code Assist, not models.dev `google`. The consumer contract keys those pools
+/// by window `id`, never title: `gemini-*` serves `antigravity-gemini-*`, while
+/// `3p-*` serves Antigravity's Claude/GPT family. Extraction and pool routing keep
+/// those windows separate; this join is restricted to the Antigravity route family.
+const ANTIGRAVITY_QUOTA_JOIN: ExceptionalQuotaJoin = ExceptionalQuotaJoin {
+    insula_provider: "antigravity",
+    route_provider: "google",
+    route_model_prefix: "antigravity-",
+};
+
+/// Resolve one Insula entry to its route-provider namespace. Published slugs are
+/// authoritative; an absent slug is not guessed, except for Antigravity's
+/// separately identified Code Assist pools.
+pub fn quota_route_join(entry: &ProviderUsage) -> Option<QuotaRouteJoin<'_>> {
+    let antigravity = entry.provider == ANTIGRAVITY_QUOTA_JOIN.insula_provider;
+    if let Some(provider_id) = entry
+        .api_provider
+        .as_deref()
+        .filter(|slug| !slug.trim().is_empty())
+    {
+        return Some(QuotaRouteJoin {
+            provider_id,
+            antigravity_family_only: antigravity,
+        });
+    }
+    antigravity.then_some(QuotaRouteJoin {
+        provider_id: ANTIGRAVITY_QUOTA_JOIN.route_provider,
+        antigravity_family_only: true,
+    })
+}
+
+fn quota_join_matches_capacity(join: QuotaRouteJoin<'_>, capacity_key: &str) -> bool {
+    let Some((provider_id, model_id)) = capacity_key.split_once('/') else {
+        return false;
+    };
+    provider_id == join.provider_id
+        && (!join.antigravity_family_only
+            || model_id.starts_with(ANTIGRAVITY_QUOTA_JOIN.route_model_prefix))
+}
+
+/// The route capacities an entry can inform, including Antigravity's family-only
+/// restriction. Event persistence and live quota overlays use the same join.
+pub fn quota_capacity_keys(entry: &ProviderUsage, facts: &[ModelFact]) -> Vec<String> {
+    let Some(join) = quota_route_join(entry) else {
+        return Vec::new();
+    };
+    facts
+        .iter()
+        .filter_map(|fact| {
+            let capacity_key = make_capacity_key(&fact.provider_id, &fact.model_id);
+            quota_join_matches_capacity(join, &capacity_key).then_some(capacity_key)
+        })
+        .collect()
+}
+
 /// The explicit-config form (testable with a fixed `now`, pace config, threshold).
 pub fn merge_quota_overlay_with(
     snapshot: &mut ModelRouteStateSnapshot,
     windows: &[ProviderUsage],
     facts: &[ModelFact],
-    name_map: &HashMap<String, String>,
     now_ms: f64,
     pace_config: &PaceConfig,
     hard_block_threshold: f64,
@@ -506,27 +568,27 @@ pub fn merge_quota_overlay_with(
         if !entry.is_healthy() {
             continue;
         }
-        // The published canonical slug wins over our local wire-name map: QTA
-        // serves apiProvider exactly so consumers stop maintaining copies of its
-        // naming table, and the fallback map exists only for the ~third of
-        // entries where the slug is null. Order matters: the local map knows
-        // nothing about providers QTA added after it was written (alibaba's
-        // token plan reached us as provider="qwen-cloud", absent from the map,
-        // so its healthy windows were dropped at this line for weeks while the
-        // provider ran at 72% of its 5h window).
-        let provider_id = match entry.api_provider.as_ref() {
-            Some(slug) if !slug.is_empty() => slug,
-            _ => match name_map.get(&entry.provider) {
-                Some(mapped) => mapped,
-                None => continue, // unmapped and no published slug → no signal (degrade safe)
-            },
+        let Some(join) = quota_route_join(entry) else {
+            continue;
         };
         let empty: Vec<String> = Vec::new();
-        let provider_caps = caps_by_provider.get(provider_id).unwrap_or(&empty);
-        let extracted = extract_windows(entry, provider_id, &entry.provider, provider_caps);
+        let mut antigravity_caps = Vec::new();
+        let provider_caps = match caps_by_provider.get(join.provider_id) {
+            Some(caps) if join.antigravity_family_only => {
+                antigravity_caps.extend(
+                    caps.iter()
+                        .filter(|capacity| quota_join_matches_capacity(join, capacity))
+                        .cloned(),
+                );
+                &antigravity_caps
+            }
+            Some(caps) => caps,
+            None => &empty,
+        };
+        let extracted = extract_windows(entry, join.provider_id, &entry.provider, provider_caps);
 
         let account_key = (
-            provider_id.clone(),
+            join.provider_id.to_string(),
             entry.account.clone().unwrap_or_default(),
         );
         for win in extracted {
@@ -790,7 +852,6 @@ mod tests {
             &mut snapshot,
             windows,
             facts,
-            &HashMap::new(),
             NOW_MS,
             &DEFAULT_PACE_CONFIG,
             DEFAULT_HARD_BLOCK_THRESHOLD,
@@ -905,7 +966,7 @@ mod tests {
         ];
         let per_model = usage(serde_json::json!({
             "provider": "antigravity",
-            "apiProvider": "google",
+            "apiProvider": null,
             "account": "one",
             "usage": { "extraRateWindows": [
                 {
@@ -978,9 +1039,6 @@ mod tests {
         windows: &[ProviderUsage],
         facts: &[ModelFact],
     ) -> ModelRouteStateSnapshot {
-        // Insula publishes antigravity with a null apiProvider; the routing
-        // module maps the wire name to the google provider id.
-        let name_map = HashMap::from([("antigravity".to_string(), "google".to_string())]);
         let mut snapshot = ModelRouteStateSnapshot {
             now: NOW_MS,
             by_route: HashMap::new(),
@@ -990,7 +1048,6 @@ mod tests {
             &mut snapshot,
             windows,
             facts,
-            &name_map,
             NOW_MS,
             &DEFAULT_PACE_CONFIG,
             DEFAULT_HARD_BLOCK_THRESHOLD,
@@ -1002,6 +1059,8 @@ mod tests {
     const AG_CLAUDE: &str = "google/antigravity-claude-opus-4-6-thinking";
     const API_GEMINI: &str = "google/gemini-3.8-flash";
     const ALTERNATIVE: &str = "openai/gpt-alternative";
+    const AG_ARGON: &str = "google/antigravity-gemini-4-argon";
+    const AG_GPT: &str = "google/antigravity-gpt-5.4";
 
     /// Antigravity Gemini is the cheapest-looking route; the alternative costs more.
     fn antigravity_facts() -> Vec<ModelFact> {
@@ -1017,6 +1076,28 @@ mod tests {
 
     fn ms(rfc3339: &str) -> f64 {
         crate::quota_extract::chrono_parse_rfc3339(rfc3339).expect("fixture timestamp")
+    }
+
+    #[test]
+    fn antigravity_quota_is_limited_to_its_route_family() {
+        let facts = vec![
+            fact("google", "antigravity-gemini-4-argon", 50.0),
+            fact("google", "antigravity-gemini-3.8-flash", 50.0),
+            fact("google", "gemini-3.8-flash", 50.0),
+        ];
+        let entry = antigravity_account(
+            "only",
+            &[
+                ("gemini-5h", 90.0, "2030-01-01T01:00:00Z"),
+                ("3p-weekly", 100.0, "2030-01-03T00:00:00Z"),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[entry], &facts);
+
+        assert!(snapshot.by_capacity[AG_ARGON].quota_pressure.is_some());
+        assert_eq!(snapshot.by_capacity[AG_ARGON].quota_exhausted_until, None);
+        assert_eq!(snapshot.by_capacity[AG_GEMINI].quota_exhausted_until, None);
+        assert!(!snapshot.by_capacity.contains_key(API_GEMINI));
     }
 
     #[test]
@@ -1121,7 +1202,9 @@ mod tests {
 
     #[test]
     fn antigravity_third_party_models_read_the_3p_pool_not_the_gemini_pool() {
-        let facts = antigravity_facts();
+        let mut facts = antigravity_facts();
+        facts.push(fact("google", "antigravity-gemini-4-argon", 50.0));
+        facts.push(fact("google", "antigravity-gpt-5.4", 50.0));
         let gemini_walled = antigravity_account(
             "only",
             &[
@@ -1134,6 +1217,7 @@ mod tests {
             .quota_exhausted_until
             .is_some());
         assert_eq!(snapshot.by_capacity[AG_CLAUDE].quota_exhausted_until, None);
+        assert_eq!(snapshot.by_capacity[AG_GPT].quota_exhausted_until, None);
 
         let third_party_walled = antigravity_account(
             "only",
@@ -1148,6 +1232,19 @@ mod tests {
             Some(ms("2030-01-03T00:00:00Z"))
         );
         assert_eq!(snapshot.by_capacity[AG_GEMINI].quota_exhausted_until, None);
+        assert_eq!(
+            snapshot.by_capacity[AG_GPT].quota_exhausted_until,
+            Some(ms("2030-01-03T00:00:00Z"))
+        );
+        assert_eq!(
+            snapshot
+                .by_capacity
+                .get(AG_ARGON)
+                .and_then(|state| state.quota_exhausted_until),
+            None,
+            "a 3p weekly exhaustion cannot wall Gemini Argon"
+        );
+        assert!(!snapshot.by_capacity.contains_key(API_GEMINI));
     }
 
     #[test]
@@ -1307,7 +1404,6 @@ mod tests {
             &mut snapshot,
             &windows,
             &facts,
-            &HashMap::new(),
             NOW_MS,
             &DEFAULT_PACE_CONFIG,
             DEFAULT_HARD_BLOCK_THRESHOLD,

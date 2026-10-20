@@ -2619,12 +2619,7 @@ mod tests {
         let mut snapshot = fixture.store().build_snapshot(NOW as f64).unwrap();
         let windows: Vec<prefrontal_routing_core::ProviderUsage> =
             serde_json::from_value(json!([exhausted, healthy])).unwrap();
-        prefrontal_routing_core::merge_quota_overlay(
-            &mut snapshot,
-            &windows,
-            &facts,
-            &std::collections::HashMap::new(),
-        );
+        prefrontal_routing_core::merge_quota_overlay(&mut snapshot, &windows, &facts);
         assert_eq!(snapshot.by_capacity[route].quota_exhausted_until, None);
         let seat = |snapshot| {
             prefrontal_routing_core::select_panel(prefrontal_routing_core::SelectPanelInput {
@@ -2651,12 +2646,7 @@ mod tests {
         healthy["usage"]["secondary"]["usedPercent"] = json!(100);
         let windows: Vec<prefrontal_routing_core::ProviderUsage> =
             serde_json::from_value(json!([exhausted, healthy])).unwrap();
-        prefrontal_routing_core::merge_quota_overlay(
-            &mut snapshot,
-            &windows,
-            &facts,
-            &std::collections::HashMap::new(),
-        );
+        prefrontal_routing_core::merge_quota_overlay(&mut snapshot, &windows, &facts);
         assert!(seat(snapshot).members.is_empty());
     }
 

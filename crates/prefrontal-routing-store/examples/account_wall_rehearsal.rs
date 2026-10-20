@@ -3,7 +3,7 @@
 use prefrontal_routing_core::{account_wall::account_scoped_wall, RouteStateStore, RouteWallClass};
 use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
 use rusqlite::{Connection, OpenFlags};
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 type Wall = (
     String,
@@ -75,7 +75,10 @@ fn main() {
     // catalog no longer serves, with their route state). A wall on a retired
     // route has nothing left to quarantine; report it and check the rest.
     let migrated = walls(&copy_conn);
-    for (route, ..) in before.iter().filter(|wall| !migrated.iter().any(|kept| kept.0 == wall.0)) {
+    for (route, ..) in before
+        .iter()
+        .filter(|wall| !migrated.iter().any(|kept| kept.0 == wall.0))
+    {
         assert!(
             !snapshot.by_route.contains_key(route),
             "{route} lost its route state in migration but still has a snapshot entry"
@@ -111,12 +114,7 @@ fn main() {
             &quota.windows_json,
         )
         .unwrap();
-        prefrontal_routing_core::merge_quota_overlay(
-            &mut admitted_snapshot,
-            &windows,
-            &facts,
-            &HashMap::new(),
-        );
+        prefrontal_routing_core::merge_quota_overlay(&mut admitted_snapshot, &windows, &facts);
     }
     for (route, _, _, _, _) in eligible
         .into_iter()

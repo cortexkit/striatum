@@ -51,6 +51,7 @@ use std::{
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
 use cortexkit_store_types::StorageDescriptor;
 use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
+#[cfg(test)]
 use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::model_router::{
@@ -497,26 +498,13 @@ fn write_quota_readings(
     observed_at_ms: u64,
 ) -> Result<(), String> {
     let facts = store.get_facts().map_err(|e| e.to_string())?;
-    let mut caps_by_provider: HashMap<String, Vec<String>> = HashMap::new();
-    for fact in &facts {
-        caps_by_provider
-            .entry(fact.provider_id.clone())
-            .or_default()
-            .push(make_capacity_key(&fact.provider_id, &fact.model_id));
-    }
-    let name_map = quota_name_map();
     let observed_at = i64::try_from(observed_at_ms).map_err(|e| e.to_string())?;
-    let empty: Vec<String> = Vec::new();
     for entry in fresh {
-        let provider_id = match entry.api_provider.as_deref() {
-            Some(slug) if !slug.is_empty() => slug.to_string(),
-            _ => match name_map.get(&entry.provider) {
-                Some(mapped) => mapped.clone(),
-                None => continue,
-            },
+        let Some(join) = prefrontal_routing_core::quota::quota_route_join(entry) else {
+            continue;
         };
-        let capacity_keys = caps_by_provider.get(&provider_id).unwrap_or(&empty);
-        record_reading_log_poll(store, entry, &provider_id, capacity_keys, observed_at)
+        let capacity_keys = prefrontal_routing_core::quota::quota_capacity_keys(entry, &facts);
+        record_reading_log_poll(store, entry, join.provider_id, &capacity_keys, observed_at)
             .map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -2808,31 +2796,6 @@ async fn handle_resolve_policy(
     send(writer, response).await
 }
 
-/// subc-wire-name → routing providerID reconciliation. The quota module's wire
-/// provider names ("codex", "claude", "antigravity", ...) differ from our
-/// providerIDs ("openai", "anthropic", "google", ...). This mirrors the plugin's
-/// live CODEXBAR_PROVIDER_MAP exactly (the 6 providers the plugin currently routes
-/// quota for). An unmapped wire name contributes no pressure (degrades safely); the
-/// `antigravity → google` entry pairs with the per-model extractor so the Geminis'
-/// own windows pressure their capacities (not the misleading aggregate).
-fn quota_name_map() -> &'static std::collections::HashMap<String, String> {
-    use std::sync::OnceLock;
-    static MAP: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        [
-            ("codex", "openai"),
-            ("grok", "xai"),
-            ("antigravity", "google"),
-            ("opencodego", "opencode-go"),
-            ("ollama", "ollama-cloud"),
-            ("claude", "anthropic"),
-        ]
-        .into_iter()
-        .map(|(wire, pid)| (wire.to_string(), pid.to_string()))
-        .collect()
-    })
-}
-
 struct PreparedSelectionInputs {
     now: f64,
     facts: Vec<ModelFact>,
@@ -2991,7 +2954,7 @@ fn prepare_selection_inputs(
         .as_ref()
         .and_then(|_| stale_quota_age_ms(quota_refreshed_at_ms, now as u64));
     if let Some(windows) = quota_windows.as_ref().filter(|_| stale_age_ms.is_none()) {
-        merge_quota_overlay(&mut snapshot, windows, &facts, quota_name_map());
+        merge_quota_overlay(&mut snapshot, windows, &facts);
     }
     subscription_economics::overlay(&mut snapshot, &facts, now as i64);
     let quota_signal_json = quota_signal_json(
@@ -10054,6 +10017,7 @@ mod tests {
             &mut quota_cache,
             vec![usage(json!({
                 "provider": "codex",
+                "apiProvider": "openai",
                 "usage": { "primary": { "usedPercent": 75.0, "resetsAt": "2099-01-01T00:00:00Z", "windowMinutes": 60 } }
             }))],
             now_ms(),
@@ -10139,11 +10103,12 @@ mod tests {
         vec![luna, opus]
     }
 
-    /// One codex reading, mapped to openai, whose 5-hour window resets at
+    /// One codex reading with apiProvider="openai", whose 5-hour window resets at
     /// `resets_at_ms` with nothing used.
     fn codex_window(resets_at_ms: u64) -> ProviderUsage {
         usage(json!({
             "provider": "codex",
+            "apiProvider": "openai",
             "usage": { "primary": {
                 "usedPercent": 0.0,
                 "resetsAt": rfc3339_utc(resets_at_ms),
@@ -10468,6 +10433,7 @@ mod tests {
             &mut cache,
             vec![usage(json!({
                 "provider": "codex",
+                "apiProvider": "openai",
                 "usage": { "primary": {
                     "usedPercent": 100.0,
                     "resetsAt": rfc3339_utc(now + 3 * 60 * 60_000),

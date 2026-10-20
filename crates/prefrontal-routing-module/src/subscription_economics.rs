@@ -260,6 +260,16 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
             })
             .or_else(|| astro_fee(report, &reading.provider, &reading.account_id, now))
             .unwrap_or(DEFAULT_PLAN_FEE_USD);
+        let pool = out
+            .pools
+            .entry(provider.into())
+            .or_insert_with(|| SubscriptionPool {
+                provider: provider.into(),
+                measured: measured(report, &reading.provider),
+                now_ms: now,
+                ..Default::default()
+            });
+        pool.keep_free_percent = get_keep_free_percent(provider);
         let Some(account) = account(&reading.entry, now) else {
             continue;
         };
@@ -272,28 +282,6 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                 accounts: Vec::new(),
             });
         plan.accounts.push(account);
-        let pool = out
-            .pools
-            .entry(provider.into())
-            .or_insert_with(|| SubscriptionPool {
-                provider: provider.into(),
-                measured: measured(report, &reading.provider),
-                now_ms: now,
-                ..Default::default()
-            });
-        pool.keep_free_percent = get_keep_free_percent(provider);
-    }
-    for (quota, provider) in crate::quota_name_map() {
-        if let Some(value) = measured(report, quota) {
-            out.pools
-                .entry(provider.clone())
-                .or_insert_with(|| SubscriptionPool {
-                    provider: provider.clone(),
-                    now_ms: now,
-                    ..Default::default()
-                })
-                .measured = Some(value);
-        }
     }
     for ((provider, _, _), plan) in plans {
         out.pools.get_mut(&provider).unwrap().plans.push(plan);

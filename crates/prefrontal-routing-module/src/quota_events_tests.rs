@@ -282,6 +282,47 @@ async fn exact_body_bytes_are_verified_and_stored_before_ack() {
     );
 }
 
+#[test]
+fn quota_samples_and_usage_snapshots_share_the_api_provider_join() {
+    let (_event_scratch, event_live) = fixture();
+    let (_snapshot_scratch, snapshot_live) = fixture();
+    let entry = json!({
+        "provider": "qwen-cloud",
+        "apiProvider": "alibaba-token-plan",
+        "account": "work",
+        "usage": { "primary": { "usedPercent": 37.0, "windowMinutes": 300 } }
+    });
+
+    event_live.store_sample(entry.clone()).unwrap();
+    snapshot_live
+        .store(
+            &serde_json::to_vec(&json!({"result": [entry]})).unwrap(),
+            false,
+        )
+        .unwrap();
+
+    let event_rows = event_live
+        .store
+        .get_quota_readings("alibaba-token-plan/work")
+        .unwrap();
+    let snapshot_rows = snapshot_live
+        .store
+        .get_quota_readings("alibaba-token-plan/work")
+        .unwrap();
+    assert!(
+        !event_rows.is_empty(),
+        "the event's published slug must join"
+    );
+    assert_eq!(event_rows.len(), snapshot_rows.len());
+    assert_eq!(event_rows[0].window_key, snapshot_rows[0].window_key);
+    assert_eq!(event_rows[0].used_percent, snapshot_rows[0].used_percent);
+    assert!(event_live
+        .store
+        .get_quota_readings("qwen-cloud/work")
+        .unwrap()
+        .is_empty());
+}
+
 #[tokio::test]
 async fn digest_mismatch_refused_and_not_acked() {
     let (_scratch, live) = fixture();

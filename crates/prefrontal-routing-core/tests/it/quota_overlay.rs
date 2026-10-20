@@ -65,18 +65,7 @@ fn usage_from_json(v: serde_json::Value) -> ProviderUsage {
     serde_json::from_value(v).unwrap()
 }
 
-fn name_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs
-        .iter()
-        .map(|(w, p)| (w.to_string(), p.to_string()))
-        .collect()
-}
-
-fn overlay(
-    windows: &[ProviderUsage],
-    facts: &[ModelFact],
-    map: &HashMap<String, String>,
-) -> ModelRouteStateSnapshot {
+fn overlay(windows: &[ProviderUsage], facts: &[ModelFact]) -> ModelRouteStateSnapshot {
     let mut snap = ModelRouteStateSnapshot {
         now: NOW,
         by_route: HashMap::new(),
@@ -86,7 +75,6 @@ fn overlay(
         &mut snap,
         windows,
         facts,
-        map,
         NOW,
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
@@ -98,14 +86,11 @@ fn overlay(
 fn degraded_entry_is_skipped() {
     let entry = usage_from_json(serde_json::json!({
         "provider": "grok",
+        "apiProvider": "xai",
         "error": "no session: no XAI_API_KEY"
     }));
     assert!(!entry.is_healthy());
-    let snap = overlay(
-        &[entry],
-        &[fact("xai", "grok-4.3", 5.0)],
-        &name_map(&[("grok", "xai")]),
-    );
+    let snap = overlay(&[entry], &[fact("xai", "grok-4.3", 5.0)]);
     assert!(
         snap.by_capacity.is_empty(),
         "a degraded entry contributes nothing"
@@ -122,9 +107,10 @@ fn high_utilization_no_window_pressures_mapped_capacity() {
     ];
     let windows = vec![usage_from_json(serde_json::json!({
         "provider": "codex",
+        "apiProvider": "openai",
         "usage": { "primary": { "usedPercent": 90.0, "resetsAt": "2030-01-01T00:00:00Z" } }
     }))];
-    let snap = overlay(&windows, &facts, &name_map(&[("codex", "openai")]));
+    let snap = overlay(&windows, &facts);
 
     let openai_cap = make_capacity_key("openai", "gpt-5.5");
     let p = snap
@@ -176,9 +162,10 @@ fn at_or_above_hard_block_sets_exhaustion_until_reset() {
     let facts = vec![fact("openai", "gpt-5.5", 30.0)];
     let windows = vec![usage_from_json(serde_json::json!({
         "provider": "codex",
+        "apiProvider": "openai",
         "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z" } }
     }))];
-    let snap = overlay(&windows, &facts, &name_map(&[("codex", "openai")]));
+    let snap = overlay(&windows, &facts);
     let state = snap
         .by_capacity
         .get(&make_capacity_key("openai", "gpt-5.5"))
@@ -194,12 +181,12 @@ fn exhausted_no_reset_uses_local_reprobe_horizon_and_low_utilization_recovers() 
     let facts = vec![fact("openai", "gpt-5.5", 30.0)];
     let exhausted_windows = vec![usage_from_json(serde_json::json!({
         "provider": "codex",
+        "apiProvider": "openai",
         "usage": { "primary": { "usedPercent": 100.0 } }
     }))];
-    let map = name_map(&[("codex", "openai")]);
     let cap = make_capacity_key("openai", "gpt-5.5");
 
-    let mut first = overlay(&exhausted_windows, &facts, &map);
+    let mut first = overlay(&exhausted_windows, &facts);
     assert_eq!(
         first.by_capacity[&cap].quota_exhausted_until,
         Some(NOW + NO_RESET_REPROBE_HORIZON_MS),
@@ -214,7 +201,6 @@ fn exhausted_no_reset_uses_local_reprobe_horizon_and_low_utilization_recovers() 
         &mut first,
         &exhausted_windows,
         &facts,
-        &map,
         refreshed_now,
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
@@ -226,9 +212,10 @@ fn exhausted_no_reset_uses_local_reprobe_horizon_and_low_utilization_recovers() 
 
     let low_windows = vec![usage_from_json(serde_json::json!({
         "provider": "codex",
+        "apiProvider": "openai",
         "usage": { "primary": { "usedPercent": 40.0 } }
     }))];
-    let recovered = overlay(&low_windows, &facts, &map);
+    let recovered = overlay(&low_windows, &facts);
     let state = &recovered.by_capacity[&cap];
     assert_eq!(state.quota_exhausted_until, None);
     assert_eq!(
@@ -244,9 +231,10 @@ fn past_reset_window_is_skipped() {
     let facts = vec![fact("openai", "gpt-5.5", 30.0)];
     let windows = vec![usage_from_json(serde_json::json!({
         "provider": "codex",
+        "apiProvider": "openai",
         "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "1970-01-01T00:00:01Z" } }
     }))];
-    let snap = overlay(&windows, &facts, &name_map(&[("codex", "openai")]));
+    let snap = overlay(&windows, &facts);
     assert!(
         snap.by_capacity.is_empty(),
         "a past-reset window is not in force"
@@ -260,9 +248,37 @@ fn unmapped_provider_contributes_no_pressure() {
         "provider": "gemini",
         "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z" } }
     }))];
-    // name_map has no "gemini" → degrade safe (empty overlay).
-    let snap = overlay(&windows, &facts, &name_map(&[("codex", "openai")]));
+    // There is no catalog slug, and no exception for this provider.
+    let snap = overlay(&windows, &facts);
     assert!(snap.by_capacity.is_empty());
+}
+
+#[test]
+fn unslugged_non_antigravity_entry_neither_joins_nor_borrows_another_slug() {
+    let facts = vec![
+        fact("openai", "gpt-5.5", 30.0),
+        fact("anthropic", "claude-opus-4-8", 25.0),
+    ];
+    let windows = vec![
+        usage_from_json(serde_json::json!({
+            "provider": "codex",
+            "apiProvider": "openai",
+            "usage": { "primary": { "usedPercent": 40.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        })),
+        usage_from_json(serde_json::json!({
+            "provider": "claude",
+            "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z" } }
+        })),
+    ];
+    let snapshot = overlay(&windows, &facts);
+
+    assert!(snapshot.by_capacity.contains_key("openai/gpt-5.5"));
+    assert!(
+        !snapshot
+            .by_capacity
+            .contains_key("anthropic/claude-opus-4-8"),
+        "a missing slug must not use another provider's quota"
+    );
 }
 
 #[test]
@@ -272,6 +288,7 @@ fn antigravity_per_model_window_pressures_only_the_matched_capacity() {
     let facts = vec![
         fact("google", "antigravity-gemini-3.5-flash", 0.0),
         fact("google", "antigravity-gemini-3.1-pro", 0.0),
+        fact("google", "gemini-3.1-pro", 0.0),
     ];
     let windows = vec![usage_from_json(serde_json::json!({
         "provider": "antigravity",
@@ -282,7 +299,7 @@ fn antigravity_per_model_window_pressures_only_the_matched_capacity() {
             ]
         }
     }))];
-    let snap = overlay(&windows, &facts, &name_map(&[("antigravity", "google")]));
+    let snap = overlay(&windows, &facts);
     // The Pro capacity is exhausted; Flash (no matching window) is untouched.
     let pro = snap
         .by_capacity
@@ -295,6 +312,12 @@ fn antigravity_per_model_window_pressures_only_the_matched_capacity() {
             .contains_key(&make_capacity_key("google", "antigravity-gemini-3.5-flash")),
         "the misleading aggregate must NOT pressure Flash"
     );
+    assert!(
+        !snap
+            .by_capacity
+            .contains_key(&make_capacity_key("google", "gemini-3.1-pro")),
+        "Antigravity quota must not reach a non-Antigravity Google route"
+    );
 }
 
 #[test]
@@ -302,11 +325,11 @@ fn fresh_soft_pressure_lowers_stale_pressure() {
     let facts = vec![fact("openai", "gpt-5.5", 30.0)];
     let windows = vec![usage_from_json(serde_json::json!({
         "provider": "codex",
+        "apiProvider": "openai",
         "usage": { "primary": { "usedPercent": 70.0, "resetsAt": "2030-01-01T00:00:00Z" } }
     }))];
     let cap = make_capacity_key("openai", "gpt-5.5");
-    let map = name_map(&[("codex", "openai")]);
-    let expected = overlay(&windows, &facts, &map)
+    let expected = overlay(&windows, &facts)
         .by_capacity
         .get(&cap)
         .and_then(|s| s.quota_pressure)
@@ -327,7 +350,6 @@ fn fresh_soft_pressure_lowers_stale_pressure() {
         &mut snap,
         &windows,
         &facts,
-        &map,
         NOW,
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
@@ -349,11 +371,11 @@ fn hard_exhaustion_retained_until_future_reset_passes() {
     let facts = vec![fact("openai", "gpt-5.5", 30.0)];
     let windows = vec![usage_from_json(serde_json::json!({
         "provider": "codex",
+        "apiProvider": "openai",
         "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z" } }
     }))];
     let cap = make_capacity_key("openai", "gpt-5.5");
-    let map = name_map(&[("codex", "openai")]);
-    let fresh_until = overlay(&windows, &facts, &map)
+    let fresh_until = overlay(&windows, &facts)
         .by_capacity
         .get(&cap)
         .and_then(|s| s.quota_exhausted_until)
@@ -375,7 +397,6 @@ fn hard_exhaustion_retained_until_future_reset_passes() {
         &mut snap,
         &windows,
         &facts,
-        &map,
         NOW,
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
@@ -395,9 +416,10 @@ fn exhausted_provider_loses_selection_to_unpressured_peer_end_to_end() {
     let facts = vec![fact("openai", "gpt-5.5", 5.0), fact("xai", "grok-4.3", 5.0)];
     let windows = vec![usage_from_json(serde_json::json!({
         "provider": "codex",
+        "apiProvider": "openai",
         "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z" } }
     }))];
-    let snap = overlay(&windows, &facts, &name_map(&[("codex", "openai")]));
+    let snap = overlay(&windows, &facts);
 
     let mut available = std::collections::HashSet::new();
     for f in &facts {
@@ -427,14 +449,10 @@ fn exhausted_provider_loses_selection_to_unpressured_peer_end_to_end() {
 }
 
 #[test]
-fn published_api_provider_slug_reaches_routes_the_local_map_never_heard_of() {
-    // The alibaba dead-signal incident (2026-08-05): QTA served the token plan
-    // as provider="qwen-cloud" with apiProvider="alibaba-token-plan". The wire
-    // name is absent from our local map, so before the slug was honored the
-    // entry was dropped at the name gate and the provider ran for weeks at 72%
-    // of its 5h window while every decision read "quota signal: none". The
-    // published slug must key the entry WITHOUT a local-map entry, and the
-    // local map (deliberately empty here) must not be consulted at all.
+fn published_api_provider_slug_routes_to_its_capacity() {
+    // The alibaba token plan arrives as provider="qwen-cloud" with
+    // apiProvider="alibaba-token-plan". The published slug identifies its route
+    // provider without inferring anything from the Insula provider name.
     let facts = vec![fact("alibaba-token-plan", "qwen3.8-max", 6.0)];
     let entry = usage_from_json(serde_json::json!({
         "provider": "qwen-cloud",
@@ -445,7 +463,7 @@ fn published_api_provider_slug_reaches_routes_the_local_map_never_heard_of() {
             "resetsAt": "2100-01-01T00:00:00Z"
         }}
     }));
-    let snap = overlay(&[entry], &facts, &name_map(&[]));
+    let snap = overlay(&[entry], &facts);
     let state = snap
         .by_capacity
         .get("alibaba-token-plan/qwen3.8-max")
@@ -473,7 +491,7 @@ fn one_exhausted_account_beside_a_free_sibling_does_not_wall_the_provider() {
             "usage": { "primary": { "usedPercent": 5.0, "resetsAt": "2030-01-01T00:00:00Z", "windowMinutes": 10080 } }
         })),
     ];
-    let snap = overlay(&windows, &facts, &HashMap::new());
+    let snap = overlay(&windows, &facts);
     let state = snap
         .by_capacity
         .get(&make_capacity_key("anthropic", "claude-opus-5"))
@@ -501,7 +519,7 @@ fn all_accounts_exhausted_walls_at_the_earliest_reset() {
             "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z", "windowMinutes": 10080 } }
         })),
     ];
-    let snap = overlay(&windows, &facts, &HashMap::new());
+    let snap = overlay(&windows, &facts);
     let state = snap
         .by_capacity
         .get(&make_capacity_key("anthropic", "claude-opus-5"))
@@ -524,7 +542,7 @@ fn wall_ms_for(rfc3339: &str) -> f64 {
         "provider": "zzz", "apiProvider": "zzz-probe", "account": "only",
         "usage": { "primary": { "usedPercent": 100.0, "resetsAt": rfc3339, "windowMinutes": 60 } }
     }))];
-    let snap = overlay(&windows, &facts, &HashMap::new());
+    let snap = overlay(&windows, &facts);
     snap.by_capacity
         .get(&make_capacity_key("zzz-probe", "probe-model"))
         .and_then(|s| s.quota_exhausted_until)
@@ -632,7 +650,7 @@ fn windowless_usage_with_empty_balance_pool_walls_without_reset() {
         extract_windows(&entry, "balance-provider", "balance-wire", &[]).is_empty(),
         "usage={{}} stays no-signal for the rate-window arm even when spend is present"
     );
-    let snap = overlay(&[entry], &facts, &HashMap::new());
+    let snap = overlay(&[entry], &facts);
     let state = snap
         .by_capacity
         .get(&make_capacity_key("balance-provider", "budget-model"))
@@ -669,7 +687,7 @@ fn pool_without_spendable_flag_decodes_and_serves() {
             "basis": "reported"
         }]
     }));
-    let snap = overlay(&[entry], &facts, &HashMap::new());
+    let snap = overlay(&[entry], &facts);
     let cap = make_capacity_key("absent-provider", "budget-model");
     assert!(
         snap.by_capacity[&cap].quota_exhausted_until.is_none(),
@@ -698,7 +716,7 @@ fn balance_only_positive_pool_keeps_provider_servable() {
             "spendable": true
         }]
     }));
-    let snap = overlay(&[entry], &facts, &HashMap::new());
+    let snap = overlay(&[entry], &facts);
     let cap = make_capacity_key("balance-provider", "budget-model");
     assert!(
         snap.by_capacity[&cap].quota_exhausted_until.is_none(),
@@ -749,7 +767,7 @@ fn derived_pool_remainder_can_pace_but_never_walls() {
             "spendable": true
         }]
     }));
-    let snap = overlay(&[entry], &facts, &HashMap::new());
+    let snap = overlay(&[entry], &facts);
     let state = &snap.by_capacity[&make_capacity_key("balance-provider", "budget-model")];
 
     assert!(
@@ -811,7 +829,7 @@ fn spend_pool_without_a_stated_balance_decodes_and_neither_walls_nor_paces() {
             "basis": "unstated", "spendable": true
         }]
     }));
-    let snap = overlay(&[granted_unstated], &facts, &HashMap::new());
+    let snap = overlay(&[granted_unstated], &facts);
     let state = snap
         .by_capacity
         .get(&make_capacity_key("balance-provider", "budget-model"));
@@ -858,7 +876,7 @@ fn an_idle_account_keeps_its_provider_off_the_all_accounts_wall() {
             windows.iter().all(ProviderUsage::is_healthy),
             "both accounts must be healthy, or the specimen is about health rather than membership"
         );
-        let snap = overlay(&windows, &facts, &HashMap::new());
+        let snap = overlay(&windows, &facts);
         let wall = snap
             .by_capacity
             .get("anthropic/claude-opus-5")
@@ -939,7 +957,7 @@ fn an_exhausted_rolling_window_still_walls_its_route() {
             windows.iter().all(ProviderUsage::is_healthy),
             "the entry must be healthy, or the specimen is about health rather than pacing"
         );
-        let snap = overlay(&windows, &facts, &HashMap::new());
+        let snap = overlay(&windows, &facts);
         let wall = snap
             .by_capacity
             .get("openai/gpt-5.4")
