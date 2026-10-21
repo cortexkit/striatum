@@ -11908,6 +11908,16 @@ mod tests {
                 cause["detail"] = json!("harness broca does not serve this route for this request");
             }
         }
+        let funnel = json!({
+            "catalog": 46, "scored": 46, "operatorAdmitted": 46, "callerAdmitted": 46,
+            "reachable": 2, "capabilityEligible": 2, "quotaEligible": 2, "packageFit": 2,
+            "adequacyEligible": 1, "distinctFamilies": 1, "initiallyAdmitted": 1,
+            "gateOrder": ["deprecated_upstream", "unscored_awaiting_placement", "excluded_by_operator",
+                "excluded", "unavailable", "capability", "quota_or_backoff", "package_fit",
+                "sibling_collapse", "family_labeled", "phase_adequacy", "distinct_families", "initially_admitted"]
+        });
+        expected["result"]["policy"]["funnel"] = funnel.clone();
+        expected["result"]["shortfall"]["funnel"] = funnel;
         assert_eq!(response_value, expected);
 
         let decisions = store.get_decisions_for_task("panel-wire-n-pick").unwrap();

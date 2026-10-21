@@ -29,6 +29,117 @@ fn keys(panel: &prefrontal_routing_core::SelectedPanel) -> Vec<&str> {
 }
 
 #[test]
+fn panel_shortfall_reports_candidate_funnel_not_catalog_noise() {
+    let facts = vec![
+        fact("first", 1900.0, Some("first")),
+        fact("second", 1880.0, Some("second")),
+        fact("third", 1870.0, Some("third")),
+    ];
+    let select = |facts: Vec<ModelFact>| {
+        let mut input = n_pick_input(facts, spec(3, 80.0, PanelDiversity::Family));
+        input.available_models.remove("p/third");
+        input.required_capabilities = Some(RequiredCapabilities {
+            vision: Some(true),
+            ..Default::default()
+        });
+        input
+            .available_models
+            .retain(|key| !key.contains("unreachable") && !key.contains("unscored"));
+        select_panel_with_policy(
+            input,
+            &DEFAULT_ROUTING_CONFIG,
+            &ClassPanelPolicy {
+                extra: 1,
+                extra_by: Some(PanelExtraOrder::Iq),
+                ..policy(2, PanelOrder::Iq, Some(80))
+            },
+        )
+        .unwrap()
+    };
+    let baseline = select(facts.clone());
+    let mut noisy = facts;
+    for index in 0..150 {
+        let mut unscored = fact(&format!("unscored-{index}"), 0.0, None);
+        unscored.score_provenance = ScoreProvenance::Unscored;
+        noisy.push(unscored);
+        let mut non_text = fact(&format!("non-text-{index}"), 100.0, None);
+        non_text.supports_vision = Some(false);
+        noisy.push(non_text);
+        noisy.push(fact(&format!("unreachable-{index}"), 100.0, None));
+        noisy.push(fact(&format!("low-iq-{index}"), 100.0, Some("noise")));
+    }
+    let noisy = select(noisy);
+    assert_eq!(keys(&noisy), keys(&baseline));
+    assert_eq!(
+        noisy.shortfall.as_ref().unwrap().detail,
+        baseline.shortfall.as_ref().unwrap().detail
+    );
+    let base = serde_json::to_value(&baseline).unwrap();
+    let value = serde_json::to_value(&noisy).unwrap();
+    let funnel = &value["shortfall"]["funnel"];
+    assert_eq!(base["shortfall"]["funnel"]["catalog"], 3);
+    assert_eq!(funnel["catalog"], 603);
+    assert_eq!(funnel["scored"], 453);
+    assert_eq!(funnel["operatorAdmitted"], 453);
+    assert_eq!(funnel["callerAdmitted"], 453);
+    assert_eq!(funnel["reachable"], 302);
+    assert_eq!(funnel["capabilityEligible"], 152);
+    assert_eq!(funnel["quotaEligible"], 152);
+    assert_eq!(funnel["packageFit"], 152);
+    assert_eq!(funnel["adequacyEligible"], 2);
+    assert_eq!(funnel["distinctFamilies"], 2);
+    assert_eq!(funnel["initiallyAdmitted"], 2);
+    assert_eq!(value["policy"]["funnel"], *funnel);
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    for cause in value["shortfall"]["causes"].as_array().unwrap() {
+        *reasons
+            .entry(cause["reason"].as_str().unwrap().to_string())
+            .or_default() += 1;
+    }
+    assert_eq!(
+        reasons,
+        std::collections::BTreeMap::from([
+            ("unscored_awaiting_placement".into(), 150),
+            ("unavailable".into(), 151),
+            ("capability".into(), 150),
+            ("below_iq_floor".into(), 150),
+        ])
+    );
+}
+
+#[test]
+fn small_window_route_is_package_rejected_not_unavailable() {
+    let mut small = fact("small-window", 1900.0, Some("third"));
+    small.context_window = Some(256_000.0);
+    small.max_output_tokens = Some(64_000);
+    let mut input = n_pick_input(vec![small], spec(1, 80.0, PanelDiversity::Family));
+    input.package_tokens = Some(179_283);
+    let panel = select_panel_with_policy(
+        input,
+        &DEFAULT_ROUTING_CONFIG,
+        &policy(1, PanelOrder::Iq, Some(80)),
+    )
+    .unwrap();
+    let shortfall = panel.shortfall.unwrap();
+    assert_eq!(shortfall.code, PanelShortfallCode::PackageUnmeetable);
+    assert_eq!(shortfall.causes.len(), 1);
+    assert_eq!(
+        shortfall.causes[0].reason,
+        PanelCauseReason::PackageTooLarge
+    );
+    let detail = shortfall.causes[0].detail.as_deref().unwrap();
+    for expected in [
+        "package 179283 tokens",
+        "window 256000",
+        "output reserve 64000",
+        "prompt reserve 16000",
+        "ceiling 88000",
+    ] {
+        assert!(detail.contains(expected), "missing {expected}: {detail}");
+    }
+}
+
+#[test]
 fn builtin_defaults_and_lab_wire_class() {
     use PanelClass::*;
     use PanelExtraOrder as Extra;
@@ -173,6 +284,9 @@ fn diagnose_iq_topk_can_sit_below_floor_bar_and_prefers_pro() {
             policy(2, PanelOrder::Iq, Some(80)),
         );
         assert_eq!(keys(&panel), ["p/frontier", "p/base-pro"]);
+        let funnel = panel.policy.as_ref().unwrap().funnel.as_ref().unwrap();
+        assert_eq!(funnel.adequacy_eligible, 2);
+        assert_eq!(funnel.distinct_families, 2);
         assert!(
             panel.shortfall.is_none(),
             "the bar must not refuse a full IQ panel"

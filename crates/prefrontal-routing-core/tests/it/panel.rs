@@ -197,7 +197,10 @@ fn package_refusal_names_size_largest_ceiling_and_roster_remedy() {
         assert!(refusal.causes.iter().any(|cause| {
             cause.model == model
                 && cause.reason == PanelCauseReason::PackageExceedsCeiling
-                && cause.detail.as_deref() == Some(detail)
+                && cause
+                    .detail
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with(detail))
         }));
     }
 }

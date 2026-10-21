@@ -282,6 +282,7 @@ pub enum PanelCauseReason {
     /// because the fix is different: one is loosening a config file, the other is
     /// changing what this call asked for.
     ExcludedByOperator,
+    UnscoredAwaitingPlacement,
     Unavailable,
     QuotaExhausted,
     BackoffActive,
@@ -320,6 +321,31 @@ pub struct PanelShortfall {
     pub code: PanelShortfallCode,
     pub detail: String,
     pub causes: Vec<PanelCause>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funnel: Option<PanelCandidateFunnel>,
+}
+
+/// Cumulative route counts at the actual admission gates, not estimates of lost
+/// seats. Earlier rejections are not tested against later gates. Adequacy counts
+/// retained siblings clearing the floor plus IQ top-K seats admitted below it;
+/// below-floor alternatives cannot fill an extra seat. `distinct_families`
+/// counts unique family labels;
+/// `initially_admitted` counts selected seats.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelCandidateFunnel {
+    pub catalog: usize,
+    pub scored: usize,
+    pub operator_admitted: usize,
+    pub caller_admitted: usize,
+    pub reachable: usize,
+    pub capability_eligible: usize,
+    pub quota_eligible: usize,
+    pub package_fit: usize,
+    pub adequacy_eligible: usize,
+    pub distinct_families: usize,
+    pub initially_admitted: usize,
+    pub gate_order: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -377,6 +403,8 @@ pub struct PanelPolicy {
     pub largest_package_ceiling: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub replacements: Vec<PackageSeatReplacement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funnel: Option<PanelCandidateFunnel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -519,9 +547,10 @@ pub fn select_panel_with_availability(
             model: panel.members[*slot].route_key.clone(),
             reason: PanelCauseReason::PackageExceedsCeiling,
             reset_at_ms: None,
-            detail: Some(format!(
-                "package {tokens} tokens exceeds {} ceiling {} tokens",
-                ceiling.route_key, ceiling.tokens
+            detail: Some(package_cause_detail(
+                tokens,
+                ceiling,
+                panel.members[*slot].max_output_tokens,
             )),
         })
         .collect::<Vec<_>>();
@@ -541,6 +570,8 @@ pub fn select_panel_with_availability(
         availability_rejections,
     )?;
     let mut policy = spares.policy.expect("automatic selection records policy");
+    // The spare search is not the admission funnel of the pinned roster.
+    policy.funnel = None;
     let mut candidates = spares
         .members
         .into_iter()
@@ -636,6 +667,7 @@ pub fn select_panel_with_availability(
             code: PanelShortfallCode::PackageUnmeetable,
             detail: package_refusal(tokens, largest, &too_small),
             causes,
+            funnel: None,
         });
         // No oversized pin is a sendable seat, even on a refused decision.
         panel.members.retain(|member| {
@@ -678,6 +710,24 @@ fn package_refusal(tokens: usize, largest: usize, too_small: &[String]) -> Strin
         )
     };
     format!("package {tokens} tokens cannot fill the panel{seats}; largest available adequate ceiling {largest} tokens. Narrow evidence or change the project athena.members roster setting; evidence was not truncated")
+}
+
+fn package_cause_detail(
+    tokens: usize,
+    ceiling: &crate::package_ceiling::PackageCeiling,
+    max_output_tokens: Option<u64>,
+) -> String {
+    use crate::package_ceiling::{
+        PANEL_MEMBER_MAX_OUTPUT_TOKENS, SEAT_PROMPT_RESERVE_TOKENS, UNKNOWN_SEAT_OUTPUT_TOKENS,
+    };
+    let output = max_output_tokens
+        .unwrap_or(UNKNOWN_SEAT_OUTPUT_TOKENS)
+        .min(PANEL_MEMBER_MAX_OUTPUT_TOKENS);
+    format!(
+        "package {tokens} tokens exceeds {} ceiling {} tokens (window {}{}; output reserve {output}; prompt reserve {SEAT_PROMPT_RESERVE_TOKENS}; half of remaining window reserved for discussion)",
+        ceiling.route_key, ceiling.tokens, ceiling.context_window,
+        if ceiling.context_window_known { "" } else { " assumed: no catalog window" },
+    )
 }
 
 fn select_panel_admitted(
@@ -734,6 +784,47 @@ fn select_panel_admitted(
         availability_rejections,
     );
     let top_routable_elo = admission.top_routable.elo;
+    // Shared admission is first-match. Subtract each disjoint gate population
+    // in that same order, rather than calling all rejected catalog rows outages.
+    let rejected_count = |reasons: &[&str]| {
+        admission
+            .rejected
+            .iter()
+            .filter(|row| reasons.contains(&row.reason.as_str()))
+            .count()
+    };
+    let scored = considered_facts.len().saturating_sub(rejected_count(&[
+        REASON_DEPRECATED_UPSTREAM,
+        "unscored_awaiting_placement",
+    ]));
+    let operator_admitted = scored.saturating_sub(rejected_count(&[REASON_EXCLUDED_BY_OPERATOR]));
+    let caller_admitted = operator_admitted.saturating_sub(rejected_count(&[REASON_EXCLUDED]));
+    let reachable = caller_admitted.saturating_sub(rejected_count(&[REASON_NOT_AVAILABLE]));
+    let mut funnel = PanelCandidateFunnel {
+        catalog: considered_facts.len(),
+        scored,
+        operator_admitted,
+        caller_admitted,
+        reachable,
+        capability_eligible: reachable
+            .saturating_sub(rejected_count(&["missing_vision", "context_too_small"])),
+        gate_order: vec![
+            "deprecated_upstream",
+            "unscored_awaiting_placement",
+            "excluded_by_operator",
+            "excluded",
+            "unavailable",
+            "capability",
+            "quota_or_backoff",
+            "package_fit",
+            "sibling_collapse",
+            "family_labeled",
+            "phase_adequacy",
+            "distinct_families",
+            "initially_admitted",
+        ],
+        ..Default::default()
+    };
     let availability_substrate = input.availability_substrate;
     causes.extend(admission.rejected.into_iter().map(|rejected| {
         // Use the same merged route/capacity deadlines as admission. Display text
@@ -757,6 +848,7 @@ fn select_panel_admitted(
                 REASON_EXCLUDED => PanelCauseReason::Excluded,
                 REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
                 REASON_DEPRECATED_UPSTREAM => PanelCauseReason::DeprecatedUpstream,
+                "unscored_awaiting_placement" => PanelCauseReason::UnscoredAwaitingPlacement,
                 "quota_exhausted" | "cooldown_active" => PanelCauseReason::QuotaExhausted,
                 "backoff_active" => PanelCauseReason::BackoffActive,
                 "missing_vision" | "context_too_small" => PanelCauseReason::Capability,
@@ -813,6 +905,7 @@ fn select_panel_admitted(
         })
         .collect::<Vec<_>>();
     let admitted_count = admitted.len();
+    funnel.quota_eligible = admitted_count;
 
     let iq_bar = class_policy
         .floor
@@ -838,10 +931,10 @@ fn select_panel_admitted(
                     model,
                     reason: PanelCauseReason::PackageTooLarge,
                     reset_at_ms: None,
-                    detail: Some(format!(
-                        "package {} tokens exceeds ceiling {} tokens",
+                    detail: Some(package_cause_detail(
                         input.package_tokens.unwrap(),
-                        ceiling.tokens
+                        &ceiling,
+                        admitted.route.fact.max_output_tokens,
                     )),
                 });
                 continue;
@@ -870,6 +963,7 @@ fn select_panel_admitted(
             speed_score: objective.speed_score,
         });
     }
+    funnel.package_fit = candidates.len();
     let (mut candidates, sibling_collapses) = if input.selection == PanelSelection::NPick {
         collapse_siblings(
             candidates,
@@ -1033,6 +1127,19 @@ fn select_panel_admitted(
         }
     }
 
+    let eligible = candidates
+        .iter()
+        .enumerate()
+        .filter(|(index, candidate)| selected.contains(index) || clears_bar(candidate))
+        .map(|(_, candidate)| candidate)
+        .collect::<Vec<_>>();
+    funnel.adequacy_eligible = eligible.len();
+    funnel.distinct_families = eligible
+        .iter()
+        .filter_map(|candidate| candidate.route.fact.family.as_ref())
+        .collect::<HashSet<_>>()
+        .len();
+
     // Preserve phase order even when an extra ranks ahead of a topK seat under
     // a different ordering. Temperatures are assigned after slot order is fixed.
     let mut members = selected
@@ -1122,6 +1229,7 @@ fn select_panel_admitted(
         None
     };
 
+    funnel.initially_admitted = members.len();
     let shortfall = shortfall_kind.map(|(code, detail)| {
         let missing_causes = if automatic {
             width
@@ -1142,10 +1250,12 @@ fn select_panel_admitted(
             code,
             detail,
             causes,
+            funnel: automatic.then(|| funnel.clone()),
         }
     });
 
     let policy = (input.selection == PanelSelection::NPick).then(|| PanelPolicy {
+        funnel: Some(funnel),
         package_tokens: input.package_tokens,
         largest_package_ceiling,
         replacements: Vec::new(),

@@ -260,9 +260,7 @@ mod tests {
     fn catalog_database_path_matches_the_route_store_opener() {
         let path = entries(CATALOG_BYTES)
             .into_iter()
-            .find_map(|(entry_id, path)| {
-                (entry_id == "prefrontal-routing/store").then_some(path)
-            })
+            .find_map(|(entry_id, path)| (entry_id == "prefrontal-routing/store").then_some(path))
             .expect("route-state entry");
         let opened_path = crate::config_overrides::default_store_path().expect("store path");
         assert_eq!(opened_path.file_name().unwrap().to_string_lossy(), path);
