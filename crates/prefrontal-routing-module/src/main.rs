@@ -7084,10 +7084,28 @@ mod tests {
                 )
                 .unwrap();
             drop(store);
+            let optimistic_quota = QuotaCache {
+                windows: vec![antigravity_reading(
+                    "quota-account",
+                    &[
+                        ("gemini-weekly", 0.0, now as u64 + 7 * 24 * 3_600_000),
+                        ("gemini-5h", 0.0, now as u64 + 5 * 3_600_000),
+                    ],
+                )],
+                refreshed_at_ms: now_ms(),
+                available: true,
+                ..Default::default()
+            };
             let next: serde_json::Value = serde_json::from_slice(
-                &run_select_against_rig(&rig, params("mason"), &facts, path)
-                    .await
-                    .body,
+                &run_select_against_rig_with_quota(
+                    &rig,
+                    params("mason"),
+                    &facts,
+                    path,
+                    optimistic_quota,
+                )
+                .await
+                .body,
             )
             .unwrap();
             assert_eq!(
@@ -9578,9 +9596,26 @@ mod tests {
     /// operator config file the module reads (and edit it between selections).
     async fn run_select_against_rig(
         rig: &Rig,
+        params: serde_json::Value,
+        facts: &[ModelFact],
+        operator_config_path: &Path,
+    ) -> Frame {
+        run_select_against_rig_with_quota(
+            rig,
+            params,
+            facts,
+            operator_config_path,
+            QuotaCache::default(),
+        )
+        .await
+    }
+
+    async fn run_select_against_rig_with_quota(
+        rig: &Rig,
         mut params: serde_json::Value,
         facts: &[ModelFact],
         operator_config_path: &Path,
+        quota: QuotaCache,
     ) -> Frame {
         params
             .as_object_mut()
@@ -9602,7 +9637,7 @@ mod tests {
             serde_json::to_vec(&request).unwrap(),
         )
         .unwrap();
-        let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
+        let quota_cache = Arc::new(Mutex::new(quota));
         let (tx, mut rx) = mpsc::channel(1);
         handle_select_request(
             frame,
@@ -12347,6 +12382,16 @@ mod tests {
                 cause["detail"] = json!("harness broca does not serve this route for this request");
             }
         }
+        let funnel = json!({
+            "catalog": 46, "scored": 46, "operatorAdmitted": 46, "callerAdmitted": 46,
+            "reachable": 2, "capabilityEligible": 2, "quotaEligible": 2, "packageFit": 2,
+            "adequacyEligible": 1, "distinctFamilies": 1, "initiallyAdmitted": 1,
+            "gateOrder": ["deprecated_upstream", "unscored_awaiting_placement", "excluded_by_operator",
+                "excluded", "unavailable", "capability", "quota_or_backoff", "package_fit",
+                "sibling_collapse", "family_labeled", "phase_adequacy", "distinct_families", "initially_admitted"]
+        });
+        expected["result"]["policy"]["funnel"] = funnel.clone();
+        expected["result"]["shortfall"]["funnel"] = funnel;
         assert_eq!(response_value, expected);
 
         let decisions = store.get_decisions_for_task("panel-wire-n-pick").unwrap();

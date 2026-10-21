@@ -199,6 +199,14 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
             readback,
             json!({
                 "selection":"class_policy", "class":class_name, "topK":3, "by":by,
+                "funnel": {
+                    "catalog": 3, "scored": 3, "operatorAdmitted": 3, "callerAdmitted": 3,
+                    "reachable": 3, "capabilityEligible": 3, "quotaEligible": 3, "packageFit": 3,
+                    "adequacyEligible": 3, "distinctFamilies": 3, "initiallyAdmitted": 3,
+                    "gateOrder": ["deprecated_upstream", "unscored_awaiting_placement", "excluded_by_operator",
+                        "excluded", "unavailable", "capability", "quota_or_backoff", "package_fit",
+                        "sibling_collapse", "family_labeled", "phase_adequacy", "distinct_families", "initially_admitted"]
+                },
                 "extra":0, "extraBy":null, "floor":floor, "width":3, "seed":null,
                 "pins":{"synthesizer":{"model":"p/synth","variant":"high"}},
                 "seats":[

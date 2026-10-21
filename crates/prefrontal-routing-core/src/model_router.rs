@@ -775,10 +775,9 @@ pub fn admit_routes_with_availability(
             });
             continue;
         }
-        if let Some(until) =
-            latest_deadline(runtime.quota_exhausted_until, runtime.provider_reset_until)
-                .filter(|until| *until > now)
-        {
+        let quota_until = runtime.quota_exhausted_until;
+        let quota_until = latest_deadline(quota_until, runtime.provider_reset_until);
+        if let Some(until) = quota_until.filter(|until| *until > now) {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: "quota_exhausted".to_string(),
