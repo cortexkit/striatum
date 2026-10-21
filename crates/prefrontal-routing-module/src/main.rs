@@ -976,8 +976,8 @@ where
         "retention",
         retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
     );
-    // Restore per-account views before the shared quota delivery task starts.
-    // The roster has a separate refresh loop; readings share the event consumer.
+    // Restore per-account views before the quota consumers start. Header forwarding
+    // owns a separate Insula route so it never interrupts event-cursor delivery.
     let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
         account_quota::restore_account_state(store.as_ref()),
     ));
@@ -985,13 +985,16 @@ where
         .get_or_init(usage_observe::SharedUsageObserve::default)
         .clone();
     loops.spawn(
+        "Insula usage observer",
+        usage_observe::run(config.connection_file_path.clone(), usage_observe),
+    );
+    loops.spawn(
         "quota events",
         quota_events::run(
             config.connection_file_path.clone(),
             Arc::clone(&quota_cache),
             Arc::clone(&account_state),
             Arc::clone(&store),
-            usage_observe.clone(),
         ),
     );
     let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));

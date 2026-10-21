@@ -1,6 +1,7 @@
 //! Coalesces Claude subscription response headers before forwarding them to Insula.
 use std::{
     collections::{BTreeMap, HashMap},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -10,8 +11,10 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+const ADVERTISEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MAX_ACCOUNTS: usize = 512;
 const IGNORE_LOG_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,12 +107,15 @@ impl SharedUsageObserve {
     }
 
     fn record_at(&self, observation: UsageObservation, now: Instant) {
+        let mut wake = false;
         if let Ok(mut buffer) = self.0.state.lock() {
             let signature = HeaderSignature::from_headers(&observation.headers);
             if let Some(reading) = buffer.accounts.get_mut(&observation.account) {
-                if reading.signature != signature {
+                let changed = reading.signature != signature;
+                if changed {
                     reading.immediate = true;
                 }
+                wake = changed || !reading.pending;
                 reading.signature = signature;
                 reading.latest = observation;
                 reading.pending = true;
@@ -127,6 +133,7 @@ impl SharedUsageObserve {
                         return;
                     }
                 }
+                wake = true;
                 buffer.accounts.insert(
                     observation.account.clone(),
                     AccountReading {
@@ -140,7 +147,9 @@ impl SharedUsageObserve {
                 );
             }
         }
-        self.0.wake.notify_one();
+        if wake {
+            self.0.wake.notify_one();
+        }
     }
 
     pub(crate) fn next_due(&self) -> Option<Instant> {
@@ -245,9 +254,185 @@ pub(crate) fn ignored_observations(reply: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
+#[async_trait::async_trait]
+trait UsageObserveRoute: Send {
+    async fn usage_observe(&mut self, observations: &[UsageObservation]) -> Result<Value, String>;
+}
+
+#[async_trait::async_trait]
+impl UsageObserveRoute for crate::quota_consumer::QuotaConsumer {
+    async fn usage_observe(&mut self, observations: &[UsageObservation]) -> Result<Value, String> {
+        self.usage_observe_on_open_route(observations)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn send_if_advertised<R: UsageObserveRoute + ?Sized>(
+    route: &mut R,
+    advertised: bool,
+    observations: &[UsageObservation],
+) -> Result<Option<Value>, String> {
+    if !advertised {
+        return Ok(None);
+    }
+    route.usage_observe(observations).await.map(Some)
+}
+
+#[derive(Default)]
+struct AdvertisementCache {
+    advertised: Option<bool>,
+    checked_at: Option<Instant>,
+}
+
+impl AdvertisementCache {
+    fn due(&self, now: Instant) -> bool {
+        self.checked_at
+            .is_none_or(|checked_at| now >= checked_at + ADVERTISEMENT_REFRESH_INTERVAL)
+    }
+
+    fn update(&mut self, advertised: bool, now: Instant) {
+        self.advertised = Some(advertised);
+        self.checked_at = Some(now);
+    }
+
+    fn next_check(&self) -> Option<Instant> {
+        self.checked_at
+            .map(|checked_at| checked_at + ADVERTISEMENT_REFRESH_INTERVAL)
+    }
+}
+
+async fn refresh_advertisement(
+    route: &mut Option<crate::quota_consumer::QuotaConsumer>,
+    cache: &mut AdvertisementCache,
+) -> Result<(), String> {
+    let result = match route.as_mut() {
+        Some(client) => client
+            .usage_observe_advertised_on_open_route()
+            .await
+            .map_err(|error| error.to_string()),
+        None => return Ok(()),
+    };
+    match result {
+        Ok(advertised) => {
+            cache.update(advertised, Instant::now());
+            Ok(())
+        }
+        Err(error) => {
+            *route = None;
+            *cache = AdvertisementCache::default();
+            Err(error)
+        }
+    }
+}
+
+pub(crate) async fn run(connection_file: PathBuf, buffer: SharedUsageObserve) {
+    let project_root =
+        prefrontal_core_store::scratch_root().join("prefrontal-routing-usage-observe");
+    let _ = std::fs::create_dir_all(&project_root);
+    let mut route = None::<crate::quota_consumer::QuotaConsumer>;
+    let mut advertisement = AdvertisementCache::default();
+    let mut retry_at = Instant::now();
+
+    loop {
+        let now = Instant::now();
+        let batch = buffer.take_due_at(now);
+        if !batch.is_empty() {
+            if route.is_none() && now >= retry_at {
+                match crate::quota_consumer::QuotaConsumer::connect(&connection_file, &project_root)
+                    .await
+                {
+                    Ok(connected) => {
+                        route = Some(connected);
+                        advertisement = AdvertisementCache::default();
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[prefrontal-routing] Insula usage observer connection failed: {error}"
+                        );
+                        retry_at = Instant::now() + RECONNECT_INTERVAL;
+                    }
+                }
+            }
+            if route.is_some() && advertisement.due(Instant::now()) {
+                if let Err(error) = refresh_advertisement(&mut route, &mut advertisement).await {
+                    eprintln!("[prefrontal-routing] Insula operation catalog failed: {error}");
+                    retry_at = Instant::now() + RECONNECT_INTERVAL;
+                }
+            }
+            if route.is_some() {
+                let result = send_if_advertised(
+                    route.as_mut().unwrap(),
+                    advertisement.advertised == Some(true),
+                    &batch,
+                )
+                .await;
+                match result {
+                    Ok(Some(reply)) => {
+                        let result = reply.get("result").unwrap_or(&reply);
+                        for (account, reason) in ignored_observations(result) {
+                            if buffer.log_ignored_once(&account, &reason, Instant::now()) {
+                                eprintln!(
+                                    "[prefrontal-routing] Insula ignored usage observation for account {account}: {reason}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "[prefrontal-routing] dropped Insula usage observation batch: {error}"
+                        );
+                        route = None;
+                        advertisement = AdvertisementCache::default();
+                        retry_at = Instant::now() + RECONNECT_INTERVAL;
+                    }
+                }
+            }
+        }
+
+        if route.is_some() && advertisement.due(Instant::now()) {
+            if let Err(error) = refresh_advertisement(&mut route, &mut advertisement).await {
+                eprintln!("[prefrontal-routing] Insula operation catalog failed: {error}");
+                retry_at = Instant::now() + RECONNECT_INTERVAL;
+            }
+        }
+
+        let now = Instant::now();
+        let mut wake_at = buffer
+            .next_due()
+            .unwrap_or(now + Duration::from_secs(24 * 60 * 60));
+        if route.is_some() {
+            if let Some(check) = advertisement.next_check() {
+                wake_at = wake_at.min(check);
+            }
+        }
+        tokio::select! {
+            _ = buffer.notified() => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct UnadvertisedRoute {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl UsageObserveRoute for UnadvertisedRoute {
+        async fn usage_observe(
+            &mut self,
+            _observations: &[UsageObservation],
+        ) -> Result<Value, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({ "result": { "accepted": 1, "ignored": [] } }))
+        }
+    }
 
     fn observation(account: &str, extra: &[(&str, &str)]) -> UsageObservation {
         let mut headers = BTreeMap::from([(
@@ -385,5 +570,63 @@ mod tests {
             observation.headers["anthropic-ratelimit-unified-overall-status"],
             "limited"
         );
+    }
+
+    #[tokio::test]
+    async fn absent_usage_observe_advertisement_makes_no_operation_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = UnadvertisedRoute {
+            calls: calls.clone(),
+        };
+        let batch = [observation("account-a", &[])];
+
+        assert!(send_if_advertised(&mut route, false, &batch)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn operation_advertisement_is_rechecked_after_ten_minutes() {
+        let start = Instant::now();
+        let mut cache = AdvertisementCache::default();
+        assert!(cache.due(start));
+        cache.update(false, start);
+        assert!(!cache.due(start + ADVERTISEMENT_REFRESH_INTERVAL - Duration::from_millis(1)));
+        assert!(cache.due(start + ADVERTISEMENT_REFRESH_INTERVAL));
+    }
+
+    #[tokio::test]
+    async fn notify_only_when_a_reading_becomes_pending_or_changes_status() {
+        let start = Instant::now();
+        let buffer = SharedUsageObserve::default();
+        buffer.record_at(observation("account-a", &[]), start);
+        tokio::time::timeout(Duration::from_millis(10), buffer.notified())
+            .await
+            .expect("first pending reading wakes the flush task");
+
+        let mut routine = observation("account-a", &[]);
+        routine.headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization".into(),
+            "0.5".into(),
+        );
+        buffer.record_at(routine, start + Duration::from_secs(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), buffer.notified())
+                .await
+                .is_err()
+        );
+
+        buffer.record_at(
+            observation(
+                "account-a",
+                &[("anthropic-ratelimit-unified-5h-status", "limited")],
+            ),
+            start + Duration::from_secs(2),
+        );
+        tokio::time::timeout(Duration::from_millis(10), buffer.notified())
+            .await
+            .expect("status change wakes the flush task");
     }
 }

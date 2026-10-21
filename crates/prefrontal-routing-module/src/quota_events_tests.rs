@@ -107,19 +107,6 @@ impl InsulaRoute for CountingRoute {
     async fn snapshot(&mut self) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError> {
         Ok(b"snapshot".to_vec())
     }
-
-    async fn advertises_usage_observe(
-        &mut self,
-    ) -> Result<bool, crate::quota_consumer::QuotaConsumerError> {
-        Ok(true)
-    }
-
-    async fn usage_observe(
-        &mut self,
-        observations: &[crate::usage_observe::UsageObservation],
-    ) -> Result<Value, crate::quota_consumer::QuotaConsumerError> {
-        Ok(json!({ "result": { "accepted": observations.len(), "ignored": [] } }))
-    }
 }
 
 #[tokio::test]
@@ -134,17 +121,6 @@ async fn quota_insula_reuses_one_connection_for_events_and_snapshot() {
         assert_eq!(source.fetch(key).await.unwrap(), key.as_bytes());
     }
     assert_eq!(source.snapshot().await.unwrap(), b"snapshot");
-    let observation = crate::usage_observe::UsageObservation {
-        provider: "claude",
-        account: "account-a".into(),
-        observed_at_ms: 1,
-        headers: Default::default(),
-    };
-    assert!(source
-        .usage_observe(&[observation])
-        .await
-        .unwrap()
-        .is_some());
 
     assert_eq!(connects.load(Ordering::SeqCst), 1);
 }
@@ -172,74 +148,6 @@ async fn quota_insula_reconnects_on_the_call_after_a_route_error() {
     assert_eq!(source.snapshot().await.unwrap(), b"snapshot");
 
     assert_eq!(connects.load(Ordering::SeqCst), 2);
-}
-
-struct NoObserveConnector {
-    calls: Arc<AtomicUsize>,
-}
-
-struct NoObserveRoute {
-    calls: Arc<AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl InsulaConnector for NoObserveConnector {
-    async fn connect(
-        &mut self,
-    ) -> Result<Box<dyn InsulaRoute>, crate::quota_consumer::QuotaConsumerError> {
-        Ok(Box::new(NoObserveRoute {
-            calls: self.calls.clone(),
-        }))
-    }
-}
-
-#[async_trait::async_trait]
-impl InsulaRoute for NoObserveRoute {
-    async fn fetch(
-        &mut self,
-        _key: &str,
-    ) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError> {
-        Ok(Vec::new())
-    }
-
-    async fn snapshot(&mut self) -> Result<Vec<u8>, crate::quota_consumer::QuotaConsumerError> {
-        Ok(Vec::new())
-    }
-
-    async fn advertises_usage_observe(
-        &mut self,
-    ) -> Result<bool, crate::quota_consumer::QuotaConsumerError> {
-        Ok(false)
-    }
-
-    async fn usage_observe(
-        &mut self,
-        _observations: &[crate::usage_observe::UsageObservation],
-    ) -> Result<Value, crate::quota_consumer::QuotaConsumerError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({ "result": { "accepted": 1, "ignored": [] } }))
-    }
-}
-
-#[tokio::test]
-async fn absent_usage_observe_advertisement_makes_no_operation_call() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut source = Insula::with_connector(Box::new(NoObserveConnector {
-        calls: calls.clone(),
-    }));
-    let observation = crate::usage_observe::UsageObservation {
-        provider: "claude",
-        account: "account-a".into(),
-        observed_at_ms: 1,
-        headers: Default::default(),
-    };
-
-    assert!(source
-        .usage_observe(&[observation])
-        .await
-        .unwrap()
-        .is_none());
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 struct Cursor {
