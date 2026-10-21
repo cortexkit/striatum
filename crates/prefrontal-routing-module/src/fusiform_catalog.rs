@@ -2701,11 +2701,7 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("test/unserved-override")));
-        let reported_before = health
-            .lock()
-            .unwrap()
-            .reported_unserved_routes
-            .len();
+        let reported_before = health.lock().unwrap().reported_unserved_routes.len();
         assert!(reported_before > 0);
         assert!(health
             .lock()
@@ -2729,18 +2725,11 @@ mod tests {
             .unwrap();
         assert_eq!(poll.get_calls, 1);
         assert_eq!(
-            health
-                .lock()
-                .unwrap()
-                .reported_unserved_routes
-                .len(),
+            health.lock().unwrap().reported_unserved_routes.len(),
             reported_before,
             "a continuing stale route is logged only once"
         );
-        assert!(health
-            .lock()
-            .unwrap()
-            .snapshot(now_ms())["unservedRoutes"]
+        assert!(health.lock().unwrap().snapshot(now_ms())["unservedRoutes"]
             .as_array()
             .unwrap()
             .contains(&json!("test/unserved-override")));

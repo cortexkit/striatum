@@ -4264,7 +4264,6 @@ fn migration_041_removes_fast_facts_and_route_state_without_touching_history() {
     assert_eq!(violations, 0);
 }
 
-
 #[test]
 fn migration_057_prunes_unserved_unpicked_facts_but_preserves_overrides_and_decisions() {
     use rusqlite::{params, Connection};
@@ -4335,7 +4334,9 @@ fn migration_057_prunes_unserved_unpicked_facts_but_preserves_overrides_and_deci
     );
 
     connection
-        .execute_batch(include_str!("../../migrations/057_prune_absent_fusiform_facts.sql"))
+        .execute_batch(include_str!(
+            "../../migrations/057_prune_absent_fusiform_facts.sql"
+        ))
         .unwrap();
 
     let row_count = |route_key: &str| {
@@ -4360,7 +4361,10 @@ fn migration_057_prunes_unserved_unpicked_facts_but_preserves_overrides_and_deci
             row.get(0)
         })
         .unwrap();
-    assert_eq!(decisions, 4, "cleanup must not erase score or decision history");
+    assert_eq!(
+        decisions, 4,
+        "cleanup must not erase score or decision history"
+    );
     let unserved_overrides: Vec<String> = connection
         .prepare(
             "SELECT route_key FROM model_facts
@@ -4398,7 +4402,9 @@ fn absent_fusiform_facts_are_filtered_unless_the_operator_overrode_the_score() {
 
     let routable = store.get_facts().unwrap();
     assert!(routable.iter().all(|fact| fact.model_id != "retired-seed"));
-    assert!(routable.iter().any(|fact| fact.model_id == "retired-override"));
+    assert!(routable
+        .iter()
+        .any(|fact| fact.model_id == "retired-override"));
     assert_eq!(
         store.unserved_override_route_keys().unwrap(),
         ["test/retired-override"]
@@ -4487,9 +4493,15 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
         .unwrap()
         .is_some());
     let routable = store.get_facts().unwrap();
-    assert!(routable.iter().any(|fact| fact.model_id == "catalog-served"));
-    assert!(routable.iter().any(|fact| fact.model_id == "operator-retired"));
-    assert!(routable.iter().all(|fact| fact.model_id != "recently-retired"));
+    assert!(routable
+        .iter()
+        .any(|fact| fact.model_id == "catalog-served"));
+    assert!(routable
+        .iter()
+        .any(|fact| fact.model_id == "operator-retired"));
+    assert!(routable
+        .iter()
+        .all(|fact| fact.model_id != "recently-retired"));
     assert_eq!(
         store.unserved_override_route_keys().unwrap(),
         ["test/operator-retired"]
@@ -4503,5 +4515,8 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(history_count, 1, "score history remains in the decision log");
+    assert_eq!(
+        history_count, 1,
+        "score history remains in the decision log"
+    );
 }

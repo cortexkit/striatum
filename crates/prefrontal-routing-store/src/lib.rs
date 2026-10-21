@@ -5607,7 +5607,10 @@ mod tests {
             .store
             .with_conn(|c| {
                 assert_eq!(route_state_version(c)?, 58);
-                assert_eq!(history_foreign_keys(c), ["account_admission -> account_pin"]);
+                assert_eq!(
+                    history_foreign_keys(c),
+                    ["account_admission -> account_pin"]
+                );
                 assert_eq!(rebuilt_table_shape(c), legacy_shape);
                 let integrity: String =
                     c.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
@@ -5627,11 +5630,10 @@ mod tests {
                     ("account_fence", 1),
                     ("account_principal_exclusion", 1),
                 ] {
-                    let count: i64 = c.query_row(
-                        &format!("SELECT COUNT(*) FROM {table}"),
-                        [],
-                        |row| row.get(0),
-                    )?;
+                    let count: i64 =
+                        c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })?;
                     assert_eq!(count, rows, "{table}");
                 }
                 let keys: String = c.query_row(
@@ -5697,7 +5699,9 @@ mod tests {
         assert_eq!(route_state_version(&connection).unwrap(), 57);
         assert_eq!(history_foreign_keys(&connection).len(), 6);
         let admissions: i64 = connection
-            .query_row("SELECT COUNT(*) FROM account_admission", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM account_admission", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(admissions, 2);
         drop(connection);
