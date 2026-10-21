@@ -8,6 +8,8 @@ use std::{
 
 use serde::Serialize;
 use serde_json::Value;
+use subc_client_rs::{CallOptions, ConsumerIdentity, ConsumerOptions, SubcConsumer};
+use subc_protocol::{BindIdentity, RouteTarget};
 use tokio::sync::Notify;
 
 pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
@@ -256,27 +258,102 @@ pub(crate) fn ignored_observations(reply: &Value) -> Vec<(String, String)> {
 
 #[async_trait::async_trait]
 trait UsageObserveRoute: Send {
-    async fn usage_observe(&mut self, observations: &[UsageObservation]) -> Result<Value, String>;
+    async fn usage_observe(
+        &mut self,
+        consumer_identity: &ConsumerIdentity,
+        observations: &[UsageObservation],
+    ) -> Result<Value, String>;
+}
+
+struct SubcUsageObserveRoute {
+    consumer: SubcConsumer,
+    bind_identity: BindIdentity,
+}
+
+impl SubcUsageObserveRoute {
+    async fn connect(connection_file: &PathBuf, project_root: &PathBuf) -> Result<Self, String> {
+        let consumer = SubcConsumer::connect(connection_file, ConsumerOptions::default())
+            .await
+            .map_err(|error| format!("Insula usage observer connection failed: {error}"))?;
+        Ok(Self {
+            consumer,
+            bind_identity: BindIdentity::new(project_root, "prefrontal-routing", "usage-observe"),
+        })
+    }
+
+    async fn usage_observe_advertised(&mut self) -> Result<bool, String> {
+        let catalog = self
+            .consumer
+            .catalog_list()
+            .await
+            .map_err(|error| format!("Insula operation catalog failed: {error}"))?;
+        let modules = serde_json::to_value(catalog.modules)
+            .map_err(|error| format!("encoding Insula operation catalog: {error}"))?;
+        Ok(crate::quota_consumer::catalog_has_operation(
+            modules.as_array().map_or(&[], Vec::as_slice),
+            "insula",
+            "usage.observe",
+        ))
+    }
+}
+
+fn usage_observe_call_options(consumer_identity: &ConsumerIdentity) -> CallOptions {
+    CallOptions {
+        timeout: Duration::from_secs(10),
+        consumer_identity: Some(consumer_identity.clone()),
+        ..Default::default()
+    }
 }
 
 #[async_trait::async_trait]
-impl UsageObserveRoute for crate::quota_consumer::QuotaConsumer {
-    async fn usage_observe(&mut self, observations: &[UsageObservation]) -> Result<Value, String> {
-        self.usage_observe_on_open_route(observations)
+impl UsageObserveRoute for SubcUsageObserveRoute {
+    async fn usage_observe(
+        &mut self,
+        consumer_identity: &ConsumerIdentity,
+        observations: &[UsageObservation],
+    ) -> Result<Value, String> {
+        let request = serde_json::to_vec(&crate::quota_consumer::usage_observe_body(observations))
+            .map_err(|error| format!("encoding Insula usage observation: {error}"))?;
+        let reply = self
+            .consumer
+            .call(
+                RouteTarget::ManagementSurface {
+                    module_id: "insula".into(),
+                },
+                self.bind_identity.clone(),
+                request,
+                usage_observe_call_options(consumer_identity),
+            )
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| format!("Insula usage observation call failed: {error}"))?;
+        serde_json::from_slice(&reply)
+            .map_err(|error| format!("decoding Insula usage observation reply: {error}"))
     }
+}
+
+fn routing_consumer_identity(launch_nonce: Option<String>) -> Option<ConsumerIdentity> {
+    launch_nonce.map(|launch_nonce| ConsumerIdentity {
+        module_id: crate::DEFAULT_MODULE_ID.to_owned(),
+        launch_nonce,
+    })
 }
 
 async fn send_if_advertised<R: UsageObserveRoute + ?Sized>(
     route: &mut R,
+    consumer_identity: Option<&ConsumerIdentity>,
     advertised: bool,
     observations: &[UsageObservation],
 ) -> Result<Option<Value>, String> {
+    let Some(consumer_identity) = consumer_identity else {
+        return Ok(None);
+    };
     if !advertised {
         return Ok(None);
     }
-    route.usage_observe(observations).await.map(Some)
+    route
+        .usage_observe(consumer_identity, observations)
+        .await
+        .map(Some)
 }
 
 #[derive(Default)]
@@ -303,14 +380,11 @@ impl AdvertisementCache {
 }
 
 async fn refresh_advertisement(
-    route: &mut Option<crate::quota_consumer::QuotaConsumer>,
+    route: &mut Option<SubcUsageObserveRoute>,
     cache: &mut AdvertisementCache,
 ) -> Result<(), String> {
     let result = match route.as_mut() {
-        Some(client) => client
-            .usage_observe_advertised_on_open_route()
-            .await
-            .map_err(|error| error.to_string()),
+        Some(client) => client.usage_observe_advertised().await,
         None => return Ok(()),
     };
     match result {
@@ -327,10 +401,28 @@ async fn refresh_advertisement(
 }
 
 pub(crate) async fn run(connection_file: PathBuf, buffer: SharedUsageObserve) {
+    let launch_nonce = match subc_client_rs::launch_nonce() {
+        Ok(Some(nonce)) => Some(nonce.value().to_owned()),
+        Ok(None) => {
+            eprintln!(
+                "[prefrontal-routing] Insula usage observer idle: routing launch nonce absent"
+            );
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "[prefrontal-routing] Insula usage observer idle: routing launch nonce unreadable"
+            );
+            return;
+        }
+    };
+    let Some(consumer_identity) = routing_consumer_identity(launch_nonce) else {
+        return;
+    };
     let project_root =
         prefrontal_core_store::scratch_root().join("prefrontal-routing-usage-observe");
     let _ = std::fs::create_dir_all(&project_root);
-    let mut route = None::<crate::quota_consumer::QuotaConsumer>;
+    let mut route = None::<SubcUsageObserveRoute>;
     let mut advertisement = AdvertisementCache::default();
     let mut retry_at = Instant::now();
 
@@ -339,9 +431,7 @@ pub(crate) async fn run(connection_file: PathBuf, buffer: SharedUsageObserve) {
         let batch = buffer.take_due_at(now);
         if !batch.is_empty() {
             if route.is_none() && now >= retry_at {
-                match crate::quota_consumer::QuotaConsumer::connect(&connection_file, &project_root)
-                    .await
-                {
+                match SubcUsageObserveRoute::connect(&connection_file, &project_root).await {
                     Ok(connected) => {
                         route = Some(connected);
                         advertisement = AdvertisementCache::default();
@@ -363,6 +453,7 @@ pub(crate) async fn run(connection_file: PathBuf, buffer: SharedUsageObserve) {
             if route.is_some() {
                 let result = send_if_advertised(
                     route.as_mut().unwrap(),
+                    Some(&consumer_identity),
                     advertisement.advertised == Some(true),
                     &batch,
                 )
@@ -419,16 +510,22 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct UnadvertisedRoute {
+    struct RecordingRoute {
         calls: Arc<AtomicUsize>,
+        consumer_identities: Arc<Mutex<Vec<ConsumerIdentity>>>,
     }
 
     #[async_trait::async_trait]
-    impl UsageObserveRoute for UnadvertisedRoute {
+    impl UsageObserveRoute for RecordingRoute {
         async fn usage_observe(
             &mut self,
+            consumer_identity: &ConsumerIdentity,
             _observations: &[UsageObservation],
         ) -> Result<Value, String> {
+            self.consumer_identities
+                .lock()
+                .unwrap()
+                .push(consumer_identity.clone());
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(serde_json::json!({ "result": { "accepted": 1, "ignored": [] } }))
         }
@@ -575,16 +672,67 @@ mod tests {
     #[tokio::test]
     async fn absent_usage_observe_advertisement_makes_no_operation_call() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut route = UnadvertisedRoute {
+        let mut route = RecordingRoute {
             calls: calls.clone(),
+            consumer_identities: Arc::new(Mutex::new(Vec::new())),
+        };
+        let batch = [observation("account-a", &[])];
+        let identity = routing_consumer_identity(Some("launch-nonce".into()));
+
+        assert!(
+            send_if_advertised(&mut route, identity.as_ref(), false, &batch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn usage_observe_without_launch_nonce_makes_no_operation_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = RecordingRoute {
+            calls: calls.clone(),
+            consumer_identities: Arc::new(Mutex::new(Vec::new())),
+        };
+        let batch = [observation("account-a", &[])];
+        let identity = routing_consumer_identity(None);
+
+        assert!(
+            send_if_advertised(&mut route, identity.as_ref(), true, &batch)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn usage_observe_request_carries_routing_consumer_identity() {
+        let identity = routing_consumer_identity(Some("launch-nonce".into())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let consumer_identities = Arc::new(Mutex::new(Vec::new()));
+        let mut route = RecordingRoute {
+            calls: calls.clone(),
+            consumer_identities: consumer_identities.clone(),
         };
         let batch = [observation("account-a", &[])];
 
-        assert!(send_if_advertised(&mut route, false, &batch)
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            send_if_advertised(&mut route, Some(&identity), true, &batch)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let presented_identity = consumer_identities.lock().unwrap()[0].clone();
+        assert_eq!(presented_identity.module_id, "prefrontal-routing");
+        assert_eq!(presented_identity.launch_nonce, "launch-nonce");
+
+        let options = usage_observe_call_options(&identity);
+        let presented_options_identity = options.consumer_identity.unwrap();
+        assert_eq!(presented_options_identity.module_id, "prefrontal-routing");
+        assert_eq!(presented_options_identity.launch_nonce, "launch-nonce");
     }
 
     #[test]

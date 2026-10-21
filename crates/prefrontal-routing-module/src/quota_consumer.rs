@@ -20,6 +20,7 @@ use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 const QUOTA_MODULE_ID: &str = "insula";
 const USAGE_GET_OP: &str = "usage.get";
+#[cfg(test)]
 const USAGE_OBSERVE_OP: &str = "usage.observe";
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,7 +58,11 @@ fn route_error(s: impl Into<String>) -> QuotaConsumerError {
     QuotaConsumerError::Route(s.into())
 }
 
-fn catalog_has_operation(modules: &[serde_json::Value], module: &str, operation: &str) -> bool {
+pub(crate) fn catalog_has_operation(
+    modules: &[serde_json::Value],
+    module: &str,
+    operation: &str,
+) -> bool {
     modules.iter().any(|entry| {
         entry.get("module_id").and_then(serde_json::Value::as_str) == Some(module)
             && entry
@@ -79,7 +84,7 @@ fn catalog_has_operation(modules: &[serde_json::Value], module: &str, operation:
     })
 }
 
-fn usage_observe_body(
+pub(crate) fn usage_observe_body(
     observations: &[crate::usage_observe::UsageObservation],
 ) -> serde_json::Value {
     serde_json::json!({
@@ -286,42 +291,6 @@ impl QuotaConsumer {
         &mut self,
     ) -> Result<Vec<u8>, QuotaConsumerError> {
         self.usage_get_body(serde_json::json!({})).await
-    }
-
-    pub(crate) async fn usage_observe_advertised_on_open_route(
-        &mut self,
-    ) -> Result<bool, QuotaConsumerError> {
-        let modules = self.catalog_modules().await?;
-        Ok(catalog_has_operation(
-            &modules,
-            QUOTA_MODULE_ID,
-            USAGE_OBSERVE_OP,
-        ))
-    }
-
-    /// Send one coalesced header batch on the already-open Insula route.
-    pub(crate) async fn usage_observe_on_open_route(
-        &mut self,
-        observations: &[crate::usage_observe::UsageObservation],
-    ) -> Result<serde_json::Value, QuotaConsumerError> {
-        let bytes = self
-            .operation_body(usage_observe_body(observations))
-            .await?;
-        let value = serde_json::from_slice(&bytes).map_err(QuotaConsumerError::Json)?;
-        Ok(value)
-    }
-
-    async fn catalog_modules(&mut self) -> Result<Vec<serde_json::Value>, QuotaConsumerError> {
-        let bytes = self
-            .operation_at(0, 0, serde_json::json!({ "op": "catalog.list" }))
-            .await?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(QuotaConsumerError::Json)?;
-        Ok(value
-            .get("modules")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default())
     }
 
     /// Preserve the raw body substring: the notice digest covers the producer's
