@@ -690,6 +690,60 @@ fn confirmed_long_and_scoped_exhaustion_migrate_in_reference_order() {
     assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
 }
 
+/// A general fence whose reset has passed stops excluding the account once a
+/// reading observed after that reset shows the window below 100%. A reading
+/// from before the reset, or a reset still ahead, keeps the fence. Without the
+/// lift, an account stayed excluded long after its window reset.
+#[test]
+fn post_reset_reading_lifts_a_passed_general_fence() {
+    let pool = |reset: ResetTime, observed_at_ms: i64| {
+        let mut fresh = reading(0.0, 0.0);
+        fresh.observed_at_ms = Some(observed_at_ms);
+        let mut st = state(vec![account("acct-a", Some(fresh))]);
+        st.affinity = None;
+        st.fences.push(fence(
+            "acct-a",
+            FenceScope::General(GeneralWindow::SevenDay),
+            reset,
+        ));
+        st
+    };
+    let fenced = |decision: &Decision| {
+        exclusions(decision, "acct-a")
+            .iter()
+            .any(|reason| matches!(reason, ExclusionReason::ConfirmedFence { .. }))
+    };
+
+    // Reset passed an hour ago and the reading came after it: the fence lifts.
+    let decision = decide(&request(), &pool(ResetTime::At(NOW - HOUR), NOW), NOW);
+    assert!(!fenced(&decision), "{decision:?}");
+    assert_eq!(admitted(&decision), "acct-a");
+
+    // The reading predates the reset: it cannot show the new window.
+    let decision = decide(
+        &request(),
+        &pool(ResetTime::At(NOW - HOUR), NOW - 2 * HOUR),
+        NOW,
+    );
+    assert!(fenced(&decision), "{decision:?}");
+
+    // The reset is still ahead: the confirmed exhaustion still governs.
+    let decision = decide(&request(), &pool(ResetTime::At(NOW + HOUR), NOW), NOW);
+    assert!(fenced(&decision), "{decision:?}");
+
+    // A fresh post-reset reading at 100% keeps the account fenced.
+    let mut full = pool(ResetTime::At(NOW - HOUR), NOW);
+    full.roster.as_mut().unwrap().accounts[0]
+        .quota
+        .as_mut()
+        .unwrap()
+        .seven_day
+        .as_mut()
+        .unwrap()
+        .used_percent = 100.0;
+    assert!(fenced(&decide(&request(), &full, NOW)));
+}
+
 #[test]
 fn unknown_scope_fence_moves_only_its_family() {
     let mut st = state(vec![account("acct-a", Some(reading(10.0, 10.0)))]);

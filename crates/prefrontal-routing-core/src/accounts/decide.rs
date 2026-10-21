@@ -21,6 +21,32 @@ use super::types::{
     OperatorOverride, QuotaReading, ResetTime,
 };
 
+/// Whether a fresh reading has superseded `fence`: its reset is a known time at
+/// or before `now`, the reading was observed after that reset, and the fenced
+/// general window reads below 100% used. Family and unknown-scope fences are
+/// kept: no reading is tied to their window here, so they stay until routing
+/// can lift them some other way (the design's single post-reset trial run, not
+/// built yet).
+fn cleared_by_post_reset_reading(
+    fence: &Fence,
+    reading: Option<&QuotaReading>,
+    now: EpochMs,
+) -> bool {
+    let (FenceScope::General(window), ResetTime::At(reset_at)) = (fence.scope, fence.reset) else {
+        return false;
+    };
+    let Some(reading) = reading else {
+        return false;
+    };
+    reset_at <= now
+        && reading
+            .observed_at_ms
+            .is_some_and(|observed| observed > reset_at)
+        && reading
+            .window(window)
+            .is_some_and(|w| w.used_percent.is_finite() && w.used_percent < 100.0)
+}
+
 fn previous_pin(affinity: &ConversationAffinity) -> PreviousPin {
     PreviousPin {
         pin_id: affinity.pin_id.clone(),
@@ -276,13 +302,24 @@ impl<'a> Allocator<'a> {
         })
     }
 
-    /// Fences on this account that restrict the requested family.
+    /// Fences on this account that restrict the requested family. A general
+    /// fence whose reset has passed stops restricting once a reading observed
+    /// after that reset shows the fenced window below 100% (design, "When the
+    /// reset time passes": a fresh post-reset reading clears the fence). Without
+    /// this, nothing ever lifted a fence and an account stayed excluded long
+    /// after its window reset.
     fn fences_for(&self, account_id: &str) -> Vec<&'a Fence> {
+        let reading = self
+            .views
+            .iter()
+            .find(|view| view.account_id == account_id)
+            .and_then(|view| view.quota.as_ref());
         let mut fences: Vec<&Fence> = self
             .state
             .fences
             .iter()
             .filter(|fence| fence.account_id == account_id && fence.scope.applies_to(self.family))
+            .filter(|fence| !cleared_by_post_reset_reading(fence, reading, self.now))
             .collect();
         fences.sort_by_key(|fence| std::cmp::Reverse(fence.observed_at_ms));
         fences
