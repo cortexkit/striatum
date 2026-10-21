@@ -450,6 +450,7 @@ fn decision_input(id: &str, parent: &str) -> DecisionInput {
 
 fn outcome(outcome: RouteOutcome, error: Option<&str>, at: i64) -> DecisionOutcomeUpdate {
     DecisionOutcomeUpdate {
+        provider_outcome: None,
         outcome,
         last_error: error.map(str::to_owned),
         observed_at_ms: at,

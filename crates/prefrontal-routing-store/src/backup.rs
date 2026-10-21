@@ -96,6 +96,10 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "unexpired provider walls new routes inherit",
     ),
     (
+        "provider_reset_fences",
+        "provider-confirmed resets scoped to request class and serving identity",
+    ),
+    (
         "account_selection_salt",
         "salt for conversation keys; a new salt changes every affinity",
     ),

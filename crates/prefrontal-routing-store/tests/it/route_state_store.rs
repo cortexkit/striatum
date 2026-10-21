@@ -555,6 +555,7 @@ fn record_decision_and_set_outcome() {
         .set_decision_outcome(
             &id,
             &DecisionOutcomeUpdate {
+                provider_outcome: None,
                 outcome: RouteOutcome::Completed,
                 last_error: None,
                 observed_at_ms: 1_000,
@@ -672,6 +673,7 @@ fn set_outcome(
         .set_decision_outcome(
             decision_id,
             &DecisionOutcomeUpdate {
+                provider_outcome: None,
                 outcome,
                 last_error: last_error.map(str::to_owned),
                 observed_at_ms,

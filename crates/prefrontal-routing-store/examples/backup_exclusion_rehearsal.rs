@@ -179,6 +179,7 @@ fn main() {
             .set_decision_outcome(
                 &id,
                 &DecisionOutcomeUpdate {
+                    provider_outcome: None,
                     outcome: RouteOutcome::Completed,
                     last_error: None,
                     observed_at_ms: 0,

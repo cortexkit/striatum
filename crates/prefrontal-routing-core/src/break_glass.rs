@@ -28,6 +28,7 @@ fn earliest_future_reset(state: &RouteRuntimeState, now: f64) -> Option<f64> {
         state.quota_exhausted_until,
         state.cooldown_until,
         state.failure_backoff_until,
+        state.provider_reset_until,
     ]
     .into_iter()
     .flatten()
@@ -155,6 +156,19 @@ pub fn relax_earliest_reset(
 
     for candidate in candidates {
         if under_live_backoff(snapshot, candidate) {
+            continue;
+        }
+        if [
+            snapshot.by_route.get(&candidate.route_key),
+            snapshot.by_capacity.get(&candidate.capacity_key),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|state| {
+            state
+                .provider_reset_until
+                .is_some_and(|at| at > snapshot.now)
+        }) {
             continue;
         }
         if under_live_billing_wall(snapshot, candidate) {
