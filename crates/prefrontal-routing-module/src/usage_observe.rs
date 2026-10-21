@@ -401,23 +401,26 @@ async fn refresh_advertisement(
 }
 
 pub(crate) async fn run(connection_file: PathBuf, buffer: SharedUsageObserve) {
+    // Routing runs this as a supervised background loop, and any loop that returns
+    // makes routing exit for a restart. Without a launch nonce the observer cannot
+    // present routing's identity, so it stays idle for the life of the process instead.
     let launch_nonce = match subc_client_rs::launch_nonce() {
         Ok(Some(nonce)) => Some(nonce.value().to_owned()),
         Ok(None) => {
             eprintln!(
                 "[prefrontal-routing] Insula usage observer idle: routing launch nonce absent"
             );
-            return;
+            None
         }
         Err(_) => {
             eprintln!(
                 "[prefrontal-routing] Insula usage observer idle: routing launch nonce unreadable"
             );
-            return;
+            None
         }
     };
     let Some(consumer_identity) = routing_consumer_identity(launch_nonce) else {
-        return;
+        return std::future::pending().await;
     };
     let project_root =
         prefrontal_core_store::scratch_root().join("prefrontal-routing-usage-observe");
