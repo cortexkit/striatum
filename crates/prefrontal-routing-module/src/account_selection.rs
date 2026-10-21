@@ -1894,6 +1894,52 @@ fn observe(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         .unwrap_or_else(store_error)
 }
 
+/// Resolve response headers only through the admission that this route principal owns.
+pub(crate) fn usage_observation(
+    body: &[u8],
+    principal: &str,
+    ctx: &Ctx<'_>,
+) -> Option<crate::usage_observe::UsageObservation> {
+    if !ctx.flags.enabled {
+        return None;
+    }
+    let params = decode_params(body).ok()?;
+    let parsed: ObserveParams = serde_json::from_value(params).ok()?;
+    if !matches!(parsed.kind.as_str(), "attempt" | "run_finished")
+        || parsed.event_id.trim().is_empty()
+    {
+        return None;
+    }
+    let admission_id = parsed.admission_id.as_deref()?;
+    let admission = ctx
+        .store
+        .account_transaction(|tx| tx.admission(principal, admission_id))
+        .ok()??;
+    let is_anthropic_subscription = ctx.accounts.is_some_and(|accounts| {
+        accounts.lock().is_ok_and(|state| {
+            state.roster.as_ref().is_some_and(|roster| {
+                roster.identities.iter().any(|identity| {
+                    identity.account_id == admission.account_id
+                        && identity.refresh_adapter == "anthropic"
+                        && identity.credential_ids.contains(&admission.credential_id)
+                })
+            })
+        })
+    });
+    let headers = parsed
+        .headers
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("anthropic-ratelimit-unified-"))
+        .collect();
+    crate::usage_observe::observation_for_admission(
+        &admission.provider,
+        Some(&admission.account_id),
+        is_anthropic_subscription,
+        parsed.observed_at_ms.unwrap_or(ctx.now_ms),
+        headers,
+    )
+}
+
 fn record_observation(
     tx: &AccountTx<'_>,
     ctx: &Ctx<'_>,

@@ -34,6 +34,7 @@ mod select_policy;
 mod selection_harness;
 mod subscription_economics;
 mod substrate_policy;
+mod usage_observe;
 mod variant_policy;
 mod winner_ladder;
 mod work_model_pin;
@@ -245,6 +246,7 @@ fn quota_health(cache: &QuotaCache, now_ms: u64) -> (Option<String>, serde_json:
 /// `route.account_quota_status` operation reads it; `None` until boot restores it.
 static ACCOUNT_QUOTA: std::sync::OnceLock<account_quota::SharedAccountQuota> =
     std::sync::OnceLock::new();
+static USAGE_OBSERVE: OnceLock<usage_observe::SharedUsageObserve> = OnceLock::new();
 
 /// The route-state store, shared by the select handler (reader). Single-writer:
 /// this module holds the store's lease for its lifetime.
@@ -974,11 +976,18 @@ where
         "retention",
         retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
     );
-    // Restore per-account views before the shared quota delivery task starts.
-    // The roster has a separate refresh loop; readings share the event consumer.
+    // Restore per-account views before the quota consumers start. Header forwarding
+    // owns a separate Insula route so it never interrupts event-cursor delivery.
     let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
         account_quota::restore_account_state(store.as_ref()),
     ));
+    let usage_observe = USAGE_OBSERVE
+        .get_or_init(usage_observe::SharedUsageObserve::default)
+        .clone();
+    loops.spawn(
+        "Insula usage observer",
+        usage_observe::run(config.connection_file_path.clone(), usage_observe),
+    );
     loops.spawn(
         "quota events",
         quota_events::run(
@@ -3312,6 +3321,14 @@ async fn handle_select_request(
             now_ms: account_selection::now_ms(),
         };
         let reply = account_selection::handle(&envelope.method, &frame.body, &principal, &ctx);
+        if envelope.method == account_selection::ACCOUNT_OBSERVE_OP {
+            if let (Some(shared), Some(observation)) = (
+                USAGE_OBSERVE.get(),
+                account_selection::usage_observation(&frame.body, &principal, &ctx),
+            ) {
+                shared.record(observation);
+            }
+        }
         return send_account_reply(writer, ver, channel, epoch, corr, reply).await;
     }
 
