@@ -4523,3 +4523,167 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
         "score history remains in the decision log"
     );
 }
+
+/// Read a route-state row's stored provider, model and variant.
+fn stored_route_identity(rig: &Rig, route_key: &str) -> (String, String, Option<String>) {
+    rusqlite::Connection::open(rig.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT provider_id, model_id, variant FROM model_route_state WHERE route_key = ?1",
+            [route_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_route_state_write_keeps_the_catalog_identity_of_a_slash_bearing_model() {
+    // Aggregator providers serve model ids that contain "/". The route key
+    // `openrouter/anthropic/claude-x` is that model with no variant, which only
+    // the stored fact can say; splitting the key reads it as model `anthropic`
+    // with variant `claude-x`.
+    const ROUTE: &str = "openrouter/anthropic/claude-x";
+    let rig = Rig::new("slash-model-route-state");
+    let store = rig.open();
+    store
+        .upsert_fact(
+            &fact("openrouter", "anthropic/claude-x"),
+            FactSource::Override,
+        )
+        .unwrap();
+    store
+        .update_route_state(
+            ROUTE,
+            "openrouter/anthropic/claude-x",
+            &RouteStateUpdate {
+                cooldown_until: Some(5_000.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        stored_route_identity(&rig, ROUTE),
+        ("openrouter".into(), "anthropic/claude-x".into(), None)
+    );
+}
+
+#[test]
+fn a_decision_outcome_keeps_the_decision_identity_of_a_slash_bearing_model() {
+    // No catalog fact: the decision's recorded provider and model decide the
+    // identity, and the key adds no variant after them.
+    const ROUTE: &str = "openrouter/anthropic/claude-y";
+    let rig = Rig::new("slash-model-decision-outcome");
+    let store = rig.open();
+    let id = selected_decision(&store, "dec-slash-model", ROUTE);
+    set_outcome(
+        &store,
+        &id,
+        RouteOutcome::Error,
+        Some("HTTP 503 provider unavailable"),
+        1_000,
+    );
+    assert_eq!(
+        stored_route_identity(&rig, ROUTE),
+        ("openrouter".into(), "anthropic/claude-y".into(), None)
+    );
+}
+
+#[test]
+fn an_undecodable_score_row_reads_as_unscored_and_does_not_block_decisions() {
+    // Routing loads a `scores_json` that does not decode as zero scores. The
+    // catalog fingerprint stamped on every decision, and the operator listings,
+    // must read the same row the same way instead of failing on it.
+    const ROUTE: &str = "p/corrupt-scores";
+    let rig = Rig::new("corrupt-score-row");
+    let store = rig.open();
+    store
+        .upsert_fact(&fact("p", "corrupt-scores"), FactSource::Override)
+        .unwrap();
+    let conn = rusqlite::Connection::open(rig.db_path()).unwrap();
+    let set_scores = |scores_json: &str| {
+        conn.execute(
+            "UPDATE model_facts SET scores_json = ?1 WHERE route_key = ?2",
+            [scores_json, ROUTE],
+        )
+        .unwrap();
+    };
+
+    set_scores(r#"{"elo":0,"eq":0,"speed":0}"#);
+    let zero_scores_fingerprint = store.catalog_fingerprint().unwrap();
+
+    set_scores("{not json");
+    let loaded = store.get_fact_by_route_key(ROUTE).unwrap().unwrap();
+    assert_eq!(loaded.scores, ModelScores::default());
+    assert_eq!(
+        store.catalog_fingerprint().unwrap(),
+        zero_scores_fingerprint,
+        "the fingerprint hashes the scores routing reads"
+    );
+    selected_decision(&store, "dec-after-corrupt-scores", "openai/gpt-5.5");
+    assert!(store
+        .list_canonical_gaps()
+        .unwrap()
+        .iter()
+        .all(|gap| gap.route_key != ROUTE));
+}
+
+#[test]
+fn new_routes_inherit_the_provider_wall_cause_through_the_insert_trigger() {
+    // The model_facts insert trigger is the one place a new route inherits a
+    // live provider wall. Both fact writers rely on it, cause included.
+    let rig = Rig::new("provider-wall-cause-inheritance");
+    let store = rig.open();
+    store
+        .upsert_fact(&fact("p", "base"), FactSource::Override)
+        .unwrap();
+    store
+        .record_provider_cooldown(
+            "p",
+            "p/base",
+            "p/base",
+            &RouteStateUpdate {
+                quota_exhausted_until: Some(50_000.0),
+                wall_class: Some(RouteWallClass::Billing),
+                last_error: Some("out of credits".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .upsert_fact(&fact("p", "upserted"), FactSource::Override)
+        .unwrap();
+    store
+        .apply_fusiform_catalog(
+            &[FusiformFactUpdate {
+                auth_methods: None,
+                provider_id: "p".into(),
+                model_id: "discovered".into(),
+                present: true,
+                context_window: Some(64_000.0),
+                max_output_tokens: Some(4_096),
+                cost_tier: Some(1.0),
+                cost_per_mtok_out: Some(1.0),
+                input_rate: None,
+                cache_read_rate: None,
+                cache_write_rate: None,
+                reasoning_rate: None,
+                supports_vision: Some(false),
+                supports_tool_use: Some(true),
+                reasoning_efforts: None,
+                canonical_id: None,
+                upstream_status: None,
+            }],
+            FusiformCatalogCursor {
+                catalog_version: 1,
+                resolved_at_ms: 100,
+            },
+        )
+        .unwrap();
+
+    let snapshot = store.build_snapshot(1_000.0).unwrap();
+    for route in ["p/upserted", "p/discovered"] {
+        let state = &snapshot.by_route[route];
+        assert_eq!(state.quota_exhausted_until, Some(50_000.0), "{route}");
+        assert_eq!(state.wall_class, Some(RouteWallClass::Billing), "{route}");
+    }
+}

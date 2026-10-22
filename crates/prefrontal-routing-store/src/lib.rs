@@ -205,11 +205,13 @@ const MAX_OMITTED_NOT_AVAILABLE_KEYS: usize = 200;
 
 /// Fetch one route's bounded observed-speed sample set through the route/time index.
 /// The batched lookup prepares this statement once and reuses it for every
-/// effective catalog key.
+/// effective catalog key. The window is `(now - 7d, now]`, the same bounds as the
+/// workload-class samples below, so a row exactly seven days old counts in
+/// neither.
 pub const OBSERVED_SPEED_SAMPLES_SQL: &str = "SELECT output_tokens, duration_ms
      FROM model_route_usage INDEXED BY model_route_usage_route_observed_idx
      WHERE route_key = ?1
-       AND observed_at >= ?2
+       AND observed_at > ?2
        AND observed_at <= ?3
        AND output_tokens >= ?4
        AND duration_ms >= ?5
@@ -646,13 +648,14 @@ struct CatalogFingerprintRow {
 /// Widening this row is intentionally migration-free even though it changes every
 /// fingerprint: comparisons only have meaning within a catalog generation, and a
 /// historical NULL fingerprint was never comparable to a live catalog value.
+///
+/// Scores are hashed as `stored_scores` decodes them, the same values routing
+/// reads, so a row whose `scores_json` does not decode hashes as zero scores
+/// instead of failing the fingerprint and with it every decision write.
 fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<String> {
     let mut statement = connection.prepare(
         "SELECT route_key, capacity_key, provider_id, model_id, variant, family,
-                json_extract(scores_json, '$.elo') AS elo,
-                json_extract(scores_json, '$.eq') AS eq,
-                json_extract(scores_json, '$.speed') AS speed,
-                context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
+                scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                 input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
                 speed_multiplier, excluded, fusiform_present, auth_methods_json,
@@ -661,6 +664,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
          ORDER BY route_key",
     )?;
     let rows = statement.query_map([], |row| {
+        let scores = stored_scores(&row.get::<_, String>(6)?);
         Ok(CatalogFingerprintRow {
             route_key: row.get(0)?,
             capacity_key: row.get(1)?,
@@ -668,28 +672,28 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             model_id: row.get(3)?,
             variant: row.get(4)?,
             family: row.get(5)?,
-            elo: row.get(6)?,
-            eq: row.get(7)?,
-            speed: row.get(8)?,
-            context_window: row.get(9)?,
-            max_output_tokens: row.get(10)?,
-            cost_tier: row.get(11)?,
-            cost_per_mtok_out: row.get(12)?,
-            input_rate: row.get(13)?,
-            cache_read_rate: row.get(14)?,
-            cache_write_rate: row.get(15)?,
-            reasoning_rate: row.get(16)?,
-            supports_vision: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
-            supports_tool_use: row.get::<_, Option<i64>>(18)?.map(|value| value != 0),
-            prompt_defaults_json: row.get(19)?,
-            confidence: row.get(20)?,
-            speed_multiplier: row.get(21)?,
-            excluded: row.get::<_, i64>(22)? != 0,
-            fusiform_present: row.get::<_, Option<i64>>(23)?.map(|value| value != 0),
-            auth_methods_json: row.get(24)?,
-            reasoning_efforts_json: row.get(25)?,
-            canonical_id: row.get(26)?,
-            upstream_status: row.get(27)?,
+            elo: scores.elo,
+            eq: scores.eq,
+            speed: scores.speed,
+            context_window: row.get(7)?,
+            max_output_tokens: row.get(8)?,
+            cost_tier: row.get(9)?,
+            cost_per_mtok_out: row.get(10)?,
+            input_rate: row.get(11)?,
+            cache_read_rate: row.get(12)?,
+            cache_write_rate: row.get(13)?,
+            reasoning_rate: row.get(14)?,
+            supports_vision: row.get::<_, Option<i64>>(15)?.map(|value| value != 0),
+            supports_tool_use: row.get::<_, Option<i64>>(16)?.map(|value| value != 0),
+            prompt_defaults_json: row.get(17)?,
+            confidence: row.get(18)?,
+            speed_multiplier: row.get(19)?,
+            excluded: row.get::<_, i64>(20)? != 0,
+            fusiform_present: row.get::<_, Option<i64>>(21)?.map(|value| value != 0),
+            auth_methods_json: row.get(22)?,
+            reasoning_efforts_json: row.get(23)?,
+            canonical_id: row.get(24)?,
+            upstream_status: row.get(25)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -697,6 +701,14 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let hex = blake3::hash(&bytes).to_hex().to_string();
     Ok(hex[..16].to_string())
+}
+
+/// Decode a stored `model_facts.scores_json`. Every reader of stored scores goes
+/// through this one decoder so they all see the same values: a row that is not
+/// a complete `{elo, eq, speed}` object reads as zero scores (unscored) rather
+/// than failing the read, wherever it is read.
+fn stored_scores(scores_json: &str) -> ModelScores {
+    serde_json::from_str(scores_json).unwrap_or_default()
 }
 
 /// Retain actionable rejection detail within the ledger's fixed-size bound,
@@ -1220,8 +1232,7 @@ impl SqliteRouteStateStore {
             .store
             .with_conn(|c: &Connection| {
                 let mut stmt = c.prepare(
-                    "SELECT route_key, source, json_extract(scores_json, '$.elo'),
-                            json_extract(scores_json, '$.eq'), facts_source
+                    "SELECT route_key, source, scores_json, facts_source
                      FROM model_facts
                      WHERE (canonical_id IS NULL OR trim(canonical_id) = '')
                        AND source IN ('seed', 'override')
@@ -1230,15 +1241,16 @@ impl SqliteRouteStateStore {
                      ORDER BY route_key",
                 )?;
                 let rows = stmt.query_map([], |row| {
+                    let scores = stored_scores(&row.get::<_, String>(2)?);
                     Ok(CanonicalGapRow {
                         route_key: row.get(0)?,
                         source: FactSource::parse(&row.get::<_, String>(1)?)
                             .provenance()
                             .as_str()
                             .to_string(),
-                        elo: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-                        eq: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                        fusiform_served: row.get::<_, Option<String>>(4)?.as_deref()
+                        elo: scores.elo,
+                        eq: scores.eq,
+                        fusiform_served: row.get::<_, Option<String>>(3)?.as_deref()
                             == Some("fusiform"),
                     })
                 })?;
@@ -1476,34 +1488,14 @@ impl SqliteRouteStateStore {
                                 fact.upstream_status,
                             ],
                         )?;
-                        let provider_key = derive_provider_key(&fact.provider_id).ok_or_else(|| {
+                        // The model_facts insert trigger has already created this route's
+                        // state row, inheriting any live provider wall and its cause.
+                        derive_provider_key(&fact.provider_id).ok_or_else(|| {
                             rusqlite::Error::InvalidParameterName(format!(
                                 "provider {} has no canonical key",
                                 fact.provider_id
                             ))
                         })?;
-                        tx.execute(
-                            "INSERT OR IGNORE INTO model_route_state (
-                               route_key, capacity_key, provider_id, model_id, variant,
-                               cooldown_until, quota_exhausted_until, quota_pressure,
-                               latency_ema_ms, success_ema, failure_count, quota_error_count,
-                               last_error, last_error_at, updated_at
-                             )
-                             SELECT ?1, ?1, ?2, ?3, NULL,
-                                    provider.cooldown_until, provider.quota_exhausted_until,
-                                    provider.quota_pressure, NULL, NULL, 0, 0,
-                                    provider.last_error, provider.last_error_at, ?5
-                             FROM (SELECT ?4 AS provider_key) AS route
-                             LEFT JOIN provider_cooldown_state AS provider
-                               ON provider.provider_key = route.provider_key",
-                            params![
-                                route_key,
-                                fact.provider_id,
-                                fact.model_id,
-                                provider_key,
-                                now_ms(),
-                            ],
-                        )?;
                     } else {
                         tx.execute(
                             "UPDATE model_facts SET
@@ -1798,9 +1790,7 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let mut stmt = c.prepare(
-                    "SELECT route_key, aa_index,
-                            json_extract(scores_json, '$.elo') AS elo,
-                            review_by_ms
+                    "SELECT route_key, aa_index, scores_json, review_by_ms
                      FROM model_facts
                      WHERE source = 'aa_inferred'
                      ORDER BY route_key",
@@ -1810,7 +1800,7 @@ impl SqliteRouteStateStore {
                     Ok(InferredScoreRow {
                         route_key: row.get(0)?,
                         aa_index: row.get(1)?,
-                        elo: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                        elo: stored_scores(&row.get::<_, String>(2)?).elo,
                         review_by_ms,
                         review_by_passed: review_by_ms.is_some_and(|deadline| deadline <= now_ms),
                     })
@@ -2286,11 +2276,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         })
         .transpose()?;
     let scores_json: String = row.get("scores_json")?;
-    let scores: ModelScores = serde_json::from_str(&scores_json).unwrap_or(ModelScores {
-        elo: 0.0,
-        eq: 0.0,
-        speed: 0.0,
-    });
+    let scores = stored_scores(&scores_json);
     let prompt_defaults_json: Option<String> = row.get("prompt_defaults_json")?;
     let prompt_defaults: Option<ModelPromptDefaults> =
         prompt_defaults_json.and_then(|s| serde_json::from_str(&s).ok());
@@ -2459,7 +2445,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         }
         let fact = &fact;
         let route = fact_to_route(fact);
-        let provider_key = derive_provider_key(&fact.provider_id)
+        derive_provider_key(&fact.provider_id)
             .ok_or_else(|| err("model fact has no canonical provider key"))?;
         let scores_json = serde_json::to_string(&fact.scores).map_err(err)?;
         let prompt_defaults_json = fact
@@ -2569,33 +2555,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                         eq_source,
                     ],
                 )?;
-                // The migration trigger covers fresh INSERTs. This idempotent
-                // backstop also repairs databases where an older route fact was
-                // updated or where a route-state row was absent before migration 15.
-                tx.execute(
-                    "INSERT OR IGNORE INTO model_route_state (
-                       route_key, capacity_key, provider_id, model_id, variant,
-                       cooldown_until, quota_exhausted_until, quota_pressure,
-                       latency_ema_ms, success_ema, failure_count, quota_error_count,
-                       last_error, last_error_at, updated_at
-                     )
-                     SELECT ?1, ?2, ?3, ?4, ?5,
-                            provider.cooldown_until, provider.quota_exhausted_until,
-                            provider.quota_pressure, NULL, NULL, 0, 0,
-                            provider.last_error, provider.last_error_at, ?7
-                     FROM (SELECT ?6 AS provider_key) AS route
-                     LEFT JOIN provider_cooldown_state AS provider
-                       ON provider.provider_key = route.provider_key",
-                    params![
-                        route.route_key,
-                        route.capacity_key,
-                        fact.provider_id,
-                        fact.model_id,
-                        fact.variant,
-                        provider_key,
-                        now_ms(),
-                    ],
-                )?;
+                // A fresh INSERT fires the model_facts insert trigger, which creates
+                // the route's state row with any live provider wall and its cause.
+                // An update leaves the existing state row alone.
                 tx.commit()
             })
             .map_err(err)
@@ -2896,8 +2858,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         let provider_key = derive_provider_key(provider_key)
             .ok_or_else(|| err("provider cooldown write has no canonical provider key"))?
             .to_owned();
-        let (route_provider, model_id, variant) = split_route_key(route_key);
-        let route_provider = derive_provider_key(&route_provider)
+        let route_provider = derive_provider_key(route_key)
             .ok_or_else(|| err("provider cooldown route has no canonical provider key"))?
             .to_owned();
         if route_provider != provider_key
@@ -2979,6 +2940,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // A direct cooldown signal can name a route that is not in the
                 // catalog yet. Materialize it from the just-merged provider row
                 // before the fanout, so it cannot miss this write.
+                let (_, model_id, variant) = route_identity(&tx, route_key, None)?;
                 tx.execute(
                     "INSERT OR IGNORE INTO model_route_state (
                        route_key, capacity_key, provider_id, model_id, variant,
@@ -3052,8 +3014,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         ) {
             return Ok(());
         }
-        let (provider_id, model_id, variant) = split_route_key(route_key);
-        let provider_key = derive_provider_key(&provider_id)
+        let provider_key = derive_provider_key(route_key)
             .ok_or_else(|| err("route state update has no canonical provider key"))?
             .to_owned();
         self.store
@@ -3061,6 +3022,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // Read-modify-write under one transaction so counter increments,
                 // provider inheritance, and field merges see one consistent row.
                 let tx = c.unchecked_transaction()?;
+                let (provider_id, model_id, variant) = route_identity(&tx, route_key, None)?;
                 let existing = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
@@ -3277,9 +3239,11 @@ impl RouteStateStore for SqliteRouteStateStore {
                     tx.commit()?;
                     return Ok(());
                 };
-                let (parsed_provider_id, parsed_model_id, variant) = split_route_key(&route_key);
-                let provider_id = selected_provider_id.unwrap_or(parsed_provider_id);
-                let model_id = selected_model_id.unwrap_or(parsed_model_id);
+                let (provider_id, model_id, variant) = route_identity(
+                    &tx,
+                    &route_key,
+                    selected_provider_id.as_deref().zip(selected_model_id.as_deref()),
+                )?;
                 let capacity_key = format!("{provider_id}/{model_id}");
                 if let Some(retry_after_secs) = update.outcome.retry_after_secs() {
                     let quota_exhausted_until = update
@@ -4014,7 +3978,10 @@ fn max_defined(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     }
 }
 
-/// Split `provider/model[/variant]` into its parts (mirrors the TS `splitRouteKey`).
+/// Split `provider/model[/variant]` into its parts. A key with three or more
+/// segments is ambiguous: `p/a/b` is model `a/b` with no variant or model `a`
+/// with variant `b`. This reads it as the latter, so it is only the fallback
+/// for a route the catalog does not hold; see `route_identity`.
 fn split_route_key(route_key: &str) -> (String, String, Option<String>) {
     let parts: Vec<&str> = route_key.split('/').collect();
     if parts.len() >= 3 {
@@ -4030,6 +3997,46 @@ fn split_route_key(route_key: &str) -> (String, String, Option<String>) {
             None,
         )
     }
+}
+
+/// The provider, model and variant behind `route_key`. A catalog route's stored
+/// fact is authoritative, since its model id may itself contain `/`. Without a
+/// fact, a caller that knows the provider and model (a decision records both)
+/// passes them as `known_model`, and the variant is whatever the key adds after
+/// them. With no catalog fact, and no `known_model` that the key starts with,
+/// the key falls back to `split_route_key`.
+fn route_identity(
+    connection: &Connection,
+    route_key: &str,
+    known_model: Option<(&str, &str)>,
+) -> rusqlite::Result<(String, String, Option<String>)> {
+    if let Some(identity) = connection
+        .query_row(
+            "SELECT provider_id, model_id, variant FROM model_facts WHERE route_key = ?1",
+            [route_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+    {
+        return Ok(identity);
+    }
+    if let Some((provider_id, model_id)) = known_model {
+        let capacity_key = prefrontal_routing_core::make_capacity_key(provider_id, model_id);
+        if route_key == capacity_key {
+            return Ok((provider_id.to_owned(), model_id.to_owned(), None));
+        }
+        if let Some(variant) = route_key
+            .strip_prefix(capacity_key.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            return Ok((
+                provider_id.to_owned(),
+                model_id.to_owned(),
+                Some(variant.to_owned()),
+            ));
+        }
+    }
+    Ok(split_route_key(route_key))
 }
 
 /// A short unique-ish id (12 hex chars), process-monotonic + time-seeded. Avoids a
@@ -4746,7 +4753,7 @@ mod tests {
                 PARTITION BY route_key ORDER BY observed_at DESC
               ) AS sample_rank
        FROM model_route_usage
-       WHERE observed_at >= ?1
+       WHERE observed_at > ?1
          AND observed_at <= ?2
          AND output_tokens >= ?3
          AND duration_ms >= ?4
@@ -5197,6 +5204,46 @@ mod tests {
         assert!(trusted.contains_key("test/exactly-limit"));
         assert!(!trusted.contains_key("test/insufficient"));
         assert!(!trusted.contains_key("test/zero-eligible"));
+
+        drop(store);
+        remove_observed_speed_test_store(&path);
+    }
+
+    #[test]
+    fn observed_speed_and_class_vectors_share_the_trailing_window_bounds() {
+        // Both read `(now - 7d, now]` from the same usage table: a row exactly
+        // seven days old is in neither population. The class-vector side of the
+        // bound is pinned by the integration test
+        // `complete_ephemeral_row_trailing_window_boundary_pinned_to_now_argument`.
+        let (path, store) = observed_speed_test_store("window-bounds");
+        let now = OBSERVED_SPEED_WINDOW_MS + 10_000.0;
+        let window_start = (now - OBSERVED_SPEED_WINDOW_MS) as i64;
+        assert_eq!(OBSERVED_SPEED_WINDOW_MS, CLASS_VECTOR_TRAILING_WINDOW_MS);
+        insert_usage_row(
+            &store,
+            "at-start",
+            "test/bounds",
+            2_000,
+            1_000,
+            window_start,
+        );
+        insert_usage_row(
+            &store,
+            "after-start",
+            "test/bounds",
+            2_000,
+            1_000,
+            window_start + 1,
+        );
+
+        let aggregates = store
+            .get_observed_speed_aggregates(&BTreeSet::from(["test/bounds".to_string()]), now)
+            .unwrap();
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(
+            aggregates[0].sample_count, 1,
+            "the row exactly seven days old is outside the speed window"
+        );
 
         drop(store);
         remove_observed_speed_test_store(&path);
