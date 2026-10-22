@@ -220,7 +220,19 @@ struct CredentialMetadata;
 impl ModuleHandler for CredentialMetadata {
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(request["method"], "credential.list_scoped");
+        // Insula, which the both-modules rig also runs, calls Claustrum's
+        // auth.watch_scoped. This stand-in models only the listing routing reads and
+        // refuses every other operation, so Insula sees an unavailable credential
+        // service instead of a panicked handler that never answers.
+        if request["method"] != "credential.list_scoped" {
+            return HandlerOutcome::Error {
+                code: "unknown_method".into(),
+                message: format!(
+                    "the stand-in Claustrum does not serve {}",
+                    request["method"]
+                ),
+            };
+        }
         assert_eq!(request["params"], serde_json::json!({}));
         let credentials: Vec<_> = FIXTURE_PROVIDERS
             .iter()
