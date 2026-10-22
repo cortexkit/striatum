@@ -194,9 +194,7 @@ fn fusiform_fixture_serves_pinned_first_page_and_terminal_continuation() {
         )["code"],
         "no_coverage"
     );
-    let prices = FusiformCatalog::reply(
-        &serde_json::json!({"name":"plan.prices","arguments":{}}),
-    );
+    let prices = FusiformCatalog::reply(&serde_json::json!({"name":"plan.prices","arguments":{}}));
     assert!(prices["result"]["prices"]
         .as_array()
         .is_some_and(|rows| !rows.is_empty()));
