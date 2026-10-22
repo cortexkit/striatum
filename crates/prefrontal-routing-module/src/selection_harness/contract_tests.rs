@@ -75,8 +75,8 @@ impl HarnessRig {
         let mut credentials =
             BrocaCredentials::api_test_credentials(&self.store.get_facts().unwrap());
         credentials.apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
-                credentials: vec![prefrontal_ckcred_client::ListedCredential {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                credentials: vec![cortexkit_claustrum_client::ListedCredential {
                     id: "apikey:anthropic:fixture".into(),
                     credential_type: "apikey".into(),
                     categories: vec!["llm-provider".into()],

@@ -2352,7 +2352,7 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::account_quota::{apply_provider_reply, apply_roster_listing};
-    use prefrontal_ckcred_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
+    use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
     use prefrontal_routing_store::dev_descriptor;
     use std::sync::{Arc, Mutex};
 

@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
+use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
 use prefrontal_routing_core::{make_route_key, ModelFact};
 use subc_protocol::session::{HealthReport, HealthStatus};
 
@@ -488,9 +488,9 @@ impl BrocaCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prefrontal_ckcred_client::{
-        CkcredCredentialResolver, CredentialGetTarget, CredentialResolver, CredentialResolverError,
-        CredentialResolverFuture, ListedCredential,
+    use cortexkit_claustrum_client::{
+        ClaustrumCredentialResolver, CredentialGetTarget, CredentialResolver,
+        CredentialResolverError, CredentialResolverFuture, ListedCredential,
     };
     use serde_json::{json, Value};
 
@@ -565,7 +565,7 @@ mod tests {
     }
 
     async fn decode(reply: Value) -> ScopedCredentialListing {
-        CkcredCredentialResolver::with_target(Arc::new(FixtureTarget(reply)), 0)
+        ClaustrumCredentialResolver::with_target(Arc::new(FixtureTarget(reply)), 0)
             .list_scoped()
             .await
             .expect("fixture decodes through the live client")

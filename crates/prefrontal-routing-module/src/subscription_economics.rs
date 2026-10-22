@@ -300,7 +300,7 @@ pub(crate) async fn refresh(
     connection: &Path,
     project: &Path,
     state: &SharedAccountQuota,
-    listing: Option<&prefrontal_ckcred_client::ScopedCredentialListing>,
+    listing: Option<&cortexkit_claustrum_client::ScopedCredentialListing>,
 ) {
     let now = crate::now_ms() as i64;
     let from = now - 24 * 3_600_000;
@@ -337,7 +337,7 @@ pub(crate) async fn refresh(
 }
 
 fn unpriced_tiers(
-    listing: &prefrontal_ckcred_client::ScopedCredentialListing,
+    listing: &cortexkit_claustrum_client::ScopedCredentialListing,
     prices: &Value,
     now: i64,
 ) -> BTreeSet<String> {
@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn unpriced_tier_health_is_deduplicated_and_names_unknown_and_refused_rows() {
-        use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
+        use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let unknown = ListedCredential {
             provider_ids: vec!["anthropic".into()],
             plan_tier: Some("pro_5x".into()),

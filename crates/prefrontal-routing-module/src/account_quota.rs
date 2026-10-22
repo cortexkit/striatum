@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use prefrontal_ckcred_client::{
+use cortexkit_claustrum_client::{
     CredentialErrorClass, CredentialResolver, CredentialResolverError, ScopedCredentialListing,
 };
 use prefrontal_routing_core::quota::{RateWindow, StaleDisclosure, Usage, LAST_GOOD_MAX_AGE_MS};
@@ -1700,6 +1700,70 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn log_listing_decode_failures(listing: &ScopedCredentialListing, mut log: impl FnMut(&str)) {
+    if listing.undecodable_credentials.is_empty() && listing.undecodable_grants.is_empty() {
+        return;
+    }
+    // Malformed grant diagnostics identify tuple positions, not a credential.
+    // Name the listing's credential IDs as context without attributing a bad
+    // tuple to an unrelated credential or repeating the log for every consumer.
+    let ids: Vec<_> = listing
+        .credentials
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect();
+    log(&format!(
+        "credential.list_scoped credentials={ids:?} undecodable_credentials={} undecodable_grants={} credential_errors={:?} grant_errors={:?}",
+        listing.undecodable_credentials.len(), listing.undecodable_grants.len(),
+        listing.undecodable_credentials, listing.undecodable_grants,
+    ));
+}
+
+#[test]
+fn published_listing_keeps_credential_with_null_optional_metadata() {
+    let listing = cortexkit_claustrum_client::decode_list_scoped_reply(serde_json::json!({
+        "view": "null-metadata",
+        "credentials": [{
+            "id": "oauth:anthropic:lab", "categories": ["llm-provider"],
+            "type": "oauth", "serves": ["anthropic"], "state": "active",
+            "record_version": 1, "operations": ["get"], "plan_tier": null,
+            "account_id": null, "auth_method": null, "refresh_adapter": null,
+            "email": null, "org_name": null, "plan_tier_source": null
+        }]
+    }))
+    .unwrap();
+    assert!(listing.undecodable_credentials.is_empty());
+    assert_eq!(listing.credentials.len(), 1);
+    assert_eq!(listing.credentials[0].id, "oauth:anthropic:lab");
+    assert_eq!(listing.credentials[0].plan_tier, None);
+}
+
+#[test]
+fn malformed_grant_is_logged_once_with_listing_credentials_and_count() {
+    let listing = cortexkit_claustrum_client::decode_list_scoped_reply(serde_json::json!({
+        "view": "test-view",
+        "credentials": [{
+            "id": "oauth:anthropic:lab", "categories": ["llm-provider"],
+            "type": "oauth", "serves": ["anthropic"], "state": "active",
+            "record_version": 1, "operations": ["get"]
+        }],
+        "grant_tuples": [{"operation": "list"}]
+    }))
+    .unwrap();
+    assert_eq!(listing.credentials.len(), 1);
+    assert!(listing.grant_tuples.is_empty());
+    assert_eq!(listing.undecodable_grants.len(), 1);
+    let mut lines = Vec::new();
+    log_listing_decode_failures(&listing, |line| lines.push(line.to_owned()));
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("oauth:anthropic:lab"));
+    assert!(lines[0].contains("undecodable_grants=1"));
+    assert!(lines[0].contains("grant tuple 0"));
+    log_listing_decode_failures(&ScopedCredentialListing::default(), |_| {
+        panic!("healthy read logged")
+    });
+}
+
 /// Refresh the vault roster and serving-method joins independently of quota delivery.
 /// Quota samples and fallback snapshots are written by the quota event consumer.
 pub async fn account_quota_loop(
@@ -1715,6 +1779,9 @@ pub async fn account_quota_loop(
     let _ = std::fs::create_dir_all(&project_root);
     loop {
         let listing = resolver.list_scoped().await;
+        if let Ok(listing) = &listing {
+            log_listing_decode_failures(listing, |message| tracing::warn!("{message}"));
+        }
         let at_ms = now_ms();
         // Derive which catalog providers Broca has credentials for from each
         // credential's operator-set provider IDs, reusing this fetched listing.
@@ -1787,7 +1854,7 @@ pub fn status_json(state: &AccountQuotaState, now_ms: i64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prefrontal_ckcred_client::{ListedCredential, ListedGrant};
+    use cortexkit_claustrum_client::{ListedCredential, ListedGrant};
     use serde_json::json;
     use sha2::{Digest, Sha256};
 

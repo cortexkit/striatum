@@ -28,7 +28,7 @@ async fn selection_before_first_plane_load_waits_then_prices_muse_as_subscriptio
     store.upsert_fact(&fact, FactSource::Override).unwrap();
     let credentials = cold_credentials();
     credentials.lock().unwrap().apply_listing(
-        &prefrontal_ckcred_client::ScopedCredentialListing {
+        &cortexkit_claustrum_client::ScopedCredentialListing {
             view: "muse-subscription".into(),
             credentials: vec![muse_credential("oauth", true)],
             ..Default::default()
@@ -117,7 +117,7 @@ async fn selection_past_first_plane_load_bound_refuses_retryably_without_a_decis
 async fn pricing_health_is_not_ready_until_first_plane_publication() {
     let credentials = cold_credentials();
     credentials.lock().unwrap().apply_listing(
-        &prefrontal_ckcred_client::ScopedCredentialListing {
+        &cortexkit_claustrum_client::ScopedCredentialListing {
             view: "healthy-listing".into(),
             credentials: vec![muse_credential("oauth", true)],
             ..Default::default()

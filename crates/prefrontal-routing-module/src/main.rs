@@ -1091,14 +1091,15 @@ where
         credentials.refresh_serving_methods(&accounts, &facts, now_ms() as i64);
     }
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
-        let roster_resolver: Arc<dyn prefrontal_ckcred_client::CredentialResolver> =
-            Arc::new(prefrontal_ckcred_client::CkcredCredentialResolver::new(
+        let roster_resolver: Arc<dyn cortexkit_claustrum_client::CredentialResolver> = Arc::new(
+            cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
                 config.connection_file_path.clone(),
                 std::env::current_dir().map_err(|error| {
                     ModuleError::Message(format!("resolve routing roster project root: {error}"))
                 })?,
                 DEFAULT_MODULE_ID,
-            ));
+            ),
+        );
         loops.spawn(
             "account roster",
             account_quota::account_quota_loop(
@@ -8267,8 +8268,8 @@ mod tests {
     fn mapped_broca_credentials(provider: &str) -> SharedBrocaCredentials {
         let credentials = empty_broca_credentials();
         credentials.lock().unwrap().apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
-                credentials: vec![prefrontal_ckcred_client::ListedCredential {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                credentials: vec![cortexkit_claustrum_client::ListedCredential {
                     id: "fixture".into(),
                     categories: vec!["llm-provider".into()],
                     state: "active".into(),
@@ -11571,16 +11572,16 @@ mod tests {
     ) {
         let broca_credentials = empty_broca_credentials();
         broca_credentials.lock().unwrap().apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
                 credentials: vec![
-                    prefrontal_ckcred_client::ListedCredential {
+                    cortexkit_claustrum_client::ListedCredential {
                         id: "fixture-mapped".into(),
                         categories: vec!["llm-provider".into()],
                         state: "active".into(),
                         provider_ids: vec!["anthropic".into()],
                         ..Default::default()
                     },
-                    prefrontal_ckcred_client::ListedCredential {
+                    cortexkit_claustrum_client::ListedCredential {
                         id: "fixture-unmapped".into(),
                         categories: vec!["llm-provider".into()],
                         state: "active".into(),
@@ -13420,11 +13421,11 @@ mod tests {
     fn platform_listing(rows: &[(&str, &[&str])]) -> SharedBrocaCredentials {
         let credentials = empty_broca_credentials();
         credentials.lock().unwrap().apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
                 credentials: rows
                     .iter()
                     .map(
-                        |(id, providers)| prefrontal_ckcred_client::ListedCredential {
+                        |(id, providers)| cortexkit_claustrum_client::ListedCredential {
                             id: (*id).into(),
                             categories: vec!["llm-provider".into()],
                             credential_type: if id.starts_with("apikey:") {
@@ -13869,8 +13870,8 @@ mod tests {
     async fn the_first_real_platform_key_pins_its_label_and_is_its_own_workspace() {
         let credentials = empty_broca_credentials();
         credentials.lock().unwrap().apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
-                credentials: vec![prefrontal_ckcred_client::ListedCredential {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                credentials: vec![cortexkit_claustrum_client::ListedCredential {
                     id: "apikey:anthropic:wsampleyahoo".into(),
                     categories: vec!["llm-provider".into()],
                     credential_type: "apikey".into(),
@@ -13913,11 +13914,11 @@ mod tests {
     fn vault_listing(rows: &[(&str, &[&str], Option<&str>)]) -> SharedBrocaCredentials {
         let credentials = empty_broca_credentials();
         credentials.lock().unwrap().apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
                 credentials: rows
                     .iter()
                     .map(
-                        |(id, providers, account)| prefrontal_ckcred_client::ListedCredential {
+                        |(id, providers, account)| cortexkit_claustrum_client::ListedCredential {
                             id: (*id).into(),
                             categories: vec!["llm-provider".into()],
                             credential_type: if id.starts_with("apikey:") {
