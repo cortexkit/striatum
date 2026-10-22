@@ -40,10 +40,24 @@ struct RealDaemon {
     /// The central storage data_home; the module's store opens under
     /// `<data_home>/cortexkit/<module_id>/store.db`.
     data_home: PathBuf,
+    _fixtures: RoutingFixtures,
+}
+
+/// The stand-in Claustrum credential listing and Fusiform catalog that routing reads
+/// before it will select: every production daemon runs both, and routing refuses
+/// `route.select` until its first billing-plane load. The services stop on drop.
+pub(crate) struct RoutingFixtures {
     _credentials: ModuleHandle,
     credential_service: tokio::task::JoinHandle<()>,
     _catalog: ModuleHandle,
     catalog_service: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RoutingFixtures {
+    fn drop(&mut self) {
+        self.credential_service.abort();
+        self.catalog_service.abort();
+    }
 }
 
 struct FusiformCatalog;
@@ -275,8 +289,6 @@ impl RealDaemon {
 
 impl Drop for RealDaemon {
     fn drop(&mut self) {
-        self.credential_service.abort();
-        self.catalog_service.abort();
         self.child.stop();
         let _ = std::fs::remove_dir_all(&self.rig);
     }
@@ -334,21 +346,31 @@ async fn start_real_daemon() -> RealDaemon {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Routing health requires a scoped credential listing for Broca reachability
-    // (the health handler in src/main.rs). Supply metadata, never secret material.
-    let (credentials, credential_service) = serve_credential_metadata(&connection_file).await;
-    let (catalog, catalog_service) = serve_fusiform_catalog(&connection_file).await;
-    let daemon = RealDaemon {
+    let fixtures = start_routing_fixtures(&connection_file).await;
+    RealDaemon {
         child,
         rig,
         connection_file,
         data_home,
+        _fixtures: fixtures,
+    }
+}
+
+/// Register the stand-in Claustrum and Fusiform on the daemon, restart the routing module so
+/// its first credential and catalog reads find them, and wait until routing reports both
+/// reached.
+pub(crate) async fn start_routing_fixtures(connection_file: &std::path::Path) -> RoutingFixtures {
+    // Routing health requires a scoped credential listing for Broca reachability
+    // (the health handler in src/main.rs). Supply metadata, never secret material.
+    let (credentials, credential_service) = serve_credential_metadata(connection_file).await;
+    let (catalog, catalog_service) = serve_fusiform_catalog(connection_file).await;
+    let fixtures = RoutingFixtures {
         _credentials: credentials,
         credential_service,
         _catalog: catalog,
         catalog_service,
     };
-    let mut consumer = connect_consumer(&daemon.connection_file).await;
+    let mut consumer = connect_consumer(connection_file).await;
     wait_for_catalog(&mut consumer, "claustrum", SETUP_TIMEOUT).await;
     wait_for_catalog(&mut consumer, "fusiform", SETUP_TIMEOUT).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
@@ -395,7 +417,7 @@ async fn start_real_daemon() -> RealDaemon {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    daemon
+    fixtures
 }
 
 /// The full supervision proof: a real subc-core binary spawns the module from
@@ -523,10 +545,12 @@ async fn real_daemon_rebinds_after_route_close_with_fresh_epoch() {
     let project_root = unique_temp_dir("prefrontal-routing-real-daemon-rebind");
     std::fs::create_dir_all(&project_root).unwrap();
     let first = route_open(&mut consumer, &project_root, 1).await;
+    // A model the fixture catalog serves on a provider the fixture vault holds a key for;
+    // a model with no catalog fact is never admissible.
     let params = serde_json::json!({
         "targetAgent": "mason",
         "requirements": { "iq": 20, "eq": 0 },
-        "availableModels": ["ollama-cloud/minimax-m2.5"],
+        "availableModels": ["xai/grok-4.3"],
     });
     let before = route_select(&mut consumer, first, 2, params.clone()).await;
     assert!(before["result"]["selected"]["model"]["modelID"]
