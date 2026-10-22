@@ -103,6 +103,17 @@ impl FusiformCatalog {
                 assert_eq!(request["arguments"], serde_json::json!({"polls":1}));
                 serde_json::json!({"result":{"catalog_version":page["catalog_version"]}})
             }
+            // Routing reads subscription plan prices on every economics refresh.
+            // Serve Fusiform's own recorded reply (the pinned served payloads).
+            "plan.prices" => {
+                assert_eq!(request["arguments"], serde_json::json!({}));
+                let served: serde_json::Value =
+                    serde_json::from_str(include_str!("../../fixtures/served-payloads.json"))
+                        .unwrap();
+                let recorded = &served["plan.prices — every curated row"];
+                assert_eq!(recorded["request"], *request);
+                serde_json::json!({"result":recorded["response"]})
+            }
             other => panic!("unexpected Fusiform fixture tool: {other}"),
         }
     }
@@ -119,7 +130,7 @@ impl ModuleHandler for FusiformCatalog {
 async fn serve_fusiform_catalog(
     connection_file: &std::path::Path,
 ) -> (ModuleHandle, tokio::task::JoinHandle<()>) {
-    let tools = ["catalog.get", "catalog.status"]
+    let tools = ["catalog.get", "catalog.status", "plan.prices"]
         .into_iter()
         .map(|name| Tool {
             name: name.into(),
@@ -183,6 +194,12 @@ fn fusiform_fixture_serves_pinned_first_page_and_terminal_continuation() {
         )["code"],
         "no_coverage"
     );
+    let prices = FusiformCatalog::reply(
+        &serde_json::json!({"name":"plan.prices","arguments":{}}),
+    );
+    assert!(prices["result"]["prices"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty()));
 }
 
 struct CredentialMetadata;
@@ -197,8 +214,11 @@ impl ModuleHandler for CredentialMetadata {
             .iter()
             .map(|provider| {
                 serde_json::json!({
-                    "id":format!("api:{provider}:routing-health-fixture"),
-                    "categories":["llm-provider"], "type":"api_key",
+                    "id":format!("apikey:{provider}:routing-health-fixture"),
+                    // Claustrum's row shape for an API key (see
+                    // fixtures/claustrum-list-scoped.json): type and
+                    // auth_method are both "apikey".
+                    "categories":["llm-provider"], "type":"apikey", "auth_method":"apikey",
                     "serves":[provider], "provider_ids":[provider], "state":"active",
                     "record_version":1, "operations":["get"],
                 })
