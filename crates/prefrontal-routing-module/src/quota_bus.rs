@@ -128,8 +128,9 @@ async fn attach_inner(path: PathBuf) -> Result<AttachedBus, String> {
     if port.is_none() || config.inbox_prefix() != credential.inbox_prefix {
         return Err("invalid ckbus endpoint, inbox, or credential expiry".into());
     }
-    // Issuance may return this spawn's existing credential. Renew it before
-    // rebuilding the connection so its authentication callback uses the new JWT.
+    // `ckbus.credential` always mints a fresh login (and supersedes routing's
+    // previous one), so this renewal is only a guard against a reply that is
+    // already close to expiry; nothing here relies on getting an existing login back.
     if credential.exp <= (super::now_ms() / 1000) as i64 + 300 {
         let renewal = route
             .call(
