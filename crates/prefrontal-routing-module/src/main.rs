@@ -106,6 +106,9 @@ const DEFAULT_MODULE_ID: &str = "prefrontal-routing";
 const ROUTE_SELECT_OP: &str = "route.select";
 const ROUTE_RESOLVE_POLICY_OP: &str = "route.resolve_policy";
 const ROUTE_SELECT_PANEL_OP: &str = "route.select_panel";
+/// The consumer every panel decision is recorded under, whatever its class. Panel
+/// seats' provider-reset fences are written and read under this consumer.
+const PANEL_DECISION_CONSUMER: &str = "athena";
 /// Render one retained routing decision without requiring local SQLite access.
 const ROUTE_EXPLAIN_OP: &str = "route.explain";
 /// List recent routing decisions using only compact diagnostic fields.
@@ -4822,6 +4825,27 @@ async fn handle_select_panel(
         credentials.price_facts(&mut prepared.facts);
     }
     live_config.apply(&mut prepared.facts);
+    // Seats are automatic choices for the class's consumer (see the variant
+    // policy below), and every seat's provider reset is fenced under the panel
+    // decision's consumer. Admission must see those fences, or a model whose
+    // account is out until a known reset keeps being seated and failing.
+    let panel_consumer =
+        if params.panel_spec.class == prefrontal_routing_core::panel::PanelClass::Lab {
+            select_policy::Consumer::Lab
+        } else {
+            select_policy::Consumer::Athena
+        };
+    apply_provider_resets_for_group(
+        &mut prepared.snapshot,
+        &prepared.facts,
+        store,
+        broca_credentials,
+        &live_config,
+        routing_config_path,
+        PANEL_DECISION_CONSUMER,
+        Some(panel_consumer),
+        None,
+    )?;
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
@@ -4965,11 +4989,7 @@ async fn handle_select_panel(
         &mut panel,
         &live_config,
         routing_config_path,
-        if class == prefrontal_routing_core::panel::PanelClass::Lab {
-            select_policy::Consumer::Lab
-        } else {
-            select_policy::Consumer::Athena
-        },
+        panel_consumer,
         &seat_models,
     );
     // Vault-mapped providers need the selected credential and launch target in
@@ -5142,6 +5162,36 @@ fn apply_provider_resets(
     let Some(group) = variant_policy::consumer_group(consumer) else {
         return Ok(());
     };
+    apply_provider_resets_for_group(
+        snapshot,
+        facts,
+        store,
+        credentials,
+        config,
+        path,
+        group,
+        consumer,
+        explicit,
+    )
+}
+
+/// Install the live provider-reset fences recorded under `group` into the
+/// selection snapshot. `consumer` chooses the variant each route runs at, which
+/// is part of the fenced route key; it is separate from `group` because panel
+/// decisions record one consumer for every class while lab seats run at the lab
+/// consumer's variants.
+#[allow(clippy::too_many_arguments)]
+fn apply_provider_resets_for_group(
+    snapshot: &mut ModelRouteStateSnapshot,
+    facts: &[ModelFact],
+    store: &SharedStore,
+    credentials: &SharedBrocaCredentials,
+    config: &config_overrides::LiveConfig,
+    path: &Path,
+    group: &str,
+    consumer: Option<select_policy::Consumer>,
+    explicit: Option<&str>,
+) -> Result<(), ModuleError> {
     let fences = store
         .provider_reset_fences(group, snapshot.now as i64)
         .map_err(|e| ModuleError::Message(e.to_string()))?;
@@ -5343,7 +5393,7 @@ fn panel_decision_input(
         "workload": "workload: athena",
     });
     DecisionInput {
-        consumer: Some("athena".into()),
+        consumer: Some(PANEL_DECISION_CONSUMER.into()),
         decision_id: None,
         decision_kind: "panel".into(),
         task_id: params.task_id.clone(),
@@ -5493,6 +5543,22 @@ struct SetDecisionOutcomeParams {
     /// Exact terminal send error surfaced by the harness, when one was available.
     #[serde(default)]
     last_error: Option<String>,
+    /// The route one seat of a panel decision ran on. A panel decision covers
+    /// several seats and names no route of its own, so a seat's provider reset
+    /// can only be fenced on the right model when the caller names the seat.
+    /// Ignored for a decision that names its own route.
+    #[serde(default)]
+    seat_route: Option<SeatRouteParams>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SeatRouteParams {
+    /// The seat's route key as `route.select_panel` returned it.
+    route_key: String,
+    /// The reasoning variant the seat ran at, when it ran at one.
+    #[serde(default)]
+    variant: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5679,11 +5745,33 @@ async fn handle_set_decision_outcome(
             .decision_provider_identity(&params.decision_id)
             .map_err(|e| ModuleError::Message(e.to_string()))?;
     }
+    let observed_at_ms = now_ms() as i64;
+    if let (Some(seat), Some(provider)) = (params.seat_route.as_ref(), provider_outcome.as_ref()) {
+        if let Err(e) = store.record_panel_seat_provider_outcome(
+            &params.decision_id,
+            &seat.route_key,
+            seat.variant.as_deref(),
+            outcome == RouteOutcome::Completed,
+            provider,
+            observed_at_ms,
+        ) {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("set_decision_outcome: panel seat provider outcome: {e}"),
+            )
+            .await;
+        }
+    }
     let update = DecisionOutcomeUpdate {
         provider_outcome,
         outcome,
         last_error: params.last_error,
-        observed_at_ms: now_ms() as i64,
+        observed_at_ms,
         failure_backoff,
     };
     match store.set_decision_outcome(&params.decision_id, &update) {
@@ -7474,6 +7562,138 @@ mod tests {
                 assert_eq!(fences[0].resets_at_ms, reset);
             }
         }
+    }
+
+    /// Replay of a live panel defect: an audit panel kept seating Meta's Muse as its
+    /// random extra seat while Muse's subscription was out until a dated provider
+    /// reset. The seat's failure was reported against the shared panel decision,
+    /// which names no route, so no fence was written, and panel admission never read
+    /// the fences anyway. One seat's reset must now fence that seat's model for
+    /// later panels, leave every other seat and consumer alone, and lift at the
+    /// reset.
+    #[tokio::test]
+    async fn a_panel_seat_provider_reset_fences_that_model_from_later_panels_until_the_reset() {
+        let rig = Rig::new("panel-seat-provider-reset");
+        let store = Arc::new(rig.open_store());
+        let request = json!({
+            "method": ROUTE_SELECT_PANEL_OP,
+            "params": {
+                "panelSpec": {"size": 1, "iqFloor": 0, "diversity": "none", "class": "AUDIT", "temperatureSpread": [0.2]},
+                "selection": "n_pick",
+                "availableModels": ["openai/gpt-5.6-sol", "openai/gpt-5.5"],
+                "taskId": "panel-seat-reset-task"
+            }
+        });
+        async fn select(store: &SharedStore, request: &serde_json::Value) -> serde_json::Value {
+            let frame = run_route_wire_request(store, request.clone()).await;
+            assert_eq!(frame.header.ty, FrameType::Response);
+            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone()
+        }
+        async fn report(store: &SharedStore, params: serde_json::Value) {
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(
+                    &json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": params}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            handle_set_decision_outcome(
+                frame,
+                &tx,
+                store,
+                Path::new("/nonexistent/panel-seat-provider-reset.jsonc"),
+            )
+            .await
+            .unwrap();
+            let ack: serde_json::Value =
+                serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+            assert_eq!(ack["result"]["ok"], true, "{ack}");
+        }
+        let seated = |panel: &serde_json::Value| -> Vec<String> {
+            panel["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|member| member["routeKey"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let first = select(&store, &request).await;
+        let seat = first["members"][0].clone();
+        let seat_route = seat["routeKey"].as_str().unwrap().to_string();
+        let seat_variant = seat["promptParams"]["variant"].as_str().map(str::to_string);
+        let decision = first["decisionID"].as_str().unwrap().to_string();
+        let reset = now_ms() as i64 + 3 * 24 * 3_600_000;
+        // Another seat of the same panel settles first; the shared decision keeps
+        // that first outcome, and the failing seat's reset must not be lost behind it.
+        report(
+            &store,
+            json!({"decisionID": decision, "outcome": "completed"}),
+        )
+        .await;
+        report(
+            &store,
+            json!({
+                "decisionID": decision,
+                "outcome": "interrupted",
+                "lastError": "account_limit_exhausted",
+                "providerOutcome": {"accountRef": "seat-account", "resetsAtMs": reset},
+                "seatRoute": {"routeKey": seat_route, "variant": seat_variant},
+            }),
+        )
+        .await;
+
+        let fences = store
+            .provider_reset_fences(PANEL_DECISION_CONSUMER, now_ms() as i64)
+            .unwrap();
+        assert_eq!(fences.len(), 1, "{fences:?}");
+        assert_eq!(
+            fences[0].route_key,
+            prefrontal_routing_core::make_route_key(
+                "openai",
+                seat_route.strip_prefix("openai/").unwrap(),
+                seat_variant.as_deref()
+            ),
+            "only the failing seat's own route is fenced"
+        );
+        assert_eq!(fences[0].resets_at_ms, reset);
+        assert!(
+            store
+                .provider_reset_fences("mason", now_ms() as i64)
+                .unwrap()
+                .is_empty(),
+            "other consumers are not fenced"
+        );
+
+        let fenced = select(&store, &request).await;
+        assert!(!seated(&fenced).contains(&seat_route), "{fenced}");
+        assert!(
+            fenced["shortfall"]["causes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|cause| cause["model"] == seat_route.as_str()
+                    && cause["reason"] == "quota_exhausted"),
+            "the fenced seat is named as a quota wall: {fenced}"
+        );
+
+        // The provider's reset passes, so the fence expires and the model is
+        // seated again.
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE provider_reset_fences SET resets_at_ms=?1",
+                [now_ms() as i64 - 1],
+            )
+            .unwrap();
+        let lifted = select(&store, &request).await;
+        assert!(seated(&lifted).contains(&seat_route), "{lifted}");
     }
 
     #[test]
