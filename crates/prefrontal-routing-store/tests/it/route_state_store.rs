@@ -4471,6 +4471,7 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
                 resolved_at_ms: now_ms,
             },
             &HashSet::new(),
+            &HashSet::new(),
         )
         .unwrap();
     let absent_before_cleanup = store.prune_unserved_unpicked_facts().unwrap();

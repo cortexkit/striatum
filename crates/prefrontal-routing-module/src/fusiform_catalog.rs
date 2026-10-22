@@ -18,7 +18,7 @@
 //! fixture at Fusiform `245826d`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -125,7 +125,9 @@ struct CatalogStatusRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct CatalogGetReply {
     catalog_version: i64,
-    models: BTreeMap<String, CatalogModelFacts>,
+    /// Kept undecoded here: each entry is decoded on its own in
+    /// `decode_catalog_get`, so one unreadable entry cannot reject the others.
+    models: BTreeMap<String, Value>,
     resolved_at_ms: i64,
     #[serde(default)]
     curated: Vec<CatalogCuratedModel>,
@@ -292,6 +294,11 @@ pub(crate) struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
     rates: BTreeMap<String, ModelRates>,
+    /// `(provider_id, model_id)` of entries served under a well-formed
+    /// `provider/model` key whose facts could not be decoded. Applying the
+    /// snapshot leaves their stored rows and cached base rates as they were:
+    /// an entry this consumer cannot read is not evidence the model is gone.
+    retained: BTreeSet<(String, String)>,
 }
 
 #[cfg(test)]
@@ -309,48 +316,59 @@ struct ModelRates {
     inherited: BTreeSet<String>,
 }
 
+/// The basket rates of every model on a billing-plane page. Unlike the
+/// whole-catalog read, a plane page is still all-or-nothing: any unreadable
+/// entry rejects the page.
 fn model_rates(models: &Value) -> Result<BTreeMap<String, ModelRates>, FusiformCatalogError> {
-    let mut decoded = BTreeMap::new();
-    for (model, facts) in models
+    models
         .as_object()
         .ok_or_else(|| error("catalog models must be an object"))?
+        .iter()
+        .map(|(model, facts)| {
+            entry_rates(model, facts)
+                .map(|rates| (model.clone(), rates))
+                .map_err(|reason| error(format!("model {model}: {reason}")))
+        })
+        .collect()
+}
+
+/// The basket rates of one served model entry. A rate that cannot be decoded
+/// makes the whole entry unreadable instead of quietly dropping that one rate.
+fn entry_rates(model: &str, facts: &Value) -> Result<ModelRates, String> {
+    let mut rates = ModelRates::default();
+    for (key, value) in facts
+        .as_object()
+        .ok_or_else(|| "model facts are not an object".to_string())?
     {
-        let mut rates = ModelRates::default();
-        for (key, value) in facts
-            .as_object()
-            .ok_or_else(|| error("model facts must be an object"))?
+        // Mode rates and unrelated additive catalog facts do not belong to
+        // the ordinary token basket. Keep above-context targets verbatim.
+        if !prefrontal_routing_core::BasketDimension::ALL
+            .into_iter()
+            .any(|dimension| {
+                key == dimension.fact_key()
+                    || key
+                        .strip_prefix(dimension.fact_key())
+                        .is_some_and(|suffix| suffix.starts_with(".above_context."))
+            })
         {
-            // Mode rates and unrelated additive catalog facts do not belong to
-            // the ordinary token basket. Keep above-context targets verbatim.
-            if !prefrontal_routing_core::BasketDimension::ALL
-                .into_iter()
-                .any(|dimension| {
-                    key == dimension.fact_key()
-                        || key
-                            .strip_prefix(dimension.fact_key())
-                            .is_some_and(|suffix| suffix.starts_with(".above_context."))
-                })
-            {
-                continue;
-            }
-            let served: CatalogRate =
-                serde_json::from_value(value.clone()).map_err(FusiformCatalogError::Json)?;
-            let rate = match &served {
-                CatalogRate::BilledAs { key } => BillingRate::BilledAs { key: key.clone() },
-                CatalogRate::NotBilled => BillingRate::NotBilled,
-                _ => match decoded_rate(model, key, Some(&served)) {
-                    Some(rate) => BillingRate::Priced { rate },
-                    None => BillingRate::Unpriced,
-                },
-            };
-            rates.rates.insert(key.clone(), rate);
-            if value.get("inherited_from").is_some_and(Value::is_object) {
-                rates.inherited.insert(key.clone());
-            }
+            continue;
         }
-        decoded.insert(model.clone(), rates);
+        let served =
+            CatalogRate::deserialize(value).map_err(|reason| format!("{key}: {reason}"))?;
+        let rate = match &served {
+            CatalogRate::BilledAs { key } => BillingRate::BilledAs { key: key.clone() },
+            CatalogRate::NotBilled => BillingRate::NotBilled,
+            _ => match decoded_rate(model, key, Some(&served)) {
+                Some(rate) => BillingRate::Priced { rate },
+                None => BillingRate::Unpriced,
+            },
+        };
+        rates.rates.insert(key.clone(), rate);
+        if value.get("inherited_from").is_some_and(Value::is_object) {
+            rates.inherited.insert(key.clone());
+        }
     }
-    Ok(decoded)
+    Ok(rates)
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -412,6 +430,23 @@ fn decode_plane_get(bytes: &[u8]) -> Result<PlaneReply, FusiformCatalogError> {
         )
         .map_err(FusiformCatalogError::Json)?,
     }))
+}
+
+/// The plane catalog's base rates once `snapshot` is applied: the snapshot's
+/// own rates, plus the previous rates of every entry it could not read, so an
+/// unreadable entry keeps its prices instead of losing them.
+fn base_rates_after(
+    mut prior: BTreeMap<String, ModelRates>,
+    snapshot: &CatalogSnapshot,
+) -> BTreeMap<String, ModelRates> {
+    let mut base = snapshot.rates.clone();
+    for (provider_id, model_id) in &snapshot.retained {
+        let served_key = format!("{provider_id}/{model_id}");
+        if let Some(rates) = prior.remove(&served_key) {
+            base.insert(served_key, rates);
+        }
+    }
+    base
 }
 
 /// Published atomically by the catalog poller, read without I/O by selection.
@@ -636,7 +671,6 @@ fn unwrap_tool_result(bytes: &[u8]) -> Result<Value, FusiformCatalogError> {
 
 pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogError> {
     let value = unwrap_tool_result(bytes)?;
-    let rates = model_rates(&value["models"])?;
     let reply: CatalogGetReply =
         serde_json::from_value(value).map_err(FusiformCatalogError::Json)?;
     let mut auth_methods = BTreeMap::new();
@@ -652,64 +686,39 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         }
     }
     let mut facts = Vec::with_capacity(reply.models.len());
-    for (served_key, model) in reply.models {
-        let (provider_id, model_id) = served_key
+    let mut rates = BTreeMap::new();
+    let mut retained = BTreeSet::new();
+    // (served key, reason) for every entry left out of this snapshot.
+    let mut unreadable: Vec<(String, String)> = Vec::new();
+    for (served_key, entry) in reply.models {
+        let entry_auth_methods = auth_methods.remove(&served_key);
+        // A key that does not split into provider/model names no stored row,
+        // so skipping it leaves nothing behind to protect.
+        let Some((provider_id, model_id)) = served_key
             .split_once('/')
             .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
-            .ok_or_else(|| {
-                error(format!(
-                    "catalog.get model key is not provider/model: {served_key}"
-                ))
-            })?;
-        let present = match model.existence.as_str() {
-            "present" => true,
-            "absent" => false,
-            other => return Err(error(format!("unknown Fusiform existence value: {other}"))),
+        else {
+            unreadable.push((served_key, "key is not provider/model".to_string()));
+            continue;
         };
-        let supports_vision = model
-            .input_modalities
-            .as_ref()
-            .map(|modalities| modalities.iter().any(|value| value == "image"))
-            .or(model.attachment);
-        let cost_per_mtok_out =
-            decoded_rate(&served_key, "rate.output", model.output_rate.as_ref());
-        let input_rate = decoded_rate(&served_key, "rate.input", model.input_rate.as_ref());
-        let cache_read_rate = decoded_rate(
+        match decode_model_entry(
             &served_key,
-            "rate.cache_read",
-            model.cache_read_rate.as_ref(),
-        );
-        let cache_write_rate = decoded_rate(
-            &served_key,
-            "rate.cache_write",
-            model.cache_write_rate.as_ref(),
-        );
-        let reasoning_rate =
-            decoded_rate(&served_key, "rate.reasoning", model.reasoning_rate.as_ref());
-        facts.push(FusiformFactUpdate {
-            provider_id: provider_id.to_string(),
-            model_id: model_id.to_string(),
-            auth_methods: auth_methods.remove(&served_key),
-            present,
-            context_window: model.context.map(|value| value as f64),
-            max_output_tokens: model.output,
-            cost_tier: cost_tier(cost_per_mtok_out),
-            cost_per_mtok_out,
-            input_rate,
-            cache_read_rate,
-            cache_write_rate,
-            reasoning_rate,
-            supports_vision,
-            supports_tool_use: model.tool_call,
-            reasoning_efforts: published_efforts(&model.reasoning_options),
-            // A blank id names no model; keep it out so it cannot group
-            // unrelated routes together.
-            canonical_id: model
-                .canonical_id
-                .filter(|canonical_id| !canonical_id.trim().is_empty()),
-            upstream_status: model.status.filter(|status| !status.trim().is_empty()),
-        });
+            provider_id,
+            model_id,
+            &entry,
+            entry_auth_methods,
+        ) {
+            Ok((fact, model_rates)) => {
+                facts.push(fact);
+                rates.insert(served_key, model_rates);
+            }
+            Err(reason) => {
+                retained.insert((provider_id.to_string(), model_id.to_string()));
+                unreadable.push((served_key, reason));
+            }
+        }
     }
+    report_unreadable_entries_once(reply.catalog_version, &unreadable);
     Ok(CatalogSnapshot {
         cursor: FusiformCatalogCursor {
             catalog_version: reply.catalog_version,
@@ -717,7 +726,102 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         },
         facts,
         rates,
+        retained,
     })
+}
+
+/// Decode one served model entry into its stored fact row and basket rates.
+/// Any error is local to this entry; the caller keeps decoding the others.
+fn decode_model_entry(
+    served_key: &str,
+    provider_id: &str,
+    model_id: &str,
+    entry: &Value,
+    auth_methods: Option<Vec<String>>,
+) -> Result<(FusiformFactUpdate, ModelRates), String> {
+    let model = CatalogModelFacts::deserialize(entry).map_err(|reason| reason.to_string())?;
+    let present = match model.existence.as_str() {
+        "present" => true,
+        "absent" => false,
+        other => return Err(format!("unknown existence value {other:?}")),
+    };
+    let model_rates = entry_rates(served_key, entry)?;
+    let supports_vision = model
+        .input_modalities
+        .as_ref()
+        .map(|modalities| modalities.iter().any(|value| value == "image"))
+        .or(model.attachment);
+    let cost_per_mtok_out = decoded_rate(served_key, "rate.output", model.output_rate.as_ref());
+    let input_rate = decoded_rate(served_key, "rate.input", model.input_rate.as_ref());
+    let cache_read_rate = decoded_rate(
+        served_key,
+        "rate.cache_read",
+        model.cache_read_rate.as_ref(),
+    );
+    let cache_write_rate = decoded_rate(
+        served_key,
+        "rate.cache_write",
+        model.cache_write_rate.as_ref(),
+    );
+    let reasoning_rate = decoded_rate(served_key, "rate.reasoning", model.reasoning_rate.as_ref());
+    let fact = FusiformFactUpdate {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        auth_methods,
+        present,
+        context_window: model.context.map(|value| value as f64),
+        max_output_tokens: model.output,
+        cost_tier: cost_tier(cost_per_mtok_out),
+        cost_per_mtok_out,
+        input_rate,
+        cache_read_rate,
+        cache_write_rate,
+        reasoning_rate,
+        supports_vision,
+        supports_tool_use: model.tool_call,
+        reasoning_efforts: published_efforts(&model.reasoning_options),
+        // A blank id names no model; keep it out so it cannot group
+        // unrelated routes together.
+        canonical_id: model
+            .canonical_id
+            .filter(|canonical_id| !canonical_id.trim().is_empty()),
+        upstream_status: model.status.filter(|status| !status.trim().is_empty()),
+    };
+    Ok((fact, model_rates))
+}
+
+/// Log unreadable catalog entries once per catalog version. The same version
+/// can be decoded again after a wake or by an on-demand upsert, so a line per
+/// decode would repeat without news; a new version is worth one line even if
+/// the list is unchanged.
+fn report_unreadable_entries_once(catalog_version: i64, unreadable: &[(String, String)]) {
+    const NAMED: usize = 3;
+    static LAST_REPORTED_VERSION: Mutex<Option<i64>> = Mutex::new(None);
+    if unreadable.is_empty() {
+        return;
+    }
+    let Ok(mut last) = LAST_REPORTED_VERSION.lock() else {
+        return;
+    };
+    if *last == Some(catalog_version) {
+        return;
+    }
+    *last = Some(catalog_version);
+    let named = unreadable
+        .iter()
+        .take(NAMED)
+        .map(|(key, reason)| format!("{key} ({reason})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if unreadable.len() > NAMED {
+        ", ..."
+    } else {
+        ""
+    };
+    eprintln!(
+        "[prefrontal-routing] fusiform catalog version {catalog_version}: skipped {} unreadable entries, their stored routes left unchanged: {named}{more}",
+        unreadable.len()
+    );
 }
 
 fn decode_catalog_status(bytes: &[u8]) -> Result<CatalogStatusReply, FusiformCatalogError> {
@@ -957,7 +1061,7 @@ impl CatalogWire for FusiformCatalogConsumer {
         };
         if let Some(snapshot) = snapshot {
             cache.version = Some(snapshot.cursor.catalog_version);
-            cache.base = snapshot.rates.clone();
+            cache.base = base_rates_after(std::mem::take(&mut cache.base), snapshot);
             cache.pages.clear();
         }
         for (provider_id, auth_method) in keys {
@@ -1201,8 +1305,14 @@ fn apply_mapped_catalog(
     if let Some(provider) = explicit_provider {
         providers.insert(provider.to_string());
     }
+    let retained: HashSet<(String, String)> = snapshot.retained.iter().cloned().collect();
     store
-        .apply_fusiform_catalog_snapshot_for_providers(&snapshot.facts, snapshot.cursor, &providers)
+        .apply_fusiform_catalog_snapshot_for_providers(
+            &snapshot.facts,
+            snapshot.cursor,
+            &providers,
+            &retained,
+        )
         .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
     if let Some(credentials) = credentials {
         credentials
@@ -2733,5 +2843,162 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("test/unserved-override")));
+    }
+
+    fn isolation_catalog(version: i64, models: Value) -> CatalogSnapshot {
+        decode_catalog_get(
+            &serde_json::to_vec(&json!({
+                "catalog_version": version,
+                "resolved_at_ms": version * 1_000,
+                "models": models,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn readable_entry(context: u64) -> Value {
+        json!({
+            "existence": "present",
+            "limit.context": context,
+            "rate.output": {"state": "priced", "currency": "USD", "exponent": 0, "units": 2},
+        })
+    }
+
+    #[test]
+    fn each_unreadable_catalog_entry_is_skipped_without_rejecting_the_others() {
+        let snapshot = isolation_catalog(
+            2,
+            json!({
+                "test/fine": readable_entry(32_000),
+                "test/unknown-existence": {"existence": "deprecated"},
+                "test/bad-rate": {
+                    "existence": "present",
+                    "rate.input": {"state": "priced", "currency": "USD"},
+                },
+                "test/bad-type": {"existence": "present", "limit.context": "lots"},
+                "no-provider-split": readable_entry(1),
+                "/empty-provider": readable_entry(1),
+                "empty-model/": readable_entry(1),
+            }),
+        );
+        let served: Vec<(&str, &str, Option<f64>)> = snapshot
+            .facts
+            .iter()
+            .map(|fact| {
+                (
+                    fact.provider_id.as_str(),
+                    fact.model_id.as_str(),
+                    fact.context_window,
+                )
+            })
+            .collect();
+        assert_eq!(served, vec![("test", "fine", Some(32_000.0))]);
+        assert_eq!(snapshot.rates.keys().collect::<Vec<_>>(), vec!["test/fine"]);
+        // Only well-formed keys are retained; a key naming no provider/model
+        // pair matches no stored row and protects nothing.
+        assert_eq!(
+            snapshot.retained,
+            BTreeSet::from([
+                ("test".to_string(), "bad-rate".to_string()),
+                ("test".to_string(), "bad-type".to_string()),
+                ("test".to_string(), "unknown-existence".to_string()),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_entry_keeps_its_stored_row_while_an_omitted_route_is_withdrawn() {
+        use prefrontal_routing_core::{FactSource, RouteStateStore as _};
+
+        let rig = Rig::new("entry-isolation");
+        let store = rig.store();
+        for model in ["kept", "gone", "fine"] {
+            store
+                .upsert_fact(&crate::tests::fact("test", model), FactSource::Seed)
+                .unwrap();
+        }
+        let row = |model: &str| {
+            store
+                .get_catalog_facts()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.fact.provider_id == "test" && row.fact.model_id == model)
+                .map(|row| serde_json::to_value(row).unwrap())
+        };
+        let health = Arc::new(Mutex::new(CatalogReachHealth::new(600_000)));
+        let mut bootstrap = FakeWire {
+            status: CatalogStatusReply { catalog_version: 1 },
+            snapshot: isolation_catalog(
+                1,
+                json!({
+                    "test/kept": readable_entry(100_000),
+                    "test/gone": readable_entry(100_000),
+                    "test/fine": readable_entry(100_000),
+                }),
+            ),
+            get_calls: 0,
+            closed: false,
+        };
+        bootstrap_cycle(&mut bootstrap, &store, &health, None, None)
+            .await
+            .unwrap();
+        let kept_before = row("kept").unwrap();
+        assert_eq!(kept_before["fusiformPresent"], json!(true));
+        assert!(row("gone").is_some());
+
+        // Version 2 serves `kept` with an existence value this consumer cannot
+        // read and no longer serves `gone` at all.
+        let mut poll = FakeWire {
+            status: CatalogStatusReply { catalog_version: 2 },
+            snapshot: isolation_catalog(
+                2,
+                json!({
+                    "test/kept": {"existence": "deprecated"},
+                    "test/fine": readable_entry(200_000),
+                }),
+            ),
+            get_calls: 0,
+            closed: false,
+        };
+        poll_cycle(&mut poll, &store, &health, None, None)
+            .await
+            .unwrap();
+        assert_eq!(poll.get_calls, 1);
+
+        assert_eq!(
+            row("kept"),
+            Some(kept_before),
+            "an unreadable entry's stored row stays exactly as it was"
+        );
+        assert_eq!(row("fine").unwrap()["contextWindow"], json!(200_000.0));
+        let unserved = health.lock().unwrap().snapshot(now_ms())["unservedRoutes"].clone();
+        assert_eq!(
+            unserved,
+            json!(["test/gone"]),
+            "the omitted route is still withdrawn and the unreadable one is not"
+        );
+        assert!(
+            row("gone").is_none(),
+            "the withdrawn, never-picked route is pruned"
+        );
+    }
+
+    #[test]
+    fn unreadable_entry_keeps_its_previous_base_rates() {
+        let previous = isolation_catalog(
+            1,
+            json!({"test/kept": readable_entry(1), "test/gone": readable_entry(1)}),
+        );
+        let next = isolation_catalog(
+            2,
+            json!({"test/kept": {"existence": "deprecated"}, "test/fine": readable_entry(1)}),
+        );
+        let base = base_rates_after(previous.rates.clone(), &next);
+        assert_eq!(
+            base.keys().collect::<Vec<_>>(),
+            vec!["test/fine", "test/kept"]
+        );
+        assert_eq!(base["test/kept"], previous.rates["test/kept"]);
     }
 }

@@ -370,7 +370,7 @@ async fn paged_inconsistent_identity_repeated_tokens_and_malformed_final_pages_f
             "catalog_version" => json!(2),
             "resolved_at_ms" => json!(101),
             "next_page_token" => json!("next"),
-            "models" => json!({"beta/m": {"existence": "unexpected"}}),
+            "models" => json!(["not an object"]),
             _ => unreachable!(),
         };
         let (mut client, peer) = paged_wire(vec![
@@ -386,7 +386,7 @@ async fn paged_inconsistent_identity_repeated_tokens_and_malformed_final_pages_f
         assert!(
             reason.contains(match field {
                 "next_page_token" => "repeated a page token",
-                "models" => "unknown Fusiform existence",
+                "models" => "invalid type",
                 _ => "page identity changed",
             }),
             "{field}: {reason}"
@@ -394,6 +394,36 @@ async fn paged_inconsistent_identity_repeated_tokens_and_malformed_final_pages_f
         client.close().await.unwrap();
         paged_finish(peer, 2).await;
     }
+}
+
+#[tokio::test]
+async fn paged_final_page_with_an_unreadable_entry_still_applies_the_rest() {
+    let mut last = paged_payload(1, 100, "beta", None);
+    last["models"] = json!({"beta/m": {"existence": "unexpected"}});
+    let (mut client, peer) = paged_wire(vec![
+        (
+            paged_request(None),
+            FrameType::Response,
+            paged_payload(1, 100, "alpha", Some("next")),
+        ),
+        (paged_request(Some("next")), FrameType::Response, last),
+    ])
+    .await;
+    let snapshot = client.catalog_get().await.unwrap();
+    assert_eq!(
+        snapshot
+            .facts
+            .iter()
+            .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
+            .collect::<Vec<_>>(),
+        vec!["alpha/m"]
+    );
+    assert_eq!(
+        snapshot.retained,
+        BTreeSet::from([("beta".to_string(), "m".to_string())])
+    );
+    client.close().await.unwrap();
+    paged_finish(peer, 2).await;
 }
 
 #[test]

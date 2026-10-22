@@ -1316,18 +1316,36 @@ impl SqliteRouteStateStore {
         cursor: FusiformCatalogCursor,
         mapped_providers: &HashSet<String>,
     ) -> RouteStateResult<()> {
-        self.apply_fusiform_catalog_for_providers_inner(facts, cursor, mapped_providers, false)
+        self.apply_fusiform_catalog_for_providers_inner(
+            facts,
+            cursor,
+            mapped_providers,
+            false,
+            &HashSet::new(),
+        )
     }
 
     /// Apply a complete catalog snapshot, treating existing rows omitted from
     /// it as absent before applying the served facts.
+    ///
+    /// `retained` names `(provider_id, model_id)` pairs the catalog did serve
+    /// but whose entry this consumer could not read. Their rows are left exactly
+    /// as stored: an entry that failed to decode says nothing about whether the
+    /// model still exists, so it must not be marked absent and later pruned.
     pub fn apply_fusiform_catalog_snapshot_for_providers(
         &self,
         facts: &[FusiformFactUpdate],
         cursor: FusiformCatalogCursor,
         mapped_providers: &HashSet<String>,
+        retained: &HashSet<(String, String)>,
     ) -> RouteStateResult<()> {
-        self.apply_fusiform_catalog_for_providers_inner(facts, cursor, mapped_providers, true)
+        self.apply_fusiform_catalog_for_providers_inner(
+            facts,
+            cursor,
+            mapped_providers,
+            true,
+            retained,
+        )
     }
 
     fn apply_fusiform_catalog_for_providers_inner(
@@ -1336,8 +1354,12 @@ impl SqliteRouteStateStore {
         cursor: FusiformCatalogCursor,
         mapped_providers: &HashSet<String>,
         complete_snapshot: bool,
+        retained: &HashSet<(String, String)>,
     ) -> RouteStateResult<()> {
         let scores_json = serde_json::to_string(&ModelScores::default()).map_err(err)?;
+        // Serialized as `[[provider_id, model_id], ...]` for json_each below.
+        let retained_json =
+            serde_json::to_string(&retained.iter().collect::<Vec<_>>()).map_err(err)?;
         self.store
             .with_conn(|connection: &Connection| {
                 let tx = connection.unchecked_transaction()?;
@@ -1345,8 +1367,13 @@ impl SqliteRouteStateStore {
                     tx.execute(
                         "UPDATE model_facts
                          SET facts_source = 'fusiform', fusiform_version = ?1,
-                             fusiform_present = 0, updated_at = ?2",
-                        params![cursor.catalog_version, now_ms()],
+                             fusiform_present = 0, updated_at = ?2
+                         WHERE NOT EXISTS (
+                           SELECT 1 FROM json_each(?3) AS kept
+                           WHERE json_extract(kept.value, '$[0]') = model_facts.provider_id
+                             AND json_extract(kept.value, '$[1]') = model_facts.model_id
+                         )",
+                        params![cursor.catalog_version, now_ms(), retained_json],
                     )?;
                 }
                 for fact in facts {
