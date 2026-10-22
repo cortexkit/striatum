@@ -1673,8 +1673,8 @@ mod tests {
             .collect()
     }
 
-    fn muse_credential(method: &str, mapped: bool) -> prefrontal_ckcred_client::ListedCredential {
-        prefrontal_ckcred_client::ListedCredential {
+    fn muse_credential(method: &str, mapped: bool) -> cortexkit_claustrum_client::ListedCredential {
+        cortexkit_claustrum_client::ListedCredential {
             id: format!("{method}:meta"),
             categories: vec!["llm-provider".into()],
             credential_type: method.into(),
@@ -1715,7 +1715,7 @@ mod tests {
             .is_none());
         let wake = Arc::clone(&credentials.lock().unwrap().catalog_wake);
         credentials.lock().unwrap().apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
                 view: "mapped".into(),
                 credentials: vec![muse_credential("oauth", true)],
                 ..Default::default()
@@ -1763,7 +1763,7 @@ mod tests {
         ] {
             let mut cache = crate::broca_credentials::BrocaCredentials::default();
             cache.apply_listing(
-                &prefrontal_ckcred_client::ScopedCredentialListing {
+                &cortexkit_claustrum_client::ScopedCredentialListing {
                     credentials: methods
                         .iter()
                         .map(|method| muse_credential(method, true))
@@ -1828,7 +1828,7 @@ mod tests {
             .0
             .contains(&restricted.into()));
         cache.apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
                 credentials: vec![muse_credential("oauth", false)],
                 view: "unmapped".into(),
                 ..Default::default()
@@ -1847,7 +1847,7 @@ mod tests {
             .0
             .contains(&"meta/unrestricted".into()));
         cache.apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
                 credentials: vec![muse_credential("oauth", true)],
                 view: "mapped".into(),
                 ..Default::default()
@@ -1923,7 +1923,7 @@ mod tests {
         let empty_policy = store.get_facts().unwrap();
         let mut cache = crate::broca_credentials::BrocaCredentials::default();
         cache.apply_listing(
-            &prefrontal_ckcred_client::ScopedCredentialListing {
+            &cortexkit_claustrum_client::ScopedCredentialListing {
                 credentials: vec![muse_credential("oauth", true)],
                 view: "empty-policy".into(),
                 ..Default::default()
@@ -2133,7 +2133,7 @@ mod tests {
     /// its stated input rate even though the plane has no separate write rate.
     #[test]
     fn free_route_prices_at_zero_through_the_plane_price_facts_attaches() {
-        use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
+        use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         use prefrontal_routing_core::BasketDimension::CacheWrite;
         let zero = json!({"state": "stated_zero"});
         let half_dollar =
@@ -2230,7 +2230,7 @@ mod tests {
 
     #[test]
     fn chatgpt_roster_with_an_apikey_also_listed_prices_on_chatgpt() {
-        use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
+        use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let listing = ScopedCredentialListing {
             view: "mixed-openai".into(),
             credentials: vec![
@@ -2284,7 +2284,7 @@ mod tests {
 
     #[tokio::test]
     async fn refusals_decode_without_failing_poll_and_planes_refresh_only_on_catalog_change() {
-        use prefrontal_ckcred_client::{ListedCredential, ScopedCredentialListing};
+        use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let rig = Rig::new("plane-poll");
         let store = rig.store();
         let facts = vec![

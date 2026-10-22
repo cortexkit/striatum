@@ -21,7 +21,7 @@ cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-nats = "0.3.0"
 cortexkit-bus-trait = "0.3.0"
 subc-client-rs = { workspace = true }
-prefrontal-ckcred-client = { path = "../prefrontal-ckcred-client" }
+cortexkit-claustrum-client = { workspace = true }
 prefrontal-routing-core = { path = "../prefrontal-routing-core" }
 prefrontal-routing-store = { path = "../prefrontal-routing-store" }
 prefrontal-core-store = { path = "../prefrontal-core-store" }
