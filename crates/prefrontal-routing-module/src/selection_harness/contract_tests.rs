@@ -39,7 +39,6 @@ impl HarnessRig {
         params: serde_json::Value,
         credentials: &SharedBrocaCredentials,
     ) -> serde_json::Value {
-        let _guard = config_overrides::multiplier_map_guard();
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),

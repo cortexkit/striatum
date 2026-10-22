@@ -97,7 +97,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn consumer_groups_apply_only_to_the_named_consumer() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         for group in ["mason", "sidekick", "athena", "lab", "core"] {
             let rig =
                 PolicyRig::new(json!({"model_routing": {"exclude": {group: ["openai/pin"]}}}));
@@ -129,7 +128,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn group_and_caller_negations_cannot_lift_all_provider_exclusions() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"exclude": {
             "all": ["anthropic"], "mason": ["-anthropic"]
         }}}));
@@ -192,7 +190,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn missing_consumer_logs_each_target_agent_once() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let warnings = Arc::new(Mutex::new(Vec::new()));
         let _subscriber = tracing::subscriber::set_default(TargetWarnings(Arc::clone(&warnings)));
         let rig = PolicyRig::new(json!({}));
@@ -214,7 +211,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn admitted_pin_bypasses_every_exclude_group_with_variant() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {
             "exclude": {"all": ["openai"], "lab": ["openai/pin"]},
         }}));
@@ -243,7 +239,6 @@ mod consumer_and_pin {
     }
 
     async fn blocked_planner(cause: &str, fallback: &str) {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(planner_config());
         let mut params = rig.pin_params();
         params["pin_fallback"] = json!(fallback);
@@ -354,7 +349,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn lab_planner_edit_is_observed_after_reload_debounce() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(planner_config());
         let first = rig.select(rig.pin_params()).await;
         assert_eq!(
@@ -388,7 +382,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn unset_pin_slot_routes_normally_with_consumer_fences() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"exclude": {"lab": ["openai"]}}}));
         let mut params = rig.pin_params();
         params["pin_fallback"] = json!("none");
@@ -417,7 +410,6 @@ mod consumer_and_pin {
     /// `fallback/safe` so a pinned answer is distinguishable from a normal one.
     #[tokio::test]
     async fn spec_designer_pin_wins_with_its_variant() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"pins": {
             "spec_designer": {"model": "fallback/safe", "variant": "high"},
         }}}));
@@ -439,7 +431,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn unset_spec_designer_pin_routes_normally_and_ignores_the_synthesizer_pin() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"pins": {
             "synthesizer": {"model": "fallback/safe", "variant": "high"},
         }}}));
@@ -457,7 +448,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn excluded_spec_designer_pin_is_refused_by_name_without_a_fallback() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"pins": {
             "spec_designer": {"model": "fallback/safe"},
         }}}));
@@ -481,7 +471,6 @@ mod consumer_and_pin {
     /// launch that names it with `model=` is admitted.
     #[tokio::test]
     async fn launch_model_pin_admits_a_route_every_exclude_group_fences_from_automatic_choice() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         for group in ["all", "mason", "sidekick", "athena", "lab", "core"] {
             let rig = PolicyRig::new(json!({"model_routing": {
                 "exclude": {group: ["openai"]},
@@ -520,7 +509,6 @@ mod consumer_and_pin {
     /// availability and quota walls in place.
     #[tokio::test]
     async fn launch_model_pin_of_an_excluded_route_still_meets_availability_and_quota_walls() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"exclude": {"all": ["openai"]}}}));
         let mut params = rig.params();
         params["consumer"] = json!("mason");
@@ -573,7 +561,6 @@ mod consumer_and_pin {
     /// group, else `all`, else the route's curated default.
     #[tokio::test]
     async fn variant_precedence_runs_pin_then_consumer_then_all_then_curated() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"variants": {
             "all": {"openai/pin": "high"},
             "mason": {"openai/pin": "xhigh"},
@@ -647,7 +634,6 @@ mod consumer_and_pin {
     /// The operator's own split: one route, two consumers, two variants.
     #[tokio::test]
     async fn the_same_route_runs_xhigh_for_athena_and_high_for_mason() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"variants": {
             "athena": {"openai/pin": "xhigh"},
             "mason": {"openai/pin": "high"},
@@ -698,7 +684,6 @@ mod consumer_and_pin {
     /// selection: the next rule runs and the skip is in the reply and the log.
     #[tokio::test]
     async fn a_variant_the_catalog_drops_falls_back_and_is_logged() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(json!({"model_routing": {"variants": {
             "all": {"openai/pin": "high"},
             "mason": {"openai/pin": "xhigh"},
@@ -745,7 +730,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn pin_cannot_spend_weekly_head_reserve() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let mut config = planner_config();
         config["model_routing"]["keep_free_percent"] = json!({"openai": 20});
         let rig = PolicyRig::new(config);
@@ -777,7 +761,6 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn fallback_does_not_relax_the_pin_that_admission_refused() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PolicyRig::new(planner_config());
         rig.store
             .update_route_state(

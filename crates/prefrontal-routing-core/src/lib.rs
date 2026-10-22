@@ -63,7 +63,7 @@ pub use model_facts::{
     derive_provider_key, fact_to_route, is_valid_grand_family_id, make_capacity_key,
     make_route_key, normalize_grand_family_id, BasketDimension, BasketPrice, ClassVector,
     Confidence, FamilySource, GrandFamily, ModelFact, ModelMetric, ModelPromptDefaults,
-    ModelRequirements, ModelRoute, ModelScores, ReasoningEffort, ScoreProvenance,
+    ModelRequirements, ModelRoute, ModelScores, ReasoningEffort, RoutePricing, ScoreProvenance,
     CLASS_VECTOR_SAMPLE_FLOOR, CLASS_VECTOR_TRAILING_WINDOW_DAYS, CLASS_VECTOR_TRAILING_WINDOW_MS,
     ENUMERATED_WORKLOAD_CLASSES, GRAND_FAMILY_NORMALIZATIONS, MODEL_METRICS,
 };

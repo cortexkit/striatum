@@ -3781,7 +3781,11 @@ impl RouteStateStore for SqliteRouteStateStore {
         Ok(vector)
     }
 
-    fn get_facts_with_observed_speed(&self, now: f64) -> RouteStateResult<Vec<ModelFact>> {
+    fn get_facts_with_observed_speed(
+        &self,
+        now: f64,
+        pricing: &prefrontal_routing_core::RoutePricing,
+    ) -> RouteStateResult<Vec<ModelFact>> {
         let facts = self.get_facts()?;
         let ephemeral_vector = self.get_class_vector("ephemeral", now)?;
         // Multiple catalog facts can resolve to the same prompt-default variant.
@@ -3824,18 +3828,13 @@ impl RouteStateStore for SqliteRouteStateStore {
                 &fact.model_id,
                 fact.variant.as_deref(),
             );
-            if let Some(multiplier) =
-                prefrontal_routing_core::model_facts::get_speed_multiplier(&route_key)
-            {
+            if let Some(multiplier) = pricing.speed_multiplier(&route_key) {
                 fact.scores.speed *= multiplier;
                 fact.speed_multiplier = Some(multiplier);
             }
-            // Subscription subsidy is overlaid rather than persisted. Selection
-            // refreshes the process-global registry from configuration before this
-            // read so the objective can price the route at list ÷ multiplier.
-            if let Some(multiplier) =
-                prefrontal_routing_core::model_facts::get_subscription_multiplier(&route_key)
-            {
+            // Subscription subsidy is overlaid rather than persisted, so the
+            // objective can price the route at list ÷ multiplier.
+            if let Some(multiplier) = pricing.subscription_multiplier(&route_key) {
                 fact.subscription_multiplier = Some(multiplier);
             }
             overlaid.push(fact);

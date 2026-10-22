@@ -55,7 +55,9 @@ use cortexkit_store_types::StorageDescriptor;
 use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
 #[cfg(test)]
 use prefrontal_routing_core::model_facts::make_capacity_key;
-use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
+use prefrontal_routing_core::model_facts::{
+    Confidence, ModelScores, RoutePricing, ScoreProvenance,
+};
 use prefrontal_routing_core::model_router::{
     select_model_route_with_availability, ModelRouteStateSnapshot, NoRouteError,
     RequiredCapabilities, RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
@@ -3069,14 +3071,18 @@ fn quota_signal_json(snapshot: &ModelRouteStateSnapshot, view: &QuotaSignalView<
 
 /// Read one consistent store/cache view for every selection operation. Quota
 /// windows are cloned before merging so no handler holds the cache lock while
-/// recording or writing its response.
+/// recording or writing its response. `pricing` is the selection's own routing
+/// configuration's multipliers and keep-free reserves: facts and subscription
+/// pools are both read against it, so a configuration published mid-selection
+/// cannot price or reserve some candidates differently from others.
 fn prepare_selection_inputs(
     quota_cache: &SharedQuotaCache,
     store: &SharedStore,
+    pricing: &RoutePricing,
 ) -> Result<PreparedSelectionInputs, String> {
     let now = now_ms() as f64;
     let facts = store
-        .get_facts_with_observed_speed(now)
+        .get_facts_with_observed_speed(now, pricing)
         .map_err(|e| format!("reading facts from route-state store: {e}"))?;
     let mut snapshot = store
         .build_snapshot(now)
@@ -3113,7 +3119,7 @@ fn prepare_selection_inputs(
     if let Some(windows) = quota_windows.as_ref().filter(|_| stale_age_ms.is_none()) {
         merge_quota_overlay(&mut snapshot, windows, &facts);
     }
-    subscription_economics::overlay(&mut snapshot, &facts, now as i64);
+    subscription_economics::overlay(&mut snapshot, &facts, now as i64, pricing);
     let quota_signal_json = quota_signal_json(
         &snapshot,
         &QuotaSignalView {
@@ -3149,7 +3155,6 @@ struct RouteSelectTiming {
     /// Decoding the parameters and resolving requirements and the caller's
     /// available models (reads the auth file).
     resolve_ms: std::cell::Cell<u64>,
-    prepare_wait_ms: std::cell::Cell<u64>,
     snapshot_closure_ms: std::cell::Cell<u64>,
     /// Live overlays, score aliases and billing-plane pricing on the facts.
     pricing_ms: std::cell::Cell<u64>,
@@ -3186,7 +3191,6 @@ impl RouteSelectTiming {
             live_config_check_ms: std::cell::Cell::new(0),
             billing_wait_ms: std::cell::Cell::new(0),
             resolve_ms: std::cell::Cell::new(0),
-            prepare_wait_ms: std::cell::Cell::new(0),
             snapshot_closure_ms: std::cell::Cell::new(0),
             pricing_ms: std::cell::Cell::new(0),
             policy_ms: std::cell::Cell::new(0),
@@ -3206,12 +3210,6 @@ impl RouteSelectTiming {
                 .get()
                 .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64),
         );
-    }
-
-    fn record_prepare(&self, wait: Duration, snapshot: Duration) {
-        self.prepare_wait_ms
-            .set(wait.as_millis().min(u64::MAX as u128) as u64);
-        self.add_snapshot_closure(snapshot);
     }
 
     fn add_snapshot_closure(&self, elapsed: Duration) {
@@ -3244,7 +3242,6 @@ impl RouteSelectTiming {
         let live_config_check_ms = self.live_config_check_ms.get();
         let billing_wait_ms = self.billing_wait_ms.get();
         let resolve_ms = self.resolve_ms.get();
-        let prepare_wait_ms = self.prepare_wait_ms.get();
         let snapshot_closure_ms = self.snapshot_closure_ms.get();
         let pricing_ms = self.pricing_ms.get();
         let policy_ms = self.policy_ms.get();
@@ -3259,7 +3256,6 @@ impl RouteSelectTiming {
             live_config_check_ms,
             billing_wait_ms,
             resolve_ms,
-            prepare_wait_ms,
             snapshot_closure_ms,
             pricing_ms,
             policy_ms,
@@ -3275,7 +3271,7 @@ impl RouteSelectTiming {
         .fold(0_u64, u64::saturating_add);
         let unclassified_ms = total_ms.saturating_sub(classified_ms);
         Some(format!(
-            "[routing] slow route.select total_ms={total_ms} wait_prepare_ms={prepare_wait_ms} live_config_check_ms={live_config_check_ms} snapshot_closure_ms={snapshot_closure_ms} selection_ms={selection_ms} reply_ms={reply_ms} billing_wait_ms={billing_wait_ms} resolve_ms={resolve_ms} pricing_ms={pricing_ms} policy_ms={policy_ms} head_history_ms={head_history_ms} ladder_ms={ladder_ms} decision_write_ms={decision_write_ms} runner_ms={runner_ms} finish_ms={finish_ms} unclassified_ms={unclassified_ms}"
+            "[routing] slow route.select total_ms={total_ms} live_config_check_ms={live_config_check_ms} snapshot_closure_ms={snapshot_closure_ms} selection_ms={selection_ms} reply_ms={reply_ms} billing_wait_ms={billing_wait_ms} resolve_ms={resolve_ms} pricing_ms={pricing_ms} policy_ms={policy_ms} head_history_ms={head_history_ms} ladder_ms={ladder_ms} decision_write_ms={decision_write_ms} runner_ms={runner_ms} finish_ms={finish_ms} unclassified_ms={unclassified_ms}"
         ))
     }
 }
@@ -3762,9 +3758,9 @@ async fn handle_select_request(
             }
         };
     let providers_without_prompt_cache = live_config.providers_without_prompt_cache();
-    let (prepared, prepare_wait, snapshot_closure) =
-        live_config.prepare_with_timing(|| prepare_selection_inputs(quota_cache, store));
-    timing.record_prepare(prepare_wait, snapshot_closure);
+    let snapshot_started = Instant::now();
+    let prepared = prepare_selection_inputs(quota_cache, store, live_config.pricing());
+    timing.add_snapshot_closure(snapshot_started.elapsed());
     let PreparedSelectionInputs {
         now,
         mut facts,
@@ -4804,7 +4800,7 @@ async fn handle_select_panel(
         )
         .await;
     }
-    let mut prepared = match live_config.prepare(|| prepare_selection_inputs(quota_cache, store)) {
+    let mut prepared = match prepare_selection_inputs(quota_cache, store, live_config.pricing()) {
         Ok(prepared) => prepared,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
@@ -7779,6 +7775,55 @@ mod tests {
         serde_json::from_value(v).expect("provider usage")
     }
 
+    /// A selection prices and reserves every candidate with the routing
+    /// configuration it started with. Publishing another configuration while it
+    /// runs changes neither one candidate's speed multiplier nor the keep-free
+    /// reserve on the other candidate's subscription pool.
+    #[test]
+    fn prepared_inputs_price_and_reserve_every_candidate_on_the_held_configuration() {
+        let rig = Rig::new("selection-input-held-pricing");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("held-a", "model"), FactSource::Override)
+            .unwrap();
+        store
+            .upsert_fact(&fact("held-b", "model"), FactSource::Override)
+            .unwrap();
+        let path = rig.dir.join("routing.jsonc");
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"models":{"held-a/model":{"speed_multiplier":0.5}},"keep_free_percent":{"held-b":20}}}"#,
+        )
+        .unwrap();
+        let held = config_overrides::settle_live_config(&path);
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"models":{"held-a/model":{"speed_multiplier":2.0}},"keep_free_percent":{"held-b":0}}}"#,
+        )
+        .unwrap();
+        let published = config_overrides::settle_live_config(&path);
+        assert!(!Arc::ptr_eq(&held, &published));
+
+        let quota = Arc::new(Mutex::new(QuotaCache::default()));
+        let judged = |pricing: &RoutePricing| {
+            let prepared = prepare_selection_inputs(&quota, &store, pricing).unwrap();
+            let a = prepared
+                .facts
+                .iter()
+                .find(|fact| fact.provider_id == "held-a")
+                .unwrap()
+                .clone();
+            let reserve = prepared.snapshot.by_capacity["held-b/model"]
+                .subscription_pool
+                .as_ref()
+                .unwrap()
+                .keep_free_percent;
+            (a.speed_multiplier, a.scores.speed, reserve)
+        };
+        assert_eq!(judged(held.pricing()), (Some(0.5), 45.0, 20.0));
+        assert_eq!(judged(published.pricing()), (Some(2.0), 180.0, 0.0));
+    }
+
     #[test]
     fn prepare_selection_inputs_preserves_the_catalog_observed_speed_overlay() {
         let rig = Rig::new("selection-input-observed-speed");
@@ -7815,13 +7860,17 @@ mod tests {
         }
 
         let expected = store
-            .get_facts_with_observed_speed(now_ms() as f64)
+            .get_facts_with_observed_speed(now_ms() as f64, &RoutePricing::default())
             .unwrap()
             .into_iter()
             .filter(|fact| fact.provider_id == "observed-caller")
             .collect::<Vec<_>>();
-        let prepared =
-            prepare_selection_inputs(&Arc::new(Mutex::new(QuotaCache::default())), &store).unwrap();
+        let prepared = prepare_selection_inputs(
+            &Arc::new(Mutex::new(QuotaCache::default())),
+            &store,
+            &RoutePricing::default(),
+        )
+        .unwrap();
         let actual = prepared
             .facts
             .into_iter()
@@ -8098,7 +8147,6 @@ mod tests {
                 .entry("executor")
                 .or_insert(json!("broca"));
         }
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
@@ -9809,7 +9857,6 @@ mod tests {
             .unwrap()
             .entry("executor")
             .or_insert(json!("broca"));
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let store = Arc::new(rig.open_store());
         for fact in facts {
             store.upsert_fact(fact, FactSource::Override).unwrap();
@@ -9845,7 +9892,6 @@ mod tests {
 
     #[tokio::test]
     async fn refusal_decision_row_carries_per_candidate_rejections() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = Rig::new("refusal-decision-evidence");
         let store = Arc::new(rig.open_store());
         let mut rejected = fact("p", "missing-vision");
@@ -9914,7 +9960,6 @@ mod tests {
 
     #[tokio::test]
     async fn third_session_error_writes_backoff_active_into_refusal_decision_ledger() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         const ROUTE: &str = "alibaba-token-plan/qwen3.8-max-preview";
         const LAST_ERROR: &str =
             "Access to model denied. Please make sure you are eligible for using the model.";
@@ -10285,7 +10330,6 @@ mod tests {
 
     #[tokio::test]
     async fn only_billing_walled_route_returns_no_route_and_quota_control_relaxes() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = Rig::new("billing-wall-break-glass");
         let store = Arc::new(rig.open_store());
         let grok = fact("xai", "grok-4.6");
@@ -10363,7 +10407,6 @@ mod tests {
     /// billing refusal. The corrected selector must explain both facts.
     #[tokio::test]
     async fn specimen_billing_grok_plus_head_withheld_openai_returns_no_route() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = Rig::new("billing-wall-specimen");
         let store = Arc::new(rig.open_store());
         for route in [fact("openai", "gpt-5.6-sol"), fact("xai", "grok-4.6")] {
@@ -10441,7 +10484,6 @@ mod tests {
 
     #[tokio::test]
     async fn typed_policy_refusal_excludes_only_the_retry_item_not_its_heads_other_items() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = Rig::new("item-policy-refusal");
         let store = Arc::new(rig.open_store());
         for model in ["sol", "astra"] {
@@ -10498,7 +10540,6 @@ mod tests {
     // Legacy untyped refusals still use the bounded head-level exclusion window.
     #[tokio::test]
     async fn head_refused_on_content_policy_loses_that_provider_for_its_next_launch() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = Rig::new("head-content-policy-exclusion");
         let store = Arc::new(rig.open_store());
         // Both OpenAI routes outrank opus on every axis, so opus wins only when
@@ -10799,7 +10840,6 @@ mod tests {
         quota_cache: QuotaCache,
         task_id: &str,
     ) -> (String, serde_json::Value) {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         // iq 70, not lower: both fixture routes sit at the request frontier, so
         // below demand 60 both would carry the same over-qualification term,
         // which lifts them out of the effectively-free bucket where the quota
@@ -10880,7 +10920,6 @@ mod tests {
         available: &[&str],
         task_id: &str,
     ) -> String {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let request = json!({
             "method": ROUTE_SELECT_OP,
             "params": {
@@ -12100,7 +12139,6 @@ mod tests {
 
     #[tokio::test]
     async fn wire_demand_uses_the_caller_0_to_100_scale_without_rescaling() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         async fn select(demand: f64) -> (Frame, Rig) {
             let rig = Rig::new(&format!("wire-demand-{demand}"));
             let store = Arc::new(rig.open_store());
@@ -12733,7 +12771,6 @@ mod tests {
 
     #[tokio::test]
     async fn select_panel_serves_full_contract_shape() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let advertised = manifest(DEFAULT_MODULE_ID)
             .provides
             .into_iter()
@@ -14333,7 +14370,6 @@ mod tests {
 
     #[tokio::test]
     async fn live_config_reloads_cost_and_exclusion_atomically_and_keeps_last_good() {
-        let _guard = config_overrides::multiplier_map_guard();
         let rig = Rig::new("live-atomic-config");
         let store = Arc::new(rig.open_store());
         let mut a = fact("a", "reader");
@@ -14437,7 +14473,6 @@ mod tests {
 
     #[tokio::test]
     async fn next_selection_observes_a_live_elo_override_edit() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         async fn select(
             store: &SharedStore,
             quota_cache: &SharedQuotaCache,
@@ -14937,7 +14972,10 @@ mod tests {
                 available_models: observation.available.iter().cloned().collect(),
                 facts: rig
                     .store
-                    .get_facts_with_observed_speed(now_ms() as f64)
+                    .get_facts_with_observed_speed(
+                        now_ms() as f64,
+                        config_overrides::live_config(&rig.sources.routing_config).pricing(),
+                    )
                     .unwrap(),
                 runtime_snapshot: Some(observation.snapshot.clone()),
                 exclude_route_keys: Vec::new(),
@@ -14956,7 +14994,6 @@ mod tests {
 
     #[test]
     fn no_ladder_exists_before_a_selection_has_been_observed() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("unobserved");
         assert_eq!(
             winner_ladder::compute_ladder(rig.store.as_ref(), &rig.sources).unwrap(),
@@ -14972,7 +15009,6 @@ mod tests {
 
     #[test]
     fn the_first_ever_ladder_is_stored_silently() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("first");
         rig.observe(&["incumbent", "small"]);
         assert_eq!(rig.announce("first selection"), None);
@@ -14988,7 +15024,6 @@ mod tests {
 
     #[tokio::test]
     async fn placement_moving_the_live_winner_emits_one_notice_naming_what_selection_returns() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("raise");
         rig.observe(&["incumbent", "small", "challenger"]);
         assert_eq!(rig.announce("first selection"), None);
@@ -15037,7 +15072,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_route_outside_the_recorded_availability_is_never_announced() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("fence");
         rig.observe(&["incumbent", "small"]);
         assert_eq!(rig.announce("first selection"), None);
@@ -15083,7 +15117,6 @@ mod tests {
 
     #[tokio::test]
     async fn placement_that_changes_a_score_but_no_winner_emits_no_notice() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("twin");
         rig.observe(&["incumbent", "small"]);
         assert_eq!(rig.announce("first selection"), None);
@@ -15110,7 +15143,6 @@ mod tests {
 
     #[test]
     fn a_quota_wall_that_moves_only_the_live_winner_is_not_announced() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("quota");
         rig.observe(&["incumbent", "small"]);
         assert_eq!(rig.announce("first selection"), None);
@@ -15149,7 +15181,6 @@ mod tests {
 
     #[test]
     fn a_restart_between_two_differing_ladders_announces_once() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("restart-moved");
         rig.observe(&["incumbent", "small", "challenger"]);
         assert_eq!(rig.announce("first selection"), None);
@@ -15178,7 +15209,6 @@ mod tests {
 
     #[test]
     fn a_restart_with_no_change_announces_nothing() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("restart-same");
         rig.observe(&["incumbent", "small"]);
         assert_eq!(rig.announce("first selection"), None);
@@ -15192,7 +15222,6 @@ mod tests {
 
     #[test]
     fn config_reload_excluding_the_winner_announces_once_and_an_unchanged_config_is_silent() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("reload");
         rig.observe(&["incumbent", "small"]);
         assert_eq!(rig.announce("first selection"), None);
@@ -15228,7 +15257,6 @@ mod tests {
     /// replaced silently rather than compared against the new keys.
     #[test]
     fn a_stored_baseline_of_the_old_shape_is_replaced_without_announcing() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("old-shape");
         let old = json!({
             "substrates": {
@@ -15257,7 +15285,6 @@ mod tests {
     /// each class's ladder replays its own list rather than a shared one.
     #[test]
     fn two_caller_classes_alternating_their_lists_announce_nothing_once_both_have_baselines() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("classes");
         rig.place_challenger_directly();
         let mut watch = winner_ladder::ConfigReloadWatch::new(&rig.sources);
@@ -15296,7 +15323,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_placement_moving_one_class_winner_announces_for_that_class_only() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("one-class");
         rig.observe_as("mason", &["incumbent", "small", "challenger"]);
         rig.observe_as("explore", &["incumbent", "small"]);
@@ -15326,7 +15352,6 @@ mod tests {
     /// their alternation is not an availability change.
     #[test]
     fn one_class_alternating_two_lists_within_the_window_uses_their_union_and_announces_nothing() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("union");
         rig.place_challenger_directly();
         let mut watch = winner_ladder::ConfigReloadWatch::new(&rig.sources);
@@ -15357,12 +15382,11 @@ mod tests {
         assert_eq!(replayed.tiers[&100].live, Some(rig.route("challenger")));
     }
 
-    /// Multipliers are process-wide and priced into facts when they are read. The
-    /// ladder must load them first, or its first computation after boot prices
-    /// subscription routes at list and disagrees with the next one.
+    /// The ladder prices facts with the multipliers of the routing config it
+    /// reads. Its first computation after boot must already use them; pricing
+    /// subscription routes at list would disagree with every later ladder.
     #[test]
     fn the_first_ladder_after_boot_prices_routes_with_the_configured_multipliers() {
-        let _multiplier_guard = crate::config_overrides::multiplier_map_guard();
         let rig = LadderRig::new("multiplier");
         let mut listed = fact(&rig.provider, "listed");
         listed.scores.elo = 1_500.0;
@@ -15383,9 +15407,6 @@ mod tests {
             serde_json::to_vec(&json!({ "model_routing": { "models": models } })).unwrap(),
         )
         .unwrap();
-        // A fresh process: nothing has loaded the multipliers yet.
-        prefrontal_routing_core::model_facts::set_subscription_multipliers(HashMap::new());
-        prefrontal_routing_core::model_facts::set_speed_multipliers(HashMap::new());
         rig.observe(&["incumbent", "listed"]);
 
         let first = rig.ladder();
@@ -15816,11 +15837,10 @@ mod slow_route_select_timing_tests {
     fn injected_snapshot_delay_is_emitted_in_the_slow_select_breakdown() {
         let timing = RouteSelectTiming::new();
         timing.is_select.set(true);
-        let config = config_overrides::LiveConfig::default();
-        let (_, wait, snapshot) = config.prepare_with_timing(|| {
-            std::thread::sleep(Duration::from_millis(1_050));
-        });
-        timing.record_prepare(wait, snapshot);
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(1_050));
+        let snapshot = started.elapsed();
+        timing.add_snapshot_closure(snapshot);
 
         let now = Instant::now();
         let line = timing
@@ -15830,7 +15850,6 @@ mod slow_route_select_timing_tests {
             rate_limit_route_select_line(line, now, &mut RouteSelectLogLimiter::default())
                 .expect("the first slow select is emitted");
         assert!(emitted.contains("slow route.select total_ms="), "{emitted}");
-        assert!(emitted.contains("wait_prepare_ms="), "{emitted}");
         assert!(emitted.contains("live_config_check_ms="), "{emitted}");
         assert!(
             emitted.contains(&format!("snapshot_closure_ms={}", snapshot.as_millis())),
@@ -15849,7 +15868,6 @@ mod slow_route_select_timing_tests {
             ("live_config_check_ms", &timing.live_config_check_ms),
             ("billing_wait_ms", &timing.billing_wait_ms),
             ("resolve_ms", &timing.resolve_ms),
-            ("wait_prepare_ms", &timing.prepare_wait_ms),
             ("snapshot_closure_ms", &timing.snapshot_closure_ms),
             ("pricing_ms", &timing.pricing_ms),
             ("policy_ms", &timing.policy_ms),

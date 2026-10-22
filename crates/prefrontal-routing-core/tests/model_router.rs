@@ -1553,14 +1553,15 @@ fn speed_multiplier_selection_tiebreak() {
         ..Default::default()
     });
 
-    let mut multipliers = std::collections::HashMap::new();
-    multipliers.insert("p/model-a".to_string(), 0.5);
-    prefrontal_routing_core::model_facts::set_speed_multipliers(multipliers);
+    let pricing = prefrontal_routing_core::RoutePricing {
+        speed_multipliers: [("p/model-a".to_string(), 0.5)].into(),
+        ..Default::default()
+    };
 
     let mut facts = vec![a, b];
     for f in &mut facts {
         let route_key = make_route_key(&f.provider_id, &f.model_id, f.variant.as_deref());
-        if let Some(mult) = prefrontal_routing_core::model_facts::get_speed_multiplier(&route_key) {
+        if let Some(mult) = pricing.speed_multiplier(&route_key) {
             f.scores.speed *= mult;
             f.speed_multiplier = Some(mult);
         }
@@ -1580,14 +1581,15 @@ fn speed_multiplier_explanation_surfaces_multiplier() {
         ..Default::default()
     });
 
-    let mut multipliers = std::collections::HashMap::new();
-    multipliers.insert("p/model-a".to_string(), 0.5);
-    prefrontal_routing_core::model_facts::set_speed_multipliers(multipliers);
+    let pricing = prefrontal_routing_core::RoutePricing {
+        speed_multipliers: [("p/model-a".to_string(), 0.5)].into(),
+        ..Default::default()
+    };
 
     let mut facts = vec![a];
     for f in &mut facts {
         let route_key = make_route_key(&f.provider_id, &f.model_id, f.variant.as_deref());
-        if let Some(mult) = prefrontal_routing_core::model_facts::get_speed_multiplier(&route_key) {
+        if let Some(mult) = pricing.speed_multiplier(&route_key) {
             f.scores.speed *= mult;
             f.speed_multiplier = Some(mult);
         }

@@ -93,7 +93,6 @@ mod class_panel_policy {
 
     #[tokio::test]
     async fn every_automatic_request_runs_audit_policy_and_ignores_classifier_hints() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({"model_routing": {"exclude": {
             "mason": ["openai/gpt-6-astra", "kimi-code-plan-global/k3"]
         }}}));
@@ -154,7 +153,6 @@ mod class_panel_policy {
 
     #[tokio::test]
     async fn explicit_seed_and_lab_round_seeds_drive_golden_draws() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({"model_routing": {"panels": {"lab": {
             "topK": 2, "by": "iq", "extra": 1, "extraBy": "random", "floor": 80
         }}}}));
@@ -177,7 +175,6 @@ mod class_panel_policy {
     /// rule that chose it are recorded beside it in `seatedVariants`.
     #[tokio::test]
     async fn panel_seats_run_their_class_consumers_variants_including_the_extra_draw() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({"model_routing": {"variants": {
             "all": {"anthropic": "low"},
             "athena": {"openai/gpt-6-astra": "xhigh", "anthropic/a": "high"},
@@ -232,7 +229,6 @@ mod class_panel_policy {
 
     #[tokio::test]
     async fn class_exclusions_follow_lab_or_athena_and_never_mason() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({"model_routing": {"exclude": {
             "athena": ["openai/gpt-6-astra"], "lab": ["kimi-code-plan-global/k3"]
         }}}));
@@ -278,7 +274,6 @@ mod class_panel_policy {
 
     #[tokio::test]
     async fn migrated_provider_exclude_cannot_be_lifted_by_group_or_caller_negations() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({"model_routing": {"exclude": {
             "all": ["anthropic"], "athena": ["-anthropic"], "lab": ["-anthropic"]
         }}}));
@@ -321,7 +316,6 @@ mod class_panel_policy {
 
     #[tokio::test]
     async fn last_match_within_a_group_still_allows_a_route_exception() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({"model_routing": {"exclude": {
             "athena": ["anthropic", "-anthropic/b"]
         }}}));
@@ -333,7 +327,6 @@ mod class_panel_policy {
 
     #[tokio::test]
     async fn live_policy_and_synthesizer_pin_edits_change_the_next_selection_after_debounce() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({"model_routing": {
             "panels": {"audit": {"topK": 1, "by": "iq"}},
             "pins": {"synthesizer": {"model": "synth/old", "variant": "high"}}
@@ -422,7 +415,6 @@ mod class_panel_policy {
 
     #[tokio::test]
     async fn previous_core_decoder_accepts_new_reply_for_request_without_consumer() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({}));
         let mut params = rig.params("AUDIT");
         params["panelSpec"] =
@@ -443,7 +435,6 @@ mod class_panel_policy {
 
     #[tokio::test]
     async fn roster_selection_or_nonempty_roster_is_refused_without_a_decision() {
-        let _guard = crate::config_overrides::multiplier_map_guard();
         let rig = PanelRig::new(json!({}));
         for patch in [
             json!({"selection": "roster"}),

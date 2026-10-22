@@ -154,7 +154,11 @@ fn one_upsert_scores_every_route_of_the_model() {
             (1810.0, 1520.0),
             "{route} reads the model's one score"
         );
-        assert!(fact.score_provenance.is_routable(), "{route} is routable");
+        assert_ne!(
+            fact.score_provenance,
+            ScoreProvenance::Unscored,
+            "{route} is routable"
+        );
     }
     // Model-intrinsic only: each route keeps its own served facts.
     assert_eq!(
@@ -258,7 +262,7 @@ fn an_alias_listing_shares_its_target_models_score() {
     let facts = routed(&store);
     let alias = &facts["google/antigravity-gemini-3.8-flash"];
     assert_eq!((alias.scores.elo, alias.scores.eq), (1760.0, 1450.0));
-    assert!(alias.score_provenance.is_routable());
+    assert_ne!(alias.score_provenance, ScoreProvenance::Unscored);
 }
 
 #[test]
@@ -281,7 +285,7 @@ fn a_score_alias_provider_borrows_the_shared_score() {
         })
         .expect("the alias provider borrows the reseller row");
     assert_eq!(aliased.scores.elo, 1810.0);
-    assert!(aliased.score_provenance.is_routable());
+    assert_ne!(aliased.score_provenance, ScoreProvenance::Unscored);
 }
 
 #[test]

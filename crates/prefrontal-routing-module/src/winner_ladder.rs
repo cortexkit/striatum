@@ -411,15 +411,14 @@ pub(crate) fn compute_ladder(
     if observed.is_empty() {
         return Ok(None);
     }
-    // Multipliers are process-wide and priced into facts as they are read, so
-    // they must be loaded BEFORE the facts, as `route.select` does. Read in the
-    // other order, the first ladder after boot priced every subscription route
-    // at list price and disagreed with every later ladder on identical facts.
-    // A broken document keeps the last good multipliers, as selection does.
+    // Multipliers come from the same routing config snapshot a selection reads,
+    // so the ladder prices facts exactly as `route.select` does, including its
+    // first computation after boot. A broken document keeps the last good
+    // multipliers, as selection does.
     let live_config = config_overrides::live_config(&sources.routing_config);
     let now = now_ms() as f64;
-    let mut facts = live_config
-        .prepare(|| store.get_facts_with_observed_speed(now))
+    let mut facts = store
+        .get_facts_with_observed_speed(now, live_config.pricing())
         .map_err(|error| format!("reading facts: {error}"))?;
     let routing_config = live_config.apply(&mut facts).routing_config;
     let min_best_effort_adequacy = live_config.min_band();

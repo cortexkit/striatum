@@ -8,7 +8,7 @@ use crate::{
     quota_consumer::QuotaConsumer,
 };
 use prefrontal_routing_core::{
-    model_facts::{get_keep_free_percent, make_capacity_key},
+    model_facts::{make_capacity_key, RoutePricing},
     model_router::ModelRouteStateSnapshot,
     subscription::{
         MeasuredValue, QuotaAccount, SubscriptionPlan, SubscriptionPool, DEFAULT_PLAN_FEE_USD,
@@ -260,8 +260,7 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
             })
             .or_else(|| astro_fee(report, &reading.provider, &reading.account_id, now))
             .unwrap_or(DEFAULT_PLAN_FEE_USD);
-        let pool = out
-            .pools
+        out.pools
             .entry(provider.into())
             .or_insert_with(|| SubscriptionPool {
                 provider: provider.into(),
@@ -269,7 +268,6 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
                 now_ms: now,
                 ..Default::default()
             });
-        pool.keep_free_percent = get_keep_free_percent(provider);
         let Some(account) = account(&reading.entry, now) else {
             continue;
         };
@@ -381,8 +379,28 @@ pub(crate) fn health_detail() -> Value {
         .unwrap_or(Value::Null)
 }
 
-pub(crate) fn overlay(snapshot: &mut ModelRouteStateSnapshot, facts: &[ModelFact], now: i64) {
-    let mut pools = cache().lock().map(|c| c.pools.clone()).unwrap_or_default();
+pub(crate) fn overlay(
+    snapshot: &mut ModelRouteStateSnapshot,
+    facts: &[ModelFact],
+    now: i64,
+    pricing: &RoutePricing,
+) {
+    let pools = cache().lock().map(|c| c.pools.clone()).unwrap_or_default();
+    overlay_pools(pools, snapshot, facts, now, pricing);
+}
+
+/// Attach the cached subscription pools to the selection's snapshot. Every
+/// pool takes its keep-free reserve from the selection's `pricing`, including a
+/// pool whose provider has no fact here: `set_banked_allowance` compares pools
+/// with each other, so one pool on a reserve read at an earlier refresh would
+/// change whether the others may spend banked resets.
+fn overlay_pools(
+    mut pools: HashMap<String, SubscriptionPool>,
+    snapshot: &mut ModelRouteStateSnapshot,
+    facts: &[ModelFact],
+    now: i64,
+    pricing: &RoutePricing,
+) {
     for fact in facts {
         let pool = pools
             .entry(fact.provider_id.clone())
@@ -390,12 +408,12 @@ pub(crate) fn overlay(snapshot: &mut ModelRouteStateSnapshot, facts: &[ModelFact
                 provider: fact.provider_id.clone(),
                 ..Default::default()
             });
-        pool.keep_free_percent = get_keep_free_percent(&fact.provider_id);
         if pool.plans.is_empty() {
             pool.plans.push(fallback_plan());
         }
     }
-    for pool in pools.values_mut() {
+    for (provider, pool) in pools.iter_mut() {
+        pool.keep_free_percent = pricing.keep_free_percent(provider);
         let elapsed = (now - pool.now_ms).max(0) as f64 / 3_600_000.0;
         for plan in &mut pool.plans {
             if elapsed > 0.25 {
@@ -701,6 +719,45 @@ mod tests {
                 .unwrap()
                 .banked_resets_applied,
             1
+        );
+    }
+
+    #[test]
+    fn every_pool_is_reserved_on_the_selection_pricing_including_providers_without_facts() {
+        // The cached anthropic pool still carries the 0% reserve in force when
+        // the cache was last refreshed; this selection's configuration keeps
+        // all of anthropic's quota free. Only openai has catalog facts.
+        let mut pools = build(&state(3.0, None), &report(), &prices(), NOW).pools;
+        pools.get_mut("anthropic").unwrap().keep_free_percent = 0.0;
+        let mut codex = pools["anthropic"].clone();
+        codex.provider = "openai".into();
+        codex.plans[0].accounts[0].weekly_used = 95.0;
+        pools.insert("openai".into(), codex);
+        let pricing = RoutePricing {
+            keep_free_percent: HashMap::from([("anthropic".into(), 100.0)]),
+            ..Default::default()
+        };
+        let facts: Vec<ModelFact> = vec![serde_json::from_value(json!({
+            "providerID":"openai", "modelID":"gpt-6-luna", "confidence":"curated",
+            "scores":{"elo":1641.0,"eq":1555.0,"speed":0.0}, "costPerMTokOut":0.5
+        }))
+        .unwrap()];
+        let mut snapshot = ModelRouteStateSnapshot::default();
+
+        overlay_pools(pools, &mut snapshot, &facts, NOW, &pricing);
+
+        // Under the selection's reserve anthropic has no free headroom, so the
+        // nearly spent openai plan may fall back on its banked resets. Judged on
+        // the stale 0% reserve, anthropic would look free and forbid them.
+        let openai = snapshot.by_capacity["openai/gpt-6-luna"]
+            .subscription_pool
+            .as_ref()
+            .unwrap();
+        assert_eq!(openai.keep_free_percent, 0.0);
+        assert!(
+            openai.allow_banked,
+            "{}",
+            openai.reserve_diagnostic(openai.keep_free_percent, false)
         );
     }
 

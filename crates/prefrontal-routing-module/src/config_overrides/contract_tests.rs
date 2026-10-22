@@ -392,6 +392,33 @@ refusal_case!(
     r#"{"model_routing":{"variants":{"mason":{"openai/gpt-6":" "}}}}"#,
     "must be one non-empty word"
 );
+// Pricing and reserve values are checked when a document is published, so an
+// invalid multiplier or reserve never reaches a selection's pricing snapshot.
+refusal_case!(
+    speed_multiplier_above_two,
+    r#"{"model_routing":{"models":{"openai/gpt-6":{"speed_multiplier":2.5}}}}"#,
+    "invalid cost/speed override for openai/gpt-6"
+);
+refusal_case!(
+    speed_multiplier_zero,
+    r#"{"model_routing":{"models":{"openai/gpt-6":{"speed_multiplier":0}}}}"#,
+    "invalid cost/speed override for openai/gpt-6"
+);
+refusal_case!(
+    route_subscription_multiplier_zero,
+    r#"{"model_routing":{"models":{"openai/gpt-6":{"subscription_multiplier":0}}}}"#,
+    "invalid positive model override for openai/gpt-6"
+);
+refusal_case!(
+    provider_subscription_multiplier_negative,
+    r#"{"model_routing":{"subscription_multipliers":{"openai":-1}}}"#,
+    "invalid subscription_multiplier for openai"
+);
+refusal_case!(
+    keep_free_percent_above_hundred,
+    r#"{"model_routing":{"keep_free_percent":{"anthropic":101}}}"#,
+    "invalid keep_free_percent for anthropic"
+);
 
 fn reasoning_catalog(entries: &[(&str, &[&str])]) -> ReasoningCatalogSource {
     let catalog = ReasoningCatalog {

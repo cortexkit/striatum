@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prefrontal_routing_core::model_facts::{
-    Confidence, ModelFact, ModelPromptDefaults, ModelScores, ScoreProvenance,
+    Confidence, ModelFact, ModelPromptDefaults, ModelScores, RoutePricing, ScoreProvenance,
 };
 use prefrontal_routing_core::{
     admit_routes, derive_provider_key, make_capacity_key, make_route_key, relax_earliest_reset,
@@ -2083,7 +2083,9 @@ fn aggregated_observed_speeds_match_the_former_per_fact_overlay() {
         })
         .collect();
 
-    let aggregated = store.get_facts_with_observed_speed(now).unwrap();
+    let aggregated = store
+        .get_facts_with_observed_speed(now, &RoutePricing::default())
+        .unwrap();
     for fact in aggregated.iter().filter(|fact| fact.provider_id == "p") {
         let route_key = make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
         assert_eq!(
@@ -2101,7 +2103,9 @@ fn facts_with_observed_speed_overlays_only_routes_with_trusted_signal() {
         .upsert_fact(&fact("p", "m"), FactSource::Override)
         .unwrap();
     // Without observations, the seed speed (90) survives.
-    let before = store.get_facts_with_observed_speed(10_000.0).unwrap();
+    let before = store
+        .get_facts_with_observed_speed(10_000.0, &RoutePricing::default())
+        .unwrap();
     let pm_before = before
         .iter()
         .find(|f| f.provider_id == "p" && f.model_id == "m")
@@ -2119,7 +2123,9 @@ fn facts_with_observed_speed_overlays_only_routes_with_trusted_signal() {
             ))
             .unwrap();
     }
-    let after = store.get_facts_with_observed_speed(10_000.0).unwrap();
+    let after = store
+        .get_facts_with_observed_speed(10_000.0, &RoutePricing::default())
+        .unwrap();
     let pm_after = after
         .iter()
         .find(|f| f.provider_id == "p" && f.model_id == "m")
@@ -2168,7 +2174,7 @@ fn one_runaway_sample_does_not_set_the_observed_speed() {
         "observed speed should follow the ordinary samples, got {speed}"
     );
     let overlaid = store
-        .get_facts_with_observed_speed(now)
+        .get_facts_with_observed_speed(now, &RoutePricing::default())
         .unwrap()
         .into_iter()
         .find(|f| f.provider_id == "p" && f.model_id == "m")
@@ -2212,7 +2218,9 @@ fn an_unmeasured_route_enters_at_the_fleet_median_rather_than_at_zero() {
         .upsert_fact(&unmeasured, FactSource::Override)
         .unwrap();
 
-    let facts = store.get_facts_with_observed_speed(10_000.0).unwrap();
+    let facts = store
+        .get_facts_with_observed_speed(10_000.0, &RoutePricing::default())
+        .unwrap();
     let speed_of = |model: &str| {
         facts
             .iter()
@@ -2241,7 +2249,9 @@ fn an_unmeasured_route_enters_at_the_fleet_median_rather_than_at_zero() {
     let seeded = fact("p", "seeded");
     assert!(seeded.scores.speed > 0.0, "fixture must carry a seed speed");
     store.upsert_fact(&seeded, FactSource::Override).unwrap();
-    let facts = store.get_facts_with_observed_speed(10_000.0).unwrap();
+    let facts = store
+        .get_facts_with_observed_speed(10_000.0, &RoutePricing::default())
+        .unwrap();
     let seeded_after = facts
         .iter()
         .find(|f| f.provider_id == "p" && f.model_id == "seeded")
@@ -2501,18 +2511,14 @@ fn migration_007_rebases_catalog_and_preserves_overrides() {
 fn speed_multiplier_applies_after_observed_speed_overlay() {
     let rig = Rig::new("speed-multiplier-overlay");
     let store = rig.open();
-    // set_speed_multipliers replaces a PROCESS-GLOBAL map with no restore, and
-    // tests share the process: keying this test on the fixture-standard "p/m"
-    // halved every later reader's p/m speed (90 -> 45) whenever the scheduler
-    // ran this test first - green locally, red on CI's core count. A route key
-    // no other test reads removes the collision domain instead of racing it.
     store
         .upsert_fact(&fact("pmult", "mmult"), FactSource::Override)
         .unwrap();
 
-    let mut multipliers = std::collections::HashMap::new();
-    multipliers.insert("pmult/mmult".to_string(), 0.5);
-    prefrontal_routing_core::model_facts::set_speed_multipliers(multipliers);
+    let pricing = RoutePricing {
+        speed_multipliers: [("pmult/mmult".to_string(), 0.5)].into(),
+        ..Default::default()
+    };
 
     for i in 0..5 {
         store
@@ -2526,7 +2532,9 @@ fn speed_multiplier_applies_after_observed_speed_overlay() {
             .unwrap();
     }
 
-    let after = store.get_facts_with_observed_speed(10_000.0).unwrap();
+    let after = store
+        .get_facts_with_observed_speed(10_000.0, &pricing)
+        .unwrap();
     let pm_after = after
         .iter()
         .find(|f| f.provider_id == "pmult" && f.model_id == "mmult")
@@ -3382,7 +3390,9 @@ fn get_facts_with_observed_speed_computes_class_vector_arithmetic_mean_over_trai
             .unwrap();
     }
 
-    let facts = store.get_facts_with_observed_speed(now).unwrap();
+    let facts = store
+        .get_facts_with_observed_speed(now, &RoutePricing::default())
+        .unwrap();
     assert!(!facts.is_empty());
     for fact in &facts {
         let vec = fact
@@ -3715,7 +3725,9 @@ fn planted_rows_of_each_enumerated_class_produce_four_separate_vectors_and_selec
         .is_none());
     assert!(store.get_class_vector("", now).unwrap().is_none());
 
-    let facts = store.get_facts_with_observed_speed(now).unwrap();
+    let facts = store
+        .get_facts_with_observed_speed(now, &RoutePricing::default())
+        .unwrap();
     for fact in facts {
         let cv = fact.class_vector.as_ref().unwrap();
         assert_eq!(cv.workload_class, "ephemeral");
@@ -3782,7 +3794,9 @@ fn class_vector_lands_as_overlay_value_and_is_never_written_back_to_stored_fact(
     );
 
     // Run overlay: now selection_cost changes
-    let overlaid = store.get_facts_with_observed_speed(now).unwrap();
+    let overlaid = store
+        .get_facts_with_observed_speed(now, &RoutePricing::default())
+        .unwrap();
     let overlaid_fact = overlaid
         .into_iter()
         .find(|f| f.provider_id == "p" && f.model_id == "custom-model")
@@ -4077,7 +4091,9 @@ fn mutation_persisting_vector_onto_stored_fact_row_reddens() {
             .unwrap();
     }
 
-    let overlaid = store.get_facts_with_observed_speed(now).unwrap();
+    let overlaid = store
+        .get_facts_with_observed_speed(now, &RoutePricing::default())
+        .unwrap();
     let overlaid_fact = overlaid
         .into_iter()
         .find(|f| f.provider_id == "p" && f.model_id == "persist-test")

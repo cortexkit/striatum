@@ -11,7 +11,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::config_policy::{ExcludeGroups, PanelPolicies, Pins, VariantGroups};
 use crate::substrate_policy::SubstrateGroups;
-use prefrontal_routing_core::model_facts::{Confidence, ModelFact, ModelScores, ScoreProvenance};
+use prefrontal_routing_core::model_facts::{
+    Confidence, ModelFact, ModelScores, RoutePricing, ScoreProvenance,
+};
 use prefrontal_routing_core::{
     make_capacity_key, make_route_key, FailureBackoffConfig, FamilySource, GrandFamily,
     ModelRoutingPolicyInput, OverqualificationConfig, RouteStateStore, RoutingConfig,
@@ -45,6 +47,36 @@ mod contract_tests;
 pub struct LiveConfig {
     config: RoutingConfigFile,
     document: Option<String>,
+    pricing: RoutePricing,
+}
+
+impl LiveConfig {
+    fn new(config: RoutingConfigFile, document: Option<String>) -> Self {
+        let pricing = route_pricing(&config.model_routing);
+        Self {
+            config,
+            document,
+            pricing,
+        }
+    }
+}
+
+/// Collect a validated section's pricing and reserve settings into one value.
+fn route_pricing(section: &ModelRoutingSection) -> RoutePricing {
+    let mut pricing = RoutePricing {
+        subscription_multipliers: section.subscription_multipliers.clone(),
+        keep_free_percent: section.keep_free_percent.clone(),
+        ..Default::default()
+    };
+    for (key, model) in &section.models {
+        if let Some(value) = model.speed_multiplier {
+            pricing.speed_multipliers.insert(key.clone(), value);
+        }
+        if let Some(value) = model.subscription_multiplier {
+            pricing.subscription_multipliers.insert(key.clone(), value);
+        }
+    }
+    pricing
 }
 
 type FileStamp = Option<(SystemTime, u64)>;
@@ -329,7 +361,7 @@ fn live_config_at_with_reporter(
             None => RoutingConfigFile::default(),
         };
         check_variants_against_catalog(path, &config)?;
-        Ok(LiveConfig { config, document })
+        Ok(LiveConfig::new(config, document))
     })();
     let active = match next {
         Ok(config) => Arc::new(config),
@@ -503,41 +535,11 @@ impl LiveConfig {
             .clone()
     }
 
-    /// The store reads speed and subsidy multipliers from process-wide maps while
-    /// loading measured speeds. Replace the maps and copy the request's facts and
-    /// quota state under one lock, so another selection or winner-ladder read
-    /// cannot change settings halfway through. Release the lock before scoring
-    /// or awaiting; the returned snapshots are independent copies.
-    pub fn prepare<T>(&self, read_snapshot: impl FnOnce() -> T) -> T {
-        self.prepare_with_timing(read_snapshot).0
-    }
-
-    pub fn prepare_with_timing<T>(
-        &self,
-        read_snapshot: impl FnOnce() -> T,
-    ) -> (T, Duration, Duration) {
-        static PREPARE: Mutex<()> = Mutex::new(());
-        let waiting = Instant::now();
-        let _guard = PREPARE.lock().unwrap();
-        let wait = waiting.elapsed();
-        let mut speeds = HashMap::new();
-        let mut subsidies = self.config.model_routing.subscription_multipliers.clone();
-        for (key, model) in &self.config.model_routing.models {
-            if let Some(value) = model.speed_multiplier {
-                speeds.insert(key.clone(), value);
-            }
-            if let Some(value) = model.subscription_multiplier {
-                subsidies.insert(key.clone(), value);
-            }
-        }
-        prefrontal_routing_core::model_facts::set_speed_multipliers(speeds);
-        prefrontal_routing_core::model_facts::set_subscription_multipliers(subsidies);
-        prefrontal_routing_core::model_facts::set_keep_free_percent(
-            self.config.model_routing.keep_free_percent.clone(),
-        );
-        let snapshot_started = Instant::now();
-        let snapshot = read_snapshot();
-        (snapshot, wait, snapshot_started.elapsed())
+    /// This document's speed multipliers, subscription multipliers and keep-free
+    /// percentages. Built once when the document is published, so every reader
+    /// holding this snapshot sees the same values.
+    pub fn pricing(&self) -> &RoutePricing {
+        &self.pricing
     }
 
     pub fn apply(&self, facts: &mut Vec<ModelFact>) -> SelectionOverrideOutcome {
@@ -1406,89 +1408,6 @@ pub fn read_min_best_effort_adequacy(path: &std::path::Path) -> Result<Option<f6
     }
 }
 
-/// Refresh route multipliers before facts are loaded for a selection. Removing
-/// the config file or a multiplier clears its previous value on the next request.
-#[cfg(test)]
-pub fn reload_live_multipliers(path: &Path) -> Result<(), String> {
-    let document = match std::fs::read_to_string(path) {
-        Ok(document) => document,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            prefrontal_routing_core::model_facts::set_speed_multipliers(HashMap::new());
-            prefrontal_routing_core::model_facts::set_subscription_multipliers(HashMap::new());
-            prefrontal_routing_core::model_facts::set_keep_free_percent(HashMap::new());
-            return Ok(());
-        }
-        Err(error) => return Err(format!("reading {}: {error}", path.display())),
-    };
-    let parsed = jsonc_to_json(&document)
-        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))
-        .and_then(|json| {
-            serde_json::from_str::<RoutingConfigFile>(&json)
-                .map_err(|error| format!("invalid config in {}: {error}", path.display()))
-        });
-    // A document that does not parse is an operator mid-edit, not a decision to
-    // withdraw every multiplier: keep the last good maps for this selection and
-    // report the error. Wiping them here priced every subscription route at list
-    // (openai at 33x) for as long as the file stayed broken. A missing file is the
-    // withdrawal and clears above.
-    let config = parsed?;
-
-    let mut keep_free = HashMap::new();
-    for (provider, value) in config.model_routing.keep_free_percent {
-        if value.is_finite() && (0.0..=100.0).contains(&value) && !provider.trim().is_empty() {
-            keep_free.insert(provider.trim().to_string(), value);
-        } else {
-            return Err(format!(
-                "invalid keep_free_percent for {provider}: must be in 0..100"
-            ));
-        }
-    }
-
-    let mut speed_multipliers = HashMap::new();
-    let mut subscription_multipliers = HashMap::new();
-    for (provider, value) in config.model_routing.subscription_multipliers {
-        let provider = provider.trim().to_string();
-        if provider.is_empty() {
-            continue;
-        }
-        if value.is_finite() && value > 0.0 {
-            subscription_multipliers.insert(provider, value);
-        } else {
-            eprintln!(
-                "[prefrontal-routing] invalid subscription_multiplier for provider {provider}: {value}; ignoring"
-            );
-        }
-    }
-    for (key, model) in config.model_routing.models {
-        let Some((provider, model_id, variant)) = parse_model_key(&key) else {
-            continue;
-        };
-        let route_key = make_route_key(&provider, &model_id, variant.as_deref());
-        if let Some(value) = model.speed_multiplier {
-            if value.is_finite() && value > 0.0 && value <= 2.0 {
-                speed_multipliers.insert(route_key.clone(), value);
-            } else {
-                eprintln!(
-                    "[prefrontal-routing] invalid speed_multiplier for route {route_key}: {value}; ignoring"
-                );
-            }
-        }
-        if let Some(value) = model.subscription_multiplier {
-            if value.is_finite() && value > 0.0 {
-                subscription_multipliers.insert(route_key, value);
-            } else {
-                eprintln!(
-                    "[prefrontal-routing] invalid subscription_multiplier for route {route_key}: {value}; ignoring"
-                );
-            }
-        }
-    }
-    prefrontal_routing_core::model_facts::set_speed_multipliers(speed_multipliers);
-    prefrontal_routing_core::model_facts::set_subscription_multipliers(subscription_multipliers);
-    prefrontal_routing_core::model_facts::set_keep_free_percent(keep_free);
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectionOverrideOutcome {
     pub routing_config: RoutingConfig,
@@ -1859,8 +1778,6 @@ fn apply_overrides<S: RouteStateStore>(
 
     let mut outcome = OverrideOutcome::default();
     let mut next_override_keys: HashSet<String> = HashSet::new();
-    let mut speed_multipliers = HashMap::new();
-    let mut subscription_multipliers = HashMap::new();
 
     for (key, ov) in overrides {
         let Some((provider_id, model_id, variant)) = parse_model_key(key) else {
@@ -1868,30 +1785,6 @@ fn apply_overrides<S: RouteStateStore>(
             continue;
         };
         let route_key = make_route_key(&provider_id, &model_id, variant.as_deref());
-        if let Some(val) = ov.speed_multiplier {
-            if val.is_finite() && val > 0.0 && val <= 2.0 {
-                speed_multipliers.insert(route_key.clone(), val);
-            } else {
-                eprintln!(
-                    "[prefrontal-routing] invalid speed_multiplier for route {}: {}, skipping multiplier",
-                    route_key, val
-                );
-            }
-        }
-        if let Some(val) = ov.subscription_multiplier {
-            // A subsidy multiplier divides list price, so it must be finite and
-            // strictly positive; zero or negative would divide by zero or flip the
-            // price negative. There is deliberately no upper cap here (unlike
-            // speed_multiplier): a measured API-to-subscription ratio may exceed 1.0.
-            if val.is_finite() && val > 0.0 {
-                subscription_multipliers.insert(route_key.clone(), val);
-            } else {
-                eprintln!(
-                    "[prefrontal-routing] invalid subscription_multiplier for route {}: {}, skipping multiplier",
-                    route_key, val
-                );
-            }
-        }
         let existing_fact = store
             .get_fact_by_route_key(&route_key)
             .map_err(|error| format!("reading override base {route_key}: {error}"))?;
@@ -1995,23 +1888,7 @@ fn apply_overrides<S: RouteStateStore>(
         outcome.reverted += 1;
     }
 
-    prefrontal_routing_core::model_facts::set_speed_multipliers(speed_multipliers);
-    prefrontal_routing_core::model_facts::set_subscription_multipliers(subscription_multipliers);
-
     Ok(outcome)
-}
-
-#[cfg(test)]
-/// SUBSCRIPTION_MULTIPLIERS and SPEED_MULTIPLIERS in model_facts are process-global
-/// maps that the setters REPLACE wholesale. Tests that load a config and then read
-/// a map race every other test that writes one, including the select-request tests
-/// in main.rs, whose handler reloads the maps from its routing config path on every
-/// request (a fixture path with no multipliers writes empty maps). Every test that
-/// writes or asserts on the maps holds this guard.
-#[cfg(test)]
-pub(crate) fn multiplier_map_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -2126,7 +2003,6 @@ mod tests {
 
     #[test]
     fn withdrawing_vision_restores_seed_and_clears_provenance_while_eq_remains() {
-        let _guard = multiplier_map_guard();
         let (root, config_path, store) = family_rule_rig("withdraw-vision");
         let route_key = "anthropic/claude-opus-4-5";
         let seed = model_facts_seed()
@@ -2173,7 +2049,6 @@ mod tests {
 
     #[test]
     fn upsert_placed_score_survives_config_entry_that_does_not_name_it() {
-        let _guard = multiplier_map_guard();
         let (root, config_path, store) = family_rule_rig("preserve-upsert-score");
         let route_key = "anthropic/claude-opus-4-5";
         let mut placed = store.get_fact_by_route_key(route_key).unwrap().unwrap();
@@ -2207,7 +2082,6 @@ mod tests {
     /// only a withdrawn operator stamp authorizes a restore.
     #[test]
     fn unstamped_catalog_field_keeps_its_served_value_across_reconciliation() {
-        let _guard = multiplier_map_guard();
         let (root, config_path, store) = family_rule_rig("unstamped-served");
         let route_key = "anthropic/claude-opus-4-5";
         let seed_context = model_facts_seed()
@@ -2245,7 +2119,6 @@ mod tests {
 
     #[test]
     fn reconciliation_preserves_a_catalog_field_still_named_by_override() {
-        let _guard = multiplier_map_guard();
         let (root, config_path, store) = family_rule_rig("preserve-named-field");
         let route_key = "anthropic/claude-opus-4-5";
         let seed_cost = model_facts_seed()
@@ -2299,7 +2172,6 @@ mod tests {
 
     #[test]
     fn explicit_family_override_beats_matching_rule() {
-        let _guard = multiplier_map_guard();
         let (root, config_path, store) = family_rule_rig("override-wins");
         std::fs::write(
             &config_path,
@@ -2323,7 +2195,6 @@ mod tests {
 
     #[test]
     fn family_glob_order_uses_the_first_written_match() {
-        let _guard = multiplier_map_guard();
         let (root, config_path, store) = family_rule_rig("first-match");
         std::fs::write(
             &config_path,
@@ -2349,7 +2220,6 @@ mod tests {
 
     #[test]
     fn example_family_rules_cover_every_seed_catalog_row() {
-        let _guard = multiplier_map_guard();
         let (root, _config_path, store) = family_rule_rig("example-coverage");
         let example = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../assets/alfonso-routing.example.jsonc");
@@ -2378,184 +2248,8 @@ mod tests {
     }
 
     #[test]
-    fn validates_speed_multiplier_at_load() {
-        let _guard = multiplier_map_guard();
-        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
-            "prefrontal-routing-overrides-test-{}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("store.db");
-        let descriptor =
-            dev_descriptor("prefrontal-routing", db_path.to_string_lossy().into_owned());
-        let store = SqliteRouteStateStore::open(&descriptor).expect("open test store");
-
-        let config_content = r#"{
-            "model_routing": {
-                "models": {
-                    "openai/gpt-5.5": {
-                        "speed_multiplier": 0.5
-                    },
-                    "openai/gpt-5.4": {
-                        "speed_multiplier": 0.0
-                    },
-                    "openai/gpt-5.4-mini": {
-                        "speed_multiplier": -1.0
-                    },
-                    "openai/gpt-5.4-fast": {
-                        "speed_multiplier": 2.5
-                    },
-                    "openai/gpt-5.4-mini-fast": {
-                        "speed_multiplier": null
-                    }
-                }
-            }
-        }"#;
-        let config_path = dir.join("prefrontal-routing.jsonc");
-        std::fs::write(&config_path, config_content).unwrap();
-
-        let outcome = apply_overrides_from_config(&store, &config_path).unwrap();
-        assert_eq!(outcome.applied, 5);
-
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.5"),
-            Some(0.5)
-        );
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.4"),
-            None
-        );
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.4-mini"),
-            None
-        );
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.4-fast"),
-            None
-        );
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.4-mini-fast"),
-            None
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn validates_nan_speed_multiplier() {
-        let _guard = multiplier_map_guard();
-        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
-            "prefrontal-routing-overrides-nan-test-{}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("store.db");
-        let descriptor =
-            dev_descriptor("prefrontal-routing", db_path.to_string_lossy().into_owned());
-        let store = SqliteRouteStateStore::open(&descriptor).expect("open test store");
-
-        let mut overrides = HashMap::new();
-        overrides.insert(
-            "openai/gpt-5.5".to_string(),
-            ModelFactOverride {
-                family: None,
-                elo: None,
-                eq: None,
-                speed: None,
-                cost_per_mtok_out: None,
-                context_window: None,
-                vision: None,
-                speed_multiplier: Some(f64::NAN),
-                subscription_multiplier: None,
-            },
-        );
-
-        let outcome = apply_overrides(&store, &overrides).unwrap();
-        assert_eq!(outcome.applied, 1);
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.5"),
-            None
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn validates_subscription_multiplier_at_load() {
-        let _guard = multiplier_map_guard();
-        use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
-            "prefrontal-routing-sub-multiplier-test-{}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("store.db");
-        let descriptor =
-            dev_descriptor("prefrontal-routing", db_path.to_string_lossy().into_owned());
-        let store = SqliteRouteStateStore::open(&descriptor).expect("open test store");
-
-        // 2.0 is a valid subsidy (halves effective price) and must be accepted; 0.0
-        // and -1.0 would divide by zero / flip the price negative and are rejected
-        // and logged rather than applied.
-        let config_content = r#"{
-            "model_routing": {
-                "models": {
-                    "openai/gpt-5.5": {
-                        "subscription_multiplier": 2.0
-                    },
-                    "openai/gpt-5.4": {
-                        "subscription_multiplier": 0.0
-                    },
-                    "openai/gpt-5.4-mini": {
-                        "subscription_multiplier": -1.0
-                    }
-                }
-            }
-        }"#;
-        let config_path = dir.join("prefrontal-routing.jsonc");
-        std::fs::write(&config_path, config_content).unwrap();
-
-        let outcome = apply_overrides_from_config(&store, &config_path).unwrap();
-        assert_eq!(outcome.applied, 3);
-
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.5"),
-            Some(2.0)
-        );
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.4"),
-            None
-        );
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier(
-                "openai/gpt-5.4-mini"
-            ),
-            None
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn unreadable_override_base_is_not_replaced_from_defaults() {
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
-        // The loader replaces the process-global multiplier maps on its early
-        // arms too; serialize with the other loader tests.
-        let _guard = multiplier_map_guard();
         let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-override-read-fault-{}-{}",
             std::process::id(),
@@ -2603,9 +2297,6 @@ mod tests {
     #[test]
     fn unreadable_stale_override_base_is_not_reverted_from_seed() {
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
-        // The loader replaces the process-global multiplier maps on its early
-        // arms too; serialize with the other loader tests.
-        let _guard = multiplier_map_guard();
         let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-stale-override-read-fault-{}-{}",
             std::process::id(),
@@ -2654,7 +2345,6 @@ mod tests {
 
     #[test]
     fn removing_an_override_demotes_the_row_and_never_deletes_it() {
-        let _guard = multiplier_map_guard();
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
         // A migration-seeded fact (absent from the compiled JSON seed) whose
         // config override disappears must SURVIVE as source='seed'. The delete
@@ -2701,113 +2391,6 @@ mod tests {
         assert!(
             fact.is_some(),
             "removing an override must never delete a migration-seeded fact"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The routing config is hand-edited; a save mid-edit must not price every
-    /// subscription route at list until the next save. Only a missing file withdraws.
-    #[test]
-    fn unparseable_routing_config_keeps_the_last_good_multipliers() {
-        let _guard = multiplier_map_guard();
-        let dir = prefrontal_test_support::scratch_root().join(format!(
-            "prefrontal-routing-reload-lastgood-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
-            &config_path,
-            r#"{"model_routing":{"subscription_multipliers":{"openai":33.0},"models":{"openai/gpt-5.5":{"speed_multiplier":0.5}}}}"#,
-        )
-        .unwrap();
-        super::reload_live_multipliers(&config_path).unwrap();
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.5"),
-            Some(33.0)
-        );
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.5"),
-            Some(0.5)
-        );
-
-        std::fs::write(
-            &config_path,
-            r#"{"model_routing":{"subscription_multipliers":{"openai": 33."#,
-        )
-        .unwrap();
-        let error = super::reload_live_multipliers(&config_path).unwrap_err();
-        assert!(error.contains("invalid"), "{error}");
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.5"),
-            Some(33.0),
-            "a parse error keeps the last good subscription multiplier"
-        );
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_speed_multiplier("openai/gpt-5.5"),
-            Some(0.5)
-        );
-
-        std::fs::remove_file(&config_path).unwrap();
-        super::reload_live_multipliers(&config_path).unwrap();
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier("openai/gpt-5.5"),
-            None,
-            "a missing file withdraws"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn provider_level_subscription_multipliers_apply_with_route_override() {
-        let _guard = multiplier_map_guard();
-        // The subsidy is a property of the account serving the provider, so the
-        // provider key is the primary shape: every model inherits it, including
-        // ones that did not exist when the config was written (the per-model
-        // repetition let a new model ship unpriced). A per-route entry still
-        // overrides its provider's value.
-        let dir = prefrontal_test_support::scratch_root().join(format!(
-            "prefrontal-routing-provider-mult-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("routing.jsonc");
-        std::fs::write(
-            &config_path,
-            r##"{
-                "model_routing": {
-                    "subscription_multipliers": { "openai": 40.0, "bogus": -1.0 },
-                    "models": {
-                        "openai/special-route": { "subscription_multiplier": 5.0 }
-                    }
-                }
-            }"##,
-        )
-        .unwrap();
-
-        super::reload_live_multipliers(&config_path).unwrap();
-        // Any model on the provider inherits, including never-listed ones.
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier(
-                "openai/brand-new-model"
-            ),
-            Some(40.0)
-        );
-        // A per-route entry overrides its provider's value.
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier(
-                "openai/special-route"
-            ),
-            Some(5.0)
-        );
-        // Invalid provider values are rejected, not applied.
-        assert_eq!(
-            prefrontal_routing_core::model_facts::get_subscription_multiplier("bogus/anything"),
-            None
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3354,38 +2937,74 @@ mod catalog_poll_tests {
 }
 
 #[cfg(test)]
-mod keep_free_tests {
+mod route_pricing_tests {
     use super::*;
-    use prefrontal_routing_core::model_facts::get_keep_free_percent;
 
+    /// Pricing and reserve settings travel with the published document: a
+    /// selection that holds one snapshot keeps its prices and reserves while
+    /// later edits publish, are refused, or withdraw the file.
     #[test]
-    fn keep_free_percent_is_live_validated_and_withdrawn_when_missing() {
-        let _guard = multiplier_map_guard();
+    fn published_pricing_belongs_to_its_snapshot_and_reloads_never_alter_it() {
         let dir = prefrontal_test_support::scratch_root()
-            .join(format!("routing-keep-free-{}", std::process::id()));
+            .join(format!("routing-pricing-snapshot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing.jsonc");
         std::fs::write(
             &path,
-            r#"{"model_routing":{"keep_free_percent":{"anthropic":20,"openai":100}}}"#,
+            r#"{"model_routing":{
+                "subscription_multipliers":{"openai":40.0},
+                "keep_free_percent":{"anthropic":20},
+                "models":{"openai/special-route":{"subscription_multiplier":5.0,"speed_multiplier":0.5}}
+            }}"#,
         )
         .unwrap();
-        reload_live_multipliers(&path).unwrap();
-        assert_eq!(get_keep_free_percent("anthropic"), 20.0);
-        assert_eq!(get_keep_free_percent("openai"), 100.0);
-        assert_eq!(get_keep_free_percent("unknown"), 0.0);
+        let held = settle_live_config(&path);
+        let pricing = held.pricing();
+        // Every model on a provider inherits the provider's subsidy, including
+        // one the config never names; a per-route entry overrides it.
+        assert_eq!(
+            pricing.subscription_multiplier("openai/brand-new-model"),
+            Some(40.0)
+        );
+        assert_eq!(
+            pricing.subscription_multiplier("openai/special-route"),
+            Some(5.0)
+        );
+        assert_eq!(pricing.subscription_multiplier("xai/grok-5"), None);
+        assert_eq!(pricing.speed_multiplier("openai/special-route"), Some(0.5));
+        assert_eq!(pricing.speed_multiplier("openai/brand-new-model"), None);
+        assert_eq!(pricing.keep_free_percent("anthropic"), 20.0);
+        assert_eq!(pricing.keep_free_percent("unknown"), 0.0);
+
+        // An invalid edit is refused whole, so the published pricing stays.
         std::fs::write(
             &path,
             r#"{"model_routing":{"keep_free_percent":{"anthropic":101}}}"#,
         )
         .unwrap();
-        assert!(reload_live_multipliers(&path)
-            .unwrap_err()
-            .contains("0..100"));
-        assert_eq!(get_keep_free_percent("anthropic"), 20.0);
+        assert!(Arc::ptr_eq(&held, &settle_live_config(&path)));
+
+        // A valid edit publishes new pricing; the held snapshot is unchanged.
+        std::fs::write(
+            &path,
+            r#"{"model_routing":{"keep_free_percent":{"anthropic":0}}}"#,
+        )
+        .unwrap();
+        let next = settle_live_config(&path);
+        assert_eq!(next.pricing().keep_free_percent("anthropic"), 0.0);
+        assert_eq!(next.pricing().subscription_multiplier("openai/x"), None);
+        assert_eq!(held.pricing().keep_free_percent("anthropic"), 20.0);
+        assert_eq!(
+            held.pricing().subscription_multiplier("openai/x"),
+            Some(40.0)
+        );
+
+        // Removing the file withdraws every multiplier and reserve.
         std::fs::remove_file(&path).unwrap();
-        reload_live_multipliers(&path).unwrap();
-        assert_eq!(get_keep_free_percent("anthropic"), 0.0);
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            settle_live_config(&path).pricing(),
+            &RoutePricing::default()
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -12,7 +12,7 @@
 //! domain. Quota windows are NOT here; they live in `insula` (formerly `ai-provider-quota`) and are
 //! consumed module-to-module (see `crate::quota`).
 
-use crate::model_facts::{ClassVector, FamilySource, GrandFamily, ModelFact};
+use crate::model_facts::{ClassVector, FamilySource, GrandFamily, ModelFact, RoutePricing};
 use crate::model_router::ModelRouteStateSnapshot;
 
 /// Provenance of a stored fact. The closed vocabulary the router and listing ops
@@ -538,8 +538,14 @@ pub trait RouteStateStore {
     /// `overlayObservedSpeeds`: a fact's observed route key is `provider/model` +
     /// the fact's prompt-default variant (falling back to its own variant), so a
     /// max-effort sibling's observations attach to the right fact. Facts without a
-    /// trusted observation keep their seed speed.
-    fn get_facts_with_observed_speed(&self, now: f64) -> RouteStateResult<Vec<ModelFact>>;
+    /// trusted observation keep their seed speed. Speed and subscription
+    /// multipliers come from `pricing`, the caller's one copy of the operator's
+    /// settings, so every fact in the result is priced against the same values.
+    fn get_facts_with_observed_speed(
+        &self,
+        now: f64,
+        pricing: &RoutePricing,
+    ) -> RouteStateResult<Vec<ModelFact>>;
 
     /// Compute the complete-case token profile vector for a workload class over the
     /// trailing 7-day window (now - 7d, now].
