@@ -1889,6 +1889,67 @@ impl SqliteRouteStateStore {
         }).map_err(err)
     }
 
+    /// Apply the provider evidence of one panel seat to the fences of the panel
+    /// decision's consumer.
+    ///
+    /// One panel selection is one decision covering every seat, and it names no
+    /// selected route, so `set_decision_outcome` cannot tell which model a seat's
+    /// account wall belongs to and keeps only the first seat's outcome. The caller
+    /// names the route the seat ran on (`seat_route_key`, as the panel returned it,
+    /// and the variant the seat ran at); the fence is written for that route alone,
+    /// for every seat that reports, so the other seats of the same panel are not
+    /// fenced and a second seat's wall is not lost behind the first seat's outcome.
+    ///
+    /// Returns whether the decision is a panel decision this applied to. A
+    /// decision that names its own route is left to `set_decision_outcome`, which
+    /// fences the route that decision chose; an unknown decision changes nothing.
+    pub fn record_panel_seat_provider_outcome(
+        &self,
+        decision_id: &str,
+        seat_route_key: &str,
+        seat_variant: Option<&str>,
+        completed: bool,
+        provider: &prefrontal_routing_core::route_state_store::ProviderOutcome,
+        observed_at_ms: i64,
+    ) -> RouteStateResult<bool> {
+        if provider.account_ref.trim().is_empty() || seat_route_key.trim().is_empty() {
+            return Ok(false);
+        }
+        self.store
+            .with_conn(|c: &Connection| {
+                let tx = c.unchecked_transaction()?;
+                let consumer: Option<Option<String>> = tx
+                    .query_row(
+                        "SELECT consumer FROM model_route_decisions
+                         WHERE id=?1 AND decision_kind='panel' AND selected_route_key IS NULL",
+                        [decision_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(Some(consumer)) = consumer else {
+                    return Ok(false);
+                };
+                let (provider_id, model_id, catalog_variant) =
+                    route_identity(&tx, seat_route_key, None)?;
+                let executed_route = prefrontal_routing_core::make_route_key(
+                    &provider_id,
+                    &model_id,
+                    seat_variant.or(catalog_variant.as_deref()),
+                );
+                write_provider_reset_fence(
+                    &tx,
+                    &executed_route,
+                    &consumer,
+                    provider,
+                    completed,
+                    observed_at_ms,
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .map_err(err)
+    }
+
     pub fn set_decision_provider_identity(
         &self,
         decision_id: &str,
@@ -3210,16 +3271,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                         [decision_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
                     if let (Some(consumer), Some(provider_id), Some(model_id), variant) = scope {
                         let executed_route = prefrontal_routing_core::make_route_key(&provider_id, &model_id, variant.as_deref());
-                        if update.outcome == prefrontal_routing_core::RouteOutcome::Completed {
-                            tx.execute("DELETE FROM provider_reset_fences WHERE route_key=?1 AND consumer=?2 AND (account_ref=?3 OR (credential_id IS NOT NULL AND credential_id=?5)) AND observed_at_ms<=?4",
-                                params![executed_route, consumer, provider.account_ref, update.observed_at_ms, provider.credential_id])?;
-                        } else if let Some(reset) = provider.resets_at_ms.filter(|at| *at > update.observed_at_ms) {
-                            tx.execute("INSERT INTO provider_reset_fences (route_key,consumer,account_ref,credential_id,resets_at_ms,observed_at_ms)
-                                VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(route_key,consumer,account_ref) DO UPDATE SET
-                                credential_id=excluded.credential_id, resets_at_ms=MAX(provider_reset_fences.resets_at_ms,excluded.resets_at_ms),
-                                observed_at_ms=MAX(provider_reset_fences.observed_at_ms,excluded.observed_at_ms)",
-                                params![executed_route,consumer,provider.account_ref,provider.credential_id,reset,update.observed_at_ms])?;
-                        }
+                        write_provider_reset_fence(
+                            &tx,
+                            &executed_route,
+                            &consumer,
+                            provider,
+                            update.outcome == prefrontal_routing_core::RouteOutcome::Completed,
+                            update.observed_at_ms,
+                        )?;
                     }
                 }
 
@@ -4036,6 +4095,33 @@ fn route_identity(
         }
     }
     Ok(split_route_key(route_key))
+}
+
+/// Record or lift one provider-reset fence on `executed_route` for `consumer`.
+///
+/// A completed run on the account proves its window has room again, so it lifts
+/// any fence observed no later than the run. A failure with a provider reset still
+/// ahead fences that account until the reset; a repeated report keeps the later of
+/// the two resets, so replaying a report is harmless.
+fn write_provider_reset_fence(
+    connection: &Connection,
+    executed_route: &str,
+    consumer: &str,
+    provider: &prefrontal_routing_core::route_state_store::ProviderOutcome,
+    completed: bool,
+    observed_at_ms: i64,
+) -> rusqlite::Result<()> {
+    if completed {
+        connection.execute("DELETE FROM provider_reset_fences WHERE route_key=?1 AND consumer=?2 AND (account_ref=?3 OR (credential_id IS NOT NULL AND credential_id=?5)) AND observed_at_ms<=?4",
+            params![executed_route, consumer, provider.account_ref, observed_at_ms, provider.credential_id])?;
+    } else if let Some(reset) = provider.resets_at_ms.filter(|at| *at > observed_at_ms) {
+        connection.execute("INSERT INTO provider_reset_fences (route_key,consumer,account_ref,credential_id,resets_at_ms,observed_at_ms)
+            VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(route_key,consumer,account_ref) DO UPDATE SET
+            credential_id=excluded.credential_id, resets_at_ms=MAX(provider_reset_fences.resets_at_ms,excluded.resets_at_ms),
+            observed_at_ms=MAX(provider_reset_fences.observed_at_ms,excluded.observed_at_ms)",
+            params![executed_route, consumer, provider.account_ref, provider.credential_id, reset, observed_at_ms])?;
+    }
+    Ok(())
 }
 
 /// A short unique-ish id (12 hex chars), process-monotonic + time-seeded. Avoids a
