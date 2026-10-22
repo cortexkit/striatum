@@ -645,6 +645,77 @@ fn record_cooldown_update(
     store.update_route_state(&params.route_key, &params.capacity_key, &update)
 }
 
+/// Why a `route.record_cooldown` request must not reach the store, if it must not.
+///
+/// A route-scoped write stores `capacityKey` on the route's row, replacing the
+/// one already there, and soft pressure and walls are shared by every route under
+/// that capacity. A capacity that is not the route's own would therefore move the
+/// route's walls and pressure onto another model. Routing builds both keys with
+/// `make_route_key` and `make_capacity_key`, so a route's capacity is the route
+/// key itself or a prefix of it that ends at a `/`. Provider-wide writes are
+/// checked by the store, which requires both keys to name the same provider.
+/// Quota pressure is a 0..=1 score that selection adds to a route's cost, so a
+/// value outside that range is refused rather than stored.
+fn record_cooldown_params_error(params: &RecordCooldownParams) -> Option<String> {
+    if let Some(pressure) = params.quota_pressure {
+        if !(0.0..=1.0).contains(&pressure) {
+            return Some(format!(
+                "record_cooldown quotaPressure {pressure} is outside 0..=1"
+            ));
+        }
+    }
+    if !params.provider_wide {
+        let capacity = params.capacity_key.as_str();
+        let paired = !capacity.is_empty()
+            && params
+                .route_key
+                .strip_prefix(capacity)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        if !paired {
+            return Some(format!(
+                "record_cooldown capacityKey {:?} is not the capacity of routeKey {:?}",
+                params.capacity_key, params.route_key
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Diagnostics written on this thread, so a test can assert that a failure
+    /// it caused was reported to the operator.
+    static OPERATOR_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Write one diagnostic line to the module's stderr log.
+fn warn_operator(line: String) {
+    #[cfg(test)]
+    OPERATOR_WARNINGS.with(|lines| lines.borrow_mut().push(line.clone()));
+    eprintln!("{line}");
+}
+
+/// The diagnostics written on this thread since the last call.
+#[cfg(test)]
+fn take_operator_warnings() -> Vec<String> {
+    OPERATOR_WARNINGS.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+}
+
+/// Record the audit row for a selection that ended without a route. The
+/// routing failure is still what the caller receives, so a failed write does
+/// not change the reply; it is logged so a missing row can be explained.
+fn record_failed_selection_decision(store: &impl RouteStateStore, decision: &DecisionInput) {
+    if let Err(error) = store.record_decision(decision) {
+        warn_operator(format!(
+            "[prefrontal-routing] WARN: a failed route.select for {} (task {}, send {}) has no decision row: {error}",
+            decision.target_agent,
+            decision.task_id.as_deref().unwrap_or("-"),
+            decision.send_id.as_deref().unwrap_or("-"),
+        ));
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1253,24 +1324,100 @@ async fn handle_frame(
             let operator_config_path = operator_config_path.to_path_buf();
             let broca_credentials = Arc::clone(broca_credentials);
             let opencode_auth_path = opencode_auth_path.to_path_buf();
+            let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
             tokio::spawn(async move {
-                let _ = handle_select_request(
-                    frame,
-                    route_epoch,
+                answer_route_request(
                     &writer,
-                    &quota_cache,
-                    &store,
-                    &min_band,
-                    &routing_config_path,
-                    &operator_config_path,
-                    &broca_credentials,
-                    &opencode_auth_path,
+                    ver,
+                    channel,
+                    route_epoch,
+                    corr,
+                    |reply| async move {
+                        handle_select_request(
+                            frame,
+                            route_epoch,
+                            &reply,
+                            &quota_cache,
+                            &store,
+                            &min_band,
+                            &routing_config_path,
+                            &operator_config_path,
+                            &broca_credentials,
+                            &opencode_auth_path,
+                        )
+                        .await
+                    },
                 )
                 .await;
             });
             Ok(true)
         }
         _ => Ok(true),
+    }
+}
+
+/// Serve one route-channel request and make sure its caller hears back.
+///
+/// `handle` replies through the sender it is given, and every frame it sends is
+/// forwarded to the connection. When it returns an error, the error is logged.
+/// If it had not sent a reply and the connection is still open, the caller is
+/// answered with an `internal_error` frame instead of waiting out its own
+/// timeout. A handler that fails after replying gets no second frame, so a
+/// caller never receives two answers to one request.
+async fn answer_route_request<F, Fut>(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    handle: F,
+) where
+    F: FnOnce(mpsc::Sender<Frame>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), ModuleError>>,
+{
+    let (reply_tx, mut reply_rx) = mpsc::channel(1);
+    let handled = handle(reply_tx);
+    tokio::pin!(handled);
+    let mut replied = false;
+    let mut egress_open = true;
+    let result = loop {
+        let frame = tokio::select! {
+            result = &mut handled => break result,
+            Some(frame) = reply_rx.recv() => frame,
+        };
+        replied = true;
+        egress_open = egress_open && send(writer, frame).await.is_ok();
+    };
+    // A send completes once the frame is queued, so everything the handler sent
+    // before returning is already buffered here.
+    while let Ok(frame) = reply_rx.try_recv() {
+        replied = true;
+        egress_open = egress_open && send(writer, frame).await.is_ok();
+    }
+    let Err(error) = result else {
+        return;
+    };
+    let when = if replied { " after replying" } else { "" };
+    warn_operator(format!(
+        "[prefrontal-routing] WARN: route request on channel {channel} (corr {corr}) failed{when}: {error}"
+    ));
+    if replied || !egress_open {
+        return;
+    }
+    if let Err(send_error) = send_route_error(
+        writer,
+        ver,
+        channel,
+        epoch,
+        corr,
+        "internal_error",
+        &format!("routing failed before replying: {error}"),
+    )
+    .await
+    {
+        warn_operator(format!(
+            "[prefrontal-routing] WARN: route request on channel {channel} (corr {corr}) got no failure reply: {send_error}"
+        ));
     }
 }
 
@@ -3600,7 +3747,7 @@ async fn handle_select_request(
                     None,
                     Some(&policy_sources_line(&operator_policy)),
                 );
-                let _ = store.record_decision(&decision);
+                record_failed_selection_decision(store.as_ref(), &decision);
                 add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
                 return send_no_route(
                     writer,
@@ -4224,12 +4371,23 @@ async fn handle_select_request(
             match recorded {
                 Ok(decision_id) => {
                     if selected_harness == Some(substrate_policy::Harness::Broca) {
-                        remember_provider_identity(
+                        // The decision row has committed, so the selection stands
+                        // without the identity. Failing the call here would make
+                        // the caller retry and record a second decision for one
+                        // launch. Without the identity, the outcome for this
+                        // decision is recorded the same way as for a route with
+                        // several serving credentials, where none is remembered.
+                        if let Err(error) = remember_provider_identity(
                             store,
                             &decision_id,
                             &selected,
                             broca_credentials,
-                        )?;
+                        ) {
+                            warn_operator(format!(
+                                "[prefrontal-routing] WARN: decision {decision_id} for {} has no remembered serving identity: {error}",
+                                selected.route_key
+                            ));
+                        }
                     }
                     let finish_started = Instant::now();
                     let mut resolved_input = json!({
@@ -4375,8 +4533,8 @@ async fn handle_select_request(
             }
             add_stage_ms(&timing.finish_ms, finish_started.elapsed());
             let write_started = Instant::now();
-            // Best-effort failed-decision audit row (ignore a store error here: the
-            // routing failure is the real result to surface).
+            // Best-effort failed-decision audit row: a store error is logged, and
+            // the routing failure is still the reply.
             let decision = decision_input_for(
                 &target_agent,
                 &requirements,
@@ -4386,7 +4544,7 @@ async fn handle_select_request(
                 Some(&provenance),
                 Some(&policy_sources),
             );
-            let _ = store.record_decision(&decision);
+            record_failed_selection_decision(store.as_ref(), &decision);
             add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
             let reply_started = Instant::now();
             let reply = send_no_route(
@@ -6167,6 +6325,18 @@ async fn handle_record_cooldown(
                 .await;
             }
         };
+    if let Some(message) = record_cooldown_params_error(&params) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            &message,
+        )
+        .await;
+    }
     match record_cooldown_update(store.as_ref(), &params) {
         Ok(()) => send_ok(writer, ver, channel, epoch, corr).await,
         Err(e) => {
@@ -15255,6 +15425,386 @@ mod tests {
             .get_fact_by_route_key("openai/gpt-5.5-fast")
             .unwrap()
             .is_none());
+    }
+
+    /// Wire tests for failures that used to be dropped without a reply or a log line.
+    mod select_wire_error_reporting {
+        use super::*;
+        use rusqlite::OptionalExtension;
+
+        fn rig_sql(rig: &Rig, sql: &str) {
+            rusqlite::Connection::open(rig.dir.join("store.db"))
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+        }
+
+        fn route_frame(corr: u64, request: serde_json::Value) -> Frame {
+            Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                corr,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn error_body(frame: &Frame) -> ErrorBody {
+            assert_eq!(frame.header.ty, FrameType::Error);
+            serde_json::from_slice(&frame.body).unwrap()
+        }
+
+        /// A route request whose handler fails before replying is answered with
+        /// `internal_error` through the live frame dispatch, and the failure is
+        /// logged. The handler failure here is real: the decision's remembered
+        /// serving identity is unreadable when a `completed` outcome reads it.
+        #[tokio::test]
+        async fn a_route_handler_failing_before_its_reply_answers_internal_error() {
+            let rig = Rig::new("route-handler-error-reply");
+            let store = Arc::new(rig.open_store());
+            let decision_id = store
+                .record_decision(&DecisionInput {
+                    target_agent: "mason".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            rig_sql(
+                &rig,
+                &format!(
+                    "UPDATE model_route_decisions SET provider_identity_json = '{{' WHERE id = '{decision_id}'"
+                ),
+            );
+            let (writer, mut replies) = mpsc::channel(4);
+            let mut route_epochs = RouteEpochs::from([(7, 1)]);
+            take_operator_warnings();
+            assert!(handle_frame(
+                route_frame(
+                    55,
+                    json!({
+                        "method": ROUTE_SET_DECISION_OUTCOME_OP,
+                        "params": { "decisionID": decision_id, "outcome": "completed" }
+                    }),
+                ),
+                &writer,
+                &Arc::new(Mutex::new(QuotaCache::default())),
+                &store,
+                &mut route_epochs,
+                &Arc::new(Mutex::new(None)),
+                &rig.dir.join("routing.jsonc"),
+                &rig.dir.join("operator.jsonc"),
+                &empty_broca_credentials(),
+                &rig.dir.join("auth.json"),
+                &Arc::new(Mutex::new(CatalogReachHealth::new(600_000))),
+            )
+            .await
+            .unwrap());
+            let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+                .await
+                .expect("a failed route handler must still answer its caller")
+                .unwrap();
+            assert_eq!(
+                (reply.header.channel, reply.header.epoch, reply.header.corr),
+                (7, 1, 55)
+            );
+            let error = error_body(&reply);
+            assert_eq!(error.code, "internal_error");
+            assert!(
+                error
+                    .message
+                    .starts_with("routing failed before replying: "),
+                "{}",
+                error.message
+            );
+            let warnings = take_operator_warnings();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|line| line.contains("route request on channel 7 (corr 55) failed: ")),
+                "{warnings:?}"
+            );
+            assert!(replies.try_recv().is_err(), "exactly one reply");
+        }
+
+        fn reply_frame(corr: u64) -> Frame {
+            Frame::build(
+                FrameType::Response,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                corr,
+                br#"{"result":{}}"#.to_vec(),
+            )
+            .unwrap()
+        }
+
+        /// A handler that already replied gets no second answer when it then
+        /// fails; a handler that succeeds has its reply forwarded unchanged.
+        #[tokio::test]
+        async fn a_handler_failing_after_its_reply_sends_no_second_frame() {
+            let (writer, mut replies) = mpsc::channel(4);
+            take_operator_warnings();
+            answer_route_request(&writer, 1, 7, 1, 61, |reply| async move {
+                send(&reply, reply_frame(61)).await?;
+                Err(ModuleError::Message("after the reply".into()))
+            })
+            .await;
+            let forwarded = replies.try_recv().unwrap();
+            assert_eq!(
+                (forwarded.header.ty, forwarded.header.corr),
+                (FrameType::Response, 61)
+            );
+            assert!(replies.try_recv().is_err(), "no second frame");
+            let warnings = take_operator_warnings();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|line| line.contains("failed after replying: after the reply")),
+                "{warnings:?}"
+            );
+
+            answer_route_request(&writer, 1, 7, 1, 62, |reply| async move {
+                send(&reply, reply_frame(62)).await
+            })
+            .await;
+            assert_eq!(replies.try_recv().unwrap().header.corr, 62);
+            assert!(replies.try_recv().is_err());
+            assert!(take_operator_warnings().is_empty());
+        }
+
+        /// With the connection gone no reply can be delivered; the failure is
+        /// still logged and serving does not stall on the closed writer.
+        #[tokio::test]
+        async fn a_failure_with_the_connection_closed_is_only_logged() {
+            let (writer, replies) = mpsc::channel(4);
+            drop(replies);
+            take_operator_warnings();
+            answer_route_request(&writer, 1, 7, 1, 63, |_reply| async move {
+                Err(ModuleError::Message("egress channel closed".into()))
+            })
+            .await;
+            let warnings = take_operator_warnings();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|line| line.contains("(corr 63) failed: egress channel closed")),
+                "{warnings:?}"
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .any(|line| line.contains("(corr 63) got no failure reply")),
+                "{warnings:?}"
+            );
+        }
+
+        async fn record_cooldown(store: &SharedStore, params: serde_json::Value) -> Frame {
+            run_route_wire_request(
+                store,
+                json!({ "method": ROUTE_RECORD_COOLDOWN_OP, "params": params }),
+            )
+            .await
+        }
+
+        fn stored_pressure(rig: &Rig, route_key: &str) -> Option<Option<f64>> {
+            rusqlite::Connection::open(rig.dir.join("store.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT quota_pressure FROM model_route_state WHERE route_key = ?1",
+                    [route_key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+        }
+
+        /// A route-scoped cooldown names its own capacity and a 0..=1 pressure;
+        /// anything else is refused before it reaches the store.
+        #[tokio::test]
+        async fn record_cooldown_refuses_a_foreign_capacity_and_out_of_range_pressure() {
+            let rig = Rig::new("record-cooldown-validation");
+            let store = Arc::new(rig.open_store());
+            for (route_key, capacity_key, pressure) in [
+                ("p/m/high", "q/m", 0.5),
+                ("p/m-long/high", "p/m", 0.5),
+                ("p/m/high", "", 0.5),
+                ("p/m/high", "p/m", 1.5),
+                ("p/m/high", "p/m", -0.1),
+            ] {
+                let reply = record_cooldown(
+                    &store,
+                    json!({
+                        "routeKey": route_key,
+                        "capacityKey": capacity_key,
+                        "cooldownUntil": 1.0e15,
+                        "quotaPressure": pressure,
+                    }),
+                )
+                .await;
+                let error = error_body(&reply);
+                assert_eq!(
+                    error.code, "invalid_request",
+                    "{route_key} {capacity_key} {pressure}: {}",
+                    error.message
+                );
+                assert_eq!(stored_pressure(&rig, route_key), None, "{route_key}");
+            }
+            // Pressure out of range is refused on a provider-wide write too.
+            let reply = record_cooldown(
+                &store,
+                json!({
+                    "routeKey": "p/m/high",
+                    "capacityKey": "p/m",
+                    "providerWide": true,
+                    "cooldownUntil": 1.0e15,
+                    "quotaPressure": 2.0,
+                }),
+            )
+            .await;
+            assert_eq!(error_body(&reply).code, "invalid_request");
+            assert_eq!(stored_pressure(&rig, "p/m/high"), None);
+
+            // The same route with its own capacity and an in-range pressure is
+            // stored, for a variant route and for a variantless one.
+            for (route_key, capacity_key) in [("p/m/high", "p/m"), ("p/m", "p/m")] {
+                let reply = record_cooldown(
+                    &store,
+                    json!({
+                        "routeKey": route_key,
+                        "capacityKey": capacity_key,
+                        "cooldownUntil": 1.0e15,
+                        "quotaPressure": 0.4,
+                    }),
+                )
+                .await;
+                assert_eq!(reply.header.ty, FrameType::Response, "{route_key}");
+                assert_eq!(stored_pressure(&rig, route_key), Some(Some(0.4)));
+            }
+        }
+
+        /// Both failed-selection paths (a request whose requirements cannot be
+        /// resolved, and a selection that finds no route) still reply with the
+        /// routing failure when the audit row cannot be written, and log it.
+        #[tokio::test]
+        async fn a_failed_selection_whose_audit_row_cannot_be_written_is_logged() {
+            let rig = Rig::new("failed-selection-audit-write");
+            let mut no_vision = fact("p", "missing-vision");
+            no_vision.supports_vision = Some(false);
+            rig.open_store()
+                .upsert_fact(&no_vision, FactSource::Override)
+                .unwrap();
+            rig_sql(
+                &rig,
+                "CREATE TRIGGER refuse_decision_rows BEFORE INSERT ON model_route_decisions
+                 BEGIN SELECT RAISE(ABORT, 'decision rows refused'); END;",
+            );
+            for (label, task, params) in [
+                (
+                    "unresolved requirements",
+                    "audit-unresolved",
+                    json!({
+                        "targetAgent": "mason",
+                        "availableModels": ["p/missing-vision"],
+                        "providerAuthTypes": {},
+                        "taskId": "audit-unresolved"
+                    }),
+                ),
+                (
+                    "no route",
+                    "audit-no-route",
+                    json!({
+                        "targetAgent": "mason",
+                        "requirements": { "iq": 30, "eq": 0 },
+                        "requiredCapabilities": { "vision": true },
+                        "availableModels": ["p/missing-vision"],
+                        "taskId": "audit-no-route"
+                    }),
+                ),
+            ] {
+                take_operator_warnings();
+                let reply = run_select_against_rig(
+                    &rig,
+                    params,
+                    &[],
+                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                )
+                .await;
+                let error = error_body(&reply);
+                if label == "unresolved requirements" {
+                    assert_eq!(error.code, "invalid_requirements", "{}", error.message);
+                }
+                assert!(
+                    !matches!(error.code.as_str(), "store_error" | "internal_error"),
+                    "{label}: the routing failure stays the reply: {}",
+                    error.message
+                );
+                let warnings = take_operator_warnings();
+                assert!(
+                    warnings.iter().any(|line| line.contains(&format!(
+                        "a failed route.select for mason (task {task}, send -) has no decision row: "
+                    )) && line.contains("decision rows refused")),
+                    "{label}: {warnings:?}"
+                );
+            }
+        }
+
+        /// The decision row of a Broca selection commits before its serving
+        /// identity is remembered. When remembering fails, the caller still gets
+        /// the selection (so it does not retry into a second decision) and the
+        /// failure is logged.
+        #[tokio::test]
+        async fn a_broca_selection_keeps_its_decision_when_the_identity_write_fails() {
+            let rig = Rig::new("broca-identity-write-failure");
+            let store = Arc::new(rig.open_store());
+            store
+                .upsert_fact(&fact("opencode-go", "m-native-fast"), FactSource::Override)
+                .unwrap();
+            let broca_credentials = mapped_broca_credentials("opencode-go");
+            let select = || {
+                run_route_wire_request_with_paths(
+                    &store,
+                    broca_select_request(&["opencode-go/m-native-fast"], Some("broca")),
+                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                    &broca_credentials,
+                )
+            };
+
+            // Control: the identity is remembered when the write succeeds, so the
+            // failing half below reaches the identity write.
+            let reply = select().await;
+            assert_eq!(reply.header.ty, FrameType::Response);
+            let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+            let decision_id = body["result"]["decisionID"].as_str().unwrap().to_owned();
+            assert!(store
+                .decision_provider_identity(&decision_id)
+                .unwrap()
+                .is_some());
+
+            rig_sql(
+                &rig,
+                "CREATE TRIGGER refuse_identity BEFORE UPDATE OF provider_identity_json
+                 ON model_route_decisions
+                 BEGIN SELECT RAISE(ABORT, 'identity refused'); END;",
+            );
+            take_operator_warnings();
+            let reply = select().await;
+            assert_eq!(reply.header.ty, FrameType::Response);
+            let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+            let decision_id = body["result"]["decisionID"].as_str().unwrap();
+            assert!(store.get_decision_by_id(decision_id).unwrap().is_some());
+            assert!(store
+                .decision_provider_identity(decision_id)
+                .unwrap()
+                .is_none());
+            let warnings = take_operator_warnings();
+            assert!(
+                warnings.iter().any(|line| line.contains(&format!(
+                    "decision {decision_id} for opencode-go/m-native-fast has no remembered serving identity: "
+                )) && line.contains("identity refused")),
+                "{warnings:?}"
+            );
+        }
     }
 }
 
