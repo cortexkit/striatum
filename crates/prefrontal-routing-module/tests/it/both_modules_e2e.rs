@@ -42,6 +42,7 @@ struct RealDaemon {
     child: Child,
     rig: PathBuf,
     connection_file: PathBuf,
+    _fixtures: crate::real_daemon_e2e::RoutingFixtures,
 }
 
 impl Drop for RealDaemon {
@@ -134,10 +135,14 @@ async fn start_both_modules_daemon() -> RealDaemon {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Routing selects only after its first billing-plane load, which needs the
+    // Claustrum credential listing and the Fusiform catalog every production daemon runs.
+    let fixtures = crate::real_daemon_e2e::start_routing_fixtures(&connection_file).await;
     RealDaemon {
         child,
         rig,
         connection_file,
+        _fixtures: fixtures,
     }
 }
 
