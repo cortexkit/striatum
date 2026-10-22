@@ -3,8 +3,6 @@
 //! (`docs/designs/account-selection.md`). It performs no I/O: the caller loads
 //! [`AllocatorState`] inside its selection transaction and commits the result.
 
-use std::cmp::Ordering;
-
 use super::decision::{
     AccountNote, Admission, AdmitReason, AffinityNote, AffinityOutcome, ApplicableWindow, Decision,
     ExclusionReason, ExclusionTier, Explanation, Hold, HoldBasis, ImportNote, InvalidationReason,
@@ -923,9 +921,14 @@ impl<'a> Allocator<'a> {
         }
         eligible.sort_by(|a, b| {
             let score = |eval: &ColdEval| eval.note.score.unwrap_or(f64::INFINITY);
+            // A score that is not a number never outranks a numeric one,
+            // whatever its sign bit; numbers compare by value. A partial
+            // comparison that called NaN equal to everything made the order
+            // depend on input position, and could make the sort panic.
             score(a)
-                .partial_cmp(&score(b))
-                .unwrap_or(Ordering::Equal)
+                .is_nan()
+                .cmp(&score(b).is_nan())
+                .then_with(|| score(a).total_cmp(&score(b)))
                 .then_with(|| {
                     self.order_index(&a.view.account_id)
                         .cmp(&self.order_index(&b.view.account_id))

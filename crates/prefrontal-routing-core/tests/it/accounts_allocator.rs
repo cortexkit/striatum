@@ -1136,6 +1136,30 @@ fn weight_is_the_minimum_window_rate_with_clamp_and_window_horizons() {
 }
 
 #[test]
+fn exhausted_zero_length_window_without_future_reset_is_below_reserve() {
+    // When no reset is scheduled, the window's length is its weighting
+    // duration. A zero-length window used to give 0 spendable / 0 hours = NaN;
+    // the minimum across windows ignored that NaN, so the healthy 5h window
+    // alone made an account with a spent window eligible.
+    let mut r = reading(10.0, 10.0);
+    r.general_windows = Some(vec![
+        window(10.0, ResetTime::At(NOW + 2 * HOUR), 300),
+        window(100.0, ResetTime::Missing, 0),
+    ]);
+    let decision = decide(&request(), &state(vec![account("acct-a", Some(r))]), NOW);
+    assert_eq!(refused(&decision), RefusalCode::AccountPoolReserveLimited);
+    assert_eq!(
+        exclusions(&decision, "acct-a"),
+        [ExclusionReason::BelowReserve {
+            windows: vec![ApplicableWindow::Reported(0)]
+        }]
+    );
+    let spent = &decision.account_note("acct-a").unwrap().window_weights[1];
+    assert_eq!(spent.horizon_hours, 1.0 / 60.0);
+    assert_eq!(spent.weight, 0.0);
+}
+
+#[test]
 fn age_bands_full_discounted_and_excluded() {
     let at = |age: i64| {
         let mut r = reading(10.0, 10.0);
@@ -1471,6 +1495,30 @@ fn fable_preservation_never_fails_healthy_siblings_or_applies_to_recovery() {
         )),
         "acct-b"
     );
+}
+
+#[test]
+fn a_score_that_is_not_a_number_never_outranks_a_numeric_score() {
+    // A non-finite preservation factor turns the preserved account's score
+    // into NaN. It must rank after every numeric score, in either roster
+    // order: a partial comparison called it equal to everything, so the
+    // account-id tie-break picked `acct-a`.
+    let mut st = state(vec![
+        account("acct-a", Some(fable_spent(10.0, 10.0))),
+        account("acct-b", Some(reading(50.0, 50.0))),
+    ]);
+    st.policy.fable_preservation_factor = f64::NAN;
+    let req = with_model(request(), "claude-opus-5-5");
+    let decision = decide(&req, &st, NOW);
+    assert!(decision
+        .account_note("acct-a")
+        .unwrap()
+        .score
+        .unwrap()
+        .is_nan());
+    assert_eq!(admitted(&decision), "acct-b");
+    st.roster.as_mut().unwrap().accounts.reverse();
+    assert_eq!(admitted(&decide(&req, &st, NOW)), "acct-b");
 }
 
 // ---- providers and bindings ----------------------------------------------

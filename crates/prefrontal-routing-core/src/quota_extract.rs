@@ -52,10 +52,6 @@ pub struct ExtractedWindow {
     pub limit_reached: bool,
 }
 
-fn clamp01(n: f64) -> f64 {
-    n.clamp(0.0, 1.0)
-}
-
 const WINDOW_SLOTS: [&str; 3] = ["primary", "secondary", "tertiary"];
 
 /// Parse an RFC3339/ISO-8601 timestamp to ms epoch, mirroring JS `Date.parse`.
@@ -84,16 +80,17 @@ fn rate_window_to_extracted(
     applies_key: Option<String>,
 ) -> Option<ExtractedWindow> {
     let w = w?;
-    let utilization = clamp01(w.used_percent / 100.0);
-    let resets_at = w.resets_at.as_deref().and_then(|raw| {
-        let parsed = parse_resets_at(raw);
-        if parsed.is_none() && utilization > 0.0 {
-            // A garbled timestamp must not hide a burning window: preserve its
-            // utilization and pace it through the no-recovery-time fallback.
-            return None;
-        }
-        parsed
-    });
+    // If the reported percent is NaN or infinite, skip this window: it is not
+    // a measurement. Clamping NaN would make the window look unused and
+    // clamping infinity would make it look fully used. Skipping matches how an
+    // unhealthy entry is treated: it contributes no signal either way.
+    if !w.used_percent.is_finite() {
+        return None;
+    }
+    let utilization = (w.used_percent / 100.0).clamp(0.0, 1.0);
+    // A garbled timestamp must not hide a burning window: the window keeps its
+    // utilization and is paced through the no-recovery-time fallback.
+    let resets_at = w.resets_at.as_deref().and_then(parse_resets_at);
     // An idle window used to return None here, on the reasoning that it carries no
     // pressure worth pacing. It carries something else: THIS ACCOUNT IS FREE. The
     // across-account fold walls a capacity only when every account holding a signal
@@ -699,6 +696,27 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].utilization, 0.4);
         assert_eq!(out[0].resets_at, None);
+    }
+
+    #[test]
+    fn non_finite_used_percent_emits_no_window() {
+        let window = |used: f64| RateWindow {
+            used_percent: used,
+            raw_used_percent: None,
+            resets_at: Some("2026-01-01T00:00:00Z".into()),
+            window_minutes: Some(300),
+            window_model: None,
+            window_kind: None,
+        };
+        for used in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let extracted = rate_window_to_extracted(
+                Some(&window(used)),
+                "codexbar:codex:primary".into(),
+                WindowScopeKind::Account,
+                None,
+            );
+            assert_eq!(extracted, None, "used_percent {used} is not a measurement");
+        }
     }
 
     #[test]

@@ -1437,12 +1437,12 @@ fn admit_and_price_shortlist(
         .unwrap_or(MIN_BEST_EFFORT_ADEQUACY);
     if best_effort && max_adequacy < min_band {
         // Find the best rejected candidate (highest adequacy below the band).
-        let best_below_band = admissible.iter().max_by(|a, b| {
-            a.adequacy
-                .adequacy
-                .partial_cmp(&b.adequacy.adequacy)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // A route whose adequacy is not a number has no rank, so it is never
+        // reported as the closest survivor; `max_adequacy` above skips it too.
+        let best_below_band = admissible
+            .iter()
+            .filter(|a| !a.adequacy.adequacy.is_nan())
+            .max_by(|a, b| total_f64(a.adequacy.adequacy, b.adequacy.adequacy));
         let best_rejected = best_below_band.map(|a| RejectedCandidate {
             route_key: a.route.route_key.clone(),
             adequacy: a.adequacy.adequacy,

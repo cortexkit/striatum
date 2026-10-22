@@ -323,9 +323,10 @@ fn compare_rows(left: &Row, right: &Row) -> Ordering {
         (None, None) => left.model_key.cmp(&right.model_key),
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
+        // Row elo is finite and positive (non-finite scores become `None` when
+        // rows are built), so the total order matches the numeric one.
         (Some(left_elo), Some(right_elo)) => right_elo
-            .partial_cmp(&left_elo)
-            .unwrap_or(Ordering::Equal)
+            .total_cmp(&left_elo)
             .then_with(|| left.model_key.cmp(&right.model_key)),
     }
 }
