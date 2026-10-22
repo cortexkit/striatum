@@ -115,51 +115,6 @@ pub fn infer_elo_from_aa(aa_index: f64, curve: &[(f64, f64)]) -> Option<f64> {
     Some(elo_interp - AA_INFERRED_PENALTY * (elo_interp - floor))
 }
 
-/// How an inferred row got its EQ. The placement sheet has no EQ column, so
-/// inferred rows inherit the nearest curated neighbor's EQ.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EqSource {
-    /// Sheet carried an EQ column (not used: the operator sheet has none).
-    AaIndex,
-    /// Inherited from the curated catalog fact whose Elo is closest to the
-    /// interpolated (pre-penalty) Elo.
-    Neighbor { route_key: String },
-}
-
-impl EqSource {
-    pub fn as_str(&self) -> String {
-        match self {
-            EqSource::AaIndex => "aa_index".to_string(),
-            EqSource::Neighbor { route_key } => format!("neighbor:{route_key}"),
-        }
-    }
-}
-
-/// Pick EQ from the curated neighbor whose Elo is closest to `elo`.
-///
-/// The AA placement sheet has no EQ column, so inferred rows inherit judgment
-/// from the nearest already-curated catalog fact. `elo` should be the
-/// interpolated (pre-penalty) value so the neighbor is chosen on the operator's
-/// curve, not the discounted score.
-pub fn inherit_eq_from_curated_neighbors(
-    elo: f64,
-    neighbors: &[(f64, f64, &str)],
-) -> Option<(f64, EqSource)> {
-    if !elo.is_finite() || neighbors.is_empty() {
-        return None;
-    }
-    let (eq, route_key) = neighbors
-        .iter()
-        .min_by(|a, b| {
-            (a.0 - elo)
-                .abs()
-                .partial_cmp(&(b.0 - elo).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(_, eq, key)| (*eq, (*key).to_string()))?;
-    Some((eq, EqSource::Neighbor { route_key }))
-}
-
 /// Convenience: infer Elo from the static operator curve.
 pub fn infer_elo_from_aa_static(aa_index: f64) -> Option<f64> {
     infer_elo_from_aa(aa_index, aa_elo_curve())
@@ -235,23 +190,6 @@ mod tests {
         let last = curve.last().unwrap();
         assert!((last.0 - 63.1).abs() < 1e-9);
         assert!((last.1 - 1920.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn inherit_eq_picks_nearest_curated_elo() {
-        let neighbors = [
-            (1800.0, 1700.0, "openai/gpt-5.6-sol"),
-            (1000.0, 900.0, "google/gemini-flash"),
-        ];
-        let (eq, source) = inherit_eq_from_curated_neighbors(1750.0, &neighbors).unwrap();
-        assert!((eq - 1700.0).abs() < 1e-9);
-        assert_eq!(
-            source,
-            EqSource::Neighbor {
-                route_key: "openai/gpt-5.6-sol".into()
-            }
-        );
-        assert_eq!(source.as_str(), "neighbor:openai/gpt-5.6-sol");
     }
 
     #[test]

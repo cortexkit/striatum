@@ -1689,6 +1689,49 @@ fn best_effort_below_band_yields_all_routes_inadequate() {
     assert_eq!(err.earliest_reset, Some(2_000.0));
 }
 
+/// A survivor whose adequacy is not a number is never the closest survivor.
+/// A partial comparison called NaN equal to everything, so `max_by` returned
+/// whichever route came last.
+#[test]
+fn best_rejected_below_band_skips_a_route_whose_adequacy_is_not_a_number() {
+    let top = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "top".into(),
+        scores: scores(1_000.0, 1500.0, 80.0),
+        ..Default::default()
+    });
+    let weak = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "weak".into(),
+        scores: scores(300.0, 1500.0, 80.0),
+        ..Default::default()
+    });
+    let unscorable = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "unscorable".into(),
+        scores: scores(f64::NAN, 1500.0, 80.0),
+        ..Default::default()
+    });
+    let err = select_model_route_with_config(
+        input(
+            vec![top, weak, unscorable],
+            req(90.0, 0.0),
+            Extra {
+                runtime_snapshot: Some(snapshot_with_quota_exhausted("p/top", 2_000.0)),
+                ..Extra::default()
+            },
+        ),
+        &DEFAULT_ROUTING_CONFIG,
+    )
+    .unwrap_err();
+    assert_eq!(err.reason, RouteFailureReason::AllRoutesInadequate);
+    let best = err
+        .best_rejected
+        .expect("weak route is the closest survivor");
+    assert_eq!(best.route_key, "p/weak");
+    assert!(best.adequacy.is_finite());
+}
+
 /// A survivor between the floor and sanity band is returned with a warning.
 #[test]
 fn best_effort_in_band_gets_below_floor_warning() {

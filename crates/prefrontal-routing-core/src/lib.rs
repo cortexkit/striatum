@@ -41,8 +41,7 @@ pub mod subscription;
 
 pub use aa_infer::{
     aa_elo_curve, elo_floor, infer_elo_from_aa, infer_elo_from_aa_static, inferred_scores,
-    inherit_eq_from_curated_neighbors, interpolate_elo, EqSource, AA_INFERRED_DEFAULT_SPEED,
-    AA_INFERRED_PENALTY,
+    interpolate_elo, AA_INFERRED_DEFAULT_SPEED, AA_INFERRED_PENALTY,
 };
 pub use billing::{BillingPlane, BillingRate};
 pub use break_glass::{

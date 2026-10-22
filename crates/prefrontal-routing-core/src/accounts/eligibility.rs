@@ -11,6 +11,9 @@ use super::types::{
 
 const MS_PER_HOUR: f64 = 3_600_000.0;
 
+/// The shortest weighting horizon: one minute.
+const MIN_HORIZON_HOURS: f64 = 1.0 / 60.0;
+
 /// The only `stale.class` value routing knows the meaning of (a preserved
 /// reading served through a 429, 5xx or network failure). Any other class is
 /// treated as unknown quota until routing's mapping covers it.
@@ -136,8 +139,11 @@ pub fn fable_freshly_exhausted(
     }
 }
 
-/// `spendable / max(hours_until_reset, 1/60)` for a future reset; with no
-/// future reset, the horizon is the window's own length.
+/// `spendable / max(horizon_hours, 1/60)`. The horizon is the time until a
+/// future reset; with no future reset, it is the window's own length. The
+/// one-minute floor applies to both: a window that reports zero minutes would
+/// otherwise divide by zero, and an exhausted one (0 / 0 = NaN) would drop out
+/// of the minimum below instead of excluding the account.
 fn window_weight(
     window: ApplicableWindow,
     used_percent: f64,
@@ -148,10 +154,11 @@ fn window_weight(
 ) -> WindowWeight {
     let spendable = (100.0 - used_percent - reserve).max(0.0);
     let (horizon_hours, reset_passed) = match resets_at {
-        ResetTime::At(at) if at > now => (((at - now) as f64 / MS_PER_HOUR).max(1.0 / 60.0), false),
+        ResetTime::At(at) if at > now => ((at - now) as f64 / MS_PER_HOUR, false),
         ResetTime::At(_) => (f64::from(window_minutes) / 60.0, true),
         ResetTime::Unparsable | ResetTime::Missing => (f64::from(window_minutes) / 60.0, false),
     };
+    let horizon_hours = horizon_hours.max(MIN_HORIZON_HOURS);
     WindowWeight {
         window,
         used_percent,
@@ -389,7 +396,7 @@ pub fn evaluate_quota(
         eval.reserve.push(ExclusionReason::BelowReserve {
             windows: weights
                 .iter()
-                .filter(|w| w.weight.is_nan() || w.weight <= 0.0)
+                .filter(|w| w.weight <= 0.0)
                 .map(|w| w.window)
                 .collect(),
         });
