@@ -224,6 +224,20 @@ async fn executor_and_required_harness_refuse_mismatched_routes() {
 }
 
 #[tokio::test]
+async fn broca_executor_pin_admits_a_route_absent_from_host_models() {
+    let rig = HarnessRig::new(json!({}));
+    let body = rig.select(json!({
+        "consumer": "athena", "targetAgent": "oracle", "workload": "athena",
+        "executor": "broca", "substrate": "broca", "availableModels": [CHEAP],
+        "pin": {"model": PAID}, "pin_fallback": "none",
+    })).await;
+    assert_eq!(body["result"]["selected"]["routeKey"], PAID, "{body}");
+    assert_eq!(body["result"]["selected"]["harness"], "broca", "{body}");
+    assert_eq!(body["result"]["runner"]["provider"], "anthropic", "{body}");
+    assert!(body["result"]["pin_rejected"].is_null(), "{body}");
+}
+
+#[tokio::test]
 async fn panel_seats_resolve_under_athena_and_only_use_broca() {
     let rig = HarnessRig::new(json!({"athena": {"opencode": "opencode"}}));
     let mut config: serde_json::Value =

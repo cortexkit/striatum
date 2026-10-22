@@ -4954,95 +4954,161 @@ async fn handle_select_panel(
             })
             .collect()
     };
-    let mut panel = match prefrontal_routing_core::panel::select_panel_with_availability(
-        SelectPanelInput {
-            package_tokens: params.package_tokens,
-            panel_spec: params.panel_spec.selection_spec(),
-            selection: PanelSelection::NPick,
-            roster: Vec::new(),
-            facts: prepared.facts,
-            runtime_snapshot: Some(prepared.snapshot),
-            exclude_route_keys: params.exclude_route_keys.clone(),
-            operator_exclude_keys,
-            required_capabilities: params.required_capabilities,
-            available_models: mapped_availability.models,
-            availability_substrate,
-            is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                subscription_keys.contains(&route.route_key)
-                    || subscription_keys.contains(&route.capacity_key)
-            })),
-        },
-        &routing_config,
-        &policy,
-        &context,
-        &mapped_availability.rejected,
-    ) {
-        Ok(panel) => panel,
-        Err(e) => {
-            return send_route_error(writer, ver, channel, epoch, corr, "invalid_request", &e.0)
-                .await;
-        }
-    };
-    // Every seat, the extra draws included, is an automatic choice for the
-    // class's consumer: lab panels read `variants.lab`, every other class
-    // `variants.athena`.
-    apply_panel_variant_policy(
-        &mut panel,
-        &live_config,
-        routing_config_path,
-        panel_consumer,
-        &seat_models,
+    let mut availability_rejections = mapped_availability.rejected;
+    let session_root = pool_session(
+        params.task_id.as_deref(),
+        params.send_id.as_deref(),
+        &format!("route.select_panel:{}", now_ms()),
     );
-    // Vault-mapped providers need the selected credential and launch target in
-    // promptParams.runner so core can persist and dispatch each member correctly.
-    if is_broca_substrate(params.substrate.as_deref()) {
-        for (slot, member) in panel.members.iter_mut().enumerate() {
-            let Some((provider, model)) = member.route_key.split_once('/') else {
-                continue;
-            };
-            if !needs_runner_pin(&operator_policy, provider) {
-                continue;
-            }
-            let variant = member
-                .prompt_params
-                .get("variant")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            // Each seat is its own session for the key pool: seats spread over
-            // the keys and each keeps its own prompt-cache workspace.
-            let session = format!(
-                "{}#seat{slot}",
-                pool_session(
-                    params.task_id.as_deref(),
-                    params.send_id.as_deref(),
-                    &format!("route.select_panel:{}", now_ms())
+    let panel = loop {
+        let mut panel = match prefrontal_routing_core::panel::select_panel_with_availability(
+            SelectPanelInput {
+                package_tokens: params.package_tokens,
+                panel_spec: params.panel_spec.selection_spec(),
+                selection: PanelSelection::NPick,
+                roster: Vec::new(),
+                facts: prepared.facts.clone(),
+                runtime_snapshot: Some(prepared.snapshot.clone()),
+                exclude_route_keys: params.exclude_route_keys.clone(),
+                operator_exclude_keys: operator_exclude_keys.clone(),
+                required_capabilities: params.required_capabilities,
+                available_models: mapped_availability.models.clone(),
+                availability_substrate,
+                is_subscription_route: Some(Box::new(|route: &ModelRoute| {
+                    subscription_keys.contains(&route.route_key)
+                        || subscription_keys.contains(&route.capacity_key)
+                })),
+            },
+            &routing_config,
+            &policy,
+            &context,
+            &availability_rejections,
+        ) {
+            Ok(panel) => panel,
+            Err(e) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &e.0,
                 )
-            );
-            match runner_for_route(
-                &operator_policy,
-                broca_credentials,
-                store.as_ref(),
-                &session,
-                provider,
-                model,
-                variant.as_deref(),
-                Some("athena"),
-            ) {
-                Ok((runner, grant)) => {
-                    member.prompt_params.insert("runner".into(), json!(runner));
-                    if let Some(grant) = grant {
+                .await;
+            }
+        };
+        // Every seat, the extra draws included, is an automatic choice for the
+        // class's consumer: lab panels read `variants.lab`, every other class
+        // `variants.athena`.
+        apply_panel_variant_policy(
+            &mut panel,
+            &live_config,
+            routing_config_path,
+            panel_consumer,
+            &seat_models,
+        );
+        // Vault-mapped providers need the selected credential and launch target in
+        // promptParams.runner so core can persist and dispatch each member correctly.
+        let mut leases = Vec::new();
+        let mut refusal = None;
+        if is_broca_substrate(params.substrate.as_deref()) {
+            for (slot, member) in panel.members.iter_mut().enumerate() {
+                let Some((provider, model)) = member.route_key.split_once('/') else {
+                    continue;
+                };
+                if !needs_runner_pin(&operator_policy, provider) {
+                    continue;
+                }
+                let variant = member
+                    .prompt_params
+                    .get("variant")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                // Each seat is its own session for the key pool: seats spread over
+                // the keys and each keeps its own prompt-cache workspace.
+                let session = format!("{session_root}#seat{slot}");
+                match key_pool::acquire(
+                    &key_pool::PoolCtx {
+                        store: store.as_ref(),
+                        credentials: broca_credentials,
+                        policy: &operator_policy,
+                        now_ms: now_ms() as i64,
+                    },
+                    provider,
+                    model,
+                    variant.as_deref(),
+                    &session,
+                ) {
+                    Ok(grant) => {
+                        member
+                            .prompt_params
+                            .insert("runner".into(), json!(grant.runner));
+                        leases.push((provider.to_string(), session, grant.lease_id.clone()));
                         member
                             .prompt_params
                             .insert("poolLease".into(), grant.lease_json());
                     }
-                }
-                Err((code, message)) => {
-                    return send_route_error(writer, ver, channel, epoch, corr, &code, &message)
-                        .await;
+                    Err(error) => {
+                        refusal = Some((member.route_key.clone(), error));
+                        break;
+                    }
                 }
             }
         }
-    }
+        let Some((route_key, error)) = refusal else {
+            break panel;
+        };
+        // A discarded panel must not keep leases for seats that may move or vanish
+        // on reselection. Keep affinity so a surviving seat can reuse its workspace.
+        for (provider, session, lease_id) in leases {
+            if let Err(error) =
+                store.pool_release(&provider, &session, Some(&lease_id), false, now_ms() as i64)
+            {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &error.to_string(),
+                )
+                .await;
+            }
+        }
+        if error.code != prefrontal_routing_core::key_pool::EXPLICIT_PROVIDER_POOL_EXHAUSTED {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                &error.code,
+                &error.message,
+            )
+            .await;
+        }
+        // Pool exhaustion is route-local unavailability for a panel, not a refusal
+        // of the entire request. Rerun all class rules so sibling/family candidates
+        // skipped for the failed seat can compete, with the blocked keys recorded.
+        // Every model and variant on this provider draws from the same key pool.
+        let detail = json!({
+            "code": error.code, "message": error.message, "pool": error.detail,
+        })
+        .to_string();
+        let provider = route_key
+            .split_once('/')
+            .expect("pool route has a provider")
+            .0;
+        for fact in prepared
+            .facts
+            .iter()
+            .filter(|fact| fact.provider_id == provider)
+        {
+            availability_rejections.insert(fact_to_route(fact).route_key, detail.clone());
+        }
+    };
     let decision = panel_decision_input(
         &params,
         &panel,
@@ -13732,6 +13798,141 @@ mod tests {
         assert!(body["result"].get("requiredSubstrate").is_none(), "{body}");
         assert!(body["result"].get("runner").is_some(), "{body}");
         assert!(body["result"].get("poolLease").is_some(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn panel_replaces_an_exhausted_claude_pool_and_records_blocked_keys() {
+        let rig = Rig::new("panel-exhausted-pool");
+        let store: SharedStore = Arc::new(rig.open_store());
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute("DELETE FROM model_facts", [])
+            .unwrap();
+        for (provider, model, family, elo) in [
+            ("anthropic", "claude-opus-5-5", "claude", 2200.0),
+            ("openai", "gpt-fallback", "gpt", 2100.0),
+            ("anthropic", "claude-sonnet-fallback", "claude", 2000.0),
+        ] {
+            let mut row = fact(provider, model);
+            row.family = Some(family.into());
+            row.scores.elo = elo;
+            store.upsert_fact(&row, FactSource::Override).unwrap();
+        }
+        let config = rig.dir.join("prefrontal-routing.jsonc");
+        std::fs::write(&config, json!({"model_routing": {
+            "score_alias": {"anthropic-platform": "anthropic"},
+            "exclude": {"all": ["anthropic/claude-opus-5-5", "anthropic-platform/claude-sonnet-fallback"]},
+            "panels": {"audit": {"topK": 2, "extra": 0, "by": "iq"}}
+        }}).to_string()).unwrap();
+        let credentials = platform_listing(&[
+            ("apikey:anthropic:empty", &["anthropic-platform"]),
+            ("apikey:anthropic:limited", &["anthropic-platform"]),
+            ("oauth:anthropic:subscription", &["anthropic"]),
+            ("apikey:openai", &["openai"]),
+        ]);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = Frame::build(
+                    FrameType::Request,
+                    Flags::new(false, Priority::Interactive, false),
+                    7,
+                    1,
+                    99,
+                    serde_json::to_vec(&json!({"method": method, "params": params})).unwrap(),
+                )
+                .unwrap();
+                let (tx, mut rx) = mpsc::channel(1);
+                handle_select_request(
+                    frame,
+                    1,
+                    &tx,
+                    &Arc::new(Mutex::new(QuotaCache::default())),
+                    &store,
+                    &Arc::new(Mutex::new(None)),
+                    &config,
+                    &config,
+                    &credentials,
+                    &empty_opencode_auth(),
+                )
+                .await
+                .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&rx.recv().await.unwrap().body).unwrap()
+            }
+        };
+        let panel_params = json!({"substrate": "broca", "panelSpec": {"class": "AUDIT"},
+            "availableModels": [], "taskId": "pool-panel"});
+        let healthy = call(ROUTE_SELECT_PANEL_OP, panel_params.clone()).await;
+        assert_eq!(
+            healthy["result"]["members"][0]["routeKey"], "anthropic-platform/claude-opus-5-5",
+            "{healthy}"
+        );
+        for (key, kind) in [("empty", "billing_exhausted"), ("limited", "rate_limited")] {
+            let wall = call(
+                "route.pool_wall",
+                json!({"provider": "anthropic-platform",
+                "credentialId": format!("apikey:anthropic:{key}"), "kind": kind,
+                "untilMs": now_ms() as i64 + 3_600_000}),
+            )
+            .await;
+            assert_eq!(wall["result"]["ok"], true, "{wall}");
+        }
+        let body = call(ROUTE_SELECT_PANEL_OP, panel_params).await;
+        let members = body["result"]["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{body}"));
+        assert_eq!(members.len(), 2, "{body}");
+        assert_eq!(members[0]["routeKey"], "openai/gpt-fallback", "{body}");
+        assert_eq!(
+            members[1]["routeKey"], "anthropic/claude-sonnet-fallback",
+            "{body}"
+        );
+        assert!(body["result"].get("shortfall").is_none(), "{body}");
+        let decision = store
+            .get_decision_by_id(body["result"]["decisionID"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let rejected: serde_json::Value = serde_json::from_str(&decision.rejected_json).unwrap();
+        let cause = rejected
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cause| cause["model"] == "anthropic-platform/claude-opus-5-5")
+            .unwrap();
+        assert_eq!(cause["reason"], "unavailable", "{rejected}");
+        let detail = cause["detail"].as_str().unwrap();
+        let pool_rejection: serde_json::Value = serde_json::from_str(detail).unwrap();
+        assert_eq!(pool_rejection["code"], "explicit_provider_pool_exhausted");
+        assert_eq!(pool_rejection["pool"]["keys"].as_array().unwrap().len(), 2);
+        for expected in [
+            "explicit_provider_pool_exhausted",
+            "apikey:anthropic:empty",
+            "billing_exhausted",
+            "apikey:anthropic:limited",
+            "rate_limited",
+        ] {
+            assert!(detail.contains(expected), "{cause}");
+        }
+        let unfilled = call(
+            ROUTE_SELECT_PANEL_OP,
+            json!({
+                "substrate": "broca", "panelSpec": {"class": "AUDIT"},
+                "taskId": "pool-panel-unfilled",
+                "excludeRouteKeys": ["openai/gpt-fallback", "anthropic/claude-sonnet-fallback"],
+            }),
+        )
+        .await;
+        assert_eq!(unfilled["result"]["members"], json!([]), "{unfilled}");
+        assert!(unfilled["result"]["shortfall"].is_object(), "{unfilled}");
+        assert!(
+            store
+                .get_decision_by_id(unfilled["result"]["decisionID"].as_str().unwrap())
+                .unwrap()
+                .is_some(),
+            "{unfilled}"
+        );
     }
 
     #[tokio::test]
