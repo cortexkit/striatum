@@ -1014,6 +1014,24 @@
             ]
           }
         },
+        "sidekick.lead": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
         "sidekick.librarian": {
           "type": "object",
           "additionalProperties": {
@@ -1033,6 +1051,42 @@
           }
         },
         "sidekick.planner": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.reader": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.reviewer": {
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/Harness"

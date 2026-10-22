@@ -912,6 +912,9 @@ fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
         "sidekick.gather",
         "sidekick.comments",
         "sidekick.planner",
+        "sidekick.lead",
+        "sidekick.reader",
+        "sidekick.reviewer",
         "hire",
         "persona_seat",
     ];
