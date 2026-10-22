@@ -236,8 +236,9 @@ const ANTIGRAVITY_MODEL_PREFIX: &str = "antigravity-";
 /// family token right after `antigravity-` in the routing model id.
 ///
 /// Source: QTA (Insula's owner), read live 2026-10-02. Antigravity publishes no
-/// primary window; every pool is an `extraRateWindows` entry whose id is
-/// `<pool>-<period>`: `gemini-5h`, `gemini-weekly`, `3p-5h`, `3p-weekly`. Gemini
+/// primary window; every pool is an `extraRateWindows` entry with one of the ids
+/// in `ANTIGRAVITY_POOL_WINDOW_IDS`: `gemini-5h`, `gemini-weekly`, `3p-5h`,
+/// `3p-weekly`. Gemini
 /// models use the `gemini` pool; third-party models served through Antigravity
 /// (Claude, GPT) use the `3p` pool. A model whose family is not listed here gets
 /// no pool signal rather than a guessed one.
@@ -296,15 +297,6 @@ impl PoolPeriod {
         }
     }
 
-    /// The period suffix the pool ids carry today (`gemini-5h`, `3p-weekly`).
-    fn from_id_suffix(suffix: &str) -> Option<Self> {
-        match suffix {
-            "5h" => Some(Self::FiveHour),
-            "weekly" => Some(Self::Weekly),
-            _ => None,
-        }
-    }
-
     fn window_ms(self) -> f64 {
         let minutes = match self {
             Self::FiveHour => 300.0,
@@ -314,26 +306,42 @@ impl PoolPeriod {
     }
 }
 
-/// Recognize an Antigravity pool window: an id `<pool>-<period>` whose pool is in
-/// `ANTIGRAVITY_POOL_BY_MODEL_FAMILY` and whose period is known. `windowKind`
-/// wins when the producer publishes a value we know; the id suffix is the
-/// fallback. Anything else is not a pool window: an unknown shape is never
-/// guessed into a pool, since one wrong guess merges two independent meters.
+/// The Antigravity pool window ids, each with the pool it meters and its period.
+/// Only these exact ids are pool windows. Antigravity also publishes separately
+/// metered allowances under other ids, some starting with `gemini-` (QTA: paid
+/// Pro accounts get a weekly Gemini 4 Argon quota); reading one of those as the
+/// `gemini` pool would let its exhaustion wall every Gemini route.
+const ANTIGRAVITY_POOL_WINDOW_IDS: &[(&str, &str, PoolPeriod)] = &[
+    ("gemini-5h", "gemini", PoolPeriod::FiveHour),
+    ("gemini-weekly", "gemini", PoolPeriod::Weekly),
+    ("3p-5h", "3p", PoolPeriod::FiveHour),
+    ("3p-weekly", "3p", PoolPeriod::Weekly),
+];
+
+/// Recognize an Antigravity pool window by its exact id. The id fixes both the
+/// pool and the period. A `windowKind` we know must name the same period; when it
+/// names another, the producer and this table disagree about what the window
+/// meters, so it is not read as a pool window at all. An unknown `windowKind`
+/// leaves the id's period in place. Any other id is not a pool window: an
+/// unknown bucket is never guessed into a pool, since one wrong guess merges two
+/// independent meters. A window rejected here is handled as an ordinary extra
+/// window: extraction keeps it only if its title matches a routed capacity, and
+/// the routing module's account status still lists it, so a new bucket stays
+/// visible.
 fn antigravity_pool_window(item: &ExtraWindow) -> Option<(&'static str, PoolPeriod)> {
-    let (pool, suffix) = item.id.as_deref()?.rsplit_once('-')?;
-    let pool = ANTIGRAVITY_POOL_BY_MODEL_FAMILY
+    let id = item.id.as_deref()?;
+    let (_, pool, period) = ANTIGRAVITY_POOL_WINDOW_IDS
         .iter()
-        .map(|(_, known_pool)| *known_pool)
-        .find(|known_pool| *known_pool == pool)?;
+        .find(|(known_id, _, _)| *known_id == id)?;
     let window_kind = item.window_kind.as_deref().or_else(|| {
         item.window
             .as_ref()
             .and_then(|window| window.window_kind.as_deref())
     });
-    let period = window_kind
-        .and_then(PoolPeriod::from_window_kind)
-        .or_else(|| PoolPeriod::from_id_suffix(suffix))?;
-    Some((pool, period))
+    match window_kind.and_then(PoolPeriod::from_window_kind) {
+        Some(declared) if declared != *period => None,
+        _ => Some((pool, *period)),
+    }
 }
 
 /// Account pools use the same identities as route walls. With a capacity key,
@@ -1003,38 +1011,150 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_window_kind_wins_over_the_id_suffix() {
-        let mut item = ExtraWindow {
+    fn antigravity_pool_ids_are_exact_and_a_known_window_kind_must_agree() {
+        // The id alone names the pool and the period. A known windowKind that
+        // names the other period means the producer and this table disagree
+        // about what the window meters, so it is no pool window at all rather
+        // than a guess in either direction.
+        let item = |id: &str, kind: Option<&str>| ExtraWindow {
             title: None,
-            id: Some("gemini-weekly".into()),
+            id: Some(id.into()),
             window: Some(win(10.0, "2026-01-01T00:00:00Z", None)),
-            window_kind: Some("five_hour".into()),
+            window_kind: kind.map(Into::into),
         };
+        let expected = [
+            (
+                "gemini-5h",
+                "gemini",
+                PoolPeriod::FiveHour,
+                "five_hour",
+                "weekly",
+            ),
+            (
+                "gemini-weekly",
+                "gemini",
+                PoolPeriod::Weekly,
+                "weekly",
+                "five_hour",
+            ),
+            ("3p-5h", "3p", PoolPeriod::FiveHour, "five_hour", "weekly"),
+            ("3p-weekly", "3p", PoolPeriod::Weekly, "weekly", "five_hour"),
+        ];
+        for (id, pool, period, agreeing, contradicting) in expected {
+            assert_eq!(
+                antigravity_pool_window(&item(id, None)),
+                Some((pool, period))
+            );
+            assert_eq!(
+                antigravity_pool_window(&item(id, Some(agreeing))),
+                Some((pool, period))
+            );
+            assert_eq!(
+                antigravity_pool_window(&item(id, Some(contradicting))),
+                None,
+                "{id} with windowKind {contradicting}"
+            );
+            // windowKind inside the window is checked the same way.
+            let mut nested = item(id, None);
+            nested.window.as_mut().unwrap().window_kind = Some(contradicting.into());
+            assert_eq!(antigravity_pool_window(&nested), None, "{id} nested kind");
+            // A windowKind outside Insula's vocabulary leaves the id's period.
+            assert_eq!(
+                antigravity_pool_window(&item(id, Some("fortnightly"))),
+                Some((pool, period))
+            );
+        }
+        // A pool-looking id that is not one of the four is not a pool window.
+        assert_eq!(antigravity_pool_window(&item("gemini-flash", None)), None);
+        assert_eq!(antigravity_pool_window(&item("other-5h", None)), None);
+        // Every pool the ids name is one some routed model family draws on.
+        for (_, pool, _) in ANTIGRAVITY_POOL_WINDOW_IDS {
+            assert!(
+                ANTIGRAVITY_POOL_BY_MODEL_FAMILY
+                    .iter()
+                    .any(|(_, family_pool)| family_pool == pool),
+                "{pool}"
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_unknown_gemini_buckets_never_pressure_gemini_capacities() {
+        // QTA: paid Pro accounts publish a separately metered weekly Gemini 4
+        // Argon allowance under a new bucket id that may start with `gemini-`.
+        // Read as the `gemini` weekly pool, an exhausted Argon allowance would
+        // wall every Gemini route. Each exhausted unknown bucket below carries
+        // windowKind weekly; the only recognized Gemini pool window in this
+        // entry is `gemini-5h`, and it alone may reach Gemini capacities.
+        let unknown_ids = [
+            "gemini-argon",
+            "gemini-4-argon-weekly",
+            "gemini-weekly-extra",
+        ];
+        let mut windows: Vec<ExtraWindow> = unknown_ids
+            .iter()
+            .map(|id| ExtraWindow {
+                title: Some("Gemini 4 Argon Weekly Limit".into()),
+                id: Some((*id).into()),
+                window: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                window_kind: Some("weekly".into()),
+            })
+            .collect();
+        for window in &windows {
+            assert_eq!(antigravity_pool_window(window), None, "{:?}", window.id);
+            assert!(!is_account_pool_window(window), "{:?}", window.id);
+        }
+        windows.push(ExtraWindow {
+            title: Some("Gemini Models Five Hour Limit".into()),
+            id: Some("gemini-5h".into()),
+            window: Some(win(25.0, "2026-01-01T00:00:00Z", None)),
+            window_kind: Some("five_hour".into()),
+        });
+        let usage = Usage {
+            primary: None,
+            secondary: None,
+            tertiary: None,
+            extra_rate_windows: Some(windows),
+        };
+        let entry = ProviderUsage {
+            stale: None,
+            fetched_at: None,
+            api_provider: None,
+            provider: "antigravity".into(),
+            account: None,
+            source: None,
+            usage: Some(usage.clone()),
+            spend: Vec::new(),
+            error: None,
+            error_class: None,
+            saved_resets: None,
+        };
+        let caps = vec![
+            "google/antigravity-gemini-3.6-flash".to_string(),
+            "google/antigravity-gemini-3.1-pro".to_string(),
+            "google/antigravity-claude-opus-4-6-thinking".to_string(),
+        ];
+        let out = extract_windows(&entry, "google", "antigravity", &caps);
+        let emitted: Vec<(&str, Option<&str>, f64)> = out
+            .iter()
+            .map(|w| {
+                (
+                    w.window_key.as_str(),
+                    w.applies_key.as_deref(),
+                    w.utilization,
+                )
+            })
+            .collect();
         assert_eq!(
-            antigravity_pool_window(&item),
-            Some(("gemini", PoolPeriod::FiveHour))
+            emitted,
+            vec![("codexbar:antigravity:gemini-5h", Some("gemini"), 0.25)],
+            "only the real Gemini pool is extracted"
         );
-        // An unknown windowKind falls back to the suffix rather than dropping.
-        item.window_kind = Some("fortnightly".into());
-        assert_eq!(
-            antigravity_pool_window(&item),
-            Some(("gemini", PoolPeriod::Weekly))
-        );
-        // windowKind inside the window is honoured too.
-        item.window_kind = None;
-        item.window.as_mut().unwrap().window_kind = Some("five_hour".into());
-        assert_eq!(
-            antigravity_pool_window(&item),
-            Some(("gemini", PoolPeriod::FiveHour))
-        );
-        // A pool-looking id with no known period and no windowKind is not
-        // guessed into a pool.
-        item.window.as_mut().unwrap().window_kind = None;
-        item.id = Some("gemini-flash".into());
-        assert_eq!(antigravity_pool_window(&item), None);
-        // Nor is an unknown pool name.
-        item.id = Some("other-5h".into());
-        assert_eq!(antigravity_pool_window(&item), None);
+        for capacity_key in &caps[..2] {
+            let reported = account_rate_windows(&usage, Some(capacity_key));
+            let used: Vec<f64> = reported.iter().map(|(_, w)| w.used_percent).collect();
+            assert_eq!(used, vec![25.0], "{capacity_key} reads only gemini-5h");
+        }
     }
 
     #[test]
