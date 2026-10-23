@@ -24,12 +24,30 @@ mod consumer_and_pin {
                 fact.cost_per_m_tok_out = Some(cost);
                 store.upsert_fact(&fact, FactSource::Override).unwrap();
             }
-            Self {
+            let policy = Self {
                 _rig: rig,
                 store,
                 path,
                 quota: Arc::new(Mutex::new(QuotaCache::default())),
+            };
+            for (provider, model) in [("openai", "pin"), ("fallback", "safe")] {
+                policy.set_auth_methods(provider, model, Some(vec!["apikey".into()]));
             }
+            policy
+        }
+
+        fn set_auth_methods(&self, provider: &str, model: &str, methods: Option<Vec<String>>) {
+            use prefrontal_routing_store::{FusiformFactUpdate, FusiformCatalogCursor};
+            let fact = self.store.get_fact_by_route_key(&format!("{provider}/{model}")).unwrap().unwrap();
+            let update = FusiformFactUpdate {
+                provider_id: provider.into(), model_id: model.into(), auth_methods: methods, present: true,
+                context_window: fact.context_window, max_output_tokens: fact.max_output_tokens.map(|n| n as u64),
+                cost_tier: fact.cost_tier, cost_per_mtok_out: fact.cost_per_m_tok_out,
+                input_rate: fact.input_rate, cache_read_rate: fact.cache_read_rate, cache_write_rate: fact.cache_write_rate, reasoning_rate: fact.reasoning_rate,
+                supports_vision: fact.supports_vision, supports_tool_use: fact.supports_tool_use,
+                reasoning_efforts: None, canonical_id: None, upstream_status: None,
+            };
+            self.store.apply_fusiform_catalog(&[update], FusiformCatalogCursor { catalog_version: 1, resolved_at_ms: 1 }).unwrap();
         }
 
         fn params(&self) -> serde_json::Value {
@@ -42,6 +60,14 @@ mod consumer_and_pin {
         }
 
         async fn select(&self, params: serde_json::Value) -> serde_json::Value {
+            self.select_with_planes(params, &[]).await
+        }
+
+        async fn select_with_planes(&self, params: serde_json::Value, planes: &[prefrontal_routing_core::billing::BillingPlane]) -> serde_json::Value {
+            self.select_with_catalog(params, planes, json!({"prices": []})).await
+        }
+
+        async fn select_with_catalog(&self, params: serde_json::Value, planes: &[prefrontal_routing_core::billing::BillingPlane], plan_prices: serde_json::Value) -> serde_json::Value {
             let frame = Frame::build(
                 FrameType::Request,
                 Flags::new(false, Priority::Interactive, false),
@@ -52,9 +78,13 @@ mod consumer_and_pin {
             )
             .unwrap();
             let (tx, mut rx) = mpsc::channel(1);
-            let credentials = Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
-                &self.store.get_facts().unwrap(),
-            )));
+            let mut facts = self.store.get_facts().unwrap();
+            for fact in &mut facts {
+                fact.billing_plane = planes.iter().find(|plane| plane.provider_id == fact.provider_id).cloned();
+            }
+            let mut credentials = BrocaCredentials::api_test_credentials(&facts);
+            credentials.publish_plan_prices(&plan_prices);
+            let credentials = Arc::new(Mutex::new(credentials));
             handle_select_request(
                 frame,
                 1,
@@ -95,12 +125,146 @@ mod consumer_and_pin {
         json!({"model_routing": {"pins": {"lab_planner": {"model": "openai/pin"}}}})
     }
 
+    fn billing_plane(provider: &str, auth: &str, kind: &str, output: Option<f64>) -> prefrontal_routing_core::billing::BillingPlane {
+        use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
+        BillingPlane {
+            provider_id: provider.into(), auth_method: auth.into(), kind: kind.into(),
+            selection_reason: "test credential".into(),
+            rates: output.map(|rate| ("rate.output".into(), BillingRate::Priced { rate })).into_iter().collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn codemode_prefers_metered_over_higher_scoring_subscription_but_mason_does_not() {
+        let rig = PolicyRig::new(json!({}));
+        let mut subscription = fact("openai", "pin");
+        subscription.scores.elo = 90.0;
+        rig.store.upsert_fact(&subscription, FactSource::Override).unwrap();
+        let planes = [billing_plane("openai", "chatgpt", "quota_proxy", Some(0.01))];
+        for (consumer, expected) in [("codemode", "fallback/safe"), ("mason", "openai/pin")] {
+            let mut params = rig.params();
+            params["consumer"] = json!(consumer);
+            let reply = rig.select_with_planes(params, &planes).await;
+            assert_eq!(reply["result"]["selected"]["capacityKey"], expected, "{consumer}: {reply}");
+        }
+        let mut params = rig.params();
+        params.as_object_mut().unwrap().remove("consumer");
+        params["targetAgent"] = json!("codemode");
+        let reply = rig.select_with_planes(params, &planes).await;
+        assert_eq!(reply["result"]["selected"]["capacityKey"], "openai/pin", "{reply}");
+    }
+
+    #[tokio::test]
+    async fn flow_never_selects_unpriced_or_monthly_apikey_allowance_even_when_pinned() {
+        let rig = PolicyRig::new(json!({}));
+        for plane in [
+            billing_plane("openai", "apikey", "upstream", None),
+            billing_plane("openai", "apikey", "quota_proxy", Some(0.01)),
+        ] {
+            let mut params = rig.params();
+            params["consumer"] = json!("flow");
+            let reply = rig.select_with_planes(params.clone(), &[plane.clone()]).await;
+            assert_eq!(reply["result"]["selected"]["capacityKey"], "fallback/safe", "{reply}");
+            params["availableModels"] = json!(["openai/pin"]);
+            let reply = rig.select_with_planes(params.clone(), &[plane.clone()]).await;
+            assert_eq!(reply["code"], "no_available_model", "{reply}");
+            assert!(reply["message"].as_str().unwrap().contains("consumer flow"), "{reply}");
+            params["modelPin"] = json!("openai/pin");
+            let reply = rig.select_with_planes(params, &[plane]).await;
+            assert!(reply.get("result").is_none(), "{reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_providers_drops_winner_and_records_fence_on_selection_and_refusal() {
+        let rig = PolicyRig::new(json!({}));
+        let absent = rig.select(rig.params()).await;
+        assert_eq!(absent["result"]["selected"]["capacityKey"], "openai/pin", "{absent}");
+        let absent_row = rig.store.get_decision_by_id(absent["result"]["decisionID"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(absent_row.allowed_providers_json, None);
+        let mut params = rig.params();
+        params["allowed_providers"] = json!(["fallback"]);
+        let reply = rig.select(params.clone()).await;
+        assert_eq!(reply["result"]["selected"]["capacityKey"], "fallback/safe", "{reply}");
+        let row = rig.store.get_decision_by_id(reply["result"]["decisionID"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(row.allowed_providers_json.as_deref(), Some("[\"fallback\"]"));
+        params["modelPin"] = json!("openai/pin");
+        assert!(rig.select(params.clone()).await.get("result").is_none());
+        params.as_object_mut().unwrap().remove("modelPin");
+        params["allowed_providers"] = json!(["missing"]);
+        params["sendID"] = json!("allowed-refusal");
+        let reply = rig.select(params).await;
+        assert_eq!(reply["code"], "no_available_model", "{reply}");
+        assert!(reply["message"].as_str().unwrap().contains("allowed_providers filter"), "{reply}");
+        let row = rig.store.get_decision_by_send_id("allowed-refusal").unwrap().unwrap();
+        assert_eq!(row.allowed_providers_json.as_deref(), Some("[\"missing\"]"));
+    }
+
+    #[tokio::test]
+    async fn unknown_consumer_and_invalid_allowed_providers_are_refused_by_name() {
+        let rig = PolicyRig::new(json!({}));
+        let mut params = rig.params();
+        params["consumer"] = json!("unknown-consumer");
+        let reply = rig.select(params).await;
+        assert_eq!(reply["code"], "invalid_request", "{reply}");
+        assert!(reply["message"].as_str().unwrap().contains("unknown-consumer"), "{reply}");
+        for invalid in [json!([]), json!(["openai", "openai"]), json!([""]), json!(["openai/pin"]), json!(null), json!("openai")] {
+            let mut params = rig.params();
+            params["allowed_providers"] = invalid;
+            let reply = rig.select(params).await;
+            assert_eq!(reply["code"], "invalid_request", "{reply}");
+            assert!(reply["message"].as_str().unwrap().contains("allowed_providers"), "{reply}");
+        }
+        assert_eq!(rig.decisions(), 0);
+    }
+
+    #[tokio::test]
+    async fn exclusions_precede_allowed_providers_filter() {
+        let rig = PolicyRig::new(json!({"model_routing": {"exclude": {"all": ["openai"]}}}));
+        let mut params = rig.params();
+        params["allowed_providers"] = json!(["fallback"]);
+        let reply = rig.select(params).await;
+        assert_eq!(rejection_reason(&reply, "openai/pin").as_deref(), Some("excluded_by_operator"), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn metered_consumers_fail_closed_when_auth_methods_are_unknown() {
+        let rig = PolicyRig::new(json!({}));
+        rig.set_auth_methods("openai", "pin", None);
+        for consumer in ["codemode", "flow"] {
+            let mut params = rig.params();
+            params["consumer"] = json!(consumer);
+            let reply = rig.select(params).await;
+            assert_eq!(reply["result"]["selected"]["capacityKey"], "fallback/safe", "{reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_membership_vetoes_priced_upstream_api_planes_and_unknown_membership_fails_closed() {
+        let rig = PolicyRig::new(json!({}));
+        let plane = billing_plane("openai", "apikey", "upstream", Some(0.01));
+        for consumer in ["codemode", "flow"] {
+            let mut params = rig.params();
+            params["consumer"] = json!(consumer);
+            let reply = rig.select_with_catalog(params.clone(), &[plane.clone()], json!({"prices": [{"provider_id": "openai", "refusal": {"code": "unpriced"}}]})).await;
+            assert_eq!(reply["result"]["selected"]["capacityKey"], "fallback/safe", "{reply}");
+            params["modelPin"] = json!("openai/pin");
+            let reply = rig.select_with_catalog(params.clone(), &[plane.clone()], json!({"prices": [{"provider_id": "openai"}]})).await;
+            assert!(reply.get("result").is_none(), "{reply}");
+            params.as_object_mut().unwrap().remove("modelPin");
+            for unknown in [json!(null), json!({"prices": [{}]})] {
+                let reply = rig.select_with_catalog(params.clone(), &[plane.clone()], unknown).await;
+                assert_eq!(reply["code"], "no_available_model", "{reply}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn consumer_groups_apply_only_to_the_named_consumer() {
-        for group in ["mason", "sidekick", "athena", "lab", "core"] {
+        for group in ["mason", "sidekick", "athena", "lab", "core", "codemode", "flow"] {
             let rig =
                 PolicyRig::new(json!({"model_routing": {"exclude": {group: ["openai/pin"]}}}));
-            for consumer in ["mason", "sidekick", "athena", "lab", "core"] {
+            for consumer in ["mason", "sidekick", "athena", "lab", "core", "codemode", "flow"] {
                 let mut params = rig.params();
                 params["consumer"] = json!(consumer);
                 let reply = rig.select(params).await;

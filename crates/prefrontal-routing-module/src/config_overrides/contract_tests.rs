@@ -934,6 +934,8 @@ fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
         "athena",
         "lab",
         "core",
+        "codemode",
+        "flow",
         "sidekick.explore",
         "sidekick.librarian",
         "sidekick.gather",

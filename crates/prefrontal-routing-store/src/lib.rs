@@ -197,6 +197,7 @@ const MIGRATION_057: &str = include_str!("../migrations/057_prune_absent_fusifor
 /// suspended (see `SqliteRouteStateStore::open`).
 const MIGRATION_058: &str = include_str!("../migrations/058_drop_history_foreign_keys.sql");
 const MIGRATION_059: &str = include_str!("../migrations/059_provider_reset_fences.sql");
+const MIGRATION_060: &str = include_str!("../migrations/060_allowed_providers.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -252,7 +253,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 59] {
+fn route_state_migrations() -> [Migration; 60] {
     [
         Migration {
             version: 1,
@@ -489,6 +490,10 @@ fn route_state_migrations() -> [Migration; 59] {
         Migration {
             version: 59,
             statements: MIGRATION_059,
+        },
+        Migration {
+            version: 60,
+            statements: MIGRATION_060,
         },
     ]
 }
@@ -866,6 +871,7 @@ pub struct ParentFailedDecision {
 /// recorded rather than reconstructing an explanation from today's catalog.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionExplainRow {
+    pub allowed_providers_json: Option<String>,
     pub id: String,
     pub decision_kind: String,
     pub task_id: Option<String>,
@@ -2012,8 +2018,8 @@ impl SqliteRouteStateStore {
                          target_agent, requirements_json, selected_route_key, selected_provider_id,
                          selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
                          quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at,
-                         selected_harness, selected_workload, consumer
-                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+                         selected_harness, selected_workload, consumer, allowed_providers_json
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
@@ -2039,6 +2045,7 @@ impl SqliteRouteStateStore {
                         selected_harness,
                         selected_workload,
                         input.consumer,
+                        input.allowed_providers_json,
                     ],
                 )?;
                 Ok(())
@@ -2061,7 +2068,7 @@ impl SqliteRouteStateStore {
                                 selected_provider_id, selected_model_id, selected_variant, score_json,
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
-                                outcome_error, selected_harness, selected_workload
+                                outcome_error, selected_harness, selected_workload, allowed_providers_json
                          FROM model_route_decisions
                          WHERE id=?1",
                         [decision_id],
@@ -2086,7 +2093,7 @@ impl SqliteRouteStateStore {
                                 selected_provider_id, selected_model_id, selected_variant, score_json,
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
-                                outcome_error, selected_harness, selected_workload
+                                outcome_error, selected_harness, selected_workload, allowed_providers_json
                          FROM model_route_decisions
                          WHERE send_id=?1
                          ORDER BY created_at DESC, id DESC
@@ -2293,6 +2300,7 @@ fn observed_route_key_for_fact(fact: &ModelFact) -> String {
 
 fn decision_explain_row(row: &Row<'_>) -> rusqlite::Result<DecisionExplainRow> {
     Ok(DecisionExplainRow {
+        allowed_providers_json: row.get(26)?,
         id: row.get(0)?,
         decision_kind: row.get(1)?,
         task_id: row.get(2)?,
@@ -5846,7 +5854,7 @@ mod tests {
         migrated
             .store
             .with_conn(|c| {
-                assert_eq!(route_state_version(c)?, 59);
+                assert_eq!(route_state_version(c)?, 60);
                 assert_eq!(
                     history_foreign_keys(c),
                     ["account_admission -> account_pin"]

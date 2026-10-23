@@ -34,6 +34,7 @@ pub struct BrocaCredentials {
     listed: Vec<ListedCredential>,
     serving: BTreeMap<String, ServingMethod>,
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
+    subscription_plan_providers: Option<HashSet<String>>,
     billing_loaded: Arc<tokio::sync::Notify>,
     pub(crate) catalog_snapshot: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
     pub(crate) catalog_wake: Arc<tokio::sync::Notify>,
@@ -156,6 +157,30 @@ impl BrocaCredentials {
         self.billing_loaded.notify_waiters();
     }
 
+    /// Every published plan counts, including unpriced or refused plan rows.
+    /// Unknown membership must not be confused with a successfully empty list.
+    pub(crate) fn publish_plan_prices(&mut self, prices: &serde_json::Value) {
+        self.subscription_plan_providers = prices
+            .get("prices")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| {
+                rows.iter()
+                    .map(|row| {
+                        row.get("provider_id")?
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            });
+    }
+
+    pub(crate) fn subscription_plan_providers(&self) -> Option<HashSet<String>> {
+        let mut providers = self.subscription_plan_providers.clone()?;
+        providers.extend(self.billing_catalog.subscription_plan_providers());
+        Some(providers)
+    }
+
     #[cfg(test)]
     pub(crate) fn api_test_credentials(facts: &[ModelFact]) -> Self {
         let mut credentials = Self::default();
@@ -165,7 +190,12 @@ impl BrocaCredentials {
                 (
                     format!("{}/{}", fact.provider_id, fact.model_id),
                     ServingMethod {
-                        auth_method: Some("apikey".into()),
+                        auth_method: Some(
+                            fact.billing_plane
+                                .as_ref()
+                                .map_or("apikey", |plane| plane.auth_method.as_str())
+                                .into(),
+                        ),
                         reason: "single listed method".into(),
                     },
                 )
@@ -173,6 +203,7 @@ impl BrocaCredentials {
             .collect();
         credentials.billing_catalog =
             crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(facts);
+        credentials.publish_plan_prices(&serde_json::json!({"prices": []}));
         credentials
     }
 

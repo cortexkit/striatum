@@ -20,6 +20,8 @@ pub struct ExcludeGroups {
     pub athena: Vec<String>,
     pub lab: Vec<String>,
     pub core: Vec<String>,
+    pub codemode: Vec<String>,
+    pub flow: Vec<String>,
 }
 
 /// Per-consumer reasoning-variant overrides, grouped like `model_routing.exclude`.
@@ -35,11 +37,13 @@ pub struct VariantGroups {
     pub athena: BTreeMap<String, String>,
     pub lab: BTreeMap<String, String>,
     pub core: BTreeMap<String, String>,
+    pub codemode: BTreeMap<String, String>,
+    pub flow: BTreeMap<String, String>,
 }
 
 impl VariantGroups {
     /// Every group with its config name, `all` first.
-    pub fn named(&self) -> [(&'static str, &BTreeMap<String, String>); 6] {
+    pub fn named(&self) -> [(&'static str, &BTreeMap<String, String>); 8] {
         [
             ("all", &self.all),
             ("mason", &self.mason),
@@ -47,6 +51,8 @@ impl VariantGroups {
             ("athena", &self.athena),
             ("lab", &self.lab),
             ("core", &self.core),
+            ("codemode", &self.codemode),
+            ("flow", &self.flow),
         ]
     }
 

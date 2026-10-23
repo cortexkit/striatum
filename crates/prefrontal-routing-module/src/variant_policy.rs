@@ -73,6 +73,8 @@ pub(crate) fn consumer_group(consumer: Option<Consumer>) -> Option<&'static str>
         Consumer::Athena => "athena",
         Consumer::Lab => "lab",
         Consumer::Core => "core",
+        Consumer::Codemode => "codemode",
+        Consumer::Flow => "flow",
     })
 }
 

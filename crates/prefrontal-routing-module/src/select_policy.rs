@@ -6,6 +6,9 @@ use prefrontal_routing_core::model_router::{SelectModelRouteInput, SelectedModel
 use prefrontal_routing_core::provider_model_spec::ExclusionPolicy;
 use prefrontal_routing_core::{ConcurrencySlots, RoutingConfig};
 use serde::Deserialize;
+use std::collections::HashMap;
+
+use prefrontal_routing_core::model_facts::{fact_to_route, ModelFact};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +18,8 @@ pub(crate) enum Consumer {
     Athena,
     Lab,
     Core,
+    Codemode,
+    Flow,
 }
 
 pub(crate) fn consumer_exclusions(groups: &ExcludeGroups, consumer: Option<Consumer>) -> &[String] {
@@ -24,8 +29,93 @@ pub(crate) fn consumer_exclusions(groups: &ExcludeGroups, consumer: Option<Consu
         Some(Consumer::Athena) => &groups.athena,
         Some(Consumer::Lab) => &groups.lab,
         Some(Consumer::Core) => &groups.core,
+        Some(Consumer::Codemode) => &groups.codemode,
+        Some(Consumer::Flow) => &groups.flow,
         None => &[],
     }
+}
+
+pub(crate) fn requires_metered(consumer: Option<Consumer>) -> bool {
+    matches!(consumer, Some(Consumer::Codemode | Consumer::Flow))
+}
+
+/// Admission uses these route-local refusals after exclusions and before scoring,
+/// including for pins. Neither an explicit model nor a quota retry lifts them.
+pub(crate) fn candidate_rejections(
+    facts: &[ModelFact],
+    consumer: Option<Consumer>,
+    allowed_providers: Option<&[String]>,
+    subscription_plan_providers: Option<&std::collections::HashSet<String>>,
+) -> HashMap<String, String> {
+    facts
+        .iter()
+        .filter_map(|fact| {
+            let detail = if allowed_providers
+                .is_some_and(|allowed| !allowed.contains(&fact.provider_id))
+            {
+                Some(format!("allowed_providers filter denies provider {}", fact.provider_id))
+            } else if requires_metered(consumer)
+                && !(fact.auth_methods.as_ref().is_some_and(|methods| methods.iter().any(|method| method == "apikey"))
+                    && fact.billing_plane.as_ref().is_some_and(|plane| plane.is_api_metered())
+                    && subscription_plan_providers.is_some_and(|providers| !providers.contains(&fact.provider_id)))
+            {
+                Some(format!(
+                    "consumer {} requires known apikey auth methods, a metered billing plane with a known output price, and known absence of a subscription plan",
+                    crate::variant_policy::consumer_group(consumer).unwrap()
+                ))
+            } else {
+                None
+            };
+            detail.map(|detail| (fact_to_route(fact).route_key, detail))
+        })
+        .collect()
+}
+
+pub(crate) fn describe_filter_refusal(
+    mut error: prefrontal_routing_core::model_router::NoRouteError,
+) -> prefrontal_routing_core::model_router::NoRouteError {
+    use prefrontal_routing_core::model_router::RouteFailureReason;
+    if error.reason == RouteFailureReason::NoAvailableModel {
+        let details: std::collections::BTreeSet<_> = error
+            .rejected
+            .iter()
+            .filter_map(|route| route.detail.as_deref())
+            .filter(|detail| {
+                detail.starts_with("allowed_providers filter") || detail.starts_with("consumer ")
+            })
+            .collect();
+        if !details.is_empty() {
+            error.message = format!(
+                "{}; no candidates remain after selection filters: {}",
+                error.message,
+                details.into_iter().collect::<Vec<_>>().join("; ")
+            );
+        }
+    }
+    error
+}
+
+pub(crate) fn deserialize_allowed_providers<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let ids = Vec::<String>::deserialize(deserializer)
+        .map_err(|error| D::Error::custom(format!("allowed_providers: {error}")))?;
+    let distinct: std::collections::HashSet<_> = ids.iter().collect();
+    if ids.is_empty()
+        || distinct.len() != ids.len()
+        || ids.iter().any(|id| {
+            id.trim().is_empty() || id.contains('/') || id.chars().any(char::is_whitespace)
+        })
+    {
+        return Err(D::Error::custom(
+            "allowed_providers must be a non-empty array of distinct non-empty provider ids",
+        ));
+    }
+    Ok(Some(ids))
 }
 
 #[derive(Debug, Deserialize)]

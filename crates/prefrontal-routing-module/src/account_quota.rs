@@ -1829,6 +1829,7 @@ pub async fn account_quota_loop(
             &project_root,
             &state,
             listing.as_ref().ok(),
+            &broca_credentials,
         )
         .await;
         tokio::time::sleep(ACCOUNT_REFRESH_INTERVAL).await;

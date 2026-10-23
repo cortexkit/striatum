@@ -233,6 +233,8 @@ pub struct CooldownState {
 pub struct DecisionInput {
     /// Request class supplied by the launcher, independent of the target agent.
     pub consumer: Option<String>,
+    /// Allowed provider IDs for this selection; absent means no provider restriction.
+    pub allowed_providers_json: Option<String>,
     pub decision_id: Option<String>,
     /// `single` keeps the historical shape; panel rows leave singular columns null.
     pub decision_kind: String,
