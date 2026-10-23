@@ -554,8 +554,13 @@ pub fn select_panel_with_availability(
             )),
         })
         .collect::<Vec<_>>();
+    let package_limits = oversized
+        .iter()
+        .map(|(_, ceiling)| (ceiling.route_key.clone(), ceiling.tokens))
+        .collect::<Vec<_>>();
     // Keep the fitting pins, but replacements are automatic choices: the same
     // admission, adequacy, sibling ordering and lineage rules as n_pick apply.
+    let required_seats = input.panel_spec.size;
     let automatic = SelectPanelInput {
         selection: PanelSelection::NPick,
         roster: Vec::new(),
@@ -643,32 +648,7 @@ pub fn select_panel_with_availability(
             .take()
             .map(|shortfall| shortfall.causes)
             .unwrap_or_default();
-        let too_small = package_causes
-            .iter()
-            .filter_map(|cause| cause.detail.clone())
-            .collect::<Vec<_>>();
         causes.extend(package_causes);
-        let largest = policy.largest_package_ceiling.unwrap_or(0).max(
-            panel
-                .members
-                .iter()
-                .map(|member| {
-                    seat_package_ceiling(
-                        &member.route_key,
-                        member.context_window,
-                        member.max_output_tokens,
-                    )
-                    .tokens
-                })
-                .max()
-                .unwrap_or(0),
-        );
-        panel.shortfall = Some(PanelShortfall {
-            code: PanelShortfallCode::PackageUnmeetable,
-            detail: package_refusal(tokens, largest, &too_small),
-            causes,
-            funnel: None,
-        });
         // No oversized pin is a sendable seat, even on a refused decision.
         panel.members.retain(|member| {
             seat_package_ceiling(
@@ -678,6 +658,12 @@ pub fn select_panel_with_availability(
             )
             .tokens
                 >= tokens
+        });
+        panel.shortfall = Some(PanelShortfall {
+            code: PanelShortfallCode::PackageUnmeetable,
+            detail: package_refusal(tokens, panel.members.len(), required_seats, &package_limits),
+            causes,
+            funnel: None,
         });
     }
     policy.seated_variants = panel
@@ -697,19 +683,47 @@ pub fn select_panel_with_availability(
     Ok(panel)
 }
 
-/// Names each pinned seat whose ceiling the package exceeds. A seat with an
-/// unknown context window has ceiling 0, and without its name the refusal reads
-/// as if the package were too big for every model.
-fn package_refusal(tokens: usize, largest: usize, too_small: &[String]) -> String {
-    let seats = if too_small.is_empty() {
-        String::new()
+/// A large single-seat ceiling does not mean enough independent seats can fit.
+/// Report how many seats fit out of the required width, alongside each rejected
+/// route's package budget.
+fn package_refusal(
+    tokens: usize,
+    fitting: usize,
+    required: usize,
+    too_small: &[(String, usize)],
+) -> String {
+    let readers = if fitting == 0 {
+        format!("none of the {required}")
     } else {
-        format!(
-            " ({}; no unused route of another family fits in its place)",
-            too_small.join("; ")
-        )
+        format!("only {fitting} of the {required}")
     };
-    format!("package {tokens} tokens cannot fill the panel{seats}; largest available adequate ceiling {largest} tokens. Narrow evidence or change the project athena.members roster setting; evidence was not truncated")
+    let mut sentences = vec![format!(
+        "The evidence package is {} tokens; {readers} panel seats can read that much.",
+        grouped_token_count(tokens)
+    )];
+    sentences.extend(too_small.iter().take(4).map(|(route, budget)| {
+        format!(
+            "{route} can read up to {} tokens.",
+            grouped_token_count(*budget)
+        )
+    }));
+    if too_small.len() > 4 {
+        sentences.push(format!("{} more seats are too small.", too_small.len() - 4));
+    }
+    sentences.push("A seat gives evidence half of its context window after reserving room for its answer and prompt; the other half is kept for the panel's discussion. Narrow the evidence (line ranges or fewer includes) or set a smaller roster in the project's athena.members setting. Nothing was sent to a model and no evidence was cut.".to_string());
+    sentences.join(" ")
+}
+
+fn grouped_token_count(tokens: usize) -> String {
+    let digits = tokens.to_string();
+    let mut grouped = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn package_cause_detail(
@@ -913,6 +927,7 @@ fn select_panel_admitted(
         .map(|floor| demand_bar(top_routable_elo, f64::from(floor), config.demand_exponent));
     let mut candidates = Vec::new();
     let mut largest_package_ceiling = None;
+    let mut package_limits = Vec::new();
     for (admitted, is_subscription) in admitted {
         let model = admitted.route.capacity_key.clone();
         if input.selection == PanelSelection::NPick && input.package_tokens.is_some() {
@@ -927,6 +942,7 @@ fn select_panel_admitted(
                     .max(ceiling.tokens),
             );
             if input.package_tokens.unwrap() > ceiling.tokens {
+                package_limits.push((ceiling.route_key.clone(), ceiling.tokens));
                 causes.push(PanelCause {
                     model,
                     reason: PanelCauseReason::PackageTooLarge,
@@ -1203,8 +1219,9 @@ fn select_panel_admitted(
             PanelShortfallCode::PackageUnmeetable,
             package_refusal(
                 input.package_tokens.unwrap(),
-                largest_package_ceiling.unwrap_or(0),
-                &[],
+                members.len(),
+                width,
+                &package_limits,
             ),
         ))
     } else if admitted_count == 0 {

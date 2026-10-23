@@ -162,7 +162,7 @@ fn oversized_roster_pin_is_replaced_using_automatic_lineage_rules() {
 }
 
 #[test]
-fn package_refusal_names_size_largest_ceiling_and_roster_remedy() {
+fn roster_package_refusal_names_binding_seat_limits_and_zero_fitting_width() {
     let facts = package_facts();
     let mut input = panel_input(facts.clone(), spec(2, 80.0, PanelDiversity::Family));
     input.roster = roster(&facts[..2]);
@@ -170,19 +170,7 @@ fn package_refusal_names_size_largest_ceiling_and_roster_remedy() {
     let panel = select_panel(input).unwrap();
     let refusal = panel.shortfall.unwrap();
     assert_eq!(refusal.code, PanelShortfallCode::PackageUnmeetable);
-    assert!(refusal.detail.contains("package 500000 tokens"));
-    assert!(refusal
-        .detail
-        .contains("largest available adequate ceiling 460000 tokens"));
-    assert!(refusal.detail.contains("Narrow evidence"));
-    assert!(refusal
-        .detail
-        .contains("project athena.members roster setting"));
-    // The detail itself names each seat that is too small, so a seat with an
-    // unknown context window (ceiling 0) is visible without reading causes.
-    assert!(refusal
-        .detail
-        .contains("exceeds p/small ceiling 210000 tokens"));
+    assert_eq!(refusal.detail, "The evidence package is 500,000 tokens; none of the 2 panel seats can read that much. p/small can read up to 210,000 tokens. p/kept can read up to 460,000 tokens. A seat gives evidence half of its context window after reserving room for its answer and prompt; the other half is kept for the panel's discussion. Narrow the evidence (line ranges or fewer includes) or set a smaller roster in the project's athena.members setting. Nothing was sent to a model and no evidence was cut.");
     assert!(panel.members.is_empty());
     for (model, detail) in [
         (
@@ -203,6 +191,39 @@ fn package_refusal_names_size_largest_ceiling_and_roster_remedy() {
                     .is_some_and(|value| value.starts_with(detail))
         }));
     }
+}
+
+#[test]
+fn automatic_package_refusal_names_binding_seat_limits_and_fitting_width() {
+    let facts = package_facts();
+    let mut panel_spec = spec(4, 80.0, PanelDiversity::Family);
+    panel_spec.class = PanelClass::Spec;
+    let mut input = n_pick_input(facts, panel_spec);
+    input.package_tokens = Some(227_000);
+    let panel = select_panel(input).unwrap();
+    assert_eq!(panel.members.len(), 2);
+    let refusal = panel.shortfall.unwrap();
+    assert_eq!(refusal.code, PanelShortfallCode::PackageUnmeetable);
+    assert_eq!(refusal.detail, "The evidence package is 227,000 tokens; only 2 of the 4 panel seats can read that much. p/small can read up to 210,000 tokens. A seat gives evidence half of its context window after reserving room for its answer and prompt; the other half is kept for the panel's discussion. Narrow the evidence (line ranges or fewer includes) or set a smaller roster in the project's athena.members setting. Nothing was sent to a model and no evidence was cut.");
+}
+
+#[test]
+fn package_refusal_bounds_the_rejected_seat_listing_in_selection_order() {
+    let facts = (1..=6)
+        .map(|index| {
+            fact(
+                &format!("small-{index}"),
+                1900.0 - f64::from(index),
+                Some(&format!("family-{index}")),
+            )
+        })
+        .collect();
+    let mut input = panel_input(facts, spec(6, 80.0, PanelDiversity::Family));
+    input.package_tokens = Some(1_234_567);
+    let panel = select_panel(input).unwrap();
+    let refusal = panel.shortfall.unwrap();
+    assert_eq!(refusal.code, PanelShortfallCode::PackageUnmeetable);
+    assert_eq!(refusal.detail, "The evidence package is 1,234,567 tokens; none of the 6 panel seats can read that much. p/small-1 can read up to 26,000 tokens. p/small-2 can read up to 26,000 tokens. p/small-3 can read up to 26,000 tokens. p/small-4 can read up to 26,000 tokens. 2 more seats are too small. A seat gives evidence half of its context window after reserving room for its answer and prompt; the other half is kept for the panel's discussion. Narrow the evidence (line ranges or fewer includes) or set a smaller roster in the project's athena.members setting. Nothing was sent to a model and no evidence was cut.");
 }
 
 #[test]
