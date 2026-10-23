@@ -3849,10 +3849,32 @@ async fn handle_select_request(
         broca_models: &broca_models,
         executor_models,
     };
+    // A host-run selection judged on Broca that carries the head's model list
+    // re-selects a launch the head already routed on that list (core's Broca
+    // step for a routed mason, or a route switch of such a worker). It stays
+    // inside the list: Broca's reach decides which of those models can run,
+    // never which other models may. A pin names its own model and is not
+    // confined.
+    let confined_broca_models = (host_run
+        && host_run_harness.is_some()
+        && params.pin.is_none()
+        && params.model_pin.is_none()
+        && !params.available_models.is_empty())
+    .then(|| {
+        let confined = confine_to_caller_list(&broca_models, &params.available_models, &facts);
+        if let Some(note) = availability.note.as_mut() {
+            note.push_str(&format!(
+                "; confined to the caller's {} listed models: {} reachable",
+                params.available_models.len(),
+                confined.len()
+            ));
+        }
+        confined
+    });
     let mapped_availability = if host_run {
         selection_harness::MappedAvailability {
             models: if host_run_harness.is_some() {
-                broca_models.clone()
+                confined_broca_models.unwrap_or_else(|| broca_models.clone())
             } else {
                 host_models.clone()
             },
@@ -4757,6 +4779,28 @@ fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
     requested_substrate.map(str::trim) == Some("broca")
 }
 
+/// The Broca routes a caller's model list admits: a route stays when the list
+/// names its route key or its `provider/model` capacity key, the same match
+/// selection uses for a host's list.
+fn confine_to_caller_list(
+    broca_models: &HashSet<String>,
+    caller: &[String],
+    facts: &[ModelFact],
+) -> HashSet<String> {
+    let caller: HashSet<&str> = caller.iter().map(String::as_str).collect();
+    facts
+        .iter()
+        .filter_map(|fact| {
+            let route_key =
+                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
+            let capacity_key = make_capacity_key(&fact.provider_id, &fact.model_id);
+            (broca_models.contains(&route_key)
+                && (caller.contains(route_key.as_str()) || caller.contains(capacity_key.as_str())))
+            .then_some(route_key)
+        })
+        .collect()
+}
+
 /// Read the cached metadata only; selection never waits on the vault.
 fn broca_served_routes(
     facts: &[ModelFact],
@@ -4783,10 +4827,12 @@ impl SelectAvailability {
 /// Availability for a `route.select` whose caller names the substrate that
 /// will send.
 ///
-/// A Broca send is judged against what Broca can reach now, never against a
-/// list the caller carries: callers without a host (core's own classifier,
+/// A Broca send is judged against what Broca can reach now, not against the
+/// list a caller carries: callers without a host (core's own classifier,
 /// wake author, and comment reviewer) have no list of their own, and a host's
-/// list describes a different substrate. If the vault listing is unknown or
+/// list describes a different substrate. (A host-run re-selection that carries
+/// the head's list is then confined to it; see `confine_to_caller_list`.) If
+/// the vault listing is unknown or
 /// no credential has a provider mapping, selection proceeds over every route
 /// the catalog still serves. Otherwise it uses only explicitly mapped providers.
 /// It stays closed to routes known to be unserved, because withdrawn catalog
@@ -13207,6 +13253,241 @@ mod tests {
         assert_eq!(
             broca["runner"],
             json!({"provider":"opencode-go", "model":"deepseek-v4.1-flash"})
+        );
+    }
+
+    /// A host-run `route.select` (no executor, workload or required harness)
+    /// naming substrate broca, as core sends for a mason the head routed:
+    /// the reply's result and the recorded decision's explanation.
+    async fn host_run_broca_select(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        mut params: serde_json::Value,
+    ) -> (serde_json::Value, String) {
+        params["substrate"] = json!("broca");
+        let request = json!({ "method": ROUTE_SELECT_OP, "params": params });
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_select_request(
+            frame,
+            1,
+            &tx,
+            &Arc::new(Mutex::new(QuotaCache::default())),
+            store,
+            &Arc::new(Mutex::new(None)),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            credentials,
+            &empty_opencode_auth(),
+        )
+        .await
+        .unwrap();
+        let response = rx.recv().await.unwrap();
+        let body = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap();
+        assert_eq!(response.header.ty, FrameType::Response, "{body}");
+        let result = body["result"].clone();
+        let explanation = decision_explanation(store, &result);
+        (result, explanation)
+    }
+
+    /// The live vault's openai credentials, in listing order (2026-10-23): two
+    /// metered API keys, then three ChatGPT logins with their account ids.
+    fn live_openai_vault() -> SharedBrocaCredentials {
+        let credentials = empty_broca_credentials();
+        let row = |id: &str, account: Option<&str>, plan: Option<&str>| {
+            let login = id.starts_with("chatgpt:");
+            cortexkit_claustrum_client::ListedCredential {
+                id: id.into(),
+                categories: if login {
+                    vec!["llm-provider".into(), "openai-native".into()]
+                } else {
+                    vec!["llm-provider".into()]
+                },
+                credential_type: if login { "oauth" } else { "apikey" }.into(),
+                auth_method: Some(if login { "chatgpt" } else { "apikey" }.into()),
+                refresh_adapter: login.then(|| "openai".into()),
+                state: "active".into(),
+                provider_ids: vec!["openai".into()],
+                account_id: account.map(str::to_string),
+                plan_tier: plan.map(str::to_string),
+                ..Default::default()
+            }
+        };
+        credentials.lock().unwrap().apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                credentials: vec![
+                    row("apikey:openai", None, None),
+                    row("apikey:openai:astro", None, None),
+                    row(
+                        "chatgpt:openai",
+                        Some("00000000-0000-4000-8000-0000000000a2"),
+                        Some("pro_200"),
+                    ),
+                    row(
+                        "chatgpt:openai:gmail",
+                        Some("00000000-0000-4000-8000-0000000000a3"),
+                        Some("pro_200"),
+                    ),
+                    row(
+                        "chatgpt:openai:live",
+                        Some("00000000-0000-4000-8000-0000000000a4"),
+                        Some("pro_100"),
+                    ),
+                ],
+                view: "live-openai-2026-10-23".into(),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        credentials
+    }
+
+    /// Live replay (task bg_cb31294f57a0fb19, decision dec_b558f7480125,
+    /// 2026-10-23). A provider reset fence held one ChatGPT login
+    /// (`chatgpt:openai:live`) for masons on openai/gpt-6.1-sol/xhigh. Routing
+    /// pinned the launch to the first serving credential the fence did not
+    /// cover, which in vault order was the metered key `apikey:openai`: the
+    /// runner carried `auth: {method: apikey}`, Broca never asked account
+    /// selection, and the runs failed `credit_balance_exhausted` while routing
+    /// had priced them on the ChatGPT plan.
+    ///
+    /// The launch must stay on a ChatGPT login: here the first unfenced one.
+    /// Requirements are lowered to this fixture's score scale; the vault rows
+    /// and the fence row are the live ones (the reset is moved forward only if
+    /// the clock has passed it, so the fence is always in force).
+    #[tokio::test]
+    async fn a_reset_fence_on_one_chatgpt_login_never_pins_an_openai_launch_to_an_api_key() {
+        let rig = Rig::new("openai-reset-fence-no-apikey-pin");
+        let store = Arc::new(rig.open_store());
+        let mut sol = fact("openai", "gpt-6.1-sol");
+        sol.prompt_defaults = Some(ModelPromptDefaults {
+            variant: Some("xhigh".into()),
+            ..Default::default()
+        });
+        store.upsert_fact(&sol, FactSource::Override).unwrap();
+        let resets_at_ms = 1_793_293_884_000_i64.max(now_ms() as i64 + 7 * 86_400_000);
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO provider_reset_fences \
+                 (route_key, consumer, account_ref, credential_id, resets_at_ms, observed_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "openai/gpt-6.1-sol/xhigh",
+                    "mason",
+                    "00000000-0000-4000-8000-0000000000a4",
+                    "chatgpt:openai:live",
+                    resets_at_ms,
+                    1_792_761_620_444_i64
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .provider_reset_fences("mason", now_ms() as i64)
+                .unwrap()
+                .len(),
+            1
+        );
+        let (result, _) = host_run_broca_select(
+            &store,
+            &live_openai_vault(),
+            json!({
+                "consumer": "mason",
+                "targetAgent": "mason",
+                "requirements": {"iq": 30, "eq": 0},
+                "availableModels": ["openai/gpt-6.1-sol"],
+                "taskId": "bg_cb31294f57a0fb19",
+            }),
+        )
+        .await;
+        assert_eq!(
+            result["selected"]["routeKey"], "openai/gpt-6.1-sol",
+            "{result}"
+        );
+        assert_eq!(result["runner"]["variant"], "xhigh", "{result}");
+        assert_eq!(
+            result["runner"]["auth"],
+            json!({"method": "chatgpt"}),
+            "the fence moves the launch to another ChatGPT login, never to an API key: {result}"
+        );
+    }
+
+    /// Live replay (task bg_42c2a98cf7e298e9, decision dec_1c1ea9180158,
+    /// 2026-10-23). The head routed the mason on its list (Opus, gpt-6-astra,
+    /// gpt-6-luna, gpt-6.1-sol) and reported Opus; core's Broca re-selection
+    /// was judged on every route Broca reaches and chose openai/gpt-5.6, which
+    /// the list does not name and every ChatGPT account refuses. A host-run
+    /// Broca selection carrying the head's list must stay inside it.
+    #[tokio::test]
+    async fn a_host_run_broca_selection_stays_inside_the_heads_model_list() {
+        let rig = Rig::new("host-run-broca-confined");
+        let store = Arc::new(rig.open_store());
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute("DELETE FROM model_facts", [])
+            .unwrap();
+        // Neither route has a price here, so speed breaks the tie: gpt-5.6 is
+        // the better route whenever it is a candidate at all.
+        let mut gpt56 = fact("openai", "gpt-5.6");
+        gpt56.scores.speed = 99.0;
+        let mut opus = fact("anthropic", "claude-opus-5-5");
+        opus.scores.speed = 40.0;
+        for fact in [&gpt56, &opus] {
+            store.upsert_fact(fact, FactSource::Override).unwrap();
+        }
+        let credentials = vault_listing(&[
+            ("oauth:anthropic", &["anthropic"], None),
+            ("chatgpt:openai", &["openai"], None),
+        ]);
+        let params = |available: serde_json::Value| {
+            json!({
+                "consumer": "mason",
+                "targetAgent": "mason",
+                "requirements": {"iq": 30, "eq": 0},
+                "availableModels": available,
+                "excludeRouteKeys": [],
+                "taskId": "bg_42c2a98cf7e298e9",
+            })
+        };
+        // Control: with no list of its own the caller is judged on Broca's
+        // reach alone, where gpt-5.6 wins.
+        let (unconfined, _) = host_run_broca_select(&store, &credentials, params(json!([]))).await;
+        assert_eq!(
+            unconfined["selected"]["routeKey"], "openai/gpt-5.6",
+            "{unconfined}"
+        );
+
+        let (confined, explanation) = host_run_broca_select(
+            &store,
+            &credentials,
+            params(json!([
+                "anthropic/claude-opus-5-5",
+                "openai/gpt-6-astra",
+                "openai/gpt-6-luna",
+                "openai/gpt-6.1-sol"
+            ])),
+        )
+        .await;
+        assert_eq!(
+            confined["selected"]["routeKey"], "anthropic/claude-opus-5-5",
+            "{confined}"
+        );
+        assert_eq!(
+            confined["runner"],
+            json!({"provider": "anthropic", "model": "claude-opus-5-5"})
+        );
+        assert!(
+            explanation.contains("confined to the caller's 4 listed models: 1 reachable"),
+            "{explanation}"
         );
     }
 
