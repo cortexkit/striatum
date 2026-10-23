@@ -224,9 +224,13 @@ pub(crate) fn rejection_reason(
 }
 
 /// Broca's provider codes for a credential out of paid balance: `billing_exhausted`,
-/// and `insufficient_quota` from older Broca releases.
+/// `insufficient_quota` from older Broca releases, and `credit_insufficient` (a
+/// balance too small for the request, OpenRouter's 402).
 fn is_billing_code(code: &str) -> bool {
-    matches!(code, "billing_exhausted" | "insufficient_quota")
+    matches!(
+        code,
+        "billing_exhausted" | "insufficient_quota" | "credit_insufficient"
+    )
 }
 
 /// Drop every credential mark from a snapshot an explicit pin is judged on:

@@ -7747,6 +7747,14 @@ mod tests {
         replay_credential_refusal("billing_exhausted", "credential_billing_exhausted").await;
     }
 
+    /// The same replay for a balance too small for the request: Broca ends the run as
+    /// permanent `credit_insufficient` (OpenRouter's 402 "This request requires more
+    /// credits"). It is the same account-level refusal as an empty balance.
+    #[tokio::test]
+    async fn a_credit_insufficient_refusal_fences_the_providers_routes_through_that_credential() {
+        replay_credential_refusal("credit_insufficient", "credential_billing_exhausted").await;
+    }
+
     async fn replay_credential_refusal(code: &str, reason: &str) {
         let rig = Rig::new(&format!("credential-refusal-fence-{code}"));
         let mut store: SharedStore = Arc::new(rig.open_store());
