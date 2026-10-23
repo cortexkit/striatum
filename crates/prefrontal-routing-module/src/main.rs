@@ -12713,7 +12713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broca_runner_maps_gateway_and_omitted_availability_matches_explicit() {
+    async fn broca_runner_keeps_the_go_provider_and_omitted_availability_matches_explicit() {
         let rig = Rig::new("broca-runner");
         let store = Arc::new(rig.open_store());
         store
@@ -12750,7 +12750,90 @@ mod tests {
         assert_eq!(results[1]["resolvedInput"]["availableModels"], json!([]));
         assert_eq!(
             results[1]["runner"],
-            json!({"provider":"opencode", "model":"m-native-fast"})
+            json!({"provider":"opencode-go", "model":"m-native-fast"})
+        );
+    }
+
+    /// The two selections a routed Broca mason gets. The launching OpenCode head
+    /// selects on its own model list and names no substrate, so routing records
+    /// no selected harness and returns no runner: that answer cannot be sent to
+    /// Broca. Core then selects the same launch for substrate broca, which
+    /// routing records under harness broca and answers with the Go plan's own
+    /// provider id as the runner.
+    #[tokio::test]
+    async fn routed_mason_selected_for_broca_records_broca_and_keeps_the_go_provider() {
+        let rig = Rig::new("broca-mason-go-plan");
+        let store = Arc::new(rig.open_store());
+        store
+            .upsert_fact(
+                &fact("opencode-go", "deepseek-v4.1-flash"),
+                FactSource::Override,
+            )
+            .unwrap();
+        let broca_credentials = mapped_broca_credentials("opencode-go");
+        let mut answers = Vec::new();
+        for substrate in [None, Some("broca")] {
+            // No executor, workload or required harness: a launch selection.
+            let mut params = json!({
+                "consumer": "mason",
+                "targetAgent": "mason",
+                "requirements": {"iq": 30, "eq": 0},
+                "availableModels": ["opencode-go/deepseek-v4.1-flash"],
+                "harness": "opencode",
+                "taskId": "bg_go_plan",
+            });
+            if let Some(substrate) = substrate {
+                params["substrate"] = json!(substrate);
+            }
+            let request = json!({ "method": ROUTE_SELECT_OP, "params": params });
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            handle_select_request(
+                frame,
+                1,
+                &tx,
+                &Arc::new(Mutex::new(QuotaCache::default())),
+                &store,
+                &Arc::new(Mutex::new(None)),
+                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                &broca_credentials,
+                &empty_opencode_auth(),
+            )
+            .await
+            .unwrap();
+            let response = rx.recv().await.unwrap();
+            assert_eq!(response.header.ty, FrameType::Response);
+            let result = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()
+                ["result"]
+                .clone();
+            let decision = store
+                .get_decision_by_id(result["decisionID"].as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            answers.push((result, decision.selected_harness));
+        }
+        let (host, host_harness) = &answers[0];
+        assert_eq!(
+            host["selected"]["routeKey"],
+            "opencode-go/deepseek-v4.1-flash"
+        );
+        assert!(host.get("runner").is_none(), "{host}");
+        assert_eq!(host_harness.as_deref(), None);
+        let (broca, broca_harness) = &answers[1];
+        assert_eq!(broca["selected"]["harness"], "broca");
+        assert_eq!(broca_harness.as_deref(), Some("broca"));
+        assert_eq!(
+            broca["runner"],
+            json!({"provider":"opencode-go", "model":"deepseek-v4.1-flash"})
         );
     }
 
