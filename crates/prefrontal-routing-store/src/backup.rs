@@ -100,6 +100,11 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "provider-confirmed resets scoped to request class and serving identity",
     ),
     (
+        "credential_entitlement_fences",
+        "credentials a provider refused permanently (no entitlement, empty balance); \
+         empty, routing selects them again and the next run repeats the refusal",
+    ),
+    (
         "account_selection_salt",
         "salt for conversation keys; a new salt changes every affinity",
     ),

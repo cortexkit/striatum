@@ -52,6 +52,22 @@ pub const REASON_NOT_AVAILABLE: &str = "not_available";
 /// use it. Checked before every other fence, because no policy can make a
 /// withdrawn model servable.
 pub const REASON_DEPRECATED_UPSTREAM: &str = "deprecated_upstream";
+/// Every credential that would serve this route got a permanent entitlement or
+/// authorization refusal from the provider. The rejection names those
+/// credentials in `credential_ids`; it carries no prose.
+pub const REASON_CREDENTIAL_UNENTITLED: &str = "credential_unentitled";
+/// Every credential that would serve this route ran out of paid balance (the
+/// provider's permanent `billing_exhausted`). Named like
+/// [`REASON_CREDENTIAL_UNENTITLED`], in `credential_ids`.
+pub const REASON_CREDENTIAL_BILLING_EXHAUSTED: &str = "credential_billing_exhausted";
+
+/// The permanently refused credentials that leave a route with no usable one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CredentialRefusalMark {
+    /// [`REASON_CREDENTIAL_UNENTITLED`] or [`REASON_CREDENTIAL_BILLING_EXHAUSTED`].
+    pub reason: &'static str,
+    pub credential_ids: Vec<String>,
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteRuntimeState {
@@ -64,6 +80,10 @@ pub struct RouteRuntimeState {
     /// Provider reset for this selection's consumer and serving identity. Unlike
     /// quota telemetry this cannot be bypassed by a speculative break-glass probe.
     pub provider_reset_until: Option<f64>,
+    /// The vault credentials that would serve this route, all of which the
+    /// provider refused permanently, so automatic selection rejects the route.
+    /// Explicit pins clear it.
+    pub credential_refusal: Option<CredentialRefusalMark>,
     /// Typed cause of the hard wall. None preserves legacy/unclassified behavior.
     pub wall_class: Option<crate::route_state_store::RouteWallClass>,
     /// Last provider error associated with the wall, retained for no-route diagnostics.
@@ -256,6 +276,9 @@ pub struct RejectedRoute {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The refused credentials behind a `credential_unentitled` rejection.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub credential_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -601,6 +624,9 @@ pub(crate) fn merged_runtime_state(
             merged.provider_reset_until,
             route_state.provider_reset_until,
         );
+        if merged.credential_refusal.is_none() {
+            merged.credential_refusal = route_state.credential_refusal.clone();
+        }
         merged.failure_backoff_until = route_state.failure_backoff_until;
         merged.failure_backoff_reason = route_state.failure_backoff_reason.clone();
         // Soft telemetry remains route-specific when present.
@@ -713,6 +739,7 @@ pub fn admit_routes_with_availability(
                 )),
                 route_key: route.route_key,
                 reason: REASON_DEPRECATED_UPSTREAM.to_string(),
+                credential_ids: Vec::new(),
             });
             continue;
         }
@@ -721,6 +748,7 @@ pub fn admit_routes_with_availability(
                 route_key: route.route_key,
                 reason: "unscored_awaiting_placement".to_string(),
                 detail: None,
+                credential_ids: Vec::new(),
             });
             continue;
         }
@@ -735,6 +763,7 @@ pub fn admit_routes_with_availability(
                     ExclusionSource::Caller => REASON_EXCLUDED.to_string(),
                 },
                 detail: None,
+                credential_ids: Vec::new(),
             });
             continue;
         }
@@ -745,6 +774,7 @@ pub fn admit_routes_with_availability(
                 detail: availability_rejections.get(&route.route_key).cloned(),
                 route_key: route.route_key,
                 reason: REASON_NOT_AVAILABLE.to_string(),
+                credential_ids: Vec::new(),
             });
             continue;
         }
@@ -753,6 +783,7 @@ pub fn admit_routes_with_availability(
                 route_key: route.route_key,
                 reason: reason.to_string(),
                 detail: None,
+                credential_ids: Vec::new(),
             });
             continue;
         }
@@ -763,6 +794,17 @@ pub fn admit_routes_with_availability(
     let mut admitted = Vec::new();
     for (fact, route) in static_candidates {
         let runtime = merged_runtime_state(&route, runtime_snapshot);
+        // A refused credential is not a wall with a deadline: nothing but a change
+        // to the credential's vault listing can lift it, so it is checked first.
+        if let Some(mark) = runtime.credential_refusal.as_ref() {
+            rejected.push(RejectedRoute {
+                route_key: route.route_key,
+                reason: mark.reason.to_string(),
+                detail: None,
+                credential_ids: mark.credential_ids.clone(),
+            });
+            continue;
+        }
         // A wall rejection names the deadline it was compared against. Without it a
         // ledger row reading `quota_exhausted` cannot be told apart from a stale stored
         // wall, a live overlay wall, or a clock in the wrong unit, and the operator's
@@ -772,6 +814,7 @@ pub fn admit_routes_with_availability(
                 route_key: route.route_key,
                 reason: "cooldown_active".to_string(),
                 detail: Some(wall_detail(until, now)),
+                credential_ids: Vec::new(),
             });
             continue;
         }
@@ -782,6 +825,7 @@ pub fn admit_routes_with_availability(
                 route_key: route.route_key,
                 reason: "quota_exhausted".to_string(),
                 detail: Some(wall_detail(until, now)),
+                credential_ids: Vec::new(),
             });
             continue;
         }
@@ -793,6 +837,7 @@ pub fn admit_routes_with_availability(
                 route_key: route.route_key,
                 reason: "backoff_active".to_string(),
                 detail: runtime.failure_backoff_reason.clone(),
+                credential_ids: Vec::new(),
             });
             continue;
         }
@@ -1397,6 +1442,7 @@ fn admit_and_price_shortlist(
                         crate::subscription::is_head(&input.target_agent),
                     )
                 }),
+                credential_ids: Vec::new(),
             });
         }
         permitted
@@ -1815,6 +1861,7 @@ pub fn select_model_route_with_availability(
             route_key: skipped.route_key.clone(),
             reason: REASON_PROVIDER_SATURATED.to_string(),
             detail: Some(skipped.slot.describe()),
+            credential_ids: Vec::new(),
         }));
     }
 

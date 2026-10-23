@@ -200,6 +200,43 @@ pub struct ProviderOutcome {
     pub account_ref: String,
     pub credential_id: Option<String>,
     pub resets_at_ms: Option<i64>,
+    /// A permanent refusal of the credential itself: the provider's
+    /// `ENTITLEMENT_ERROR` (the account has no plan for the provider's models) or
+    /// `billing_exhausted` (its paid balance is empty). Optional on the wire: a
+    /// routing build that predates the field ignores it, and a core build that
+    /// predates it never sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_refusal: Option<CredentialRefusal>,
+}
+
+/// A provider's permanent refusal of one vault credential, as the run that hit it
+/// reported it. Routing stops choosing the provider through that credential until
+/// the credential's vault listing changes; see [`CredentialEntitlementFence`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRefusal {
+    /// Routing's provider id the refused run was launched on.
+    pub provider_id: String,
+    /// The vault credential Broca reported for the run: its frozen
+    /// `auth_selection`, or the `credential_id` a billing error names.
+    pub credential_id: String,
+    /// The provider's refusal code as Broca reported it (`ENTITLEMENT_ERROR`,
+    /// `billing_exhausted`).
+    pub code: String,
+}
+
+/// A stored (provider, credential) pair that routing does not select
+/// automatically. `listing_fingerprint` is the credential's vault listing
+/// (provider ids, plan tier and state) when the refusal arrived; the fence ends
+/// when the listing no longer matches it, never on a timer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialEntitlementFence {
+    pub provider_id: String,
+    pub credential_id: String,
+    pub code: String,
+    /// `None` when routing had no vault listing for the credential at the time.
+    pub listing_fingerprint: Option<String>,
+    pub observed_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
