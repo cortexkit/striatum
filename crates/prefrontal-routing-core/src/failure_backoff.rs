@@ -101,17 +101,23 @@ pub fn classify_failure_attribution(
     {
         return FailureAttribution::RunnerState;
     }
-    if [
-        "getaddrinfo",
-        "enotfound",
-        "etimeout",
-        "econnrefused",
-        "eai_again",
-        "network is unreachable",
-        "dns",
-    ]
-    .iter()
-    .any(|class| error.contains(class))
+    if error
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|token| {
+            matches!(
+                token,
+                "getaddrinfo" | "enotfound" | "etimedout" | "econnrefused" | "eai_again"
+            )
+        })
+        || [
+            "network is unreachable",
+            "dns lookup failed",
+            "dns resolution failed",
+            "dns lookup timed out",
+            "dns resolution timed out",
+        ]
+        .iter()
+        .any(|signature| error.contains(signature))
     {
         return FailureAttribution::LocalNetwork;
     }
@@ -493,6 +499,59 @@ mod tests {
 
         assert_eq!(consecutive_failures, 0);
         assert_eq!(cooldown_until, None);
+    }
+
+    #[test]
+    fn local_connection_timeout_codes_preserve_the_route_streak_and_backoff() {
+        for error in [
+            "connect ETIMEDOUT 203.0.113.1:443",
+            "Error [ETIMEDOUT]: connection failed",
+            "getaddrinfo EAI_AGAIN api.example.com",
+            "DNS lookup failed for api.example.com",
+            "DNS resolution failed for api.example.com",
+            "DNS lookup timed out for api.example.com",
+        ] {
+            assert_eq!(
+                failure_backoff_transition(
+                    2,
+                    RouteOutcome::SessionError,
+                    Some(error),
+                    1_000,
+                    FailureBackoffConfig::default(),
+                ),
+                FailureBackoffTransition::Unchanged,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_dns_mentions_and_post_dispatch_timeouts_still_charge_the_route() {
+        for error in [
+            "provider returned HTTP 503: upstream DNS service unavailable",
+            "provider returned HTTP 500: rdns_backend failed",
+            "provider returned HTTP 503: dns configuration rejected",
+            "provider returned HTTP 500: enotfound_backend failed",
+            "provider stream timed out after the first token",
+        ] {
+            assert_eq!(
+                failure_backoff_transition(
+                    2,
+                    RouteOutcome::SessionError,
+                    Some(error),
+                    1_000,
+                    FailureBackoffConfig::default(),
+                ),
+                FailureBackoffTransition::Failure {
+                    consecutive_failures: 3,
+                    cooldown_until: Some(1_000 + FAILURE_BACKOFF_INITIAL_MS),
+                    reason: Some(format!(
+                        "consecutive terminal send failures: 3; last error: {error}"
+                    )),
+                },
+                "{error}"
+            );
+        }
     }
 
     #[test]
