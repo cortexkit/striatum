@@ -644,6 +644,40 @@ pub(crate) fn merged_runtime_state(
     merged
 }
 
+/// When a route that admission rejects for a timed wall (`cooldown_active`,
+/// `quota_exhausted`, `backoff_active`) becomes admissible again: the latest
+/// still-future deadline among the walls admission checks, read from the route
+/// and its capacity the way admission merges them. `None` when no wall is live,
+/// so nothing names a time the route recovers.
+pub fn route_wall_until(
+    snapshot: &ModelRouteStateSnapshot,
+    route_key: &str,
+    capacity_key: &str,
+) -> Option<f64> {
+    let by_route = snapshot.by_route.get(route_key);
+    let by_capacity = snapshot.by_capacity.get(capacity_key);
+    // Admission composes the hard walls of both scopes and reads the failure
+    // backoff from the route when it has state (see `merged_runtime_state`).
+    let backoff = match by_route {
+        Some(route) => route.failure_backoff_until,
+        None => by_capacity.and_then(|capacity| capacity.failure_backoff_until),
+    };
+    [by_route, by_capacity]
+        .into_iter()
+        .flatten()
+        .flat_map(|state| {
+            [
+                state.cooldown_until,
+                state.quota_exhausted_until,
+                state.provider_reset_until,
+            ]
+        })
+        .chain([backoff])
+        .flatten()
+        .filter(|until| *until > snapshot.now)
+        .max_by(f64::total_cmp)
+}
+
 #[derive(Debug, Clone)]
 pub struct AdmittedRoute {
     pub route: ModelRoute,

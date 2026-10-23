@@ -4022,6 +4022,13 @@ async fn handle_select_request(
             variant.as_deref(),
         )?;
         let mut pin_availability = mapped_availability.rejected.clone();
+        // When a pin refused for a timed wall can be admitted again, so a caller
+        // that may not fall back can wait for that time instead of failing.
+        let pin_wall_until = prefrontal_routing_core::model_router::route_wall_until(
+            &pin_snapshot,
+            &pin_key,
+            &pin_capacity,
+        );
         let mut pin_available = available.clone();
         // A host-run pin is judged on the same list as the host's automatic
         // selections; it is not added to that list.
@@ -4262,12 +4269,20 @@ async fn handle_select_request(
                     }
                 }
                 if params.pin.is_some() {
+                    let timed = matches!(
+                        refusal.code.as_str(),
+                        "cooldown_active" | "quota_exhausted" | "backoff_active"
+                    );
                     pin_rejected = Some(refusal.code);
                     if params.pin_fallback == select_policy::PinFallback::None {
-                        let body = serde_json::to_vec(&json!({ "result": {
+                        let mut result = json!({
                             "selected": null, "decisionID": null, "pin_rejected": pin_rejected,
-                        }}))
-                        .map_err(ModuleError::Json)?;
+                        });
+                        if let Some(until) = pin_wall_until.filter(|_| timed) {
+                            result["pin_rejected_until_ms"] = json!(until as i64);
+                        }
+                        let body = serde_json::to_vec(&json!({ "result": result }))
+                            .map_err(ModuleError::Json)?;
                         let response = Frame::build_with_version(
                             ver,
                             FrameType::Response,
@@ -14975,6 +14990,315 @@ mod tests {
             reasons,
             vec!["credential_billing_exhausted"; 4],
             "{refused}"
+        );
+    }
+
+    /// The four API keys the live vault maps to `anthropic-platform`.
+    const LIVE_PLATFORM_KEYS: [&str; 4] = [
+        "apikey:anthropic:wsampleyahoo",
+        "apikey:anthropic:usersamplegmail",
+        "apikey:anthropic:wsamplegmail",
+        "apikey:anthropic:ysample",
+    ];
+
+    /// Broca's run-end error for the low-credit key, as core stored it in the
+    /// provider cooldown's `last_error` (serde_json's sorted key order).
+    const LIVE_LOW_CREDIT_ERROR: &str = r#"{"class":"permanent","credential_id":"apikey:anthropic:wsampleyahoo","message":"400: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.\"},\"request_id\":\"req_011CgK8eU8fTeQoECLazghi7\"}","provider_code":"billing_exhausted","status":400}"#;
+
+    /// A pool of the four live keys with `anthropic/claude-opus-5-5` in the catalog.
+    fn live_platform_pool(name: &str) -> (Rig, SharedStore, SharedBrocaCredentials, PathBuf) {
+        let platform: &[&str] = &["anthropic-platform"];
+        let credentials = platform_listing(&LIVE_PLATFORM_KEYS.map(|key| (key, platform)));
+        let rig = Rig::new(name);
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-5-5"), FactSource::Override)
+            .unwrap();
+        let config = platform_operator_config(&rig);
+        (rig, store, credentials, config)
+    }
+
+    async fn live_platform_call(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        config: &Path,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let frame = run_route_wire_request_with_paths(
+            store,
+            json!({"method": method, "params": params}),
+            config,
+            credentials,
+        )
+        .await;
+        serde_json::from_slice(&frame.body).unwrap()
+    }
+
+    /// Core's outcome report for a run one key ended with `billing_exhausted`.
+    async fn report_live_billing_refusal(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        credential: &str,
+    ) {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": {
+                "decisionID": format!("decision-{credential}"), "outcome": "error",
+                "lastError": LIVE_LOW_CREDIT_ERROR.replace(LIVE_PLATFORM_KEYS[0], credential),
+                "providerOutcome": {
+                    "accountRef": credential, "credentialId": credential,
+                    "credentialRefusal": {"providerId": "anthropic-platform", "credentialId": credential, "code": "billing_exhausted"}
+                }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_set_decision_outcome(
+            frame,
+            &tx,
+            store,
+            Path::new("/nonexistent/live-platform-pool.jsonc"),
+            credentials,
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(ack["result"]["ok"], true, "{ack}");
+    }
+
+    fn live_opus_pin(task: &str) -> serde_json::Value {
+        json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+               "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-5-5",
+               "taskId": task})
+    }
+
+    /// Replay of the live incident: one of anthropic-platform's four API keys
+    /// (`apikey:anthropic:wsampleyahoo`) ran out of credit. Core reported the
+    /// refusal, which fenced that key, and also sent a provider-wide billing
+    /// cooldown whose evidence names the key. That cooldown walled every
+    /// anthropic-platform route until a re-probe hours later, so a pinned
+    /// `anthropic-platform/claude-opus-5-5` was refused `cooldown_active` and a
+    /// spec campaign died. The refusal must fence the one key only: the pin is
+    /// admitted on another key, and with all four keys fenced it is refused
+    /// naming each of them.
+    #[tokio::test]
+    async fn a_billing_refusal_naming_one_key_never_cools_the_provider_while_another_key_serves_it()
+    {
+        let (rig, store, credentials, config) =
+            live_platform_pool("platform-pool-key-named-billing-wall");
+        let call = |method: &'static str, params: serde_json::Value| {
+            let (store, credentials, config) = (store.clone(), credentials.clone(), config.clone());
+            async move { live_platform_call(&store, &credentials, &config, method, params).await }
+        };
+        let healthy = call(ROUTE_SELECT_OP, live_opus_pin("ses-before")).await;
+        assert!(
+            healthy["result"]["poolLease"]["credentialId"].is_string(),
+            "precondition: the pin is admitted before any refusal: {healthy}"
+        );
+
+        report_live_billing_refusal(&store, &credentials, LIVE_PLATFORM_KEYS[0]).await;
+        // Then the provider-wide billing wall core's consult writer sent live,
+        // with the key-named error as its evidence.
+        let until = now_ms() as f64 + 6.0 * 3_600_000.0;
+        let wall = call(
+            ROUTE_RECORD_COOLDOWN_OP,
+            json!({"routeKey": "anthropic-platform/claude-opus-5-5",
+                   "capacityKey": "anthropic-platform/claude-opus-5-5",
+                   "cooldownUntil": until, "quotaExhaustedUntil": until,
+                   "wallClass": "billing", "providerWide": true,
+                   "incrementQuotaError": true, "incrementFailure": true,
+                   "lastError": LIVE_LOW_CREDIT_ERROR}),
+        )
+        .await;
+        assert_eq!(wall["result"]["ok"], true, "{wall}");
+        assert_eq!(
+            store.get_provider_cooldown("anthropic-platform").unwrap(),
+            None,
+            "a refusal that names its key never cools the provider"
+        );
+        // Nothing is written either: the store holds no provider row and no
+        // route horizon for the refusal.
+        let conn = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let provider_rows: i64 = conn
+            .query_row("SELECT count(*) FROM provider_cooldown_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let route_walls: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM model_route_state
+                 WHERE cooldown_until IS NOT NULL OR quota_exhausted_until IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((provider_rows, route_walls), (0, 0));
+
+        for session in ["ses-1", "ses-2", "ses-3", "ses-4"] {
+            let pinned = call(ROUTE_SELECT_OP, live_opus_pin(session)).await;
+            assert_eq!(
+                pinned["result"]["selected"]["model"]["modelID"], "claude-opus-5-5",
+                "the pin stays admissible on another key: {pinned}"
+            );
+            let key = pinned["result"]["poolLease"]["credentialId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{pinned}"));
+            assert_ne!(key, LIVE_PLATFORM_KEYS[0], "{pinned}");
+        }
+
+        // Every key fenced: the pin is refused by name, each key listed.
+        for key in &LIVE_PLATFORM_KEYS[1..] {
+            report_live_billing_refusal(&store, &credentials, key).await;
+        }
+        let refused = call(ROUTE_SELECT_OP, live_opus_pin("ses-all-fenced")).await;
+        assert_eq!(
+            refused["code"], "explicit_provider_pool_exhausted",
+            "{refused}"
+        );
+        assert!(refused.get("result").is_none(), "no fallback: {refused}");
+        let message = refused["message"].as_str().unwrap_or_default();
+        for key in LIVE_PLATFORM_KEYS {
+            assert!(
+                message.contains(&format!("{key} credential_billing_exhausted")),
+                "{key} is named: {refused}"
+            );
+        }
+    }
+
+    /// The provider cooldown already stored live, before routing kept key-named
+    /// refusals off the provider: the provider row and the fanned-out route row
+    /// hold a billing wall until a re-probe hours away, with the low-credit key's
+    /// run error as evidence, and the key's fence is recorded. After the deploy,
+    /// with no edit to the store, that wall no longer blocks the pin, the
+    /// cooldown status, or a later write to the route; its evidence is kept.
+    #[tokio::test]
+    async fn a_stored_provider_cooldown_naming_a_fenced_key_stops_blocking() {
+        let (rig, store, credentials, config) =
+            live_platform_pool("platform-pool-stored-key-named-wall");
+        report_live_billing_refusal(&store, &credentials, LIVE_PLATFORM_KEYS[0]).await;
+        let until = now_ms() as i64 + 6 * 3_600_000;
+        let recorded_at = now_ms() as i64 - 3_600_000;
+        {
+            let conn = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+            conn.execute(
+                "INSERT INTO provider_cooldown_state (provider_key, cooldown_until,
+                   quota_exhausted_until, quota_pressure, last_error, last_error_at,
+                   updated_at, wall_class)
+                 VALUES ('anthropic-platform', ?1, ?1, NULL, ?2, ?3, ?3, 'billing')",
+                rusqlite::params![until, LIVE_LOW_CREDIT_ERROR, recorded_at],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO model_route_state (route_key, capacity_key, provider_id, model_id,
+                   cooldown_until, quota_exhausted_until, last_error, last_error_at,
+                   wall_class, updated_at)
+                 VALUES ('anthropic-platform/claude-opus-5-5', 'anthropic-platform/claude-opus-5-5',
+                   'anthropic-platform', 'claude-opus-5-5', ?1, ?1, ?2, ?3, 'billing', ?3)",
+                rusqlite::params![until, LIVE_LOW_CREDIT_ERROR, recorded_at],
+            )
+            .unwrap();
+        }
+
+        let pinned = live_platform_call(
+            &store,
+            &credentials,
+            &config,
+            ROUTE_SELECT_OP,
+            live_opus_pin("ses-after-deploy"),
+        )
+        .await;
+        assert_eq!(
+            pinned["result"]["selected"]["model"]["modelID"], "claude-opus-5-5",
+            "{pinned}"
+        );
+        assert_ne!(
+            pinned["result"]["poolLease"]["credentialId"], LIVE_PLATFORM_KEYS[0],
+            "{pinned}"
+        );
+        assert_eq!(
+            store.get_provider_cooldown("anthropic-platform").unwrap(),
+            None
+        );
+        // A later route-scoped write neither inherits the stored provider wall
+        // nor keeps the route row's own horizon.
+        store
+            .update_route_state(
+                "anthropic-platform/claude-opus-5-5",
+                "anthropic-platform/claude-opus-5-5",
+                &prefrontal_routing_core::RouteStateUpdate {
+                    latency_ema_ms: Some(1_000.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let snapshot = store.build_snapshot(now_ms() as f64).unwrap();
+        let route = &snapshot.by_route["anthropic-platform/claude-opus-5-5"];
+        assert_eq!(
+            (route.cooldown_until, route.quota_exhausted_until),
+            (None, None),
+            "{route:?}"
+        );
+        assert_eq!(route.last_error.as_deref(), Some(LIVE_LOW_CREDIT_ERROR));
+    }
+
+    /// A pin that may not fall back and is refused for a timed wall carries the
+    /// time routing can admit it again, so the caller can wait for it; a
+    /// refusal with no recovery time (here a caller exclusion) carries none.
+    #[tokio::test]
+    async fn a_pin_refused_for_a_timed_wall_names_when_it_can_be_admitted_again() {
+        let (_rig, store, credentials, config) = live_platform_pool("platform-pin-wall-until");
+        let until = now_ms() as i64 + 2 * 3_600_000;
+        let wall = live_platform_call(
+            &store,
+            &credentials,
+            &config,
+            ROUTE_RECORD_COOLDOWN_OP,
+            json!({"routeKey": "anthropic-platform/claude-opus-5-5",
+                   "capacityKey": "anthropic-platform/claude-opus-5-5",
+                   "cooldownUntil": until, "lastError": "HTTP 529 overloaded"}),
+        )
+        .await;
+        assert_eq!(wall["result"]["ok"], true, "{wall}");
+        let pin_only = |exclude: serde_json::Value| {
+            json!({"targetAgent": "oracle", "consumer": "athena", "workload": "athena",
+                   "requirements": {"iq": 90, "eq": 0}, "substrate": "broca", "executor": "broca",
+                   "pin": {"model": "anthropic-platform/claude-opus-5-5"}, "pin_fallback": "none",
+                   "excludeRouteKeys": exclude, "taskId": "ct-pin-wall"})
+        };
+        let cooled = live_platform_call(
+            &store,
+            &credentials,
+            &config,
+            ROUTE_SELECT_OP,
+            pin_only(json!([])),
+        )
+        .await;
+        assert_eq!(
+            cooled["result"]["pin_rejected"], "cooldown_active",
+            "{cooled}"
+        );
+        assert_eq!(cooled["result"]["pin_rejected_until_ms"], until, "{cooled}");
+        let excluded = live_platform_call(
+            &store,
+            &credentials,
+            &config,
+            ROUTE_SELECT_OP,
+            pin_only(json!(["anthropic-platform/claude-opus-5-5"])),
+        )
+        .await;
+        assert_eq!(
+            excluded["result"]["pin_rejected"], "caller_excluded",
+            "{excluded}"
+        );
+        assert!(
+            excluded["result"].get("pin_rejected_until_ms").is_none(),
+            "{excluded}"
         );
     }
 
