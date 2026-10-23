@@ -458,6 +458,18 @@ pub(crate) struct PlaneCatalog {
 }
 
 impl PlaneCatalog {
+    pub(crate) fn subscription_plan_providers(&self) -> BTreeSet<String> {
+        self.pages
+            .values()
+            .filter_map(|reply| match reply {
+                PlaneReply::Served(page) if page.plane.kind == "quota_proxy" => {
+                    Some(page.plane.provider_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub(crate) fn is_loaded(&self) -> bool {
         self.version.is_some()
     }
@@ -469,6 +481,29 @@ impl PlaneCatalog {
             ..Self::default()
         };
         for fact in facts {
+            if let Some(plane) = &fact.billing_plane {
+                catalog.pages.insert(
+                    (fact.provider_id.clone(), plane.auth_method.clone()),
+                    PlaneReply::Served(PlanePage {
+                        plane: PlaneDescriptor {
+                            provider_id: plane.provider_id.clone(),
+                            auth_method: plane.auth_method.clone(),
+                            kind: plane.kind.clone(),
+                            source_ref: None,
+                            review_by_ms: None,
+                        },
+                        rates: BTreeMap::from([(
+                            format!("{}/{}", fact.provider_id, fact.model_id),
+                            ModelRates {
+                                rates: plane.rates.clone(),
+                                inherited: BTreeSet::new(),
+                            },
+                        )]),
+                        billing_rules: vec![],
+                    }),
+                );
+                continue;
+            }
             catalog.base.insert(
                 format!("{}/{}", fact.provider_id, fact.model_id),
                 ModelRates {

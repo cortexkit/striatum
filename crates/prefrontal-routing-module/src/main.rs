@@ -1568,6 +1568,13 @@ struct SelectBody {
 struct SelectParams {
     #[serde(default)]
     consumer: Option<select_policy::Consumer>,
+    #[serde(
+        default,
+        rename = "allowed_providers",
+        alias = "allowedProviders",
+        deserialize_with = "select_policy::deserialize_allowed_providers"
+    )]
+    allowed_providers: Option<Vec<String>>,
     #[serde(default)]
     pin: Option<select_policy::Pin>,
     #[serde(default, rename = "pin_fallback", alias = "pinFallback")]
@@ -3799,10 +3806,18 @@ async fn handle_select_request(
         &mut facts,
         &operator_policy.score_alias,
     );
-    if let Ok(credentials) = broca_credentials.lock() {
+    let subscription_plan_providers = if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(&mut facts);
-    }
+        credentials.subscription_plan_providers()
+    } else {
+        None
+    };
     live_config.apply(&mut facts);
+    if select_policy::requires_metered(params.consumer) {
+        for fact in &mut facts {
+            fact.subscription_multiplier = None;
+        }
+    }
     apply_provider_resets(
         &mut snapshot,
         &facts,
@@ -3849,7 +3864,7 @@ async fn handle_select_request(
         broca_models: &broca_models,
         executor_models,
     };
-    let mapped_availability = if host_run {
+    let mut mapped_availability = if host_run {
         selection_harness::MappedAvailability {
             models: if host_run_harness.is_some() {
                 broca_models.clone()
@@ -3861,6 +3876,14 @@ async fn handle_select_request(
     } else {
         harness_context.availability(&facts)
     };
+    mapped_availability
+        .rejected
+        .extend(select_policy::candidate_rejections(
+            &facts,
+            params.consumer,
+            params.allowed_providers.as_deref(),
+            subscription_plan_providers.as_ref(),
+        ));
     let available = mapped_availability.models.clone();
     // The harness a route selected here runs on, as far as routing knows: the
     // mapped harness, or for a host-run selection Broca when it was judged on
@@ -3988,6 +4011,17 @@ async fn handle_select_request(
                 pin_available.insert(pin_key.clone());
             }
         }
+        if let Some(detail) = select_policy::candidate_rejections(
+            &pin_facts,
+            params.consumer,
+            params.allowed_providers.as_deref(),
+            subscription_plan_providers.as_ref(),
+        )
+        .values()
+        .next()
+        {
+            pin_availability.insert(pin_key.clone(), detail.clone());
+        }
         let pin_harness = run_harness(&pin_key);
         let runner_pin_refusal = if host_run {
             host_runner_pin_refusal(
@@ -4041,7 +4075,8 @@ async fn handle_select_request(
                 operator_exclude_keys: operator_exclude.clone(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                    sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
+                    !select_policy::requires_metered(params.consumer)
+                        && (sub.contains(&route.route_key) || sub.contains(&route.capacity_key))
                 })),
                 min_best_effort_adequacy,
                 prefer_prompt_cache: false,
@@ -4256,7 +4291,8 @@ async fn handle_select_request(
                 operator_exclude_keys: operator_exclude.clone(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                    sub.contains(&route.route_key) || sub.contains(&route.capacity_key)
+                    !select_policy::requires_metered(params.consumer)
+                        && (sub.contains(&route.route_key) || sub.contains(&route.capacity_key))
                 })),
                 min_best_effort_adequacy,
                 prefer_prompt_cache,
@@ -4270,6 +4306,7 @@ async fn handle_select_request(
             consumer_exclude,
             &mapped_availability.rejected,
         )
+        .map_err(select_policy::describe_filter_refusal)
     };
 
     // First attempt against the live snapshot.
@@ -5527,6 +5564,7 @@ fn panel_decision_input(
     });
     DecisionInput {
         consumer: Some(PANEL_DECISION_CONSUMER.into()),
+        allowed_providers_json: None,
         decision_id: None,
         decision_kind: "panel".into(),
         task_id: params.task_id.clone(),
@@ -5573,6 +5611,10 @@ fn decision_input_for(
     let policy_revision = provenance.map(|value| value.policy_revision.clone());
     match selected {
         Some(sel) => DecisionInput {
+            allowed_providers_json: params
+                .allowed_providers
+                .as_ref()
+                .map(|ids| serde_json::to_string(ids).unwrap()),
             consumer: variant_policy::consumer_group(params.consumer).map(str::to_string),
             decision_id: None,
             decision_kind: "single".into(),
@@ -5607,6 +5649,10 @@ fn decision_input_for(
         None => {
             let failure = no_route.expect("a refusal decision must preserve its routing failure");
             DecisionInput {
+                allowed_providers_json: params
+                    .allowed_providers
+                    .as_ref()
+                    .map(|ids| serde_json::to_string(ids).unwrap()),
                 consumer: variant_policy::consumer_group(params.consumer).map(str::to_string),
                 decision_id: None,
                 decision_kind: "single".into(),
@@ -6235,6 +6281,7 @@ async fn handle_route_explain(
         },
         "why": {
             "requirements": recorded_json(&decision.requirements_json),
+            "allowed_providers": recorded_optional_json(decision.allowed_providers_json.as_deref()),
             "score": recorded_json(&decision.score_json),
             "explanation": recorded_optional_json(decision.explanation_json.as_deref()),
             // This is the persisted rejection payload, not a new scoring pass.

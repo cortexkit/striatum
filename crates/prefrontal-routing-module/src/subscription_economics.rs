@@ -301,6 +301,7 @@ pub(crate) async fn refresh(
     project: &Path,
     state: &SharedAccountQuota,
     listing: Option<&cortexkit_claustrum_client::ScopedCredentialListing>,
+    credentials: &crate::broca_credentials::SharedBrocaCredentials,
 ) {
     let now = crate::now_ms() as i64;
     let from = now - 24 * 3_600_000;
@@ -323,6 +324,9 @@ pub(crate) async fn refresh(
             .query(json!({"name":"plan.prices", "arguments":{}}))
             .await
             .unwrap_or(Value::Null);
+    }
+    if let Ok(mut credentials) = credentials.lock() {
+        credentials.publish_plan_prices(&prices);
     }
     let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
         return;

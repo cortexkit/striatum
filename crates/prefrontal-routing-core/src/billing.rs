@@ -27,6 +27,14 @@ pub struct BillingPlane {
 }
 
 impl BillingPlane {
+    /// Only API-balance charges with a resolved output price can be budgeted in
+    /// dollars. A plan may publish token rates without charging an API balance.
+    pub fn is_api_metered(&self) -> bool {
+        self.auth_method == "apikey"
+            && matches!(self.kind.as_str(), "upstream" | "no_coverage fallback")
+            && self.rate("rate.output").is_some()
+    }
+
     pub fn rate(&self, key: &str) -> Option<f64> {
         let mut key = key;
         // A producer alias cycle is unpriced, rather than a selection-path loop.
@@ -47,6 +55,50 @@ impl BillingPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_metered_requires_api_auth_direct_plane_and_resolved_output_price() {
+        let mut plane = BillingPlane {
+            provider_id: "provider".into(),
+            auth_method: "apikey".into(),
+            kind: "upstream".into(),
+            selection_reason: "roster".into(),
+            rates: BTreeMap::from([("rate.output".into(), BillingRate::Priced { rate: 2.0 })]),
+        };
+        assert!(plane.is_api_metered());
+        plane.kind = "no_coverage fallback".into();
+        assert!(plane.is_api_metered());
+        for kind in ["quota_proxy", "unpriced", "refused: unavailable", "unknown"] {
+            plane.kind = kind.into();
+            assert!(!plane.is_api_metered(), "{kind}");
+        }
+        plane.kind = "upstream".into();
+        for auth in ["oauth", "chatgpt", "antigravity", "ambiguous"] {
+            plane.auth_method = auth.into();
+            assert!(!plane.is_api_metered(), "{auth}");
+        }
+        plane.auth_method = "apikey".into();
+        for rate in [
+            BillingRate::Unpriced,
+            BillingRate::Priced { rate: -1.0 },
+            BillingRate::Priced { rate: f64::NAN },
+            BillingRate::Priced {
+                rate: f64::INFINITY,
+            },
+            BillingRate::BilledAs {
+                key: "missing".into(),
+            },
+        ] {
+            plane.rates.insert("rate.output".into(), rate);
+            assert!(!plane.is_api_metered());
+        }
+        plane
+            .rates
+            .insert("rate.output".into(), BillingRate::NotBilled);
+        assert!(plane.is_api_metered());
+        plane.rates.clear();
+        assert!(!plane.is_api_metered());
+    }
 
     #[test]
     fn billed_as_uses_the_exact_target_and_not_billed_is_free() {

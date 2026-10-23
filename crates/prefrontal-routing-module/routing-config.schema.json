@@ -81,7 +81,9 @@
         "exclude": {
           "all": [],
           "athena": [],
+          "codemode": [],
           "core": [],
+          "flow": [],
           "lab": [],
           "mason": [],
           "sidekick": []
@@ -106,7 +108,9 @@
         "variants": {
           "all": {},
           "athena": {},
+          "codemode": {},
           "core": {},
+          "flow": {},
           "lab": {},
           "mason": {},
           "sidekick": {}
@@ -160,7 +164,21 @@
             "type": "string"
           }
         },
+        "codemode": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "core": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "flow": {
           "type": "array",
           "default": [],
           "items": {
@@ -430,7 +448,9 @@
           "default": {
             "all": [],
             "athena": [],
+            "codemode": [],
             "core": [],
+            "flow": [],
             "lab": [],
             "mason": [],
             "sidekick": []
@@ -534,7 +554,9 @@
           "default": {
             "all": {},
             "athena": {},
+            "codemode": {},
             "core": {},
+            "flow": {},
             "lab": {},
             "mason": {},
             "sidekick": {}
@@ -852,7 +874,43 @@
             ]
           }
         },
+        "codemode": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
         "core": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "flow": {
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/Harness"
@@ -1143,7 +1201,21 @@
           },
           "default": {}
         },
+        "codemode": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
         "core": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "flow": {
           "type": "object",
           "additionalProperties": {
             "type": "string"
