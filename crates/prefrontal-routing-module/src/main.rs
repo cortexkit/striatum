@@ -54,7 +54,6 @@ use std::{
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
 use cortexkit_store_types::StorageDescriptor;
 use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
-#[cfg(test)]
 use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{
     Confidence, ModelScores, RoutePricing, ScoreProvenance,
