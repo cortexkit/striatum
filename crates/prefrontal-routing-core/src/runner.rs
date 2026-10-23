@@ -68,15 +68,13 @@ pub struct RunnerModel {
 }
 
 impl RunnerModel {
-    /// Broca translates model aliases (including priority-tier names), so this
-    /// conversion changes only the provider name and leaves model IDs unchanged.
+    /// Broca translates model aliases (including priority-tier names), so the
+    /// routing provider id goes to Broca unchanged. OpenCode Zen (`opencode`) and
+    /// the Go plan (`opencode-go`) are separate Broca providers with separate
+    /// endpoints and billing, so they must never be merged here.
     pub fn broca(provider: &str, model: &str, variant: Option<&str>) -> Self {
         Self {
-            provider: match provider {
-                "opencode-go" => "opencode",
-                other => other,
-            }
-            .to_string(),
+            provider: provider.to_string(),
             model: model.to_string(),
             variant: variant.map(str::to_string),
             auth: None,
@@ -157,7 +155,7 @@ mod tests {
         );
         assert_eq!(
             RunnerModel::broca("opencode-go", "glm", None).provider,
-            "opencode"
+            "opencode-go"
         );
     }
 }

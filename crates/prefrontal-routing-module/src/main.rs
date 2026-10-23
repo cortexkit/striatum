@@ -12713,7 +12713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broca_runner_maps_gateway_and_omitted_availability_matches_explicit() {
+    async fn broca_runner_keeps_the_go_provider_and_omitted_availability_matches_explicit() {
         let rig = Rig::new("broca-runner");
         let store = Arc::new(rig.open_store());
         store
@@ -12750,7 +12750,7 @@ mod tests {
         assert_eq!(results[1]["resolvedInput"]["availableModels"], json!([]));
         assert_eq!(
             results[1]["runner"],
-            json!({"provider":"opencode", "model":"m-native-fast"})
+            json!({"provider":"opencode-go", "model":"m-native-fast"})
         );
     }
 
