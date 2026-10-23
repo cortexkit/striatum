@@ -65,8 +65,8 @@ pub const CREDENTIAL_REFUSAL_CODES: [&str; 4] = [
 /// The credential a recorded error says the provider refused permanently, with
 /// the provider code: Broca's typed run error (top level, or under `provider`)
 /// with class `permanent`, one of [`CREDENTIAL_REFUSAL_CODES`], and a non-empty
-/// `credential_id`. Such an error is evidence about that credential only; other
-/// credentials of the provider still serve its routes. Prose that mentions a
+/// `credential_id`. Such an error is evidence about that credential only: it
+/// does not by itself fence the provider's other credentials. Prose that mentions a
 /// credential is not this evidence.
 pub fn credential_refusal_in(error: &str) -> Option<(String, String)> {
     let value = serde_json::from_str::<Value>(error).ok()?;

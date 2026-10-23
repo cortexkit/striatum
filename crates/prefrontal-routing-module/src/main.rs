@@ -4000,6 +4000,13 @@ async fn handle_select_request(
             variant.as_deref(),
         )?;
         let mut pin_availability = mapped_availability.rejected.clone();
+        // When a pin refused for a timed wall can be admitted again, so a caller
+        // that may not fall back can wait for that time instead of failing.
+        let pin_wall_until = prefrontal_routing_core::model_router::route_wall_until(
+            &pin_snapshot,
+            &pin_key,
+            &pin_capacity,
+        );
         let mut pin_available = available.clone();
         // A host-run pin is judged on the same list as the host's automatic
         // selections; it is not added to that list.
@@ -4228,12 +4235,20 @@ async fn handle_select_request(
                     }
                 }
                 if params.pin.is_some() {
+                    let timed = matches!(
+                        refusal.code.as_str(),
+                        "cooldown_active" | "quota_exhausted" | "backoff_active"
+                    );
                     pin_rejected = Some(refusal.code);
                     if params.pin_fallback == select_policy::PinFallback::None {
-                        let body = serde_json::to_vec(&json!({ "result": {
+                        let mut result = json!({
                             "selected": null, "decisionID": null, "pin_rejected": pin_rejected,
-                        }}))
-                        .map_err(ModuleError::Json)?;
+                        });
+                        if let Some(until) = pin_wall_until.filter(|_| timed) {
+                            result["pin_rejected_until_ms"] = json!(until as i64);
+                        }
+                        let body = serde_json::to_vec(&json!({ "result": result }))
+                            .map_err(ModuleError::Json)?;
                         let response = Frame::build_with_version(
                             ver,
                             FrameType::Response,
@@ -15042,8 +15057,8 @@ mod tests {
         );
 
         report_live_billing_refusal(&store, &credentials, LIVE_PLATFORM_KEYS[0]).await;
-        // Core's consult writer then reports the same error as a provider-wide
-        // billing wall, as it did live.
+        // Then the provider-wide billing wall core's consult writer sent live,
+        // with the key-named error as its evidence.
         let until = now_ms() as f64 + 6.0 * 3_600_000.0;
         let wall = call(
             ROUTE_RECORD_COOLDOWN_OP,
@@ -15184,6 +15199,61 @@ mod tests {
             "{route:?}"
         );
         assert_eq!(route.last_error.as_deref(), Some(LIVE_LOW_CREDIT_ERROR));
+    }
+
+    /// A pin that may not fall back and is refused for a timed wall carries the
+    /// time routing can admit it again, so the caller can wait for it; a
+    /// refusal with no recovery time (here a caller exclusion) carries none.
+    #[tokio::test]
+    async fn a_pin_refused_for_a_timed_wall_names_when_it_can_be_admitted_again() {
+        let (_rig, store, credentials, config) = live_platform_pool("platform-pin-wall-until");
+        let until = now_ms() as i64 + 2 * 3_600_000;
+        let wall = live_platform_call(
+            &store,
+            &credentials,
+            &config,
+            ROUTE_RECORD_COOLDOWN_OP,
+            json!({"routeKey": "anthropic-platform/claude-opus-5-5",
+                   "capacityKey": "anthropic-platform/claude-opus-5-5",
+                   "cooldownUntil": until, "lastError": "HTTP 529 overloaded"}),
+        )
+        .await;
+        assert_eq!(wall["result"]["ok"], true, "{wall}");
+        let pin_only = |exclude: serde_json::Value| {
+            json!({"targetAgent": "oracle", "consumer": "athena", "workload": "athena",
+                   "requirements": {"iq": 90, "eq": 0}, "substrate": "broca", "executor": "broca",
+                   "pin": {"model": "anthropic-platform/claude-opus-5-5"}, "pin_fallback": "none",
+                   "excludeRouteKeys": exclude, "taskId": "ct-pin-wall"})
+        };
+        let cooled = live_platform_call(
+            &store,
+            &credentials,
+            &config,
+            ROUTE_SELECT_OP,
+            pin_only(json!([])),
+        )
+        .await;
+        assert_eq!(
+            cooled["result"]["pin_rejected"], "cooldown_active",
+            "{cooled}"
+        );
+        assert_eq!(cooled["result"]["pin_rejected_until_ms"], until, "{cooled}");
+        let excluded = live_platform_call(
+            &store,
+            &credentials,
+            &config,
+            ROUTE_SELECT_OP,
+            pin_only(json!(["anthropic-platform/claude-opus-5-5"])),
+        )
+        .await;
+        assert_eq!(
+            excluded["result"]["pin_rejected"], "caller_excluded",
+            "{excluded}"
+        );
+        assert!(
+            excluded["result"].get("pin_rejected_until_ms").is_none(),
+            "{excluded}"
+        );
     }
 
     /// The first real key, as CKCRED lists it: a labelled id, active,

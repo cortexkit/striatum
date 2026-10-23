@@ -3359,7 +3359,8 @@ impl RouteStateStore for SqliteRouteStateStore {
         // route-global quota writer and the terminal-failure backoff writer. The
         // request-class provider reset below is independent of both.
         // A permanent refusal of one credential is the same kind of evidence: the
-        // credential is fenced, and the route's other credentials still serve it.
+        // credential is fenced, and the refusal does not by itself block the
+        // route's other credentials.
         let mut normalized = update.clone();
         let last_error = update.last_error.as_deref().unwrap_or("");
         if prefrontal_routing_core::account_wall::account_scoped_error(last_error)
