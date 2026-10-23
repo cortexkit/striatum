@@ -444,8 +444,10 @@ async fn route_explain_legacy_row_does_not_infer_execution_identity_from_caller(
 /// a host's own route resolver (an OpenCode or Pi head picking the model for a
 /// mason or explore subagent) or from core repeating such a selection. Core
 /// still decides where that worker runs, so routing judges the routes against
-/// the caller's own model list, or Broca's when the caller names substrate
-/// broca, and leaves the harness unrecorded. The route-to-harness mapping
+/// the caller's own model list and leaves the harness unrecorded. When the
+/// caller names substrate broca, the routes are those Broca reaches, still
+/// within the caller's list: a route outside the list is never chosen, even
+/// when Broca reaches no route the list names. The route-to-harness mapping
 /// applies only once a caller names its workload.
 #[tokio::test]
 async fn host_run_selection_is_judged_on_the_callers_list_not_the_mapping() {
@@ -467,8 +469,13 @@ async fn host_run_selection_is_judged_on_the_callers_list_not_the_mapping() {
         assert!(explained["selectedRoute"]["workload"].is_null(), "{explained}");
     }
 
+    // Broca reaches only the paid route, which the caller's list does not name.
     let broca = rig
         .select(json!({"substrate": "broca", "harness": "opencode", "availableModels": [CHEAP]}))
+        .await;
+    assert_eq!(broca["code"], "no_available_model", "{broca}");
+    let broca = rig
+        .select(json!({"substrate": "broca", "harness": "opencode", "availableModels": [CHEAP, PAID]}))
         .await;
     assert_eq!(broca["result"]["selected"]["routeKey"], PAID, "{broca}");
     assert_eq!(broca["result"]["selected"]["harness"], "broca");

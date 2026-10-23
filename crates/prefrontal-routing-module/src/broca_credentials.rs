@@ -177,6 +177,18 @@ impl BrocaCredentials {
             })
     }
 
+    /// The credentials a launch on `fact` may run on, in listing order: the
+    /// serving identities provider-reset and entitlement fences are judged
+    /// against, and the only credentials routing may pin a launch to.
+    ///
+    /// Only credentials of the route's serving method count: the method
+    /// pricing and Broca's account selection use (for `openai`, the ChatGPT
+    /// logins of the billing roster). A provider can also have metered API
+    /// keys mapped to it (`apikey:openai`); those are not how the route is
+    /// served, so a fence on one subscription login must move the launch to
+    /// another login, never to a key billed per token. When the serving method
+    /// is ambiguous, API keys are left out for the same reason. A provider
+    /// served by API keys alone keeps them (its serving method is `apikey`).
     pub(crate) fn serving_identities(&self, fact: &ModelFact) -> Vec<(String, Option<String>)> {
         if self
             .reached_at_ms
@@ -184,11 +196,41 @@ impl BrocaCredentials {
         {
             return Vec::new();
         }
+        let serving = self.serving_method(fact).auth_method;
         self.listed
             .iter()
             .filter(|row| credential_serves_fact(row, fact))
+            .filter(|row| {
+                // The listed method and the adapter-derived one can differ on
+                // older rows; either naming the serving method counts.
+                let methods = [
+                    listed_method(row),
+                    credential_method(row.refresh_adapter.as_deref(), &row.credential_type),
+                ];
+                match serving.as_deref() {
+                    Some(serving) => methods.iter().any(|method| method == serving),
+                    None => methods.iter().all(|method| method != "apikey"),
+                }
+            })
             .map(|row| (row.id.clone(), row.account_id.clone()))
             .collect()
+    }
+
+    /// The method a route is served and priced under: the one the last
+    /// refresh resolved, or before any refresh the single method of the
+    /// credentials listed for it (the same fallback pricing uses).
+    fn serving_method(&self, fact: &ModelFact) -> ServingMethod {
+        let key = format!("{}/{}", fact.provider_id, fact.model_id);
+        self.serving.get(&key).cloned().unwrap_or_else(|| {
+            choose_method(
+                BTreeSet::new(),
+                self.listed
+                    .iter()
+                    .filter(|row| credential_serves_fact(row, fact))
+                    .map(listed_method)
+                    .collect(),
+            )
+        })
     }
     pub(crate) fn publish_billing_catalog(
         &mut self,
@@ -409,16 +451,7 @@ impl BrocaCredentials {
         }
         for fact in facts {
             let key = format!("{}/{}", fact.provider_id, fact.model_id);
-            let method = self.serving.get(&key).cloned().unwrap_or_else(|| {
-                choose_method(
-                    BTreeSet::new(),
-                    self.listed
-                        .iter()
-                        .filter(|row| credential_serves_fact(row, fact))
-                        .map(listed_method)
-                        .collect(),
-                )
-            });
+            let method = self.serving_method(fact);
             let catalog_key =
                 prefrontal_routing_core::score_alias::catalog_key(&self.score_alias, &key);
             fact.billing_plane = Some(self.billing_catalog.for_route(&catalog_key, &method));
@@ -614,6 +647,59 @@ mod tests {
         assert_eq!(
             credentials.serving["openai/example"].auth_method.as_deref(),
             Some("apikey")
+        );
+    }
+
+    /// The credentials a launch may be pinned to are those of the route's
+    /// serving method. `openai` is served through its ChatGPT logins (the
+    /// roster's method); its metered API keys, listed first, are never among
+    /// them, whether the method came from the roster or is ambiguous. A
+    /// provider served by API keys alone keeps its keys.
+    #[test]
+    fn serving_identities_are_the_serving_methods_credentials_only() {
+        let row = |id: &str, provider: &str| {
+            let login = id.starts_with("chatgpt:");
+            let mut row = credential(id, &[provider]);
+            row.credential_type = if login { "oauth" } else { "apikey" }.into();
+            row.auth_method = Some(if login { "chatgpt" } else { "apikey" }.into());
+            row.refresh_adapter = login.then(|| "openai".into());
+            row
+        };
+        let mut cache = BrocaCredentials::default();
+        cache.apply_listing(
+            &listing(vec![
+                row("apikey:openai", "openai"),
+                row("apikey:openai:astro", "openai"),
+                row("chatgpt:openai", "openai"),
+                row("chatgpt:openai:live", "openai"),
+                row("apikey:metered", "metered"),
+            ]),
+            crate::now_ms(),
+        );
+        let sol = crate::tests::fact("openai", "gpt-6.1-sol");
+        let ids = |cache: &BrocaCredentials, fact: &ModelFact| {
+            cache
+                .serving_identities(fact)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        let logins = ["chatgpt:openai", "chatgpt:openai:live"];
+        // No roster yet: the listed methods are mixed, so the method is
+        // ambiguous, and an API key is still never a serving identity.
+        assert_eq!(ids(&cache, &sol), logins);
+        // The roster resolves the method to chatgpt, as it did live.
+        cache.serving.insert(
+            "openai/gpt-6.1-sol".into(),
+            ServingMethod {
+                auth_method: Some("chatgpt".into()),
+                reason: "roster".into(),
+            },
+        );
+        assert_eq!(ids(&cache, &sol), logins);
+        assert_eq!(
+            ids(&cache, &crate::tests::fact("metered", "m")),
+            ["apikey:metered"]
         );
     }
 
