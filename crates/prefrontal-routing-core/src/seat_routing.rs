@@ -258,6 +258,7 @@ pub fn select_seat_route_with_config(
                     .subscription_pool
                     .as_ref()
                     .map(|pool| pool.reserve_diagnostic(pool.keep_free_percent, false)),
+                credential_ids: Vec::new(),
             });
         }
         permitted

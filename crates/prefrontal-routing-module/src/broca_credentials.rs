@@ -103,6 +103,32 @@ fn choose_method(roster: BTreeSet<String>, listed: BTreeSet<String>) -> ServingM
 
 pub type SharedBrocaCredentials = Arc<Mutex<BrocaCredentials>>;
 
+/// What routing's last vault listing says about one credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ListingLookup {
+    /// Routing has not read a listing yet, so nothing can be compared.
+    Unknown,
+    /// The listing no longer names the credential.
+    Absent,
+    /// The credential's fingerprint (see [`listing_fingerprint_of`]).
+    Listed(String),
+}
+
+/// `provider_ids=<sorted ids>;plan_tier=<tier>;state=<state>`. Token refreshes
+/// and record versions are left out: they do not change what the provider
+/// entitles the credential to.
+pub(crate) fn listing_fingerprint_of(row: &ListedCredential) -> String {
+    let mut provider_ids = row.provider_ids.clone();
+    provider_ids.sort();
+    provider_ids.dedup();
+    format!(
+        "provider_ids={};plan_tier={};state={}",
+        provider_ids.join(","),
+        row.plan_tier.as_deref().unwrap_or(""),
+        row.state
+    )
+}
+
 /// Wait for the first complete plane publication, not merely a catalog connection.
 /// Restored account identities can resolve a serving method before its rates arrive.
 pub(crate) async fn wait_for_billing_catalog(
@@ -135,6 +161,21 @@ pub(crate) async fn wait_for_billing_catalog(
 }
 
 impl BrocaCredentials {
+    /// The vault listing of one credential, reduced to the fields that could
+    /// change whether a provider entitles it: the provider ids it is mapped to,
+    /// its plan tier and its state. `Unknown` until routing has read a listing.
+    pub(crate) fn listing_fingerprint(&self, credential_id: &str) -> ListingLookup {
+        if self.view.is_none() {
+            return ListingLookup::Unknown;
+        }
+        self.listed
+            .iter()
+            .find(|row| row.id == credential_id)
+            .map_or(ListingLookup::Absent, |row| {
+                ListingLookup::Listed(listing_fingerprint_of(row))
+            })
+    }
+
     pub(crate) fn serving_identities(&self, fact: &ModelFact) -> Vec<(String, Option<String>)> {
         if self
             .reached_at_ms

@@ -83,10 +83,11 @@ pub use model_resolution::{
 pub use model_router::{
     admit_routes, select_model_route, select_model_route_with_config,
     select_model_route_with_slots, selection_cost, AdmissionResult, AdmittedRoute,
-    BasketRoutePricing, BasketVectorSource, BelowFloorWarning, ModelRouteStateSnapshot,
-    NoRouteError, ObjectiveBreakdown, PricingMode, PromptParams, RejectedCandidate, RejectedRoute,
-    RequiredCapabilities, RouteFailureReason, RouteRuntimeState, SelectModelRouteInput,
-    SelectedModel, SelectedModelRoute, SelectedRouteScore, REASON_DEPRECATED_UPSTREAM,
+    BasketRoutePricing, BasketVectorSource, BelowFloorWarning, CredentialRefusalMark,
+    ModelRouteStateSnapshot, NoRouteError, ObjectiveBreakdown, PricingMode, PromptParams,
+    RejectedCandidate, RejectedRoute, RequiredCapabilities, RouteFailureReason, RouteRuntimeState,
+    SelectModelRouteInput, SelectedModel, SelectedModelRoute, SelectedRouteScore,
+    REASON_CREDENTIAL_BILLING_EXHAUSTED, REASON_CREDENTIAL_UNENTITLED, REASON_DEPRECATED_UPSTREAM,
     REASON_EXCLUDED, REASON_EXCLUDED_BY_OPERATOR, REASON_NOT_AVAILABLE,
 };
 pub use panel::{

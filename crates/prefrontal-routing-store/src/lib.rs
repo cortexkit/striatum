@@ -197,6 +197,7 @@ const MIGRATION_057: &str = include_str!("../migrations/057_prune_absent_fusifor
 /// suspended (see `SqliteRouteStateStore::open`).
 const MIGRATION_058: &str = include_str!("../migrations/058_drop_history_foreign_keys.sql");
 const MIGRATION_059: &str = include_str!("../migrations/059_provider_reset_fences.sql");
+const MIGRATION_060: &str = include_str!("../migrations/060_credential_entitlement_fences.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -252,7 +253,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 59] {
+fn route_state_migrations() -> [Migration; 60] {
     [
         Migration {
             version: 1,
@@ -490,6 +491,10 @@ fn route_state_migrations() -> [Migration; 59] {
             version: 59,
             statements: MIGRATION_059,
         },
+        Migration {
+            version: 60,
+            statements: MIGRATION_060,
+        },
     ]
 }
 
@@ -723,11 +728,20 @@ fn bound_rejected_json(raw: &str) -> String {
 
     // Runtime walls and subscription budgets explain why otherwise usable
     // routes were refused. Preserve their deadlines and reserve arithmetic
-    // ahead of catalog-tail exclusions so an outage remains diagnosable.
+    // ahead of catalog-tail exclusions so an outage remains diagnosable. A
+    // credential refusal names the credential that has to be fixed, so it is
+    // kept as well.
     let is_actionable = |entry: &&serde_json::Value| {
         matches!(
             entry.get("reason").and_then(serde_json::Value::as_str),
-            Some("backoff_active" | "cooldown_active" | "quota_exhausted" | "subscription_reserve")
+            Some(
+                "backoff_active"
+                    | "cooldown_active"
+                    | "quota_exhausted"
+                    | "subscription_reserve"
+                    | "credential_unentitled"
+                    | "credential_billing_exhausted"
+            )
         )
     };
     let mut prioritized = Vec::with_capacity(rejected.len());
@@ -1887,6 +1901,106 @@ impl SqliteRouteStateStore {
             }))?;
             rows.collect::<Result<Vec<_>, _>>()
         }).map_err(err)
+    }
+
+    /// Record that the provider permanently refused `credential_id`.
+    ///
+    /// A repeated report for the same pair keeps the first observation and the
+    /// fingerprint it was recorded against, so a replay cannot move the fence onto
+    /// a newer listing; a fingerprint is filled in only where none was known.
+    pub fn record_credential_entitlement_fence(
+        &self,
+        refusal: &prefrontal_routing_core::route_state_store::CredentialRefusal,
+        listing_fingerprint: Option<&str>,
+        observed_at_ms: i64,
+    ) -> RouteStateResult<()> {
+        if refusal.provider_id.trim().is_empty() || refusal.credential_id.trim().is_empty() {
+            return Ok(());
+        }
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "INSERT INTO credential_entitlement_fences
+                       (provider_id, credential_id, code, listing_fingerprint, observed_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(provider_id, credential_id) DO UPDATE SET
+                       listing_fingerprint = COALESCE(
+                         credential_entitlement_fences.listing_fingerprint,
+                         excluded.listing_fingerprint)",
+                    params![
+                        refusal.provider_id,
+                        refusal.credential_id,
+                        refusal.code,
+                        listing_fingerprint,
+                        observed_at_ms
+                    ],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
+    /// Every stored credential entitlement fence.
+    pub fn credential_entitlement_fences(
+        &self,
+    ) -> RouteStateResult<Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>>
+    {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(
+                    "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
+                     FROM credential_entitlement_fences ORDER BY provider_id, credential_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(
+                        prefrontal_routing_core::route_state_store::CredentialEntitlementFence {
+                            provider_id: row.get(0)?,
+                            credential_id: row.get(1)?,
+                            code: row.get(2)?,
+                            listing_fingerprint: row.get(3)?,
+                            observed_at_ms: row.get(4)?,
+                        },
+                    )
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(err)
+    }
+
+    /// End every fence on `credential_id` that was recorded against
+    /// `fingerprint` (or against no listing at all); returns how many ended.
+    pub fn clear_credential_entitlement_fences(
+        &self,
+        credential_id: &str,
+        fingerprint: Option<&str>,
+    ) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "DELETE FROM credential_entitlement_fences
+                     WHERE credential_id = ?1 AND listing_fingerprint IS ?2",
+                    params![credential_id, fingerprint],
+                )
+            })
+            .map_err(err)
+    }
+
+    /// Record the listing a fence recorded without one was first seen against.
+    pub fn adopt_credential_entitlement_fingerprint(
+        &self,
+        credential_id: &str,
+        fingerprint: &str,
+    ) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "UPDATE credential_entitlement_fences SET listing_fingerprint = ?2
+                     WHERE credential_id = ?1 AND listing_fingerprint IS NULL",
+                    params![credential_id, fingerprint],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
     }
 
     /// Apply the provider evidence of one panel seat to the fences of the panel
@@ -5846,7 +5960,7 @@ mod tests {
         migrated
             .store
             .with_conn(|c| {
-                assert_eq!(route_state_version(c)?, 59);
+                assert_eq!(route_state_version(c)?, 60);
                 assert_eq!(
                     history_foreign_keys(c),
                     ["account_admission -> account_pin"]

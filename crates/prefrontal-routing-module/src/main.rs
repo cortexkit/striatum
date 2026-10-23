@@ -20,6 +20,7 @@ mod available_models_text;
 mod broca_credentials;
 mod config_overrides;
 mod config_policy;
+mod credential_fences;
 mod engram_catalog;
 mod fusiform_catalog;
 mod key_pool;
@@ -3481,7 +3482,14 @@ async fn handle_select_request(
     }
 
     if envelope.method == ROUTE_SET_DECISION_OUTCOME_OP {
-        return handle_set_decision_outcome(frame, writer, store, routing_config_path).await;
+        return handle_set_decision_outcome(
+            frame,
+            writer,
+            store,
+            routing_config_path,
+            broca_credentials,
+        )
+        .await;
     }
     if envelope.method == ROUTE_RECORD_USAGE_OP {
         return handle_record_usage(frame, writer, store).await;
@@ -3805,6 +3813,16 @@ async fn handle_select_request(
         params.consumer,
         None,
     )?;
+    // Credentials a provider refused permanently: automatic selection skips a
+    // route no other credential serves, and launches the rest on another one.
+    let entitlement_fences =
+        credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?;
+    credential_fences::apply(
+        &mut snapshot,
+        &facts,
+        &entitlement_fences,
+        broca_credentials,
+    );
     add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
 
     let policy_started = Instant::now();
@@ -3942,6 +3960,8 @@ async fn handle_select_request(
         for state in pin_snapshot.by_route.values_mut() {
             state.provider_reset_until = None;
         }
+        // An explicit pin is not subject to credential entitlement fences.
+        credential_fences::clear(&mut pin_snapshot);
         let pin_facts: Vec<_> = facts
             .iter()
             .filter(|f| format!("{}/{}", f.provider_id, f.model_id) == pin_capacity)
@@ -4100,6 +4120,7 @@ async fn handle_select_request(
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
                             variant_policy::consumer_group(params.consumer),
+                            &[],
                         )
                         .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
                     )
@@ -4444,6 +4465,7 @@ async fn handle_select_request(
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
                             variant_policy::consumer_group(params.consumer),
+                            &entitlement_fences,
                         ) {
                             Ok((runner, _)) => result["runner"] = json!(runner),
                             Err((code, message)) => {
@@ -4605,6 +4627,7 @@ fn runner_for_route(
     model: &str,
     variant: Option<&str>,
     consumer: Option<&str>,
+    entitlement_fences: &[prefrontal_routing_core::route_state_store::CredentialEntitlementFence],
 ) -> Result<
     (
         prefrontal_routing_core::runner::RunnerModel,
@@ -4613,22 +4636,39 @@ fn runner_for_route(
     (String, String),
 > {
     if !needs_runner_pin(policy, provider) {
-        if let Some(consumer) = consumer {
-            let fences = store
-                .provider_reset_fences(consumer, now_ms() as i64)
+        let refused_here = entitlement_fences
+            .iter()
+            .any(|fence| fence.provider_id == provider);
+        let reset_fences = match consumer {
+            Some(consumer) => {
+                let key = prefrontal_routing_core::make_route_key(provider, model, variant);
+                store
+                    .provider_reset_fences(consumer, now_ms() as i64)
+                    .map_err(|e| ("store_error".into(), e.to_string()))?
+                    .into_iter()
+                    .filter(|f| f.route_key == key)
+                    .collect::<Vec<_>>()
+            }
+            None => Vec::new(),
+        };
+        if !reset_fences.is_empty() || refused_here {
+            let facts = store
+                .get_facts()
                 .map_err(|e| ("store_error".into(), e.to_string()))?;
-            let key = prefrontal_routing_core::make_route_key(provider, model, variant);
-            let fences: Vec<_> = fences.into_iter().filter(|f| f.route_key == key).collect();
-            if !fences.is_empty() {
-                let facts = store
-                    .get_facts()
-                    .map_err(|e| ("store_error".into(), e.to_string()))?;
-                let identities = facts
-                    .iter()
-                    .find(|f| f.provider_id == provider && f.model_id == model)
-                    .and_then(|fact| credentials.lock().ok().map(|c| c.serving_identities(fact)))
-                    .unwrap_or_default();
-                if let Some(id) = provider_resets::healthy_credential(&fences, &identities) {
+            let identities = facts
+                .iter()
+                .find(|f| f.provider_id == provider && f.model_id == model)
+                .and_then(|fact| credentials.lock().ok().map(|c| c.serving_identities(fact)))
+                .unwrap_or_default();
+            // A credential the provider refused permanently is never launched
+            // on automatically; the others are checked for provider resets.
+            let entitled: Vec<(String, Option<String>)> =
+                credential_fences::entitled(entitlement_fences, provider, &identities)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+            if !reset_fences.is_empty() {
+                if let Some(id) = provider_resets::healthy_credential(&reset_fences, &entitled) {
                     if let Some(runner) =
                         prefrontal_routing_core::runner::RunnerModel::pinned(&id, model, variant)
                     {
@@ -4637,9 +4677,25 @@ fn runner_for_route(
                 }
                 return Err((
                     "quota_exhausted".into(),
-                    format!("provider reset for {consumer} on {key}"),
+                    format!(
+                        "provider reset for {} on {}",
+                        consumer.unwrap_or_default(),
+                        prefrontal_routing_core::make_route_key(provider, model, variant)
+                    ),
                 ));
             }
+            // Pin the launch to a credential the provider has not refused, so
+            // Broca cannot fall back to the refused one.
+            if let Some(runner) = entitled.first().and_then(|(id, _)| {
+                prefrontal_routing_core::runner::RunnerModel::pinned(id, model, variant)
+            }) {
+                return Ok((runner, None));
+            }
+            let refused = credential_fences::unentitled(entitlement_fences, provider, &identities);
+            return Err((
+                credential_fences::rejection_reason(entitlement_fences, provider, &refused).into(),
+                refused.join(","),
+            ));
         }
         return Ok((
             prefrontal_routing_core::runner::RunnerModel::broca(provider, model, variant),
@@ -4847,6 +4903,15 @@ async fn handle_select_panel(
         Some(panel_consumer),
         None,
     )?;
+    // Seats are automatic choices: a model no entitled credential serves is not seated.
+    let entitlement_fences =
+        credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?;
+    credential_fences::apply(
+        &mut prepared.snapshot,
+        &prepared.facts,
+        &entitlement_fences,
+        broca_credentials,
+    );
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     let resolved_policy = resolve_routing_policy(
         params.available_models.iter().cloned(),
@@ -5345,6 +5410,7 @@ fn remember_provider_identity(
                         account_ref: account.clone().unwrap_or_else(|| credential.clone()),
                         credential_id: Some(credential.clone()),
                         resets_at_ms: None,
+                        credential_refusal: None,
                     },
                 )
                 .map_err(|e| ModuleError::Message(e.to_string()))?;
@@ -5755,6 +5821,7 @@ async fn handle_set_decision_outcome(
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
     routing_config_path: &Path,
+    broca_credentials: &SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -5813,6 +5880,27 @@ async fn handle_set_decision_outcome(
             .map_err(|e| ModuleError::Message(e.to_string()))?;
     }
     let observed_at_ms = now_ms() as i64;
+    // A credential the provider refused permanently is fenced whatever the
+    // decision ledger still holds: the report names the provider and the
+    // credential itself, and a replayed report changes nothing.
+    if let Some(refusal) = provider_outcome
+        .as_ref()
+        .and_then(|provider| provider.credential_refusal.as_ref())
+    {
+        if let Err(e) = credential_fences::record(store, broca_credentials, refusal, observed_at_ms)
+        {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("set_decision_outcome: credential entitlement fence: {e}"),
+            )
+            .await;
+        }
+    }
     if let (Some(seat), Some(provider)) = (params.seat_route.as_ref(), provider_outcome.as_ref()) {
         if let Err(e) = store.record_panel_seat_provider_outcome(
             &params.decision_id,
@@ -7417,6 +7505,7 @@ mod tests {
                             account_ref: "quota-account".into(),
                             credential_id: Some("antigravity:google".into()),
                             resets_at_ms: has_reset.then_some(reset),
+                            credential_refusal: None,
                         }),
                     },
                 )
@@ -7526,6 +7615,7 @@ mod tests {
                                     account_ref: account.into(),
                                     credential_id: None,
                                     resets_at_ms: None,
+                                    credential_refusal: None,
                                 }),
                             },
                         )
@@ -7576,6 +7666,7 @@ mod tests {
                     account_ref: "vault-account".into(),
                     credential_id: Some("antigravity:google".into()),
                     resets_at_ms: None,
+                    credential_refusal: None,
                 },
             )
             .unwrap();
@@ -7586,6 +7677,7 @@ mod tests {
                     account_ref: "quota-account".into(),
                     credential_id: Some("antigravity:google".into()),
                     resets_at_ms: None,
+                    credential_refusal: None,
                 },
             )
             .unwrap();
@@ -7614,6 +7706,7 @@ mod tests {
                 &tx,
                 &store,
                 Path::new("/nonexistent/provider-reset-wire.jsonc"),
+                &SharedBrocaCredentials::default(),
             )
             .await
             .unwrap();
@@ -7629,6 +7722,285 @@ mod tests {
                 assert_eq!(fences[0].resets_at_ms, reset);
             }
         }
+    }
+
+    /// Replay of a live incident: vault credential `apikey:cline-pass` was mapped to
+    /// provider `cline-pass`, routing sent a mason to cline-pass, and the provider
+    /// answered HTTP 403 `ENTITLEMENT_ERROR` (the account has no plan for the model).
+    /// The retry went to another cline-pass model and got the same 403, because the
+    /// refusal is about the account, not the model. The first refusal must now fence
+    /// (cline-pass, apikey:cline-pass): the retry avoids every cline-pass route and the
+    /// decision log names the fence; the fence survives a store reopen and any amount
+    /// of time; an explicit pin is not fenced; and the fence ends when the
+    /// credential's vault listing changes.
+    #[tokio::test]
+    async fn an_entitlement_refusal_fences_the_providers_routes_through_that_credential() {
+        replay_credential_refusal("ENTITLEMENT_ERROR", "credential_unentitled").await;
+    }
+
+    /// The same replay for an empty balance: Broca ends the run as permanent
+    /// `billing_exhausted` naming the credential (xAI's spending limit, Anthropic's
+    /// "credit balance too low", OpenAI's insufficient_quota, OpenCode's HTTP 402
+    /// "Insufficient account funds"). Topping up does not show on a timer either.
+    #[tokio::test]
+    async fn a_billing_exhausted_refusal_fences_the_providers_routes_through_that_credential() {
+        replay_credential_refusal("billing_exhausted", "credential_billing_exhausted").await;
+    }
+
+    /// The same replay for a balance too small for the request: Broca ends the run as
+    /// permanent `credit_insufficient` (OpenRouter's 402 "This request requires more
+    /// credits"). It is the same account-level refusal as an empty balance.
+    #[tokio::test]
+    async fn a_credit_insufficient_refusal_fences_the_providers_routes_through_that_credential() {
+        replay_credential_refusal("credit_insufficient", "credential_billing_exhausted").await;
+    }
+
+    async fn replay_credential_refusal(code: &str, reason: &str) {
+        let rig = Rig::new(&format!("credential-refusal-fence-{code}"));
+        let mut store: SharedStore = Arc::new(rig.open_store());
+        let mut cheap = fact("cline-pass", "muse-spark-1.3-contributor");
+        cheap.cost_per_m_tok_out = Some(0.5);
+        let mut flash = fact("cline-pass", "deepseek-v4.1-flash");
+        flash.cost_per_m_tok_out = Some(0.6);
+        let mut fallback = fact("other", "fallback-model");
+        fallback.cost_per_m_tok_out = Some(40.0);
+        for fact in [&cheap, &flash, &fallback] {
+            store.upsert_fact(fact, FactSource::Override).unwrap();
+        }
+        let listing = |plan_tier: Option<&str>| {
+            let credentials = empty_broca_credentials();
+            credentials.lock().unwrap().apply_listing(
+                &cortexkit_claustrum_client::ScopedCredentialListing {
+                    credentials: [
+                        ("apikey:cline-pass", "cline-pass"),
+                        ("apikey:other", "other"),
+                    ]
+                    .into_iter()
+                    .map(
+                        |(id, provider)| cortexkit_claustrum_client::ListedCredential {
+                            id: id.into(),
+                            categories: vec!["llm-provider".into()],
+                            credential_type: "apikey".into(),
+                            state: "active".into(),
+                            provider_ids: vec![provider.into()],
+                            plan_tier: plan_tier
+                                .filter(|_| provider == "cline-pass")
+                                .map(str::to_string),
+                            ..Default::default()
+                        },
+                    )
+                    .collect(),
+                    view: format!("cline-pass-view-{plan_tier:?}"),
+                    ..Default::default()
+                },
+                now_ms(),
+            );
+            credentials
+        };
+        let credentials = listing(None);
+        let request = json!({"method": ROUTE_SELECT_OP, "params": {
+            "consumer": "mason", "targetAgent": "mason", "requirements": {"iq": 30, "eq": 0},
+            "availableModels": ["cline-pass/muse-spark-1.3-contributor", "cline-pass/deepseek-v4.1-flash", "other/fallback-model"]}});
+        async fn select(
+            store: &SharedStore,
+            credentials: &SharedBrocaCredentials,
+            request: &serde_json::Value,
+        ) -> serde_json::Value {
+            let frame = run_route_wire_request_with_paths(
+                store,
+                request.clone(),
+                Path::new("/nonexistent/credential-refusal-fence.jsonc"),
+                credentials,
+            )
+            .await;
+            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone()
+        }
+        let first = select(&store, &credentials, &request).await;
+        assert_eq!(
+            first["selected"]["model"]["providerID"], "cline-pass",
+            "precondition: cline-pass wins before any refusal: {first}"
+        );
+        let decision = first["decisionID"].as_str().unwrap().to_string();
+
+        // Core's report of the first 403, as its credential-refusal reader writes it.
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": {
+                "decisionID": decision, "outcome": "error",
+                "lastError": format!("{code}: provider cline-pass refused credential apikey:cline-pass"),
+                "providerOutcome": {
+                    "accountRef": "apikey:cline-pass", "credentialId": "apikey:cline-pass", "resetsAtMs": null,
+                    "credentialRefusal": {"providerId": "cline-pass", "credentialId": "apikey:cline-pass", "code": code}
+                }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_set_decision_outcome(
+            frame,
+            &tx,
+            &store,
+            Path::new("/nonexistent/credential-refusal-fence.jsonc"),
+            &credentials,
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(ack["result"]["ok"], true, "{ack}");
+
+        let assert_fenced = |retry: &serde_json::Value| {
+            assert_eq!(retry["selected"]["model"]["providerID"], "other", "{retry}");
+            for route in [
+                "cline-pass/muse-spark-1.3-contributor",
+                "cline-pass/deepseek-v4.1-flash",
+            ] {
+                let rejection = retry["selected"]["rejected"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["routeKey"] == route)
+                    .unwrap_or_else(|| panic!("{route} must be rejected: {retry}"));
+                assert_eq!(rejection["reason"], reason, "{rejection}");
+                assert_eq!(rejection["credentialIds"], json!(["apikey:cline-pass"]));
+                assert!(
+                    rejection.get("detail").is_none(),
+                    "a reason code, no prose: {rejection}"
+                );
+            }
+        };
+        let retry = select(&store, &credentials, &request).await;
+        assert_fenced(&retry);
+        // The decision log names the fence too.
+        let logged = store
+            .get_decision_by_id(retry["decisionID"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            logged
+                .rejected_json
+                .contains(&format!("\"reason\":\"{reason}\""))
+                && logged
+                    .rejected_json
+                    .contains("\"credentialIds\":[\"apikey:cline-pass\"]"),
+            "{}",
+            logged.rejected_json
+        );
+
+        // The fence is routing state, not memory: it survives a store reopen. It
+        // has no expiry either: a fence recorded long ago still holds.
+        drop(store);
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute(
+                "UPDATE credential_entitlement_fences SET observed_at_ms = 0",
+                [],
+            )
+            .unwrap();
+        store = Arc::new(rig.open_store());
+        assert_fenced(&select(&store, &credentials, &request).await);
+
+        // An explicit pin keeps its behaviour: it is not fenced.
+        let mut pinned = request.clone();
+        pinned["params"]["modelPin"] = json!("cline-pass/deepseek-v4.1-flash");
+        let pinned = select(&store, &credentials, &pinned).await;
+        assert_eq!(
+            pinned["selected"]["model"]["modelID"], "deepseek-v4.1-flash",
+            "{pinned}"
+        );
+
+        // A change to the credential's vault listing (here its plan tier) is what can
+        // fix the refusal, so it ends the fence. No timer does.
+        let changed = listing(Some("contributor"));
+        let healed = select(&store, &changed, &request).await;
+        assert_eq!(
+            healed["selected"]["model"]["providerID"], "cline-pass",
+            "{healed}"
+        );
+        assert!(store.credential_entitlement_fences().unwrap().is_empty());
+    }
+
+    /// A refusal fences one credential, not the provider: when another credential
+    /// also serves the provider, its routes stay eligible and the launch is pinned to
+    /// the credential the provider has not refused.
+    #[tokio::test]
+    async fn another_credential_for_the_refused_provider_stays_eligible_and_is_pinned() {
+        for code in ["ENTITLEMENT_ERROR", "billing_exhausted"] {
+            let rig = Rig::new(&format!("credential-refusal-sibling-{code}"));
+            let store: SharedStore = Arc::new(rig.open_store());
+            let mut cheap = fact("cline-pass", "muse-spark-1.3-contributor");
+            cheap.cost_per_m_tok_out = Some(0.5);
+            let mut fallback = fact("other", "fallback-model");
+            fallback.cost_per_m_tok_out = Some(40.0);
+            for fact in [&cheap, &fallback] {
+                store.upsert_fact(fact, FactSource::Override).unwrap();
+            }
+            let credentials = vault_listing(&[
+                ("apikey:cline-pass", &["cline-pass"], None),
+                ("apikey:cline-pass:team", &["cline-pass"], None),
+                ("apikey:other", &["other"], None),
+            ]);
+            credential_fences::record(
+                &store,
+                &credentials,
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: "cline-pass".into(),
+                    credential_id: "apikey:cline-pass".into(),
+                    code: code.into(),
+                },
+                now_ms() as i64,
+            )
+            .unwrap();
+            let frame = run_route_wire_request_with_paths(
+            &store,
+            json!({"method": ROUTE_SELECT_OP, "params": {
+                "consumer": "mason", "targetAgent": "mason", "requirements": {"iq": 30, "eq": 0},
+                "availableModels": ["cline-pass/muse-spark-1.3-contributor", "other/fallback-model"]}}),
+            Path::new("/nonexistent/credential-entitlement-sibling.jsonc"),
+            &credentials,
+        )
+        .await;
+            let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            let result = &body["result"];
+            assert_eq!(
+                result["selected"]["model"]["providerID"], "cline-pass",
+                "{body}"
+            );
+            assert_eq!(
+                result["runner"]["auth"],
+                json!({"method": "apikey", "account": "team"}),
+                "the launch is pinned to the credential the provider did not refuse: {body}"
+            );
+            assert_eq!(store.credential_entitlement_fences().unwrap().len(), 1);
+        }
+    }
+
+    /// Routing deploys before core, and core may run against an older routing, so
+    /// neither side may reject the other's report: unknown members of
+    /// `providerOutcome` and of `credentialRefusal` are ignored.
+    #[test]
+    fn the_outcome_report_ignores_unknown_fields() {
+        let params: SetDecisionOutcomeParams = serde_json::from_value(json!({
+            "decisionID": "d", "outcome": "error", "futureField": 1,
+            "providerOutcome": {"accountRef": "a", "futureField": true,
+                "credentialRefusal": {"providerId": "p", "credentialId": "c", "code": "ENTITLEMENT_ERROR", "futureField": "x"}}
+        }))
+        .unwrap();
+        let refusal = params.provider_outcome.unwrap().credential_refusal.unwrap();
+        assert_eq!(
+            (refusal.provider_id.as_str(), refusal.credential_id.as_str()),
+            ("p", "c")
+        );
+        // A report from a core that predates the field still decodes.
+        let old: SetDecisionOutcomeParams = serde_json::from_value(json!({
+            "decisionID": "d", "outcome": "error", "providerOutcome": {"accountRef": "a"}
+        }))
+        .unwrap();
+        assert_eq!(old.provider_outcome.unwrap().credential_refusal, None);
     }
 
     /// Replay of a live panel defect: an audit panel kept seating Meta's Muse as its
@@ -7675,6 +8047,7 @@ mod tests {
                 &tx,
                 store,
                 Path::new("/nonexistent/panel-seat-provider-reset.jsonc"),
+                &SharedBrocaCredentials::default(),
             )
             .await
             .unwrap();
@@ -14144,6 +14517,138 @@ mod tests {
         .await;
         assert_eq!(host["code"], "explicit_provider_pool_exhausted", "{host}");
         assert!(host.get("result").is_none(), "no fallback route: {host}");
+    }
+
+    /// Replay of a live panel seat: one of anthropic-platform's four API keys
+    /// (`apikey:anthropic:wsampleyahoo`) ended a run on Broca's permanent
+    /// `billing_exhausted` ("Your credit balance is too low"). The report fences that
+    /// one key: the pool never leases it again, for any session or pin, while the
+    /// other three stay admissible. Fencing every key refuses the pool by name.
+    #[tokio::test]
+    async fn a_low_credit_key_is_fenced_and_the_pools_other_keys_stay_admissible() {
+        let keys = [
+            "apikey:anthropic:wsampleyahoo",
+            "apikey:anthropic:wsamplegmail",
+            "apikey:anthropic:usersamplegmail",
+            "apikey:anthropic:ysample",
+        ];
+        let platform: &[&str] = &["anthropic-platform"];
+        let credentials = platform_listing(&keys.map(|key| (key, platform)));
+        let rig = Rig::new("platform-pool-low-credit");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+            .unwrap();
+        let config = platform_operator_config(&rig);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": method, "params": params}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        let report = |credential: &'static str| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            async move {
+                let frame = Frame::build(
+                    FrameType::Request,
+                    Flags::new(false, Priority::Interactive, false),
+                    7,
+                    1,
+                    99,
+                    serde_json::to_vec(&json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": {
+                        "decisionID": "panel-decision-low-credit", "outcome": "interrupted",
+                        "providerOutcome": {
+                            "accountRef": credential, "credentialId": credential,
+                            "credentialRefusal": {"providerId": "anthropic-platform", "credentialId": credential, "code": "billing_exhausted"}
+                        }}}))
+                    .unwrap(),
+                )
+                .unwrap();
+                let (tx, mut rx) = mpsc::channel(1);
+                handle_set_decision_outcome(
+                    frame,
+                    &tx,
+                    &store,
+                    Path::new("/nonexistent/platform-pool-low-credit.jsonc"),
+                    &credentials,
+                )
+                .await
+                .unwrap();
+                let ack: serde_json::Value =
+                    serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+                assert_eq!(ack["result"]["ok"], true, "{ack}");
+            }
+        };
+        report(keys[0]).await;
+
+        let mut leased = std::collections::BTreeSet::new();
+        for session in ["ses-1", "ses-2", "ses-3", "ses-4", "ses-5", "ses-6"] {
+            let grant = call(
+                "route.pool_acquire",
+                json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": session}),
+            )
+            .await;
+            let key = grant["result"]["credentialId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{grant}"));
+            leased.insert(key.to_string());
+        }
+        assert!(
+            !leased.contains(keys[0]),
+            "the refused key is never leased: {leased:?}"
+        );
+        assert_eq!(
+            leased,
+            keys[1..].iter().map(|key| key.to_string()).collect(),
+            "the other three keys stay admissible"
+        );
+        // The key routing picks for an explicit model pin skips the refused key too.
+        let pinned = call(
+            "route.select",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1",
+                   "taskId": "ses-pin"}),
+        )
+        .await;
+        let pin_key = pinned["result"]["poolLease"]["credentialId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{pinned}"));
+        assert_ne!(pin_key, keys[0], "{pinned}");
+
+        // With every key refused, the pool refuses by name; no other route is used.
+        for key in &keys[1..] {
+            report(*key).await;
+        }
+        let refused = call(
+            "route.pool_acquire",
+            json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": "ses-7"}),
+        )
+        .await;
+        assert_eq!(
+            refused["code"], "explicit_provider_pool_exhausted",
+            "{refused}"
+        );
+        let reasons: Vec<&str> = refused["detail"]["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec!["credential_billing_exhausted"; 4],
+            "{refused}"
+        );
     }
 
     /// The first real key, as CKCRED lists it: a labelled id, active,
