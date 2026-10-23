@@ -172,6 +172,31 @@ pub fn acquire(
             ),
         ));
     }
+    // A key the provider refused permanently (no entitlement, or no balance) is
+    // fenced until its vault listing changes: only the pool's other keys are leased.
+    let fences = crate::credential_fences::live(ctx.store, ctx.credentials)
+        .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
+    let (refused, keys): (Vec<_>, Vec<_>) = keys.into_iter().partition(|key| {
+        fences
+            .iter()
+            .any(|fence| fence.provider_id == provider && fence.credential_id == key.credential_id)
+    });
+    let refused: Vec<PoolBlockedKey> = refused
+        .into_iter()
+        .map(|key| PoolBlockedKey {
+            reason: crate::credential_fences::rejection_reason(
+                &fences,
+                provider,
+                std::slice::from_ref(&key.credential_id),
+            )
+            .into(),
+            credential_id: key.credential_id,
+            reset_at_ms: None,
+        })
+        .collect();
+    if keys.is_empty() && !refused.is_empty() {
+        return Err(exhausted(provider, &refused));
+    }
     let outcome = ctx
         .store
         .pool_acquire(&PoolAcquire {
@@ -185,7 +210,10 @@ pub fn acquire(
         .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
     let lease = match outcome {
         PoolAcquireOutcome::Leased(lease) => lease,
-        PoolAcquireOutcome::Exhausted(blocked) => return Err(exhausted(provider, &blocked)),
+        PoolAcquireOutcome::Exhausted(mut blocked) => {
+            blocked.extend(refused);
+            return Err(exhausted(provider, &blocked));
+        }
     };
     if let (Some(from), Some(reason)) = (&lease.moved_from, &lease.move_reason) {
         eprintln!(

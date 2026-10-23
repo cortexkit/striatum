@@ -14428,6 +14428,138 @@ mod tests {
         assert!(host.get("result").is_none(), "no fallback route: {host}");
     }
 
+    /// Replay of a live panel seat: one of anthropic-platform's four API keys
+    /// (`apikey:anthropic:wsampleyahoo`) ended a run on Broca's permanent
+    /// `billing_exhausted` ("Your credit balance is too low"). The report fences that
+    /// one key: the pool never leases it again, for any session or pin, while the
+    /// other three stay admissible. Fencing every key refuses the pool by name.
+    #[tokio::test]
+    async fn a_low_credit_key_is_fenced_and_the_pools_other_keys_stay_admissible() {
+        let keys = [
+            "apikey:anthropic:wsampleyahoo",
+            "apikey:anthropic:wsamplegmail",
+            "apikey:anthropic:usersamplegmail",
+            "apikey:anthropic:ysample",
+        ];
+        let platform: &[&str] = &["anthropic-platform"];
+        let credentials = platform_listing(&keys.map(|key| (key, platform)));
+        let rig = Rig::new("platform-pool-low-credit");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("anthropic", "claude-opus-4-1"), FactSource::Override)
+            .unwrap();
+        let config = platform_operator_config(&rig);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": method, "params": params}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        let report = |credential: &'static str| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            async move {
+                let frame = Frame::build(
+                    FrameType::Request,
+                    Flags::new(false, Priority::Interactive, false),
+                    7,
+                    1,
+                    99,
+                    serde_json::to_vec(&json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": {
+                        "decisionID": "panel-decision-low-credit", "outcome": "interrupted",
+                        "providerOutcome": {
+                            "accountRef": credential, "credentialId": credential,
+                            "credentialRefusal": {"providerId": "anthropic-platform", "credentialId": credential, "code": "billing_exhausted"}
+                        }}}))
+                    .unwrap(),
+                )
+                .unwrap();
+                let (tx, mut rx) = mpsc::channel(1);
+                handle_set_decision_outcome(
+                    frame,
+                    &tx,
+                    &store,
+                    Path::new("/nonexistent/platform-pool-low-credit.jsonc"),
+                    &credentials,
+                )
+                .await
+                .unwrap();
+                let ack: serde_json::Value =
+                    serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+                assert_eq!(ack["result"]["ok"], true, "{ack}");
+            }
+        };
+        report(keys[0]).await;
+
+        let mut leased = std::collections::BTreeSet::new();
+        for session in ["ses-1", "ses-2", "ses-3", "ses-4", "ses-5", "ses-6"] {
+            let grant = call(
+                "route.pool_acquire",
+                json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": session}),
+            )
+            .await;
+            let key = grant["result"]["credentialId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{grant}"));
+            leased.insert(key.to_string());
+        }
+        assert!(
+            !leased.contains(keys[0]),
+            "the refused key is never leased: {leased:?}"
+        );
+        assert_eq!(
+            leased,
+            keys[1..].iter().map(|key| key.to_string()).collect(),
+            "the other three keys stay admissible"
+        );
+        // The key routing picks for an explicit model pin skips the refused key too.
+        let pinned = call(
+            "route.select",
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 90, "eq": 0},
+                   "substrate": "broca", "modelPin": "anthropic-platform/claude-opus-4-1",
+                   "taskId": "ses-pin"}),
+        )
+        .await;
+        let pin_key = pinned["result"]["poolLease"]["credentialId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{pinned}"));
+        assert_ne!(pin_key, keys[0], "{pinned}");
+
+        // With every key refused, the pool refuses by name; no other route is used.
+        for key in &keys[1..] {
+            report(*key).await;
+        }
+        let refused = call(
+            "route.pool_acquire",
+            json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": "ses-7"}),
+        )
+        .await;
+        assert_eq!(
+            refused["code"], "explicit_provider_pool_exhausted",
+            "{refused}"
+        );
+        let reasons: Vec<&str> = refused["detail"]["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec!["credential_billing_exhausted"; 4],
+            "{refused}"
+        );
+    }
+
     /// The first real key, as CKCRED lists it: a labelled id, active,
     /// llm-provider, mapped to `anthropic-platform`, and no `account_id`. Every
     /// real key carries a label, so the pin always names it; with no
