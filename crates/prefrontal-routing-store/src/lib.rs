@@ -2996,22 +2996,31 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 c.query_row(
                     "SELECT provider_key, cooldown_until, quota_exhausted_until, quota_pressure,
-                            wall_class
+                            wall_class, last_error
                      FROM provider_cooldown_state WHERE provider_key = ?1",
                     [&provider_key],
                     |row| {
-                        Ok(ProviderCooldownState {
+                        let state = ProviderCooldownState {
                             provider_key: row.get(0)?,
                             cooldown_until: row.get(1)?,
                             quota_exhausted_until: row.get(2)?,
                             quota_pressure: row.get(3)?,
                             wall_class: row_wall_class(row, 4)?,
-                        })
+                        };
+                        let last_error: Option<String> = row.get(5)?;
+                        Ok((state, last_error))
                     },
                 )
                 .optional()
             })
             .map_err(err)
+            .map(|row| {
+                // A provider row written from one credential's refusal (before
+                // such refusals were kept off the provider) is read as absent: it
+                // is evidence about that credential, which its fence covers.
+                row.filter(|(_, last_error)| !credential_refusal_wall(last_error.as_deref()))
+                    .map(|(state, _)| state)
+            })
     }
 
     fn record_provider_cooldown(
@@ -3066,7 +3075,11 @@ impl RouteStateStore for SqliteRouteStateStore {
                         },
                     )
                     .optional()?;
-                let existing = existing.unwrap_or_default();
+                // A stored row from one credential's refusal holds no provider
+                // wall, so a new provider-wide signal merges with nothing.
+                let existing = existing
+                    .filter(|state| !credential_refusal_wall(state.last_error.as_deref()))
+                    .unwrap_or_default();
                 let cooldown_until = max_defined(existing.cooldown_until, update.cooldown_until);
                 let quota_exhausted_until =
                     max_defined(existing.quota_exhausted_until, update.quota_exhausted_until);
@@ -3221,7 +3234,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                         },
                     )
                     .optional()?;
-                let ex = existing.unwrap_or_default();
+                let mut ex = existing.unwrap_or_default();
+                // The route's own wall from one credential's refusal keeps its
+                // evidence (last_error) but lends no horizon to this write.
+                if credential_refusal_wall(ex.last_error.as_deref()) {
+                    ex.cooldown_until = None;
+                    ex.quota_exhausted_until = None;
+                    ex.wall_class = None;
+                }
                 let provider = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
@@ -3241,6 +3261,13 @@ impl RouteStateStore for SqliteRouteStateStore {
                     )
                     .optional()?
                     .unwrap_or_default();
+                // A stored provider row from one credential's refusal is not
+                // inherited: that refusal never walled the provider.
+                let provider = if credential_refusal_wall(provider.last_error.as_deref()) {
+                    ExistingProviderState::default()
+                } else {
+                    provider
+                };
 
                 let cooldown_until = max_defined(
                     max_defined(ex.cooldown_until, provider.cooldown_until),
@@ -3331,10 +3358,17 @@ impl RouteStateStore for SqliteRouteStateStore {
         // scoped failure as neutral model-health evidence. This closes both the
         // route-global quota writer and the terminal-failure backoff writer. The
         // request-class provider reset below is independent of both.
+        // A permanent refusal of one credential is the same kind of evidence: the
+        // credential is fenced, and the route's other credentials still serve it.
         let mut normalized = update.clone();
-        if prefrontal_routing_core::account_wall::account_scoped_error(
-            update.last_error.as_deref().unwrap_or(""),
-        ) {
+        let last_error = update.last_error.as_deref().unwrap_or("");
+        if prefrontal_routing_core::account_wall::account_scoped_error(last_error)
+            || prefrontal_routing_core::account_wall::credential_refusal_in(last_error).is_some()
+            || update
+                .provider_outcome
+                .as_ref()
+                .is_some_and(|provider| provider.credential_refusal.is_some())
+        {
             normalized.outcome = prefrontal_routing_core::RouteOutcome::Interrupted;
         }
         let update = &normalized;
@@ -4138,6 +4172,15 @@ struct StateRow {
     success_ema: Option<f64>,
     failure_backoff_until: Option<f64>,
     failure_backoff_reason: Option<String>,
+}
+
+/// Whether a stored wall was written from a permanent refusal of one named
+/// credential. Such a wall is not provider or route evidence: the credential's
+/// fence covers it, so it neither blocks nor lends its horizon to a later write.
+fn credential_refusal_wall(last_error: Option<&str>) -> bool {
+    last_error.is_some_and(|error| {
+        prefrontal_routing_core::account_wall::credential_refusal_in(error).is_some()
+    })
 }
 
 /// `max` over two optional times, treating `None` as "no value" (the defined one

@@ -50,10 +50,56 @@ pub fn account_scoped_error(error: &str) -> bool {
         })
 }
 
-/// A billing wall remains provider/model-wide even if its narrative mentions an
-/// account. Only explicitly scoped quota evidence is quarantined.
+/// Provider codes of a permanent refusal of one credential: the account has no
+/// plan for the provider's models (`ENTITLEMENT_ERROR`), or no paid balance
+/// (`billing_exhausted`, its legacy spelling `insufficient_quota`, and
+/// `credit_insufficient` for a balance too small for the request). Routing fences
+/// the credential for these (see the routing module's credential fences).
+pub const CREDENTIAL_REFUSAL_CODES: [&str; 4] = [
+    "ENTITLEMENT_ERROR",
+    "billing_exhausted",
+    "insufficient_quota",
+    "credit_insufficient",
+];
+
+/// The credential a recorded error says the provider refused permanently, with
+/// the provider code: Broca's typed run error (top level, or under `provider`)
+/// with class `permanent`, one of [`CREDENTIAL_REFUSAL_CODES`], and a non-empty
+/// `credential_id`. Such an error is evidence about that credential only; other
+/// credentials of the provider still serve its routes. Prose that mentions a
+/// credential is not this evidence.
+pub fn credential_refusal_in(error: &str) -> Option<(String, String)> {
+    let value = serde_json::from_str::<Value>(error).ok()?;
+    let provider = value.get("provider").unwrap_or(&value);
+    if provider.get("class").and_then(Value::as_str) != Some("permanent") {
+        return None;
+    }
+    let code = provider.get("provider_code").and_then(Value::as_str)?;
+    if !CREDENTIAL_REFUSAL_CODES.contains(&code) {
+        return None;
+    }
+    let credential = provider
+        .get("credential_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|credential| !credential.is_empty())?;
+    Some((credential.to_string(), code.to_string()))
+}
+
+/// Whether a wall's evidence is about one account or credential rather than the
+/// route, so it must not cool the route, its capacity or its provider.
+///
+/// A billing wall stays provider/model-wide even if its narrative mentions an
+/// account: only explicitly scoped quota evidence is quarantined for quota. A
+/// permanent refusal that names its credential (see [`credential_refusal_in`]) is
+/// scoped whatever its class, including billing: routing fences that credential
+/// instead, and rejects the route only once every credential serving it is fenced.
 pub fn account_scoped_wall(error: Option<&str>, class: Option<RouteWallClass>) -> bool {
-    class != Some(RouteWallClass::Billing) && error.is_some_and(account_scoped_error)
+    let Some(error) = error else {
+        return false;
+    };
+    (class != Some(RouteWallClass::Billing) && account_scoped_error(error))
+        || credential_refusal_in(error).is_some()
 }
 
 #[cfg(test)]
