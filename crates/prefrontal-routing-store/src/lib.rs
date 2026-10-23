@@ -254,7 +254,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 60] {
+fn route_state_migrations() -> [Migration; 61] {
     [
         Migration {
             version: 1,
@@ -5968,7 +5968,7 @@ mod tests {
         migrated
             .store
             .with_conn(|c| {
-                assert_eq!(route_state_version(c)?, 60);
+                assert_eq!(route_state_version(c)?, 61);
                 assert_eq!(
                     history_foreign_keys(c),
                     ["account_admission -> account_pin"]
