@@ -68,6 +68,10 @@ mod consumer_and_pin {
         }
 
         async fn select_with_catalog(&self, params: serde_json::Value, planes: &[prefrontal_routing_core::billing::BillingPlane], plan_prices: serde_json::Value) -> serde_json::Value {
+            self.select_with_listing(params, planes, plan_prices, None).await
+        }
+
+        async fn select_with_listing(&self, params: serde_json::Value, planes: &[prefrontal_routing_core::billing::BillingPlane], plan_prices: serde_json::Value, listing: Option<cortexkit_claustrum_client::ScopedCredentialListing>) -> serde_json::Value {
             let frame = Frame::build(
                 FrameType::Request,
                 Flags::new(false, Priority::Interactive, false),
@@ -84,6 +88,9 @@ mod consumer_and_pin {
             }
             let mut credentials = BrocaCredentials::api_test_credentials(&facts);
             credentials.publish_plan_prices(&plan_prices);
+            if let Some(listing) = listing {
+                credentials.apply_listing(&listing, now_ms());
+            }
             let credentials = Arc::new(Mutex::new(credentials));
             handle_select_request(
                 frame,
@@ -132,6 +139,38 @@ mod consumer_and_pin {
             selection_reason: "test credential".into(),
             rates: output.map(|rate| ("rate.output".into(), BillingRate::Priced { rate })).into_iter().collect(),
         }
+    }
+
+    #[tokio::test]
+    async fn vault_apikey_admits_catalog_unknown_routes_for_automatic_and_pinned_metered_selection() {
+        use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+        let rig = PolicyRig::new(json!({}));
+        rig.set_auth_methods("openai", "pin", None);
+        let listing = ScopedCredentialListing {
+            view: "api-view".into(),
+            credentials: vec![ListedCredential {
+                id: "opaque".into(),
+                credential_type: "apikey".into(),
+                state: "active".into(),
+                categories: vec!["llm-provider".into()],
+                provider_ids: vec!["openai".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for consumer in ["codemode", "flow"] {
+            for pinned in [false, true] {
+                let mut params = rig.params();
+                params["consumer"] = json!(consumer);
+                params["availableModels"] = json!(["openai/pin"]);
+                if pinned {
+                    params["modelPin"] = json!("openai/pin");
+                }
+                let reply = rig.select_with_listing(params, &[], json!({"prices": []}), Some(listing.clone())).await;
+                assert_eq!(reply["result"]["selected"]["capacityKey"], "openai/pin", "{reply}");
+            }
+        }
+        assert_eq!(rig.store.get_fact_by_route_key("openai/pin").unwrap().unwrap().auth_methods, None);
     }
 
     #[tokio::test]
