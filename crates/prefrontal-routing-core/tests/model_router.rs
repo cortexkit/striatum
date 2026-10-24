@@ -4928,3 +4928,107 @@ fn no_route_refusal_groups_fences_and_attributes_xai_wall() {
         .iter()
         .any(|group| group["reason"] == "excluded_by_operator" && group["count"] == 10));
 }
+
+/// A plan whose serving credential Fusiform publishes no rates for (`no_coverage`)
+/// has no price unless the operator configured a subscription multiplier for its
+/// provider, in which case the catalog base rates price it. The decision says
+/// which of the two happened, naming the provider in the first case.
+#[test]
+fn uncovered_plan_names_the_missing_multiplier_or_prices_at_list() {
+    use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
+
+    fn uncovered_plan(multiplier: Option<f64>, uncovered: bool) -> ModelFact {
+        let mut plan = make_complete_basket_fact("giraffe", "stripes-1", 90.0, None);
+        plan.subscription_multiplier = multiplier;
+        let rates = if uncovered {
+            [
+                "rate.input",
+                "rate.output",
+                "rate.cache_read",
+                "rate.cache_write",
+            ]
+            .into_iter()
+            .map(|key| (key.to_string(), BillingRate::Unpriced))
+            .collect()
+        } else {
+            [
+                ("rate.input".to_string(), BillingRate::Priced { rate: 2.0 }),
+                ("rate.output".to_string(), BillingRate::Priced { rate: 6.0 }),
+                (
+                    "rate.cache_read".to_string(),
+                    BillingRate::Priced { rate: 0.5 },
+                ),
+            ]
+            .into_iter()
+            .collect()
+        };
+        // The fact columns carry the same base rates a live attachment copies
+        // from the catalog, so the basket fallbacks (reasoning to output,
+        // cache-write to input) read what the plane does.
+        plan.cost_per_m_tok_out = Some(6.0);
+        plan.input_rate = Some(2.0);
+        plan.cache_read_rate = Some(0.5);
+        plan.cache_write_rate = Some(1.5);
+        plan.reasoning_rate = Some(6.0);
+        plan.billing_plane = Some(BillingPlane {
+            provider_id: "giraffe".into(),
+            auth_method: "oauth".into(),
+            kind: "no_coverage fallback".into(),
+            selection_reason: "single listed method".into(),
+            rates,
+        });
+        plan
+    }
+
+    let vector = make_ephemeral_vector(10_000.0, 2_000.0, 0.0, 5_000.0, 0.0, 50);
+    let mut unpriced = uncovered_plan(None, true);
+    unpriced.class_vector = Some(vector.clone());
+    unpriced.class_vector_is_overlay = true;
+    let selected =
+        select_without_overqualification(input(vec![unpriced], req(20.0, 0.0), Extra::default()))
+            .expect("the sole adequate route stays selectable");
+    assert!(selected.score.objective.price_unknown);
+    let explanation = selected.explanation.join("\n");
+    assert!(
+        explanation
+            .contains("price_unknown: giraffe has no plan pricing and no subscription multiplier"),
+        "{explanation}"
+    );
+
+    // The same route with a configured multiplier prices at list divided by it.
+    let mut priced = uncovered_plan(Some(15.0), false);
+    priced.class_vector = Some(vector.clone());
+    priced.class_vector_is_overlay = true;
+    let list_dollars = (10_000.0 * 2.0 + 2_000.0 * 6.0 + 5_000.0 * 0.5) / 1_000_000.0;
+    let expected = list_dollars
+        / prefrontal_routing_core::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE
+        / 15.0;
+    let price = priced.basket_price(&vector);
+    assert!(price.unpriced.is_empty(), "{:?}", price.unpriced);
+    assert!((price.cost.expect("a priced route") - expected).abs() < 1e-12);
+    let selected =
+        select_without_overqualification(input(vec![priced], req(20.0, 0.0), Extra::default()))
+            .expect("the sole adequate route stays selectable");
+    let explanation = selected.explanation.join("\n");
+    assert!(!selected.score.objective.price_unknown, "{explanation}");
+    assert!(
+        !explanation.contains("no plan pricing and no subscription multiplier"),
+        "{explanation}"
+    );
+
+    // A configured multiplier alone does not invent rates the catalog does not
+    // serve: the route stays unknown, but the note names the multiplier rather
+    // than the missing plan pricing.
+    let mut without_rates = uncovered_plan(Some(15.0), true);
+    without_rates.cost_per_m_tok_out = None;
+    without_rates.class_vector = Some(vector.clone());
+    without_rates.class_vector_is_overlay = true;
+    let selected = select_without_overqualification(input(
+        vec![without_rates],
+        req(20.0, 0.0),
+        Extra::default(),
+    ))
+    .expect("the sole adequate route stays selectable");
+    let explanation = selected.explanation.join("\n");
+    assert!(selected.score.objective.price_unknown, "{explanation}");
+}

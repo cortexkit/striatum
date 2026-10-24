@@ -3235,7 +3235,7 @@ fn price_selection_inputs(
         &sources.operator_policy.score_alias,
     );
     let subscription_plan_providers = if let Ok(credentials) = broca_credentials.lock() {
-        credentials.price_facts(facts);
+        credentials.price_facts(facts, sources.live_config.pricing());
         credentials.subscription_plan_providers()
     } else {
         None
@@ -5078,7 +5078,7 @@ async fn handle_select_panel(
         &operator_policy.score_alias,
     );
     if let Ok(credentials) = broca_credentials.lock() {
-        credentials.price_facts(&mut prepared.facts);
+        credentials.price_facts(&mut prepared.facts, live_config.pricing());
     }
     live_config.apply(&mut prepared.facts);
     // Seats are automatic choices for the class's consumer (see the variant

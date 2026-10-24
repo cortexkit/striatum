@@ -490,7 +490,15 @@ impl BrocaCredentials {
     }
 
     /// Only cached data is read here; a selection cannot trigger a catalog call.
-    pub(crate) fn price_facts(&self, facts: &mut [ModelFact]) {
+    /// `pricing` is the selection's own configuration: a route whose provider
+    /// has an operator-configured subscription multiplier keeps the catalog's
+    /// base list rates when Fusiform does not cover its plan (see
+    /// [`crate::fusiform_catalog::PlaneCatalog::for_route`]).
+    pub(crate) fn price_facts(
+        &self,
+        facts: &mut [ModelFact],
+        pricing: &prefrontal_routing_core::RoutePricing,
+    ) {
         // The ignored live replay can run the pre-plane scorer on the same
         // copied database. This switch does not exist in production builds.
         #[cfg(test)]
@@ -502,7 +510,12 @@ impl BrocaCredentials {
             let method = self.serving_method(fact);
             let catalog_key =
                 prefrontal_routing_core::score_alias::catalog_key(&self.score_alias, &key);
-            fact.billing_plane = Some(self.billing_catalog.for_route(&catalog_key, &method));
+            let multiplier_configured = pricing.subscription_multiplier(&key).is_some();
+            fact.billing_plane = Some(self.billing_catalog.for_route(
+                &catalog_key,
+                &method,
+                multiplier_configured,
+            ));
         }
     }
 

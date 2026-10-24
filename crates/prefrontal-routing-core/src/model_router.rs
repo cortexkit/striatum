@@ -1144,9 +1144,31 @@ pub(crate) fn compute_objective(
         }
     }
     if objective.price_unknown {
-        notes.push("price_unknown: no effective price; ranked after known prices".into());
+        notes.push(price_unknown_note(route));
     }
     (objective, notes)
+}
+
+/// Why a route has no known price, in the words a decision reader needs.
+///
+/// On a plan whose serving credential Fusiform publishes no rates for (the
+/// `no_coverage` fallback plane on a non-apikey method), the price is unknown
+/// only because nothing states what the plan bills: the route is then priced at
+/// list rates when its provider has an operator-configured subscription
+/// multiplier, and unpriced otherwise.
+fn price_unknown_note(route: &ModelRoute) -> String {
+    let uncovered_plan =
+        route.fact.billing_plane.as_ref().is_some_and(|plane| {
+            plane.kind == "no_coverage fallback" && plane.auth_method != "apikey"
+        });
+    if uncovered_plan {
+        format!(
+            "price_unknown: {} has no plan pricing and no subscription multiplier; ranked after known prices",
+            route.fact.provider_id
+        )
+    } else {
+        "price_unknown: no effective price; ranked after known prices".into()
+    }
 }
 
 /// The cost line's detail on the output-only ladder.
