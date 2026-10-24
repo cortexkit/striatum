@@ -348,10 +348,22 @@ impl ExcludeGroups {
 
 /// The `routing/v1` consumers routing serves beyond the request classes
 /// [`crate::select_policy::Consumer`] already names (mason, sidekick, athena,
-/// lab, core, codemode, flow). Magic Context owns these two (its summary and
-/// dream work); they take the default policy: no exclusions beyond
+/// lab, core, codemode, flow). Magic Context owns these summary and dream
+/// consumers; they take the default policy: no exclusions beyond
 /// `exclude.all`, and any route, priced per token or not.
-pub const MAGIC_CONTEXT_CONSUMERS: &[&str] = &["mc_summary", "mc_dream"];
+pub const MAGIC_CONTEXT_CONSUMERS: &[&str] = &[
+    "mc_summary",
+    "mc_dream",
+    "mc_dream_verify",
+    "mc_dream_map",
+    "mc_dream_curate",
+    "mc_dream_classify",
+    "mc_dream_review_user",
+    "mc_dream_retrospective",
+    "mc_dream_primers",
+    "mc_dream_compress_cues",
+    "mc_dream_docs",
+];
 
 /// A runner module `routing/v1` answers with (`model_routing.runners[]`).
 /// Listed in preference order: the first listed runner that can serve the
