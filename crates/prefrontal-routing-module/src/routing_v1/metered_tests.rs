@@ -36,10 +36,10 @@ fn model(route_key: &str) -> CatalogModel {
     }
 }
 
-/// Both routes are API-key routes on a metered plane with a known output
-/// price; only the plan list tells them apart.
-fn facts() -> Vec<ModelFact> {
-    [PLAN, METERED]
+/// API-key routes on a metered plane with a known output price, cheapest
+/// first; only the plan list and the configured subsidies tell them apart.
+fn facts(route_keys: &[&str]) -> Vec<ModelFact> {
+    route_keys
         .iter()
         .enumerate()
         .map(|(rank, key)| {
@@ -66,8 +66,14 @@ fn facts() -> Vec<ModelFact> {
 /// A harness serving both routes on one runner, with `plan_prices` as the
 /// subscription plans the catalog publishes.
 fn harness(plan_prices: Value) -> Arc<Harness> {
+    harness_of(&[PLAN, METERED], plan_prices)
+}
+
+/// A harness serving `route_keys` (cheapest first) on one runner, with
+/// `plan_prices` as the subscription plans the catalog publishes.
+fn harness_of(route_keys: &[&str], plan_prices: Value) -> Arc<Harness> {
     let harness = Harness::new("metered");
-    let facts = facts();
+    let facts = facts(route_keys);
     harness.install_facts(&facts);
     for fact in &facts {
         // Login methods come from the catalog, as they do in production.
@@ -158,4 +164,31 @@ async fn codemode_fails_closed_while_plan_membership_is_unknown() {
     assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
     let mason = route.call("route.select", &select("mason")).await;
     assert_eq!(route_key(&mason), PLAN);
+}
+
+/// Two plan-free metered routes: `CHEAP` has the lower list price, and the
+/// operator states a subscription subsidy for `SUBSIDISED`'s provider that
+/// makes it cheaper than `CHEAP` once divided in. Codemode pays list price,
+/// so its select reads the facts without that subsidy and answers `CHEAP`.
+#[tokio::test]
+async fn codemode_ranks_routes_at_list_price_never_at_a_subscription_subsidy() {
+    const CHEAP: &str = "metered-a/model-a";
+    const SUBSIDISED: &str = "metered-b/model-b";
+    let harness = harness_of(
+        &[CHEAP, SUBSIDISED],
+        json!({ "prices": [{ "provider_id": "plan-provider" }] }),
+    );
+    harness.edit_config(|config| {
+        config["model_routing"]["subscription_multipliers"] = json!({ "metered-b": 40.0 });
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+
+    // A consumer that may use a subsidy takes the subsidised route.
+    let mason = route.call("route.select", &select("mason")).await;
+    assert_eq!(route_key(&mason), SUBSIDISED);
+
+    for consumer in ["codemode", "flow"] {
+        let reply = route.call("route.select", &select(consumer)).await;
+        assert_eq!(route_key(&reply), CHEAP, "{consumer}");
+    }
 }
