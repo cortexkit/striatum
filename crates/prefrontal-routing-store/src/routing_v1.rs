@@ -1,0 +1,407 @@
+//! Persistence for the routing/v1 role (migration 62): the binding of each v1
+//! decision to the principal and consumer that selected it, the affinity
+//! preference per `(principal, consumer, affinity)`, and the first body and
+//! answer of every report and v1 admission, which make those ops idempotent.
+//!
+//! The decision itself is the row `route.select` writes into the decision
+//! ledger; this module only keeps what v1 adds to it.
+
+use prefrontal_routing_core::RouteStateResult;
+use rusqlite::{params, Connection, OptionalExtension};
+
+use super::{err, SqliteRouteStateStore};
+
+/// What a v1 decision is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V1Decision {
+    pub decision_id: String,
+    /// The route principal that selected it (`reserved:<module>`, ...).
+    pub principal: String,
+    pub consumer: String,
+    pub project_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub variant: Option<String>,
+    /// The runner module the answer named.
+    pub runner_module: String,
+    pub affinity: Option<String>,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+/// The first body recorded under an idempotency key, and the answer it got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V1Recorded {
+    pub body_json: String,
+    pub answer_json: String,
+}
+
+impl SqliteRouteStateStore {
+    /// Bind a decision and, when it carries an affinity key, make it the key's
+    /// previous decision, in one transaction.
+    pub fn v1_record_decision(&self, decision: &V1Decision) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let tx = c.unchecked_transaction()?;
+                tx.execute(
+                    "INSERT INTO routing_v1_decision
+                       (decision_id, principal, consumer, project_id, provider, model, variant,
+                        runner_module, affinity, created_at_ms, expires_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        decision.decision_id,
+                        decision.principal,
+                        decision.consumer,
+                        decision.project_id,
+                        decision.provider,
+                        decision.model,
+                        decision.variant,
+                        decision.runner_module,
+                        decision.affinity,
+                        decision.created_at_ms,
+                        decision.expires_at_ms,
+                    ],
+                )?;
+                if let Some(affinity) = &decision.affinity {
+                    tx.execute(
+                        "INSERT INTO routing_v1_affinity
+                           (principal, consumer, affinity, decision_id, updated_at_ms, ended_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+                         ON CONFLICT(principal, consumer, affinity) DO UPDATE SET
+                           decision_id = excluded.decision_id,
+                           updated_at_ms = excluded.updated_at_ms,
+                           ended_at_ms = NULL",
+                        params![
+                            decision.principal,
+                            decision.consumer,
+                            affinity,
+                            decision.decision_id,
+                            decision.created_at_ms,
+                        ],
+                    )?;
+                }
+                tx.commit()
+            })
+            .map_err(err)
+    }
+
+    /// The binding of `decision_id`, whoever selected it. Callers check the
+    /// principal or runner themselves so a refusal never says which it was.
+    pub fn v1_decision(&self, decision_id: &str) -> RouteStateResult<Option<V1Decision>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT decision_id, principal, consumer, project_id, provider, model, variant,
+                            runner_module, affinity, created_at_ms, expires_at_ms
+                     FROM routing_v1_decision WHERE decision_id = ?1",
+                    params![decision_id],
+                    |row| {
+                        Ok(V1Decision {
+                            decision_id: row.get(0)?,
+                            principal: row.get(1)?,
+                            consumer: row.get(2)?,
+                            project_id: row.get(3)?,
+                            provider: row.get(4)?,
+                            model: row.get(5)?,
+                            variant: row.get(6)?,
+                            runner_module: row.get(7)?,
+                            affinity: row.get(8)?,
+                            created_at_ms: row.get(9)?,
+                            expires_at_ms: row.get(10)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
+    /// The previous decision for an affinity key, unless a failure report
+    /// ended the preference.
+    pub fn v1_affinity_decision(
+        &self,
+        principal: &str,
+        consumer: &str,
+        affinity: &str,
+    ) -> RouteStateResult<Option<V1Decision>> {
+        let decision_id: Option<String> = self
+            .store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT decision_id FROM routing_v1_affinity
+                     WHERE principal = ?1 AND consumer = ?2 AND affinity = ?3
+                       AND ended_at_ms IS NULL",
+                    params![principal, consumer, affinity],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .map_err(err)?;
+        match decision_id {
+            Some(id) => self.v1_decision(&id),
+            None => Ok(None),
+        }
+    }
+
+    /// The first report on `decision_id`, if one was recorded.
+    pub fn v1_report(&self, decision_id: &str) -> RouteStateResult<Option<V1Recorded>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT body_json, answer_json FROM routing_v1_report WHERE decision_id = ?1",
+                    params![decision_id],
+                    |row| {
+                        Ok(V1Recorded {
+                            body_json: row.get(0)?,
+                            answer_json: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Record the first report on a decision. When `ends_affinity` is set, the
+    /// affinity preference whose previous decision this is ends in the same
+    /// transaction. Returns the report that stands: this one, or one another
+    /// caller recorded first.
+    pub fn v1_record_report(
+        &self,
+        decision_id: &str,
+        report_id: &str,
+        recorded: &V1Recorded,
+        ends_affinity: bool,
+        now_ms: i64,
+    ) -> RouteStateResult<V1Recorded> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let tx = c.unchecked_transaction()?;
+                let inserted = tx.execute(
+                    "INSERT INTO routing_v1_report
+                       (decision_id, report_id, body_json, answer_json, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(decision_id) DO NOTHING",
+                    params![
+                        decision_id,
+                        report_id,
+                        recorded.body_json,
+                        recorded.answer_json,
+                        now_ms
+                    ],
+                )?;
+                if inserted == 1 && ends_affinity {
+                    tx.execute(
+                        "UPDATE routing_v1_affinity SET ended_at_ms = ?2
+                         WHERE decision_id = ?1 AND ended_at_ms IS NULL",
+                        params![decision_id, now_ms],
+                    )?;
+                }
+                let standing = tx.query_row(
+                    "SELECT body_json, answer_json FROM routing_v1_report WHERE decision_id = ?1",
+                    params![decision_id],
+                    |row| {
+                        Ok(V1Recorded {
+                            body_json: row.get(0)?,
+                            answer_json: row.get(1)?,
+                        })
+                    },
+                )?;
+                tx.commit()?;
+                Ok(standing)
+            })
+            .map_err(err)
+    }
+
+    /// The first v1 admission a runner made under `admission_id`.
+    pub fn v1_admission(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<Option<V1Recorded>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT body_json, answer_json FROM routing_v1_admission
+                     WHERE principal = ?1 AND admission_id = ?2",
+                    params![principal, admission_id],
+                    |row| {
+                        Ok(V1Recorded {
+                            body_json: row.get(0)?,
+                            answer_json: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
+    /// Record a runner's first v1 admission under `admission_id`. Returns the
+    /// admission that stands: this one, or one recorded first.
+    pub fn v1_record_admission(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        recorded: &V1Recorded,
+        now_ms: i64,
+    ) -> RouteStateResult<V1Recorded> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "INSERT INTO routing_v1_admission
+                       (principal, admission_id, body_json, answer_json, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(principal, admission_id) DO NOTHING",
+                    params![
+                        principal,
+                        admission_id,
+                        recorded.body_json,
+                        recorded.answer_json,
+                        now_ms
+                    ],
+                )?;
+                c.query_row(
+                    "SELECT body_json, answer_json FROM routing_v1_admission
+                     WHERE principal = ?1 AND admission_id = ?2",
+                    params![principal, admission_id],
+                    |row| {
+                        Ok(V1Recorded {
+                            body_json: row.get(0)?,
+                            answer_json: row.get(1)?,
+                        })
+                    },
+                )
+            })
+            .map_err(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dev_descriptor;
+
+    fn store(label: &str) -> SqliteRouteStateStore {
+        let dir = prefrontal_test_support::scratch_root().join(format!(
+            "routing-v1-store-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        SqliteRouteStateStore::open(&dev_descriptor(
+            "routing-v1-store-test",
+            dir.join("store.db").to_string_lossy().into_owned(),
+        ))
+        .unwrap()
+    }
+
+    fn decision(id: &str, affinity: Option<&str>) -> V1Decision {
+        V1Decision {
+            decision_id: id.into(),
+            principal: "reserved:consumer".into(),
+            consumer: "summary".into(),
+            project_id: None,
+            provider: "p".into(),
+            model: "m".into(),
+            variant: None,
+            runner_module: "runner".into(),
+            affinity: affinity.map(str::to_owned),
+            created_at_ms: 1,
+            expires_at_ms: 2,
+        }
+    }
+
+    #[test]
+    fn affinity_follows_the_last_decision_and_a_failure_report_ends_it() {
+        let store = store("affinity");
+        store
+            .v1_record_decision(&decision("d1", Some("k")))
+            .unwrap();
+        store
+            .v1_record_decision(&decision("d2", Some("k")))
+            .unwrap();
+        let previous = store
+            .v1_affinity_decision("reserved:consumer", "summary", "k")
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.decision_id, "d2");
+
+        // A failure report on an older decision leaves the preference alone.
+        let body = V1Recorded {
+            body_json: "{}".into(),
+            answer_json: "{}".into(),
+        };
+        store.v1_record_report("d1", "r1", &body, true, 5).unwrap();
+        assert!(store
+            .v1_affinity_decision("reserved:consumer", "summary", "k")
+            .unwrap()
+            .is_some());
+
+        store.v1_record_report("d2", "r2", &body, true, 6).unwrap();
+        assert!(store
+            .v1_affinity_decision("reserved:consumer", "summary", "k")
+            .unwrap()
+            .is_none());
+
+        // The next decision for the key starts the preference again.
+        store
+            .v1_record_decision(&decision("d3", Some("k")))
+            .unwrap();
+        assert_eq!(
+            store
+                .v1_affinity_decision("reserved:consumer", "summary", "k")
+                .unwrap()
+                .unwrap()
+                .decision_id,
+            "d3"
+        );
+    }
+
+    #[test]
+    fn the_first_report_and_admission_stand() {
+        let store = store("first-stands");
+        store.v1_record_decision(&decision("d1", None)).unwrap();
+        let first = V1Recorded {
+            body_json: "first".into(),
+            answer_json: "a1".into(),
+        };
+        let second = V1Recorded {
+            body_json: "second".into(),
+            answer_json: "a2".into(),
+        };
+        assert_eq!(
+            store
+                .v1_record_report("d1", "r1", &first, false, 1)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            store
+                .v1_record_report("d1", "r2", &second, false, 2)
+                .unwrap(),
+            first
+        );
+        assert_eq!(store.v1_report("d1").unwrap(), Some(first.clone()));
+
+        assert_eq!(
+            store
+                .v1_record_admission("reserved:runner", "adm", &first, 1)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            store
+                .v1_record_admission("reserved:runner", "adm", &second, 2)
+                .unwrap(),
+            first
+        );
+        assert!(store
+            .v1_admission("reserved:other", "adm")
+            .unwrap()
+            .is_none());
+    }
+}

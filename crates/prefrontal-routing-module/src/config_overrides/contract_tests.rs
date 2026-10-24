@@ -964,3 +964,91 @@ fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
         serde_json::json!(["broca", "opencode", "pi"])
     );
 }
+
+#[test]
+fn routing_v1_consumers_default_to_the_built_in_list_and_a_listing_replaces_it() {
+    let defaults = LiveConfig::default().v1_consumers();
+    let ids: Vec<&str> = defaults.iter().map(|(id, _)| id.as_str()).collect();
+    for id in [
+        "mason",
+        "sidekick",
+        "athena",
+        "lab",
+        "core",
+        "codemode",
+        "flow",
+        "mc_summary",
+        "mc_dream",
+    ] {
+        assert!(ids.contains(&id), "{id} is a default consumer");
+    }
+    let priced_only: Vec<&str> = defaults
+        .iter()
+        .filter(|(_, policy)| policy.priced_only)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert_eq!(priced_only, ["codemode", "flow"]);
+
+    let mut rig = Rig::new();
+    rig.write(r#"{"model_routing":{"consumers":{"summary":{"priced_only":true}}}}"#);
+    initialize_config(&rig.path).unwrap();
+    let configured = live_config(&rig.path).v1_consumers();
+    assert_eq!(configured.len(), 1);
+    assert_eq!(configured[0].0, "summary");
+    assert!(configured[0].1.priced_only);
+}
+
+#[test]
+fn routing_v1_runners_default_to_broca_and_exclusions_follow_the_consumer_group() {
+    let config = LiveConfig::default();
+    let runners = config.v1_runners();
+    assert_eq!(runners.len(), 1);
+    assert_eq!(runners[0].module, "broca");
+    assert!(runners[0].routes.is_none());
+
+    let mut rig = Rig::new();
+    rig.write(r#"{"model_routing":{"exclude":{"all":["a"],"mason":["b"]}}}"#);
+    initialize_config(&rig.path).unwrap();
+    let groups = live_config(&rig.path).exclude_groups().clone();
+    assert_eq!(groups.named_group("mason"), ["b"]);
+    // A consumer with no group of its own reads only `all`, which the
+    // selection applies separately.
+    assert!(groups.named_group("mc_summary").is_empty());
+    assert!(groups.named_group("all").is_empty());
+}
+
+#[test]
+fn routing_v1_sections_refuse_malformed_entries_by_path() {
+    for (document, message) in [
+        (
+            r#"{"model_routing":{"consumers":{"two words":{}}}}"#,
+            "model_routing.consumers",
+        ),
+        (
+            r#"{"model_routing":{"runners":[{"module":"r"},{"module":"r"}]}}"#,
+            "listed once",
+        ),
+        (
+            r#"{"model_routing":{"runners":[{"module":"r","routes":["-p"]}]}}"#,
+            "model_routing.runners.r",
+        ),
+        (
+            r#"{"model_routing":{"project_pins":{"p":{"nobody":"a/b"}}}}"#,
+            "is not a configured consumer",
+        ),
+        (
+            r#"{"model_routing":{"project_pins":{"p":{"mason":"model-only"}}}}"#,
+            "must be provider/model[:variant]",
+        ),
+    ] {
+        first_load_refuses(document, message);
+    }
+    let mut rig = Rig::new();
+    rig.write(r#"{"model_routing":{"project_pins":{"p1":{"mc_dream":"a/b:high"}}}}"#);
+    initialize_config(&rig.path).unwrap();
+    assert_eq!(
+        live_config(&rig.path).project_pin("p1", "mc_dream"),
+        Some("a/b:high")
+    );
+    assert_eq!(live_config(&rig.path).project_pin("p2", "mc_dream"), None);
+}

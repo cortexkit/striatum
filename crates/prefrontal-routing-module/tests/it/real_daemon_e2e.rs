@@ -635,7 +635,7 @@ async fn real_daemon_no_available_model_returns_typed_error() {
         2,
         serde_json::json!({
             "method": "route.select",
-            "params": { "executor": "broca", "requirements": { "iq": 50, "eq": 10 }, "availableModels": [] }
+            "params": { "targetAgent": "mason", "executor": "broca", "requirements": { "iq": 50, "eq": 10 }, "availableModels": [] }
         }),
     )
     .await;
@@ -645,6 +645,73 @@ async fn real_daemon_no_available_model_returns_typed_error() {
         body.code, "no_available_model",
         "typed reason must cross the wire"
     );
+
+    let _ = std::fs::remove_dir_all(&project_root);
+}
+
+/// `routing/v1` through a real daemon: the module lists the role's capability,
+/// a v1 `route.select` (a body without the older op's `targetAgent`) is
+/// answered with a decision and a runner, and the selecting route reports on
+/// that decision. The conformance kit runs every v1 rule over the module's own
+/// frame handler; this proves the daemon's route carries the same requests.
+#[tokio::test]
+#[ignore = "builds subc-core in ../subconscious and binds loopback ports"]
+async fn real_daemon_serves_routing_v1_select_then_report() {
+    let daemon = start_real_daemon().await;
+    let mut consumer = connect_consumer(&daemon.connection_file).await;
+    let entry = wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
+    assert!(
+        entry.to_string().contains("routing/v1"),
+        "the catalog entry must list routing/v1: {entry}"
+    );
+
+    let project_root = unique_temp_dir("prefrontal-routing-real-daemon-v1");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let route_channel = route_open(&mut consumer, &project_root, 1).await;
+
+    let frame = raw_route_frame(
+        &mut consumer,
+        route_channel,
+        2,
+        serde_json::json!({
+            "method": "route.select",
+            "params": { "consumer": "mason", "requirements": { "iq": 20 } }
+        }),
+    )
+    .await;
+    let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(
+        frame.header.ty,
+        subc_protocol::FrameType::Response,
+        "v1 route.select was refused: {body}"
+    );
+    let answer = &body["result"];
+    let decision_id = answer["decision_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("v1 answer has no decision_id: {body}"));
+    assert_eq!(answer["runner"]["module"], "broca", "{body}");
+    assert!(answer["expires_at_ms"].is_u64(), "{body}");
+    eprintln!(
+        "[real-daemon] v1 route.select -> {} on {}",
+        answer["route"], answer["runner"]["module"]
+    );
+
+    let report = serde_json::json!({
+        "method": "route.report",
+        "params": { "decision_id": decision_id, "outcome": "completed" }
+    });
+    let frame = raw_route_frame(&mut consumer, route_channel, 3, report.clone()).await;
+    let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+    assert_eq!(
+        frame.header.ty,
+        subc_protocol::FrameType::Response,
+        "route.report was refused: {body}"
+    );
+    assert_eq!(body["result"]["decision_id"], decision_id, "{body}");
+    assert_eq!(body["result"]["outcome"], "completed", "{body}");
+    let again = raw_route_frame(&mut consumer, route_channel, 4, report).await;
+    let again: serde_json::Value = serde_json::from_slice(&again.body).unwrap();
+    assert_eq!(again, body, "a repeated report returns the first answer");
 
     let _ = std::fs::remove_dir_all(&project_root);
 }

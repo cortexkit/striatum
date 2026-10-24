@@ -323,3 +323,80 @@ impl Pins {
         Ok(())
     }
 }
+
+impl ExcludeGroups {
+    /// The exclusion list a consumer group names, or nothing when no group of
+    /// that name exists. Looked up through the serialized field names so a
+    /// group added to this struct is found without a second list to update.
+    pub fn named_group(&self, group: &str) -> Vec<String> {
+        if group == "all" {
+            return Vec::new();
+        }
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|groups| groups.get(group).cloned())
+            .and_then(|entries| serde_json::from_value(entries).ok())
+            .unwrap_or_default()
+    }
+}
+
+/// One `routing/v1` consumer's policy (`model_routing.consumers.<id>`).
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsumerPolicy {
+    /// Answer this consumer only with routes priced per token, never with a
+    /// route paid from subscription quota.
+    pub priced_only: bool,
+}
+
+/// The `routing/v1` consumers served when the routing file names none:
+/// `(id, priced_only)`. A consumer's exclusions are `model_routing.exclude.all`
+/// plus the `exclude` group of the same name when one exists.
+pub const DEFAULT_CONSUMERS: &[(&str, bool)] = &[
+    ("mason", false),
+    ("sidekick", false),
+    ("athena", false),
+    ("lab", false),
+    ("core", false),
+    // Codemode runs and flows pay per token: they are never answered with a
+    // route paid from subscription quota.
+    ("codemode", true),
+    ("flow", true),
+    // Magic Context owns these two consumers (its summary and dream work).
+    // They take the default policy: no exclusions beyond `exclude.all`.
+    ("mc_summary", false),
+    ("mc_dream", false),
+];
+
+/// A runner module `routing/v1` answers with (`model_routing.runners[]`).
+/// Listed in preference order: the first listed runner that can serve the
+/// answered route is named.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerPolicy {
+    /// The runner's module id. Only a route principal the daemon verified as
+    /// this module may call the runner operations.
+    #[schemars(regex(pattern = r"^\S+$"))]
+    pub module: String,
+    /// The routes it runs, in the exclusion grammar (`provider`,
+    /// `provider/model`, `provider/model/variant`). Absent: every route it
+    /// serves; for `broca`, the routes Broca's credentials serve, and for any
+    /// other module every catalog route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routes: Option<Vec<String>>,
+    /// Tool capability tags (such as `code.read/v1`) the runner can reach a
+    /// tool provider for. A select that lists tool capabilities is answered
+    /// only on a runner reaching every one of them.
+    #[serde(default)]
+    pub tool_capabilities: Vec<String>,
+}
+
+/// The runners served when the routing file names none: Broca, on the routes
+/// its credentials serve.
+pub fn default_runners() -> Vec<RunnerPolicy> {
+    vec![RunnerPolicy {
+        module: "broca".into(),
+        routes: None,
+        tool_capabilities: Vec::new(),
+    }]
+}

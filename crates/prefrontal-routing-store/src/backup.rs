@@ -126,5 +126,23 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     ("pool_key_state", "key-pool walls"),
     ("pool_key_lease", "live key leases"),
     ("pool_session_affinity", "session-to-key binding"),
+    (
+        "routing_v1_decision",
+        "which principal and consumer may report each v1 decision and which runner may \
+         cite it; empty, every report and decision-citing admission is unknown_decision",
+    ),
+    (
+        "routing_v1_affinity",
+        "previous v1 decision per affinity key; empty, warm prompt caches move routes",
+    ),
+    (
+        "routing_v1_report",
+        "first v1 report per decision; empty, a re-sent report is recorded twice",
+    ),
+    (
+        "routing_v1_admission",
+        "first v1 admission answer per runner and admission id; empty, a re-sent \
+         admission is decided again",
+    ),
     ("cortexkit_schema_version", "migration ledger"),
 ];

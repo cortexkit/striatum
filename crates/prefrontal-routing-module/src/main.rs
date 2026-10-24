@@ -31,6 +31,7 @@ mod quota_bus;
 mod quota_consumer;
 mod quota_events;
 mod retention;
+mod routing_v1;
 mod runtime_lag;
 mod select_policy;
 mod selection_harness;
@@ -1339,6 +1340,24 @@ async fn handle_frame(
                     route_epoch,
                     corr,
                     |reply| async move {
+                        // The routing/v1 surface answers the requests it claims;
+                        // every other request reaches the older ops unchanged.
+                        if routing_v1::claims(&frame.body) {
+                            return routing_v1::serve(
+                                frame,
+                                route_epoch,
+                                &reply,
+                                &routing_v1::Deps {
+                                    quota_cache: &quota_cache,
+                                    store: &store,
+                                    routing_config_path: &routing_config_path,
+                                    operator_config_path: &operator_config_path,
+                                    broca_credentials: &broca_credentials,
+                                    opencode_auth_path: &opencode_auth_path,
+                                },
+                            )
+                            .await;
+                        }
                         handle_select_request(
                             frame,
                             route_epoch,
@@ -1458,6 +1477,7 @@ async fn handle_control_request(
             route_channel,
             epoch,
             principal,
+            scope,
             ..
         } => {
             if let Ok(mut map) = route_principals().lock() {
@@ -1469,6 +1489,11 @@ async fn handle_control_request(
                     ),
                 );
             }
+            routing_v1::remember_route_scope(
+                route_channel,
+                epoch,
+                scope.as_ref().and_then(|scope| scope.project_id.clone()),
+            );
             // The catalog is machine-global, but the wire identity is binding-specific.
             // Install it only after the accepted bind ACK is queued.
             let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
@@ -1638,6 +1663,13 @@ struct SelectParams {
 }
 
 impl SelectParams {
+    /// The params of a selection that carries none of the older request's
+    /// audit members (task, session, harness, project root, send id): what a
+    /// `routing/v1` decision records them as.
+    fn for_record() -> Self {
+        serde_json::from_value(json!({})).expect("every select param has a default")
+    }
+
     /// A selection that names no executor, no workload and no required harness
     /// comes from a host's own route resolver (an OpenCode or Pi head choosing
     /// the model for a mason or explore subagent it launches) or from core
@@ -3147,6 +3179,79 @@ fn prepare_selection_inputs(
     })
 }
 
+/// The configuration documents one selection reads, resolved once for it.
+struct SelectionPolicySources<'a> {
+    live_config: &'a config_overrides::LiveConfig,
+    operator_config: &'a config_overrides::LiveConfig,
+    operator_config_path: &'a Path,
+    operator_policy: &'a ModelRoutingPolicyInput,
+}
+
+/// What pricing a selection's inputs yields besides the priced facts and the
+/// fenced snapshot.
+struct PricedSelection {
+    routing_config: prefrontal_routing_core::RoutingConfig,
+    provenance: DecisionProvenance,
+    entitlement_fences: Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>,
+}
+
+/// Apply one selection's configuration to the facts and snapshot that
+/// [`prepare_selection_inputs`] read: the live overlays, borrowed score-alias
+/// rows, Broca's billing-plane prices, the provider-confirmed resets recorded
+/// for `reset_group`, and the credential entitlement fences. Every route
+/// selection runs this same sequence, so a route fenced for one caller's
+/// selection is fenced for every other.
+#[allow(clippy::too_many_arguments)]
+fn price_selection_inputs(
+    facts: &mut Vec<ModelFact>,
+    snapshot: &mut ModelRouteStateSnapshot,
+    quota_signal_json: String,
+    sources: &SelectionPolicySources<'_>,
+    store: &SharedStore,
+    broca_credentials: &SharedBrocaCredentials,
+    reset_group: Option<&str>,
+    consumer: Option<select_policy::Consumer>,
+) -> Result<PricedSelection, ModuleError> {
+    let outcome = sources.live_config.apply(facts);
+    let provenance = DecisionProvenance {
+        quota_signal_json,
+        policy_revision: outcome.policy_revision,
+    };
+    // Borrowed rows are added after the live overlays so they carry the target's
+    // current quality data, and before pricing so they get their own plane.
+    prefrontal_routing_core::score_alias::append_alias_rows(
+        facts,
+        &sources.operator_policy.score_alias,
+    );
+    if let Ok(credentials) = broca_credentials.lock() {
+        credentials.price_facts(facts);
+    }
+    sources.live_config.apply(facts);
+    if let Some(group) = reset_group {
+        apply_provider_resets_for_group(
+            snapshot,
+            facts,
+            store,
+            broca_credentials,
+            sources.operator_config,
+            sources.operator_config_path,
+            group,
+            consumer,
+            None,
+        )?;
+    }
+    // Credentials a provider refused permanently: automatic selection skips a
+    // route no other credential serves, and launches the rest on another one.
+    let entitlement_fences =
+        credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?;
+    credential_fences::apply(snapshot, facts, &entitlement_fences, broca_credentials);
+    Ok(PricedSelection {
+        routing_config: outcome.routing_config,
+        provenance,
+        entitlement_fences,
+    })
+}
+
 /// Where one route.select spent its time, for the slow-request log line. Each
 /// stage is a separate bucket so `unclassified_ms` (total minus every bucket)
 /// stays near zero; a large remainder means a stage is missing a timer.
@@ -3785,43 +3890,25 @@ async fn handle_select_request(
         }
     };
     let pricing_started = Instant::now();
-    let outcome = live_config.apply(&mut facts);
-    let (routing_config, policy_revision) = (outcome.routing_config, outcome.policy_revision);
-    let provenance = DecisionProvenance {
-        quota_signal_json,
-        policy_revision,
-    };
-
-    // Borrowed rows are added after the live overlays so they carry the target's
-    // current quality data, and before pricing so they get their own plane.
-    prefrontal_routing_core::score_alias::append_alias_rows(
+    let PricedSelection {
+        routing_config,
+        provenance,
+        entitlement_fences,
+    } = price_selection_inputs(
         &mut facts,
-        &operator_policy.score_alias,
-    );
-    if let Ok(credentials) = broca_credentials.lock() {
-        credentials.price_facts(&mut facts);
-    }
-    live_config.apply(&mut facts);
-    apply_provider_resets(
         &mut snapshot,
-        &facts,
+        quota_signal_json,
+        &SelectionPolicySources {
+            live_config: &live_config,
+            operator_config: &operator_config,
+            operator_config_path,
+            operator_policy: &operator_policy,
+        },
         store,
         broca_credentials,
-        &operator_config,
-        operator_config_path,
+        variant_policy::consumer_group(params.consumer),
         params.consumer,
-        None,
     )?;
-    // Credentials a provider refused permanently: automatic selection skips a
-    // route no other credential serves, and launches the rest on another one.
-    let entitlement_fences =
-        credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?;
-    credential_fences::apply(
-        &mut snapshot,
-        &facts,
-        &entitlement_fences,
-        broca_credentials,
-    );
     add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
 
     let policy_started = Instant::now();
@@ -6873,6 +6960,7 @@ fn handles(method: &str) -> bool {
             | account_selection::ACCOUNT_OBSERVE_OP
             | account_selection::ACCOUNT_RELEASE_OP
     ) || key_pool::handles(method)
+        || routing_v1::V1_ONLY_OPS.contains(&method)
 }
 
 /// Operations registered in HELLO and exposed by `--print-manifest`.
@@ -7050,6 +7138,20 @@ fn served_operations() -> Vec<ManagementOperation> {
                 "Release an unstarted admission or end a conversation lease".to_string(),
             ),
         },
+        // The ops only routing/v1 serves; its other three share the names above.
+        ManagementOperation {
+            name: cortexkit_role_routing::ops::ROLE_DESCRIBE.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "routing/v1: the role, its ops, the configured consumers and requirement fields"
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
+            name: cortexkit_role_routing::ops::ROUTE_REPORT.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("routing/v1: how running on a decision went".to_string()),
+        },
     ];
     operations.extend(pool_operations);
     operations
@@ -7088,7 +7190,8 @@ fn print_manifest_operations() -> Result<(), ModuleError> {
 /// schema and is the sole writer for its provider and route cooldown state.
 fn manifest(module_id: &str) -> ModuleManifest {
     // `ModuleManifest` is `#[non_exhaustive]`, so this module constructs it
-    // with the builder. This module declares no capabilities or self-signals.
+    // with the builder. It provides the routing/v1 capability and requires
+    // none.
     // Build provenance comes from the module's build script.
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
         .trust_tier(Some(TrustTier::FirstParty))
@@ -7106,6 +7209,12 @@ fn manifest(module_id: &str) -> ModuleManifest {
             },
         }))
         .protocol_ver(PROTOCOL_VERSION)
+        // The catalog finds the routing provider by this capability.
+        .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec![routing_v1::PROVIDES.to_string()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
         .provides(vec![ProviderRole::ManagementSurface {
             // Deliberate lane, not a default: routing serves concurrent
             // selection reads; Serial would put every route decision in

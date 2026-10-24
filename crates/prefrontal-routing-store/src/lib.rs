@@ -41,10 +41,12 @@ pub mod backup;
 mod key_pool;
 mod reasoning_catalog;
 mod retention;
+mod routing_v1;
 
 pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
 pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
 pub use retention::AffinityRetentionBatch;
+pub use routing_v1::{V1Decision, V1Recorded};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use account_selection::AccountServingCounts;
@@ -198,6 +200,11 @@ const MIGRATION_057: &str = include_str!("../migrations/057_prune_absent_fusifor
 const MIGRATION_058: &str = include_str!("../migrations/058_drop_history_foreign_keys.sql");
 const MIGRATION_059: &str = include_str!("../migrations/059_provider_reset_fences.sql");
 const MIGRATION_060: &str = include_str!("../migrations/060_credential_entitlement_fences.sql");
+// routing/v1 decision binding, affinity, report and admission idempotency.
+// Version 61 is left for a separately developed migration. The runner skips
+// every version at or below the highest one a store has applied, so version 61
+// must ship in the same binary as 62 or before it, never after.
+const MIGRATION_062: &str = include_str!("../migrations/062_routing_v1.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -253,7 +260,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 60] {
+fn route_state_migrations() -> [Migration; 61] {
     [
         Migration {
             version: 1,
@@ -494,6 +501,10 @@ fn route_state_migrations() -> [Migration; 60] {
         Migration {
             version: 60,
             statements: MIGRATION_060,
+        },
+        Migration {
+            version: 62,
+            statements: MIGRATION_062,
         },
     ]
 }
@@ -5960,7 +5971,7 @@ mod tests {
         migrated
             .store
             .with_conn(|c| {
-                assert_eq!(route_state_version(c)?, 60);
+                assert_eq!(route_state_version(c)?, 62);
                 assert_eq!(
                     history_foreign_keys(c),
                     ["account_admission -> account_pin"]

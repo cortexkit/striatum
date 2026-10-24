@@ -96,6 +96,7 @@
         },
         "panels": {},
         "pins": {},
+        "project_pins": {},
         "providers_without_prompt_cache": [
           "ollama-cloud"
         ],
@@ -139,6 +140,18 @@
           "format": "uint64",
           "default": null,
           "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConsumerPolicy": {
+      "description": "One `routing/v1` consumer's policy (`model_routing.consumers.<id>`).",
+      "type": "object",
+      "properties": {
+        "priced_only": {
+          "description": "Answer this consumer only with routes priced per token, never with a\nroute paid from subscription quota.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
@@ -404,6 +417,16 @@
           "default": null,
           "minimum": 1
         },
+        "consumers": {
+          "description": "The `routing/v1` consumer ids `route.select` answers, each with its\npolicy. Absent: mason, sidekick, athena, lab and core; codemode and flow\n(priced per token only); and Magic Context's mc_summary and mc_dream.\nPresent: exactly these.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/ConsumerPolicy"
+          }
+        },
         "demand_exponent": {
           "description": "Power-curve exponent mapping caller IQ demand to the request frontier.",
           "type": [
@@ -484,6 +507,17 @@
           "$ref": "#/$defs/Pins",
           "default": {}
         },
+        "project_pins": {
+          "description": "Operator pins per project, `{<project id>: {<consumer>:\n\"provider/model[:variant]\"}}`. A `routing/v1` select on a route bound to\nthat project, for that consumer, that names no pin of its own runs on\nthe pinned model when it can be served, and is routed as usual when not.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "default": {}
+        },
         "providers_without_prompt_cache": {
           "description": "Providers that do not expose prompt-cache reads or writes. Gather seats\navoid these providers when a cache-capable adequate route exists.",
           "type": "array",
@@ -492,6 +526,16 @@
           ],
           "items": {
             "type": "string"
+          }
+        },
+        "runners": {
+          "description": "The runner modules `routing/v1` answers with, in preference order.\nAbsent: Broca alone, on the routes its credentials serve.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RunnerPolicy"
           }
         },
         "score_alias": {
@@ -811,6 +855,39 @@
         "iq",
         "eq",
         "cost"
+      ]
+    },
+    "RunnerPolicy": {
+      "description": "A runner module `routing/v1` answers with (`model_routing.runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",
+      "type": "object",
+      "properties": {
+        "module": {
+          "description": "The runner's module id. Only a route principal the daemon verified as\nthis module may call the runner operations.",
+          "type": "string",
+          "pattern": "^\\S+$"
+        },
+        "routes": {
+          "description": "The routes it runs, in the exclusion grammar (`provider`,\n`provider/model`, `provider/model/variant`). Absent: every route it\nserves; for `broca`, the routes Broca's credentials serve, and for any\nother module every catalog route.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "tool_capabilities": {
+          "description": "Tool capability tags (such as `code.read/v1`) the runner can reach a\ntool provider for. A select that lists tool capabilities is answered\nonly on a runner reaching every one of them.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "module"
       ]
     },
     "SubstrateGroups": {

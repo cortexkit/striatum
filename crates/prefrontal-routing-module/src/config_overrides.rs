@@ -2,14 +2,17 @@
 //! Each selection overlays one complete snapshot onto catalog facts; reloads
 //! never rewrite the catalog or replace an in-flight request's configuration.
 
-use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::config_policy::{ExcludeGroups, PanelPolicies, Pins, VariantGroups};
+use crate::config_policy::{
+    default_runners, ConsumerPolicy, ExcludeGroups, PanelPolicies, Pins, RunnerPolicy,
+    VariantGroups, DEFAULT_CONSUMERS,
+};
 use crate::substrate_policy::SubstrateGroups;
 use prefrontal_routing_core::model_facts::{
     Confidence, ModelFact, ModelScores, RoutePricing, ScoreProvenance,
@@ -412,6 +415,7 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
     section.panels.validate()?;
     section.pins.validate()?;
     section.variants.validate()?;
+    validate_v1_policy(section)?;
     for (provider, value) in &section.subscription_multipliers {
         if provider.trim().is_empty() || !value.is_finite() || *value <= 0.0 {
             return Err(format!("invalid subscription_multiplier for {provider}"));
@@ -453,6 +457,74 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
                 .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 2.0)
         {
             return Err(format!("invalid cost/speed override for {key}"));
+        }
+    }
+    Ok(())
+}
+
+/// Shape checks for the `routing/v1` sections: consumer ids and runner modules
+/// are single words, runner routes use the exclusion grammar without negation,
+/// and every project pin names a configured consumer and a
+/// `provider/model[:variant]` pin.
+fn validate_v1_policy(section: &ModelRoutingSection) -> Result<(), String> {
+    let is_word = |text: &str| !text.is_empty() && !text.chars().any(char::is_whitespace);
+    if let Some(consumers) = &section.consumers {
+        if let Some(id) = consumers.keys().find(|id| !is_word(id)) {
+            return Err(format!(
+                "model_routing.consumers: consumer id {id:?} must be one non-empty word"
+            ));
+        }
+    }
+    if let Some(runners) = &section.runners {
+        let mut seen = std::collections::HashSet::new();
+        for runner in runners {
+            if !is_word(&runner.module) || !seen.insert(runner.module.as_str()) {
+                return Err(format!(
+                    "model_routing.runners: module {:?} must be one non-empty word, listed once",
+                    runner.module
+                ));
+            }
+            for spec in runner.routes.iter().flatten() {
+                let parsed = prefrontal_routing_core::provider_model_spec::parse_spec(spec);
+                if spec.trim() != spec || parsed.is_none_or(|parsed| parsed.negated) {
+                    return Err(format!(
+                        "model_routing.runners.{}: route {spec:?} must be provider, provider/model or provider/model/variant",
+                        runner.module
+                    ));
+                }
+            }
+            if let Some(tag) = runner.tool_capabilities.iter().find(|tag| !is_word(tag)) {
+                return Err(format!(
+                    "model_routing.runners.{}: tool capability {tag:?} must be one non-empty word",
+                    runner.module
+                ));
+            }
+        }
+    }
+    let consumers: Vec<String> = match &section.consumers {
+        Some(consumers) => consumers.keys().cloned().collect(),
+        None => DEFAULT_CONSUMERS
+            .iter()
+            .map(|(id, _)| (*id).to_owned())
+            .collect(),
+    };
+    for (project, pins) in &section.project_pins {
+        if !is_word(project) {
+            return Err(format!(
+                "model_routing.project_pins: project id {project:?} must be one non-empty word"
+            ));
+        }
+        for (consumer, pin) in pins {
+            if !consumers.contains(consumer) {
+                return Err(format!(
+                    "model_routing.project_pins.{project}: {consumer:?} is not a configured consumer"
+                ));
+            }
+            if !is_word(pin) || cortexkit_role_routing::select::RouteRef::parse_pin(pin).is_none() {
+                return Err(format!(
+                    "model_routing.project_pins.{project}.{consumer}: pin {pin:?} must be provider/model[:variant]"
+                ));
+            }
         }
     }
     Ok(())
@@ -508,6 +580,50 @@ impl LiveConfig {
 
     pub fn account_flags(&self) -> AccountSelectionFlags {
         self.config.account_selection
+    }
+
+    /// The `routing/v1` consumers, `(id, policy)`, in id order.
+    pub fn v1_consumers(&self) -> Vec<(String, ConsumerPolicy)> {
+        match &self.config.model_routing.consumers {
+            Some(consumers) => consumers
+                .iter()
+                .map(|(id, policy)| (id.clone(), policy.clone()))
+                .collect(),
+            None => {
+                let mut defaults: Vec<(String, ConsumerPolicy)> = DEFAULT_CONSUMERS
+                    .iter()
+                    .map(|(id, priced_only)| {
+                        (
+                            (*id).to_owned(),
+                            ConsumerPolicy {
+                                priced_only: *priced_only,
+                            },
+                        )
+                    })
+                    .collect();
+                defaults.sort_by(|left, right| left.0.cmp(&right.0));
+                defaults
+            }
+        }
+    }
+
+    /// The `routing/v1` runners, in preference order.
+    pub fn v1_runners(&self) -> Vec<RunnerPolicy> {
+        self.config
+            .model_routing
+            .runners
+            .clone()
+            .unwrap_or_else(default_runners)
+    }
+
+    /// The operator's pin for `consumer` within `project_id`, if any.
+    pub fn project_pin(&self, project_id: &str, consumer: &str) -> Option<&str> {
+        self.config
+            .model_routing
+            .project_pins
+            .get(project_id)?
+            .get(consumer)
+            .map(String::as_str)
     }
 
     pub fn failure_backoff(&self) -> FailureBackoffConfig {
@@ -929,6 +1045,22 @@ struct ModelRoutingSection {
     /// long-lived head agents may spend that reserved share.
     #[serde(default)]
     keep_free_percent: HashMap<String, f64>,
+    /// The `routing/v1` consumer ids `route.select` answers, each with its
+    /// policy. Absent: mason, sidekick, athena, lab and core; codemode and flow
+    /// (priced per token only); and Magic Context's mc_summary and mc_dream.
+    /// Present: exactly these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consumers: Option<BTreeMap<String, ConsumerPolicy>>,
+    /// The runner modules `routing/v1` answers with, in preference order.
+    /// Absent: Broca alone, on the routes its credentials serve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runners: Option<Vec<RunnerPolicy>>,
+    /// Operator pins per project, `{<project id>: {<consumer>:
+    /// "provider/model[:variant]"}}`. A `routing/v1` select on a route bound to
+    /// that project, for that consumer, that names no pin of its own runs on
+    /// the pinned model when it can be served, and is routed as usual when not.
+    #[serde(default)]
+    project_pins: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 fn routing_schema_constraints(schema: &mut schemars::Schema) {
