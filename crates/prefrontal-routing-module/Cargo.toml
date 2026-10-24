@@ -21,7 +21,7 @@ cortexkit-bus-naming = "=0.2.7"
 cortexkit-bus-nats = "0.3.0"
 cortexkit-bus-trait = "0.3.0"
 # The routing/v1 role contract: wire shapes and validators for the v1 ops.
-cortexkit-role-routing = "0.1.0"
+cortexkit-role-routing = "0.2.0"
 subc-client-rs = { workspace = true }
 cortexkit-claustrum-client = { workspace = true }
 prefrontal-routing-core = { path = "../prefrontal-routing-core" }
@@ -43,7 +43,7 @@ reqwest = { workspace = true }
 [dev-dependencies]
 cortexkit-bus-inmemory = "0.3.0"
 # Drives this module through every routing/v1 contract rule.
-cortexkit-role-routing-conformance = "0.1.0"
+cortexkit-role-routing-conformance = "0.3.0"
 prefrontal-routing-store = { path = "../prefrontal-routing-store", features = ["test-support"] }
 prefrontal-test-support = { path = "../prefrontal-test-support" }
 rusqlite = { version = "0.32", features = ["bundled"] }
