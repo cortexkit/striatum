@@ -3899,7 +3899,7 @@ async fn handle_select_request(
     };
     let admission_facts = broca_credentials.lock().map_or_else(
         |_| facts.clone(),
-        |credentials| credentials.admission_facts(&facts, now_ms()),
+        |credentials| credentials.admission_facts(&facts, params.consumer, now_ms()),
     );
     mapped_availability
         .rejected

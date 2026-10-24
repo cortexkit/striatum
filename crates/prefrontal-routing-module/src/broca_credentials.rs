@@ -331,10 +331,17 @@ impl BrocaCredentials {
         self.providers.clone()
     }
 
-    /// Admission learns payment methods from active provider mappings without
-    /// changing the catalog login allowlists used for availability and billing.
-    pub(crate) fn admission_facts(&self, facts: &[ModelFact], now_ms: u64) -> Vec<ModelFact> {
-        if self.fallback_reason(now_ms).is_some() {
+    /// Only metered consumers learn vault payment methods in admission-only
+    /// copies. Other consumers keep the catalog facts, as do availability and billing.
+    pub(crate) fn admission_facts(
+        &self,
+        facts: &[ModelFact],
+        consumer: Option<crate::select_policy::Consumer>,
+        now_ms: u64,
+    ) -> Vec<ModelFact> {
+        if !crate::select_policy::requires_metered(consumer)
+            || self.fallback_reason(now_ms).is_some()
+        {
             return facts.to_vec();
         }
         let mut methods_by_provider: std::collections::HashMap<_, BTreeSet<_>> =
@@ -712,7 +719,7 @@ mod tests {
         consumer: crate::select_policy::Consumer,
     ) -> std::collections::HashMap<String, String> {
         crate::select_policy::candidate_rejections(
-            &cache.admission_facts(facts, 1),
+            &cache.admission_facts(facts, Some(consumer), 1),
             Some(consumer),
             None,
             cache.subscription_plan_providers().as_ref(),
@@ -721,6 +728,7 @@ mod tests {
 
     #[test]
     fn active_apikey_mapping_admits_metered_routes_without_changing_catalog_policy() {
+        let consumer = Some(crate::select_policy::Consumer::Codemode);
         let mut row = credential("oauth:misleading", &["mapped"]);
         row.credential_type = "apikey".into();
         let mut cache = BrocaCredentials::default();
@@ -735,7 +743,7 @@ mod tests {
         ] {
             assert!(admission_refusals(&cache, &facts, consumer).is_empty());
         }
-        let enriched = cache.admission_facts(&facts, 1);
+        let enriched = cache.admission_facts(&facts, consumer, 1);
         assert_eq!(enriched[0].auth_methods, Some(vec!["apikey".into()]));
         assert_eq!(
             enriched[1].auth_methods,
@@ -747,8 +755,11 @@ mod tests {
             .served_routes(&facts, 1)
             .0
             .contains(&"mapped/other".into()));
-        assert_eq!(cache.admission_facts(&enriched, 1), enriched);
-        assert_eq!(cache.admission_facts(&facts, MAX_AGE_MS + 2), facts);
+        assert_eq!(cache.admission_facts(&enriched, consumer, 1), enriched);
+        assert_eq!(
+            cache.admission_facts(&facts, consumer, MAX_AGE_MS + 2),
+            facts
+        );
         cache.apply_listing(
             &ScopedCredentialListing {
                 view: "removed".into(),
@@ -756,7 +767,7 @@ mod tests {
             },
             2,
         );
-        assert_eq!(cache.admission_facts(&facts, 2), facts);
+        assert_eq!(cache.admission_facts(&facts, consumer, 2), facts);
     }
 
     #[test]
@@ -788,6 +799,7 @@ mod tests {
 
     #[test]
     fn inactive_unmapped_and_unknown_credentials_do_not_supply_apikey_auth() {
+        let consumer = Some(crate::select_policy::Consumer::Codemode);
         let mut inactive = credential("apikey:inactive", &["mapped"]);
         inactive.credential_type = "apikey".into();
         inactive.state = "dead".into();
@@ -804,7 +816,10 @@ mod tests {
         );
         cache.publish_plan_prices(&json!({"prices": []}));
         let facts = [metered_fact()];
-        assert_eq!(cache.admission_facts(&facts, 1)[0].auth_methods, None);
+        assert_eq!(
+            cache.admission_facts(&facts, consumer, 1)[0].auth_methods,
+            None
+        );
         assert!(
             admission_refusals(&cache, &facts, crate::select_policy::Consumer::Codemode)
                 .contains_key("mapped/metered")
@@ -816,7 +831,52 @@ mod tests {
             },
             2,
         );
-        assert_eq!(cache.admission_facts(&facts, 2)[0].auth_methods, None);
+        assert_eq!(
+            cache.admission_facts(&facts, consumer, 2)[0].auth_methods,
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_consumers_keep_catalog_admission_facts_with_or_without_vault_apikeys() {
+        use crate::select_policy::{candidate_rejections, Consumer};
+        let mut facts = vec![metered_fact(), metered_fact(), metered_fact()];
+        for (fact, provider) in facts
+            .iter_mut()
+            .zip(["openai", "openrouter", "fireworks-ai"])
+        {
+            fact.provider_id = provider.into();
+            fact.billing_plane.as_mut().unwrap().provider_id = provider.into();
+        }
+        facts[1].auth_methods = Some(vec!["oauth".into()]);
+        facts[2].auth_methods = Some(vec![]);
+        let mut row = credential("opaque", &["openai", "openrouter", "fireworks-ai"]);
+        row.credential_type = "apikey".into();
+        let mut cache = BrocaCredentials::default();
+        cache.apply_listing(&listing(vec![row]), 1);
+        let absent = BrocaCredentials::default();
+        let plans = HashSet::new();
+        let allowed_providers = ["openai".into()];
+        for consumer in [
+            Some(Consumer::Mason),
+            Some(Consumer::Sidekick),
+            Some(Consumer::Athena),
+            Some(Consumer::Core),
+            Some(Consumer::Lab),
+            None,
+        ] {
+            let with_vault = cache.admission_facts(&facts, consumer, 1);
+            let without_vault = absent.admission_facts(&facts, consumer, 1);
+            assert_eq!(with_vault, facts, "{consumer:?}");
+            assert_eq!(with_vault, without_vault, "{consumer:?}");
+            for allowed in [None, Some(allowed_providers.as_slice())] {
+                assert_eq!(
+                    candidate_rejections(&with_vault, consumer, allowed, Some(&plans)),
+                    candidate_rejections(&without_vault, consumer, allowed, Some(&plans)),
+                    "{consumer:?}"
+                );
+            }
+        }
     }
 
     #[test]
