@@ -314,6 +314,9 @@ pub struct SelectedRouteScore {
     pub selection_cost: f64,
     pub metrics: BTreeMap<ModelMetric, MetricFit>,
     pub objective: ObjectiveBreakdown,
+    /// Other routes that cleared the quality gate, in this decision's ranking order.
+    /// Persist even an empty list so old, unrecorded shortlists remain distinguishable.
+    pub also_adequate: Vec<String>,
     /// The unit the whole selection was priced in.
     pub pricing_mode: PricingMode,
     /// Why the selection priced output-only, when it did.
@@ -1925,6 +1928,27 @@ pub fn select_model_route_with_availability(
             selection_cost: winner.objective.selection_cost,
             metrics: winner_admissible.adequacy.metrics.clone(),
             objective: winner.objective.clone(),
+            also_adequate: scored
+                .iter()
+                .filter(|candidate| candidate.idx != winner.idx)
+                .map(|candidate| &admissible[candidate.idx])
+                .filter(|candidate| candidate.adequacy.clears_adequacy_floor())
+                .take(4)
+                .map(|candidate| {
+                    let fact = &candidate.route.fact;
+                    let model = format!("{}/{}", fact.provider_id, fact.model_id);
+                    match fact
+                        .prompt_defaults
+                        .as_ref()
+                        .and_then(|defaults| defaults.variant.as_deref())
+                        .or(fact.variant.as_deref())
+                        .filter(|variant| !variant.is_empty())
+                    {
+                        Some(variant) => format!("{model}:{variant}"),
+                        None => model,
+                    }
+                })
+                .collect(),
             pricing_mode: if use_basket {
                 PricingMode::Basket
             } else {

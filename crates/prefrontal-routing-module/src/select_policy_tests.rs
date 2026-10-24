@@ -1,6 +1,26 @@
 mod consumer_and_pin {
     use super::*;
 
+    #[tokio::test]
+    async fn decision_stores_adequate_alternatives_in_rank_order_without_winner() {
+        let rig = PolicyRig::new(json!({}));
+        for (model, cost) in [("a", 1.0), ("b", 10.0), ("c", 100.0), ("d", 1_000.0), ("e", 10_000.0), ("f", 100_000.0)] {
+            let mut candidate = fact("rank", model);
+            candidate.cost_per_m_tok_out = Some(cost);
+            rig.store.upsert_fact(&candidate, FactSource::Override).unwrap();
+            rig.set_auth_methods("rank", model, Some(vec!["apikey".into()]));
+        }
+        let mut params = rig.params();
+        params["availableModels"] = json!(["rank/f", "rank/d", "rank/b", "rank/a", "rank/e", "rank/c"]);
+        params["sendID"] = json!("adequate-shortlist");
+        let reply = rig.select(params).await;
+        assert_eq!(reply["result"]["selected"]["routeKey"], "rank/a", "{reply}");
+        let row = rig.store.get_decision_by_send_id("adequate-shortlist").unwrap().unwrap();
+        assert_eq!(row.selected_route_key.as_deref(), Some("rank/a"));
+        let score: serde_json::Value = serde_json::from_str(&row.score_json).unwrap();
+        assert_eq!(score["alsoAdequate"], json!(["rank/b", "rank/c", "rank/d", "rank/e"]));
+    }
+
     struct PolicyRig {
         _rig: Rig,
         store: SharedStore,
