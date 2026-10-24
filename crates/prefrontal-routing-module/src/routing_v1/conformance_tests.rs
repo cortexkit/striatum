@@ -146,6 +146,12 @@ impl Harness {
             Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(facts)));
     }
 
+    /// Serve requests with `credentials` as Broca's credential and billing
+    /// view.
+    pub(super) fn set_credentials(&self, credentials: BrocaCredentials) {
+        *self.broca_credentials.lock().unwrap() = Arc::new(Mutex::new(credentials));
+    }
+
     /// Bind a new route as `principal`, scoped to `project_id` when given,
     /// with the control frame the daemon sends.
     pub(super) async fn bind(
@@ -466,17 +472,27 @@ impl RoutingSubject for KitSubject {
     }
 
     async fn configure_consumers(&self, consumers: &[ConsumerConfig]) -> Result<(), String> {
-        let consumers: serde_json::Map<String, Value> = consumers
+        // Routing configures consumer ids only: whether a consumer runs
+        // priced per token is the rule of the request class its id names.
+        // A kit consumer whose priced_only that rule does not give cannot be
+        // configured.
+        for consumer in consumers {
+            let routing = crate::select_policy::requires_metered(
+                crate::select_policy::Consumer::from_id(&consumer.id),
+            );
+            if routing != consumer.priced_only {
+                return Err(format!(
+                    "consumer {} is priced_only {routing} in routing, the kit asks {}",
+                    consumer.id, consumer.priced_only
+                ));
+            }
+        }
+        let ids: Vec<&str> = consumers
             .iter()
-            .map(|consumer| {
-                (
-                    consumer.id.clone(),
-                    json!({ "priced_only": consumer.priced_only }),
-                )
-            })
+            .map(|consumer| consumer.id.as_str())
             .collect();
         self.harness().edit_config(|config| {
-            config["model_routing"]["consumers"] = Value::Object(consumers);
+            config["model_routing"]["consumers"] = json!(ids);
         });
         Ok(())
     }

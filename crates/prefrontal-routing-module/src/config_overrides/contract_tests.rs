@@ -934,6 +934,8 @@ fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
         "athena",
         "lab",
         "core",
+        "codemode",
+        "flow",
         "sidekick.explore",
         "sidekick.librarian",
         "sidekick.gather",
@@ -968,34 +970,27 @@ fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
 #[test]
 fn routing_v1_consumers_default_to_the_built_in_list_and_a_listing_replaces_it() {
     let defaults = LiveConfig::default().v1_consumers();
-    let ids: Vec<&str> = defaults.iter().map(|(id, _)| id.as_str()).collect();
-    for id in [
-        "mason",
-        "sidekick",
+    let mut expected = vec![
         "athena",
-        "lab",
-        "core",
         "codemode",
+        "core",
         "flow",
-        "mc_summary",
+        "lab",
+        "mason",
         "mc_dream",
-    ] {
-        assert!(ids.contains(&id), "{id} is a default consumer");
-    }
-    let priced_only: Vec<&str> = defaults
-        .iter()
-        .filter(|(_, policy)| policy.priced_only)
-        .map(|(id, _)| id.as_str())
-        .collect();
-    assert_eq!(priced_only, ["codemode", "flow"]);
+        "mc_summary",
+        "sidekick",
+    ];
+    expected.sort();
+    assert_eq!(defaults, expected);
 
     let mut rig = Rig::new();
-    rig.write(r#"{"model_routing":{"consumers":{"summary":{"priced_only":true}}}}"#);
+    rig.write(r#"{"model_routing":{"consumers":["summary","codemode"]}}"#);
     initialize_config(&rig.path).unwrap();
-    let configured = live_config(&rig.path).v1_consumers();
-    assert_eq!(configured.len(), 1);
-    assert_eq!(configured[0].0, "summary");
-    assert!(configured[0].1.priced_only);
+    assert_eq!(
+        live_config(&rig.path).v1_consumers(),
+        ["codemode", "summary"]
+    );
 }
 
 #[test]
@@ -1021,8 +1016,12 @@ fn routing_v1_runners_default_to_broca_and_exclusions_follow_the_consumer_group(
 fn routing_v1_sections_refuse_malformed_entries_by_path() {
     for (document, message) in [
         (
-            r#"{"model_routing":{"consumers":{"two words":{}}}}"#,
+            r#"{"model_routing":{"consumers":["two words"]}}"#,
             "model_routing.consumers",
+        ),
+        (
+            r#"{"model_routing":{"consumers":["a","a"]}}"#,
+            "listed once",
         ),
         (
             r#"{"model_routing":{"runners":[{"module":"r"},{"module":"r"}]}}"#,

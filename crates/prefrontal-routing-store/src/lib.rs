@@ -200,10 +200,8 @@ const MIGRATION_057: &str = include_str!("../migrations/057_prune_absent_fusifor
 const MIGRATION_058: &str = include_str!("../migrations/058_drop_history_foreign_keys.sql");
 const MIGRATION_059: &str = include_str!("../migrations/059_provider_reset_fences.sql");
 const MIGRATION_060: &str = include_str!("../migrations/060_credential_entitlement_fences.sql");
+const MIGRATION_061: &str = include_str!("../migrations/061_allowed_providers.sql");
 // routing/v1 decision binding, affinity, report and admission idempotency.
-// Version 61 is left for a separately developed migration. The runner skips
-// every version at or below the highest one a store has applied, so version 61
-// must ship in the same binary as 62 or before it, never after.
 const MIGRATION_062: &str = include_str!("../migrations/062_routing_v1.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
@@ -260,7 +258,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 61] {
+fn route_state_migrations() -> [Migration; 62] {
     [
         Migration {
             version: 1,
@@ -501,6 +499,10 @@ fn route_state_migrations() -> [Migration; 61] {
         Migration {
             version: 60,
             statements: MIGRATION_060,
+        },
+        Migration {
+            version: 61,
+            statements: MIGRATION_061,
         },
         Migration {
             version: 62,
@@ -891,6 +893,7 @@ pub struct ParentFailedDecision {
 /// recorded rather than reconstructing an explanation from today's catalog.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionExplainRow {
+    pub allowed_providers_json: Option<String>,
     pub id: String,
     pub decision_kind: String,
     pub task_id: Option<String>,
@@ -2137,8 +2140,8 @@ impl SqliteRouteStateStore {
                          target_agent, requirements_json, selected_route_key, selected_provider_id,
                          selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
                          quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at,
-                         selected_harness, selected_workload, consumer
-                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+                         selected_harness, selected_workload, consumer, allowed_providers_json
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
@@ -2164,6 +2167,7 @@ impl SqliteRouteStateStore {
                         selected_harness,
                         selected_workload,
                         input.consumer,
+                        input.allowed_providers_json,
                     ],
                 )?;
                 Ok(())
@@ -2186,7 +2190,7 @@ impl SqliteRouteStateStore {
                                 selected_provider_id, selected_model_id, selected_variant, score_json,
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
-                                outcome_error, selected_harness, selected_workload
+                                outcome_error, selected_harness, selected_workload, allowed_providers_json
                          FROM model_route_decisions
                          WHERE id=?1",
                         [decision_id],
@@ -2211,7 +2215,7 @@ impl SqliteRouteStateStore {
                                 selected_provider_id, selected_model_id, selected_variant, score_json,
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
-                                outcome_error, selected_harness, selected_workload
+                                outcome_error, selected_harness, selected_workload, allowed_providers_json
                          FROM model_route_decisions
                          WHERE send_id=?1
                          ORDER BY created_at DESC, id DESC
@@ -2418,6 +2422,7 @@ fn observed_route_key_for_fact(fact: &ModelFact) -> String {
 
 fn decision_explain_row(row: &Row<'_>) -> rusqlite::Result<DecisionExplainRow> {
     Ok(DecisionExplainRow {
+        allowed_providers_json: row.get(26)?,
         id: row.get(0)?,
         decision_kind: row.get(1)?,
         task_id: row.get(2)?,
@@ -3007,22 +3012,31 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 c.query_row(
                     "SELECT provider_key, cooldown_until, quota_exhausted_until, quota_pressure,
-                            wall_class
+                            wall_class, last_error
                      FROM provider_cooldown_state WHERE provider_key = ?1",
                     [&provider_key],
                     |row| {
-                        Ok(ProviderCooldownState {
+                        let state = ProviderCooldownState {
                             provider_key: row.get(0)?,
                             cooldown_until: row.get(1)?,
                             quota_exhausted_until: row.get(2)?,
                             quota_pressure: row.get(3)?,
                             wall_class: row_wall_class(row, 4)?,
-                        })
+                        };
+                        let last_error: Option<String> = row.get(5)?;
+                        Ok((state, last_error))
                     },
                 )
                 .optional()
             })
             .map_err(err)
+            .map(|row| {
+                // A provider row written from one credential's refusal (before
+                // such refusals were kept off the provider) is read as absent: it
+                // is evidence about that credential, which its fence covers.
+                row.filter(|(_, last_error)| !credential_refusal_wall(last_error.as_deref()))
+                    .map(|(state, _)| state)
+            })
     }
 
     fn record_provider_cooldown(
@@ -3077,7 +3091,11 @@ impl RouteStateStore for SqliteRouteStateStore {
                         },
                     )
                     .optional()?;
-                let existing = existing.unwrap_or_default();
+                // A stored row from one credential's refusal holds no provider
+                // wall, so a new provider-wide signal merges with nothing.
+                let existing = existing
+                    .filter(|state| !credential_refusal_wall(state.last_error.as_deref()))
+                    .unwrap_or_default();
                 let cooldown_until = max_defined(existing.cooldown_until, update.cooldown_until);
                 let quota_exhausted_until =
                     max_defined(existing.quota_exhausted_until, update.quota_exhausted_until);
@@ -3232,7 +3250,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                         },
                     )
                     .optional()?;
-                let ex = existing.unwrap_or_default();
+                let mut ex = existing.unwrap_or_default();
+                // The route's own wall from one credential's refusal keeps its
+                // evidence (last_error) but lends no horizon to this write.
+                if credential_refusal_wall(ex.last_error.as_deref()) {
+                    ex.cooldown_until = None;
+                    ex.quota_exhausted_until = None;
+                    ex.wall_class = None;
+                }
                 let provider = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
@@ -3252,6 +3277,13 @@ impl RouteStateStore for SqliteRouteStateStore {
                     )
                     .optional()?
                     .unwrap_or_default();
+                // A stored provider row from one credential's refusal is not
+                // inherited: that refusal never walled the provider.
+                let provider = if credential_refusal_wall(provider.last_error.as_deref()) {
+                    ExistingProviderState::default()
+                } else {
+                    provider
+                };
 
                 let cooldown_until = max_defined(
                     max_defined(ex.cooldown_until, provider.cooldown_until),
@@ -3342,10 +3374,18 @@ impl RouteStateStore for SqliteRouteStateStore {
         // scoped failure as neutral model-health evidence. This closes both the
         // route-global quota writer and the terminal-failure backoff writer. The
         // request-class provider reset below is independent of both.
+        // A permanent refusal of one credential is the same kind of evidence: the
+        // credential is fenced, and the refusal does not by itself block the
+        // route's other credentials.
         let mut normalized = update.clone();
-        if prefrontal_routing_core::account_wall::account_scoped_error(
-            update.last_error.as_deref().unwrap_or(""),
-        ) {
+        let last_error = update.last_error.as_deref().unwrap_or("");
+        if prefrontal_routing_core::account_wall::account_scoped_error(last_error)
+            || prefrontal_routing_core::account_wall::credential_refusal_in(last_error).is_some()
+            || update
+                .provider_outcome
+                .as_ref()
+                .is_some_and(|provider| provider.credential_refusal.is_some())
+        {
             normalized.outcome = prefrontal_routing_core::RouteOutcome::Interrupted;
         }
         let update = &normalized;
@@ -4149,6 +4189,15 @@ struct StateRow {
     success_ema: Option<f64>,
     failure_backoff_until: Option<f64>,
     failure_backoff_reason: Option<String>,
+}
+
+/// Whether a stored wall was written from a permanent refusal of one named
+/// credential. Such a wall is not provider or route evidence: the credential's
+/// fence covers it, so it neither blocks nor lends its horizon to a later write.
+fn credential_refusal_wall(last_error: Option<&str>) -> bool {
+    last_error.is_some_and(|error| {
+        prefrontal_routing_core::account_wall::credential_refusal_in(error).is_some()
+    })
 }
 
 /// `max` over two optional times, treating `None` as "no value" (the defined one

@@ -20,6 +20,8 @@ pub struct ExcludeGroups {
     pub athena: Vec<String>,
     pub lab: Vec<String>,
     pub core: Vec<String>,
+    pub codemode: Vec<String>,
+    pub flow: Vec<String>,
 }
 
 /// Per-consumer reasoning-variant overrides, grouped like `model_routing.exclude`.
@@ -35,11 +37,13 @@ pub struct VariantGroups {
     pub athena: BTreeMap<String, String>,
     pub lab: BTreeMap<String, String>,
     pub core: BTreeMap<String, String>,
+    pub codemode: BTreeMap<String, String>,
+    pub flow: BTreeMap<String, String>,
 }
 
 impl VariantGroups {
     /// Every group with its config name, `all` first.
-    pub fn named(&self) -> [(&'static str, &BTreeMap<String, String>); 6] {
+    pub fn named(&self) -> [(&'static str, &BTreeMap<String, String>); 8] {
         [
             ("all", &self.all),
             ("mason", &self.mason),
@@ -47,6 +51,8 @@ impl VariantGroups {
             ("athena", &self.athena),
             ("lab", &self.lab),
             ("core", &self.core),
+            ("codemode", &self.codemode),
+            ("flow", &self.flow),
         ]
     }
 
@@ -340,33 +346,12 @@ impl ExcludeGroups {
     }
 }
 
-/// One `routing/v1` consumer's policy (`model_routing.consumers.<id>`).
-#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct ConsumerPolicy {
-    /// Answer this consumer only with routes priced per token, never with a
-    /// route paid from subscription quota.
-    pub priced_only: bool,
-}
-
-/// The `routing/v1` consumers served when the routing file names none:
-/// `(id, priced_only)`. A consumer's exclusions are `model_routing.exclude.all`
-/// plus the `exclude` group of the same name when one exists.
-pub const DEFAULT_CONSUMERS: &[(&str, bool)] = &[
-    ("mason", false),
-    ("sidekick", false),
-    ("athena", false),
-    ("lab", false),
-    ("core", false),
-    // Codemode runs and flows pay per token: they are never answered with a
-    // route paid from subscription quota.
-    ("codemode", true),
-    ("flow", true),
-    // Magic Context owns these two consumers (its summary and dream work).
-    // They take the default policy: no exclusions beyond `exclude.all`.
-    ("mc_summary", false),
-    ("mc_dream", false),
-];
+/// The `routing/v1` consumers routing serves beyond the request classes
+/// [`crate::select_policy::Consumer`] already names (mason, sidekick, athena,
+/// lab, core, codemode, flow). Magic Context owns these two (its summary and
+/// dream work); they take the default policy: no exclusions beyond
+/// `exclude.all`, and any route, priced per token or not.
+pub const MAGIC_CONTEXT_CONSUMERS: &[&str] = &["mc_summary", "mc_dream"];
 
 /// A runner module `routing/v1` answers with (`model_routing.runners[]`).
 /// Listed in preference order: the first listed runner that can serve the

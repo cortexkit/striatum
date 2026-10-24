@@ -45,12 +45,12 @@ fn the_older_shapes_are_recognised_by_their_marker_alone() {
 /// A harness with the kit's consumers and catalog, and a consumer route.
 async fn configured() -> (std::sync::Arc<Harness>, Route) {
     let harness = Harness::new("dispatch");
-    let consumers: serde_json::Map<String, Value> = fixture::consumers()
+    let consumers: Vec<String> = fixture::consumers()
         .into_iter()
-        .map(|consumer| (consumer.id, json!({ "priced_only": consumer.priced_only })))
+        .map(|consumer| consumer.id)
         .collect();
     harness.edit_config(|config| {
-        config["model_routing"]["consumers"] = Value::Object(consumers);
+        config["model_routing"]["consumers"] = json!(consumers);
     });
     install_catalog(&harness, &fixture::catalog());
     let route = harness.bind(reserved(fixture::CONSUMER), None).await;

@@ -93,13 +93,9 @@ pub(super) async fn select(
     let live_config = config_overrides::live_config(deps.routing_config_path);
     let operator_config = operator_config(deps);
     let consumer = request.consumer.clone();
-    let Some((_, consumer_policy)) = operator_config
-        .v1_consumers()
-        .into_iter()
-        .find(|(id, _)| *id == consumer)
-    else {
+    if !operator_config.v1_consumers().contains(&consumer) {
         return Err(Refusal::unknown_consumer(consumer));
-    };
+    }
     if !crate::broca_credentials::wait_for_billing_catalog(deps.broca_credentials, BILLING_WAIT)
         .await
     {
@@ -110,10 +106,11 @@ pub(super) async fn select(
     }
 
     let operator_policy = operator_config.operator_policy();
-    // The older consumer groups (mason, sidekick, ...) keep their variant and
-    // provider-reset policy; any other consumer reads only the `all` groups.
-    let legacy_consumer: Option<select_policy::Consumer> =
-        serde_json::from_value(json!(consumer)).ok();
+    // A consumer id that names a request class (mason, ..., codemode, flow)
+    // takes that class's policy: its variants, provider resets and, for
+    // codemode and flow, the priced-per-token rule. Any other consumer reads
+    // only the `all` groups.
+    let legacy_consumer = select_policy::Consumer::from_id(&consumer);
     let crate::PreparedSelectionInputs {
         now,
         mut facts,
@@ -232,16 +229,20 @@ pub(super) async fn select(
     .subscription_keys
     .into_iter()
     .collect();
-    let covered = |route: &ModelRoute| {
-        subscription_keys.contains(&route.route_key)
-            || subscription_keys.contains(&route.capacity_key)
-    };
     let available: HashSet<String> = capable
         .iter()
-        .map(|fact| fact_to_route(fact))
-        .filter(|route| !(consumer_policy.priced_only && covered(route)))
-        .map(|route| route.route_key)
+        .map(|fact| fact_to_route(fact).route_key)
         .collect();
+    // The route-local refusals every selection applies before scoring, pins
+    // included: codemode and flow run only on routes priced per token, never
+    // on a provider that publishes a subscription plan. A v1 request names no
+    // provider allow-list, so that filter admits every provider here.
+    let rejections = select_policy::candidate_rejections(
+        &facts,
+        legacy_consumer,
+        None,
+        priced.subscription_plan_providers.as_ref(),
+    );
 
     let demand = ModelRequirements {
         iq: f64::from(requirements.iq),
@@ -278,6 +279,7 @@ pub(super) async fn select(
         operator_exclude: &operator_policy.exclude,
         consumer_exclude: &consumer_exclude,
         subscription_keys: &subscription_keys,
+        rejections: &rejections,
         routing_config: &priced.routing_config,
         slots: slots.as_ref(),
         min_band: live_config.min_band(),
@@ -460,6 +462,8 @@ struct Selection<'a> {
     operator_exclude: &'a [String],
     consumer_exclude: &'a [String],
     subscription_keys: &'a HashSet<String>,
+    /// Route-local refusals, by route key ([`select_policy::candidate_rejections`]).
+    rejections: &'a HashMap<String, String>,
     routing_config: &'a RoutingConfig,
     slots: Option<&'a ConcurrencySlots>,
     min_band: Option<f64>,
@@ -477,6 +481,7 @@ impl<'a> Selection<'a> {
         snapshot: ModelRouteStateSnapshot,
     ) -> SelectModelRouteInput<'a> {
         let subscription_keys = self.subscription_keys.clone();
+        let consumer = self.legacy_consumer;
         SelectModelRouteInput {
             target_agent: self.consumer.to_owned(),
             requirements: self.demand,
@@ -487,8 +492,7 @@ impl<'a> Selection<'a> {
             operator_exclude_keys: self.operator_exclude.to_vec(),
             required_capabilities: self.required_capabilities,
             is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                subscription_keys.contains(&route.route_key)
-                    || subscription_keys.contains(&route.capacity_key)
+                select_policy::subscription_covered(consumer, &subscription_keys, route)
             })),
             min_best_effort_adequacy: self.min_band,
             prefer_prompt_cache: false,
@@ -509,8 +513,9 @@ impl<'a> Selection<'a> {
             self.routing_config,
             self.slots,
             self.consumer_exclude,
-            &HashMap::new(),
+            self.rejections,
         )
+        .map_err(select_policy::describe_filter_refusal)
     }
 
     /// A named model, through the same pin admission a work run's `model=`
@@ -566,7 +571,7 @@ impl<'a> Selection<'a> {
             self.slots,
             catalog.as_ref(),
             self.sources.operator_config.score_aliases(),
-            &HashMap::new(),
+            self.rejections,
         )
         .map_err(|refusal| refused(&refusal.code))?;
         let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();

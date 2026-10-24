@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config_policy::{
-    default_runners, ConsumerPolicy, ExcludeGroups, PanelPolicies, Pins, RunnerPolicy,
-    VariantGroups, DEFAULT_CONSUMERS,
+    default_runners, ExcludeGroups, PanelPolicies, Pins, RunnerPolicy, VariantGroups,
+    MAGIC_CONTEXT_CONSUMERS,
 };
 use crate::substrate_policy::SubstrateGroups;
 use prefrontal_routing_core::model_facts::{
@@ -469,10 +469,14 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
 fn validate_v1_policy(section: &ModelRoutingSection) -> Result<(), String> {
     let is_word = |text: &str| !text.is_empty() && !text.chars().any(char::is_whitespace);
     if let Some(consumers) = &section.consumers {
-        if let Some(id) = consumers.keys().find(|id| !is_word(id)) {
+        if let Some(id) = consumers.iter().find(|id| !is_word(id)) {
             return Err(format!(
                 "model_routing.consumers: consumer id {id:?} must be one non-empty word"
             ));
+        }
+        let distinct: std::collections::HashSet<&String> = consumers.iter().collect();
+        if distinct.len() != consumers.len() {
+            return Err("model_routing.consumers: each consumer id is listed once".into());
         }
     }
     if let Some(runners) = &section.runners {
@@ -501,13 +505,7 @@ fn validate_v1_policy(section: &ModelRoutingSection) -> Result<(), String> {
             }
         }
     }
-    let consumers: Vec<String> = match &section.consumers {
-        Some(consumers) => consumers.keys().cloned().collect(),
-        None => DEFAULT_CONSUMERS
-            .iter()
-            .map(|(id, _)| (*id).to_owned())
-            .collect(),
-    };
+    let consumers = v1_consumer_ids(section);
     for (project, pins) in &section.project_pins {
         if !is_word(project) {
             return Err(format!(
@@ -528,6 +526,21 @@ fn validate_v1_policy(section: &ModelRoutingSection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The `routing/v1` consumer ids a routing section serves, in id order.
+fn v1_consumer_ids(section: &ModelRoutingSection) -> Vec<String> {
+    let mut ids: Vec<String> = match &section.consumers {
+        Some(consumers) => consumers.clone(),
+        None => crate::select_policy::Consumer::ALL
+            .into_iter()
+            .filter_map(|consumer| crate::variant_policy::consumer_group(Some(consumer)))
+            .chain(MAGIC_CONTEXT_CONSUMERS.iter().copied())
+            .map(str::to_owned)
+            .collect(),
+    };
+    ids.sort();
+    ids
 }
 
 impl LiveConfig {
@@ -582,29 +595,9 @@ impl LiveConfig {
         self.config.account_selection
     }
 
-    /// The `routing/v1` consumers, `(id, policy)`, in id order.
-    pub fn v1_consumers(&self) -> Vec<(String, ConsumerPolicy)> {
-        match &self.config.model_routing.consumers {
-            Some(consumers) => consumers
-                .iter()
-                .map(|(id, policy)| (id.clone(), policy.clone()))
-                .collect(),
-            None => {
-                let mut defaults: Vec<(String, ConsumerPolicy)> = DEFAULT_CONSUMERS
-                    .iter()
-                    .map(|(id, priced_only)| {
-                        (
-                            (*id).to_owned(),
-                            ConsumerPolicy {
-                                priced_only: *priced_only,
-                            },
-                        )
-                    })
-                    .collect();
-                defaults.sort_by(|left, right| left.0.cmp(&right.0));
-                defaults
-            }
-        }
+    /// The `routing/v1` consumer ids, in id order.
+    pub fn v1_consumers(&self) -> Vec<String> {
+        v1_consumer_ids(&self.config.model_routing)
     }
 
     /// The `routing/v1` runners, in preference order.
@@ -1045,12 +1038,12 @@ struct ModelRoutingSection {
     /// long-lived head agents may spend that reserved share.
     #[serde(default)]
     keep_free_percent: HashMap<String, f64>,
-    /// The `routing/v1` consumer ids `route.select` answers, each with its
-    /// policy. Absent: mason, sidekick, athena, lab and core; codemode and flow
-    /// (priced per token only); and Magic Context's mc_summary and mc_dream.
-    /// Present: exactly these.
+    /// The `routing/v1` consumer ids `route.select` answers. Absent: every
+    /// request class (mason, sidekick, athena, lab, core, codemode, flow) and
+    /// Magic Context's mc_summary and mc_dream. Present: exactly these.
+    /// Codemode and flow are answered only with routes priced per token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    consumers: Option<BTreeMap<String, ConsumerPolicy>>,
+    consumers: Option<Vec<String>>,
     /// The runner modules `routing/v1` answers with, in preference order.
     /// Absent: Broca alone, on the routes its credentials serve.
     #[serde(default, skip_serializing_if = "Option::is_none")]

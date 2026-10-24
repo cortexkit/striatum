@@ -35,6 +35,8 @@ mod select;
 mod conformance_tests;
 #[cfg(test)]
 mod dispatch_tests;
+#[cfg(test)]
+mod metered_tests;
 
 /// The `routing/v1` capability a routing provider lists in its manifest.
 pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;

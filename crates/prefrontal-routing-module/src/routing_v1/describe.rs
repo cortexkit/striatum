@@ -6,15 +6,18 @@ use cortexkit_role_routing::errors::Refusal;
 use serde_json::Value;
 
 use super::{operator_config, Deps};
+use crate::select_policy;
 
 /// Params are ignored: the role defines `{}` and no refusal for this op.
 pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
     let consumers = operator_config(deps)
         .v1_consumers()
         .into_iter()
-        .map(|(id, policy)| ConsumerEntry {
+        .map(|id| ConsumerEntry {
+            // The same rule selection applies to the request class the id
+            // names: codemode and flow run only priced per token.
+            priced_only: select_policy::requires_metered(select_policy::Consumer::from_id(&id)),
             id,
-            priced_only: policy.priced_only,
         })
         .collect();
     // A `detail: true` select is answered with the selection's explanation

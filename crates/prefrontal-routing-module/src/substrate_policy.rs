@@ -31,13 +31,15 @@ impl Harness {
     }
 }
 
-const GROUP_NAMES: [&str; 16] = [
+const GROUP_NAMES: [&str; 18] = [
     "all",
     "mason",
     "sidekick",
     "athena",
     "lab",
     "core",
+    "codemode",
+    "flow",
     "sidekick.explore",
     "sidekick.librarian",
     "sidekick.gather",
@@ -155,6 +157,8 @@ pub(crate) fn resolve(
         Consumer::Athena => "athena",
         Consumer::Lab => "lab",
         Consumer::Core => "core",
+        Consumer::Codemode => "codemode",
+        Consumer::Flow => "flow",
     });
     workload
         .into_iter()

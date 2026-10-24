@@ -81,7 +81,9 @@
         "exclude": {
           "all": [],
           "athena": [],
+          "codemode": [],
           "core": [],
+          "flow": [],
           "lab": [],
           "mason": [],
           "sidekick": []
@@ -107,7 +109,9 @@
         "variants": {
           "all": {},
           "athena": {},
+          "codemode": {},
           "core": {},
+          "flow": {},
           "lab": {},
           "mason": {},
           "sidekick": {}
@@ -144,18 +148,6 @@
       },
       "additionalProperties": false
     },
-    "ConsumerPolicy": {
-      "description": "One `routing/v1` consumer's policy (`model_routing.consumers.<id>`).",
-      "type": "object",
-      "properties": {
-        "priced_only": {
-          "description": "Answer this consumer only with routes priced per token, never with a\nroute paid from subscription quota.",
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "additionalProperties": false
-    },
     "ExcludeGroups": {
       "type": "object",
       "properties": {
@@ -173,7 +165,21 @@
             "type": "string"
           }
         },
+        "codemode": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "core": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "flow": {
           "type": "array",
           "default": [],
           "items": {
@@ -418,13 +424,13 @@
           "minimum": 1
         },
         "consumers": {
-          "description": "The `routing/v1` consumer ids `route.select` answers, each with its\npolicy. Absent: mason, sidekick, athena, lab and core; codemode and flow\n(priced per token only); and Magic Context's mc_summary and mc_dream.\nPresent: exactly these.",
+          "description": "The `routing/v1` consumer ids `route.select` answers. Absent: every\nrequest class (mason, sidekick, athena, lab, core, codemode, flow) and\nMagic Context's mc_summary and mc_dream. Present: exactly these.\nCodemode and flow are answered only with routes priced per token.",
           "type": [
-            "object",
+            "array",
             "null"
           ],
-          "additionalProperties": {
-            "$ref": "#/$defs/ConsumerPolicy"
+          "items": {
+            "type": "string"
           }
         },
         "demand_exponent": {
@@ -453,7 +459,9 @@
           "default": {
             "all": [],
             "athena": [],
+            "codemode": [],
             "core": [],
+            "flow": [],
             "lab": [],
             "mason": [],
             "sidekick": []
@@ -578,7 +586,9 @@
           "default": {
             "all": {},
             "athena": {},
+            "codemode": {},
             "core": {},
+            "flow": {},
             "lab": {},
             "mason": {},
             "sidekick": {}
@@ -929,7 +939,43 @@
             ]
           }
         },
+        "codemode": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
         "core": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "flow": {
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/Harness"
@@ -1220,7 +1266,21 @@
           },
           "default": {}
         },
+        "codemode": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
         "core": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "flow": {
           "type": "object",
           "additionalProperties": {
             "type": "string"
