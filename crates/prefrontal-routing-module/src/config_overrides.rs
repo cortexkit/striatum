@@ -1040,7 +1040,11 @@ struct ModelRoutingSection {
     keep_free_percent: HashMap<String, f64>,
     /// The `routing/v1` consumer ids `route.select` answers. Absent: every
     /// request class (mason, sidekick, athena, lab, core, codemode, flow) and
-    /// Magic Context's mc_summary and mc_dream. Present: exactly these.
+    /// Magic Context's mc_summary, mc_dream, mc_dream_verify, mc_dream_map,
+    /// mc_dream_curate, mc_dream_classify, mc_dream_review_user,
+    /// mc_dream_retrospective, mc_dream_primers, mc_dream_compress_cues and
+    /// mc_dream_docs. When present, this array replaces the defaults; only its
+    /// listed ids are accepted.
     /// Codemode and flow are answered only with routes priced per token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consumers: Option<Vec<String>>,

@@ -424,7 +424,7 @@
           "minimum": 1
         },
         "consumers": {
-          "description": "The `routing/v1` consumer ids `route.select` answers. Absent: every\nrequest class (mason, sidekick, athena, lab, core, codemode, flow) and\nMagic Context's mc_summary and mc_dream. Present: exactly these.\nCodemode and flow are answered only with routes priced per token.",
+          "description": "The `routing/v1` consumer ids `route.select` answers. Absent: every\nrequest class (mason, sidekick, athena, lab, core, codemode, flow) and\nMagic Context's mc_summary, mc_dream, mc_dream_verify, mc_dream_map,\nmc_dream_curate, mc_dream_classify, mc_dream_review_user,\nmc_dream_retrospective, mc_dream_primers, mc_dream_compress_cues and\nmc_dream_docs. When present, this array replaces the defaults; only its\nlisted ids are accepted.\nCodemode and flow are answered only with routes priced per token.",
           "type": [
             "array",
             "null"

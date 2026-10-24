@@ -130,6 +130,49 @@ fn route_key(reply: &(FrameType, Value)) -> String {
 }
 
 #[tokio::test]
+async fn magic_context_consumers_select_with_default_policy() {
+    let harness = harness(json!({ "prices": [{ "provider_id": "plan-provider" }] }));
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    // Keep this list independent of the registry so a missing default is caught.
+    let consumers = [
+        "mc_summary",
+        "mc_dream",
+        "mc_dream_verify",
+        "mc_dream_map",
+        "mc_dream_curate",
+        "mc_dream_classify",
+        "mc_dream_review_user",
+        "mc_dream_retrospective",
+        "mc_dream_primers",
+        "mc_dream_compress_cues",
+        "mc_dream_docs",
+    ];
+    for consumer in consumers {
+        let reply = route.call("route.select", &select(consumer)).await;
+        assert_eq!(route_key(&reply), PLAN, "{consumer}");
+    }
+
+    harness.edit_config(|config| {
+        config["model_routing"]["exclude"] = json!({ "all": [PLAN] });
+    });
+    for consumer in consumers {
+        let reply = route.call("route.select", &select(consumer)).await;
+        assert_eq!(route_key(&reply), METERED, "{consumer}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_magic_context_consumer_is_refused() {
+    let harness = harness(json!({ "prices": [{ "provider_id": "plan-provider" }] }));
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let reply = route
+        .call("route.select", &select("mc_dream_unknown"))
+        .await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "unknown_consumer", "{}", reply.1);
+}
+
+#[tokio::test]
 async fn codemode_and_flow_never_answer_a_subscription_plan_route() {
     let harness = harness(json!({ "prices": [{ "provider_id": "plan-provider" }] }));
     let route = harness.bind(reserved("example-consumer"), None).await;

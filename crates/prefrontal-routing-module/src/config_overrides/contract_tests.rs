@@ -978,6 +978,15 @@ fn routing_v1_consumers_default_to_the_built_in_list_and_a_listing_replaces_it()
         "lab",
         "mason",
         "mc_dream",
+        "mc_dream_verify",
+        "mc_dream_map",
+        "mc_dream_curate",
+        "mc_dream_classify",
+        "mc_dream_review_user",
+        "mc_dream_retrospective",
+        "mc_dream_primers",
+        "mc_dream_compress_cues",
+        "mc_dream_docs",
         "mc_summary",
         "sidekick",
     ];
@@ -1008,7 +1017,9 @@ fn routing_v1_runners_default_to_broca_and_exclusions_follow_the_consumer_group(
     assert_eq!(groups.named_group("mason"), ["b"]);
     // A consumer with no group of its own reads only `all`, which the
     // selection applies separately.
-    assert!(groups.named_group("mc_summary").is_empty());
+    for consumer in crate::config_policy::MAGIC_CONTEXT_CONSUMERS {
+        assert!(groups.named_group(consumer).is_empty(), "{consumer}");
+    }
     assert!(groups.named_group("all").is_empty());
 }
 
