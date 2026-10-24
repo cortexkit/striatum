@@ -287,12 +287,14 @@ pub(super) async fn select(
         deps,
         sources: &sources,
         account_flags: live_config.account_flags(),
+        scope: caller.scope.clone(),
         now,
     };
 
     let project_pin = caller
-        .project_id
-        .as_deref()
+        .scope
+        .as_ref()
+        .and_then(|scope| scope.project_id.as_deref())
         .and_then(|project| operator_config.project_pin(project, &consumer))
         .map(str::to_owned);
     let previous = match &request.affinity {
@@ -365,7 +367,10 @@ pub(super) async fn select(
         &demand,
         Some(&selected),
         None,
-        &crate::SelectParams::for_record(),
+        &crate::SelectParams {
+            scope: caller.scope.clone(),
+            ..crate::SelectParams::for_record()
+        },
         Some(&priced.provenance),
         Some(&crate::policy_sources_line(&operator_policy)),
     );
@@ -401,7 +406,10 @@ pub(super) async fn select(
             decision_id: decision_id.clone(),
             principal: caller.principal.clone(),
             consumer: consumer.clone(),
-            project_id: caller.project_id.clone(),
+            project_id: caller
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.project_id.clone()),
             provider: route.provider.clone(),
             model: route.model.clone(),
             variant: route.variant.clone(),
@@ -471,6 +479,9 @@ struct Selection<'a> {
     deps: &'a Deps<'a>,
     sources: &'a SelectionPolicySources<'a>,
     account_flags: config_overrides::AccountSelectionFlags,
+    /// The scope the selecting route is bound under, recorded with a refusal
+    /// the same way a decision records it.
+    scope: Option<crate::DecisionScope>,
     now: f64,
 }
 
@@ -591,7 +602,10 @@ impl<'a> Selection<'a> {
             &self.demand,
             None,
             Some(no_route),
-            &crate::SelectParams::for_record(),
+            &crate::SelectParams {
+                scope: self.scope.clone(),
+                ..crate::SelectParams::for_record()
+            },
             Some(provenance),
             None,
         );

@@ -1134,6 +1134,45 @@ fn migration_030_preserves_real_028_era_decision_rows_without_join_identity() {
 }
 
 #[test]
+fn decision_scope_attribution_round_trips_and_stays_null_when_absent() {
+    let rig = Rig::new("decision-scope-attribution");
+    let store = rig.open();
+    let scoped = DecisionInput {
+        task_id: Some("scoped-task".into()),
+        requirements_json: "{}".into(),
+        score_json: "{}".into(),
+        rejected_json: "[]".into(),
+        project_root: Some("/work/projects/example".into()),
+        project_id: Some("entorhinal-project-7".into()),
+        workdir: Some("/work/projects/example".into()),
+        ..Default::default()
+    };
+    let scoped_id = store.record_decision(&scoped).unwrap();
+    // An unscoped decision keeps both columns NULL: the project is never
+    // derived from the folder or anything else the row carries.
+    let unscoped = DecisionInput {
+        task_id: Some("unscoped-task".into()),
+        requirements_json: "{}".into(),
+        score_json: "{}".into(),
+        rejected_json: "[]".into(),
+        project_root: Some("/work/projects/example".into()),
+        ..Default::default()
+    };
+    let unscoped_id = store.record_decision(&unscoped).unwrap();
+    drop(store);
+
+    let store = rig.open();
+    let row = store.get_decision_by_id(&scoped_id).unwrap().unwrap();
+    assert_eq!(row.project_id.as_deref(), Some("entorhinal-project-7"));
+    assert_eq!(row.workdir.as_deref(), Some("/work/projects/example"));
+    assert_eq!(row.project_root.as_deref(), Some("/work/projects/example"));
+    let row = store.get_decision_by_id(&unscoped_id).unwrap().unwrap();
+    assert_eq!(row.project_id, None);
+    assert_eq!(row.workdir, None);
+    assert_eq!(row.project_root.as_deref(), Some("/work/projects/example"));
+}
+
+#[test]
 fn selected_execution_identity_round_trips_independently_of_caller_provenance() {
     let rig = Rig::new("selected-execution-identity");
     let store = rig.open();

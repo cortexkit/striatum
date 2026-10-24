@@ -207,6 +207,44 @@ impl Harness {
         }
     }
 
+    /// The next unused route channel for a bind on this harness.
+    pub(super) fn reserve_channel(&self) -> u16 {
+        self.next_channel.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Send `bind` as the control frame for `channel` under `epoch` and return
+    /// the route it bound. A test that needs a stamp shape `bind` builds its
+    /// own frame; this one answers the daemon's `route.bind` acknowledgement.
+    pub(super) async fn bind_frame(
+        self: &Arc<Self>,
+        bind: Value,
+        channel: u16,
+        epoch: u32,
+    ) -> Route {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Passive, false),
+            0,
+            0,
+            u64::from(channel),
+            serde_json::to_vec(&bind).unwrap(),
+        )
+        .unwrap();
+        let reply = self.handle(frame).await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "route.bind was refused: {}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        Route {
+            harness: Arc::clone(self),
+            channel,
+            epoch,
+            next_corr: AtomicU64::new(1),
+        }
+    }
+
     /// Hand one frame to the module's frame handler and wait for its reply.
     async fn handle(&self, frame: Frame) -> Frame {
         let (writer, mut replies) = mpsc::channel(4);

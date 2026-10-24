@@ -289,9 +289,65 @@ fn route_principal(channel: u16, epoch: u32) -> String {
         .unwrap_or_else(|| account_selection::principal_label(None))
 }
 
+/// The scope stamp of each bind whose route this module records decisions for,
+/// by channel, reduced to the fields the decision ledger keeps: the Entorhinal
+/// project id and the session folder. `None` for a route opened without a
+/// scope. The daemon sends both only to a target that provides
+/// `scope-workdir/v1`, so a scope it stamped without them records nothing.
+static ROUTE_SCOPES: OnceLock<Mutex<HashMap<u16, (u32, Option<DecisionScope>)>>> = OnceLock::new();
+
+fn route_scopes() -> &'static Mutex<HashMap<u16, (u32, Option<DecisionScope>)>> {
+    ROUTE_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The project and folder a route's scope was bound to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DecisionScope {
+    project_id: Option<String>,
+    workdir: Option<String>,
+}
+
+impl DecisionScope {
+    /// The fields of a bind's scope stamp; `None` when the bind carried no
+    /// scope at all. The stamp is the daemon's, read from the control frame,
+    /// never from a request.
+    fn from_stamp(scope: Option<&subc_protocol::scope::ScopeStamp>) -> Option<Self> {
+        scope.map(|stamp| Self {
+            project_id: stamp.project_id.clone(),
+            workdir: stamp.workdir.clone(),
+        })
+    }
+}
+
+/// Record the scope of the route bound on `channel` under `epoch`.
+fn remember_route_scope(channel: u16, epoch: u32, scope: Option<DecisionScope>) {
+    if let Ok(mut map) = route_scopes().lock() {
+        map.insert(channel, (epoch, scope));
+    }
+}
+
+fn clear_route_scope(channel: u16, epoch: u32) {
+    if let Ok(mut map) = route_scopes().lock() {
+        if map.get(&channel).is_some_and(|(bound, _)| *bound == epoch) {
+            map.remove(&channel);
+        }
+    }
+}
+
+/// The scope the request on `channel` was bound under, when it still holds
+/// for `epoch`.
+fn route_scope(channel: u16, epoch: u32) -> Option<DecisionScope> {
+    route_scopes().lock().ok().and_then(|map| {
+        map.get(&channel)
+            .filter(|(bound, _)| *bound == epoch)
+            .and_then(|(_, scope)| scope.clone())
+    })
+}
+
 fn clear_route_epoch(route_epochs: &mut RouteEpochs, channel: u16, epoch: u32) {
     if route_epochs.get(&channel) == Some(&epoch) {
         route_epochs.remove(&channel);
+        clear_route_scope(channel, epoch);
     }
 }
 
@@ -1489,10 +1545,10 @@ async fn handle_control_request(
                     ),
                 );
             }
-            routing_v1::remember_route_scope(
+            remember_route_scope(
                 route_channel,
                 epoch,
-                scope.as_ref().and_then(|scope| scope.project_id.clone()),
+                DecisionScope::from_stamp(scope.as_ref()),
             );
             // The catalog is machine-global, but the wire identity is binding-specific.
             // Install it only after the accepted bind ACK is queued.
@@ -1646,6 +1702,11 @@ struct SelectParams {
     task_id: Option<String>,
     #[serde(default, alias = "parentSessionID")]
     parent_session_id: Option<String>,
+    /// The project and folder the daemon stamped on the request's scope. This
+    /// is never a request member: it is filled in from the route's bind just
+    /// before the decision is built, so a body cannot name its own project.
+    #[serde(skip)]
+    scope: Option<DecisionScope>,
     /// For `executor: broca`, `substrate: broca` uses Broca's served routes;
     /// absent or other values use `availableModels`. Launch selections ignore
     /// this legacy field and use each route's mapped harness.
@@ -3774,6 +3835,12 @@ async fn handle_select_request(
             .await;
         }
     };
+    // The decision ledger records the project and folder the daemon stamped on
+    // this route's scope, never anything the request body says.
+    let params = SelectParams {
+        scope: route_scope(channel, epoch),
+        ..params
+    };
     let host_run = params.is_host_run();
     let selected_workload = params
         .resolved_workload()
@@ -5741,6 +5808,10 @@ fn panel_decision_input(
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned),
+        // A panel decision keeps no scope attribution: it names no single
+        // caller route to read one from.
+        project_id: None,
+        workdir: None,
         send_id: params.send_id.clone(),
         target_agent: "athena-panel".into(),
         requirements_json: serde_json::to_string(&params.panel_spec)
@@ -5792,6 +5863,14 @@ fn decision_input_for(
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned),
+            project_id: params
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.project_id.clone()),
+            workdir: params
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.workdir.clone()),
             send_id: params.send_id.clone(),
             target_agent: target_agent.to_string(),
             requirements_json,
@@ -5830,6 +5909,14 @@ fn decision_input_for(
                     .as_deref()
                     .filter(|value| !value.trim().is_empty())
                     .map(str::to_owned),
+                project_id: params
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.project_id.clone()),
+                workdir: params
+                    .scope
+                    .as_ref()
+                    .and_then(|scope| scope.workdir.clone()),
                 send_id: params.send_id.clone(),
                 target_agent: target_agent.to_string(),
                 requirements_json,
@@ -7265,10 +7352,10 @@ fn print_manifest_operations() -> Result<(), ModuleError> {
 /// The catalog and route-state tables are machine-global, so `identity_scope` is
 /// empty and the identity binding requires nothing. The routing module owns this
 /// schema and is the sole writer for its provider and route cooldown state.
-fn manifest(module_id: &str) -> ModuleManifest {
+pub(crate) fn manifest(module_id: &str) -> ModuleManifest {
     // `ModuleManifest` is `#[non_exhaustive]`, so this module constructs it
-    // with the builder. It provides the routing/v1 capability and requires
-    // none.
+    // with the builder. It provides the routing/v1 and scope-workdir
+    // capabilities and requires none.
     // Build provenance comes from the module's build script.
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
         .trust_tier(Some(TrustTier::FirstParty))
@@ -7286,9 +7373,17 @@ fn manifest(module_id: &str) -> ModuleManifest {
             },
         }))
         .protocol_ver(PROTOCOL_VERSION)
-        // The catalog finds the routing provider by this capability.
+        // The catalog finds the routing provider by this capability. It also
+        // provides `scope-workdir/v1`, which obliges it to accept the extra
+        // scope-stamp fields the daemon sends with it: the session folder and
+        // the Entorhinal project id, recorded on every decision the route's
+        // caller selects. Without the declaration the daemon strips both and a
+        // scoped select records no project.
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
-            provides: vec![routing_v1::PROVIDES.to_string()],
+            provides: vec![
+                routing_v1::PROVIDES.to_string(),
+                subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+            ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))

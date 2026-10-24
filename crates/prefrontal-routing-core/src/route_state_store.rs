@@ -281,6 +281,13 @@ pub struct DecisionInput {
     pub harness: Option<String>,
     /// The caller's project directory, used to match the decision with recorded spend facts.
     pub project_root: Option<String>,
+    /// The Entorhinal project id the daemon stamped on the caller's scope, when
+    /// the route was opened under one. Attribution only: absent for an unscoped
+    /// route, and never derived from the request or from `project_root`.
+    pub project_id: Option<String>,
+    /// The session folder the daemon stamped on the caller's scope, when the
+    /// route was opened under one. Absent for an unscoped route.
+    pub workdir: Option<String>,
     /// Caller-provided launch attempt id. A decision without an execution keeps this null.
     pub send_id: Option<String>,
     pub target_agent: String,

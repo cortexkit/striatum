@@ -12,9 +12,7 @@
 //! attested when it bound the route, and the project the route's scope stamp
 //! names. No request member is ever read as the caller or the scope.
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::ops;
@@ -37,6 +35,8 @@ mod conformance_tests;
 mod dispatch_tests;
 #[cfg(test)]
 mod metered_tests;
+#[cfg(test)]
+mod scope_attribution_tests;
 
 /// The `routing/v1` capability a routing provider lists in its manifest.
 pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;
@@ -44,35 +44,6 @@ pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;
 /// The ops only `routing/v1` serves. The other three v1 ops share their
 /// names with older ops and are listed with those.
 pub(crate) const V1_ONLY_OPS: &[&str] = &[ops::ROLE_DESCRIBE, ops::ROUTE_REPORT];
-
-/// The project each bound route's scope stamp names, by channel, with the
-/// epoch it was bound under. Kept beside the route principals for the same
-/// reason: the shared request handler keeps its signature.
-static ROUTE_PROJECTS: OnceLock<Mutex<RouteProjects>> = OnceLock::new();
-
-/// Channel to (bound epoch, project id).
-type RouteProjects = HashMap<u16, (u32, Option<String>)>;
-
-fn route_projects() -> &'static Mutex<RouteProjects> {
-    ROUTE_PROJECTS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Record the project a route was bound to, from the daemon's scope stamp on
-/// its bind. `None` for a route opened without a scope or a scope that names
-/// no project.
-pub(crate) fn remember_route_scope(channel: u16, epoch: u32, project_id: Option<String>) {
-    if let Ok(mut map) = route_projects().lock() {
-        map.insert(channel, (epoch, project_id));
-    }
-}
-
-fn route_project(channel: u16, epoch: u32) -> Option<String> {
-    route_projects().lock().ok().and_then(|map| {
-        map.get(&channel)
-            .filter(|(bound_epoch, _)| *bound_epoch == epoch)
-            .and_then(|(_, project)| project.clone())
-    })
-}
 
 /// Whether the `routing/v1` surface answers this request body.
 ///
@@ -124,8 +95,8 @@ pub(crate) struct Deps<'a> {
 pub(crate) struct Caller {
     /// `reserved:<module>`, `direct`, `unverified` or `unattested`.
     pub principal: String,
-    /// The project the route is bound to; `None` for an unscoped route.
-    pub project_id: Option<String>,
+    /// The scope the route is bound under; `None` for an unscoped route.
+    pub scope: Option<crate::DecisionScope>,
 }
 
 impl Caller {
@@ -147,7 +118,7 @@ pub(crate) async fn serve(
     let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
     let caller = Caller {
         principal: crate::route_principal(channel, route_epoch),
-        project_id: route_project(channel, route_epoch),
+        scope: crate::route_scope(channel, route_epoch),
     };
     let reply = match serde_json::from_slice::<Value>(&frame.body) {
         Ok(request) => {

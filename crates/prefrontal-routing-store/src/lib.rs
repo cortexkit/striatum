@@ -203,6 +203,8 @@ const MIGRATION_060: &str = include_str!("../migrations/060_credential_entitleme
 const MIGRATION_061: &str = include_str!("../migrations/061_allowed_providers.sql");
 // routing/v1 decision binding, affinity, report and admission idempotency.
 const MIGRATION_062: &str = include_str!("../migrations/062_routing_v1.sql");
+/// The project and session folder the daemon stamped on a decision's scope.
+const MIGRATION_064: &str = include_str!("../migrations/064_decision_scope_attribution.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -258,7 +260,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 62] {
+fn route_state_migrations() -> [Migration; 63] {
     [
         Migration {
             version: 1,
@@ -507,6 +509,10 @@ fn route_state_migrations() -> [Migration; 62] {
         Migration {
             version: 62,
             statements: MIGRATION_062,
+        },
+        Migration {
+            version: 64,
+            statements: MIGRATION_064,
         },
     ]
 }
@@ -900,6 +906,10 @@ pub struct DecisionExplainRow {
     pub parent_session_id: Option<String>,
     pub harness: Option<String>,
     pub project_root: Option<String>,
+    /// The project the decision's scope was bound to, when it had one.
+    pub project_id: Option<String>,
+    /// The session folder the decision's scope was bound to, when it had one.
+    pub workdir: Option<String>,
     pub send_id: Option<String>,
     pub target_agent: String,
     pub requirements_json: String,
@@ -2140,8 +2150,9 @@ impl SqliteRouteStateStore {
                          target_agent, requirements_json, selected_route_key, selected_provider_id,
                          selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
                          quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at,
-                         selected_harness, selected_workload, consumer, allowed_providers_json
-                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+                         selected_harness, selected_workload, consumer, allowed_providers_json,
+                         project_id, workdir
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
@@ -2168,6 +2179,8 @@ impl SqliteRouteStateStore {
                         selected_workload,
                         input.consumer,
                         input.allowed_providers_json,
+                        input.project_id,
+                        input.workdir,
                     ],
                 )?;
                 Ok(())
@@ -2190,7 +2203,8 @@ impl SqliteRouteStateStore {
                                 selected_provider_id, selected_model_id, selected_variant, score_json,
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
-                                outcome_error, selected_harness, selected_workload, allowed_providers_json
+                                outcome_error, selected_harness, selected_workload, allowed_providers_json,
+                                project_id, workdir
                          FROM model_route_decisions
                          WHERE id=?1",
                         [decision_id],
@@ -2215,7 +2229,8 @@ impl SqliteRouteStateStore {
                                 selected_provider_id, selected_model_id, selected_variant, score_json,
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
-                                outcome_error, selected_harness, selected_workload, allowed_providers_json
+                                outcome_error, selected_harness, selected_workload, allowed_providers_json,
+                                project_id, workdir
                          FROM model_route_decisions
                          WHERE send_id=?1
                          ORDER BY created_at DESC, id DESC
@@ -2449,6 +2464,8 @@ fn decision_explain_row(row: &Row<'_>) -> rusqlite::Result<DecisionExplainRow> {
         outcome_error: row.get(23)?,
         selected_harness: row.get(24)?,
         selected_workload: row.get(25)?,
+        project_id: row.get(27)?,
+        workdir: row.get(28)?,
     })
 }
 
@@ -6020,7 +6037,7 @@ mod tests {
         migrated
             .store
             .with_conn(|c| {
-                assert_eq!(route_state_version(c)?, 62);
+                assert_eq!(route_state_version(c)?, 64);
                 assert_eq!(
                     history_foreign_keys(c),
                     ["account_admission -> account_pin"]
