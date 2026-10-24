@@ -3897,10 +3897,14 @@ async fn handle_select_request(
     } else {
         harness_context.availability(&facts)
     };
+    let admission_facts = broca_credentials.lock().map_or_else(
+        |_| facts.clone(),
+        |credentials| credentials.admission_facts(&facts, now_ms()),
+    );
     mapped_availability
         .rejected
         .extend(select_policy::candidate_rejections(
-            &facts,
+            &admission_facts,
             params.consumer,
             params.allowed_providers.as_deref(),
             subscription_plan_providers.as_ref(),
@@ -4039,8 +4043,13 @@ async fn handle_select_request(
                 pin_available.insert(pin_key.clone());
             }
         }
+        let pin_admission_facts: Vec<_> = admission_facts
+            .iter()
+            .filter(|f| format!("{}/{}", f.provider_id, f.model_id) == pin_capacity)
+            .cloned()
+            .collect();
         if let Some(detail) = select_policy::candidate_rejections(
-            &pin_facts,
+            &pin_admission_facts,
             params.consumer,
             params.allowed_providers.as_deref(),
             subscription_plan_providers.as_ref(),
