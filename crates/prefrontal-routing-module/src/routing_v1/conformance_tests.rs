@@ -540,8 +540,10 @@ impl RoutingSubject for KitSubject {
 /// first seven need the account-op members routing/v1 0.2.0 added
 /// (`parent_conversation_key`, `pool`, `eligibility`, `request_input_tokens`),
 /// which the v1 account ops and report still refuse as unknown members. The
-/// last six need consumer declarations read from the daemon catalog, which
+/// next six need consumer declarations read from the daemon catalog, which
 /// this subject's `configure_catalog_declarations` hook does not support yet.
+/// The last needs `runner.harness` in the select answer, filled from a
+/// runner's own declaration, which routing does not read yet.
 /// Each is expected to fail until routing serves it; the work that makes one
 /// pass removes it here, and the full-kit verdict holds once the list is empty.
 const NOT_YET_SERVED: &[&str] = &[
@@ -558,12 +560,32 @@ const NOT_YET_SERVED: &[&str] = &[
     "operator_config_overrides_declared_default",
     "declared_consumer_unverified_entry_ignored",
     "declared_consumer_conflict_refused",
+    "harness_only_when_declared",
 ];
 
-/// Every kit check this module serves passes, and exactly the checks in
-/// [`NOT_YET_SERVED`] fail: a newly failing check, or a listed check that
-/// now passes, both break the test. A failing check names the contract rule
-/// it holds the provider to.
+/// The kit's hold checks, in run order. The kit reports them not applicable
+/// because `role.describe` does not declare `select_hold_control`
+/// ([`super::describe::CAPABILITIES`] is empty). When routing declares the
+/// group, these checks run, and this list empties alongside the subject's
+/// hold hooks (`configure_consumer_mode`, `configure_hold_limits`,
+/// `block_account`), which this subject does not implement yet.
+const NOT_APPLICABLE_WITHOUT_HOLD_CONTROL: &[&str] = &[
+    "hold_answers_blocked_entry_within_limits",
+    "hold_moves_when_reset_beyond_window",
+    "hold_moves_when_reset_unknown",
+    "hold_moves_beyond_caller_cap",
+    "hold_ok_false_moves_to_usable_entry",
+    "hold_ok_false_falls_back_to_soonest_entry",
+    "hold_nothing_within_limit_accounts_blocked",
+    "hold_demand_mode_skips_blocked_model",
+    "hold_account_for_applies_recorded_cap",
+];
+
+/// Every kit check this module serves passes, exactly the checks in
+/// [`NOT_YET_SERVED`] fail, and exactly the hold checks are not applicable:
+/// a newly failing check, or a listed check that now passes or runs, breaks
+/// the test. A failing check names the contract rule it holds the provider
+/// to.
 #[tokio::test]
 async fn routing_v1_conformance_kit_passes_every_served_check() {
     let subject = KitSubject {
@@ -572,4 +594,10 @@ async fn routing_v1_conformance_kit_passes_every_served_check() {
     let report = run_suite(&subject).await;
     assert_eq!(report.checks.len(), CHECKS.len());
     assert_eq!(report.failing(), NOT_YET_SERVED, "{}", report.render());
+    assert_eq!(
+        report.not_applicable(),
+        NOT_APPLICABLE_WITHOUT_HOLD_CONTROL,
+        "{}",
+        report.render()
+    );
 }
