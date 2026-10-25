@@ -24,13 +24,11 @@ use cortexkit_role_routing::select::{
 };
 use prefrontal_routing_core::model_router::{
     ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
-    SelectModelRouteInput, SelectedModelRoute,
+    SelectedModelRoute,
 };
 use prefrontal_routing_core::provider_model_spec::{parse_spec_list, resolve_spec};
 use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
-use prefrontal_routing_core::{
-    fact_to_route, ModelFact, ModelRequirements, ModelRoute, RoutingConfig,
-};
+use prefrontal_routing_core::{fact_to_route, ModelFact, ModelRequirements, RoutingConfig};
 use prefrontal_routing_store::V1Decision;
 use serde_json::{json, Value};
 
@@ -105,10 +103,8 @@ pub(super) async fn select(
     }
 
     let operator_policy = operator_config.operator_policy();
-    // A consumer id that names a request class (mason, ..., codemode, flow)
-    // takes that class's policy: its variants, provider resets and, for
-    // codemode and flow, the priced-per-token rule. Any other consumer reads
-    // only the `all` groups.
+    // Legacy classes still identify variant/reset groups. Payment class comes
+    // only from the resolved consumer policy, not from the consumer's name.
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
     let consumer_policy = operator_config.consumer_policy(
         &consumer,
@@ -161,6 +157,12 @@ pub(super) async fn select(
     let runners: Vec<RunnerPolicy> = operator_config
         .v1_runners()
         .into_iter()
+        .filter(|runner| {
+            consumer_policy
+                .runner
+                .as_ref()
+                .is_none_or(|module| module == &runner.module)
+        })
         .filter(|runner| {
             request
                 .runners
@@ -225,7 +227,7 @@ pub(super) async fn select(
         .filter(|fact| {
             requirements
                 .max_output_tokens
-                .is_none_or(|floor| fact.max_output_tokens.is_none_or(|limit| limit >= floor))
+                .is_none_or(|floor| fact.max_output_tokens.is_some_and(|limit| limit >= floor))
         })
         .collect();
     if capable.is_empty() && !reachable.is_empty() {
@@ -324,14 +326,12 @@ pub(super) async fn select(
     // Request pin, then project pin, then the continuing model, then the mode.
     // A pin does not fall through. The continuing model does, once it is no
     // longer allowed. Legacy targetAgent bodies never reach this surface.
-    let ordered = select_policy::select_ordered(
+    let ordered = selection.pass().select(
         &available,
         request.pin.as_deref(),
         project_pin.as_deref(),
         continuing.as_deref(),
         |pin| selection.pin(pin, &available),
-        |only| selection.score(only),
-        || selection.automatic(&available),
     );
     let (mut selected, basis, explicit_variant) = match ordered {
         Ok((selected, order)) => {
@@ -501,84 +501,27 @@ struct Selection<'a> {
 }
 
 impl<'a> Selection<'a> {
-    fn input(
-        &self,
-        available: &HashSet<String>,
-        snapshot: ModelRouteStateSnapshot,
-    ) -> SelectModelRouteInput<'a> {
-        let subscription_keys = self.subscription_keys.clone();
-        let priced_per_token = self.priced_per_token;
-        SelectModelRouteInput {
-            target_agent: self.consumer.to_owned(),
+    fn pass(&self) -> select_policy::SelectionPass<'_> {
+        select_policy::SelectionPass {
+            consumer: self.consumer,
+            target_agent: self.consumer,
             requirements: self.demand,
-            available_models: available.clone(),
-            facts: self.facts.to_vec(),
-            runtime_snapshot: Some(snapshot),
-            exclude_route_keys: self.exclude.to_vec(),
-            operator_exclude_keys: self.operator_exclude.to_vec(),
+            facts: self.facts,
+            snapshot: self.snapshot,
+            exclude: self.exclude,
+            operator_exclude: self.operator_exclude,
             required_capabilities: self.required_capabilities,
-            is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                select_policy::subscription_covered(priced_per_token, &subscription_keys, route)
-            })),
-            min_best_effort_adequacy: self.min_band,
+            subscription_keys: self.subscription_keys,
+            priced_per_token: self.priced_per_token,
+            min_band: self.min_band,
             prefer_prompt_cache: false,
-            providers_without_prompt_cache: self
-                .providers_without_prompt_cache
-                .iter()
-                .cloned()
-                .collect(),
+            providers_without_prompt_cache: &self.providers_without_prompt_cache,
+            consumer_exclude: self.consumer_exclude,
+            rejections: self.rejections,
+            config: self.routing_config,
+            slots: self.slots,
+            operator_config: self.sources.operator_config,
         }
-    }
-
-    /// The scorer's choice among `available`, without walking a ladder. A
-    /// continuing conversation uses this so an earlier ladder entry or a
-    /// cheaper demand model cannot take the route back.
-    fn score(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
-        let available = available
-            .iter()
-            .filter(|route| {
-                self.sources
-                    .operator_config
-                    .route_allowed(self.consumer, route, false)
-            })
-            .cloned()
-            .collect();
-        select_policy::select_candidates(
-            self.input(&available, self.snapshot.clone()),
-            self.routing_config,
-            self.slots,
-            self.consumer_exclude,
-            self.rejections,
-        )
-    }
-
-    /// The scorer's choice among `available`. Unlike the older select there
-    /// is no break-glass retry: a route that is cooling down or out of quota
-    /// is fenced, and the refusal says when the earliest one returns.
-    fn automatic(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
-        let available = available
-            .iter()
-            .filter(|route| {
-                self.sources
-                    .operator_config
-                    .route_allowed(self.consumer, route, false)
-            })
-            .cloned()
-            .collect();
-        let policy = self.sources.operator_config.consumer_policy(
-            self.consumer,
-            &crate::config_policy::ConsumerPolicy::default(),
-            &std::collections::BTreeMap::new(),
-        );
-        select_policy::select_in_order(&available, &policy, |candidates| {
-            select_policy::select_candidates(
-                self.input(candidates, self.snapshot.clone()),
-                self.routing_config,
-                self.slots,
-                self.consumer_exclude,
-                self.rejections,
-            )
-        })
     }
 
     /// A named model, through the same pin admission a work run's `model=`
@@ -633,7 +576,7 @@ impl<'a> Selection<'a> {
         let catalog = config_overrides::reasoning_catalog_for(self.sources.operator_config_path);
         let selected = work_model_pin::select_with_availability(
             pin,
-            self.input(available, snapshot.clone()),
+            self.pass().input(available, snapshot.clone()),
             self.routing_config,
             self.slots,
             catalog.as_ref(),

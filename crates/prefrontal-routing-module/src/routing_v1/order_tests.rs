@@ -3,7 +3,7 @@
 //! Both wire shapes read the same order: a request pin, then a project pin,
 //! then a continuing model, then the consumer's mode. A pin is one ladder
 //! entry. The runner is the consumer's runner, otherwise the first runner
-//! entry in array order. No session binding is consulted.
+//! entry in array order, not a runner inferred from session data.
 
 use std::sync::Arc;
 
@@ -194,6 +194,38 @@ async fn a_continuing_conversation_keeps_its_model_until_it_is_not_allowed() {
     assert_eq!(route_of(&left), CHEAP, "{}", left.1);
 }
 
+#[tokio::test]
+async fn request_and_project_pins_beat_a_continuing_conversation_on_the_live_handler() {
+    const PIN: &str = "pin-provider/model-c";
+    let harness = harness(&[
+        (CHEAP, true, true, 200_000),
+        (DEAR, true, true, 200_000),
+        (PIN, true, true, 200_000),
+    ]);
+    let route = harness
+        .bind(reserved("example-consumer"), Some("order-project"))
+        .await;
+    let mut request = select("mason");
+    request["affinity"] = json!("pin-precedence");
+    request["pin"] = json!(DEAR);
+    assert_eq!(route_of(&route.call("route.select", &request).await), DEAR);
+
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["projects"]["order-project"] = json!({"pin": PIN});
+    });
+    request.as_object_mut().unwrap().remove("pin");
+    assert_eq!(route_of(&route.call("route.select", &request).await), PIN);
+
+    request["pin"] = json!(CHEAP);
+    assert_eq!(route_of(&route.call("route.select", &request).await), CHEAP);
+    request["pin"] = json!("absent/model");
+    assert_eq!(
+        route.call("route.select", &request).await.0,
+        FrameType::Error,
+        "a request pin must not fall through to a project pin or affinity"
+    );
+}
+
 /// A legacy targetAgent body carries no affinity, so a later body follows the
 /// current ladder instead of the model the first body answered.
 #[tokio::test]
@@ -271,11 +303,31 @@ async fn pay_per_token_follows_the_consumer_flag_not_the_name() {
         "an explicit pay_per_token false is not the historical class: {}",
         named.1
     );
+    harness.edit_config(|config| {
+        config["consumers"]["codemode"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pay_per_token");
+    });
+    assert_eq!(
+        route_of(&route.call("route.select", &select("codemode")).await),
+        CHEAP
+    );
+    let legacy = route
+        .call(
+            "route.select",
+            &json!({
+                "targetAgent": "codemode", "consumer": "codemode", "executor": "broca",
+                "requirements": {"iq": 10, "eq": 0}
+            }),
+        )
+        .await;
+    assert_eq!(legacy_route(&legacy), CHEAP, "{}", legacy.1);
 }
 
 /// Runner choice is the consumer's runner, otherwise the first array entry,
 /// including when the module ids are in reverse alphabetical order. A converted
-/// two-runner array keeps that order. A session stamp does not name the runner.
+/// two-runner array keeps that order. Session data does not choose the runner.
 #[tokio::test]
 async fn runner_choice_is_the_consumer_or_the_first_array_entry() {
     let converted = crate::config_convert::convert_value(json!({
@@ -307,10 +359,48 @@ async fn runner_choice_is_the_consumer_or_the_first_array_entry() {
     assert_eq!(named.1["result"]["runner"]["module"], "alpha-runner");
 }
 
+#[tokio::test]
+async fn the_consumer_runner_must_reach_the_chosen_route_on_both_wire_shapes() {
+    let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
+    harness.edit_config(|config| {
+        config["runners"] = json!([
+            {"module": "zeta-runner", "routes": [CHEAP]},
+            {"module": "alpha-runner", "routes": [DEAR]}
+        ]);
+        config["consumers"]["mason"]["runner"] = json!("alpha-runner");
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let answer = route.call("route.select", &select("mason")).await;
+    assert_eq!(route_of(&answer), DEAR);
+    assert_eq!(answer.1["result"]["runner"]["module"], "alpha-runner");
+    let legacy = route
+        .call(
+            "route.select",
+            &json!({
+                "targetAgent": "mason", "consumer": "mason", "substrate": "broca",
+                "requirements": {"iq": 10, "eq": 0}
+            }),
+        )
+        .await;
+    assert_eq!(legacy_route(&legacy), DEAR, "{}", legacy.1);
+    assert_eq!(legacy.1["result"]["runner"]["module"], "alpha-runner");
+    assert_eq!(
+        legacy.1["result"]["runner"]["route"],
+        legacy.1["result"]["route"]
+    );
+    assert_eq!(
+        legacy.1["result"]["decision_id"],
+        legacy.1["result"]["decisionID"]
+    );
+    assert_eq!(legacy.1["result"]["context_window"], 200_000);
+    assert_eq!(legacy.1["result"]["max_output_tokens"], 32_000);
+}
+
 /// The v1 answer carries the route, runner, variant, limits, decision id and
 /// expiry from the one pass. The caller does not select a second time.
 #[tokio::test]
 async fn the_answer_carries_route_runner_variant_limits_decision_and_expiry() {
+    let _clock = crate::InjectedClock::set(1_792_000_000_000);
     let harness = harness(&[(CHEAP, true, true, 200_000)]);
     let route = harness.bind(reserved("example-consumer"), None).await;
     let reply = route.call("route.select", &select("mason")).await;
@@ -319,15 +409,15 @@ async fn the_answer_carries_route_runner_variant_limits_decision_and_expiry() {
     assert!(result["decision_id"].is_string(), "{result}");
     assert_eq!(result["route"]["provider"], "cheap-provider");
     assert_eq!(result["route"]["model"], "model-a");
-    assert!(result["route"].get("variant").is_some() || result["route"]["variant"].is_null());
+    assert_eq!(result["route"]["variant"], Value::Null);
     assert_eq!(result["runner"]["module"], "zeta-runner");
-    assert_eq!(result["runner"]["route"]["model"], "model-a");
+    assert_eq!(result["runner"]["model"], result["route"]);
     assert!(result["context_window"].as_u64().unwrap() > 0, "{result}");
     assert!(
         result["max_output_tokens"].as_u64().unwrap() > 0,
         "{result}"
     );
-    assert!(result["expires_at_ms"].as_u64().unwrap() > 0, "{result}");
+    assert_eq!(result["expires_at_ms"], 1_792_000_600_000_u64, "{result}");
     // One decision was recorded for the one select.
     assert_eq!(
         harness

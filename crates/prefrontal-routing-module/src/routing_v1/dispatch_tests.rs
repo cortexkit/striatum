@@ -102,11 +102,11 @@ async fn route_select_is_older_with_target_agent_and_v1_without() {
         .await;
     assert_eq!(older.0, FrameType::Response, "{}", older.1);
     assert!(older.1["result"]["decisionID"].is_string(), "{}", older.1);
-    assert!(
-        older.1["result"].get("decision_id").is_none(),
-        "{}",
-        older.1
+    assert_eq!(
+        older.1["result"]["decision_id"],
+        older.1["result"]["decisionID"]
     );
+    assert!(older.1["result"]["selected"].is_object(), "{}", older.1);
 
     let v1 = route
         .call(

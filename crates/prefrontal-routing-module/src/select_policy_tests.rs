@@ -1010,7 +1010,7 @@ mod consumer_and_pin {
     fn consumer_and_pin_shapes_refuse_unknown_values_and_mixed_pins() {
         for params in [
             json!({"consumer": "explore"}),
-            json!({"pin": {"slot": "synthesizer"}}),
+            json!({"pin": {"slot": "unknown-slot"}}),
             json!({"pin": {"slot": "lab_planner", "model": "openai/pin"}}),
             json!({"pin": {"model": "openai/pin", "extra": true}}),
             json!({"pin_fallback": "maybe"}),
@@ -1020,5 +1020,10 @@ mod consumer_and_pin {
                 "{params}"
             );
         }
+    }
+
+    #[test]
+    fn synthesizer_is_a_supported_request_slot() {
+        assert!(serde_json::from_value::<SelectParams>(json!({"pin": {"slot": "synthesizer"}})).is_ok());
     }
 }

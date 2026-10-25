@@ -3355,8 +3355,7 @@ fn price_selection_inputs(
     };
     sources.live_config.apply(facts);
     // A consumer priced per token is never priced as if a subscription
-    // subsidised it. The flag is the authority; the historical class applies
-    // only when the flag is absent.
+    // subsidised it. Only the consumer flag authorizes that payment class.
     if priced_per_token {
         for fact in facts.iter_mut() {
             fact.subscription_multiplier = None;
@@ -4196,11 +4195,54 @@ async fn handle_select_request(
         models: candidates.available,
         rejected: candidates.rejected,
     };
-    let pinned = params.pin.is_some() || params.model_pin.is_some();
-    mapped_availability
-        .models
-        .retain(|route| operator_config.route_allowed(consumer_id, route, pinned));
+    let configured_runners = operator_config.v1_runners();
+    let runner_runs = |runner: &config_policy::RunnerPolicy, key: &str, capacity: &str| {
+        runner.routes.as_ref().is_none_or(|specs| {
+            prefrontal_routing_core::provider_model_spec::resolve_spec(
+                &prefrontal_routing_core::provider_model_spec::parse_spec_list(specs),
+                key,
+                false,
+            )
+        }) && (!runner.via_vault || broca_models.contains(key) || broca_models.contains(capacity))
+    };
+    if !host_run {
+        mapped_availability.models.retain(|key| {
+            select_policy::choose_runner(
+                &configured_runners,
+                consumer_policy.runner.as_deref(),
+                key,
+                key,
+                &runner_runs,
+            )
+            .is_some()
+        });
+    }
     let available = mapped_availability.models.clone();
+    let runner_module = |selected: &SelectedModelRoute| -> Option<String> {
+        if host_run {
+            Some(
+                if deferred_runner_pin {
+                    "broca"
+                } else {
+                    params
+                        .harness
+                        .as_deref()
+                        .or(params.substrate.as_deref())
+                        .unwrap_or("host")
+                }
+                .to_owned(),
+            )
+        } else {
+            select_policy::choose_runner(
+                &configured_runners,
+                consumer_policy.runner.as_deref(),
+                &selected.route_key,
+                &selected.capacity_key,
+                &runner_runs,
+            )
+            .map(|runner| runner.module.clone())
+        }
+    };
     // The harness a route selected here runs on, as far as routing knows: the
     // mapped harness, or for a host-run selection Broca when it was judged on
     // Broca's routes and unknown otherwise.
@@ -4268,6 +4310,27 @@ async fn handle_select_request(
     let min_best_effort_adequacy = live_config.min_band();
     let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
 
+    let pass = select_policy::SelectionPass {
+        consumer: consumer_id,
+        target_agent: &target_agent,
+        requirements,
+        required_capabilities,
+        facts: &facts,
+        snapshot: &snapshot,
+        exclude: &exclude,
+        operator_exclude: &operator_exclude,
+        consumer_exclude,
+        subscription_keys: &subscription_keys,
+        priced_per_token,
+        rejections: &mapped_availability.rejected,
+        config: &routing_config,
+        slots: concurrency_slots.as_ref(),
+        min_band: min_best_effort_adequacy,
+        prefer_prompt_cache,
+        providers_without_prompt_cache: &providers_without_prompt_cache,
+        operator_config: &operator_config,
+    };
+
     let admission_pin = params
         .pin
         .as_ref()
@@ -4312,16 +4375,15 @@ async fn handle_select_request(
             &pin_capacity,
         );
         let mut pin_available = available.clone();
+        let allowed = operator_config.route_allowed(consumer_id, &pin_key, true)
+            && operator_config.route_allowed(consumer_id, &pin_capacity, true);
+        if !allowed {
+            pin_availability.insert(pin_key.clone(), format!("not_for excludes {consumer_id}"));
+        }
         // A host-run pin is judged on the same list as the host's automatic
         // selections; it is not added to that list.
-        if !host_run {
-            // A named model that operator config excludes is not put back on
-            // the list. pin_only still admits, because the request named it.
-            let allowed = operator_config.route_allowed(consumer_id, &pin_key, true)
-                || operator_config.route_allowed(consumer_id, &pin_capacity, true);
-            if !allowed {
-                pin_availability.insert(pin_key.clone(), format!("not_for excludes {consumer_id}"));
-            } else if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
+        if !host_run && allowed {
+            if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
                 pin_availability.insert(pin_key.clone(), detail);
             } else {
                 pin_available.insert(pin_key.clone());
@@ -4372,49 +4434,46 @@ async fn handle_select_request(
             )
             .await;
         }
-        let sub = subscription_keys.clone();
         add_stage_ms(&timing.policy_ms, policy_started.elapsed());
         let selection_started = Instant::now();
         let selection = {
-            let input = SelectModelRouteInput {
-                target_agent: target_agent.clone(),
-                requirements,
-                available_models: pin_available,
-                facts: facts.clone(),
-                runtime_snapshot: Some(pin_snapshot),
-                exclude_route_keys: exclude.clone(),
-                operator_exclude_keys: operator_exclude.clone(),
-                required_capabilities,
-                is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                    select_policy::subscription_covered(priced_per_token, &sub, route)
-                })),
-                min_best_effort_adequacy,
+            let input = select_policy::SelectionPass {
                 prefer_prompt_cache: false,
-                providers_without_prompt_cache: HashSet::new(),
-            };
-            if let Some(pin) = &admission_pin {
-                select_policy::select_pin_with_availability(
-                    pin,
-                    input,
-                    &routing_config,
-                    concurrency_slots.as_ref(),
-                    &pin_availability,
-                )
-                .map_err(|code| work_model_pin::Refusal {
-                    message: code.clone(),
-                    code,
-                })
-            } else {
-                work_model_pin::select_with_availability(
-                    pin,
-                    input,
-                    &routing_config,
-                    concurrency_slots.as_ref(),
-                    config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
-                    &catalog_targets,
-                    &pin_availability,
-                )
+                ..pass
             }
+            .input(&pin_available, pin_snapshot);
+            let mut input = Some(input);
+            pass.select(&pin_available, Some(pin), None, None, |_| {
+                let input = input.take().expect("a terminal pin is admitted once");
+                if let Some(pin) = &admission_pin {
+                    select_policy::select_pin_with_availability(
+                        pin,
+                        input,
+                        &routing_config,
+                        concurrency_slots.as_ref(),
+                        &pin_availability,
+                    )
+                    .map_err(|code| work_model_pin::Refusal {
+                        message: code.clone(),
+                        code,
+                    })
+                } else {
+                    work_model_pin::select_with_availability(
+                        pin,
+                        input,
+                        &routing_config,
+                        concurrency_slots.as_ref(),
+                        config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
+                        &catalog_targets,
+                        &pin_availability,
+                    )
+                }
+            })
+            .map(|(selected, _)| selected)
+            .map_err(|error| match error {
+                select_policy::OrderFailure::Pin(refusal) => refusal,
+                select_policy::OrderFailure::Score(_) => unreachable!("a request pin is terminal"),
+            })
         };
         let selection = selection.map(|mut selected| {
             let explicit = admission_pin.as_ref().map_or_else(
@@ -4481,6 +4540,18 @@ async fn handle_select_request(
         policy_started = Instant::now();
         match selection {
             Ok((mut selected, runner, variant_choice)) => {
+                let Some(module) = runner_module(&selected) else {
+                    return send_route_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "no_route",
+                        "no configured runner can run the pinned route",
+                    )
+                    .await;
+                };
                 let ladder_started = Instant::now();
                 record_ladder(pin_harness);
                 add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
@@ -4500,7 +4571,11 @@ async fn handle_select_request(
                 let decision_id = store
                     .record_decision_with_selection(
                         &decision,
-                        pin_harness.map(substrate_policy::Harness::as_str),
+                        if host_run {
+                            pin_harness.map(substrate_policy::Harness::as_str)
+                        } else {
+                            Some(&module)
+                        },
                         selected_workload,
                     )
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
@@ -4531,6 +4606,9 @@ async fn handle_select_request(
                 }
                 if host_run && !deferred_runner_pin {
                     result["runner"] = host_runner(&params, &selected);
+                }
+                if !deferred_runner_pin {
+                    complete_legacy_selection(&mut result, &selected, &facts, &module);
                 }
                 let body =
                     serde_json::to_vec(&json!({"result": result})).map_err(ModuleError::Json)?;
@@ -4612,43 +4690,37 @@ async fn handle_select_request(
             .and_then(|project| operator_config.project_pin(project, consumer_id))
             .map(str::to_owned)
     });
-    let mode_policy = match &project_pin {
-        Some(pin) => {
-            let mut policy = consumer_policy.clone();
-            policy.mode = Some(config_policy::ConsumerMode::Ladder);
-            policy.ladder = Some(vec![pin.clone()]);
-            policy
-        }
-        None => consumer_policy.clone(),
-    };
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
-        select_policy::select_in_order(&available, &mode_policy, |candidates| {
-            let sub = subscription_keys.clone();
-            select_policy::select_candidates(
-                SelectModelRouteInput {
-                    target_agent: target_agent.clone(),
-                    requirements,
-                    available_models: candidates.clone(),
-                    facts: facts.clone(),
-                    runtime_snapshot: Some(snap.clone()),
-                    exclude_route_keys: exclude.clone(),
-                    operator_exclude_keys: operator_exclude.clone(),
-                    required_capabilities,
-                    is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                        select_policy::subscription_covered(priced_per_token, &sub, route)
-                    })),
-                    min_best_effort_adequacy,
-                    prefer_prompt_cache,
-                    providers_without_prompt_cache: providers_without_prompt_cache
-                        .iter()
-                        .cloned()
-                        .collect(),
-                },
+        let pass = select_policy::SelectionPass {
+            snapshot: &snap,
+            ..pass
+        };
+        pass.select(&available, None, project_pin.as_deref(), None, |pin| {
+            let allowed = available
+                .iter()
+                .filter(|key| operator_config.route_allowed(consumer_id, key, true))
+                .cloned()
+                .collect();
+            work_model_pin::select_with_availability(
+                pin,
+                pass.input(&allowed, snap.clone()),
                 &routing_config,
                 concurrency_slots.as_ref(),
-                consumer_exclude,
+                config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
+                &catalog_targets,
                 &mapped_availability.rejected,
             )
+            .map_err(|refusal| {
+                let mut error = pass.score(&HashSet::new()).unwrap_err();
+                error.message = refusal.message;
+                error
+            })
+        })
+        .map(|(selected, _)| selected)
+        .map_err(|error| match error {
+            select_policy::OrderFailure::Pin(error) | select_policy::OrderFailure::Score(error) => {
+                error
+            }
         })
     };
 
@@ -4722,6 +4794,18 @@ async fn handle_select_request(
     let policy_sources = policy_sources_line(&operator_policy);
     match selection {
         Ok(mut selected) => {
+            let Some(module) = runner_module(&selected) else {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "no_route",
+                    "no configured runner can run the selected route",
+                )
+                .await;
+            };
             let selected_harness = run_harness(&selected.route_key);
             add_stage_ms(&timing.finish_ms, finish_started.elapsed());
             let ladder_started = Instant::now();
@@ -4734,7 +4818,11 @@ async fn handle_select_request(
                 operator_config_path,
                 &catalog_targets,
                 params.consumer,
-                None,
+                project_pin
+                    .as_deref()
+                    .and_then(|pin| cortexkit_role_routing::select::RouteRef::parse_pin(pin))
+                    .and_then(|pin| pin.variant)
+                    .as_deref(),
             );
             selected.explanation.push(policy_sources.clone());
             if let Some(line) = &executor_workload {
@@ -4766,7 +4854,11 @@ async fn handle_select_request(
             );
             let recorded = store.record_decision_with_selection(
                 &decision,
-                selected_harness.map(substrate_policy::Harness::as_str),
+                if host_run {
+                    selected_harness.map(substrate_policy::Harness::as_str)
+                } else {
+                    Some(&module)
+                },
                 selected_workload,
             );
             add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
@@ -4861,6 +4953,7 @@ async fn handle_select_request(
                         }
                     }
                     add_stage_ms(&timing.runner_ms, runner_started.elapsed());
+                    complete_legacy_selection(&mut result, &selected, &facts, &module);
                     let finish_started = Instant::now();
                     let body = serde_json::to_vec(&json!({ "result": result }))
                         .map_err(ModuleError::Json)?;
@@ -4983,6 +5076,37 @@ fn host_runner(params: &SelectParams, selected: &SelectedModelRoute) -> serde_js
             variant: selected.prompt_params.variant.clone(),
         },
     ))
+}
+
+/// Add the common decision envelope without removing legacy launch fields
+/// (notably credential pins and pool leases) that existing callers consume.
+fn complete_legacy_selection(
+    result: &mut serde_json::Value,
+    selected: &SelectedModelRoute,
+    facts: &[ModelFact],
+    module: &str,
+) {
+    let route = cortexkit_role_routing::select::RouteRef {
+        provider: selected.model.provider_id.clone(),
+        model: selected.model.model_id.clone(),
+        variant: selected.prompt_params.variant.clone(),
+    };
+    let fact = facts
+        .iter()
+        .filter(|fact| fact.provider_id == route.provider && fact.model_id == route.model)
+        .min_by_key(|fact| u8::from(fact.variant != route.variant));
+    if !result["runner"].is_object() {
+        result["runner"] = json!({});
+    }
+    result["runner"]["module"] = json!(module);
+    result["runner"]["route"] = json!(route);
+    result["route"] = json!(route);
+    result["decision_id"] = result["decisionID"].clone();
+    result["context_window"] = json!(fact
+        .and_then(|fact| fact.context_window)
+        .map_or(0, |window| window as u64));
+    result["max_output_tokens"] = json!(fact.and_then(|fact| fact.max_output_tokens).unwrap_or(0));
+    result["expires_at_ms"] = json!(now_ms() + 10 * 60_000);
 }
 
 /// Panel legs use the substrate that sends. Claustrum's complete mappings
@@ -9274,12 +9398,7 @@ mod tests {
     }
 
     async fn run_route_wire_request(store: &SharedStore, request: serde_json::Value) -> Frame {
-        run_route_wire_request_with_operator_config(
-            store,
-            request,
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-        )
-        .await
+        run_route_wire_request_with_operator_config(store, request, &test_operator_config()).await
     }
 
     fn empty_broca_credentials() -> SharedBrocaCredentials {
@@ -9325,6 +9444,19 @@ mod tests {
                 std::process::id()
             ));
             std::fs::write(&path, "{}").unwrap();
+            path
+        })
+        .clone()
+    }
+
+    fn test_operator_config() -> PathBuf {
+        static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            let path = prefrontal_test_support::scratch_root().join(format!(
+                "prefrontal-routing-test-operator-{}.json",
+                std::process::id()
+            ));
+            crate::test_config::write(&path, "{}").unwrap();
             path
         })
         .clone()
@@ -9392,6 +9524,12 @@ mod tests {
         operator_config_path: &Path,
         broca_credentials: &SharedBrocaCredentials,
     ) -> Frame {
+        let fixture_config = test_operator_config();
+        let operator_config_path = if operator_config_path.exists() {
+            operator_config_path
+        } else {
+            &fixture_config
+        };
         // Legacy wire fixtures exercise executor availability from an explicit
         // list or Broca substrate. Launch-mapping tests use their own fixture.
         if request["method"] == ROUTE_SELECT_OP {
@@ -9419,7 +9557,7 @@ mod tests {
             &quota_cache,
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             operator_config_path,
             broca_credentials,
             &empty_opencode_auth(),
@@ -11071,13 +11209,7 @@ mod tests {
         facts: &[ModelFact],
     ) -> (Frame, Rig) {
         let rig = Rig::new(label);
-        let response = run_select_against_rig(
-            &rig,
-            params,
-            facts,
-            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
-        )
-        .await;
+        let response = run_select_against_rig(&rig, params, facts, &test_operator_config()).await;
         (response, rig)
     }
 
@@ -11134,7 +11266,7 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             operator_config_path,
             &catalog_broca_credentials(&store),
             &empty_opencode_auth(),
@@ -11179,8 +11311,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &catalog_broca_credentials(&store),
             &empty_opencode_auth(),
         )
@@ -11276,8 +11408,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &catalog_broca_credentials(&store),
             &empty_opencode_auth(),
         )
@@ -11934,8 +12066,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &catalog_broca_credentials(store),
             &empty_opencode_auth(),
         )
@@ -12019,8 +12151,8 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &catalog_broca_credentials(&store),
             &empty_opencode_auth(),
         )
@@ -12125,8 +12257,8 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
                 &quota_decides_facts(),
             ))),
@@ -12205,8 +12337,8 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &catalog_broca_credentials(store),
             &empty_opencode_auth(),
         )
@@ -13049,7 +13181,7 @@ mod tests {
                 "providerAuthTypes": { "openai": "oauth" }
             }),
             &[luna, sol],
-            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
         )
         .await;
 
@@ -13425,8 +13557,8 @@ mod tests {
                 &quota_cache,
                 &store,
                 &min_band,
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                &test_operator_config(),
+                &test_operator_config(),
                 &catalog_broca_credentials(&store),
                 &empty_opencode_auth(),
             )
@@ -13507,7 +13639,7 @@ mod tests {
                 let response = run_route_wire_request_with_paths(
                     &store,
                     request(substrate),
-                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                    &test_operator_config(),
                     &broca_credentials,
                 )
                 .await;
@@ -13575,7 +13707,7 @@ mod tests {
                     "taskId": "panel-substrate-unknown-reach",
                 }
             }),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             &broca_credentials,
         )
         .await;
@@ -13646,7 +13778,7 @@ mod tests {
                     "taskId": "panel-substrate-uncredentialed"
                 }
             }),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             &mapped_broca_credentials("kimi-code-plan-global"),
         )
         .await;
@@ -13697,7 +13829,7 @@ mod tests {
             let response = run_route_wire_request_with_paths(
                 &store,
                 request,
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                &test_operator_config(),
                 &broca_credentials,
             )
             .await;
@@ -13715,7 +13847,7 @@ mod tests {
         assert_eq!(results[1]["resolvedInput"]["availableModels"], json!([]));
         assert_eq!(
             results[1]["runner"],
-            json!({"provider":"opencode-go", "model":"m-native-fast"})
+            json!({"provider":"opencode-go", "model":"m-native-fast", "module":"broca", "route":{"provider":"opencode-go", "model":"m-native-fast"}})
         );
     }
 
@@ -13768,8 +13900,8 @@ mod tests {
                 &Arc::new(Mutex::new(QuotaCache::default())),
                 &store,
                 &Arc::new(Mutex::new(None)),
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                &test_operator_config(),
+                &test_operator_config(),
                 &broca_credentials,
                 &empty_opencode_auth(),
             )
@@ -13798,7 +13930,7 @@ mod tests {
         assert_eq!(broca_harness.as_deref(), Some("broca"));
         assert_eq!(
             broca["runner"],
-            json!({"provider":"opencode-go", "model":"deepseek-v4.1-flash"})
+            json!({"provider":"opencode-go", "model":"deepseek-v4.1-flash", "module":"broca", "route":{"provider":"opencode-go", "model":"deepseek-v4.1-flash"}})
         );
     }
 
@@ -13829,8 +13961,8 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             credentials,
             &empty_opencode_auth(),
         )
@@ -14029,7 +14161,7 @@ mod tests {
         );
         assert_eq!(
             confined["runner"],
-            json!({"provider": "anthropic", "model": "claude-opus-5-5"})
+            json!({"provider": "anthropic", "model": "claude-opus-5-5", "module":"broca", "route":{"provider":"anthropic", "model":"claude-opus-5-5"}})
         );
         assert!(
             explanation.contains("confined to the caller's 4 listed models: 1 reachable"),
@@ -14074,7 +14206,7 @@ mod tests {
                 let response = run_route_wire_request_with_paths(
                     &store,
                     request,
-                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                    &test_operator_config(),
                     &broca_credentials,
                 )
                 .await;
@@ -14134,7 +14266,7 @@ mod tests {
         let response = run_route_wire_request_with_paths(
             &store,
             broca_select_request(&[], Some("broca")),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             &empty_broca_credentials(),
         )
         .await;
@@ -14388,8 +14520,8 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &empty_broca_credentials(),
             &empty_opencode_auth(),
         )
@@ -14737,7 +14869,7 @@ mod tests {
                 "targetAgent":"mason", "requestedRequirements":{"iq":72,"eq":0},
                 "availableModels":[], "modelPin":"openai/gpt-5.5:high"
             }}),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             &empty_broca_credentials(),
         )
         .await;
@@ -14983,7 +15115,8 @@ mod tests {
             body["result"]["runner"],
             json!({"provider": "anthropic", "model": "claude-opus-4-1",
                    "auth": {"method": "apikey", "account": "work"},
-                   "pool": "anthropic-platform", "pool_session": session}),
+                   "pool": "anthropic-platform", "pool_session": session,
+                   "module":"broca", "route":{"provider":"anthropic-platform", "model":"claude-opus-4-1"}}),
             "{body}"
         );
         assert_eq!(
@@ -16324,7 +16457,7 @@ mod tests {
             &rig,
             saturation_select_params(None),
             &saturation_facts(),
-            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
         )
         .await;
         let next: serde_json::Value = serde_json::from_slice(&next.body).unwrap();
@@ -16384,7 +16517,7 @@ mod tests {
         for variant in [None, Some("thinking")] {
             let response = run_route_wire_request_with_paths(&store, json!({"method": ROUTE_MODEL_UPSERT_OP,
                 "params":{"providerID":"meta","modelID":"muse-wonder-1.0","variant":variant,"elo":1808,"eq":1600}
-            }), Path::new("/nonexistent/prefrontal-routing.jsonc"), &credentials).await;
+            }), &test_operator_config(), &credentials).await;
             assert_eq!(
                 response.header.ty,
                 FrameType::Response,
@@ -16840,7 +16973,7 @@ mod tests {
                 store,
                 &Arc::new(Mutex::new(None)),
                 config_path,
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                &test_operator_config(),
                 &catalog_broca_credentials(store),
                 &empty_opencode_auth(),
             )
@@ -18078,13 +18211,8 @@ mod tests {
                 ),
             ] {
                 take_operator_warnings();
-                let reply = run_select_against_rig(
-                    &rig,
-                    params,
-                    &[],
-                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                )
-                .await;
+                let reply =
+                    run_select_against_rig(&rig, params, &[], &test_operator_config()).await;
                 let error = error_body(&reply);
                 if label == "unresolved requirements" {
                     assert_eq!(error.code, "invalid_requirements", "{}", error.message);
@@ -18120,7 +18248,7 @@ mod tests {
                 run_route_wire_request_with_paths(
                     &store,
                     broca_select_request(&["opencode-go/m-native-fast"], Some("broca")),
-                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                    &test_operator_config(),
                     &broca_credentials,
                 )
             };

@@ -10,6 +10,109 @@ use std::collections::HashMap;
 
 use prefrontal_routing_core::model_facts::{fact_to_route, ModelFact};
 
+/// Normalized selection inputs. Wire adapters supply reachability and hard-pin
+/// admission, but share requirements, entity rules, ordering and scoring here.
+#[derive(Clone, Copy)]
+pub(crate) struct SelectionPass<'a> {
+    pub consumer: &'a str,
+    pub target_agent: &'a str,
+    pub requirements: ModelRequirements,
+    pub required_capabilities: Option<prefrontal_routing_core::model_router::RequiredCapabilities>,
+    pub facts: &'a [ModelFact],
+    pub snapshot: &'a prefrontal_routing_core::ModelRouteStateSnapshot,
+    pub exclude: &'a [String],
+    pub operator_exclude: &'a [String],
+    pub consumer_exclude: &'a [String],
+    pub subscription_keys: &'a std::collections::HashSet<String>,
+    pub priced_per_token: bool,
+    pub rejections: &'a HashMap<String, String>,
+    pub config: &'a RoutingConfig,
+    pub slots: Option<&'a ConcurrencySlots>,
+    pub min_band: Option<f64>,
+    pub prefer_prompt_cache: bool,
+    pub providers_without_prompt_cache: &'a [String],
+    pub operator_config: &'a crate::config_overrides::LiveConfig,
+}
+
+impl<'a> SelectionPass<'a> {
+    pub fn input(
+        &self,
+        available: &std::collections::HashSet<String>,
+        snapshot: prefrontal_routing_core::ModelRouteStateSnapshot,
+    ) -> SelectModelRouteInput<'a> {
+        let subscription_keys = self.subscription_keys.clone();
+        let priced_per_token = self.priced_per_token;
+        SelectModelRouteInput {
+            target_agent: self.target_agent.to_owned(),
+            requirements: self.requirements,
+            available_models: available.clone(),
+            facts: self.facts.to_vec(),
+            runtime_snapshot: Some(snapshot),
+            exclude_route_keys: self.exclude.to_vec(),
+            operator_exclude_keys: self.operator_exclude.to_vec(),
+            required_capabilities: self.required_capabilities,
+            is_subscription_route: Some(Box::new(move |route| {
+                subscription_covered(priced_per_token, &subscription_keys, route)
+            })),
+            min_best_effort_adequacy: self.min_band,
+            prefer_prompt_cache: self.prefer_prompt_cache,
+            providers_without_prompt_cache: self
+                .providers_without_prompt_cache
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    pub fn score(
+        &self,
+        available: &std::collections::HashSet<String>,
+    ) -> Result<SelectedModelRoute, prefrontal_routing_core::model_router::NoRouteError> {
+        let allowed = available
+            .iter()
+            .filter(|route| {
+                self.operator_config
+                    .route_allowed(self.consumer, route, false)
+            })
+            .cloned()
+            .collect();
+        select_candidates(
+            self.input(&allowed, self.snapshot.clone()),
+            self.config,
+            self.slots,
+            self.consumer_exclude,
+            self.rejections,
+        )
+    }
+
+    pub fn select<E>(
+        &self,
+        available: &std::collections::HashSet<String>,
+        request_pin: Option<&str>,
+        project_pin: Option<&str>,
+        continuing: Option<&str>,
+        admit_pin: impl FnMut(&str) -> Result<SelectedModelRoute, E>,
+    ) -> Result<
+        (SelectedModelRoute, OrderBasis),
+        OrderFailure<E, prefrontal_routing_core::model_router::NoRouteError>,
+    > {
+        let policy = self.operator_config.consumer_policy(
+            self.consumer,
+            &crate::config_policy::ConsumerPolicy::default(),
+            &std::collections::BTreeMap::new(),
+        );
+        select_ordered(
+            available,
+            request_pin,
+            project_pin,
+            continuing,
+            admit_pin,
+            |only| self.score(only),
+            || select_in_order(available, &policy, |only| self.score(only)),
+        )
+    }
+}
+
 pub(crate) enum CandidateSource<'a> {
     Host {
         auth_types: &'a HashMap<String, String>,
@@ -333,16 +436,13 @@ pub(crate) fn requires_metered(consumer: Option<Consumer>) -> bool {
 }
 
 /// Whether this selection runs priced per token. An explicit
-/// `pay_per_token` on the consumer is the authority. When the flag is absent,
-/// the historical request classes stay priced per token so a config that has
-/// not written the flag yet does not change class.
+/// `pay_per_token` on the consumer is the authority; the consumer's name does
+/// not imply a payment class. Conversion writes flags for the old classes.
 pub(crate) fn priced_per_token(
     policy: &crate::config_policy::ConsumerPolicy,
-    consumer: Option<Consumer>,
+    _consumer: Option<Consumer>,
 ) -> bool {
-    policy
-        .pay_per_token
-        .unwrap_or_else(|| requires_metered(consumer))
+    policy.pay_per_token == Some(true)
 }
 
 /// Copy vault payment methods onto an admission-only fact list. Used when a
@@ -470,8 +570,7 @@ pub(crate) fn select_ordered<T, PinE, ScoreE>(
 /// The runner for a chosen route: the consumer's `runner` when it names one,
 /// otherwise the first entry in array order that can run the route.
 ///
-/// Module ids are not sorted. A session's runner is not read; nothing in the
-/// session binding returns one, so the operator's array is the whole rule.
+/// Module ids are not sorted, and session data does not choose the runner.
 pub(crate) fn choose_runner<'a>(
     runners: &'a [crate::config_policy::RunnerPolicy],
     consumer_runner: Option<&str>,
@@ -480,7 +579,9 @@ pub(crate) fn choose_runner<'a>(
     runs: impl Fn(&crate::config_policy::RunnerPolicy, &str, &str) -> bool,
 ) -> Option<&'a crate::config_policy::RunnerPolicy> {
     if let Some(module) = consumer_runner.filter(|module| !module.is_empty()) {
-        return runners.iter().find(|runner| runner.module == *module);
+        return runners
+            .iter()
+            .find(|runner| runner.module == *module && runs(runner, route_key, capacity_key));
     }
     runners
         .iter()
@@ -645,8 +746,8 @@ impl Pin {
 #[derive(Debug, Default, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PinFallback {
-    #[default]
     Route,
+    #[default]
     None,
 }
 
@@ -999,7 +1100,7 @@ mod order_unit_tests {
             || Ok::<_, &str>("mode"),
         )
         .unwrap();
-        assert_eq!((chosen, basis), ("mode".to_owned(), OrderBasis::Mode));
+        assert_eq!((chosen, basis), ("mode", OrderBasis::Mode));
     }
 
     #[test]

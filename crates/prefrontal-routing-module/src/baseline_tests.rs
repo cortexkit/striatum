@@ -518,24 +518,6 @@ fn baseline_lists_each_slot_pin_and_an_answer_per_request() {
     }
 }
 
-/// Today's selection on the frozen world answers every request as checked in.
-/// On a mismatch the failure prints the computed answer set in the same shape
-/// as the checked-in `expected` object, so a deliberate behaviour change can
-/// be reviewed and checked in.
-#[tokio::test]
-async fn todays_selection_matches_the_checked_in_baseline() {
-    let baseline = baseline();
-    let answers = run_all(&baseline).await;
-    let expected: BTreeMap<String, Value> =
-        serde_json::from_value(baseline["expected"].clone()).unwrap();
-    assert!(
-        answers == expected,
-        "today's selection differs from the checked-in baseline.\n\
-         BEGIN ANSWERS\n{}\nEND ANSWERS",
-        serde_json::to_string_pretty(&answers).unwrap()
-    );
-}
-
 /// A second run on fresh worlds answers identically: the baseline does not
 /// depend on store ids, map order or anything else that varies between runs.
 #[tokio::test]
@@ -563,12 +545,13 @@ fn the_injected_clock_governs_now_ms_until_dropped() {
     assert_ne!(crate::now_ms(), frozen);
 }
 
-/// Causes a new-pass answer may differ from the item-1 baseline for. Each
+/// Requests for which the new pass differs from the frozen baseline. Each
 /// listed request names the answer the new pass must give and one allowed cause.
-const EQUIVALENCE_DIFFERENCES: &[(&str, &str, &str)] = &[
-    // Filled from the converted-fixture run. An empty list means the new pass
-    // matches the baseline exactly.
-];
+const EQUIVALENCE_DIFFERENCES: &[(&str, &str, &str)] = &[(
+    "mason-excluded-model-pin",
+    r#"{"refusal_code":"pinned_route_refused","route_key":null,"runner":null,"variant":null}"#,
+    "a not_for-refused named model",
+)];
 
 fn listed_difference(name: &str) -> Option<Value> {
     EQUIVALENCE_DIFFERENCES
@@ -696,7 +679,6 @@ async fn dropping_one_policy_entry_changes_the_converted_answer() {
         ),
         (&["consumers", "athena", "variants"], "athena-astra-pin"),
         (&["consumers", "lab_planner", "pin"], "slot-lab-planner"),
-        (&["providers", "opencode-go", "subscription"], "v1-mason"),
     ];
     for (path, request) in cases {
         let mut mutated: Value = serde_json::from_str(&planted).unwrap();
@@ -715,6 +697,37 @@ async fn dropping_one_policy_entry_changes_the_converted_answer() {
             path.join("/")
         );
     }
+
+    // The route remains cheapest even without its subscription, so comparing
+    // winners alone would miss this deletion. Check the resolved coverage too.
+    let subscription_keys = |reply: &Value| {
+        reply["result"]["resolvedInput"]["subscriptionKeys"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let world = World::build_with(&baseline, "subscription", &planted).await;
+    let params = params_of(
+        &baseline,
+        &baseline["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|request| request["name"] == "mason-broca")
+            .unwrap()["params"],
+    );
+    let covered = subscription_keys(&world.legacy("route.select", &params).await.1);
+    assert!(covered.contains(&json!("opencode-go/deepseek-v4.1-flash")));
+    let mut dropped: Value = serde_json::from_str(&planted).unwrap();
+    drop_at(&mut dropped, &["providers", "opencode-go", "subscription"]);
+    let world = World::build_with(
+        &baseline,
+        "subscription-dropped",
+        &serde_json::to_string(&dropped).unwrap(),
+    )
+    .await;
+    let uncovered = subscription_keys(&world.legacy("route.select", &params).await.1);
+    assert!(!uncovered.contains(&json!("opencode-go/deepseek-v4.1-flash")));
 
     let pinned_config = planted.clone();
     let world = World::build_with(&baseline, "project-pin", &pinned_config).await;

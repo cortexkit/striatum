@@ -12,7 +12,20 @@ pub fn document(document: &str) -> String {
     }) {
         super::config_convert::convert(document).unwrap_or_else(|_| document.to_owned())
     } else {
-        document.to_owned()
+        match value {
+            Some(mut value) if value.is_object() => {
+                // Selection fixtures that predate runner configuration used
+                // Broca implicitly. State that test reach explicitly; an
+                // explicitly empty array still tests an unconfigured registry.
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .entry("runners")
+                    .or_insert_with(|| serde_json::json!([{"module": "broca", "via_vault": true}]));
+                value.to_string()
+            }
+            _ => document.to_owned(),
+        }
     }
 }
 

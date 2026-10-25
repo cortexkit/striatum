@@ -581,6 +581,10 @@ impl RoutingSubject for KitSubject {
 /// runner's own declaration, which routing does not read yet.
 /// Each is expected to fail until routing serves it; the work that makes one
 /// pass removes it here, and the full-kit verdict holds once the list is empty.
+/// The `affinity_holds_until_failure_report` check in
+/// cortexkit-role-routing-conformance 0.4.0 is a separate contract disagreement:
+/// it ends affinity on failure, while routing's continuing-conversation policy
+/// deliberately keeps it. The live order tests assert that policy directly.
 const NOT_YET_SERVED: &[&str] = &[
     "parent_account_preference",
     "parent_account_fallback",
@@ -595,6 +599,7 @@ const NOT_YET_SERVED: &[&str] = &[
     "operator_config_overrides_declared_default",
     "declared_consumer_unverified_entry_ignored",
     "declared_consumer_conflict_refused",
+    "affinity_holds_until_failure_report",
     "harness_only_when_declared",
 ];
 
