@@ -520,8 +520,9 @@ fn baseline_lists_each_slot_pin_and_an_answer_per_request() {
 }
 
 /// Today's selection on the frozen world answers every request as checked in.
-/// On a mismatch the failure prints the whole answer set as the `expected`
-/// object, so a deliberate behaviour change can be reviewed and checked in.
+/// On a mismatch the failure prints the computed answer set in the same shape
+/// as the checked-in `expected` object, so a deliberate behaviour change can
+/// be reviewed and checked in.
 #[tokio::test]
 async fn todays_selection_matches_the_checked_in_baseline() {
     let baseline = baseline();
