@@ -14,8 +14,9 @@
 //! credential, so the read-time subscription view of the catalog row (its
 //! subsidy multiplier and billing plane) is never copied onto the borrowed row.
 //!
-//! The module keeps its historical name: the operator's `score_alias` map it
-//! used to read is gone, and the vault is now the only source of the mapping.
+//! The module keeps its historical name. The config loader still parses the
+//! operator's old `score_alias` map, but nothing here reads it: the vault is
+//! the only source of the mapping.
 
 use std::collections::{BTreeMap, BTreeSet};
 
