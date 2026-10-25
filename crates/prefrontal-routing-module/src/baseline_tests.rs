@@ -92,7 +92,7 @@ impl World {
             .expect("open the routing store"),
         );
         let config_path = dir.join("prefrontal-routing.jsonc");
-        std::fs::write(&config_path, CONFIG).unwrap();
+        crate::test_config::write(&config_path, CONFIG).unwrap();
         let auth_path = dir.join("auth.json");
         std::fs::write(&auth_path, baseline["auth_json"].to_string()).unwrap();
 

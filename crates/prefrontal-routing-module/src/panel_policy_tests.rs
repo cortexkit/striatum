@@ -16,7 +16,7 @@ mod class_panel_policy {
             let rig = Rig::new("class-panel-policy");
             let store: SharedStore = Arc::new(rig.open_store());
             let path = rig.dir.join("routing.jsonc");
-            std::fs::write(&path, config.to_string()).unwrap();
+            crate::test_config::write(&path, config.to_string()).unwrap();
             for (provider, model, family, elo) in [
                 ("openai", "gpt-6-astra", "gpt", 1800.0),
                 ("kimi-code-plan-global", "k3", "kimi", 1750.0),
@@ -77,7 +77,7 @@ mod class_panel_policy {
         }
 
         fn edit(&self, config: serde_json::Value, mtime: u64) {
-            std::fs::write(&self.path, config.to_string()).unwrap();
+            crate::test_config::write(&self.path, config.to_string()).unwrap();
             set_config_mtime(&self.path, mtime);
         }
     }

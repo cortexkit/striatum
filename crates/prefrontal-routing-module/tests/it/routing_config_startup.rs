@@ -1,6 +1,11 @@
 //! Exercise startup before a daemon connection: bad operator policy must stop
 //! the real process rather than silently permit models the operator excluded.
 
+#[path = "../../src/config_convert.rs"]
+mod config_convert;
+#[path = "../../src/test_config.rs"]
+mod test_config;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -64,9 +69,9 @@ fn renamed_refusal(xdg: bool) {
         let directory = home.config_dir(xdg);
         let old = directory.join("alfonso-routing.jsonc");
         let new = directory.join("prefrontal-routing.jsonc");
-        std::fs::write(&old, "old settings must never be read").unwrap();
+        test_config::write_raw(&old, "old settings must never be read").unwrap();
         if both {
-            std::fs::write(&new, "{}").unwrap();
+            test_config::write_raw(&new, "{}").unwrap();
         }
         let message = stderr(home.run(xdg));
         assert!(message.contains("config_renamed"), "{message}");
@@ -98,19 +103,23 @@ fn config_renamed_resolves_home_paths_at_startup() {
 
 fn invalid_startup(document: &str, token: &str) {
     let home = Home::new();
-    std::fs::write(
+    test_config::write_raw(
         home.config_dir(true).join("prefrontal-routing.jsonc"),
         document,
     )
     .unwrap();
     let message = stderr(home.run(true));
     assert!(message.contains(token), "{message}");
+    assert!(message.contains("prefrontal-routing.jsonc"), "{message}");
     assert!(!message.contains("missing-connection-file"), "{message}");
 }
 
 #[test]
-fn exclude_shape_refuses_startup() {
-    invalid_startup(r#"{"model_routing":{"exclude":[]}}"#, "exclude_shape");
+fn old_shape_refuses_startup_and_names_converter() {
+    invalid_startup(
+        r#"{"model_routing":{"exclude":[]}}"#,
+        "prefrontal-routing config-convert",
+    );
 }
 
 #[test]
@@ -119,30 +128,30 @@ fn config_key_removed_refuses_startup() {
 }
 
 #[test]
-fn account_selection_shadow_refuses_startup_with_the_delete_remedy() {
+fn old_account_selection_refuses_startup_with_converter() {
     invalid_startup(
         r#"{"account_selection":{"enabled":true,"shadow":true}}"#,
-        "config_key_removed: account_selection.shadow; delete it; account selection serves directly",
+        "prefrontal-routing config-convert",
     );
 }
 
 #[test]
-fn explicit_only_providers_refuses_startup_with_the_exclude_remedy() {
+fn old_explicit_only_providers_refuses_startup_with_converter() {
     invalid_startup(
         r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,
-        "config_key_removed: model_routing.explicit_only_providers; list the provider in model_routing.exclude.all; pins still work",
+        "prefrontal-routing config-convert",
     );
 }
 
 #[test]
 fn unknown_key_refuses_startup() {
-    invalid_startup(r#"{"model_routing":{"unknown":true}}"#, "unknown field");
+    invalid_startup(r#"{"models":{"p/m":{"unknown":true}}}"#, "unknown field");
 }
 
 #[test]
 fn absent_routing_file_with_xdg_does_not_read_home_legacy_file() {
     let home = Home::new();
-    std::fs::write(home.config_dir(false).join("alfonso-routing.jsonc"), "{}").unwrap();
+    test_config::write_raw(home.config_dir(false).join("alfonso-routing.jsonc"), "{}").unwrap();
     let message = stderr(home.run(true));
     assert!(!message.contains("config_renamed"), "{message}");
     assert!(

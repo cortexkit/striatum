@@ -257,9 +257,7 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
         "account_hold" => Refusal::account_hold(wait_until().unwrap_or_else(now_ms)),
         "account_pool_exhausted" => Refusal::account_pool_exhausted(wait_until()),
         "invalid_request" => Refusal::invalid_request("params", message.clone()),
-        "account_selection_disabled" | "store_error" => {
-            Refusal::new(RefusalCode::AccountSelectionUnavailable, message.clone())
-        }
+        "store_error" => Refusal::new(RefusalCode::AccountSelectionUnavailable, message.clone()),
         other => Refusal::new(RefusalCode::parse(other), message.clone()),
     };
     refusal.message = message;

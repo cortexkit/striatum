@@ -110,7 +110,7 @@ fn harness_of(route_keys: &[&str], plan_prices: Value) -> Arc<Harness> {
     credentials.publish_plan_prices(&plan_prices);
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
-        config["model_routing"]["runners"] = json!([{ "module": "runner-one" }]);
+        config["runners"] = json!([{ "module": "runner-one" }]);
     });
     harness
 }
@@ -153,7 +153,7 @@ async fn magic_context_consumers_select_with_default_policy() {
     }
 
     harness.edit_config(|config| {
-        config["model_routing"]["exclude"] = json!({ "all": [PLAN] });
+        config["models"][PLAN] = json!({"pin_only": true});
     });
     for consumer in consumers {
         let reply = route.call("route.select", &select(consumer)).await;
@@ -222,7 +222,7 @@ async fn codemode_ranks_routes_at_list_price_never_at_a_subscription_subsidy() {
         json!({ "prices": [{ "provider_id": "plan-provider" }] }),
     );
     harness.edit_config(|config| {
-        config["model_routing"]["subscription_multipliers"] = json!({ "metered-b": 40.0 });
+        config["providers"]["metered-b"] = json!({ "subscription_multiplier": 40.0 });
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
 

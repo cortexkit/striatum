@@ -50,7 +50,11 @@ async fn configured() -> (std::sync::Arc<Harness>, Route) {
         .map(|consumer| consumer.id)
         .collect();
     harness.edit_config(|config| {
-        config["model_routing"]["consumers"] = json!(consumers);
+        config["consumers"] = consumers
+            .iter()
+            .map(|id| ((*id).to_owned(), json!({})))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+            .into();
     });
     install_catalog(&harness, &fixture::catalog());
     let route = harness.bind(reserved(fixture::CONSUMER), None).await;
@@ -119,6 +123,74 @@ fn admission(admission_id: &str) -> Value {
         "conversation_key": format!("conversation-{admission_id}"),
         "admission_id": admission_id,
     })
+}
+
+#[tokio::test]
+async fn converted_disabled_account_selection_stays_disabled() {
+    let (harness, _) = configured().await;
+    let converted = crate::config_convert::convert_value(json!({
+        "account_selection": {"enabled": false}
+    }))
+    .unwrap();
+    harness.edit_config(|config| config["accounts"] = converted["accounts"].clone());
+    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
+    let response = runner
+        .call("route.account_for", &admission("disabled"))
+        .await;
+    assert_eq!(response.0, FrameType::Error, "{}", response.1);
+    assert_eq!(
+        response.1["code"], "account_selection_disabled",
+        "{}",
+        response.1
+    );
+}
+
+#[tokio::test]
+async fn named_model_cannot_bypass_operator_not_for() {
+    let (harness, route) = configured().await;
+    harness.edit_config(|config| {
+        config["models"]["example-provider/model-a"] = json!({"not_for": [fixture::SUMMARY]});
+    });
+    let response = route
+        .call(
+            "route.select",
+            &json!({
+                "consumer": fixture::SUMMARY, "requirements": {"iq": 50},
+                "pin": "example-provider/model-a"
+            }),
+        )
+        .await;
+    assert_eq!(response.0, FrameType::Error, "{}", response.1);
+    assert_eq!(response.1["code"], "pin_unavailable", "{}", response.1);
+    assert_eq!(response.1["detail"]["reason"], "excluded", "{}", response.1);
+}
+
+#[tokio::test]
+async fn describe_omits_all_pin_slots_and_select_refuses_them_as_consumers() {
+    let (harness, route) = configured().await;
+    harness.edit_config(|config| {
+        for slot in ["synthesizer", "lab_planner", "spec_designer"] {
+            config["consumers"][slot] = json!({"pin": {"model": "example-provider/model-a"}});
+        }
+    });
+    let describe = route.call("role.describe", &json!({})).await;
+    assert_eq!(describe.0, FrameType::Response, "{}", describe.1);
+    let ids: Vec<_> = describe.1["result"]["consumers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect();
+    for slot in ["synthesizer", "lab_planner", "spec_designer"] {
+        assert!(!ids.contains(&slot), "{ids:?}");
+        let selected = route
+            .call(
+                "route.select",
+                &json!({"consumer": slot, "requirements": {"iq": 50}}),
+            )
+            .await;
+        assert_eq!(selected.1["code"], "unknown_consumer", "{}", selected.1);
+    }
 }
 
 #[tokio::test]

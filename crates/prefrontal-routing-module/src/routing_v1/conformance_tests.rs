@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
 use cortexkit_role_routing_conformance::{
-    run_suite, Catalog, ConsumerConfig, Reply, RouteFailure, RouteStamp, RoutingRoute,
+    fixture, run_suite, Catalog, ConsumerConfig, Reply, RouteFailure, RouteStamp, RoutingRoute,
     RoutingSubject, CHECKS,
 };
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
@@ -101,10 +101,12 @@ impl Harness {
             catalog_health: Arc::new(Mutex::new(CatalogReachHealth::new(600_000))),
             auth_path,
             config_path: Mutex::new(dir.join("routing-0.jsonc")),
-            config: Mutex::new(json!({
-                "model_routing": {},
-                "account_selection": {"enabled": true},
-            })),
+            config: Mutex::new(
+                crate::config_convert::convert_value(json!({
+                    "model_routing": {}, "account_selection": {"enabled": true},
+                }))
+                .unwrap(),
+            ),
             config_generation: AtomicU64::new(0),
             route_epochs: tokio::sync::Mutex::new(RouteEpochs::new()),
             next_channel: AtomicU16::new(100),
@@ -130,7 +132,7 @@ impl Harness {
         edit(&mut config);
         let generation = self.config_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let path = self.dir.join(format!("routing-{generation}.jsonc"));
-        std::fs::write(&path, serde_json::to_vec_pretty(&*config).unwrap()).unwrap();
+        crate::test_config::write(&path, serde_json::to_vec_pretty(&*config).unwrap()).unwrap();
         // Reading it once here refuses an invalid document before any
         // request does.
         crate::config_overrides::initialize_config(&path).unwrap();
@@ -479,8 +481,10 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
         })
         .collect();
     harness.edit_config(|config| {
-        config["model_routing"]["runners"] = json!(runners);
-        config["model_routing"]["subscription"] = json!(subscription);
+        config["runners"] = json!(runners);
+        for key in &subscription {
+            config["models"][key] = json!({"subscription": true});
+        }
     });
     *crate::ACCOUNT_QUOTA
         .get()
@@ -510,27 +514,20 @@ impl RoutingSubject for KitSubject {
     }
 
     async fn configure_consumers(&self, consumers: &[ConsumerConfig]) -> Result<(), String> {
-        // Routing configures consumer ids only: whether a consumer runs
-        // priced per token is the rule of the request class its id names.
-        // A kit consumer whose priced_only that rule does not give cannot be
-        // configured.
-        for consumer in consumers {
-            let routing = crate::select_policy::requires_metered(
-                crate::select_policy::Consumer::from_id(&consumer.id),
-            );
-            if routing != consumer.priced_only {
-                return Err(format!(
-                    "consumer {} is priced_only {routing} in routing, the kit asks {}",
-                    consumer.id, consumer.priced_only
-                ));
-            }
-        }
-        let ids: Vec<&str> = consumers
-            .iter()
-            .map(|consumer| consumer.id.as_str())
-            .collect();
         self.harness().edit_config(|config| {
-            config["model_routing"]["consumers"] = json!(ids);
+            config["consumers"] = consumers
+                .iter()
+                .map(|consumer| {
+                    (
+                        consumer.id.clone(),
+                        json!({
+                            "owner": fixture::CONSUMER.trim_start_matches("reserved:"),
+                            "pay_per_token": consumer.priced_only,
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<String, Value>>()
+                .into();
         });
         Ok(())
     }
@@ -547,7 +544,7 @@ impl RoutingSubject for KitSubject {
         pin: &str,
     ) -> Result<(), String> {
         self.harness().edit_config(|config| {
-            config["model_routing"]["project_pins"][project_id][consumer] = json!(pin);
+            config["consumers"][consumer]["projects"][project_id] = json!({"pin": pin});
         });
         Ok(())
     }

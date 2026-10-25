@@ -38,7 +38,7 @@ mod consumer_and_pin {
             let rig = Rig::new("consumer-and-pin");
             let store = Arc::new(rig.open_store());
             let path = rig.dir.join("routing.jsonc");
-            std::fs::write(&path, config.to_string()).unwrap();
+            crate::test_config::write(&path, config.to_string()).unwrap();
             for (provider, model, cost) in [("openai", "pin", 0.1), ("fallback", "safe", 10.0)] {
                 let mut fact = fact(provider, model);
                 fact.cost_per_m_tok_out = Some(cost);
@@ -433,9 +433,9 @@ mod consumer_and_pin {
     }
 
     #[tokio::test]
-    async fn admitted_pin_bypasses_every_exclude_group_with_variant() {
+    async fn admitted_pin_bypasses_global_pin_only_policy_with_variant() {
         let rig = PolicyRig::new(json!({"model_routing": {
-            "exclude": {"all": ["openai"], "lab": ["openai/pin"]},
+            "exclude": {"all": ["openai"]},
         }}));
         let mut params = rig.params();
         params["pin"] = json!({"model": "openai/pin", "variant": "high"});
@@ -578,7 +578,7 @@ mod consumer_and_pin {
             first["result"]["selected"]["capacityKey"], "openai/pin",
             "{first}"
         );
-        std::fs::write(
+        crate::test_config::write(
             &rig.path,
             json!({"model_routing": {"pins": {
                 "lab_planner": {"model": "fallback/safe"}
@@ -689,11 +689,10 @@ mod consumer_and_pin {
         assert_eq!(rig.decisions(), 0);
     }
 
-    /// `exclude` keeps a route out of automatic choice only. For every group, an
-    /// unpinned request from the fenced consumer never gets the route, while a
-    /// launch that names it with `model=` is admitted.
+    /// Global exclusions convert to pin-only rules, while consumer restrictions
+    /// remain binding even when a launch names its model.
     #[tokio::test]
-    async fn launch_model_pin_admits_a_route_every_exclude_group_fences_from_automatic_choice() {
+    async fn launch_pin_bypasses_global_pin_only_but_not_consumer_restrictions() {
         for group in ["all", "mason", "sidekick", "athena", "lab", "core"] {
             let rig = PolicyRig::new(json!({"model_routing": {
                 "exclude": {group: ["openai"]},
@@ -718,12 +717,13 @@ mod consumer_and_pin {
                 );
                 params["modelPin"] = json!("openai/pin");
                 let pinned = rig.select(params).await;
-                assert_eq!(
-                    pinned["result"]["selected"]["capacityKey"], "openai/pin",
-                    "group={group} consumer={consumer}: {pinned}"
-                );
-                assert!(pinned.get("pin_rejected").is_none(), "{pinned}");
-                assert!(pinned["result"].get("pin_rejected").is_none(), "{pinned}");
+                if group == "all" {
+                    assert_eq!(pinned["result"]["selected"]["capacityKey"], "openai/pin", "{pinned}");
+                    assert!(pinned["result"].get("pin_rejected").is_none(), "{pinned}");
+                } else {
+                    assert_eq!(pinned["code"], "not_available", "{pinned}");
+                    assert!(pinned["result"]["selected"].is_null(), "{pinned}");
+                }
             }
         }
     }
