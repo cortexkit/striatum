@@ -867,6 +867,35 @@ mod tests {
         });
         fact.class_vector_is_overlay = true;
         let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+        credentials.apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                view: "incident".into(),
+                credentials: state
+                    .roster
+                    .as_ref()
+                    .unwrap()
+                    .identities
+                    .iter()
+                    .flat_map(|identity| {
+                        identity.credential_ids.iter().map(|id| {
+                            cortexkit_claustrum_client::ListedCredential {
+                                id: id.clone(),
+                                account_id: Some(identity.account_id.clone()),
+                                refresh_adapter: Some("anthropic".into()),
+                                provider_ids: vec!["anthropic".into()],
+                                credential_type: "oauth".into(),
+                                auth_method: Some("oauth".into()),
+                                categories: vec!["llm-provider".into()],
+                                state: "active".into(),
+                                ..Default::default()
+                            }
+                        })
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            now as u64,
+        );
         credentials.refresh_serving_methods(&state, &[fact.clone()], now);
         assert_eq!(
             credentials.plane_keys(),

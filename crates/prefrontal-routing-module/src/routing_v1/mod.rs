@@ -27,6 +27,7 @@ use crate::{
 mod accounts;
 mod describe;
 mod report;
+pub(crate) mod runners;
 mod select;
 
 #[cfg(test)]
@@ -37,6 +38,8 @@ mod dispatch_tests;
 mod metered_tests;
 #[cfg(test)]
 mod order_tests;
+#[cfg(test)]
+mod runners_tests;
 #[cfg(test)]
 mod scope_attribution_tests;
 

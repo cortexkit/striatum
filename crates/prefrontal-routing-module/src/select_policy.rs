@@ -260,10 +260,10 @@ pub(crate) fn prepare_candidates(
             let rows = guard
                 .as_ref()
                 .map_or(&[][..], |guard| guard.listed_credentials());
-            let catalog_providers: std::collections::HashSet<&str> = facts
+            let catalog_providers: std::collections::BTreeSet<String> = facts
                 .iter()
                 .filter(|fact| !catalog_targets.contains_key(&fact.provider_id))
-                .map(|fact| fact.provider_id.as_str())
+                .map(|fact| fact.provider_id.clone())
                 .collect();
             for fact in facts {
                 let route = fact_to_route(fact);
@@ -275,22 +275,11 @@ pub(crate) fn prepare_candidates(
                                 .categories
                                 .iter()
                                 .any(|category| category == "llm-provider")
-                            && (row.provider_ids.contains(&fact.provider_id)
-                                || (row.provider_ids.is_empty() && {
-                                    let vendors: std::collections::HashSet<_> = row
-                                        .serves
-                                        .iter()
-                                        .filter(|vendor| {
-                                            catalog_providers.contains(vendor.as_str())
-                                        })
-                                        .collect();
-                                    vendors.len() == 1
-                                        && vendors.iter().any(|vendor| {
-                                            **vendor == fact.provider_id
-                                                || catalog_targets.get(&fact.provider_id)
-                                                    == Some(*vendor)
-                                        })
-                                }))
+                            && crate::broca_credentials::credential_providers(
+                                row,
+                                &catalog_providers,
+                            )
+                            .contains(&fact.provider_id)
                     })
                     .collect();
                 let serving: Vec<_> = provider_rows
@@ -463,19 +452,9 @@ fn with_vault_methods(
         {
             continue;
         }
-        let method = row
-            .auth_method
-            .clone()
-            .filter(|method| !method.is_empty())
-            .unwrap_or_else(|| {
-                crate::broca_credentials::credential_method(
-                    row.refresh_adapter.as_deref(),
-                    &row.credential_type,
-                )
-            });
-        if method.is_empty() {
+        let Some(method) = row.auth_method.clone().filter(|method| !method.is_empty()) else {
             continue;
-        }
+        };
         for provider in &row.provider_ids {
             methods_by_provider
                 .entry(provider.clone())

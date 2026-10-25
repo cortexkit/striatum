@@ -2,8 +2,8 @@
 //! `route.account_observe`.
 //!
 //! Only a runner module may call them: a route whose principal the daemon
-//! verified as `reserved:<module>`, for a module routing's configuration
-//! lists as a runner. The calling runner comes from that principal, never
+//! verified as `reserved:<module>`, for a module on the effective runner
+//! registry. The calling runner comes from that principal, never
 //! from the body. Both ops run on routing's account allocator, the one the
 //! older ops serve Broca with; this module translates the v1 request into it
 //! and its answer back.
@@ -20,7 +20,7 @@ use prefrontal_routing_core::accounts::AllocatorPolicy;
 use prefrontal_routing_store::V1Recorded;
 use serde_json::{json, Value};
 
-use super::{account_ctx, now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
+use super::{account_ctx, now_ms, provider_refusal, store_refusal, Caller, Deps};
 use crate::account_selection::{self, OpReply, ACCOUNT_FOR_OP, ACCOUNT_OBSERVE_OP};
 use crate::{account_quota, config_overrides};
 
@@ -58,14 +58,14 @@ const OBSERVE_MEMBERS: &[&str] = &[
 
 /// The calling runner's module, when the caller is an attested runner.
 fn runner_module(caller: &Caller, deps: &Deps<'_>) -> Result<String, Refusal> {
-    let runners = operator_config(deps).v1_runners();
+    let runners = super::runners::effective(deps);
     caller
         .attested_module()
-        .filter(|module| runners.iter().any(|runner| runner.module == *module))
+        .filter(|module| runners.get(module).is_some())
         .map(str::to_owned)
         .ok_or_else(|| {
             Refusal::new(
-                RefusalCode::AccountNotAuthorized,
+                RefusalCode::parse("unscoped_caller"),
                 "only a runner module routing knows, on a route the daemon attested, may call this",
             )
         })

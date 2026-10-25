@@ -807,11 +807,19 @@ pub fn admit_routes_with_availability(
         if availability_rejections.contains_key(&route.route_key)
             || !is_route_available(&route, available_models)
         {
+            let runtime = merged_runtime_state(&route, runtime_snapshot);
+            let refusal = runtime.credential_refusal.as_ref();
             rejected.push(RejectedRoute {
-                detail: availability_rejections.get(&route.route_key).cloned(),
+                detail: if refusal.is_some() {
+                    None
+                } else {
+                    availability_rejections.get(&route.route_key).cloned()
+                },
                 route_key: route.route_key,
-                reason: REASON_NOT_AVAILABLE.to_string(),
-                credential_ids: Vec::new(),
+                reason: refusal
+                    .map_or(REASON_NOT_AVAILABLE, |mark| mark.reason)
+                    .to_string(),
+                credential_ids: refusal.map_or_else(Vec::new, |mark| mark.credential_ids.clone()),
             });
             continue;
         }
@@ -2819,5 +2827,66 @@ mod route_order_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod availability_credential_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_routes_preserve_credential_refusal_without_hiding_other_unavailability() {
+        let facts = ["accountless", "unavailable"]
+            .into_iter()
+            .map(|model| {
+                serde_json::from_value(serde_json::json!({
+                    "providerID":"vendor", "modelID":model, "confidence":"curated",
+                    "scores":{"elo":1800.0,"eq":1900.0,"speed":100.0}
+                }))
+                .unwrap()
+            })
+            .collect();
+        let result = select_model_route(SelectModelRouteInput {
+            target_agent: "fixture-consumer".into(),
+            requirements: ModelRequirements { iq: 20.0, eq: 20.0 },
+            available_models: HashSet::new(),
+            facts,
+            runtime_snapshot: Some(ModelRouteStateSnapshot {
+                now: 1_000.0,
+                by_route: HashMap::new(),
+                by_capacity: HashMap::from([(
+                    "vendor/accountless".into(),
+                    RouteRuntimeState {
+                        credential_refusal: Some(CredentialRefusalMark {
+                            reason: "no_eligible_account".into(),
+                            credential_ids: vec!["credential-a".into()],
+                        }),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            required_capabilities: None,
+            is_subscription_route: None,
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: HashSet::new(),
+        })
+        .unwrap_err();
+        let accountless = result
+            .rejected
+            .iter()
+            .find(|route| route.route_key == "vendor/accountless")
+            .unwrap();
+        assert_eq!(accountless.reason, "no_eligible_account");
+        assert_eq!(accountless.credential_ids, ["credential-a"]);
+        let unavailable = result
+            .rejected
+            .iter()
+            .find(|route| route.route_key == "vendor/unavailable")
+            .unwrap();
+        assert_eq!(unavailable.reason, "not_available");
+        assert!(unavailable.credential_ids.is_empty());
     }
 }

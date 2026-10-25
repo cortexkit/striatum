@@ -26,7 +26,6 @@ use prefrontal_routing_core::model_router::{
     ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
     SelectedModelRoute,
 };
-use prefrontal_routing_core::provider_model_spec::{parse_spec_list, resolve_spec};
 use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
 use prefrontal_routing_core::{fact_to_route, ModelFact, ModelRequirements, RoutingConfig};
 use prefrontal_routing_store::V1Decision;
@@ -154,8 +153,20 @@ pub(super) async fn select(
         .tool_capabilities
         .clone()
         .unwrap_or_default();
-    let runners: Vec<RunnerPolicy> = operator_config
-        .v1_runners()
+    let registry = deps
+        .broca_credentials
+        .lock()
+        .map(|credentials| {
+            super::runners::Registry::build(
+                operator_config.v1_runners(),
+                &credentials,
+                &facts,
+                now as u64,
+            )
+        })
+        .unwrap_or_default();
+    let runners: Vec<RunnerPolicy> = registry
+        .policies()
         .into_iter()
         .filter(|runner| {
             consumer_policy
@@ -183,18 +194,8 @@ pub(super) async fn select(
     if runners.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
-    let broca_served: HashSet<String> = crate::broca_served_routes(&facts, deps.broca_credentials)
-        .0
-        .into_iter()
-        .collect();
     let runs = |runner: &RunnerPolicy, route_key: &str, capacity_key: &str| -> bool {
-        match &runner.routes {
-            Some(specs) => resolve_spec(&parse_spec_list(specs), route_key, false),
-            None if runner.module == "broca" => {
-                broca_served.contains(route_key) || broca_served.contains(capacity_key)
-            }
-            None => true,
-        }
+        registry.runs(&runner.module, route_key, capacity_key)
     };
 
     // The routes some eligible runner runs, then the requirements the scorer
@@ -397,7 +398,10 @@ pub(super) async fn select(
         .store
         .record_decision_with_selection(&decision, Some(&runner.module), None)
         .map_err(store_refusal)?;
-    if runner.module == "broca" {
+    if registry
+        .get(&runner.module)
+        .is_some_and(|runner| runner.follows_account_choice)
+    {
         // The decision stands without the serving identity: an outcome for
         // it is then recorded as for a route with several credentials.
         if let Err(error) = crate::remember_provider_identity(

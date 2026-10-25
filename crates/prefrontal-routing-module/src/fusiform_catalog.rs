@@ -294,6 +294,7 @@ pub(crate) struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
     rates: BTreeMap<String, ModelRates>,
+    pub(crate) wire_apis: BTreeMap<String, String>,
     /// `(provider_id, model_id)` of entries served under a well-formed
     /// `provider/model` key whose facts could not be decoded. Applying the
     /// snapshot leaves their stored rows and cached base rates as they were:
@@ -723,6 +724,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut facts = Vec::with_capacity(reply.models.len());
     let mut rates = BTreeMap::new();
     let mut retained = BTreeSet::new();
+    let mut wire_apis = BTreeMap::new();
     // (served key, reason) for every entry left out of this snapshot.
     let mut unreadable: Vec<(String, String)> = Vec::new();
     for (served_key, entry) in reply.models {
@@ -745,6 +747,9 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         ) {
             Ok((fact, model_rates)) => {
                 facts.push(fact);
+                if let Some(api) = entry.get("transport.wire_api").and_then(Value::as_str) {
+                    wire_apis.insert(served_key.clone(), api.to_owned());
+                }
                 rates.insert(served_key, model_rates);
             }
             Err(reason) => {
@@ -762,6 +767,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         facts,
         rates,
         retained,
+        wire_apis,
     })
 }
 
@@ -1328,7 +1334,7 @@ fn report_unserved_routes(
     Ok(())
 }
 
-fn apply_mapped_catalog(
+pub(crate) fn apply_mapped_catalog(
     store: &SqliteRouteStateStore,
     snapshot: &CatalogSnapshot,
     credentials: Option<&crate::broca_credentials::SharedBrocaCredentials>,
@@ -1350,10 +1356,19 @@ fn apply_mapped_catalog(
         )
         .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
     if let Some(credentials) = credentials {
-        credentials
+        let mut credentials = credentials
             .lock()
-            .map_err(|_| error("credential cache poisoned"))?
-            .catalog_snapshot = Some(Arc::new(snapshot.clone()));
+            .map_err(|_| error("credential cache poisoned"))?;
+        // An unreadable entry is not a withdrawal of its last known transport.
+        let previous = credentials.wire_apis.clone();
+        credentials.wire_apis = snapshot.wire_apis.clone();
+        for (provider, model) in &snapshot.retained {
+            let key = format!("{provider}/{model}");
+            if let Some(api) = previous.get(&key) {
+                credentials.wire_apis.insert(key, api.clone());
+            }
+        }
+        credentials.catalog_snapshot = Some(Arc::new(snapshot.clone()));
     }
     Ok(())
 }
@@ -1853,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn muse_requires_fresh_operator_provider_mapping_even_with_catalog_fallback() {
+    fn muse_requires_fresh_provider_membership_even_with_catalog_fallback() {
         let rig = Rig::new("muse-no-auto-route");
         let facts = stored_muse_facts(&rig);
         let restricted = "meta/muse-wonder-full-1.0";
@@ -1871,11 +1886,11 @@ mod tests {
             1,
         );
         assert!(
-            !cache
+            cache
                 .served_routes(&facts, 1)
                 .0
                 .contains(&restricted.into()),
-            "a vendor name and OAuth token cannot substitute for provider_ids"
+            "one catalog vendor in serves supplies account-set membership"
         );
         assert!(cache
             .served_routes(&facts, 1)
@@ -2179,6 +2194,7 @@ mod tests {
                 view: "opencode-apikey".into(),
                 credentials: vec![ListedCredential {
                     id: "opencode-key".into(),
+                    auth_method: Some("apikey".into()),
                     categories: vec!["llm-provider".into()],
                     provider_ids: vec!["opencode".into()],
                     credential_type: "apikey".into(),
@@ -2271,6 +2287,7 @@ mod tests {
             credentials: vec![
                 ListedCredential {
                     id: "arbitrary-login-id".into(),
+                    auth_method: Some("chatgpt".into()),
                     categories: vec!["llm-provider".into()],
                     provider_ids: vec!["openai".into()],
                     refresh_adapter: Some("openai".into()),
@@ -2281,6 +2298,7 @@ mod tests {
                 },
                 ListedCredential {
                     id: "arbitrary-api-id".into(),
+                    auth_method: Some("apikey".into()),
                     categories: vec!["llm-provider".into()],
                     provider_ids: vec!["openai".into()],
                     credential_type: "apikey".into(),
@@ -2332,6 +2350,7 @@ mod tests {
                 ListedCredential {
                     provider_ids: vec!["google".into()],
                     refresh_adapter: Some("antigravity".into()),
+                    auth_method: Some("antigravity".into()),
                     credential_type: "oauth".into(),
                     state: "active".into(),
                     categories: vec!["llm-provider".into()],
@@ -2340,6 +2359,7 @@ mod tests {
                 ListedCredential {
                     provider_ids: vec!["openai".into()],
                     credential_type: "bogus".into(),
+                    auth_method: Some("bogus".into()),
                     state: "active".into(),
                     categories: vec!["llm-provider".into()],
                     ..Default::default()

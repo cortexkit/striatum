@@ -1192,6 +1192,13 @@ where
     let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
     broca_credentials.lock().unwrap().connection_file_path =
         Some(config.connection_file_path.clone());
+    loops.spawn(
+        "runner declarations",
+        routing_v1::runners::refresh_loop(
+            config.connection_file_path.clone(),
+            Arc::clone(&broca_credentials),
+        ),
+    );
     // Restored login identities identify their serving plane before the first
     // catalog poll; API-only providers wait for the non-secret listing poll.
     if let (Ok(accounts), Ok(facts), Ok(mut credentials)) = (
@@ -4195,23 +4202,34 @@ async fn handle_select_request(
         models: candidates.available,
         rejected: candidates.rejected,
     };
-    let configured_runners = operator_config.v1_runners();
-    let runner_runs = |runner: &config_policy::RunnerPolicy, key: &str, capacity: &str| {
-        runner.routes.as_ref().is_none_or(|specs| {
-            prefrontal_routing_core::provider_model_spec::resolve_spec(
-                &prefrontal_routing_core::provider_model_spec::parse_spec_list(specs),
-                key,
-                false,
+    let runner_registry = broca_credentials
+        .lock()
+        .map(|credentials| {
+            routing_v1::runners::Registry::build(
+                operator_config.v1_runners(),
+                &credentials,
+                &facts,
+                snapshot.now as u64,
             )
-        }) && (!runner.via_vault || broca_models.contains(key) || broca_models.contains(capacity))
+        })
+        .unwrap_or_default();
+    let configured_runners = runner_registry.policies();
+    let runner_runs = |runner: &config_policy::RunnerPolicy, key: &str, capacity: &str| {
+        runner_registry.runs(&runner.module, key, capacity)
     };
     if !host_run {
         mapped_availability.models.retain(|key| {
+            let capacity = facts
+                .iter()
+                .map(fact_to_route)
+                .find(|route| route.route_key == *key)
+                .map(|route| route.capacity_key)
+                .unwrap_or_else(|| key.clone());
             select_policy::choose_runner(
                 &configured_runners,
                 consumer_policy.runner.as_deref(),
                 key,
-                key,
+                &capacity,
                 &runner_runs,
             )
             .is_some()
@@ -4436,6 +4454,10 @@ async fn handle_select_request(
         }
         add_stage_ms(&timing.policy_ms, policy_started.elapsed());
         let selection_started = Instant::now();
+        let pin_credential_refusal = pin_snapshot
+            .by_capacity
+            .get(&pin_capacity)
+            .and_then(|state| state.credential_refusal.clone());
         let selection = {
             let input = select_policy::SelectionPass {
                 prefer_prompt_cache: false,
@@ -4662,17 +4684,28 @@ async fn handle_select_request(
                         return send(writer, response).await;
                     }
                 } else {
-                    if refusal.code == "not_available" && !host_run {
+                    let detail = pin_credential_refusal.as_ref()
+                        .filter(|mark| mark.reason == refusal.code)
+                        .map(|mark| json!({"reason": mark.reason, "credentialIds": mark.credential_ids}));
+                    if !host_run
+                        && matches!(
+                            refusal.code.as_str(),
+                            "not_available" | "no_eligible_account"
+                        )
+                    {
                         refusal.code = "pinned_route_refused".into();
                     }
-                    return send_route_error(
+                    return send_route_error_body(
                         writer,
                         ver,
                         channel,
                         epoch,
                         corr,
-                        &refusal.code,
-                        &refusal.message,
+                        ErrorBody {
+                            code: refusal.code,
+                            message: refusal.message,
+                            detail,
+                        },
                     )
                     .await;
                 }
@@ -7304,12 +7337,30 @@ async fn send_route_error(
     code: &str,
     message: &str,
 ) -> Result<(), ModuleError> {
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_string(),
-        message: message.to_string(),
-        detail: None,
-    })
-    .map_err(ModuleError::Json)?;
+    send_route_error_body(
+        writer,
+        ver,
+        channel,
+        epoch,
+        corr,
+        ErrorBody {
+            code: code.to_string(),
+            message: message.to_string(),
+            detail: None,
+        },
+    )
+    .await
+}
+
+async fn send_route_error_body(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    error: ErrorBody,
+) -> Result<(), ModuleError> {
+    let body = serde_json::to_vec(&error).map_err(ModuleError::Json)?;
     let frame = Frame::build_with_version(
         ver,
         FrameType::Error,
@@ -8531,6 +8582,12 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&pinned.body).unwrap();
         assert_eq!(pinned.header.ty, FrameType::Error, "{body}");
         assert_eq!(body["code"], reason);
+        assert_eq!(body["detail"]["reason"], reason, "{body}");
+        assert_eq!(
+            body["detail"]["credentialIds"],
+            json!(["apikey:cline-pass"]),
+            "{body}"
+        );
 
         // A change to the credential's vault listing (here its plan tier) is what can
         // fix the refusal, so it ends the fence. No timer does.
@@ -14877,6 +14934,8 @@ mod tests {
         .await;
         let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["code"], "pinned_route_refused", "{body}");
+        assert_eq!(body["detail"]["reason"], "no_eligible_account", "{body}");
+        assert_eq!(body["detail"]["credentialIds"], json!([]), "{body}");
         assert!(body["message"]
             .as_str()
             .unwrap()

@@ -397,6 +397,7 @@ fn account_state(
                 id: account.credential_id.clone(),
                 categories: vec!["llm-provider".into()],
                 credential_type: account.method.clone(),
+                auth_method: Some(account.method.clone()),
                 refresh_adapter: Some(account.provider.clone()),
                 state: "active".into(),
                 record_version: 1,
@@ -577,12 +578,13 @@ impl RoutingSubject for KitSubject {
 /// which the v1 account ops and report still refuse as unknown members. The
 /// next six need consumer declarations read from the daemon catalog, which
 /// this subject's `configure_catalog_declarations` hook does not support yet.
-/// The last needs `runner.harness` in the select answer, filled from a
-/// runner's own declaration, which routing does not read yet.
+/// The last needs `runner.harness` from a runner's own declaration. The shared
+/// runner declaration has no harness field, so answers omit it until the
+/// contract provides one.
 /// Each is expected to fail until routing serves it; the work that makes one
 /// pass removes it here, and the full-kit verdict holds once the list is empty.
 /// The `affinity_holds_until_failure_report` check in
-/// cortexkit-role-routing-conformance 0.4.0 is a separate contract disagreement:
+/// cortexkit-role-routing-conformance 0.5.0 is a separate contract disagreement:
 /// it ends affinity on failure, while routing's continuing-conversation policy
 /// deliberately keeps it. The live order tests assert that policy directly.
 const NOT_YET_SERVED: &[&str] = &[

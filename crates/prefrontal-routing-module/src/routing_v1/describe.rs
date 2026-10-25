@@ -40,6 +40,9 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         RoleDescribe::new(consumers, true),
         |describe, capability| describe.with_capability(*capability),
     );
-    serde_json::to_value(describe)
-        .map_err(|error| super::provider_refusal("internal_error", error.to_string()))
+    let mut value = serde_json::to_value(describe)
+        .map_err(|error| super::provider_refusal("internal_error", error.to_string()))?;
+    value["runners"] = serde_json::to_value(super::runners::effective(deps).entries)
+        .map_err(|error| super::provider_refusal("internal_error", error.to_string()))?;
+    Ok(value)
 }

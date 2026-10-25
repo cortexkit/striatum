@@ -1,0 +1,222 @@
+//! One effective view of operator runner policy and verified runner facts.
+
+use std::collections::BTreeSet;
+
+pub(crate) use cortexkit_role_routing::declarations::RunnerDeclaration;
+use cortexkit_role_routing::declarations::{RunnerPair, StandingLimits};
+use prefrontal_routing_core::RouteStateStore;
+use prefrontal_routing_core::{
+    make_route_key,
+    provider_model_spec::{parse_spec_list, resolve_spec},
+    ModelFact,
+};
+use serde::Serialize;
+
+use crate::{
+    broca_credentials::{credential_serves_fact, BrocaCredentials},
+    config_policy::RunnerPolicy,
+};
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct EffectiveRunner {
+    #[serde(flatten)]
+    pub policy: RunnerPolicy,
+    pub follows_account_choice: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standing_limits: Option<StandingLimits>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pairs: Option<Vec<RunnerPair>>,
+    #[serde(skip)]
+    route_policy: Option<Vec<String>>,
+    #[serde(skip)]
+    reachable_models: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Registry {
+    pub entries: Vec<EffectiveRunner>,
+}
+
+impl Registry {
+    pub(crate) fn build(
+        policies: Vec<RunnerPolicy>,
+        credentials: &BrocaCredentials,
+        facts: &[ModelFact],
+        now_ms: u64,
+    ) -> Self {
+        let catalog = facts
+            .iter()
+            .map(|fact| fact.provider_id.clone())
+            .collect::<BTreeSet<_>>();
+        let entries = policies
+            .into_iter()
+            .map(|mut policy| {
+                let declaration = credentials.runner_declarations.get(&policy.module);
+                let needs_vault = declaration.is_some() || policy.via_vault;
+                let reachable_models: BTreeSet<_> = facts
+                    .iter()
+                    .filter(|fact| {
+                        !needs_vault
+                            || (credentials.listing_is_fresh(now_ms)
+                                && credentials.listed_credentials().iter().any(|row| {
+                                    credential_serves_fact(row, fact, &catalog)
+                                        && declaration.is_none_or(|declaration| {
+                                            declaration
+                                                .standing_limits
+                                                .as_ref()
+                                                .and_then(|limits| {
+                                                    limits.explicit_providers.as_ref()
+                                                })
+                                                .is_none_or(|providers| {
+                                                    providers.contains(&fact.provider_id)
+                                                })
+                                                && declaration.pairs.iter().any(|pair| {
+                                                    credentials.wire_api(fact)
+                                                        == Some(pair.wire_api.as_str())
+                                                        && row.auth_method.as_ref()
+                                                            == Some(&pair.auth_method)
+                                                })
+                                        })
+                                }))
+                    })
+                    .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
+                    .collect();
+                let route_policy = policy.routes.clone();
+                let routes = facts
+                    .iter()
+                    .filter(|fact| {
+                        let key = make_route_key(
+                            &fact.provider_id,
+                            &fact.model_id,
+                            fact.variant.as_deref(),
+                        );
+                        reachable_models
+                            .contains(&format!("{}/{}", fact.provider_id, fact.model_id))
+                            && route_policy.as_ref().is_none_or(|specs| {
+                                resolve_spec(&parse_spec_list(specs), &key, false)
+                            })
+                    })
+                    .map(|fact| {
+                        make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
+                    })
+                    .collect();
+                policy.routes = Some(routes);
+                let follows_account_choice =
+                    declaration.map_or(policy.via_vault, |d| d.follows_account_choice);
+                let standing_limits = declaration.and_then(|d| d.standing_limits.clone());
+                if let Some(declaration) = declaration {
+                    policy.tool_capabilities = declaration.tool_capabilities.clone();
+                }
+                EffectiveRunner {
+                    policy,
+                    follows_account_choice,
+                    standing_limits,
+                    pairs: declaration.map(|declaration| declaration.pairs.clone()),
+                    route_policy,
+                    reachable_models,
+                }
+            })
+            .collect();
+        Self { entries }
+    }
+
+    pub(crate) fn policies(&self) -> Vec<RunnerPolicy> {
+        self.entries
+            .iter()
+            .map(|runner| runner.policy.clone())
+            .collect()
+    }
+
+    pub(crate) fn get(&self, module: &str) -> Option<&EffectiveRunner> {
+        self.entries
+            .iter()
+            .find(|runner| runner.policy.module == module)
+    }
+
+    pub(crate) fn runs(&self, module: &str, route: &str, capacity: &str) -> bool {
+        self.get(module).is_some_and(|runner| {
+            // Variants share their model's transport and credential reach, but
+            // operator route rules still judge the exact requested variant.
+            runner.reachable_models.contains(capacity)
+                && runner
+                    .route_policy
+                    .as_ref()
+                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+        })
+    }
+}
+
+pub(crate) fn effective(deps: &super::Deps<'_>) -> Registry {
+    let mut facts = deps.store.get_facts().unwrap_or_default();
+    deps.broca_credentials
+        .lock()
+        .map(|credentials| {
+            let targets = credentials.catalog_targets(&facts);
+            prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
+            Registry::build(
+                super::operator_config(deps).v1_runners(),
+                &credentials,
+                &facts,
+                crate::now_ms(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Read runner facts with the shared routing role declaration validator.
+pub(crate) fn parse_declaration(
+    slot: &serde_json::Value,
+) -> Result<Option<RunnerDeclaration>, String> {
+    cortexkit_role_routing::declarations::parse_consumer_declarations(slot)
+        .map(|declaration| declaration.runner)
+        .map_err(|error| error.to_string())
+}
+
+/// Each successful catalog read replaces the declaration snapshot, so removal
+/// or loss of nonce verification also removes a module's previously trusted facts.
+pub(crate) fn declarations_from_catalog(
+    modules: &serde_json::Value,
+) -> std::collections::BTreeMap<String, RunnerDeclaration> {
+    modules.as_array().into_iter().flatten().filter_map(|entry| {
+        if entry.get("nonce_verified").and_then(serde_json::Value::as_bool) != Some(true) {
+            return None;
+        }
+        let module = entry.get("module_id")?.as_str()?;
+        let slot = entry.get("role_declarations")?.get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)?;
+        match parse_declaration(slot) {
+            Ok(Some(declaration)) => Some((module.to_owned(), declaration)),
+            Ok(None) => None,
+            Err(error) => {
+                crate::warn_operator(format!("[prefrontal-routing] ignored invalid runner declaration from {module}: {error}"));
+                None
+            }
+        }
+    }).collect()
+}
+
+pub(crate) async fn refresh_loop(
+    connection_file: std::path::PathBuf,
+    credentials: crate::SharedBrocaCredentials,
+) {
+    use subc_client_rs::{ConsumerOptions, SubcConsumer};
+    loop {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
+                .await
+                .map_err(|error| error.to_string())?;
+            let catalog = consumer
+                .catalog_list()
+                .await
+                .map_err(|error| error.to_string())?;
+            serde_json::to_value(catalog.modules).map_err(|error| error.to_string())
+        })
+        .await;
+        if let Ok(Ok(modules)) = result {
+            let declarations = declarations_from_catalog(&modules);
+            if let Ok(mut credentials) = credentials.lock() {
+                credentials.runner_declarations = declarations;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
