@@ -138,9 +138,10 @@ mod tests {
     use super::*;
 
     fn request(outcome: &str, reset_at_ms: Option<u64>) -> ReportRequest {
-        ReportRequest {
-            reset_at_ms,
-            ..ReportRequest::new("d", Outcome::parse(outcome))
+        let request = ReportRequest::new("d", Outcome::parse(outcome));
+        match reset_at_ms {
+            Some(reset_at_ms) => request.with_reset_at_ms(reset_at_ms),
+            None => request,
         }
     }
 

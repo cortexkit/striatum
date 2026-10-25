@@ -1,0 +1,177 @@
+{
+  "about": [
+    "Conversion-equivalence baseline for the routing policy rebuild. The input is the owner's scrubbed live routing config (routing-config-live-2026-10-24.jsonc, pinned by sha256 below) plus every other input a selection reads, frozen here: the Fusiform catalog rows, the Fusiform plan-price providers, the Claustrum vault listing (every llm-provider row carries auth_method), the Insula quota reading, OpenCode's auth.json (provider auth types only, no secrets), the host's available-models list and the clock.",
+    "Only the config is a capture. The other inputs are a synthesized frozen world shaped like the live system on 2026-10-24: the providers, models, accounts and windows the config names, with invented scores, prices and usage. They are inputs, not evidence about live routing.",
+    "baseline_tests.rs runs today's selection on each request below, each from its own empty store, and checks the answer against `expected`: the route key, variant, runner and refusal code. For a legacy route.select the runner is the answer's `selected.harness` (null when routing names none) and the refusal code is the error frame's `code`, else the result's `pin_rejected`. For a routing/v1 select they are the answer's `route` and `runner.module`, and the error's `code`.",
+    "The `synthesizer` request is two steps, as core runs them: route.select_panel reports the configured synthesizer pin in `policy.pins.synthesizer`, and core then admits that pin with a pinned route.select."
+  ],
+  "config": {
+    "file": "routing-config-live-2026-10-24.jsonc",
+    "sha256": "9447e7e8b5803b1b231ea57e50ab04ac65c0ac7eeb6e488d4a7322bb17262ed1"
+  },
+  "clock_ms": 1792843200000,
+  "auth_json": {
+    "anthropic": {"type": "oauth"},
+    "openai": {"type": "oauth"},
+    "xai": {"type": "oauth"},
+    "google": {"type": "oauth"},
+    "meta": {"type": "oauth"},
+    "kimi-for-coding": {"type": "api"},
+    "opencode-go": {"type": "api"},
+    "openrouter": {"type": "api"},
+    "deepseek": {"type": "api"}
+  },
+  "catalog": {
+    "catalog_version": 1,
+    "rows": [
+      {"provider": "anthropic", "model": "claude-opus-5-5", "canonical_id": "anthropic/claude-opus-5-5", "family": "claude", "elo": 1872, "eq": 2060, "speed": 55, "context_window": 1000000, "max_output_tokens": 128000, "input_rate": 5.0, "output_rate": 25.0, "cache_read_rate": 0.5, "cost_tier": 4, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["oauth", "apikey"], "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"]},
+      {"provider": "anthropic", "model": "claude-sonnet-5-5", "canonical_id": "anthropic/claude-sonnet-5-5", "family": "claude", "elo": 1810, "eq": 1950, "speed": 70, "context_window": 1000000, "max_output_tokens": 64000, "input_rate": 3.0, "output_rate": 15.0, "cache_read_rate": 0.3, "cost_tier": 3, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["oauth", "apikey"], "reasoning_efforts": ["low", "medium", "high", "max"]},
+      {"provider": "anthropic", "model": "claude-haiku-5-5", "canonical_id": "anthropic/claude-haiku-5-5", "family": "claude", "elo": 1660, "eq": 1720, "speed": 140, "context_window": 200000, "max_output_tokens": 64000, "input_rate": 1.0, "output_rate": 5.0, "cache_read_rate": 0.1, "cost_tier": 2, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["oauth", "apikey"], "reasoning_efforts": ["low", "medium", "high"]},
+      {"provider": "openai", "model": "gpt-6.1-sol", "canonical_id": "openai/gpt-6.1-sol", "family": "gpt", "elo": 1884, "eq": 1900, "speed": 80, "context_window": 400000, "max_output_tokens": 128000, "input_rate": 1.25, "output_rate": 10.0, "cache_read_rate": 0.125, "cost_tier": 3, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["chatgpt", "apikey"], "reasoning_efforts": ["low", "medium", "high", "xhigh"]},
+      {"provider": "openai", "model": "gpt-6-sol", "canonical_id": "openai/gpt-6-sol", "family": "gpt", "elo": 1850, "eq": 1880, "speed": 80, "context_window": 400000, "max_output_tokens": 128000, "input_rate": 1.25, "output_rate": 10.0, "cache_read_rate": 0.125, "cost_tier": 3, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["chatgpt", "apikey"], "reasoning_efforts": ["low", "medium", "high", "xhigh"]},
+      {"provider": "openai", "model": "gpt-6-luna", "canonical_id": "openai/gpt-6-luna", "family": "gpt", "elo": 1740, "eq": 1640, "speed": 150, "context_window": 400000, "max_output_tokens": 128000, "input_rate": 0.25, "output_rate": 2.0, "cache_read_rate": 0.025, "cost_tier": 1, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["chatgpt", "apikey"], "reasoning_efforts": ["low", "medium", "high"]},
+      {"provider": "openai", "model": "gpt-6-astra", "canonical_id": "openai/gpt-6-astra", "family": "gpt", "elo": 1960, "eq": 2010, "speed": 40, "context_window": 400000, "max_output_tokens": 128000, "input_rate": 15.0, "output_rate": 120.0, "cache_read_rate": 1.5, "cost_tier": 6, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["chatgpt", "apikey"], "reasoning_efforts": ["medium", "high", "xhigh"]},
+      {"provider": "openai", "model": "gpt-5.6-sol", "canonical_id": "openai/gpt-5.6-sol", "family": "gpt", "elo": 1800, "eq": 1820, "speed": 85, "context_window": 400000, "max_output_tokens": 128000, "input_rate": 1.25, "output_rate": 10.0, "cache_read_rate": 0.125, "cost_tier": 3, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["chatgpt", "apikey"], "reasoning_efforts": ["low", "medium", "high", "xhigh"]},
+      {"provider": "xai", "model": "grok-4.7", "canonical_id": "xai/grok-4.7", "family": "grok", "elo": 1790, "eq": 1760, "speed": 90, "context_window": 2000000, "max_output_tokens": 64000, "input_rate": 3.0, "output_rate": 15.0, "cache_read_rate": 0.75, "cost_tier": 3, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["oauth", "apikey"], "reasoning_efforts": ["low", "high"]},
+      {"provider": "xai", "model": "grok-4.5", "canonical_id": "xai/grok-4.5", "family": "grok", "elo": 1720, "eq": 1700, "speed": 95, "context_window": 2000000, "max_output_tokens": 64000, "input_rate": 3.0, "output_rate": 15.0, "cache_read_rate": 0.75, "cost_tier": 3, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["oauth", "apikey"], "reasoning_efforts": ["low", "high"]},
+      {"provider": "xai", "model": "grok-build-0.1", "canonical_id": "xai/grok-build-0.1", "family": "grok", "elo": 1650, "eq": 1500, "speed": 160, "context_window": 256000, "max_output_tokens": 32000, "input_rate": 0.2, "output_rate": 1.5, "cache_read_rate": 0.02, "cost_tier": 1, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["oauth", "apikey"], "reasoning_efforts": null},
+      {"provider": "google", "model": "antigravity-gemini-4-argon", "canonical_id": "google/gemini-4-argon", "family": "gemini", "elo": 1915, "eq": 1990, "speed": 70, "context_window": 1000000, "max_output_tokens": 65536, "input_rate": 2.5, "output_rate": 15.0, "cache_read_rate": 0.25, "cost_tier": 3, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["antigravity"], "reasoning_efforts": ["low", "high"]},
+      {"provider": "google", "model": "gemini-3.6-flash", "canonical_id": "google/gemini-3.6-flash", "family": "gemini", "elo": 1700, "eq": 1600, "speed": 200, "context_window": 1000000, "max_output_tokens": 65536, "input_rate": 0.3, "output_rate": 2.5, "cache_read_rate": 0.03, "cost_tier": 1, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["antigravity", "apikey"], "reasoning_efforts": ["low", "medium", "high"]},
+      {"provider": "meta", "model": "muse-wonder-full-1.0", "canonical_id": "meta/muse-wonder-full-1.0", "family": "llama", "elo": 1895, "eq": 2030, "speed": 45, "context_window": 1000000, "max_output_tokens": 64000, "input_rate": 4.0, "output_rate": 20.0, "cache_read_rate": null, "cost_tier": 4, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["oauth"], "reasoning_efforts": ["low", "medium", "high", "xhigh"]},
+      {"provider": "meta", "model": "muse-spark-1.3-contributor", "canonical_id": "meta/muse-spark-1.3-contributor", "family": "llama", "elo": 1730, "eq": 1810, "speed": 120, "context_window": 1000000, "max_output_tokens": 64000, "input_rate": 0.6, "output_rate": 3.6, "cache_read_rate": null, "cost_tier": 2, "supports_tool_use": true, "supports_vision": true, "auth_methods": ["oauth"], "reasoning_efforts": ["low", "medium", "high", "xhigh"]},
+      {"provider": "kimi-code-plan-global", "model": "k3", "canonical_id": "moonshot/kimi-k3", "family": "kimi", "elo": 1830, "eq": 1915.5, "speed": 60, "context_window": 262144, "max_output_tokens": 32768, "input_rate": 0.6, "output_rate": 2.5, "cache_read_rate": 0.15, "cost_tier": 1, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "kimi-code-plan-global", "model": "k3-256k", "canonical_id": "moonshot/kimi-k3", "family": "kimi", "elo": 1830, "eq": 1915.5, "speed": 60, "context_window": 262144, "max_output_tokens": 32768, "input_rate": 0.6, "output_rate": 2.5, "cache_read_rate": 0.15, "cost_tier": 1, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "kimi-code-plan-global", "model": "k3.1-pro", "canonical_id": "moonshot/kimi-k3.1-pro", "family": "kimi", "elo": 1884, "eq": 2011.3, "speed": 55, "context_window": 262144, "max_output_tokens": 32768, "input_rate": 0.8, "output_rate": 3.5, "cache_read_rate": 0.2, "cost_tier": 2, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "kimi-code-plan-global", "model": "k3.1-pro-highspeed", "canonical_id": null, "family": "kimi", "elo": 1884, "eq": 2011.3, "speed": 140, "context_window": 262144, "max_output_tokens": 32768, "input_rate": 1.6, "output_rate": 7.0, "cache_read_rate": 0.4, "cost_tier": 3, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "kimi-for-coding", "model": "kimi-k3", "canonical_id": "moonshot/kimi-k3", "family": "kimi", "elo": 1830, "eq": 1915.5, "speed": 60, "context_window": 262144, "max_output_tokens": 32768, "input_rate": 0.6, "output_rate": 2.5, "cache_read_rate": 0.15, "cost_tier": 1, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "alibaba-token-plan", "model": "qwen3.8-max", "canonical_id": "qwen/qwen3.8-max", "family": "qwen", "elo": 1765, "eq": 1690, "speed": 50, "context_window": 262144, "max_output_tokens": 65536, "input_rate": 1.2, "output_rate": 6.0, "cache_read_rate": 0.24, "cost_tier": 3, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "ollama-cloud", "model": "glm-5.2", "canonical_id": "zhipu/glm-5.2", "family": "glm", "elo": 1750, "eq": 1680, "speed": 110, "context_window": 200000, "max_output_tokens": 128000, "input_rate": 0.6, "output_rate": 2.2, "cache_read_rate": 0.11, "cost_tier": 1, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "fireworks-ai", "model": "glm-5.2", "canonical_id": "zhipu/glm-5.2", "family": "glm", "elo": 1750, "eq": 1680, "speed": 120, "context_window": 200000, "max_output_tokens": 128000, "input_rate": 0.9, "output_rate": 3.0, "cache_read_rate": null, "cost_tier": 2, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "opencode-go", "model": "deepseek-v4.1-flash", "canonical_id": "deepseek/deepseek-v4.1-flash", "family": "deepseek", "elo": 1640, "eq": 1500, "speed": 130, "context_window": 128000, "max_output_tokens": 32768, "input_rate": 0.07, "output_rate": 0.28, "cache_read_rate": 0.007, "cost_tier": 0, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "opencode", "model": "big-pickle", "canonical_id": null, "family": "glm", "elo": 1600, "eq": 1450, "speed": 100, "context_window": 200000, "max_output_tokens": 32768, "input_rate": 0.0, "output_rate": 0.0, "cache_read_rate": null, "cost_tier": 0, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "deepseek", "model": "deepseek-v4.1", "canonical_id": "deepseek/deepseek-v4.1", "family": "deepseek", "elo": 1760, "eq": 1650, "speed": 60, "context_window": 128000, "max_output_tokens": 32768, "input_rate": 0.28, "output_rate": 1.1, "cache_read_rate": 0.028, "cost_tier": 1, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "openrouter", "model": "moonshotai-kimi-k3", "canonical_id": "moonshot/kimi-k3", "family": "kimi", "elo": 1830, "eq": 1915.5, "speed": 50, "context_window": 262144, "max_output_tokens": 32768, "input_rate": 0.6, "output_rate": 2.5, "cache_read_rate": null, "cost_tier": 1, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null},
+      {"provider": "inception", "model": "mercury-3", "canonical_id": "inception/mercury-3", "family": "other", "elo": 1641, "eq": 1555, "speed": 700, "context_window": 128000, "max_output_tokens": 32768, "input_rate": 0.25, "output_rate": 1.0, "cache_read_rate": 0.025, "cost_tier": 1, "supports_tool_use": true, "supports_vision": false, "auth_methods": ["apikey"], "reasoning_efforts": null}
+    ]
+  },
+  "plan_prices": {
+    "prices": [
+      {"provider_id": "anthropic"},
+      {"provider_id": "openai"},
+      {"provider_id": "xai"},
+      {"provider_id": "google"},
+      {"provider_id": "meta"},
+      {"provider_id": "kimi-code-plan-global"},
+      {"provider_id": "kimi-for-coding"},
+      {"provider_id": "alibaba-token-plan"},
+      {"provider_id": "ollama-cloud"},
+      {"provider_id": "opencode-go"}
+    ]
+  },
+  "credential_listing": {
+    "result": {
+      "credentials": [
+        {"id": "oauth:anthropic", "type": "oauth", "auth_method": "oauth", "categories": ["llm-provider"], "state": "active", "provider_ids": ["anthropic"], "serves": ["anthropic"], "refresh_adapter": "anthropic", "account_id": "00000000-0000-4000-8000-0000000000a1", "plan_tier": "max_20x", "operations": ["list"], "record_version": 40},
+        {"id": "oauth:anthropic:second", "type": "oauth", "auth_method": "oauth", "categories": ["llm-provider"], "state": "active", "provider_ids": ["anthropic"], "serves": ["anthropic"], "refresh_adapter": "anthropic", "account_id": "00000000-0000-4000-8000-0000000000a2", "plan_tier": "max_20x", "operations": ["list"], "record_version": 31},
+        {"id": "chatgpt:openai", "type": "oauth", "auth_method": "chatgpt", "categories": ["llm-provider"], "state": "active", "provider_ids": ["openai"], "serves": ["openai"], "refresh_adapter": "openai", "account_id": "00000000-0000-4000-8000-0000000000b1", "plan_tier": "pro_200", "operations": ["list"], "record_version": 22},
+        {"id": "chatgpt:openai:upgraded", "type": "oauth", "auth_method": "chatgpt", "categories": ["llm-provider"], "state": "active", "provider_ids": [], "serves": ["openai"], "refresh_adapter": "openai", "account_id": "00000000-0000-4000-8000-0000000000b2", "plan_tier": "pro_100", "operations": ["list"], "record_version": 3},
+        {"id": "apikey:openai", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["openai"], "serves": ["openai"], "operations": ["list"], "record_version": 7},
+        {"id": "oauth:xai", "type": "oauth", "auth_method": "oauth", "categories": ["llm-provider"], "state": "active", "provider_ids": ["xai"], "serves": ["xai"], "refresh_adapter": "xai", "account_id": "00000000-0000-4000-8000-0000000000c1", "plan_tier": "supergrok", "operations": ["list"], "record_version": 12},
+        {"id": "antigravity:google", "type": "oauth", "auth_method": "antigravity", "categories": ["llm-provider"], "state": "active", "provider_ids": ["google"], "serves": ["google", "anthropic", "openai"], "refresh_adapter": "antigravity", "account_id": "00000000-0000-4000-8000-0000000000d1", "operations": ["list"], "record_version": 9},
+        {"id": "oauth:meta", "type": "oauth", "auth_method": "oauth", "categories": ["llm-provider"], "state": "active", "provider_ids": ["meta"], "serves": ["meta"], "refresh_adapter": "meta", "account_id": "00000000-0000-4000-8000-0000000000e1", "operations": ["list"], "record_version": 5},
+        {"id": "apikey:anthropic:main", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["anthropic-platform"], "serves": ["anthropic"], "account_id": "workspace-main", "operations": ["list"], "record_version": 4},
+        {"id": "apikey:anthropic:team", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["anthropic-platform"], "serves": ["anthropic"], "account_id": "workspace-team", "operations": ["list"], "record_version": 2},
+        {"id": "apikey:kimi-code-plan-global", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["kimi-code-plan-global"], "serves": ["moonshot"], "operations": ["list"], "record_version": 6},
+        {"id": "apikey:kimi-for-coding", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["kimi-for-coding"], "serves": ["moonshot"], "operations": ["list"], "record_version": 3},
+        {"id": "apikey:alibaba-token-plan", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["alibaba-token-plan"], "serves": ["qwen"], "operations": ["list"], "record_version": 8},
+        {"id": "apikey:ollama-cloud", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["ollama-cloud"], "serves": ["zhipu", "moonshot", "deepseek"], "operations": ["list"], "record_version": 5},
+        {"id": "apikey:opencode-go", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["opencode-go"], "serves": ["deepseek", "zhipu"], "operations": ["list"], "record_version": 4},
+        {"id": "apikey:inception", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["inception"], "serves": ["inception"], "operations": ["list"], "record_version": 2},
+        {"id": "apikey:deepseek", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["deepseek"], "serves": ["deepseek"], "operations": ["list"], "record_version": 3},
+        {"id": "apikey:openrouter", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["openrouter"], "serves": ["anthropic", "openai", "moonshot", "qwen", "deepseek"], "operations": ["list"], "record_version": 6},
+        {"id": "apikey:fireworks-ai", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["fireworks-ai"], "serves": ["zhipu"], "operations": ["list"], "record_version": 2},
+        {"id": "apikey:cline-pass", "type": "apikey", "auth_method": "apikey", "categories": ["llm-provider"], "state": "active", "provider_ids": ["cline-pass"], "serves": ["meta"], "operations": ["list"], "record_version": 1}
+      ],
+      "grant_tuples": [
+        {"operation": "list", "selector": "llm-provider", "selector_kind": "category"}
+      ],
+      "grants": 1,
+      "view": "baseline-2026-10-24-vault-view"
+    }
+  },
+  "quota": {
+    "completeProviders": ["claude", "codex", "grok", "antigravity", "meta"],
+    "result": [
+      {"provider": "claude", "apiProvider": "anthropic", "account": "00000000-0000-4000-8000-0000000000a1", "source": "vault", "fetchedAt": "2026-10-24T11:59:00+00:00", "usage": {"primary": {"usedPercent": 30.0, "windowMinutes": 300, "resetsAt": "2026-10-24T14:00:00+00:00"}, "secondary": {"usedPercent": 55.0, "windowMinutes": 10080, "resetsAt": "2026-10-27T09:00:00+00:00"}}},
+      {"provider": "claude", "apiProvider": "anthropic", "account": "00000000-0000-4000-8000-0000000000a2", "source": "vault", "fetchedAt": "2026-10-24T11:59:00+00:00", "usage": {"primary": {"usedPercent": 10.0, "windowMinutes": 300, "resetsAt": "2026-10-24T15:30:00+00:00"}, "secondary": {"usedPercent": 97.0, "windowMinutes": 10080, "resetsAt": "2026-10-25T08:00:00+00:00"}}},
+      {"provider": "codex", "apiProvider": "openai", "account": "00000000-0000-4000-8000-0000000000b1", "source": "vault", "fetchedAt": "2026-10-24T11:59:00+00:00", "usage": {"primary": {"usedPercent": 40.0, "windowMinutes": 300, "resetsAt": "2026-10-24T13:10:00+00:00"}, "secondary": {"usedPercent": 62.0, "windowMinutes": 10080, "resetsAt": "2026-10-28T03:30:00+00:00"}}},
+      {"provider": "codex", "apiProvider": "openai", "account": "00000000-0000-4000-8000-0000000000b2", "source": "vault", "fetchedAt": "2026-10-24T11:59:00+00:00", "usage": {"primary": {"usedPercent": 5.0, "windowMinutes": 300, "resetsAt": "2026-10-24T16:00:00+00:00"}, "secondary": {"usedPercent": 20.0, "windowMinutes": 10080, "resetsAt": "2026-10-30T10:00:00+00:00"}}},
+      {"provider": "grok", "apiProvider": "xai", "account": "00000000-0000-4000-8000-0000000000c1", "source": "vault", "fetchedAt": "2026-10-24T11:59:00+00:00", "usage": {"primary": {"usedPercent": 20.0, "windowMinutes": 300, "resetsAt": "2026-10-24T15:00:00+00:00"}}},
+      {"provider": "antigravity", "apiProvider": "google", "account": "00000000-0000-4000-8000-0000000000d1", "source": "vault", "fetchedAt": "2026-10-24T11:59:00+00:00", "usage": {"primary": {"usedPercent": 10.0, "windowMinutes": 300, "resetsAt": "2026-10-24T16:00:00+00:00"}}},
+      {"provider": "meta", "apiProvider": "meta", "account": "00000000-0000-4000-8000-0000000000e1", "source": "vault", "fetchedAt": "2026-10-24T11:59:00+00:00", "usage": {"primary": {"usedPercent": 75.0, "windowMinutes": 300, "resetsAt": "2026-10-24T13:30:00+00:00"}}}
+    ]
+  },
+  "available_models": [
+    "anthropic/claude-opus-5-5",
+    "anthropic/claude-sonnet-5-5",
+    "anthropic/claude-haiku-5-5",
+    "openai/gpt-6.1-sol",
+    "openai/gpt-6-luna",
+    "openai/gpt-6-astra",
+    "xai/grok-4.7",
+    "kimi-for-coding/kimi-k3",
+    "alibaba-token-plan/qwen3.8-max",
+    "opencode-go/deepseek-v4.1-flash",
+    "opencode/big-pickle"
+  ],
+  "requests": [
+    {"name": "mason-launch", "op": "route.select", "params": {"targetAgent": "mason", "consumer": "mason", "workload": "mason", "requirements": {"iq": 60, "eq": 0}, "availableModels": "$available_models", "taskId": "baseline-mason-launch"}},
+    {"name": "mason-broca", "op": "route.select", "params": {"targetAgent": "mason", "consumer": "mason", "executor": "broca", "workload": "mason", "substrate": "broca", "requirements": {"iq": 60, "eq": 0}, "availableModels": [], "taskId": "baseline-mason-broca"}},
+    {"name": "mason-no-consumer", "op": "route.select", "params": {"targetAgent": "mason", "executor": "broca", "workload": "mason", "substrate": "broca", "requirements": {"iq": 60, "eq": 0}, "availableModels": [], "taskId": "baseline-mason-no-consumer"}},
+    {"name": "mason-model-pin", "op": "route.select", "params": {"targetAgent": "mason", "consumer": "mason", "executor": "broca", "workload": "mason", "substrate": "broca", "modelPin": "anthropic/claude-opus-5-5", "requirements": {"iq": 60, "eq": 0}, "availableModels": [], "taskId": "baseline-mason-model-pin"}},
+    {"name": "mason-excluded-model-pin", "op": "route.select", "params": {"targetAgent": "mason", "consumer": "mason", "executor": "broca", "workload": "mason", "substrate": "broca", "modelPin": "openai/gpt-6-luna", "requirements": {"iq": 60, "eq": 0}, "availableModels": [], "taskId": "baseline-mason-excluded-model-pin"}},
+    {"name": "flow-subscription-pin", "op": "route.select", "params": {"targetAgent": "flow", "consumer": "flow", "executor": "broca", "substrate": "broca", "modelPin": "anthropic/claude-opus-5-5", "requirements": {"iq": 50, "eq": 0}, "availableModels": [], "taskId": "baseline-flow-subscription-pin"}},
+    {"name": "sidekick-lead", "op": "route.select", "params": {"targetAgent": "sidekick", "consumer": "sidekick", "workload": "sidekick.lead", "requirements": {"iq": 40, "eq": 0}, "availableModels": "$available_models", "taskId": "baseline-sidekick-lead"}},
+    {"name": "sidekick-muse-spark-pin", "op": "route.select", "params": {"targetAgent": "sidekick", "consumer": "sidekick", "executor": "broca", "workload": "sidekick.lead", "substrate": "broca", "modelPin": "meta/muse-spark-1.3-contributor", "requirements": {"iq": 40, "eq": 0}, "availableModels": [], "taskId": "baseline-sidekick-muse-spark-pin"}},
+    {"name": "athena-astra-pin", "op": "route.select", "params": {"targetAgent": "oracle", "consumer": "athena", "executor": "broca", "workload": "athena", "substrate": "broca", "modelPin": "openai/gpt-6-astra", "requirements": {"iq": 90, "eq": 0}, "availableModels": [], "taskId": "baseline-athena-astra-pin"}},
+    {"name": "athena-broca", "op": "route.select", "params": {"targetAgent": "oracle", "consumer": "athena", "executor": "broca", "workload": "athena", "substrate": "broca", "requirements": {"iq": 90, "eq": 0}, "availableModels": [], "taskId": "baseline-athena-broca"}},
+    {"name": "lab-broca", "op": "route.select", "params": {"targetAgent": "oracle", "consumer": "lab", "executor": "broca", "workload": "athena", "substrate": "broca", "requirements": {"iq": 90, "eq": 0}, "availableModels": [], "taskId": "baseline-lab-broca"}},
+    {"name": "core-broca", "op": "route.select", "params": {"targetAgent": "core", "consumer": "core", "executor": "broca", "substrate": "broca", "requirements": {"iq": 50, "eq": 0}, "availableModels": [], "taskId": "baseline-core-broca"}},
+    {"name": "codemode-broca", "op": "route.select", "params": {"targetAgent": "codemode", "consumer": "codemode", "executor": "broca", "substrate": "broca", "requirements": {"iq": 50, "eq": 0}, "availableModels": [], "taskId": "baseline-codemode-broca"}},
+    {"name": "flow-broca", "op": "route.select", "params": {"targetAgent": "flow", "consumer": "flow", "executor": "broca", "substrate": "broca", "requirements": {"iq": 50, "eq": 0}, "availableModels": [], "taskId": "baseline-flow-broca"}},
+    {"name": "host-opencode-mason", "op": "route.select", "params": {"targetAgent": "mason", "consumer": "mason", "harness": "opencode", "requirements": {"iq": 60, "eq": 0}, "availableModels": "$available_models", "taskId": "baseline-host-opencode-mason"}},
+    {"name": "host-pi-explore", "op": "route.select", "params": {"targetAgent": "explore", "consumer": "sidekick", "harness": "pi", "requirements": {"iq": 30, "eq": 0}, "availableModels": "$available_models", "providerAuthTypes": {"anthropic": "oauth", "openai": "oauth", "xai": "oauth", "kimi-for-coding": "api", "opencode-go": "api"}, "taskId": "baseline-host-pi-explore"}},
+    {"name": "slot-synthesizer", "op": "synthesizer", "panel_params": {"panelSpec": {"class": "AUDIT"}, "substrate": "broca", "taskId": "baseline-synthesizer", "seed": "baseline-2026-10-24", "availableModels": [], "excludeRouteKeys": [], "subscriptionKeys": []}, "params": {"targetAgent": "oracle", "consumer": "athena", "executor": "broca", "workload": "athena", "substrate": "broca", "pin_fallback": "none", "requirements": {"iq": 90, "eq": 0}, "availableModels": [], "excludeRouteKeys": [], "subscriptionKeys": [], "preferPromptCache": false, "taskId": "baseline-synthesizer"}},
+    {"name": "slot-lab-planner", "op": "route.select", "params": {"targetAgent": "oracle", "consumer": "lab", "executor": "broca", "workload": "athena", "substrate": "broca", "pin": {"slot": "lab_planner"}, "pin_fallback": "route", "requirements": {"iq": 90, "eq": 0}, "requiredCapabilities": {"minContext": 60000}, "availableModels": [], "excludeRouteKeys": [], "subscriptionKeys": [], "preferPromptCache": false, "taskId": "baseline-lab-planner"}},
+    {"name": "slot-spec-designer", "op": "route.select", "params": {"targetAgent": "oracle", "consumer": "athena", "executor": "broca", "workload": "athena", "substrate": "broca", "pin": {"slot": "spec_designer"}, "pin_fallback": "none", "requirements": {"iq": 90, "eq": 0}, "availableModels": [], "excludeRouteKeys": [], "subscriptionKeys": [], "preferPromptCache": true, "taskId": "baseline-spec-designer"}},
+    {"name": "v1-mc-dream-curate", "op": "routing/v1 route.select", "principal": "reserved:magic-context", "params": {"consumer": "mc_dream_curate", "requirements": {"iq": 50}}},
+    {"name": "v1-mason", "op": "routing/v1 route.select", "principal": "reserved:prefrontal-core", "params": {"consumer": "mason", "requirements": {"iq": 60}}},
+    {"name": "v1-codemode", "op": "routing/v1 route.select", "principal": "reserved:prefrontal-core", "params": {"consumer": "codemode", "requirements": {"iq": 50}}},
+    {"name": "v1-unknown-consumer", "op": "routing/v1 route.select", "principal": "reserved:magic-context", "params": {"consumer": "mcx", "requirements": {"iq": 50}}}
+  ],
+  "expected": {
+    "mason-launch": {"route_key": "opencode-go/deepseek-v4.1-flash", "variant": null, "runner": "broca", "refusal_code": null},
+    "mason-broca": {"route_key": "opencode-go/deepseek-v4.1-flash", "variant": null, "runner": "broca", "refusal_code": null},
+    "mason-no-consumer": {"route_key": "inception/mercury-3", "variant": null, "runner": "broca", "refusal_code": null},
+    "mason-model-pin": {"route_key": "anthropic/claude-opus-5-5", "variant": null, "runner": "broca", "refusal_code": null},
+    "mason-excluded-model-pin": {"route_key": "openai/gpt-6-luna", "variant": null, "runner": "broca", "refusal_code": null},
+    "flow-subscription-pin": {"route_key": null, "variant": null, "runner": null, "refusal_code": "pinned_route_refused"},
+    "sidekick-lead": {"route_key": "alibaba-token-plan/qwen3.8-max", "variant": null, "runner": "broca", "refusal_code": null},
+    "sidekick-muse-spark-pin": {"route_key": "meta/muse-spark-1.3-contributor", "variant": "medium", "runner": "broca", "refusal_code": null},
+    "athena-astra-pin": {"route_key": "openai/gpt-6-astra", "variant": "xhigh", "runner": "broca", "refusal_code": null},
+    "athena-broca": {"route_key": "kimi-for-coding/kimi-k3", "variant": null, "runner": "broca", "refusal_code": null},
+    "lab-broca": {"route_key": "kimi-for-coding/kimi-k3", "variant": null, "runner": "broca", "refusal_code": null},
+    "core-broca": {"route_key": "alibaba-token-plan/qwen3.8-max", "variant": null, "runner": "broca", "refusal_code": null},
+    "codemode-broca": {"route_key": "inception/mercury-3", "variant": null, "runner": "broca", "refusal_code": null},
+    "flow-broca": {"route_key": "inception/mercury-3", "variant": null, "runner": "broca", "refusal_code": null},
+    "host-opencode-mason": {"route_key": "opencode-go/deepseek-v4.1-flash", "variant": null, "runner": null, "refusal_code": null},
+    "host-pi-explore": {"route_key": "alibaba-token-plan/qwen3.8-max", "variant": null, "runner": null, "refusal_code": null},
+    "slot-synthesizer": {"route_key": "anthropic-platform/claude-opus-5-5/medium", "variant": "medium", "runner": "broca", "refusal_code": null},
+    "slot-lab-planner": {"route_key": "anthropic-platform/claude-opus-5-5", "variant": null, "runner": "broca", "refusal_code": null},
+    "slot-spec-designer": {"route_key": "kimi-for-coding/kimi-k3", "variant": null, "runner": "broca", "refusal_code": null},
+    "v1-mc-dream-curate": {"route_key": "inception/mercury-3", "variant": null, "runner": "broca", "refusal_code": null},
+    "v1-mason": {"route_key": "opencode-go/deepseek-v4.1-flash", "variant": null, "runner": "broca", "refusal_code": null},
+    "v1-codemode": {"route_key": "inception/mercury-3", "variant": null, "runner": "broca", "refusal_code": null},
+    "v1-unknown-consumer": {"route_key": null, "variant": null, "runner": null, "refusal_code": "unknown_consumer"}
+  }
+}

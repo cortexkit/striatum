@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal};
 use cortexkit_role_routing::select::{
-    parse_select_request, Modality, RouteRef, RunnerRef, SelectAnswer, ToolsRequirement,
+    parse_select_request_serving, Modality, RouteRef, RunnerRef, SelectAnswer, ToolsRequirement,
     EXPLANATION_MAX_CHARS,
 };
 use prefrontal_routing_core::model_router::{
@@ -89,7 +89,7 @@ pub(super) async fn select(
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
-    let request = parse_select_request(params)?;
+    let request = parse_select_request_serving(params, super::describe::CAPABILITIES)?;
     let live_config = config_overrides::live_config(deps.routing_config_path);
     let operator_config = operator_config(deps);
     let consumer = request.consumer.clone();
@@ -433,11 +433,7 @@ pub(super) async fn select(
     let answer = SelectAnswer {
         decision_id,
         route: route.clone(),
-        runner: RunnerRef {
-            module: runner.module.clone(),
-            model: route,
-            auth: None,
-        },
+        runner: RunnerRef::new(runner.module.clone(), route),
         context_window: fact
             .and_then(|fact| fact.context_window)
             .map_or(0, |window| window as u64),
