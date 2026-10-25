@@ -563,7 +563,7 @@
           }
         },
         "subscription_multipliers": {
-          "description": "Provider-keyed subscription subsidy multipliers (\"openai\": 40). The\nsubsidy is a property of the account serving the provider, so this is\nthe primary shape; a per-model `subscription_multiplier` in `models`\noverrides its provider's value for that route only.",
+          "description": "Provider-keyed subscription subsidy multipliers (\"openai\": 40). The\nsubsidy is a property of the account serving the provider, so this is\nthe primary shape; a per-model `subscription_multiplier` in `models`\noverrides its provider's value for that route only. An entry also states\nthat the provider's plan is priced at list divided by the multiplier, so\na plan whose own rates the catalog does not publish still prices.",
           "type": "object",
           "additionalProperties": {
             "type": "number",
