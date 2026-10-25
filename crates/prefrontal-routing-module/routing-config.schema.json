@@ -169,7 +169,7 @@
   "additionalProperties": false,
   "$defs": {
     "AccountSelectionFlags": {
-      "description": "The account-selection flag (`\"accounts\"` in the routing file).\nOff unless the file turns it on.",
+      "description": "Controls account selection and usage reports through `accounts.enabled`.\nOff unless the file turns it on.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -534,7 +534,7 @@
       "additionalProperties": false
     },
     "OverqualificationSection": {
-      "description": "`model_routing.overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.\n`base: 0` switches the term off.",
+      "description": "`overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.\n`base: 0` switches the term off.",
       "type": "object",
       "properties": {
         "base": {
