@@ -95,9 +95,6 @@ pub(super) fn report(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
                 body_json: body_json.clone(),
                 answer_json,
             },
-            // A failure, an unknown outcome included, ends the affinity
-            // preference whose previous decision this is.
-            request.outcome.is_failure(),
             now as i64,
         )
         .map_err(store_refusal)?;

@@ -42,6 +42,24 @@ fn the_older_shapes_are_recognised_by_their_marker_alone() {
     }
 }
 
+#[test]
+fn the_manifest_registers_one_selection_pass() {
+    let operations = crate::served_operations();
+    let selects: Vec<_> = operations
+        .iter()
+        .filter(|operation| operation.name == "route.select")
+        .collect();
+    assert_eq!(
+        selects.len(),
+        1,
+        "route.select is one pass, not two selectors"
+    );
+    let description = selects[0].description.as_deref().unwrap_or_default();
+    assert!(description.contains("One selection pass"), "{description}");
+    assert!(crate::handles("route.select"));
+    assert!(!crate::handles("route.select_again"));
+}
+
 /// A harness with the kit's consumers and catalog, and a consumer route.
 async fn configured() -> (std::sync::Arc<Harness>, Route) {
     let harness = Harness::new("dispatch");

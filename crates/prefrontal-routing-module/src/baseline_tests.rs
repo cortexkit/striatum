@@ -76,6 +76,10 @@ impl Drop for World {
 
 impl World {
     async fn build(baseline: &Value, label: &str) -> Self {
+        Self::build_with(baseline, label, CONFIG).await
+    }
+
+    async fn build_with(baseline: &Value, label: &str, config: &str) -> Self {
         let now = clock_ms(baseline);
         let n = NEXT_WORLD.fetch_add(1, Ordering::Relaxed);
         let dir = prefrontal_test_support::scratch_root().join(format!(
@@ -92,7 +96,7 @@ impl World {
             .expect("open the routing store"),
         );
         let config_path = dir.join("prefrontal-routing.jsonc");
-        crate::test_config::write(&config_path, CONFIG).unwrap();
+        crate::test_config::write(&config_path, config).unwrap();
         let auth_path = dir.join("auth.json");
         std::fs::write(&auth_path, baseline["auth_json"].to_string()).unwrap();
 
@@ -557,4 +561,209 @@ fn the_injected_clock_governs_now_ms_until_dropped() {
         assert_eq!(crate::now_ms(), frozen);
     }
     assert_ne!(crate::now_ms(), frozen);
+}
+
+/// Causes a new-pass answer may differ from the item-1 baseline for. Each
+/// listed request names the answer the new pass must give and one allowed cause.
+const EQUIVALENCE_DIFFERENCES: &[(&str, &str, &str)] = &[
+    // Filled from the converted-fixture run. An empty list means the new pass
+    // matches the baseline exactly.
+];
+
+fn listed_difference(name: &str) -> Option<Value> {
+    EQUIVALENCE_DIFFERENCES
+        .iter()
+        .find_map(|(request, answer, cause)| {
+            (*request == name).then(|| {
+                let mut answer: Value = serde_json::from_str(answer).expect("listed answer");
+                answer["cause"] = json!(cause);
+                answer
+            })
+        })
+}
+
+/// The new pass on the converted live file, each request from its own empty
+/// store, matches the baseline. A difference must be listed with its exact
+/// answer and one allowed cause.
+#[tokio::test]
+async fn the_new_pass_on_the_converted_fixture_matches_the_baseline() {
+    let baseline = baseline();
+    let answers = run_all(&baseline).await;
+    let expected: BTreeMap<String, Value> =
+        serde_json::from_value(baseline["expected"].clone()).unwrap();
+    let mut unexpected = Vec::new();
+    for (name, answer) in &answers {
+        let wanted = listed_difference(name).unwrap_or_else(|| expected[name].clone());
+        let comparable = if wanted.get("cause").is_some() {
+            let mut got = answer.clone();
+            got["cause"] = wanted["cause"].clone();
+            got
+        } else {
+            answer.clone()
+        };
+        if comparable != wanted {
+            unexpected.push((name.clone(), answer.clone(), wanted));
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "new pass differs from the baseline without a listed cause.\n{}",
+        unexpected
+            .iter()
+            .map(|(name, got, wanted)| format!("{name}: got {got} wanted {wanted}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for (name, _, _) in EQUIVALENCE_DIFFERENCES {
+        assert!(
+            answers.contains_key(*name),
+            "listed difference {name} is not a baseline request"
+        );
+    }
+}
+
+fn drop_at(document: &mut Value, path: &[&str]) {
+    let (last, parents) = path.split_last().expect("path");
+    let mut cursor = document;
+    for segment in parents {
+        cursor = cursor
+            .get_mut(*segment)
+            .unwrap_or_else(|| panic!("missing {segment} in {}", path.join("/")));
+    }
+    assert!(
+        cursor
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("not an object at {}", path.join("/")))
+            .remove(*last)
+            .is_some(),
+        "nothing to drop at {}",
+        path.join("/")
+    );
+}
+
+async fn one_answer(baseline: &Value, config: &str, name: &str) -> Value {
+    let request = baseline["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|request| request["name"] == name)
+        .unwrap_or_else(|| panic!("no request {name}"));
+    let world = World::build_with(baseline, name, config).await;
+    let params = params_of(baseline, &request["params"]);
+    match request["op"].as_str().unwrap() {
+        "route.select" => legacy_answer(&world.legacy("route.select", &params).await),
+        "synthesizer" => {
+            let panel_params = params_of(baseline, &request["panel_params"]);
+            let panel = world.legacy("route.select_panel", &panel_params).await;
+            assert_eq!(panel.0, FrameType::Response, "{}", panel.1);
+            let pin = &panel.1["result"]["policy"]["pins"]["synthesizer"];
+            let mut params = params;
+            params["pin"] = json!({"model": pin["model"]});
+            if let Some(variant) = pin["variant"].as_str() {
+                params["pin"]["variant"] = json!(variant);
+            }
+            legacy_answer(&world.legacy("route.select", &params).await)
+        }
+        "routing/v1 route.select" => v1_answer(
+            &world
+                .v1(request["principal"].as_str().unwrap(), &params)
+                .await,
+        ),
+        other => panic!("control does not run {other}"),
+    }
+}
+
+/// Dropping one not_for, variant, project-pin, slot-pin or subscription entry
+/// from the converted file changes an answer, so a check that recorded the
+/// undropped answer fails.
+#[tokio::test]
+async fn dropping_one_policy_entry_changes_the_converted_answer() {
+    let baseline = baseline();
+    let _clock = crate::InjectedClock::set(clock_ms(&baseline));
+    let converted = crate::config_convert::convert(CONFIG).expect("the live file converts");
+    let mut document: Value = serde_json::from_str(&converted).unwrap();
+    // The live file has no project pin. Plant one so this control has an entry
+    // to drop; a scoped athena select must answer that pin.
+    document["consumers"]["athena"]["projects"] = json!({
+        "baseline-project": { "pin": "anthropic/claude-opus-5-5" }
+    });
+    let planted = serde_json::to_string(&document).unwrap();
+
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["models", "openai/gpt-6-luna", "not_for"],
+            "mason-excluded-model-pin",
+        ),
+        (&["consumers", "athena", "variants"], "athena-astra-pin"),
+        (&["consumers", "lab_planner", "pin"], "slot-lab-planner"),
+        (&["providers", "opencode-go", "subscription"], "v1-mason"),
+    ];
+    for (path, request) in cases {
+        let mut mutated: Value = serde_json::from_str(&planted).unwrap();
+        drop_at(&mut mutated, path);
+        let before = one_answer(&baseline, &planted, request).await;
+        let after = one_answer(
+            &baseline,
+            &serde_json::to_string(&mutated).unwrap(),
+            request,
+        )
+        .await;
+        assert_ne!(
+            before,
+            after,
+            "dropping {} did not change {request}: {before}",
+            path.join("/")
+        );
+    }
+
+    let pinned_config = planted.clone();
+    let world = World::build_with(&baseline, "project-pin", &pinned_config).await;
+    super::remember_route_scope(
+        9_001,
+        1,
+        Some(super::DecisionScope {
+            project_id: Some("baseline-project".into()),
+            workdir: None,
+        }),
+    );
+    let pinned = v1_answer(
+        &world
+            .v1(
+                "reserved:prefrontal-core",
+                &json!({"consumer": "athena", "requirements": {"iq": 90}}),
+            )
+            .await,
+    );
+    let mut dropped: Value = serde_json::from_str(&planted).unwrap();
+    drop_at(
+        &mut dropped,
+        &["consumers", "athena", "projects", "baseline-project", "pin"],
+    );
+    let world = World::build_with(
+        &baseline,
+        "project-pin-dropped",
+        &serde_json::to_string(&dropped).unwrap(),
+    )
+    .await;
+    super::remember_route_scope(
+        9_001,
+        1,
+        Some(super::DecisionScope {
+            project_id: Some("baseline-project".into()),
+            workdir: None,
+        }),
+    );
+    let unpinned = v1_answer(
+        &world
+            .v1(
+                "reserved:prefrontal-core",
+                &json!({"consumer": "athena", "requirements": {"iq": 90}}),
+            )
+            .await,
+    );
+    assert_ne!(
+        pinned, unpinned,
+        "dropping the project pin did not change the scoped select: {pinned}"
+    );
+    assert_eq!(pinned["route_key"], "anthropic/claude-opus-5-5", "{pinned}");
 }

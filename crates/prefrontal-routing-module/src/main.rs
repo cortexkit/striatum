@@ -1450,8 +1450,8 @@ async fn handle_frame(
                     route_epoch,
                     corr,
                     |reply| async move {
-                        // The routing/v1 surface answers the requests it claims;
-                        // every other request reaches the older ops unchanged.
+                        // Both wire shapes are answered by one selection pass.
+                        // claims() only chooses which request body that pass reads.
                         if routing_v1::claims(&frame.body) {
                             return routing_v1::serve(
                                 frame,
@@ -3337,6 +3337,7 @@ fn price_selection_inputs(
     reset_group: Option<&str>,
     consumer: Option<select_policy::Consumer>,
     credentialed: bool,
+    priced_per_token: bool,
 ) -> Result<PricedSelection, ModuleError> {
     let outcome = sources.live_config.apply(facts);
     let provenance = DecisionProvenance {
@@ -3353,9 +3354,10 @@ fn price_selection_inputs(
         None
     };
     sources.live_config.apply(facts);
-    // A consumer that must run priced per token is never priced as if a
-    // subscription subsidised it.
-    if select_policy::requires_metered(consumer) {
+    // A consumer priced per token is never priced as if a subscription
+    // subsidised it. The flag is the authority; the historical class applies
+    // only when the flag is absent.
+    if priced_per_token {
         for fact in facts.iter_mut() {
             fact.subscription_multiplier = None;
         }
@@ -4070,6 +4072,13 @@ async fn handle_select_request(
         }
     };
     let pricing_started = Instant::now();
+    let consumer_id = variant_policy::consumer_group(params.consumer).unwrap_or("");
+    let consumer_policy = operator_config.consumer_policy(
+        consumer_id,
+        &config_policy::ConsumerPolicy::default(),
+        &std::collections::BTreeMap::new(),
+    );
+    let priced_per_token = select_policy::priced_per_token(&consumer_policy, params.consumer);
     let PricedSelection {
         routing_config,
         provenance,
@@ -4090,6 +4099,7 @@ async fn handle_select_request(
         variant_policy::consumer_group(params.consumer),
         params.consumer,
         !host_run,
+        priced_per_token,
     )?;
     add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
 
@@ -4172,6 +4182,7 @@ async fn handle_select_request(
             }
         },
         params.consumer,
+        priced_per_token,
         params.allowed_providers.as_deref(),
         subscription_plan_providers.as_ref(),
         &operator_policy,
@@ -4185,7 +4196,6 @@ async fn handle_select_request(
         models: candidates.available,
         rejected: candidates.rejected,
     };
-    let consumer_id = crate::variant_policy::consumer_group(params.consumer).unwrap_or("");
     let pinned = params.pin.is_some() || params.model_pin.is_some();
     mapped_availability
         .models
@@ -4261,7 +4271,7 @@ async fn handle_select_request(
     let admission_pin = params
         .pin
         .as_ref()
-        .and_then(|pin| pin.resolve(operator_config.pins()));
+        .and_then(|pin| pin.resolve(|slot| operator_config.slot_pin(slot).cloned()));
     let mut pin_rejected = None;
     if let Some(pin) = params
         .model_pin
@@ -4305,7 +4315,13 @@ async fn handle_select_request(
         // A host-run pin is judged on the same list as the host's automatic
         // selections; it is not added to that list.
         if !host_run {
-            if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
+            // A named model that operator config excludes is not put back on
+            // the list. pin_only still admits, because the request named it.
+            let allowed = operator_config.route_allowed(consumer_id, &pin_key, true)
+                || operator_config.route_allowed(consumer_id, &pin_capacity, true);
+            if !allowed {
+                pin_availability.insert(pin_key.clone(), format!("not_for excludes {consumer_id}"));
+            } else if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
                 pin_availability.insert(pin_key.clone(), detail);
             } else {
                 pin_available.insert(pin_key.clone());
@@ -4370,7 +4386,7 @@ async fn handle_select_request(
                 operator_exclude_keys: operator_exclude.clone(),
                 required_capabilities,
                 is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                    select_policy::subscription_covered(params.consumer, &sub, route)
+                    select_policy::subscription_covered(priced_per_token, &sub, route)
                 })),
                 min_best_effort_adequacy,
                 prefer_prompt_cache: false,
@@ -4586,13 +4602,27 @@ async fn handle_select_request(
         }
     }
 
-    let consumer_policy = operator_config.consumer_policy(
-        consumer_id,
-        &config_policy::ConsumerPolicy::default(),
-        &std::collections::BTreeMap::new(),
-    );
+    // A project pin is a one-entry ladder and beats the consumer mode. Legacy
+    // bodies carry no affinity, so each one is fresh. A request pin was already
+    // admitted above.
+    let project_pin = route_scope(channel, epoch).and_then(|scope| {
+        scope
+            .project_id
+            .as_deref()
+            .and_then(|project| operator_config.project_pin(project, consumer_id))
+            .map(str::to_owned)
+    });
+    let mode_policy = match &project_pin {
+        Some(pin) => {
+            let mut policy = consumer_policy.clone();
+            policy.mode = Some(config_policy::ConsumerMode::Ladder);
+            policy.ladder = Some(vec![pin.clone()]);
+            policy
+        }
+        None => consumer_policy.clone(),
+    };
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
-        select_policy::select_in_order(&available, &consumer_policy, |candidates| {
+        select_policy::select_in_order(&available, &mode_policy, |candidates| {
             let sub = subscription_keys.clone();
             select_policy::select_candidates(
                 SelectModelRouteInput {
@@ -4605,7 +4635,7 @@ async fn handle_select_request(
                     operator_exclude_keys: operator_exclude.clone(),
                     required_capabilities,
                     is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                        select_policy::subscription_covered(params.consumer, &sub, route)
+                        select_policy::subscription_covered(priced_per_token, &sub, route)
                     })),
                     min_best_effort_adequacy,
                     prefer_prompt_cache,
@@ -5393,7 +5423,7 @@ async fn handle_select_panel(
             .cloned()
             .unwrap_or_default(),
         pins: prefrontal_routing_core::panel::PanelPins {
-            synthesizer: live_config.pins().synthesizer.as_ref().map(|pin| {
+            synthesizer: live_config.slot_pin("synthesizer").map(|pin| {
                 prefrontal_routing_core::panel::PanelSynthesizerPin {
                     model: pin.model.clone(),
                     variant: pin.variant.clone(),
@@ -7223,7 +7253,7 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
-fn handles(method: &str) -> bool {
+pub(crate) fn handles(method: &str) -> bool {
     matches!(
         method,
         ROUTE_SELECT_OP
@@ -7258,7 +7288,7 @@ fn handles(method: &str) -> bool {
 }
 
 /// Operations registered in HELLO and exposed by `--print-manifest`.
-fn served_operations() -> Vec<ManagementOperation> {
+pub(crate) fn served_operations() -> Vec<ManagementOperation> {
     let pool_operations = [
         key_pool::POOL_ACQUIRE_OP,
         key_pool::POOL_RENEW_OP,
@@ -7272,11 +7302,16 @@ fn served_operations() -> Vec<ManagementOperation> {
         description: None,
     });
     let mut operations = vec![
-        // route.select is a mutation because it records the decision it returns.
+        // route.select is one selection pass for both wire shapes. The older
+        // body is recognised by targetAgent; every other body is routing/v1.
+        // The pass records the decision it returns, so the op is a mutation.
         ManagementOperation {
             name: ROUTE_SELECT_OP.to_string(),
             kind: ManagementOperationKind::Mutate,
-            description: None,
+            description: Some(
+                "One selection pass for the older route.select body and routing/v1 select: route, runner, variant, limits, decision id and expiry"
+                    .to_string(),
+            ),
         },
         ManagementOperation {
             name: ROUTE_RESOLVE_POLICY_OP.to_string(),

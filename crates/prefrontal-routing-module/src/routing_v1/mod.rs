@@ -36,6 +36,8 @@ mod dispatch_tests;
 #[cfg(test)]
 mod metered_tests;
 #[cfg(test)]
+mod order_tests;
+#[cfg(test)]
 mod scope_attribution_tests;
 
 /// The `routing/v1` capability a routing provider lists in its manifest.

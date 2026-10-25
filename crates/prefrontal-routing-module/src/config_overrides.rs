@@ -568,10 +568,6 @@ impl LiveConfig {
         &self.config.model_routing.panels
     }
 
-    pub fn pins(&self) -> &Pins {
-        &self.config.model_routing.pins
-    }
-
     pub fn policy_revision(&self) -> String {
         self.document
             .as_deref()

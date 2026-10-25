@@ -110,6 +110,12 @@ pub(super) async fn select(
     // codemode and flow, the priced-per-token rule. Any other consumer reads
     // only the `all` groups.
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
+    let consumer_policy = operator_config.consumer_policy(
+        &consumer,
+        &crate::config_policy::ConsumerPolicy::default(),
+        &std::collections::BTreeMap::new(),
+    );
+    let priced_per_token = select_policy::priced_per_token(&consumer_policy, legacy_consumer);
     let crate::PreparedSelectionInputs {
         now,
         mut facts,
@@ -141,6 +147,7 @@ pub(super) async fn select(
         Some(&consumer),
         legacy_consumer,
         true,
+        priced_per_token,
     )
     .map_err(|error| store_refusal(error.to_string()))?;
 
@@ -240,6 +247,7 @@ pub(super) async fn select(
             defer_pool_pin: false,
         },
         legacy_consumer,
+        priced_per_token,
         None,
         priced.subscription_plan_providers.as_ref(),
         &operator_policy,
@@ -276,6 +284,7 @@ pub(super) async fn select(
     let selection = Selection {
         consumer: &consumer,
         legacy_consumer,
+        priced_per_token,
         demand,
         required_capabilities,
         facts: &facts,
@@ -309,48 +318,47 @@ pub(super) async fn select(
             .map_err(store_refusal)?,
         None => None,
     };
-    let (mut selected, basis, explicit_variant) = if let Some(pin) = &request.pin {
-        let selected = selection.pin(pin, &available)?;
-        (
-            selected,
-            Basis::RequestPin,
-            RouteRef::parse_pin(pin).and_then(|pin| pin.variant),
-        )
-    } else if let Some(selected) = project_pin
-        .as_deref()
-        .and_then(|pin| selection.pin(pin, &available).ok())
-    {
-        let variant = project_pin
-            .as_deref()
-            .and_then(RouteRef::parse_pin)
-            .and_then(|pin| pin.variant);
-        (selected, Basis::ProjectPin, variant)
-    } else if let Some(selected) = previous.as_ref().and_then(|previous| {
-        // The previous route again, under the full requirements: affinity
-        // keeps a route only while it still meets the request.
-        let key = prefrontal_routing_core::make_route_key(
-            &previous.provider,
-            &previous.model,
-            previous.variant.as_deref(),
-        );
-        let base = format!("{}/{}", previous.provider, previous.model);
-        let only: HashSet<String> = available
-            .iter()
-            .filter(|candidate| **candidate == key || **candidate == base)
-            .cloned()
-            .collect();
-        (!only.is_empty())
-            .then(|| selection.automatic(&only).ok())
-            .flatten()
-    }) {
-        (selected, Basis::Affinity, None)
-    } else {
-        match selection.automatic(&available) {
-            Ok(selected) => (selected, Basis::Automatic, None),
-            Err(no_route) => {
-                selection.record_refusal(&no_route, &priced.provenance);
-                return Err(no_route_refusal(&no_route, now));
-            }
+    let continuing = previous
+        .as_ref()
+        .map(|previous| format!("{}/{}", previous.provider, previous.model));
+    // Request pin, then project pin, then the continuing model, then the mode.
+    // A pin does not fall through. The continuing model does, once it is no
+    // longer allowed. Legacy targetAgent bodies never reach this surface.
+    let ordered = select_policy::select_ordered(
+        &available,
+        request.pin.as_deref(),
+        project_pin.as_deref(),
+        continuing.as_deref(),
+        |pin| selection.pin(pin, &available),
+        |only| selection.score(only),
+        || selection.automatic(&available),
+    );
+    let (mut selected, basis, explicit_variant) = match ordered {
+        Ok((selected, order)) => {
+            let explicit = match order {
+                select_policy::OrderBasis::RequestPin => request
+                    .pin
+                    .as_deref()
+                    .and_then(RouteRef::parse_pin)
+                    .and_then(|pin| pin.variant),
+                select_policy::OrderBasis::ProjectPin => project_pin
+                    .as_deref()
+                    .and_then(RouteRef::parse_pin)
+                    .and_then(|pin| pin.variant),
+                select_policy::OrderBasis::Continuing | select_policy::OrderBasis::Mode => None,
+            };
+            let basis = match order {
+                select_policy::OrderBasis::RequestPin => Basis::RequestPin,
+                select_policy::OrderBasis::ProjectPin => Basis::ProjectPin,
+                select_policy::OrderBasis::Continuing => Basis::Affinity,
+                select_policy::OrderBasis::Mode => Basis::Automatic,
+            };
+            (selected, basis, explicit)
+        }
+        Err(select_policy::OrderFailure::Pin(refusal)) => return Err(refusal),
+        Err(select_policy::OrderFailure::Score(no_route)) => {
+            selection.record_refusal(&no_route, &priced.provenance);
+            return Err(no_route_refusal(&no_route, now));
         }
     };
     let variant_choice = crate::apply_variant_policy(
@@ -362,10 +370,14 @@ pub(super) async fn select(
         explicit_variant.as_deref(),
     );
 
-    let runner = runners
-        .iter()
-        .find(|runner| runs(runner, &selected.route_key, &selected.capacity_key))
-        .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
+    let runner = select_policy::choose_runner(
+        &runners,
+        consumer_policy.runner.as_deref(),
+        &selected.route_key,
+        &selected.capacity_key,
+        &runs,
+    )
+    .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
 
     // Record the decision in the ledger every selection writes, then bind it.
     let mut decision = crate::decision_input_for(
@@ -464,6 +476,7 @@ pub(super) async fn select(
 struct Selection<'a> {
     consumer: &'a str,
     legacy_consumer: Option<select_policy::Consumer>,
+    priced_per_token: bool,
     demand: ModelRequirements,
     required_capabilities: Option<RequiredCapabilities>,
     facts: &'a [ModelFact],
@@ -494,7 +507,7 @@ impl<'a> Selection<'a> {
         snapshot: ModelRouteStateSnapshot,
     ) -> SelectModelRouteInput<'a> {
         let subscription_keys = self.subscription_keys.clone();
-        let consumer = self.legacy_consumer;
+        let priced_per_token = self.priced_per_token;
         SelectModelRouteInput {
             target_agent: self.consumer.to_owned(),
             requirements: self.demand,
@@ -505,7 +518,7 @@ impl<'a> Selection<'a> {
             operator_exclude_keys: self.operator_exclude.to_vec(),
             required_capabilities: self.required_capabilities,
             is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                select_policy::subscription_covered(consumer, &subscription_keys, route)
+                select_policy::subscription_covered(priced_per_token, &subscription_keys, route)
             })),
             min_best_effort_adequacy: self.min_band,
             prefer_prompt_cache: false,
@@ -515,6 +528,28 @@ impl<'a> Selection<'a> {
                 .cloned()
                 .collect(),
         }
+    }
+
+    /// The scorer's choice among `available`, without walking a ladder. A
+    /// continuing conversation uses this so an earlier ladder entry or a
+    /// cheaper demand model cannot take the route back.
+    fn score(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
+        let available = available
+            .iter()
+            .filter(|route| {
+                self.sources
+                    .operator_config
+                    .route_allowed(self.consumer, route, false)
+            })
+            .cloned()
+            .collect();
+        select_policy::select_candidates(
+            self.input(&available, self.snapshot.clone()),
+            self.routing_config,
+            self.slots,
+            self.consumer_exclude,
+            self.rejections,
+        )
     }
 
     /// The scorer's choice among `available`. Unlike the older select there

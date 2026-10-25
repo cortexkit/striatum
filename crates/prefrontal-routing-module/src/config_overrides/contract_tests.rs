@@ -104,7 +104,7 @@ fn reload_refuses(document: &str, message: &str) {
         repaired.panels().audit.is_none(),
         "a class is replaced whole, not deep-merged"
     );
-    assert!(repaired.pins().synthesizer.is_none());
+    assert!(repaired.slot_pin("synthesizer").is_none());
     assert_eq!(held.operator_policy().exclude, ["anthropic"]);
 }
 
@@ -692,20 +692,14 @@ fn valid_panel_boundaries_all_classes_and_strict_pins() {
     );
     assert_eq!(active.panels().diagnose.as_ref().unwrap().floor, Some(0));
     assert_eq!(active.panels().evaluate.as_ref().unwrap().floor, Some(100));
-    assert_eq!(active.pins().lab_planner.as_ref().unwrap().model, "q/n");
-    let designer = active.pins().spec_designer.as_ref().unwrap();
+    assert_eq!(active.slot_pin("lab_planner").unwrap().model, "q/n");
+    let designer = active.slot_pin("spec_designer").unwrap();
     assert_eq!(
         (designer.model.as_str(), designer.variant.as_deref()),
         ("r/o", Some("xhigh"))
     );
     assert_eq!(
-        active
-            .pins()
-            .synthesizer
-            .as_ref()
-            .unwrap()
-            .variant
-            .as_deref(),
+        active.slot_pin("synthesizer").unwrap().variant.as_deref(),
         Some("high")
     );
 }

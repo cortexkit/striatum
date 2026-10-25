@@ -98,22 +98,14 @@ fn conversion_round_trip_keeps_every_policy_and_materializes_data_defaults() {
     );
     assert_eq!(
         loaded
-            .pins()
-            .synthesizer
-            .as_ref()
-            .unwrap()
-            .variant
-            .as_deref(),
+            .slot_pin("synthesizer")
+            .and_then(|pin| pin.variant.as_deref()),
         Some("high")
     );
     assert_eq!(
         loaded
-            .pins()
-            .spec_designer
-            .as_ref()
-            .unwrap()
-            .variant
-            .as_deref(),
+            .slot_pin("spec_designer")
+            .and_then(|pin| pin.variant.as_deref()),
         Some("medium")
     );
     assert_eq!(loaded.project_pin("project", "mason"), Some("p/model:low"));

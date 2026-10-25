@@ -1,6 +1,6 @@
 //! Apply consumer exclusions and select pinned models without quality ranking.
 
-use crate::config_policy::{ExcludeGroups, Pins, SynthesizerPin};
+use crate::config_policy::{ExcludeGroups, SynthesizerPin};
 use prefrontal_routing_core::model_facts::ModelRequirements;
 use prefrontal_routing_core::model_router::{SelectModelRouteInput, SelectedModelRoute};
 use prefrontal_routing_core::provider_model_spec::ExclusionPolicy;
@@ -112,6 +112,7 @@ pub(crate) fn prepare_candidates(
     mut rejected: HashMap<String, String>,
     source: CandidateSource<'_>,
     consumer: Option<Consumer>,
+    priced_per_token: bool,
     allowed_providers: Option<&[String]>,
     subscription_plan_providers: Option<&std::collections::HashSet<String>>,
     policy: &prefrontal_routing_core::launch_policy::ModelRoutingPolicyInput,
@@ -139,9 +140,10 @@ pub(crate) fn prepare_candidates(
                     subscription_keys.insert(route.route_key);
                 }
             }
-            filters = candidate_rejections(
+            filters = candidate_rejections_priced(
                 facts,
                 consumer,
+                priced_per_token,
                 allowed_providers,
                 subscription_plan_providers,
             );
@@ -206,14 +208,14 @@ pub(crate) fn prepare_candidates(
                 // Account class is decided before fences: losing every oauth
                 // account must not silently authorize a priced-per-token key.
                 let subscription = serving.iter().any(covered);
-                if subscription && !requires_metered(consumer) {
+                if subscription && !priced_per_token {
                     subscription_keys.insert(route.route_key.clone());
                 }
                 let class: Vec<_> = serving
                     .iter()
                     .copied()
                     .filter(|row| {
-                        if requires_metered(consumer) {
+                        if priced_per_token {
                             !covered(row)
                         } else {
                             !subscription || covered(row)
@@ -252,13 +254,21 @@ pub(crate) fn prepare_candidates(
                     });
                 }
             }
-            let admission_facts = guard.as_ref().map_or_else(
+            let mut admission_facts = guard.as_ref().map_or_else(
                 || facts.to_vec(),
                 |guard| guard.admission_facts(facts, consumer, snapshot.now as u64),
             );
-            filters = candidate_rejections(
+            // A consumer priced per token by its flag, rather than by the
+            // historical request class, still needs the vault's payment
+            // methods on the admission copy. Merging again is harmless when
+            // the class already injected them.
+            if priced_per_token {
+                admission_facts = with_vault_methods(&admission_facts, rows);
+            }
+            filters = candidate_rejections_priced(
                 &admission_facts,
                 consumer,
+                priced_per_token,
                 allowed_providers,
                 subscription_plan_providers,
             );
@@ -322,15 +332,169 @@ pub(crate) fn requires_metered(consumer: Option<Consumer>) -> bool {
     matches!(consumer, Some(Consumer::Codemode | Consumer::Flow))
 }
 
-/// Whether selection prices `route` as paid from subscription quota: it is
-/// on the subscription list, and the consumer is not one that must run
-/// priced per token ([`requires_metered`]).
-pub(crate) fn subscription_covered(
+/// Whether this selection runs priced per token. An explicit
+/// `pay_per_token` on the consumer is the authority. When the flag is absent,
+/// the historical request classes stay priced per token so a config that has
+/// not written the flag yet does not change class.
+pub(crate) fn priced_per_token(
+    policy: &crate::config_policy::ConsumerPolicy,
     consumer: Option<Consumer>,
+) -> bool {
+    policy
+        .pay_per_token
+        .unwrap_or_else(|| requires_metered(consumer))
+}
+
+/// Copy vault payment methods onto an admission-only fact list. Used when a
+/// consumer is priced per token by its flag, so the metered filter can see
+/// methods the catalog row itself does not list.
+fn with_vault_methods(
+    facts: &[ModelFact],
+    rows: &[cortexkit_claustrum_client::ListedCredential],
+) -> Vec<ModelFact> {
+    let mut methods_by_provider: HashMap<String, std::collections::BTreeSet<String>> =
+        HashMap::new();
+    for row in rows {
+        if row.state != "active"
+            || !row
+                .categories
+                .iter()
+                .any(|category| category == "llm-provider")
+        {
+            continue;
+        }
+        let method = row
+            .auth_method
+            .clone()
+            .filter(|method| !method.is_empty())
+            .unwrap_or_else(|| {
+                crate::broca_credentials::credential_method(
+                    row.refresh_adapter.as_deref(),
+                    &row.credential_type,
+                )
+            });
+        if method.is_empty() {
+            continue;
+        }
+        for provider in &row.provider_ids {
+            methods_by_provider
+                .entry(provider.clone())
+                .or_default()
+                .insert(method.clone());
+        }
+    }
+    facts
+        .iter()
+        .cloned()
+        .map(|mut fact| {
+            if let Some(methods) = methods_by_provider.get(&fact.provider_id) {
+                let auth = fact.auth_methods.get_or_insert_with(Vec::new);
+                for method in methods {
+                    if !auth.contains(method) {
+                        auth.push(method.clone());
+                    }
+                }
+            }
+            fact
+        })
+        .collect()
+}
+
+/// Why the ordered pass chose the route it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderBasis {
+    RequestPin,
+    ProjectPin,
+    Continuing,
+    Mode,
+}
+
+/// A pin refusal, or the scorer's refusal after pins and a continuing model
+/// have been tried.
+#[derive(Debug)]
+pub(crate) enum OrderFailure<PinE, ScoreE> {
+    Pin(PinE),
+    Score(ScoreE),
+}
+
+/// Routes in `available` that are the named pin or one of its variants.
+pub(crate) fn routes_matching(
+    available: &std::collections::HashSet<String>,
+    pin: &str,
+) -> std::collections::HashSet<String> {
+    available
+        .iter()
+        .filter(|key| *key == pin || key.starts_with(&format!("{pin}/")))
+        .cloned()
+        .collect()
+}
+
+/// Request pin, then project pin, then a continuing model, then `mode`.
+///
+/// A present pin is a one-entry ladder: it does not fall through. A continuing
+/// model is kept only while `score` still accepts it; otherwise `mode` runs.
+/// `mode` is the consumer's ladder or demand, supplied by the caller so a
+/// ladder can keep the refusals `select_in_order` records.
+pub(crate) fn select_ordered<T, PinE, ScoreE>(
+    available: &std::collections::HashSet<String>,
+    request_pin: Option<&str>,
+    project_pin: Option<&str>,
+    continuing: Option<&str>,
+    mut admit_pin: impl FnMut(&str) -> Result<T, PinE>,
+    mut score: impl FnMut(&std::collections::HashSet<String>) -> Result<T, ScoreE>,
+    mode: impl FnOnce() -> Result<T, ScoreE>,
+) -> Result<(T, OrderBasis), OrderFailure<PinE, ScoreE>> {
+    if let Some(pin) = request_pin {
+        return admit_pin(pin)
+            .map(|selected| (selected, OrderBasis::RequestPin))
+            .map_err(OrderFailure::Pin);
+    }
+    if let Some(pin) = project_pin {
+        return admit_pin(pin)
+            .map(|selected| (selected, OrderBasis::ProjectPin))
+            .map_err(OrderFailure::Pin);
+    }
+    if let Some(previous) = continuing {
+        let only = routes_matching(available, previous);
+        if !only.is_empty() {
+            if let Ok(selected) = score(&only) {
+                return Ok((selected, OrderBasis::Continuing));
+            }
+        }
+    }
+    mode()
+        .map(|selected| (selected, OrderBasis::Mode))
+        .map_err(OrderFailure::Score)
+}
+
+/// The runner for a chosen route: the consumer's `runner` when it names one,
+/// otherwise the first entry in array order that can run the route.
+///
+/// Module ids are not sorted. A session's runner is not read; nothing in the
+/// session binding returns one, so the operator's array is the whole rule.
+pub(crate) fn choose_runner<'a>(
+    runners: &'a [crate::config_policy::RunnerPolicy],
+    consumer_runner: Option<&str>,
+    route_key: &str,
+    capacity_key: &str,
+    runs: impl Fn(&crate::config_policy::RunnerPolicy, &str, &str) -> bool,
+) -> Option<&'a crate::config_policy::RunnerPolicy> {
+    if let Some(module) = consumer_runner.filter(|module| !module.is_empty()) {
+        return runners.iter().find(|runner| runner.module == *module);
+    }
+    runners
+        .iter()
+        .find(|runner| runs(runner, route_key, capacity_key))
+}
+
+/// Whether selection prices `route` as paid from subscription quota: it is
+/// on the subscription list, and this selection is not priced per token.
+pub(crate) fn subscription_covered(
+    priced_per_token: bool,
     subscription_keys: &std::collections::HashSet<String>,
     route: &prefrontal_routing_core::ModelRoute,
 ) -> bool {
-    !requires_metered(consumer)
+    !priced_per_token
         && (subscription_keys.contains(&route.route_key)
             || subscription_keys.contains(&route.capacity_key))
 }
@@ -343,6 +507,22 @@ pub(crate) fn candidate_rejections(
     allowed_providers: Option<&[String]>,
     subscription_plan_providers: Option<&std::collections::HashSet<String>>,
 ) -> HashMap<String, String> {
+    candidate_rejections_priced(
+        facts,
+        consumer,
+        requires_metered(consumer),
+        allowed_providers,
+        subscription_plan_providers,
+    )
+}
+
+fn candidate_rejections_priced(
+    facts: &[ModelFact],
+    consumer: Option<Consumer>,
+    priced_per_token: bool,
+    allowed_providers: Option<&[String]>,
+    subscription_plan_providers: Option<&std::collections::HashSet<String>>,
+) -> HashMap<String, String> {
     facts
         .iter()
         .filter_map(|fact| {
@@ -350,14 +530,14 @@ pub(crate) fn candidate_rejections(
                 .is_some_and(|allowed| !allowed.contains(&fact.provider_id))
             {
                 Some(format!("allowed_providers filter denies provider {}", fact.provider_id))
-            } else if requires_metered(consumer)
+            } else if priced_per_token
                 && !(fact.auth_methods.as_ref().is_some_and(|methods| methods.iter().any(|method| method == "apikey"))
                     && fact.billing_plane.as_ref().is_some_and(|plane| plane.is_api_metered())
                     && subscription_plan_providers.is_some_and(|providers| !providers.contains(&fact.provider_id)))
             {
                 Some(format!(
                     "consumer {} requires known apikey auth methods, a metered billing plane with a known output price, and known absence of a subscription plan",
-                    crate::variant_policy::consumer_group(consumer).unwrap()
+                    crate::variant_policy::consumer_group(consumer).unwrap_or("pay_per_token")
                 ))
             } else {
                 None
@@ -427,29 +607,36 @@ pub(crate) struct PinSlotRequest {
     slot: PinSlot,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PinSlot {
+    Synthesizer,
     LabPlanner,
     SpecDesigner,
+}
+
+impl PinSlot {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Synthesizer => "synthesizer",
+            Self::LabPlanner => "lab_planner",
+            Self::SpecDesigner => "spec_designer",
+        }
+    }
 }
 
 impl Pin {
     /// The pin a request names, or `None` when it names a slot the operator
     /// left unset; the request is then selected like an unpinned one.
-    pub(crate) fn resolve(&self, pins: &Pins) -> Option<SynthesizerPin> {
+    ///
+    /// A slot is read from `consumers.<slot>.pin`. The model and variant are
+    /// kept as stored.
+    pub(crate) fn resolve(
+        &self,
+        slot_pin: impl Fn(&str) -> Option<SynthesizerPin>,
+    ) -> Option<SynthesizerPin> {
         match self {
-            Self::Slot(PinSlotRequest {
-                slot: PinSlot::LabPlanner,
-            }) => pins.lab_planner.as_ref().map(|pin| SynthesizerPin {
-                model: pin.model.clone(),
-                variant: None,
-            }),
-            // Only the designer's own pin: a configured synthesizer pin is
-            // Athena's choice and never routes the designer.
-            Self::Slot(PinSlotRequest {
-                slot: PinSlot::SpecDesigner,
-            }) => pins.spec_designer.clone(),
+            Self::Slot(PinSlotRequest { slot }) => slot_pin(slot.name()),
             Self::Model(pin) => Some(pin.clone()),
         }
     }
@@ -613,6 +800,7 @@ mod candidate_tests {
                 defer_pool_pin: false,
             },
             Some(Consumer::Mason),
+            false,
             None,
             None,
             &policy,
@@ -720,6 +908,139 @@ mod candidate_tests {
                 .unwrap()
                 .reason,
             "no_eligible_account"
+        );
+    }
+}
+
+#[cfg(test)]
+mod order_unit_tests {
+    use super::{choose_runner, select_ordered, OrderBasis, OrderFailure};
+    use crate::config_policy::RunnerPolicy;
+    use std::collections::HashSet;
+
+    fn runners(modules: &[&str]) -> Vec<RunnerPolicy> {
+        modules
+            .iter()
+            .map(|module| RunnerPolicy {
+                module: (*module).to_owned(),
+                routes: None,
+                tool_capabilities: Vec::new(),
+                via_vault: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn order_is_request_pin_then_project_pin_then_continuing_then_mode() {
+        let available = HashSet::from(["a/m".to_owned(), "b/m".to_owned(), "c/m".to_owned()]);
+        let admit = |pin: &str| Ok::<_, &str>(format!("pin:{pin}"));
+        let score = |set: &HashSet<String>| Ok::<_, &str>(format!("score:{}", set.len()));
+        let mode = || Ok::<_, &str>("mode".to_owned());
+
+        let (chosen, basis) = select_ordered(
+            &available,
+            Some("a/m"),
+            Some("b/m"),
+            Some("c/m"),
+            admit,
+            score,
+            mode,
+        )
+        .unwrap();
+        assert_eq!(
+            (chosen, basis),
+            ("pin:a/m".to_owned(), OrderBasis::RequestPin)
+        );
+
+        let admit = |pin: &str| Ok::<_, &str>(format!("pin:{pin}"));
+        let score = |set: &HashSet<String>| Ok::<_, &str>(format!("score:{}", set.len()));
+        let mode = || Ok::<_, &str>("mode".to_owned());
+        let (chosen, basis) = select_ordered(
+            &available,
+            None,
+            Some("b/m"),
+            Some("c/m"),
+            admit,
+            score,
+            mode,
+        )
+        .unwrap();
+        assert_eq!(
+            (chosen, basis),
+            ("pin:b/m".to_owned(), OrderBasis::ProjectPin)
+        );
+
+        let admit = |pin: &str| Ok::<_, &str>(format!("pin:{pin}"));
+        let score = |set: &HashSet<String>| Ok::<_, &str>(format!("score:{}", set.len()));
+        let mode = || Ok::<_, &str>("mode".to_owned());
+        let (chosen, basis) =
+            select_ordered(&available, None, None, Some("c/m"), admit, score, mode).unwrap();
+        assert_eq!(basis, OrderBasis::Continuing);
+        assert_eq!(chosen, "score:1");
+
+        let admit = |pin: &str| Ok::<_, &str>(format!("pin:{pin}"));
+        let score = |set: &HashSet<String>| Ok::<_, &str>(format!("score:{}", set.len()));
+        let mode = || Ok::<_, &str>("mode".to_owned());
+        let (chosen, basis) =
+            select_ordered(&available, None, None, None, admit, score, mode).unwrap();
+        assert_eq!((chosen, basis), ("mode".to_owned(), OrderBasis::Mode));
+    }
+
+    #[test]
+    fn a_continuing_model_that_is_no_longer_allowed_falls_through_to_mode() {
+        let available = HashSet::from(["a/m".to_owned()]);
+        let (chosen, basis) = select_ordered(
+            &available,
+            None,
+            None,
+            Some("gone/model"),
+            |_: &str| Ok::<_, &str>("pin"),
+            |_: &HashSet<String>| Err("not allowed"),
+            || Ok::<_, &str>("mode"),
+        )
+        .unwrap();
+        assert_eq!((chosen, basis), ("mode".to_owned(), OrderBasis::Mode));
+    }
+
+    #[test]
+    fn a_request_pin_does_not_fall_through() {
+        let available = HashSet::from(["a/m".to_owned()]);
+        let error = select_ordered(
+            &available,
+            Some("a/m"),
+            Some("b/m"),
+            None,
+            |_: &str| Err("refused"),
+            |_: &HashSet<String>| Ok::<_, &str>("score"),
+            || Ok::<_, &str>("mode"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, OrderFailure::Pin("refused")));
+    }
+
+    #[test]
+    fn runner_choice_uses_the_consumer_then_array_order_not_module_id_order() {
+        let listed = runners(&["zeta-runner", "alpha-runner"]);
+        let runs = |_: &RunnerPolicy, _: &str, _: &str| true;
+        assert_eq!(
+            choose_runner(&listed, None, "p/m", "p/m", runs)
+                .unwrap()
+                .module,
+            "zeta-runner"
+        );
+        assert_eq!(
+            choose_runner(&listed, Some("alpha-runner"), "p/m", "p/m", runs)
+                .unwrap()
+                .module,
+            "alpha-runner"
+        );
+        // A runner the route cannot use is skipped when the consumer named none.
+        let runs = |runner: &RunnerPolicy, _: &str, _: &str| runner.module == "alpha-runner";
+        assert_eq!(
+            choose_runner(&listed, None, "p/m", "p/m", runs)
+                .unwrap()
+                .module,
+            "alpha-runner"
         );
     }
 }
