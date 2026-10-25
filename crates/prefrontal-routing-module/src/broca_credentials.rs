@@ -3,6 +3,9 @@
 //! `serves` names model vendors; only the operator's `provider_ids` mapping
 //! names Fusiform providers. Older vaults omit the mapping and upgraded vaults
 //! initially emit empty mappings, so either shape requires a catalog fallback.
+//! A mapped provider with no catalog rows (`anthropic-platform`) borrows the
+//! rows of the one catalog provider its credentials' `serves` names; see
+//! [`BrocaCredentials::catalog_resolution`].
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -39,11 +42,12 @@ pub struct BrocaCredentials {
     pub(crate) catalog_snapshot: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
     pub(crate) catalog_wake: Arc<tokio::sync::Notify>,
     pub(crate) connection_file_path: Option<std::path::PathBuf>,
-    /// The operator's `model_routing.score_alias` as of the last refresh. An
-    /// aliased provider has no Fusiform plane of its own: its serving method is
-    /// read from the credentials mapped to the alias, and its rates from the
-    /// target provider's catalog under that method.
-    score_alias: std::collections::BTreeMap<String, String>,
+    /// The providers with no catalog rows that resolved to a catalog provider
+    /// at the last [`Self::refresh_serving_methods`], each with its catalog
+    /// provider. Such a provider has no Fusiform plane of its own: its serving
+    /// method is read from the credentials mapped to it, and its rates from the
+    /// catalog provider's plane under that method.
+    priced_targets: BTreeMap<String, String>,
     #[cfg(test)]
     pub(crate) legacy_pricing_baseline: bool,
 }
@@ -379,10 +383,41 @@ impl BrocaCredentials {
             .collect()
     }
 
-    /// Replace the score aliases used for serving methods, Fusiform plane keys
-    /// and pricing. Takes effect for serving methods on the next refresh.
-    pub(crate) fn set_score_alias(&mut self, aliases: std::collections::BTreeMap<String, String>) {
-        self.score_alias = aliases;
+    /// Resolve every provider the listing maps credentials to but that has no
+    /// rows in `facts` (the stored catalog rows, before any borrowed rows are
+    /// appended): it borrows the rows of the one catalog provider that a
+    /// `serves` vendor of its active credentials names. With no such vendor,
+    /// or more than one, the provider stays unresolved and gets no rows, so it
+    /// has no scores and no prices and is never selected.
+    pub(crate) fn catalog_resolution(
+        &self,
+        facts: &[ModelFact],
+    ) -> prefrontal_routing_core::score_alias::CatalogResolution {
+        let catalog: BTreeSet<String> = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        prefrontal_routing_core::score_alias::resolve_catalog_targets(
+            &catalog,
+            self.listed
+                .iter()
+                .filter(|row| {
+                    row.state == "active"
+                        && row
+                            .categories
+                            .iter()
+                            .any(|category| category == "llm-provider")
+                })
+                .map(
+                    |row| prefrontal_routing_core::score_alias::CredentialVendors {
+                        provider_ids: &row.provider_ids,
+                        serves: &row.serves,
+                    },
+                ),
+        )
+    }
+
+    /// [`Self::catalog_resolution`]'s map from each resolved provider to the
+    /// catalog provider whose rows it borrows.
+    pub(crate) fn catalog_targets(&self, facts: &[ModelFact]) -> BTreeMap<String, String> {
+        self.catalog_resolution(facts).targets
     }
 
     pub(crate) fn refresh_serving_methods(
@@ -391,10 +426,11 @@ impl BrocaCredentials {
         facts: &[ModelFact],
         at_ms: i64,
     ) {
-        // Aliased providers have no stored rows; serve them the borrowed rows
+        // Resolved providers have no stored rows; serve them the borrowed rows
         // selection will see so their credential method is known.
+        self.priced_targets = self.catalog_targets(facts);
         let mut facts = facts.to_vec();
-        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &self.score_alias);
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &self.priced_targets);
         self.serving = facts
             .iter()
             .map(|fact| {
@@ -451,12 +487,14 @@ impl BrocaCredentials {
             .serving
             .iter()
             .filter_map(|(key, method)| {
-                // An aliased provider is priced on its target's plane, the only
-                // one Fusiform knows, under the alias's own credential method.
+                // A resolved provider is priced on its catalog provider's plane,
+                // the only one Fusiform knows, under its own credential method.
                 let provider = key.split_once('/')?.0;
-                let provider =
-                    prefrontal_routing_core::score_alias::alias_target(&self.score_alias, provider)
-                        .unwrap_or(provider);
+                let provider = prefrontal_routing_core::score_alias::alias_target(
+                    &self.priced_targets,
+                    provider,
+                )
+                .unwrap_or(provider);
                 Some((provider.to_string(), method.auth_method.clone()?))
             })
             .collect();
@@ -478,7 +516,7 @@ impl BrocaCredentials {
                         continue;
                     }
                     let provider = prefrontal_routing_core::score_alias::alias_target(
-                        &self.score_alias,
+                        &self.priced_targets,
                         provider,
                     )
                     .unwrap_or(provider);
@@ -501,7 +539,7 @@ impl BrocaCredentials {
             let key = format!("{}/{}", fact.provider_id, fact.model_id);
             let method = self.serving_method(fact);
             let catalog_key =
-                prefrontal_routing_core::score_alias::catalog_key(&self.score_alias, &key);
+                prefrontal_routing_core::score_alias::catalog_key(&self.priced_targets, &key);
             fact.billing_plane = Some(self.billing_catalog.for_route(&catalog_key, &method));
         }
     }

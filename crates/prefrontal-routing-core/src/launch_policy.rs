@@ -116,11 +116,10 @@ pub struct ModelRoutingPolicyInput {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub subscription: Vec<String>,
-    /// Routing providers that have no catalog rows of their own and take their
-    /// quality, capability, context and speed rows from another provider's
-    /// route with the same model id: `{"anthropic-platform": "anthropic"}`.
-    /// Pricing comes from the target provider's catalog under the alias's own
-    /// credential method. An aliased provider is never subscription-covered.
+    /// The operator file's old `score_alias` map, still parsed by the config
+    /// loader. No selection path reads it: a provider with no catalog rows now
+    /// resolves through its credentials' `serves` vendors
+    /// ([`crate::score_alias::resolve_catalog_targets`]).
     #[serde(default)]
     pub score_alias: BTreeMap<String, String>,
 }
@@ -148,6 +147,29 @@ pub fn resolve_routing_policy(
     caller: &ModelRoutingPolicyInput,
     provider_auth_types: &HashMap<String, String>,
 ) -> ResolvedRoutingPolicy {
+    resolve_routing_policy_with_catalog_targets(
+        available_models,
+        operator,
+        caller,
+        provider_auth_types,
+        &BTreeMap::new(),
+    )
+}
+
+/// [`resolve_routing_policy`] for a selection that knows which providers
+/// resolved to another provider's catalog rows (`catalog_targets`, resolved
+/// provider to catalog provider, from
+/// [`crate::score_alias::resolve_catalog_targets`]). A resolved provider is
+/// never subscription-covered: it borrows the catalog provider's rows but bills
+/// its own credential, so a subscription the catalog provider has must not
+/// price it as quota.
+pub fn resolve_routing_policy_with_catalog_targets(
+    available_models: impl IntoIterator<Item = String>,
+    operator: &ModelRoutingPolicyInput,
+    caller: &ModelRoutingPolicyInput,
+    provider_auth_types: &HashMap<String, String>,
+    catalog_targets: &BTreeMap<String, String>,
+) -> ResolvedRoutingPolicy {
     let connected: HashSet<String> = available_models.into_iter().collect();
     let connected_model_count = connected.len();
     let filtered = filter_excluded_keys_with_policy(
@@ -174,10 +196,10 @@ pub fn resolve_routing_policy(
         .iter()
         .filter(|key| {
             let provider = key.split('/').next().unwrap_or(key);
-            // A score-aliased provider borrows another provider's rows but bills
-            // its own credential (a metered API key). Treating it as covered would
-            // let a subscription spec meant for the target price it as quota.
-            if operator.score_alias.contains_key(provider) {
+            // A resolved provider borrows another provider's rows but bills its
+            // own credential (a metered API key). Treating it as covered would
+            // let a subscription meant for the target price it as quota.
+            if catalog_targets.contains_key(provider) {
                 return false;
             }
             let oauth = provider_auth_types
@@ -380,6 +402,41 @@ mod tests {
         assert!(merged
             .subscription_keys
             .contains(&"fireworks-ai/llama".to_string()));
+    }
+
+    #[test]
+    fn a_resolved_provider_is_never_subscription_covered() {
+        let keys = ["anthropic/claude-opus-4-1", "platform/claude-opus-4-1"];
+        let operator = ModelRoutingPolicyInput {
+            subscription: vec!["platform".into()],
+            ..ModelRoutingPolicyInput::default()
+        };
+        let mut auth = auth_types();
+        auth.insert("platform".into(), "oauth".into());
+        let targets = BTreeMap::from([("platform".to_string(), "anthropic".to_string())]);
+        let resolved = resolve_routing_policy_with_catalog_targets(
+            keys.iter().map(|key| (*key).to_string()),
+            &operator,
+            &ModelRoutingPolicyInput::default(),
+            &auth,
+            &targets,
+        );
+        assert_eq!(
+            resolved.subscription_keys,
+            vec!["anthropic/claude-opus-4-1"]
+        );
+        // The old operator map is no longer read: without a resolution the
+        // provider is judged on its own id like any other.
+        let unresolved = resolve_routing_policy(
+            keys.iter().map(|key| (*key).to_string()),
+            &ModelRoutingPolicyInput {
+                score_alias: targets.clone(),
+                ..operator
+            },
+            &ModelRoutingPolicyInput::default(),
+            &auth,
+        );
+        assert_eq!(unresolved.subscription_keys, keys);
     }
 
     #[test]

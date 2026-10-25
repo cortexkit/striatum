@@ -82,11 +82,12 @@ pub(crate) fn route_keys(
 ///
 /// A named variant is checked against the reasoning efforts the catalog
 /// publishes for the model (Fusiform's `reasoning_options`, which Broca also
-/// admits by), following a score alias to the provider whose catalog rows it
-/// borrows, as the `model_routing.variants` check does. A variant outside a
-/// published list is refused. When the catalog has not been read for the model
-/// yet, or no catalog is attached, the pin is admitted with a warning and
-/// Broca decides.
+/// admits by), following a provider with no catalog rows to the catalog
+/// provider whose rows it borrows (`catalog_targets`, resolved through the
+/// vault's `serves`), as the `model_routing.variants` check does. A variant
+/// outside a published list is refused. When the catalog has not been read for
+/// the model yet, or no catalog is attached, the pin is admitted with a
+/// warning and Broca decides.
 #[cfg(test)]
 pub(crate) fn select(
     pin: &str,
@@ -94,9 +95,17 @@ pub(crate) fn select(
     config: &RoutingConfig,
     slots: Option<&ConcurrencySlots>,
     catalog: Option<&ReasoningCatalog>,
-    aliases: &BTreeMap<String, String>,
+    catalog_targets: &BTreeMap<String, String>,
 ) -> Result<SelectedModelRoute, Refusal> {
-    select_with_availability(pin, input, config, slots, catalog, aliases, &HashMap::new())
+    select_with_availability(
+        pin,
+        input,
+        config,
+        slots,
+        catalog,
+        catalog_targets,
+        &HashMap::new(),
+    )
 }
 
 pub(crate) fn select_with_availability(
@@ -105,7 +114,7 @@ pub(crate) fn select_with_availability(
     config: &RoutingConfig,
     slots: Option<&ConcurrencySlots>,
     catalog: Option<&ReasoningCatalog>,
-    aliases: &BTreeMap<String, String>,
+    catalog_targets: &BTreeMap<String, String>,
     availability_rejections: &HashMap<String, String>,
 ) -> Result<SelectedModelRoute, Refusal> {
     let (provider, requested_model) = pin.split_once('/').ok_or_else(|| {
@@ -147,9 +156,9 @@ pub(crate) fn select_with_availability(
     }
     let mut variant_warning = None;
     if let Some(variant) = variant {
-        match catalog
-            .and_then(|catalog| variant_policy::published(catalog, aliases, provider, model))
-        {
+        match catalog.and_then(|catalog| {
+            variant_policy::published(catalog, catalog_targets, provider, model)
+        }) {
             Some(PublishedEfforts::Published(values)) => {
                 if !values.iter().any(|value| value == variant) {
                     return Err(refuse(
@@ -395,8 +404,9 @@ mod tests {
     /// A pinned variant is judged by the reasoning efforts the catalog
     /// publishes, the same list Broca admits by: `xhigh` on an Opus route is
     /// admitted when published, a variant outside the list is refused and the
-    /// refusal names the list, a score alias reads its target's catalog rows,
-    /// and a model the catalog has not been read for is admitted with a warning.
+    /// refusal names the list, a provider resolved to another provider's
+    /// catalog rows reads that provider's efforts, and a model the catalog has
+    /// not been read for is admitted with a warning.
     #[test]
     fn pinned_variants_are_checked_against_the_published_reasoning_efforts() {
         let published = catalog(&[
