@@ -8,6 +8,14 @@ use serde_json::Value;
 use super::{operator_config, Deps};
 use crate::select_policy;
 
+/// The optional routing/v1 groups this provider serves, listed in
+/// `role.describe` as `capabilities` and passed to the `route.select`
+/// validator, so the two always agree. None yet: without
+/// `select_hold_control` the validator refuses a select carrying `hold_ok`
+/// or `hold_wait_max_s` by name, and callers do not send them. Add the group
+/// here when select answers a blocked ladder entry under the hold rule.
+pub(super) const CAPABILITIES: &[&str] = &[];
+
 /// Params are ignored: the role defines `{}` and no refusal for this op.
 pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
     let consumers = operator_config(deps)
@@ -22,6 +30,10 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         .collect();
     // A `detail: true` select is answered with the selection's explanation
     // lines, rejections and score.
-    serde_json::to_value(RoleDescribe::new(consumers, true))
+    let describe = CAPABILITIES.iter().fold(
+        RoleDescribe::new(consumers, true),
+        |describe, capability| describe.with_capability(*capability),
+    );
+    serde_json::to_value(describe)
         .map_err(|error| super::provider_refusal("internal_error", error.to_string()))
 }
