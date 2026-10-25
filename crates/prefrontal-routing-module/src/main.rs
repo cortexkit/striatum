@@ -20,6 +20,7 @@ mod available_models_text;
 #[cfg(test)]
 mod baseline_tests;
 mod broca_credentials;
+mod config_convert;
 mod config_overrides;
 mod config_policy;
 mod credential_fences;
@@ -39,6 +40,8 @@ mod select_policy;
 mod selection_harness;
 mod subscription_economics;
 mod substrate_policy;
+#[cfg(test)]
+mod test_config;
 mod usage_observe;
 mod variant_policy;
 mod winner_ladder;
@@ -862,6 +865,22 @@ fn check_config_at(path: &Path) -> Result<(), ModuleError> {
 
 #[tokio::main]
 async fn main() -> Result<(), ModuleError> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "config-convert") {
+        if args.len() != 3 {
+            return Err(ModuleError::Message(format!(
+                "usage: {} <input> <output>",
+                config_convert::COMMAND
+            )));
+        }
+        let input = std::fs::read_to_string(&args[1])
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
+        let output = config_convert::convert(&input).map_err(ModuleError::Message)?;
+        config_overrides::validate_document(&output).map_err(ModuleError::Message)?;
+        std::fs::write(&args[2], output)
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
+        return Ok(());
+    }
     // Read the launch nonce before anything else can spawn a process: until
     // this first read, the pipe the daemon handed it over on is inheritable,
     // so a child spawned earlier would receive it. The result is cached for
@@ -4160,6 +4179,11 @@ async fn handle_select_request(
             params.allowed_providers.as_deref(),
             subscription_plan_providers.as_ref(),
         ));
+    let consumer_id = crate::variant_policy::consumer_group(params.consumer).unwrap_or("");
+    let pinned = params.pin.is_some() || params.model_pin.is_some();
+    mapped_availability
+        .models
+        .retain(|route| operator_config.route_allowed(consumer_id, route, pinned));
     let available = mapped_availability.models.clone();
     // The harness a route selected here runs on, as far as routing knows: the
     // mapped harness, or for a host-run selection Broca when it was judged on
@@ -7655,31 +7679,29 @@ mod tests {
         let path = scratch.join("prefrontal-routing.jsonc");
         check_config_at(&path).unwrap();
         let renamed = prefrontal_test_support::ScratchDir::new("routing-config-check-renamed");
-        std::fs::write(renamed.join("alfonso-routing.jsonc"), "{}").unwrap();
+        crate::test_config::write(renamed.join("alfonso-routing.jsonc"), "{}").unwrap();
         assert!(check_config_at(&renamed.join("prefrontal-routing.jsonc"))
             .unwrap_err()
             .to_string()
             .contains("config_renamed"));
         let invalid = prefrontal_test_support::ScratchDir::new("routing-config-check-invalid");
         let invalid_path = invalid.join("prefrontal-routing.jsonc");
-        std::fs::write(&invalid_path, "{\"not_a_routing_setting\":true}").unwrap();
+        crate::test_config::write(&invalid_path, "{\"not_a_routing_setting\":true}").unwrap();
         assert!(check_config_at(&invalid_path).is_err());
     }
 
     #[test]
-    fn config_check_refuses_explicit_only_providers_and_names_the_exclude_remedy() {
+    fn config_check_refuses_old_shape_and_names_converter() {
         let scratch = prefrontal_test_support::ScratchDir::new("routing-config-check-explicit");
         let path = scratch.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write_raw(
             &path,
             r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,
         )
         .unwrap();
         let error = check_config_at(&path).unwrap_err().to_string();
         assert!(
-            error.contains("config_key_removed: model_routing.explicit_only_providers")
-                && error
-                    .contains("list the provider in model_routing.exclude.all; pins still work"),
+            error.contains("model_routing") && error.contains("prefrontal-routing config-convert"),
             "{error}"
         );
     }
@@ -8882,13 +8904,13 @@ mod tests {
             .upsert_fact(&fact("held-b", "model"), FactSource::Override)
             .unwrap();
         let path = rig.dir.join("routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"models":{"held-a/model":{"speed_multiplier":0.5}},"keep_free_percent":{"held-b":20}}}"#,
         )
         .unwrap();
         let held = config_overrides::settle_live_config(&path);
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"models":{"held-a/model":{"speed_multiplier":2.0}},"keep_free_percent":{"held-b":0}}}"#,
         )
@@ -10420,7 +10442,7 @@ mod tests {
             )
             .expect("stamp the stale exclusion column");
         let operator_config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": {"all": ["fixture/wire-only"]} } }"#,
         )
@@ -12590,7 +12612,7 @@ mod tests {
             ))
             .unwrap();
         let operator_config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": { "all": ["google/antigravity-gemini-4-argon"] } } }"#,
         )
@@ -12647,7 +12669,7 @@ mod tests {
             fact("openai", "gpt-5.5"),
         ];
         let operator_config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": {"all": ["anthropic"]} } }"#,
         )
@@ -12738,7 +12760,7 @@ mod tests {
         );
 
         // Live edit: a new exclude list takes effect on the next selection, no restart.
-        std::fs::write(
+        crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": {"all": ["openai"]} } }"#,
         )
@@ -14595,7 +14617,7 @@ mod tests {
     /// of its models still admits it.
     fn platform_operator_config(rig: &Rig) -> PathBuf {
         let path = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{ "model_routing": {
                 "exclude": { "all": ["anthropic-platform"] }
@@ -14950,7 +14972,7 @@ mod tests {
             store.upsert_fact(&row, FactSource::Override).unwrap();
         }
         let config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(&config, json!({"model_routing": {
+        crate::test_config::write(&config, json!({"model_routing": {
             "exclude": {"all": ["anthropic/claude-opus-5-5", "anthropic-platform/claude-sonnet-fallback"]},
             "panels": {"audit": {"topK": 2, "extra": 0, "by": "iq"}}
         }}).to_string()).unwrap();
@@ -16534,7 +16556,7 @@ mod tests {
         }
         let credentials = Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(&[a, b])));
         let path = rig.dir.join("routing.jsonc");
-        std::fs::write(&path, "{}").unwrap();
+        crate::test_config::write(&path, "{}").unwrap();
         async fn select(
             store: &SharedStore,
             credentials: &SharedBrocaCredentials,
@@ -16576,7 +16598,7 @@ mod tests {
         }
         let first = select(&store, &credentials, &path).await;
         assert_eq!(first["result"]["selected"]["routeKey"], "a/reader");
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#,
         )
@@ -16584,7 +16606,7 @@ mod tests {
         config_overrides::settle_live_config(&path);
         let cost_edit = select(&store, &credentials, &path).await;
         assert_eq!(cost_edit["result"]["selected"]["routeKey"], "b/reader");
-        std::fs::write(&path, r#"{"model_routing":{"exclude":{"all":["b"]},"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
+        crate::test_config::write(&path, r#"{"model_routing":{"exclude":{"all":["b"]},"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
         config_overrides::settle_live_config(&path);
         let fenced = select(&store, &credentials, &path).await;
         assert_eq!(fenced["result"]["selected"]["routeKey"], "a/reader");
@@ -16600,7 +16622,7 @@ mod tests {
             // The removed key is refused whole, so its exclusion is never applied.
             r#"{"model_routing":{"explicit_only_providers":["a"]}}"#,
         ] {
-            std::fs::write(&path, invalid).unwrap();
+            crate::test_config::write(&path, invalid).unwrap();
             let retained = config_overrides::settle_live_config(&path);
             assert!(
                 Arc::ptr_eq(&good, &retained),
@@ -16609,7 +16631,7 @@ mod tests {
             let selected = select(&store, &credentials, &path).await;
             assert_eq!(selected["result"]["selected"], fenced["result"]["selected"]);
         }
-        std::fs::write(&path, "{}").unwrap();
+        crate::test_config::write(&path, "{}").unwrap();
         config_overrides::settle_live_config(&path);
         let removed = select(&store, &credentials, &path).await;
         assert_eq!(removed["result"]["selected"]["routeKey"], "a/reader");
@@ -16685,11 +16707,11 @@ mod tests {
         store.upsert_fact(&weak, FactSource::Override).unwrap();
         store.upsert_fact(&strong, FactSource::Override).unwrap();
         let config_path = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(&config_path, r#"{"model_routing":{}}"#).unwrap();
+        crate::test_config::write(&config_path, r#"{"model_routing":{}}"#).unwrap();
         let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
 
         assert_eq!(select(&store, &quota_cache, &config_path).await, "p/strong");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{"model_routing":{"elo_overrides":{"p/weak":1900}}}"#,
         )
@@ -17381,7 +17403,7 @@ mod tests {
         let mut watch = winner_ladder::ConfigReloadWatch::new(&rig.sources);
         assert_eq!(watch.check(rig.store.as_ref(), &rig.sources), None);
 
-        std::fs::write(
+        crate::test_config::write(
             &rig.sources.routing_config,
             serde_json::to_vec(&json!({
                 "model_routing": { "exclude": {"all": [rig.route("incumbent")]} }
@@ -17555,7 +17577,7 @@ mod tests {
             rig.route("incumbent"),
             json!({ "subscription_multiplier": 100 }),
         );
-        std::fs::write(
+        crate::test_config::write(
             &rig.sources.routing_config,
             serde_json::to_vec(&json!({ "model_routing": { "models": models } })).unwrap(),
         )

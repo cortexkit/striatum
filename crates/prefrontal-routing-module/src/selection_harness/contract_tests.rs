@@ -21,7 +21,7 @@ impl HarnessRig {
             store.upsert_fact(&row, FactSource::Override).unwrap();
         }
         let config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &config,
             json!({"model_routing": {"substrates": mapping, "models": {
                 "opencode/deepseek-v4.1-flash-free": {"cost_per_mtok_out": 0},
@@ -243,7 +243,7 @@ async fn panel_seats_resolve_under_athena_and_only_use_broca() {
     let mut config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rig.config).unwrap()).unwrap();
     config["model_routing"]["panels"] = json!({"audit": {"topK": 1, "extra": 0, "by": "iq"}});
-    std::fs::write(&rig.config, config.to_string()).unwrap();
+    crate::test_config::write(&rig.config, config.to_string()).unwrap();
     let body = rig
         .call(
             ROUTE_SELECT_PANEL_OP,
@@ -329,7 +329,7 @@ async fn runner_auth_pin_mapped_off_broca_refuses_even_with_broca_substrate() {
     let mut config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rig.config).unwrap()).unwrap();
     config["model_routing"]["score_alias"] = json!({"anthropic-platform": "anthropic"});
-    std::fs::write(&rig.config, config.to_string()).unwrap();
+    crate::test_config::write(&rig.config, config.to_string()).unwrap();
     let body = rig.call(ROUTE_SELECT_OP, json!({
         "consumer": "mason", "targetAgent": "mason", "workload": "mason", "requirements": {"iq": 30, "eq": 0},
         "modelPin": "anthropic-platform/claude-opus-5-5", "substrate": "broca", "harness": "opencode",

@@ -18,13 +18,19 @@ pub(super) const CAPABILITIES: &[&str] = &[];
 
 /// Params are ignored: the role defines `{}` and no refusal for this op.
 pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
-    let consumers = operator_config(deps)
+    let config = operator_config(deps);
+    let consumers = config
         .v1_consumers()
         .into_iter()
         .map(|id| ConsumerEntry {
             // The same rule selection applies to the request class the id
             // names: codemode and flow run only priced per token.
-            priced_only: select_policy::requires_metered(select_policy::Consumer::from_id(&id)),
+            priced_only: config
+                .consumer_policy(&id, &Default::default(), &Default::default())
+                .pay_per_token
+                .unwrap_or_else(|| {
+                    select_policy::requires_metered(select_policy::Consumer::from_id(&id))
+                }),
             id,
         })
         .collect();

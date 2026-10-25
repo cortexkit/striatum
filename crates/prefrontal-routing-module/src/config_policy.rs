@@ -365,7 +365,7 @@ pub const MAGIC_CONTEXT_CONSUMERS: &[&str] = &[
     "mc_dream_docs",
 ];
 
-/// A runner module `routing/v1` answers with (`model_routing.runners[]`).
+/// A runner module `routing/v1` answers with (`runners[]`).
 /// Listed in preference order: the first listed runner that can serve the
 /// answered route is named.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -377,8 +377,7 @@ pub struct RunnerPolicy {
     pub module: String,
     /// The routes it runs, in the exclusion grammar (`provider`,
     /// `provider/model`, `provider/model/variant`). Absent: every route it
-    /// serves; for `broca`, the routes Broca's credentials serve, and for any
-    /// other module every catalog route.
+    /// serves. With `via_vault`, reach also requires a serving vault credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routes: Option<Vec<String>>,
     /// Tool capability tags (such as `code.read/v1`) the runner can reach a
@@ -386,14 +385,117 @@ pub struct RunnerPolicy {
     /// only on a runner reaching every one of them.
     #[serde(default)]
     pub tool_capabilities: Vec<String>,
+    /// When true, reaching this runner also requires a serving vault credential.
+    #[serde(default)]
+    pub via_vault: bool,
 }
 
-/// The runners served when the routing file names none: Broca, on the routes
-/// its credentials serve.
-pub fn default_runners() -> Vec<RunnerPolicy> {
-    vec![RunnerPolicy {
-        module: "broca".into(),
-        routes: None,
-        tool_capabilities: Vec::new(),
-    }]
+/// Match only whole dotted consumer segments, never an unrelated name that
+/// happens to start with the same characters.
+pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
+    consumer == prefix
+        || consumer
+            .strip_prefix(prefix)
+            .is_some_and(|tail| tail.starts_with('.'))
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct EntityPolicy {
+    pub only_for: Option<Vec<String>>,
+    pub not_for: Option<Vec<String>>,
+    pub pin_only: Option<bool>,
+    pub subscription: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderPolicy {
+    #[serde(flatten)]
+    pub rules: EntityPolicy,
+    pub prompt_cache: Option<bool>,
+    pub subscription_multiplier: Option<f64>,
+    pub keep_free_percent: Option<f64>,
+    pub models: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerMode {
+    Demand,
+    Ladder,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectPolicy {
+    pub pin: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsumerPolicy {
+    pub mode: Option<ConsumerMode>,
+    pub ladder: Option<Vec<String>>,
+    pub variants: Option<BTreeMap<String, String>>,
+    pub runner: Option<String>,
+    pub owner: Option<String>,
+    pub pay_per_token: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pin: Option<SynthesizerPin>,
+    pub projects: BTreeMap<String, ProjectPolicy>,
+    pub iq: Option<f64>,
+    pub eq: Option<f64>,
+    pub context_tokens: Option<u64>,
+    pub tool_capabilities: Option<Vec<String>>,
+}
+
+pub fn is_slot(name: &str) -> bool {
+    matches!(name, "synthesizer" | "lab_planner" | "spec_designer")
+}
+
+/// Resolve each key independently, exhausting operator ancestors before looking
+/// at the request or declaration. A more specific lower-priority source cannot
+/// override an operator's parent entry.
+pub fn resolve_consumer_policy(
+    consumer: &str,
+    operator: &BTreeMap<String, ConsumerPolicy>,
+    request: &ConsumerPolicy,
+    declared: &BTreeMap<String, ConsumerPolicy>,
+) -> ConsumerPolicy {
+    let mut result = serde_json::Map::new();
+    let mut overlay = |entry: &ConsumerPolicy| {
+        for (key, value) in serde_json::to_value(entry).unwrap().as_object().unwrap() {
+            if !value.is_null() && value != &serde_json::json!({}) {
+                result.insert(key.clone(), value.clone());
+            }
+        }
+    };
+    for (source, is_operator) in [(declared, false), (operator, true)] {
+        if is_operator {
+            overlay(request);
+        }
+        let mut chain: Vec<_> = source
+            .iter()
+            .filter(|(name, _)| !is_slot(name) && consumer_matches(name, consumer))
+            .collect();
+        chain.sort_by_key(|(name, _)| name.len());
+        for (_, entry) in chain {
+            overlay(entry);
+        }
+    }
+    let mut result: ConsumerPolicy =
+        serde_json::from_value(serde_json::Value::Object(result)).unwrap();
+    if let Some(pin) = &result.pin {
+        result.mode = Some(ConsumerMode::Ladder);
+        result.ladder = Some(vec![pin.variant.as_ref().map_or_else(
+            || pin.model.clone(),
+            |variant| format!("{}:{variant}", pin.model),
+        )]);
+    }
+    result
 }

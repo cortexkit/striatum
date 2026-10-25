@@ -10,8 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config_policy::{
-    default_runners, ExcludeGroups, PanelPolicies, Pins, RunnerPolicy, VariantGroups,
-    MAGIC_CONTEXT_CONSUMERS,
+    ConsumerPolicy, ExcludeGroups, PanelPolicies, Pins, ProviderPolicy, RunnerPolicy, VariantGroups,
 };
 use crate::substrate_policy::SubstrateGroups;
 use prefrontal_routing_core::model_facts::{
@@ -42,6 +41,9 @@ pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 mod contract_tests;
+mod new_shape;
+#[cfg(test)]
+mod new_shape_tests;
 
 /// A complete, validated document held for the lifetime of one selection. Model
 /// overrides are overlays, not store writes: withdrawing one exposes stored facts
@@ -158,8 +160,27 @@ fn check_variants_with(
     catalog: &ReasoningCatalog,
 ) -> Result<Vec<String>, String> {
     let section = &config.model_routing;
-    crate::variant_policy::check_against_catalog(&section.variants, &section.score_alias, catalog)
-        .map_err(|error| format!("variant_not_published: {error}"))
+    let mut groups = serde_json::to_value(&section.variants).unwrap();
+    let mut warnings = Vec::new();
+    for entries in groups.as_object_mut().unwrap().values_mut() {
+        entries.as_object_mut().unwrap().retain(|key, _| {
+            let provider = key.split('/').next().unwrap_or(key);
+            if catalog.models_of(provider).next().is_some() {
+                true
+            } else {
+                warnings.push(format!(
+                    "variants for {key} await the provider's credential-to-catalog resolution"
+                ));
+                false
+            }
+        });
+    }
+    let groups = serde_json::from_value(groups).unwrap();
+    warnings.extend(
+        crate::variant_policy::check_against_catalog(&groups, &BTreeMap::new(), catalog)
+            .map_err(|error| format!("variant_not_published: {error}"))?,
+    );
+    Ok(warnings)
 }
 
 fn report_variant_warnings(path: &Path, warnings: Vec<String>) {
@@ -272,37 +293,24 @@ fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
     if value.get("aa").is_some() {
         return Err("config_key_removed: aa; delete this key".into());
     }
-    // `exclude` now keeps a route out of automatic choice only and a named model
-    // is always admitted, which is everything this key used to mean.
-    if value
-        .get("model_routing")
-        .and_then(|section| section.get("explicit_only_providers"))
-        .is_some()
-    {
-        return Err("config_key_removed: model_routing.explicit_only_providers; list the provider in model_routing.exclude.all; pins still work".into());
-    }
-    // Shadow mode was the dry run before account selection served; with
-    // serving on it only re-ran the allocator for nobody. Named here, whatever
-    // its value, so the operator learns why the key went away.
-    if value
-        .get("account_selection")
-        .and_then(|section| section.get("shadow"))
-        .is_some()
-    {
-        return Err("config_key_removed: account_selection.shadow; delete it; account selection serves directly".into());
-    }
-    if value
-        .get("model_routing")
-        .and_then(|section| section.get("exclude"))
-        .is_some_and(serde_json::Value::is_array)
-    {
-        return Err("exclude_shape: model_routing.exclude must be an object; move the array to model_routing.exclude.all".into());
+    for key in ["model_routing", "account_selection", "pins", "score_alias"] {
+        if value.get(key).is_some() {
+            return Err(format!(
+                "old routing config key {key}; run {} <input> <output>",
+                crate::config_convert::COMMAND
+            ));
+        }
     }
     // Parse the original text so ordered model_families rules retain their order.
-    let config: RoutingConfigFile =
+    let mut config: RoutingConfigFile =
         serde_json::from_str(&json).map_err(|error| format!("invalid routing config: {error}"))?;
+    config.prepare()?;
     validate_live_config(&config)?;
     Ok(config)
+}
+
+pub(crate) fn validate_document(document: &str) -> Result<(), String> {
+    parse_config(document).map(|_| ())
 }
 
 fn live_config_at(path: &Path, now: Instant) -> Result<Arc<LiveConfig>, String> {
@@ -360,7 +368,8 @@ fn live_config_at_with_reporter(
             Err(error) => return Err(error.to_string()),
         };
         let config = match &document {
-            Some(document) => parse_config(document)?,
+            Some(document) => parse_config(document)
+                .map_err(|error| format!("invalid config in {}: {error}", path.display()))?,
             None => RoutingConfigFile::default(),
         };
         check_variants_against_catalog(path, &config)?;
@@ -535,7 +544,6 @@ fn v1_consumer_ids(section: &ModelRoutingSection) -> Vec<String> {
         None => crate::select_policy::Consumer::ALL
             .into_iter()
             .filter_map(|consumer| crate::variant_policy::consumer_group(Some(consumer)))
-            .chain(MAGIC_CONTEXT_CONSUMERS.iter().copied())
             .map(str::to_owned)
             .collect(),
     };
@@ -554,10 +562,6 @@ impl LiveConfig {
 
     pub(crate) fn substrate_groups(&self) -> &SubstrateGroups {
         &self.config.model_routing.substrates
-    }
-
-    pub fn score_aliases(&self) -> &std::collections::BTreeMap<String, String> {
-        &self.config.model_routing.score_alias
     }
 
     pub fn panels(&self) -> &PanelPolicies {
@@ -580,7 +584,7 @@ impl LiveConfig {
         ModelRoutingPolicyInput {
             exclude: clean_spec_entries(section.exclude.all.clone()),
             subscription: clean_spec_entries(section.subscription.clone()),
-            score_alias: section.score_alias.clone(),
+            score_alias: BTreeMap::new(),
         }
     }
 
@@ -592,31 +596,41 @@ impl LiveConfig {
     }
 
     pub fn account_flags(&self) -> AccountSelectionFlags {
-        self.config.account_selection
+        self.config.accounts
     }
 
     /// The `routing/v1` consumer ids, in id order.
     pub fn v1_consumers(&self) -> Vec<String> {
-        v1_consumer_ids(&self.config.model_routing)
+        self.config
+            .consumers
+            .keys()
+            .filter(|id| !crate::config_policy::is_slot(id))
+            .cloned()
+            .collect()
     }
 
     /// The `routing/v1` runners, in preference order.
     pub fn v1_runners(&self) -> Vec<RunnerPolicy> {
-        self.config
-            .model_routing
-            .runners
-            .clone()
-            .unwrap_or_else(default_runners)
+        self.config.runners.clone()
     }
 
     /// The operator's pin for `consumer` within `project_id`, if any.
     pub fn project_pin(&self, project_id: &str, consumer: &str) -> Option<&str> {
         self.config
-            .model_routing
-            .project_pins
-            .get(project_id)?
-            .get(consumer)
-            .map(String::as_str)
+            .consumers
+            .iter()
+            .filter(|(name, _)| {
+                !crate::config_policy::is_slot(name)
+                    && crate::config_policy::consumer_matches(name, consumer)
+            })
+            .filter_map(|(name, policy)| {
+                policy
+                    .projects
+                    .get(project_id)
+                    .map(|project| (name.len(), project.pin.as_str()))
+            })
+            .max_by_key(|(length, _)| *length)
+            .map(|(_, pin)| pin)
     }
 
     pub fn failure_backoff(&self) -> FailureBackoffConfig {
@@ -653,7 +667,10 @@ impl LiveConfig {
 
     pub fn apply(&self, facts: &mut Vec<ModelFact>) -> SelectionOverrideOutcome {
         let section = &self.config.model_routing;
-        for key in section.models.keys() {
+        for (key, model) in &section.models {
+            if !model.has_fact_override() {
+                continue;
+            }
             let (provider, model, variant) = parse_model_key(key).expect("validated model key");
             if !facts.iter().any(|fact| {
                 make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()) == *key
@@ -769,10 +786,10 @@ mod live_snapshot_tests {
             .join(format!("routing-config-debounce-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing.jsonc");
-        std::fs::write(&path, r#"{"model_routing":{"subscription":["meta"]}}"#).unwrap();
+        crate::test_config::write(&path, r#"{"model_routing":{"subscription":["meta"]}}"#).unwrap();
         let now = Instant::now();
         let held = live_config_at(&path, now).unwrap();
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"subscription":["other-provider"]}}"#,
         )
@@ -783,8 +800,14 @@ mod live_snapshot_tests {
             &live_config_at(&path, now + RELOAD_DEBOUNCE / 2).unwrap()
         ));
         let published = live_config_at(&path, now + RELOAD_DEBOUNCE).unwrap();
-        assert_eq!(published.operator_policy().subscription, ["other-provider"]);
-        assert_eq!(held.operator_policy().subscription, ["meta"]);
+        assert_eq!(
+            published.operator_policy().subscription,
+            ["ollama-cloud", "opencode-go", "other-provider"]
+        );
+        assert_eq!(
+            held.operator_policy().subscription,
+            ["meta", "ollama-cloud", "opencode-go"]
+        );
         assert!(!Arc::ptr_eq(&held, &published));
         std::fs::remove_file(&path).unwrap();
         assert!(Arc::ptr_eq(
@@ -816,21 +839,25 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn default_providers_without_prompt_cache() -> Vec<String> {
-    vec!["ollama-cloud".to_string()]
-}
-
 #[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RoutingConfigFile {
-    #[serde(default)]
+    #[serde(flatten)]
     model_routing: ModelRoutingSection,
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderPolicy>,
+    #[serde(default, rename = "variants")]
+    default_variants: BTreeMap<String, String>,
+    #[serde(default)]
+    consumers: BTreeMap<String, ConsumerPolicy>,
+    #[serde(default)]
+    runners: Vec<RunnerPolicy>,
     #[serde(default)]
     model_families: ModelFamilyRules,
     #[serde(default)]
     catalog: CatalogSection,
     #[serde(default)]
-    account_selection: AccountSelectionFlags,
+    accounts: AccountSelectionFlags,
 }
 
 /// Regenerate with `cargo run -p prefrontal-routing-module --bin ck-prefrontal-routing -- --print-config-schema`.
@@ -838,7 +865,7 @@ pub fn routing_config_schema() -> String {
     serde_json::to_string_pretty(&schemars::schema_for!(RoutingConfigFile)).unwrap() + "\n"
 }
 
-/// The account-selection flag (`"account_selection"` in the routing file).
+/// Controls account selection and usage reports through `accounts.enabled`.
 /// Off unless the file turns it on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -977,13 +1004,13 @@ struct ModelRoutingSection {
     /// Exclusion keeps a route out of automatic choice only: a request that names
     /// the model (a work run's `model=`, a synthesizer or planner pin) is still
     /// admitted when the route is otherwise servable.
-    #[serde(default)]
+    #[serde(skip)]
     exclude: ExcludeGroups,
     /// Reasoning-variant overrides by consumer, grouped like `exclude`. A
     /// selection runs at the caller's named variant, else `variants.<consumer>`,
     /// else `variants.all`, else the route's curated default. Each value must
     /// be an effort the catalog publishes for the matched models.
-    #[serde(default)]
+    #[serde(skip)]
     variants: VariantGroups,
     /// Route-to-harness mapping. Resolve the workload group, consumer group,
     /// then `all`, taking each group's longest matching route key or default.
@@ -992,15 +1019,11 @@ struct ModelRoutingSection {
     substrates: SubstrateGroups,
     #[serde(default)]
     panels: PanelPolicies,
-    #[serde(default)]
+    #[serde(skip)]
     pins: Pins,
     /// Providers and models priced as subscription-backed in addition to auth facts.
-    #[serde(default)]
+    #[serde(skip)]
     subscription: Vec<String>,
-    /// Providers that borrow another provider's catalog rows, keyed alias to
-    /// target: `{"anthropic-platform": "anthropic"}`. Default empty.
-    #[serde(default)]
-    score_alias: std::collections::BTreeMap<String, String>,
     /// Keyed by "provider/model" or "provider/model/variant".
     #[serde(default)]
     models: HashMap<String, ModelFactOverride>,
@@ -1026,17 +1049,17 @@ struct ModelRoutingSection {
     consecutive_terminal_failure_threshold: Option<u32>,
     /// Providers that do not expose prompt-cache reads or writes. Gather seats
     /// avoid these providers when a cache-capable adequate route exists.
-    #[serde(default = "default_providers_without_prompt_cache")]
+    #[serde(skip)]
     providers_without_prompt_cache: Vec<String>,
     /// Provider-keyed subscription subsidy multipliers ("openai": 40). The
     /// subsidy is a property of the account serving the provider, so this is
     /// the primary shape; a per-model `subscription_multiplier` in `models`
     /// overrides its provider's value for that route only.
-    #[serde(default)]
+    #[serde(skip)]
     subscription_multipliers: HashMap<String, f64>,
     /// Percent of each weekly account window reserved from delegated workers;
     /// long-lived head agents may spend that reserved share.
-    #[serde(default)]
+    #[serde(skip)]
     keep_free_percent: HashMap<String, f64>,
     /// The `routing/v1` consumer ids `route.select` answers. Absent: every
     /// request class (mason, sidekick, athena, lab, core, codemode, flow) and
@@ -1046,17 +1069,17 @@ struct ModelRoutingSection {
     /// mc_dream_docs. When present, this array replaces the defaults; only its
     /// listed ids are accepted.
     /// Codemode and flow are answered only with routes priced per token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     consumers: Option<Vec<String>>,
     /// The runner modules `routing/v1` answers with, in preference order.
     /// Absent: Broca alone, on the routes its credentials serve.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     runners: Option<Vec<RunnerPolicy>>,
     /// Operator pins per project, `{<project id>: {<consumer>:
     /// "provider/model[:variant]"}}`. A `routing/v1` select on a route bound to
     /// that project, for that consumer, that names no pin of its own runs on
     /// the pinned model when it can be served, and is routed as usual when not.
-    #[serde(default)]
+    #[serde(skip)]
     project_pins: BTreeMap<String, BTreeMap<String, String>>,
 }
 
@@ -1066,14 +1089,7 @@ fn routing_schema_constraints(schema: &mut schemars::Schema) {
         .unwrap()
         .as_object_mut()
         .unwrap();
-    for field in ["elo_overrides", "subscription_multipliers"] {
-        properties[field]["additionalProperties"]["exclusiveMinimum"] = serde_json::json!(0);
-    }
-    for field in ["subscription_multipliers", "keep_free_percent"] {
-        properties[field]["propertyNames"] = serde_json::json!({"pattern": "\\S"});
-    }
-    properties["keep_free_percent"]["additionalProperties"]["minimum"] = serde_json::json!(0);
-    properties["keep_free_percent"]["additionalProperties"]["maximum"] = serde_json::json!(100);
+    properties["elo_overrides"]["additionalProperties"]["exclusiveMinimum"] = serde_json::json!(0);
 }
 
 fn positive_number(schema: &mut schemars::Schema) {
@@ -1086,7 +1102,7 @@ impl Default for ModelRoutingSection {
     }
 }
 
-/// `model_routing.overqualification`: `term = 0` while a route's surplus over
+/// `overqualification`: `term = 0` while a route's surplus over
 /// the iq demand (both on the 0..100 demand scale) is at most `threshold`, else
 /// `base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.
 /// `base: 0` switches the term off.
@@ -1148,6 +1164,8 @@ struct ModelFactOverride {
     /// and > 0); an invalid value is rejected and logged, not applied.
     #[schemars(transform = positive_number)]
     subscription_multiplier: Option<f64>,
+    #[serde(flatten)]
+    rules: crate::config_policy::EntityPolicy,
 }
 
 /// Resolve a path under the user's config home. Honors XDG_CONFIG_HOME, else
@@ -1683,12 +1701,11 @@ where
     }
 
     let providers = match modified_at {
-        None => Ok(default_providers_without_prompt_cache()),
+        None => Ok(Vec::new()),
         Some(_) => read_file(path).and_then(|doc| {
             let json = jsonc_to_json(&doc)
                 .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
-            let config: RoutingConfigFile = serde_json::from_str(&json)
-                .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
+            let config = parse_config(&json)?;
             let mut providers = config
                 .model_routing
                 .providers_without_prompt_cache
@@ -1837,12 +1854,7 @@ fn parse_operator_routing_policy(
     Ok(ModelRoutingPolicyInput {
         exclude: clean_spec_entries(section.exclude.all),
         subscription: clean_spec_entries(section.subscription),
-        score_alias: section
-            .score_alias
-            .into_iter()
-            .map(|(alias, target)| (alias.trim().to_string(), target.trim().to_string()))
-            .filter(|(alias, target)| !alias.is_empty() && !target.is_empty())
-            .collect(),
+        score_alias: BTreeMap::new(),
     })
 }
 
@@ -1860,22 +1872,10 @@ fn clean_spec_entries(entries: Vec<String>) -> Vec<String> {
 /// not read as a selection-policy change.
 pub fn operator_policy_revision(policy: &ModelRoutingPolicyInput) -> String {
     let mut hasher = Sha256::new();
-    let aliases = policy
-        .score_alias
-        .iter()
-        .map(|(alias, target)| format!("{alias}={target}"))
-        .collect::<Vec<_>>();
     for (label, entries) in [
         ("exclude", &policy.exclude),
         ("subscription", &policy.subscription),
-        ("score_alias", &aliases),
     ] {
-        // The alias list is hashed only when set: a config without aliases
-        // then hashes exactly as it did before `score_alias` existed, so its
-        // recorded policy revision (shown by `route.explain`) does not change.
-        if entries.is_empty() && label == "score_alias" {
-            continue;
-        }
         hasher.update(label.as_bytes());
         hasher.update([0u8]);
         for entry in entries {
@@ -2143,7 +2143,7 @@ mod tests {
             .unwrap();
         assert_eq!(seed.supports_vision, Some(true));
 
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"vision":false,"eq":1600}}}}"#,
         )
@@ -2153,7 +2153,7 @@ mod tests {
         assert_eq!(first.supports_vision, Some(false));
         assert_eq!(first.scores.eq, 1600.0);
 
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"eq":1600}}}}"#,
         )
@@ -2183,7 +2183,7 @@ mod tests {
         let mut placed = store.get_fact_by_route_key(route_key).unwrap().unwrap();
         placed.scores.elo = 1900.0;
         store.upsert_fact(&placed, FactSource::Override).unwrap();
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"cost_per_mtok_out":1}}}}"#,
         )
@@ -2226,7 +2226,7 @@ mod tests {
         served.context_window = served_context;
         store.upsert_fact(&served, FactSource::Seed).unwrap();
 
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"eq":1600}}}}"#,
         )
@@ -2265,13 +2265,13 @@ mod tests {
             .mark_operator_fact_fields(route_key, &[CatalogFactField::SupportsToolUse])
             .unwrap();
 
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"vision":false,"cost_per_mtok_out":1}}}}"#,
         )
         .unwrap();
         apply_overrides_from_config(&store, &config_path).unwrap();
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{"model_routing":{"models":{"anthropic/claude-opus-4-5":{"vision":false}}}}"#,
         )
@@ -2302,7 +2302,7 @@ mod tests {
     #[test]
     fn explicit_family_override_beats_matching_rule() {
         let (root, config_path, store) = family_rule_rig("override-wins");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{
                 "model_families": { "gpt": ["openai/*"] },
@@ -2325,7 +2325,7 @@ mod tests {
     #[test]
     fn family_glob_order_uses_the_first_written_match() {
         let (root, config_path, store) = family_rule_rig("first-match");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{
                 "model_families": {
@@ -2408,7 +2408,7 @@ mod tests {
             .unwrap();
         assert!(store.get_fact_by_route_key(&route_key).is_err());
         let config_path = dir.join("routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             serde_json::json!({
                 "model_routing": {
@@ -2447,7 +2447,7 @@ mod tests {
             .expect("the seed has a fact without max output metadata");
         let route_key = make_route_key(&seed.provider_id, &seed.model_id, seed.variant.as_deref());
         let config_path = dir.join("routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             serde_json::json!({
                 "model_routing": {
@@ -2466,7 +2466,8 @@ mod tests {
             )
             .unwrap();
         assert!(store.get_fact_by_route_key(&route_key).is_err());
-        std::fs::write(&config_path, r#"{ "model_routing": { "models": {} } }"#).unwrap();
+        crate::test_config::write(&config_path, r#"{ "model_routing": { "models": {} } }"#)
+            .unwrap();
         let error = apply_overrides_from_config(&store, &config_path).unwrap_err();
         assert!(error.contains("reading stale override base"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
@@ -2497,7 +2498,7 @@ mod tests {
         // Round 1: config carries an override for a MIGRATION-ONLY model
         // (opus-5 is in the store via migration 018/024, not the JSON seed).
         let config_path = dir.join("routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r##"{ "model_routing": { "models": {
                 "anthropic/claude-opus-5": { "speed_multiplier": 0.9 }
@@ -2507,7 +2508,8 @@ mod tests {
         apply_overrides_from_config(&store, &config_path).unwrap();
 
         // Round 2: the override is removed from config entirely.
-        std::fs::write(&config_path, r#"{ "model_routing": { "models": {} } }"#).unwrap();
+        crate::test_config::write(&config_path, r#"{ "model_routing": { "models": {} } }"#)
+            .unwrap();
         apply_overrides_from_config(&store, &config_path).unwrap();
 
         // The fact must still exist, demoted to seed, not deleted.
@@ -2548,7 +2550,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{ "model_routing": { "consecutive_terminal_failure_threshold": 5 } }"#,
         )
@@ -2560,7 +2562,7 @@ mod tests {
             5
         );
 
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{ "model_routing": { "consecutive_terminal_failure_threshold": 0 } }"#,
         )
@@ -2590,7 +2592,7 @@ mod tests {
 
         // File with the key → returns clamped value.
         let config_path = dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{ "model_routing": { "min_best_effort_adequacy": 0.35 } }"#,
         )
@@ -2600,7 +2602,8 @@ mod tests {
 
         // File without the key → None.
         let config_path2 = dir.join("prefrontal-routing-empty.jsonc");
-        std::fs::write(&config_path2, r#"{ "model_routing": { "models": {} } }"#).unwrap();
+        crate::test_config::write(&config_path2, r#"{ "model_routing": { "models": {} } }"#)
+            .unwrap();
         assert_eq!(
             super::read_min_best_effort_adequacy(&config_path2).unwrap(),
             None
@@ -2608,7 +2611,7 @@ mod tests {
 
         // File with NaN key → error.
         let config_path3 = dir.join("prefrontal-routing-nan.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &config_path3,
             r#"{ "model_routing": { "min_best_effort_adequacy": NaN } }"#,
         )
@@ -2632,11 +2635,11 @@ mod tests {
         let missing = dir.join("missing.jsonc");
         assert_eq!(
             read_providers_without_prompt_cache(&missing).unwrap(),
-            vec!["ollama-cloud"]
+            Vec::<String>::new()
         );
 
         let path = dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"providers_without_prompt_cache":["ollama-cloud"," custom ","ollama-cloud"]}}"#,
         )
@@ -2645,7 +2648,7 @@ mod tests {
             read_providers_without_prompt_cache(&path).unwrap(),
             vec!["custom", "ollama-cloud"]
         );
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"providers_without_prompt_cache":["cacheless-two"]}}"#,
         )
@@ -2683,7 +2686,7 @@ mod tests {
             std::fs::read_to_string(path).map_err(|error| error.to_string())
         };
 
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"providers_without_prompt_cache":["first"]}}"#,
         )
@@ -2703,7 +2706,7 @@ mod tests {
             "unchanged mtime reused cache"
         );
 
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"providers_without_prompt_cache":["second"]}}"#,
         )
@@ -2719,12 +2722,12 @@ mod tests {
             "changed mtime reparsed config"
         );
 
-        std::fs::write(&path, "{ not jsonc").unwrap();
+        crate::test_config::write(&path, "{ not jsonc").unwrap();
         set_mtime(1_700_000_002);
         assert!(read_providers_without_prompt_cache_with_reader(&path, read_file).is_err());
         assert_eq!(reads.load(Ordering::Relaxed), 3);
 
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"providers_without_prompt_cache":["repaired"]}}"#,
         )
@@ -2778,7 +2781,7 @@ mod tests {
         };
 
         // Comments and trailing commas: the operator's real file is JSONC.
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{
               // routing fence
@@ -2792,7 +2795,10 @@ mod tests {
         set_mtime(1_700_000_000);
         let first = read_operator_routing_policy_with_reader(&path, read_file);
         assert_eq!(first.exclude, vec!["anthropic", "ollama-cloud/glm-5.1"]);
-        assert_eq!(first.subscription, vec!["kimi-for-coding"]);
+        assert_eq!(
+            first.subscription,
+            vec!["kimi-for-coding", "ollama-cloud", "opencode-go"]
+        );
         assert_eq!(
             read_operator_routing_policy_with_reader(&path, read_file),
             first
@@ -2804,7 +2810,7 @@ mod tests {
         );
 
         // A live edit takes effect on the next read with no restart.
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{ "model_routing": { "exclude": {"all": ["xai"]} } }"#,
         )
@@ -2815,7 +2821,7 @@ mod tests {
         assert_eq!(reads.load(Ordering::Relaxed), 2, "changed mtime reparsed");
 
         // An absent model_routing block is an empty policy, not a parse failure.
-        std::fs::write(&path, r#"{}"#).unwrap();
+        crate::test_config::write(&path, r#"{}"#).unwrap();
         set_mtime(1_700_000_002);
         assert_eq!(
             read_operator_routing_policy_with_reader(&path, read_file),
@@ -2861,7 +2867,7 @@ mod tests {
             std::fs::read_to_string(path).map_err(|error| error.to_string())
         };
 
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{ "model_routing": { "exclude": {"all": ["anthropic"]} } }"#,
         )
@@ -2874,7 +2880,7 @@ mod tests {
 
         // Half-finished edit. The fence must NOT drop to empty: routing would
         // immediately start selecting the very routes the operator excluded.
-        std::fs::write(&path, "{ \"model_routing\": { \"exclude\": [").unwrap();
+        crate::test_config::write(&path, "{ \"model_routing\": { \"exclude\": [").unwrap();
         set_mtime(1_700_000_001);
         assert_eq!(
             read_operator_routing_policy_with_reader(&path, read_file).exclude,
@@ -2899,7 +2905,7 @@ mod tests {
         );
 
         // Repairing it is an edit, so the new policy is picked up.
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{ "model_routing": { "exclude": {"all": ["xai"]} } }"#,
         )
@@ -2936,7 +2942,7 @@ mod tests {
                 .elo
         };
 
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"demand_exponent":0.4,"elo_overrides":{"openai/gpt-5.6-sol":1800,"typo/missing":9999}}}"#,
         )
@@ -2948,7 +2954,7 @@ mod tests {
         assert_eq!(sol(&facts), 1_800.0);
 
         facts = model_facts_seed().to_vec();
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"demand_exponent":0.25,"elo_overrides":{"openai/gpt-5.6-sol":1750}}}"#,
         )
@@ -2975,7 +2981,7 @@ mod overqualification_config_tests {
         ));
         let _ = std::fs::remove_file(&path);
         if let Some(document) = document {
-            std::fs::write(&path, document).unwrap();
+            crate::test_config::write(&path, document).unwrap();
         }
         let mut facts = Vec::new();
         let result = apply_live_selection_config(&path, &mut facts).map(|o| o.routing_config);
@@ -3055,9 +3061,9 @@ mod catalog_poll_tests {
             "prefrontal-routing-catalog-poll-{}.jsonc",
             std::process::id()
         ));
-        std::fs::write(&path, r#"{ "catalog": { "poll_ms": 1234 } }"#).unwrap();
+        crate::test_config::write(&path, r#"{ "catalog": { "poll_ms": 1234 } }"#).unwrap();
         assert_eq!(read_catalog_poll_ms(&path).unwrap(), 1234);
-        std::fs::write(&path, r#"{ "catalog": { "poll_ms": 0 } }"#).unwrap();
+        crate::test_config::write(&path, r#"{ "catalog": { "poll_ms": 0 } }"#).unwrap();
         assert!(read_catalog_poll_ms(&path)
             .unwrap_err()
             .contains("greater than zero"));
@@ -3078,7 +3084,7 @@ mod route_pricing_tests {
             .join(format!("routing-pricing-snapshot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{
                 "subscription_multipliers":{"openai":40.0},
@@ -3106,7 +3112,7 @@ mod route_pricing_tests {
         assert_eq!(pricing.keep_free_percent("unknown"), 0.0);
 
         // An invalid edit is refused whole, so the published pricing stays.
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"keep_free_percent":{"anthropic":101}}}"#,
         )
@@ -3114,7 +3120,7 @@ mod route_pricing_tests {
         assert!(Arc::ptr_eq(&held, &settle_live_config(&path)));
 
         // A valid edit publishes new pricing; the held snapshot is unchanged.
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"keep_free_percent":{"anthropic":0}}}"#,
         )

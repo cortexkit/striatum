@@ -22,8 +22,12 @@ fn harness() -> Arc<Harness> {
         .map(|consumer| consumer.id)
         .collect();
     harness.edit_config(|config| {
-        config["model_routing"]["consumers"] = json!(consumers);
-        config["model_routing"]["runners"] = json!([{ "module": "runner-one" }]);
+        config["consumers"] = consumers
+            .iter()
+            .map(|id| ((*id).to_owned(), json!({})))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+            .into();
+        config["runners"] = json!([{ "module": "runner-one" }]);
     });
     install_catalog(&harness, &fixture::catalog());
     harness

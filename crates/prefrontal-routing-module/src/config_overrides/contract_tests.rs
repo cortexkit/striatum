@@ -25,7 +25,7 @@ impl Rig {
 
     fn write(&mut self, document: &str) {
         self.revision += 1;
-        std::fs::write(&self.path, document).unwrap();
+        crate::test_config::write(&self.path, document).unwrap();
         std::fs::File::open(&self.path)
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(
@@ -147,8 +147,8 @@ refusal_case!(
 
 refusal_case!(
     exclude_shape,
-    r#"{"model_routing":{"exclude":["anthropic"]}}"#,
-    "exclude_shape"
+    r#"{"providers":{"p":{"not_for":true}}}"#,
+    "invalid type"
 );
 refusal_case!(
     removed_aa,
@@ -159,22 +159,22 @@ refusal_case!(removed_aa_null, r#"{"aa":null}"#, "config_key_removed: aa");
 refusal_case!(
     removed_explicit_only_providers,
     r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"],"exclude":{"all":["xai"]}}}"#,
-    "config_key_removed: model_routing.explicit_only_providers; list the provider in model_routing.exclude.all; pins still work"
+    "unknown field `explicit_only_providers`"
 );
 refusal_case!(
     removed_explicit_only_providers_empty,
     r#"{"model_routing":{"explicit_only_providers":[]}}"#,
-    "config_key_removed: model_routing.explicit_only_providers"
+    "unknown field `explicit_only_providers`"
 );
 refusal_case!(
     removed_account_selection_shadow,
     r#"{"account_selection":{"enabled":true,"shadow":false}}"#,
-    "config_key_removed: account_selection.shadow; delete it; account selection serves directly"
+    "unknown field `shadow`"
 );
 refusal_case!(
     removed_account_selection_shadow_null,
     r#"{"account_selection":{"shadow":null}}"#,
-    "config_key_removed: account_selection.shadow"
+    "unknown field `shadow`"
 );
 refusal_case!(
     unknown_root,
@@ -188,12 +188,12 @@ refusal_case!(
 );
 refusal_case!(
     unknown_exclude_group,
-    r#"{"model_routing":{"exclude":{"surprise":[]}}}"#,
+    r#"{"providers":{"p":{"surprise":[]}}}"#,
     "unknown field `surprise`"
 );
 refusal_case!(
     non_array_exclude_group,
-    r#"{"model_routing":{"exclude":{"mason":"anthropic"}}}"#,
+    r#"{"providers":{"p":{"not_for":"mason"}}}"#,
     "expected a sequence"
 );
 refusal_case!(
@@ -303,7 +303,7 @@ refusal_case!(
 );
 refusal_case!(
     unknown_pin,
-    r#"{"model_routing":{"pins":{"surprise":{"model":"p/m"}}}}"#,
+    r#"{"consumers":{"synthesizer":{"pin":{"model":"p/m","surprise":true}}}}"#,
     "unknown field `surprise`"
 );
 refusal_case!(
@@ -337,9 +337,9 @@ refusal_case!(
     "missing field `model`"
 );
 refusal_case!(
-    planner_variant_refused,
-    r#"{"model_routing":{"pins":{"lab_planner":{"model":"p/m","variant":"high"}}}}"#,
-    "unknown field `variant`"
+    planner_unknown_key_refused,
+    r#"{"consumers":{"lab_planner":{"pin":{"model":"p/m","unknown":"high"}}}}"#,
+    "unknown field `unknown`"
 );
 // The designer pin is checked exactly as the synthesizer pin is.
 refusal_case!(
@@ -365,7 +365,7 @@ refusal_case!(
 refusal_case!(
     spec_designer_model_shape,
     r#"{"model_routing":{"pins":{"spec_designer":{"model":"bare"}}}}"#,
-    "model_routing.pins.spec_designer.model must be provider/model"
+    "consumers.spec_designer.pin.model must be provider/model"
 );
 refusal_case!(
     spec_designer_variant_type,
@@ -375,11 +375,11 @@ refusal_case!(
 refusal_case!(
     spec_designer_variant_empty,
     r#"{"model_routing":{"pins":{"spec_designer":{"model":"p/m","variant":" "}}}}"#,
-    "model_routing.pins.spec_designer.variant must be non-empty"
+    "consumers.spec_designer.pin.variant must be non-empty"
 );
 refusal_case!(
     unknown_variant_group,
-    r#"{"model_routing":{"variants":{"surprise":{"openai/gpt-6":"high"}}}}"#,
+    r#"{"consumers":{"mason":{"surprise":{}}}}"#,
     "unknown field `surprise`"
 );
 refusal_case!(
@@ -574,7 +574,10 @@ fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
         rig.write(&document);
         initialize_config(&rig.path).unwrap();
         let active = live_config(&rig.path);
-        assert_eq!(active.document.as_deref(), Some(document.as_str()));
+        assert_eq!(
+            active.document.as_deref(),
+            Some(crate::test_config::document(&document).as_str())
+        );
         let section = &active.config.model_routing;
         assert_eq!(
             active.exclude_groups().all,
@@ -582,14 +585,17 @@ fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
         );
         assert_eq!(
             active.exclude_groups().mason,
-            ["openai/gpt-6-astra", "kimi-code-plan-global/k3"]
+            ["kimi-code-plan-global/k3", "openai/gpt-6-astra"]
         );
         assert_eq!(active.exclude_groups().sidekick, ["xai", "-xai/grok-5"]);
         assert_eq!(active.exclude_groups().athena, ["local/model"]);
         assert_eq!(active.exclude_groups().lab, ["google/gemini-4"]);
         assert_eq!(active.exclude_groups().core, ["deepseek"]);
-        assert_eq!(section.subscription, ["openai", "-openai/metered"]);
-        assert_eq!(section.score_alias["anthropic-platform"], "anthropic");
+        assert_eq!(
+            section.subscription,
+            ["ollama-cloud", "openai", "opencode-go", "-openai/metered"]
+        );
+        assert!(active.operator_policy().score_alias.is_empty());
         let model = &section.models["openai/gpt-6/high"];
         assert_eq!(model.family, Some(Some("gpt".into())));
         assert_eq!(
@@ -712,7 +718,7 @@ fn renamed_first_load_refuses_old_only_and_both_files() {
             rig.write(GOOD);
         }
         let old = rig.path.with_file_name(OLD_CONFIG_BASENAME);
-        std::fs::write(&old, "invalid settings are never read").unwrap();
+        crate::test_config::write(&old, "invalid settings are never read").unwrap();
         let error = initialize_config(&rig.path).unwrap_err();
         assert!(error.contains("config_renamed"), "{error}");
         assert!(
@@ -736,7 +742,7 @@ fn renamed_reload_keeps_last_good_and_reports_once_per_old_name_change() {
     let mut reports = Vec::new();
     let now = Instant::now();
     for edit in 0..2 {
-        std::fs::write(&old, "x".repeat(edit + 1)).unwrap();
+        crate::test_config::write(&old, "x".repeat(edit + 1)).unwrap();
         for tick in 0..3 {
             let next = live_config_at_with_reporter(
                 &rig.path,
@@ -768,19 +774,18 @@ fn generated_schema_is_current_and_closed() {
     let schema: serde_json::Value = serde_json::from_str(&generated).unwrap();
     assert_eq!(schema["additionalProperties"], false);
     for name in [
-        "ModelRoutingSection",
-        "ExcludeGroups",
+        "ConsumerPolicy",
+        "ProviderPolicy",
+        "ProjectPolicy",
+        "RunnerPolicy",
         "PanelPolicies",
         "PanelPolicy",
-        "Pins",
         "SynthesizerPin",
-        "LabPlannerPin",
         "CatalogSection",
         "AccountSelectionFlags",
         "ModelFactOverride",
         "OverqualificationSection",
         "ModelFamilyRules",
-        "VariantGroups",
         "SubstrateGroups",
     ] {
         assert_eq!(
@@ -788,7 +793,7 @@ fn generated_schema_is_current_and_closed() {
             "{name}"
         );
     }
-    let properties = &schema["$defs"]["ModelRoutingSection"]["properties"];
+    let properties = &schema["properties"];
     assert!(properties
         .get("consecutiveTerminalFailureThreshold")
         .is_none());
@@ -819,7 +824,7 @@ fn substrate_mapping_loads_all_groups_and_matches_own_provider_not_score_alias()
     );
     initialize_config(&rig.path).unwrap();
     let config = live_config(&rig.path);
-    assert_eq!(config.score_aliases().get("alias").unwrap(), "vendor");
+    assert!(config.operator_policy().score_alias.is_empty());
     assert_eq!(
         resolve(config.substrate_groups(), "alias/model/high", None, None),
         Harness::Broca
@@ -968,8 +973,12 @@ fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
 }
 
 #[test]
-fn routing_v1_consumers_default_to_the_built_in_list_and_a_listing_replaces_it() {
-    let defaults = LiveConfig::default().v1_consumers();
+fn conversion_materializes_consumers_and_a_listing_replaces_them() {
+    let defaults = LiveConfig::new(
+        parse_config(&crate::config_convert::convert("{}").unwrap()).unwrap(),
+        None,
+    )
+    .v1_consumers();
     let mut expected = vec![
         "athena",
         "codemode",
@@ -994,6 +1003,7 @@ fn routing_v1_consumers_default_to_the_built_in_list_and_a_listing_replaces_it()
     assert_eq!(defaults, expected);
 
     let mut rig = Rig::new();
+    rig.write(r#"{"model_routing":{}}"#);
     rig.write(r#"{"model_routing":{"consumers":["summary","codemode"]}}"#);
     initialize_config(&rig.path).unwrap();
     assert_eq!(
@@ -1003,14 +1013,18 @@ fn routing_v1_consumers_default_to_the_built_in_list_and_a_listing_replaces_it()
 }
 
 #[test]
-fn routing_v1_runners_default_to_broca_and_exclusions_follow_the_consumer_group() {
-    let config = LiveConfig::default();
+fn conversion_materializes_runner_and_exclusions_follow_the_consumer_group() {
+    let config = LiveConfig::new(
+        parse_config(&crate::config_convert::convert("{}").unwrap()).unwrap(),
+        None,
+    );
     let runners = config.v1_runners();
     assert_eq!(runners.len(), 1);
     assert_eq!(runners[0].module, "broca");
     assert!(runners[0].routes.is_none());
 
     let mut rig = Rig::new();
+    rig.write(r#"{"model_routing":{}}"#);
     rig.write(r#"{"model_routing":{"exclude":{"all":["a"],"mason":["b"]}}}"#);
     initialize_config(&rig.path).unwrap();
     let groups = live_config(&rig.path).exclude_groups().clone();
@@ -1028,12 +1042,9 @@ fn routing_v1_sections_refuse_malformed_entries_by_path() {
     for (document, message) in [
         (
             r#"{"model_routing":{"consumers":["two words"]}}"#,
-            "model_routing.consumers",
+            "consumer id",
         ),
-        (
-            r#"{"model_routing":{"consumers":["a","a"]}}"#,
-            "listed once",
-        ),
+        (r#"{"consumers":{"a":{"mode":"other"}}}"#, "unknown variant"),
         (
             r#"{"model_routing":{"runners":[{"module":"r"},{"module":"r"}]}}"#,
             "listed once",
@@ -1043,8 +1054,8 @@ fn routing_v1_sections_refuse_malformed_entries_by_path() {
             "model_routing.runners.r",
         ),
         (
-            r#"{"model_routing":{"project_pins":{"p":{"nobody":"a/b"}}}}"#,
-            "is not a configured consumer",
+            r#"{"consumers":{"nobody":{"projects":{"p":{"pin":"bad"}}}}}"#,
+            "must be provider/model[:variant]",
         ),
         (
             r#"{"model_routing":{"project_pins":{"p":{"mason":"model-only"}}}}"#,

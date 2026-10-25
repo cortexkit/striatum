@@ -525,8 +525,17 @@ impl<'a> Selection<'a> {
     /// is no break-glass retry: a route that is cooling down or out of quota
     /// is fenced, and the refusal says when the earliest one returns.
     fn automatic(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
+        let available = available
+            .iter()
+            .filter(|route| {
+                self.sources
+                    .operator_config
+                    .route_allowed(self.consumer, route, false)
+            })
+            .cloned()
+            .collect();
         select_model_route_with_availability(
-            self.input(available, self.snapshot.clone()),
+            self.input(&available, self.snapshot.clone()),
             self.routing_config,
             self.slots,
             self.consumer_exclude,
@@ -540,7 +549,12 @@ impl<'a> Selection<'a> {
     fn pin(&self, pin: &str, available: &HashSet<String>) -> Result<SelectedModelRoute, Refusal> {
         let parsed = RouteRef::parse_pin(pin)
             .ok_or_else(|| Refusal::pin_unavailable(pin, PinUnavailableReason::Invalid, None))?;
-        if self.exclude.contains(&parsed.route_key()) {
+        if self.exclude.contains(&parsed.route_key())
+            || !self
+                .sources
+                .operator_config
+                .route_allowed(self.consumer, &parsed.route_key(), true)
+        {
             return Err(Refusal::pin_unavailable(
                 pin,
                 PinUnavailableReason::Excluded,
