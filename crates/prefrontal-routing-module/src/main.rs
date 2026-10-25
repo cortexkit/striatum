@@ -18244,11 +18244,12 @@ mod tests {
                 .upsert_fact(&fact("opencode-go", "m-native-fast"), FactSource::Override)
                 .unwrap();
             let broca_credentials = mapped_broca_credentials("opencode-go");
+            let operator_config = test_operator_config();
             let select = || {
                 run_route_wire_request_with_paths(
                     &store,
                     broca_select_request(&["opencode-go/m-native-fast"], Some("broca")),
-                    &test_operator_config(),
+                    &operator_config,
                     &broca_credentials,
                 )
             };
