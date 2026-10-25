@@ -10,8 +10,6 @@ use crate::provider_model_spec::{
     filter_excluded_keys_with_policy, parse_spec_list, resolve_spec, ExclusionPolicy,
 };
 
-pub const CURATED_SUBSCRIPTION_PROVIDERS: [&str; 2] = ["opencode-go", "ollama-cloud"];
-
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestedCapabilities {
@@ -182,11 +180,7 @@ pub fn resolve_routing_policy_with_catalog_targets(
 
     // Subscription specs are additive rather than a fence, so caller entries
     // follow the operator's and refine them for this call.
-    let mut subscription_specs = CURATED_SUBSCRIPTION_PROVIDERS
-        .iter()
-        .map(|provider| (*provider).to_string())
-        .collect::<Vec<_>>();
-    subscription_specs.extend(operator.subscription.iter().cloned());
+    let mut subscription_specs = operator.subscription.clone();
     subscription_specs.extend(caller.subscription.iter().cloned());
     let subscription_specs = parse_spec_list(&subscription_specs);
 
@@ -259,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_and_curated_providers_are_subscriptions_by_default() {
+    fn only_oauth_is_subscription_without_configuration() {
         let resolved = resolve(
             &[
                 "anthropic/claude-opus-4-8",
@@ -275,20 +269,22 @@ mod tests {
             vec![
                 "anthropic/claude-opus-4-8",
                 "google/antigravity-gemini-3.5-flash",
-                "opencode-go/qwen3.7-max",
                 "xai/grok-4.3",
             ]
         );
     }
 
     #[test]
-    fn missing_auth_data_leaves_only_curated_or_configured_subscriptions() {
+    fn missing_auth_data_leaves_only_configured_subscriptions() {
         let resolved = resolve_routing_policy(
             [
                 "anthropic/claude-opus-4-8".to_string(),
                 "opencode-go/qwen3.7-max".to_string(),
             ],
-            &ModelRoutingPolicyInput::default(),
+            &ModelRoutingPolicyInput {
+                subscription: vec!["opencode-go".into()],
+                ..Default::default()
+            },
             &ModelRoutingPolicyInput::default(),
             &HashMap::new(),
         );
@@ -296,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn user_subscription_specs_override_curated_and_oauth_defaults() {
+    fn user_subscription_specs_override_configured_and_oauth_defaults() {
         let resolved = resolve(
             &[
                 "anthropic/claude-opus-4-8",
@@ -308,6 +304,7 @@ mod tests {
                 subscription: vec![
                     "-anthropic".into(),
                     "fireworks-ai".into(),
+                    "opencode-go".into(),
                     "-opencode-go/some-metered-model".into(),
                 ],
                 ..ModelRoutingPolicyInput::default()

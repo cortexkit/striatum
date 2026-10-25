@@ -110,6 +110,7 @@ mod consumer_and_pin {
             credentials.publish_plan_prices(&plan_prices);
             if let Some(listing) = listing {
                 credentials.apply_listing(&listing, now_ms());
+                credentials.refresh_serving_methods(&crate::account_quota::AccountQuotaState::default(), &facts, now_ms() as i64);
             }
             let credentials = Arc::new(Mutex::new(credentials));
             handle_select_request(
@@ -165,12 +166,14 @@ mod consumer_and_pin {
     async fn vault_apikey_admits_catalog_unknown_routes_for_automatic_and_pinned_metered_selection() {
         use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let rig = PolicyRig::new(json!({}));
+        crate::test_config::write(&rig.path, json!({"model_routing": {"substrates": {"all": {"default": "broca"}}}}).to_string()).unwrap();
         rig.set_auth_methods("openai", "pin", None);
         let listing = ScopedCredentialListing {
             view: "api-view".into(),
             credentials: vec![ListedCredential {
                 id: "opaque".into(),
                 credential_type: "apikey".into(),
+                auth_method: Some("apikey".into()),
                 state: "active".into(),
                 categories: vec!["llm-provider".into()],
                 provider_ids: vec!["openai".into()],
@@ -181,6 +184,7 @@ mod consumer_and_pin {
         for consumer in ["codemode", "flow"] {
             for pinned in [false, true] {
                 let mut params = rig.params();
+                params["executor"] = json!("broca");
                 params["consumer"] = json!(consumer);
                 params["availableModels"] = json!(["openai/pin"]);
                 if pinned {

@@ -130,6 +130,79 @@ fn route_key(reply: &(FrameType, Value)) -> String {
 }
 
 #[tokio::test]
+async fn credentialed_ladders_skip_an_unentitled_entry_on_both_wire_shapes() {
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let harness = harness(json!({"prices": []}));
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["mode"] = json!("ladder");
+        config["consumers"]["mason"]["ladder"] = json!([PLAN, METERED]);
+    });
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                provider_id: "plan-provider".into(),
+                credential_id: "catalog-credential-plan-provider-apikey".into(),
+                code: "ENTITLEMENT_ERROR".into(),
+            },
+            None,
+            crate::now_ms() as i64,
+        )
+        .unwrap();
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    for legacy in [false, true] {
+        let mut params = select("mason");
+        params["detail"] = json!(true);
+        if legacy {
+            params["requirements"]["eq"] = json!(0);
+            params["targetAgent"] = json!("mason");
+            params["executor"] = json!("broca");
+            params["substrate"] = json!("broca");
+        }
+        let reply = route.call("route.select", &params).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        let rejected = if legacy {
+            assert_eq!(
+                reply.1["result"]["selected"]["routeKey"], METERED,
+                "{}",
+                reply.1
+            );
+            &reply.1["result"]["selected"]["rejected"]
+        } else {
+            assert_eq!(route_key(&reply), METERED);
+            &reply.1["result"]["detail"]["rejected"]
+        };
+        let first = rejected
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["routeKey"] == PLAN)
+            .unwrap();
+        assert_eq!(first["reason"], "credential_unentitled");
+        assert_eq!(
+            first["credentialIds"],
+            json!(["catalog-credential-plan-provider-apikey"])
+        );
+    }
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["ladder"] = json!([PLAN]);
+    });
+    let reply = route.call("route.select", &select("mason")).await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "no_route");
+    assert!(
+        reply.1["detail"].get("reset_at_ms").is_none(),
+        "{}",
+        reply.1
+    );
+    assert_eq!(
+        reply.1["detail"]["rejected"][0]["reason"], "credential_unentitled",
+        "{}",
+        reply.1
+    );
+}
+
+#[tokio::test]
 async fn magic_context_consumers_select_with_default_policy() {
     let harness = harness(json!({ "prices": [{ "provider_id": "plan-provider" }] }));
     let route = harness.bind(reserved("example-consumer"), None).await;

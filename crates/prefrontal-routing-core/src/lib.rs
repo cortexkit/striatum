@@ -56,7 +56,7 @@ pub use failure_backoff::{
 pub use launch_policy::{
     resolve_launch_requirements, resolve_routing_policy, LaunchRequirementsError,
     ModelRoutingPolicyInput, RequestedCapabilities, RequestedModelRequirements,
-    ResolvedLaunchRequirements, ResolvedRoutingPolicy, CURATED_SUBSCRIPTION_PROVIDERS,
+    ResolvedLaunchRequirements, ResolvedRoutingPolicy,
 };
 pub use model_facts::{
     derive_provider_key, fact_to_route, is_valid_grand_family_id, make_capacity_key,

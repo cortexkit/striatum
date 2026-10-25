@@ -2,6 +2,7 @@ struct HarnessRig {
     rig: Rig,
     store: SharedStore,
     config: PathBuf,
+    credential_providers: Vec<&'static str>,
 }
 
 impl HarnessRig {
@@ -30,7 +31,7 @@ impl HarnessRig {
             .to_string(),
         )
         .unwrap();
-        Self { rig, store, config }
+        Self { rig, store, config, credential_providers: vec!["anthropic", "opencode"] }
     }
 
     async fn call(
@@ -79,11 +80,20 @@ impl HarnessRig {
                 credentials: vec![cortexkit_claustrum_client::ListedCredential {
                     id: "apikey:anthropic:fixture".into(),
                     credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
                     categories: vec!["llm-provider".into()],
                     state: "active".into(),
                     provider_ids: vec!["anthropic".into()],
                     ..Default::default()
-                }],
+                }, cortexkit_claustrum_client::ListedCredential {
+                    id: "apikey:opencode:fixture".into(),
+                    credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
+                    categories: vec!["llm-provider".into()],
+                    state: "active".into(),
+                    provider_ids: vec!["opencode".into()],
+                    ..Default::default()
+                }].into_iter().filter(|row| row.provider_ids.iter().any(|provider| self.credential_providers.contains(&provider.as_str()))).collect(),
                 view: "fixture".into(),
                 ..Default::default()
             },
@@ -133,7 +143,8 @@ async fn launch_availability_is_per_mapped_harness() {
             "harness opencode does not serve this route for this request"
         );
     }
-    let unmapped = HarnessRig::new(json!({}));
+    let mut unmapped = HarnessRig::new(json!({}));
+    unmapped.credential_providers = vec!["anthropic"];
     let result = unmapped
         .select(json!({"workload": "mason", "harness": "opencode", "availableModels": [CHEAP], "substrate": "opencode"}))
         .await;
@@ -142,7 +153,7 @@ async fn launch_availability_is_per_mapped_harness() {
         .call(
             ROUTE_SELECT_OP,
             json!({"targetAgent": "mason", "workload": "mason", "requirements": {"iq": 30, "eq": 0}}),
-            &empty_broca_credentials(),
+            &mapped_broca_credentials("anthropic"),
         )
         .await;
     assert_eq!(fallback["result"]["selected"]["harness"], "broca");
@@ -212,11 +223,12 @@ async fn executor_and_required_harness_refuse_mismatched_routes() {
         rejection(&body, PAID)["detail"],
         "harness_mismatch: task runs on opencode"
     );
-    let plain = HarnessRig::new(json!({}));
+    let mut plain = HarnessRig::new(json!({}));
     let body = plain
         .select(json!({"executor": "broca", "availableModels": [CHEAP, PAID]}))
         .await;
     assert_eq!(body["result"]["selected"]["routeKey"], CHEAP, "{body}");
+    plain.credential_providers = vec!["anthropic"];
     let body = plain
         .select(json!({"executor": "broca", "substrate": "broca"}))
         .await;
@@ -440,18 +452,14 @@ async fn route_explain_legacy_row_does_not_infer_execution_identity_from_caller(
     assert_eq!(explained["provenance"]["harness"], "pi");
 }
 
-/// A selection that names no executor, workload or required harness comes from
-/// a host's own route resolver (an OpenCode or Pi head picking the model for a
-/// mason or explore subagent) or from core repeating such a selection. Core
-/// still decides where that worker runs, so routing judges the routes against
-/// the caller's own model list and leaves the harness unrecorded. When the
-/// caller names substrate broca, the routes are those Broca reaches, still
-/// within the caller's list: a route outside the list is never chosen, even
-/// when Broca reaches no route the list names. The route-to-harness mapping
-/// applies only once a caller names its workload.
+/// Hosts choose from their own model list without vault admission. A legacy
+/// re-selection explicitly sent to Broca instead needs a vault credential and
+/// remains confined to the caller's list. A workload request uses the harness
+/// mapping rather than the host's local execution context.
 #[tokio::test]
 async fn host_run_selection_is_judged_on_the_callers_list_not_the_mapping() {
-    let rig = HarnessRig::new(json!({}));
+    let mut rig = HarnessRig::new(json!({}));
+    rig.credential_providers = vec!["anthropic"];
     for extra in [
         json!({"consumer": "sidekick", "targetAgent": "explore", "harness": "opencode", "availableModels": [CHEAP]}),
         json!({"harness": "pi", "availableModels": [CHEAP]}),

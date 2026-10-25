@@ -5,7 +5,7 @@
 //! credential entitlement fences and operator exclusions every route
 //! selection reads ([`crate::prepare_selection_inputs`],
 //! [`crate::price_selection_inputs`]), the scorer
-//! ([`select_model_route_with_availability`]) and the pin admission
+//! ([`select_policy::select_candidates`]) and the pin admission
 //! ([`crate::work_model_pin::select_with_availability`]). What this module
 //! adds is the v1 request: which runners can serve, the requirements the
 //! scorer has no input for, the consumer's policy, the project's pin and the
@@ -22,15 +22,14 @@ use cortexkit_role_routing::select::{
     parse_select_request_serving, Modality, RouteRef, RunnerRef, SelectAnswer, ToolsRequirement,
     EXPLANATION_MAX_CHARS,
 };
-use prefrontal_routing_core::launch_policy::resolve_routing_policy_with_catalog_targets;
 use prefrontal_routing_core::model_router::{
-    select_model_route_with_availability, ModelRouteStateSnapshot, NoRouteError,
-    RequiredCapabilities, RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
+    ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
+    SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::provider_model_spec::{parse_spec_list, resolve_spec};
 use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
 use prefrontal_routing_core::{
-    fact_to_route, ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput, RoutingConfig,
+    fact_to_route, ModelFact, ModelRequirements, ModelRoute, RoutingConfig,
 };
 use prefrontal_routing_store::V1Decision;
 use serde_json::{json, Value};
@@ -38,8 +37,8 @@ use serde_json::{json, Value};
 use super::{now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
 use crate::config_policy::RunnerPolicy;
 use crate::{
-    account_selection, config_overrides, credential_fences, select_policy, work_model_pin,
-    DecisionProvenance, SelectionPolicySources,
+    account_selection, config_overrides, select_policy, work_model_pin, DecisionProvenance,
+    SelectionPolicySources,
 };
 
 /// The members a v1 select may carry.
@@ -141,6 +140,7 @@ pub(super) async fn select(
         deps.broca_credentials,
         Some(&consumer),
         legacy_consumer,
+        true,
     )
     .map_err(|error| store_refusal(error.to_string()))?;
 
@@ -225,33 +225,29 @@ pub(super) async fn select(
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
 
-    // Subscription coverage, read the way every selection reads it: the
-    // operator's `subscription` list and the provider auth facts. A provider
-    // resolved to another provider's catalog rows is never covered.
-    let subscription_keys: HashSet<String> = resolve_routing_policy_with_catalog_targets(
-        capable.iter().map(|fact| fact_to_route(fact).route_key),
-        &operator_policy,
-        &ModelRoutingPolicyInput::default(),
-        &crate::provider_auth_types(None, deps.opencode_auth_path),
-        &catalog_targets,
-    )
-    .subscription_keys
-    .into_iter()
-    .collect();
     let available: HashSet<String> = capable
         .iter()
         .map(|fact| fact_to_route(fact).route_key)
         .collect();
-    // The route-local refusals every selection applies before scoring, pins
-    // included: codemode and flow run only on routes priced per token, never
-    // on a provider that publishes a subscription plan. A v1 request names no
-    // provider allow-list, so that filter admits every provider here.
-    let rejections = select_policy::candidate_rejections(
+    let candidates = select_policy::prepare_candidates(
         &facts,
+        &mut snapshot,
+        available,
+        HashMap::new(),
+        select_policy::CandidateSource::Vault {
+            credentials: deps.broca_credentials,
+            fences: &priced.entitlement_fences,
+            defer_pool_pin: false,
+        },
         legacy_consumer,
         None,
         priced.subscription_plan_providers.as_ref(),
+        &operator_policy,
+        &catalog_targets,
     );
+    let available = candidates.available;
+    let subscription_keys = candidates.subscription_keys;
+    let rejections = candidates.rejected;
 
     let demand = ModelRequirements {
         iq: f64::from(requirements.iq),
@@ -534,14 +530,20 @@ impl<'a> Selection<'a> {
             })
             .cloned()
             .collect();
-        select_model_route_with_availability(
-            self.input(&available, self.snapshot.clone()),
-            self.routing_config,
-            self.slots,
-            self.consumer_exclude,
-            self.rejections,
-        )
-        .map_err(select_policy::describe_filter_refusal)
+        let policy = self.sources.operator_config.consumer_policy(
+            self.consumer,
+            &crate::config_policy::ConsumerPolicy::default(),
+            &std::collections::BTreeMap::new(),
+        );
+        select_policy::select_in_order(&available, &policy, |candidates| {
+            select_policy::select_candidates(
+                self.input(candidates, self.snapshot.clone()),
+                self.routing_config,
+                self.slots,
+                self.consumer_exclude,
+                self.rejections,
+            )
+        })
     }
 
     /// A named model, through the same pin admission a work run's `model=`
@@ -564,14 +566,12 @@ impl<'a> Selection<'a> {
         let variant = work_model_pin::named_variant(pin, self.facts);
         let (pin_key, pin_capacity) =
             work_model_pin::route_keys(pin, variant.as_deref(), self.facts);
-        // The pin's own snapshot: provider resets are read again at the
-        // variant the pin names, and credential entitlement fences, which
-        // only steer automatic choice, do not apply to an explicit pin.
+        // Provider resets are read again at the variant the pin names.
+        // Credential eligibility applies to pins just as to automatic choices.
         let mut snapshot = self.snapshot.clone();
         for state in snapshot.by_route.values_mut() {
             state.provider_reset_until = None;
         }
-        credential_fences::clear(&mut snapshot);
         let pin_facts: Vec<ModelFact> = self
             .facts
             .iter()
@@ -705,6 +705,9 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
         .map(|reset| reset as u64);
     let mut refusal = Refusal::no_route(reason, reset);
     refusal.message = format!("{}: {}", refusal.message, no_route.refusal_message());
+    refusal
+        .detail
+        .insert("rejected".into(), json!(no_route.rejected));
     refusal
 }
 

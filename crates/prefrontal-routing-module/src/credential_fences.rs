@@ -9,7 +9,7 @@
 //! route whose every serving credential is fenced is rejected as
 //! `credential_unentitled` or `credential_billing_exhausted`, and a route that
 //! another credential still serves is launched pinned to that other credential.
-//! Explicit pins are not fenced.
+//! Explicit pins require an eligible credential too.
 //!
 //! Waiting fixes neither refusal, so a fence has no expiry. It ends when the
 //! credential's vault listing (provider ids, plan tier or state) no longer matches
@@ -231,18 +231,6 @@ fn is_billing_code(code: &str) -> bool {
         code,
         "billing_exhausted" | "insufficient_quota" | "credit_insufficient"
     )
-}
-
-/// Drop every credential mark from a snapshot an explicit pin is judged on:
-/// a pin keeps the behaviour it had before credential fences existed.
-pub(crate) fn clear(snapshot: &mut ModelRouteStateSnapshot) {
-    for state in snapshot
-        .by_route
-        .values_mut()
-        .chain(snapshot.by_capacity.values_mut())
-    {
-        state.credential_refusal = None;
-    }
 }
 
 #[cfg(test)]

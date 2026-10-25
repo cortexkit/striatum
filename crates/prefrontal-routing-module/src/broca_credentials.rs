@@ -166,6 +166,12 @@ pub(crate) async fn wait_for_billing_catalog(
 }
 
 impl BrocaCredentials {
+    /// The vault's listed facts, without deriving a credential kind from its id
+    /// or refresh adapter. Selection uses these facts to classify account coverage.
+    pub(crate) fn listed_credentials(&self) -> &[ListedCredential] {
+        &self.listed
+    }
+
     /// The vault listing of one credential, reduced to the fields that could
     /// change whether a provider entitles it: the provider ids it is mapped to,
     /// its plan tier and its state. `Unknown` until routing has read a listing.
@@ -271,6 +277,53 @@ impl BrocaCredentials {
     #[cfg(test)]
     pub(crate) fn api_test_credentials(facts: &[ModelFact]) -> Self {
         let mut credentials = Self::default();
+        if !facts.is_empty() {
+            credentials.apply_listing(
+                &ScopedCredentialListing {
+                    view: "test-catalog-credentials".into(),
+                    credentials: facts
+                        .iter()
+                        .map(|fact| {
+                            let method = fact
+                                .billing_plane
+                                .as_ref()
+                                .map(|plane| plane.auth_method.clone())
+                                .or_else(|| {
+                                    fact.auth_methods
+                                        .as_ref()
+                                        .and_then(|methods| methods.first().cloned())
+                                })
+                                .unwrap_or_else(|| "apikey".into());
+                            (
+                                (fact.provider_id.clone(), method.clone()),
+                                ListedCredential {
+                                    id: format!("catalog-credential-{}-{method}", fact.provider_id),
+                                    account_id: Some(format!(
+                                        "catalog-account-{}-{method}",
+                                        fact.provider_id
+                                    )),
+                                    state: "active".into(),
+                                    categories: vec!["llm-provider".into()],
+                                    provider_ids: vec![fact.provider_id.clone()],
+                                    credential_type: if method == "apikey" {
+                                        "apikey"
+                                    } else {
+                                        "oauth"
+                                    }
+                                    .into(),
+                                    auth_method: Some(method),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                        .into_values()
+                        .collect(),
+                    ..Default::default()
+                },
+                crate::now_ms(),
+            );
+        }
         credentials.serving = facts
             .iter()
             .map(|fact| {
@@ -678,6 +731,29 @@ impl BrocaCredentials {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn listed_credentials_preserve_the_vault_type_without_adapter_inference() {
+        let mut credentials = super::BrocaCredentials::default();
+        credentials.apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                view: "type-facts".into(),
+                credentials: vec![cortexkit_claustrum_client::ListedCredential {
+                    id: "opaque-id".into(),
+                    credential_type: "apikey".into(),
+                    refresh_adapter: Some("chatgpt".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            1,
+        );
+        assert_eq!(
+            credentials.listed_credentials()[0].credential_type,
+            "apikey"
+        );
+        assert_eq!(credentials.listed_credentials()[0].id, "opaque-id");
+    }
+
     use super::*;
     use cortexkit_claustrum_client::{
         ClaustrumCredentialResolver, CredentialGetTarget, CredentialResolver,
