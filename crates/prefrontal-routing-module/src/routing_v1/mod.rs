@@ -232,7 +232,7 @@ fn account_ctx<'a>(
         accounts: crate::ACCOUNT_QUOTA.get(),
         flags,
         policy,
-        now_ms: account_selection::now_ms(),
+        now_ms: now_ms() as i64,
     }
 }
 
