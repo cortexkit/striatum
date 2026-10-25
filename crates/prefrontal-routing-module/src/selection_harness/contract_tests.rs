@@ -405,8 +405,11 @@ async fn route_explain_reads_selected_execution_identity_for_fresh_and_pinned_la
         let selected = rig.select(params).await;
         let id = selected["result"]["decisionID"].as_str().unwrap_or_else(|| panic!("{selected}"));
         assert_eq!(selected["result"]["selected"]["harness"], harness, "{selected}");
+        // The reply's selected.harness retains the legacy substrate value;
+        // the decision ledger names the configured runner that executes it.
+        assert_eq!(selected["result"]["runner"]["module"], "broca", "{selected}");
         let explained = rig.explain(json!({"decisionID": id})).await;
-        assert_eq!(explained["selectedRoute"]["harness"], harness, "{explained}");
+        assert_eq!(explained["selectedRoute"]["harness"], "broca", "{explained}");
         assert_eq!(explained["selectedRoute"]["workload"], json!(workload), "{explained}");
         assert_eq!(explained["selectedRoute"]["routeKey"], selected["result"]["selected"]["routeKey"]);
         assert_eq!(explained["provenance"]["harness"], "opencode");

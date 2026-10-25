@@ -13,16 +13,25 @@ pub fn document(document: &str) -> String {
         super::config_convert::convert(document).unwrap_or_else(|_| document.to_owned())
     } else {
         match value {
-            Some(mut value) if value.is_object() => {
+            Some(value) if value.is_object() && value.get("runners").is_none() => {
                 // Selection fixtures that predate runner configuration used
                 // Broca implicitly. State that test reach explicitly; an
                 // explicitly empty array still tests an unconfigured registry.
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .entry("runners")
-                    .or_insert_with(|| serde_json::json!([{"module": "broca", "via_vault": true}]));
-                value.to_string()
+                // Family globs use written order as precedence. Do not sort
+                // their keys by serializing the document through Value.
+                let json = subc_jsonc::jsonc_to_json(document).unwrap();
+                let end = json.rfind('}').unwrap();
+                let separator = if value.as_object().unwrap().is_empty() {
+                    ""
+                } else {
+                    ","
+                };
+                format!(
+                    "{}{}\"runners\":[{{\"module\":\"broca\",\"via_vault\":true}}]{}",
+                    &json[..end],
+                    separator,
+                    &json[end..]
+                )
             }
             _ => document.to_owned(),
         }

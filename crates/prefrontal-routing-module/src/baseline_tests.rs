@@ -416,13 +416,57 @@ fn answer(
     })
 }
 
+/// For legacy route.select requests, the frozen baseline's `runner` records
+/// the reply's `selected.harness`. For host requests, that field is absent and
+/// `runner.module` matches the requested `harness`. Check both reply fields
+/// independently. Every non-host winner in the frozen fixture runs on Broca.
+fn verify_execution_identity(baseline: &Value, request: &Value, reply: &(FrameType, Value)) {
+    let name = request["name"].as_str().unwrap();
+    let wanted = listed_difference(name).unwrap_or_else(|| baseline["expected"][name].clone());
+    let v1 = request["op"] == "routing/v1 route.select";
+    let winner = wanted["route_key"].is_string();
+    let expected_harness = (!v1).then(|| wanted["runner"].as_str()).flatten();
+    let expected_runner = if !winner {
+        None
+    } else {
+        wanted["runner"].as_str().or_else(|| {
+            request["params"]["harness"]
+                .as_str()
+                .or_else(|| request["params"]["substrate"].as_str())
+                .or(Some("host"))
+        })
+    };
+    let result = &reply.1["result"];
+    assert_eq!(
+        result["runner"]["module"].as_str(),
+        expected_runner,
+        "{name}: runner module differs from frozen execution identity: {}",
+        reply.1
+    );
+    let actual_harness = if v1 {
+        &result["runner"]["harness"]
+    } else {
+        &result["selected"]["harness"]
+    };
+    assert_eq!(
+        actual_harness.as_str(),
+        expected_harness,
+        "{name}: reply harness differs from frozen execution identity: {}",
+        reply.1
+    );
+}
+
 /// Run one request on a fresh world and return its checked-in facts.
 async fn run_request(baseline: &Value, request: &Value) -> Value {
     let name = request["name"].as_str().expect("request name");
     let world = World::build(baseline, name).await;
     let params = params_of(baseline, &request["params"]);
     match request["op"].as_str().expect("request op") {
-        "route.select" => legacy_answer(&world.legacy("route.select", &params).await),
+        "route.select" => {
+            let reply = world.legacy("route.select", &params).await;
+            verify_execution_identity(baseline, request, &reply);
+            legacy_answer(&reply)
+        }
         "synthesizer" => {
             // Core reads the synthesizer pin from the panel answer's policy,
             // then admits exactly that pin with a pinned route.select.
@@ -440,13 +484,17 @@ async fn run_request(baseline: &Value, request: &Value) -> Value {
             if let Some(variant) = pin["variant"].as_str() {
                 params["pin"]["variant"] = json!(variant);
             }
-            legacy_answer(&world.legacy("route.select", &params).await)
+            let reply = world.legacy("route.select", &params).await;
+            verify_execution_identity(baseline, request, &reply);
+            legacy_answer(&reply)
         }
-        "routing/v1 route.select" => v1_answer(
-            &world
+        "routing/v1 route.select" => {
+            let reply = world
                 .v1(request["principal"].as_str().expect("principal"), &params)
-                .await,
-        ),
+                .await;
+            verify_execution_identity(baseline, request, &reply);
+            v1_answer(&reply)
+        }
         other => panic!("unknown baseline op {other}"),
     }
 }
@@ -666,8 +714,8 @@ async fn dropping_one_policy_entry_changes_the_converted_answer() {
     let converted = crate::config_convert::convert(CONFIG).expect("the live file converts");
     let mut document: Value = serde_json::from_str(&converted).unwrap();
     // The live file has no project pin. Plant one so this control has an entry
-    // to drop; a scoped athena select must answer that pin.
-    document["consumers"]["athena"]["projects"] = json!({
+    // to drop; a scoped mason select must answer that allowed pin.
+    document["consumers"]["mason"]["projects"] = json!({
         "baseline-project": { "pin": "anthropic/claude-opus-5-5" }
     });
     let planted = serde_json::to_string(&document).unwrap();
@@ -743,14 +791,14 @@ async fn dropping_one_policy_entry_changes_the_converted_answer() {
         &world
             .v1(
                 "reserved:prefrontal-core",
-                &json!({"consumer": "athena", "requirements": {"iq": 90}}),
+                &json!({"consumer": "mason", "requirements": {"iq": 60}}),
             )
             .await,
     );
     let mut dropped: Value = serde_json::from_str(&planted).unwrap();
     drop_at(
         &mut dropped,
-        &["consumers", "athena", "projects", "baseline-project", "pin"],
+        &["consumers", "mason", "projects", "baseline-project"],
     );
     let world = World::build_with(
         &baseline,
@@ -770,7 +818,7 @@ async fn dropping_one_policy_entry_changes_the_converted_answer() {
         &world
             .v1(
                 "reserved:prefrontal-core",
-                &json!({"consumer": "athena", "requirements": {"iq": 90}}),
+                &json!({"consumer": "mason", "requirements": {"iq": 60}}),
             )
             .await,
     );

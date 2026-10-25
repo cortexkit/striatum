@@ -65,36 +65,38 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
     let harness = Harness::new("order");
     let facts = facts(specs);
     harness.install_facts(&facts);
-    for fact in &facts {
-        harness
-            .store()
-            .apply_fusiform_catalog(
-                &[FusiformFactUpdate {
-                    provider_id: fact.provider_id.clone(),
-                    model_id: fact.model_id.clone(),
-                    auth_methods: Some(vec!["apikey".into()]),
-                    present: true,
-                    context_window: fact.context_window,
-                    max_output_tokens: fact.max_output_tokens,
-                    cost_tier: fact.cost_tier,
-                    cost_per_mtok_out: fact.cost_per_m_tok_out,
-                    input_rate: None,
-                    cache_read_rate: None,
-                    cache_write_rate: None,
-                    reasoning_rate: None,
-                    supports_vision: fact.supports_vision,
-                    supports_tool_use: fact.supports_tool_use,
-                    reasoning_efforts: None,
-                    canonical_id: None,
-                    upstream_status: None,
-                }],
-                FusiformCatalogCursor {
-                    catalog_version: 1,
-                    resolved_at_ms: 1,
-                },
-            )
-            .unwrap();
-    }
+    let updates: Vec<_> = facts
+        .iter()
+        .map(|fact| FusiformFactUpdate {
+            provider_id: fact.provider_id.clone(),
+            model_id: fact.model_id.clone(),
+            auth_methods: Some(vec!["apikey".into()]),
+            present: true,
+            context_window: fact.context_window,
+            max_output_tokens: fact.max_output_tokens,
+            cost_tier: fact.cost_tier,
+            cost_per_mtok_out: fact.cost_per_m_tok_out,
+            input_rate: None,
+            cache_read_rate: None,
+            cache_write_rate: None,
+            reasoning_rate: None,
+            supports_vision: fact.supports_vision,
+            supports_tool_use: fact.supports_tool_use,
+            reasoning_efforts: None,
+            canonical_id: None,
+            upstream_status: None,
+        })
+        .collect();
+    harness
+        .store()
+        .apply_fusiform_catalog(
+            &updates,
+            FusiformCatalogCursor {
+                catalog_version: 1,
+                resolved_at_ms: 1,
+            },
+        )
+        .unwrap();
     let mut credentials = BrocaCredentials::api_test_credentials(&facts);
     credentials.publish_plan_prices(&json!({ "prices": [] }));
     harness.set_credentials(credentials);
@@ -202,6 +204,9 @@ async fn request_and_project_pins_beat_a_continuing_conversation_on_the_live_han
         (DEAR, true, true, 200_000),
         (PIN, true, true, 200_000),
     ]);
+    harness.edit_config(|config| {
+        config["accounts"]["enabled"] = json!(false);
+    });
     let route = harness
         .bind(reserved("example-consumer"), Some("order-project"))
         .await;
@@ -317,7 +322,8 @@ async fn pay_per_token_follows_the_consumer_flag_not_the_name() {
         .call(
             "route.select",
             &json!({
-                "targetAgent": "codemode", "consumer": "codemode", "executor": "broca",
+                "targetAgent": "codemode", "consumer": "codemode",
+                "executor": "broca", "substrate": "broca",
                 "requirements": {"iq": 10, "eq": 0}
             }),
         )

@@ -8089,7 +8089,8 @@ mod tests {
                 json!({"consumer":consumer,"targetAgent":"mason",
                 "requirements":{"iq":30,"eq":0},"availableModels":["google/antigravity-gemini-3.8-flash","google/antigravity-gemini-3.8-flash/high","z-provider/adequate-fallback"]})
             };
-            let path = Path::new("/nonexistent/provider-reset-routing.jsonc");
+            let operator_config = test_operator_config();
+            let path = operator_config.as_path();
             let selected: serde_json::Value = serde_json::from_slice(
                 &run_select_against_rig(&rig, params("mason"), &facts, path)
                     .await
@@ -14770,6 +14771,7 @@ mod tests {
             )
             .unwrap();
         let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        crate::test_config::write(&operator_config, "{}").unwrap();
         let catalog_store = Arc::clone(&store);
         config_overrides::attach_reasoning_catalog(
             &operator_config,
