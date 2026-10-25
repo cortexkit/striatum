@@ -17,6 +17,8 @@
 mod account_quota;
 mod account_selection;
 mod available_models_text;
+#[cfg(test)]
+mod baseline_tests;
 mod broca_credentials;
 mod config_overrides;
 mod config_policy;
@@ -778,11 +780,47 @@ fn record_failed_selection_decision(store: &impl RouteStateStore, decision: &Dec
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The wall clock a test injected on this thread (see [`InjectedClock`]).
+    static INJECTED_NOW_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 fn now_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = INJECTED_NOW_MS.with(std::cell::Cell::get) {
+        return now;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Holds this thread's [`now_ms`] at a fixed time until dropped, then restores
+/// whatever clock was in force before. A test that replays frozen evidence
+/// (quota readings, a vault listing) sets the time that evidence was captured
+/// at, so freshness and reset checks answer the same on every run. The clock
+/// is per thread: a `#[tokio::test]` runs its tasks on the test's own thread.
+#[cfg(test)]
+pub(crate) struct InjectedClock {
+    previous: Option<u64>,
+}
+
+#[cfg(test)]
+impl InjectedClock {
+    pub(crate) fn set(now_ms: u64) -> Self {
+        Self {
+            previous: INJECTED_NOW_MS.with(|clock| clock.replace(Some(now_ms))),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for InjectedClock {
+    fn drop(&mut self) {
+        INJECTED_NOW_MS.with(|clock| clock.set(self.previous));
+    }
 }
 
 /// Resolve the storage descriptor, preferring the daemon-delivered one from
@@ -3296,7 +3334,7 @@ fn price_selection_inputs(
         &sources.operator_policy.score_alias,
     );
     let subscription_plan_providers = if let Ok(credentials) = broca_credentials.lock() {
-        credentials.price_facts(facts);
+        credentials.price_facts(facts, sources.live_config.pricing());
         credentials.subscription_plan_providers()
     } else {
         None
@@ -5145,7 +5183,7 @@ async fn handle_select_panel(
         &operator_policy.score_alias,
     );
     if let Ok(credentials) = broca_credentials.lock() {
-        credentials.price_facts(&mut prepared.facts);
+        credentials.price_facts(&mut prepared.facts, live_config.pricing());
     }
     live_config.apply(&mut prepared.facts);
     // Seats are automatic choices for the class's consumer (see the variant

@@ -1031,7 +1031,9 @@ struct ModelRoutingSection {
     /// Provider-keyed subscription subsidy multipliers ("openai": 40). The
     /// subsidy is a property of the account serving the provider, so this is
     /// the primary shape; a per-model `subscription_multiplier` in `models`
-    /// overrides its provider's value for that route only.
+    /// overrides its provider's value for that route only. An entry also states
+    /// that the provider's plan is priced at list divided by the multiplier, so
+    /// a plan whose own rates the catalog does not publish still prices.
     #[serde(default)]
     subscription_multipliers: HashMap<String, f64>,
     /// Percent of each weekly account window reserved from delegated workers;

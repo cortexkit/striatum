@@ -529,10 +529,22 @@ impl PlaneCatalog {
         catalog
     }
 
+    /// The billing plane for one route served by one credential method.
+    ///
+    /// `multiplier_configured` says the operator configured a
+    /// `subscription_multipliers` entry covering this route (see
+    /// [`crate::broca_credentials::BrocaCredentials::price_facts`]). A plan whose
+    /// rates Fusiform does not serve (a `no_coverage` answer on a non-apikey
+    /// method) then bills at the catalog's base list rates, which the pricing
+    /// path divides by that multiplier. Without such an entry the rates stay
+    /// [`BillingRate::Unpriced`]: nothing states what the plan charges, and
+    /// guessing "list price" would rank the route against priced ones on a
+    /// number nobody gave.
     pub(crate) fn for_route(
         &self,
         model: &str,
         method: &crate::broca_credentials::ServingMethod,
+        multiplier_configured: bool,
     ) -> BillingPlane {
         let provider = model
             .split_once('/')
@@ -561,9 +573,12 @@ impl PlaneCatalog {
                         .rates
                         .iter()
                         .map(|(key, rate)| {
+                            let stated = auth_method == "apikey"
+                                || base.inherited.contains(key)
+                                || multiplier_configured;
                             (
                                 key.clone(),
-                                if auth_method == "apikey" || base.inherited.contains(key) {
+                                if stated {
                                     rate.clone()
                                 } else {
                                     BillingRate::Unpriced
@@ -2117,6 +2132,7 @@ mod tests {
                 auth_method: Some("oauth".into()),
                 reason: "single listed method".into(),
             },
+            false,
         ));
         let mut vector = vector();
         vector.cache_write = 0.0;
@@ -2155,6 +2171,7 @@ mod tests {
                 auth_method: Some("apikey".into()),
                 reason: "single listed method".into(),
             },
+            false,
         );
         assert_eq!(plane.rate("rate.input"), Some(2.0));
         assert_eq!(plane.rate("rate.output"), Some(4.0));
@@ -2222,7 +2239,10 @@ mod tests {
         }
         facts[0].cost_per_m_tok_out = Some(0.0);
         facts[1].cost_per_m_tok_out = Some(0.5);
-        credentials.price_facts(&mut facts);
+        credentials.price_facts(
+            &mut facts,
+            &prefrontal_routing_core::RoutePricing::default(),
+        );
 
         let free = &facts[0];
         let plane = free.billing_plane.as_ref().unwrap();
@@ -2310,7 +2330,10 @@ mod tests {
             ("openai".into(), "chatgpt".into()),
             decode_plane_get(&get_reply("chatgpt luna — named, unfiltered")).unwrap(),
         );
-        credentials.price_facts(&mut facts);
+        credentials.price_facts(
+            &mut facts,
+            &prefrontal_routing_core::RoutePricing::default(),
+        );
         let plane = facts[0].billing_plane.as_ref().unwrap();
         assert_eq!(plane.auth_method, "chatgpt");
         assert_eq!(plane.selection_reason, "roster");
@@ -2443,7 +2466,10 @@ mod tests {
             1
         );
         let mut priced = facts;
-        credentials.lock().unwrap().price_facts(&mut priced);
+        credentials.lock().unwrap().price_facts(
+            &mut priced,
+            &prefrontal_routing_core::RoutePricing::default(),
+        );
         assert_eq!(
             priced[0].billing_plane.as_ref().unwrap().kind,
             "no_coverage fallback"
@@ -3035,5 +3061,361 @@ mod tests {
             vec!["test/fine", "test/kept"]
         );
         assert_eq!(base["test/kept"], previous.rates["test/kept"]);
+    }
+}
+
+#[cfg(test)]
+mod multiplier_fallback_tests {
+    //! An oauth route Fusiform does not cover prices at the catalog's list rates
+    //! when the operator configured a subscription multiplier for its provider,
+    //! and stays unknown otherwise. Giraffe-, not xai-specific: any plan whose
+    //! rates the catalog does not serve behaves the same way.
+
+    use crate::broca_credentials::ServingMethod;
+    use prefrontal_routing_core::billing::BillingRate;
+    use prefrontal_routing_core::{selection_cost, RoutePricing};
+    use serde_json::json;
+
+    use super::{model_rates, BillingPlane, ModelRates, PlaneCatalog, PlaneReply};
+
+    fn oauth_serving() -> ServingMethod {
+        ServingMethod {
+            auth_method: Some("oauth".into()),
+            reason: "single listed method".into(),
+        }
+    }
+
+    fn apikey_serving() -> ServingMethod {
+        ServingMethod {
+            auth_method: Some("apikey".into()),
+            reason: "single listed method".into(),
+        }
+    }
+
+    fn rates(provider: &str, model: &str) -> ModelRates {
+        let served = json!({
+            "rate.input": {"state": "priced", "currency": "USD", "units": 2_000_000_000_i64, "exponent": 9},
+            "rate.output": {"state": "priced", "currency": "USD", "units": 6_000_000_000_i64, "exponent": 9},
+            "rate.cache_read": {"state": "priced", "currency": "USD", "units": 500_000_000_i64, "exponent": 9},
+        });
+        let mut keyed: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        keyed.insert(format!("{provider}/{model}"), served);
+        model_rates(&serde_json::Value::Object(keyed))
+            .expect("served base rates")
+            .remove(&format!("{provider}/{model}"))
+            .expect("the model's rates")
+    }
+
+    fn unserviceable_catalog(provider: &str, model: &str) -> PlaneCatalog {
+        PlaneCatalog {
+            version: Some(0),
+            base: std::collections::BTreeMap::from([(
+                format!("{provider}/{model}"),
+                rates(provider, model),
+            )]),
+            pages: ["oauth", "apikey"]
+                .into_iter()
+                .map(|method| {
+                    (
+                        (provider.to_string(), method.to_string()),
+                        PlaneReply::Refused {
+                            code: "no_coverage".into(),
+                            message: "no plan rates served".into(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The decision path's inputs: list rates from the catalog base, the
+    /// plane's coverage verdict, and a token basket the workload actually uses.
+    fn fact(
+        provider: &str,
+        model: &str,
+        elo: f64,
+        multiplier: Option<f64>,
+    ) -> prefrontal_routing_core::ModelFact {
+        let mut fact = crate::tests::fact(provider, model);
+        fact.scores.elo = elo;
+        fact.scores.eq = 1_500.0;
+        fact.cost_per_m_tok_out = Some(6.0);
+        fact.input_rate = Some(2.0);
+        fact.cache_read_rate = Some(0.5);
+        fact.subscription_multiplier = multiplier;
+        fact.class_vector = Some(prefrontal_routing_core::ClassVector {
+            workload_class: "ephemeral".into(),
+            sample_count: 50,
+            trailing_window_days: 7.0,
+            statistic: "mean".into(),
+            is_overlay: true,
+            fresh_input: 10_000.0,
+            output_excluding_reasoning: 2_000.0,
+            reasoning: 0.0,
+            cached_read: 5_000.0,
+            cache_write: 0.0,
+        });
+        fact
+    }
+
+    fn sign_in(credentials: &mut crate::broca_credentials::BrocaCredentials) {
+        use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+        let listing = ScopedCredentialListing {
+            view: "oauth-only".into(),
+            credentials: vec![ListedCredential {
+                id: "plan-login".into(),
+                categories: vec!["llm-provider".into()],
+                provider_ids: vec!["giraffe".into()],
+                refresh_adapter: Some("giraffe".into()),
+                credential_type: "oauth".into(),
+                state: "active".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        credentials.apply_listing(&listing, 1);
+        credentials.billing_catalog = unserviceable_catalog("giraffe", "stripes-1");
+    }
+
+    fn priced_by_oauth_route(pricing: &RoutePricing) -> prefrontal_routing_core::ModelFact {
+        let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+        sign_in(&mut credentials);
+        let mut facts = vec![fact("giraffe", "stripes-1", 1_700.0, None)];
+        credentials.price_facts(&mut facts, pricing);
+        // A live selection reads the multiplier onto the fact in the store's
+        // overlay (get_facts_with_observed_speed); this sets it the same way.
+        facts[0].subscription_multiplier = pricing.subscription_multiplier("giraffe/stripes-1");
+        facts.remove(0)
+    }
+
+    fn priced_credentials(pricing: &RoutePricing) -> Vec<prefrontal_routing_core::ModelFact> {
+        let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+        sign_in(&mut credentials);
+        let mut facts = vec![fact("giraffe", "stripes-1", 1_700.0, None)];
+        credentials.price_facts(&mut facts, pricing);
+        facts
+    }
+
+    #[test]
+    fn oauth_route_with_a_configured_multiplier_keeps_list_rates_divided_by_it() {
+        let multiplier = 15.0;
+        let pricing = RoutePricing {
+            subscription_multipliers: std::collections::HashMap::from([(
+                "giraffe".to_string(),
+                multiplier,
+            )]),
+            ..Default::default()
+        };
+        let priced = priced_by_oauth_route(&pricing);
+        let plane = priced.billing_plane.as_ref().expect("plane attached");
+        assert_eq!(plane.auth_method, "oauth");
+        assert_eq!(plane.kind, "no_coverage fallback");
+        assert_eq!(plane.rate("rate.input"), Some(2.0));
+        assert_eq!(plane.rate("rate.output"), Some(6.0));
+        assert_eq!(plane.rate("rate.cache_read"), Some(0.5));
+        // The undisclosed rate is neither inherited nor configured here, so no
+        // one states it.
+        assert_eq!(plane.rates.get("rate.cache_write"), None);
+
+        // The fact's multiplier is what divides the list price.
+        let priced = priced_by_oauth_route(&pricing);
+        assert_eq!(priced.subscription_multiplier, Some(multiplier));
+        let list_dollars = (10_000.0 * 2.0 + 2_000.0 * 6.0 + 5_000.0 * 0.5) / 1_000_000.0;
+        let expected =
+            list_dollars / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE / multiplier;
+        let basket = priced.basket_price(priced.class_vector.as_ref().unwrap());
+        assert!(basket.unpriced.is_empty(), "{:?}", basket.unpriced);
+        assert!((basket.cost.unwrap() - expected).abs() < 1e-12);
+        assert!(
+            (selection_cost(&priced, false, true) - expected).abs() < 1e-12,
+            "basket prices at list divided by the multiplier"
+        );
+        // The output-only ladder divides by the same multiplier.
+        assert_eq!(
+            selection_cost(&priced, false, false),
+            (6.0 / multiplier) / prefrontal_routing_core::routing_config::COST_REFERENCE_PER_MTOK
+        );
+    }
+
+    #[test]
+    fn the_priced_oauth_route_beats_a_pricier_metered_route() {
+        let pricing = RoutePricing {
+            subscription_multipliers: std::collections::HashMap::from([(
+                "giraffe".to_string(),
+                15.0,
+            )]),
+            ..Default::default()
+        };
+        let plan = priced_by_oauth_route(&pricing);
+        assert_eq!(plan.subscription_multiplier, Some(15.0));
+        // gpt-style API route at $15/Mtok output, $4/Mtok input, $1/Mtok cache read.
+        let mut api = fact("interchange", "thoroughfare-1", 1_700.0, None);
+        api.cost_per_m_tok_out = Some(15.0);
+        api.input_rate = Some(4.0);
+        api.cache_read_rate = Some(1.0);
+        api.billing_plane = Some(BillingPlane {
+            provider_id: "interchange".into(),
+            auth_method: "apikey".into(),
+            kind: "upstream".into(),
+            selection_reason: "single listed method".into(),
+            rates: std::collections::BTreeMap::from([
+                ("rate.input".into(), BillingRate::Priced { rate: 4.0 }),
+                ("rate.output".into(), BillingRate::Priced { rate: 15.0 }),
+                ("rate.cache_read".into(), BillingRate::Priced { rate: 1.0 }),
+            ]),
+        });
+
+        let selection = prefrontal_routing_core::model_router::select_model_route(
+            prefrontal_routing_core::model_router::SelectModelRouteInput {
+                target_agent: "mason".into(),
+                requirements: prefrontal_routing_core::ModelRequirements { iq: 20.0, eq: 0.0 },
+                available_models: ["giraffe/stripes-1", "interchange/thoroughfare-1"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                facts: vec![plan.clone(), api.clone()],
+                runtime_snapshot: None,
+                exclude_route_keys: Vec::new(),
+                operator_exclude_keys: Vec::new(),
+                required_capabilities: None,
+                is_subscription_route: None,
+                min_best_effort_adequacy: None,
+                prefer_prompt_cache: false,
+                providers_without_prompt_cache: Default::default(),
+            },
+        )
+        .expect("a route is selected");
+        let explanation = selection.explanation.join("\n");
+        assert_eq!(selection.route_key, "giraffe/stripes-1", "{explanation}");
+        assert!(!explanation.contains("price_unknown"), "{explanation}");
+        assert!(
+            !selection.score.objective.price_unknown,
+            "a configured multiplier makes the uncovered plan priceable"
+        );
+    }
+
+    #[test]
+    fn oauth_route_without_a_multiplier_stays_unknown_and_says_why() {
+        let priced = priced_by_oauth_route(&RoutePricing::default());
+        let plane = priced.billing_plane.as_ref().expect("plane attached");
+        assert_eq!(plane.rate("rate.input"), None);
+        assert_eq!(plane.rate("rate.output"), None);
+        assert_eq!(plane.rate("rate.cache_read"), None);
+        assert_eq!(plane.rates.get("rate.input"), Some(&BillingRate::Unpriced));
+        assert_eq!(selection_cost(&priced, false, true), 1.0);
+        assert_eq!(selection_cost(&priced, false, false), 1.0);
+
+        let selection = prefrontal_routing_core::model_router::select_model_route(
+            prefrontal_routing_core::model_router::SelectModelRouteInput {
+                target_agent: "mason".into(),
+                requirements: prefrontal_routing_core::ModelRequirements { iq: 20.0, eq: 0.0 },
+                available_models: ["giraffe/stripes-1"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                facts: vec![priced],
+                runtime_snapshot: None,
+                exclude_route_keys: Vec::new(),
+                operator_exclude_keys: Vec::new(),
+                required_capabilities: None,
+                is_subscription_route: None,
+                min_best_effort_adequacy: None,
+                prefer_prompt_cache: false,
+                providers_without_prompt_cache: Default::default(),
+            },
+        )
+        .expect("the sole adequate route stays selectable");
+        assert!(selection.score.objective.price_unknown);
+        let explanation = selection.explanation.join("\n");
+        assert!(
+            explanation.contains(
+                "price_unknown: giraffe has no plan pricing and no subscription multiplier"
+            ),
+            "{explanation}"
+        );
+    }
+
+    #[test]
+    fn a_rate_the_served_plane_states_overrides_the_configured_fallback() {
+        let served: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/served-payloads.json"))
+                .expect("served payload fixture");
+        let page = super::decode_plane_get(
+            &serde_json::to_vec(&served["oauth anthropic — quota weights"]["response"])
+                .expect("payload bytes"),
+        )
+        .expect("served oauth page");
+        let super::PlaneReply::Served(page) = page else {
+            panic!("fixture is a served plane");
+        };
+        let served_output = page.rates["anthropic/claude-sonnet-4-5"].rates["rate.output"].clone();
+        let priced_catalog = PlaneCatalog {
+            version: Some(0),
+            base: std::collections::BTreeMap::from([(
+                "anthropic/claude-sonnet-4-5".to_string(),
+                rates("anthropic", "claude-sonnet-4-5"),
+            )]),
+            pages: std::collections::BTreeMap::from([(
+                ("anthropic".to_string(), "oauth".to_string()),
+                super::PlaneReply::Served(page),
+            )]),
+        };
+        let plane = priced_catalog.for_route("anthropic/claude-sonnet-4-5", &oauth_serving(), true);
+        assert_eq!(plane.kind, "quota_proxy");
+        assert_eq!(plane.rates["rate.output"], served_output);
+        assert_ne!(
+            plane.rate("rate.output"),
+            Some(6.0),
+            "the catalog base rate must not win over a served page rate"
+        );
+    }
+
+    #[test]
+    fn a_provider_without_a_configured_multiplier_keeps_todays_unknown_rates() {
+        // Control for the multiplier gate: the same uncovered oauth route, and
+        // an apikey route beside it, on a provider the configuration does not
+        // name.
+        let plan = unserviceable_catalog("giraffe", "stripes-1").for_route(
+            "giraffe/stripes-1",
+            &oauth_serving(),
+            false,
+        );
+        assert_eq!(plan.kind, "no_coverage fallback");
+        assert_eq!(plan.rate("rate.input"), None);
+        let api = unserviceable_catalog("giraffe", "stripes-1").for_route(
+            "giraffe/stripes-1",
+            &apikey_serving(),
+            false,
+        );
+        assert_eq!(api.rate("rate.input"), Some(2.0));
+    }
+
+    #[test]
+    fn price_facts_reads_the_selections_multipliers_for_both_panel_and_select_paths() {
+        // The multiplier comes from the configuration the selection was built
+        // with, not from a process-wide map.
+        let with = RoutePricing {
+            subscription_multipliers: std::collections::HashMap::from([(
+                "giraffe".to_string(),
+                15.0,
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            priced_credentials(&with)[0]
+                .billing_plane
+                .as_ref()
+                .unwrap()
+                .rate("rate.output"),
+            Some(6.0)
+        );
+        assert_eq!(
+            priced_credentials(&RoutePricing::default())[0]
+                .billing_plane
+                .as_ref()
+                .unwrap()
+                .rate("rate.output"),
+            None
+        );
     }
 }
