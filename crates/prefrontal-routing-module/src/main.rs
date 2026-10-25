@@ -57,6 +57,7 @@ use std::{
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
 use cortexkit_store_types::StorageDescriptor;
 use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
+use prefrontal_routing_core::launch_policy::resolve_routing_policy_with_catalog_targets;
 use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{
     Confidence, ModelScores, RoutePricing, ScoreProvenance,
@@ -1179,10 +1180,6 @@ where
         store.get_facts(),
         broca_credentials.lock(),
     ) {
-        credentials.set_score_alias(
-            config_overrides::read_operator_routing_policy(&config_overrides::config_path())
-                .score_alias,
-        );
         credentials.refresh_serving_methods(&accounts, &facts, now_ms() as i64);
     }
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
@@ -2125,9 +2122,29 @@ fn no_route_error(
     }
 }
 
+/// [`resolve_select_request_with_catalog_targets`] with no provider resolved
+/// through the vault, for tests that resolve a request without a listing.
+#[cfg(test)]
 fn resolve_select_request(
     params: &SelectParams,
     operator_policy: &ModelRoutingPolicyInput,
+    opencode_auth_path: &Path,
+) -> Result<ResolvedSelectRequest, NoRouteError> {
+    resolve_select_request_with_catalog_targets(
+        params,
+        operator_policy,
+        &std::collections::BTreeMap::new(),
+        opencode_auth_path,
+    )
+}
+
+/// Resolve a legacy select's requirements and available-model policy.
+/// `catalog_targets` names the providers with no catalog rows that resolved
+/// through the vault; they are never subscription-covered.
+fn resolve_select_request_with_catalog_targets(
+    params: &SelectParams,
+    operator_policy: &ModelRoutingPolicyInput,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     opencode_auth_path: &Path,
 ) -> Result<ResolvedSelectRequest, NoRouteError> {
     let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
@@ -2172,11 +2189,12 @@ fn resolve_select_request(
     if params.pin.is_some() || params.model_pin.is_some() {
         availability_policy.exclude.clear();
     }
-    let policy = resolve_routing_policy(
+    let policy = resolve_routing_policy_with_catalog_targets(
         params.available_models.iter().cloned(),
         &availability_policy,
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
+        catalog_targets,
     );
     let uses_host_availability = (params.executor.is_some() || params.is_host_run())
         && !is_broca_substrate(params.substrate.as_deref());
@@ -2726,12 +2744,13 @@ async fn handle_list_canonical_gaps(
 }
 
 /// The canonical model id of each panel candidate, so a panel never seats two
-/// routes of one model. A score-alias row serves its target provider's model,
-/// so it takes the target row's id.
+/// routes of one model. A row borrowed by a provider with no catalog rows
+/// (`catalog_targets`) serves its catalog provider's model, so it takes that
+/// row's id.
 fn panel_canonical_ids(
     store: &SqliteRouteStateStore,
     facts: &[ModelFact],
-    aliases: &std::collections::BTreeMap<String, String>,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
 ) -> Result<HashMap<String, String>, prefrontal_routing_core::RouteStateStoreError> {
     let stored = store.canonical_ids_by_route_key()?;
     Ok(facts
@@ -2739,7 +2758,7 @@ fn panel_canonical_ids(
         .filter_map(|fact| {
             let route_key = fact_to_route(fact).route_key;
             let catalog_key =
-                prefrontal_routing_core::score_alias::catalog_key(aliases, &route_key);
+                prefrontal_routing_core::score_alias::catalog_key(catalog_targets, &route_key);
             stored
                 .get(&catalog_key)
                 .map(|canonical_id| (route_key, canonical_id.clone()))
@@ -3290,7 +3309,10 @@ struct SelectionPolicySources<'a> {
     live_config: &'a config_overrides::LiveConfig,
     operator_config: &'a config_overrides::LiveConfig,
     operator_config_path: &'a Path,
-    operator_policy: &'a ModelRoutingPolicyInput,
+    /// Each provider with no catalog rows that resolved to a catalog provider
+    /// through its credentials' `serves` vendor
+    /// ([`BrocaCredentials::catalog_targets`]), read once for the selection.
+    catalog_targets: &'a std::collections::BTreeMap<String, String>,
 }
 
 /// What pricing a selection's inputs yields besides the priced facts and the
@@ -3306,11 +3328,11 @@ struct PricedSelection {
 }
 
 /// Apply one selection's configuration to the facts and snapshot that
-/// [`prepare_selection_inputs`] read: the live overlays, borrowed score-alias
-/// rows, Broca's billing-plane prices, the provider-confirmed resets recorded
-/// for `reset_group`, and the credential entitlement fences. Every route
-/// selection runs this same sequence, so a route fenced for one caller's
-/// selection is fenced for every other.
+/// [`prepare_selection_inputs`] read: the live overlays, the rows borrowed by
+/// providers with no catalog rows, Broca's billing-plane prices, the
+/// provider-confirmed resets recorded for `reset_group`, and the credential
+/// entitlement fences. Every route selection runs this same sequence, so a
+/// route fenced for one caller's selection is fenced for every other.
 #[allow(clippy::too_many_arguments)]
 fn price_selection_inputs(
     facts: &mut Vec<ModelFact>,
@@ -3329,10 +3351,7 @@ fn price_selection_inputs(
     };
     // Borrowed rows are added after the live overlays so they carry the target's
     // current quality data, and before pricing so they get their own plane.
-    prefrontal_routing_core::score_alias::append_alias_rows(
-        facts,
-        &sources.operator_policy.score_alias,
-    );
+    prefrontal_routing_core::score_alias::append_alias_rows(facts, sources.catalog_targets);
     let subscription_plan_providers = if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(facts);
         credentials.subscription_plan_providers()
@@ -3355,6 +3374,7 @@ fn price_selection_inputs(
             broca_credentials,
             sources.operator_config,
             sources.operator_config_path,
+            sources.catalog_targets,
             group,
             consumer,
             None,
@@ -3781,14 +3801,34 @@ async fn handle_select_request(
         return handle_list_canonical_gaps(frame, writer, store).await;
     }
     if key_pool::handles(&envelope.method) {
-        let policy = config_overrides::read_operator_routing_policy(operator_config_path);
+        // The pool's providers resolve from the stored catalog rows and the
+        // vault listing.
+        let facts = match store.get_facts() {
+            Ok(facts) => facts,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &format!("key pool: {error}"),
+                )
+                .await;
+            }
+        };
+        let catalog_targets = broca_credentials
+            .lock()
+            .map(|credentials| credentials.catalog_targets(&facts))
+            .unwrap_or_default();
         let reply = key_pool::handle(
             &envelope.method,
             &frame.body,
             &key_pool::PoolCtx {
                 store: store.as_ref(),
                 credentials: broca_credentials,
-                policy: &policy,
+                catalog_targets: &catalog_targets,
                 now_ms: now_ms() as i64,
             },
         );
@@ -3913,35 +3953,9 @@ async fn handle_select_request(
     };
     let operator_policy = operator_config.operator_policy();
     timing.add_live_config_check(live_config_started.elapsed());
-    // A host does not choose the substrate of the mason it launches. A host's
-    // mason pin on a provider that needs a per-send credential pin is admitted
-    // provisionally against Broca's routes, without leasing a key; core selects
-    // the pin again with substrate broca before it records the launch.
-    let deferred_runner_pin = host_run
-        && params.substrate.is_none()
-        && params.target_agent == "mason"
-        && params.model_pin.as_deref().is_some_and(|pin| {
-            pin.split_once('/')
-                .is_some_and(|(provider, _)| needs_runner_pin(&operator_policy, provider))
-        });
-    // The harness a host-run selection is judged on: Broca's served routes when
-    // the caller names substrate broca (or for a deferred runner pin), otherwise
-    // the caller's own list, which has no harness of routing's choosing.
-    let host_run_harness = (host_run
-        && (deferred_runner_pin || is_broca_substrate(params.substrate.as_deref())))
-    .then_some(substrate_policy::Harness::Broca);
     let snapshot_started = Instant::now();
-    let mut availability = match store.get_facts() {
-        Ok(mut facts) => {
-            live_config.apply(&mut facts);
-            // Aliased providers are reachable through their own credentials,
-            // so their borrowed rows join the served-route join.
-            prefrontal_routing_core::score_alias::append_alias_rows(
-                &mut facts,
-                &operator_policy.score_alias,
-            );
-            select_availability(Some("broca"), Vec::new(), &facts, broca_credentials)
-        }
+    let stored_facts = match store.get_facts() {
+        Ok(facts) => facts,
         Err(e) => {
             return send_route_error(
                 writer,
@@ -3955,6 +3969,39 @@ async fn handle_select_request(
             .await;
         }
     };
+    // Providers with no catalog rows of their own, each resolved to the catalog
+    // provider whose rows it borrows, read once for this selection.
+    let catalog_targets = broca_credentials
+        .lock()
+        .map(|credentials| credentials.catalog_targets(&stored_facts))
+        .unwrap_or_default();
+    timing.add_snapshot_closure(snapshot_started.elapsed());
+    // A host does not choose the substrate of the mason it launches. A host's
+    // mason pin on a provider that needs a per-send credential pin is admitted
+    // provisionally against Broca's routes, without leasing a key; core selects
+    // the pin again with substrate broca before it records the launch.
+    let deferred_runner_pin = host_run
+        && params.substrate.is_none()
+        && params.target_agent == "mason"
+        && params.model_pin.as_deref().is_some_and(|pin| {
+            pin.split_once('/')
+                .is_some_and(|(provider, _)| needs_runner_pin(&catalog_targets, provider))
+        });
+    // The harness a host-run selection is judged on: Broca's served routes when
+    // the caller names substrate broca (or for a deferred runner pin), otherwise
+    // the caller's own list, which has no harness of routing's choosing.
+    let host_run_harness = (host_run
+        && (deferred_runner_pin || is_broca_substrate(params.substrate.as_deref())))
+    .then_some(substrate_policy::Harness::Broca);
+    let snapshot_started = Instant::now();
+    let mut availability = {
+        let mut facts = stored_facts;
+        live_config.apply(&mut facts);
+        // Resolved providers are reachable through their own credentials, so
+        // their borrowed rows join the served-route join.
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &catalog_targets);
+        select_availability(Some("broca"), Vec::new(), &facts, broca_credentials)
+    };
     timing.add_snapshot_closure(snapshot_started.elapsed());
     // A host-run selection judged on the caller's own list never consulted
     // Broca's routes, so its explanation must not describe them.
@@ -3962,44 +4009,48 @@ async fn handle_select_request(
         availability.note = None;
     }
     let resolve_started = Instant::now();
-    let resolved_request =
-        match resolve_select_request(&params, &operator_policy, opencode_auth_path) {
-            Ok(resolved) => {
-                add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
-                resolved
+    let resolved_request = match resolve_select_request_with_catalog_targets(
+        &params,
+        &operator_policy,
+        &catalog_targets,
+        opencode_auth_path,
+    ) {
+        Ok(resolved) => {
+            add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
+            resolved
+        }
+        Err(mut no_route) => {
+            add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
+            let write_started = Instant::now();
+            if let Some(note) = &availability.note {
+                no_route.message = format!("{} ({note})", no_route.message);
             }
-            Err(mut no_route) => {
-                add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
-                let write_started = Instant::now();
-                if let Some(note) = &availability.note {
-                    no_route.message = format!("{} ({note})", no_route.message);
-                }
-                let requirements = no_route
-                    .requirements
-                    .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
-                let decision = decision_input_for(
-                    &params.target_agent,
-                    &requirements,
-                    None,
-                    Some(&no_route),
-                    &params,
-                    None,
-                    Some(&policy_sources_line(&operator_policy)),
-                );
-                record_failed_selection_decision(store.as_ref(), &decision);
-                add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
-                return send_no_route(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    &no_route,
-                    params.pin.as_ref().map(|_| "invalid_requirements"),
-                )
-                .await;
-            }
-        };
+            let requirements = no_route
+                .requirements
+                .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
+            let decision = decision_input_for(
+                &params.target_agent,
+                &requirements,
+                None,
+                Some(&no_route),
+                &params,
+                None,
+                Some(&policy_sources_line(&operator_policy)),
+            );
+            record_failed_selection_decision(store.as_ref(), &decision);
+            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
+            return send_no_route(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                &no_route,
+                params.pin.as_ref().map(|_| "invalid_requirements"),
+            )
+            .await;
+        }
+    };
     let providers_without_prompt_cache = live_config.providers_without_prompt_cache();
     let snapshot_started = Instant::now();
     let prepared = prepare_selection_inputs(quota_cache, store, live_config.pricing());
@@ -4030,7 +4081,7 @@ async fn handle_select_request(
             live_config: &live_config,
             operator_config: &operator_config,
             operator_config_path,
-            operator_policy: &operator_policy,
+            catalog_targets: &catalog_targets,
         },
         store,
         broca_credentials,
@@ -4124,11 +4175,12 @@ async fn handle_select_request(
     if params.pin.is_some() || params.model_pin.is_some() {
         execution_operator_policy.exclude.clear();
     }
-    let execution_policy = resolve_routing_policy(
+    let execution_policy = resolve_routing_policy_with_catalog_targets(
         available.iter().cloned(),
         &execution_operator_policy,
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
+        &catalog_targets,
     );
     let subscription_keys: HashSet<String> =
         execution_policy.subscription_keys.into_iter().collect();
@@ -4222,6 +4274,7 @@ async fn handle_select_request(
             broca_credentials,
             &operator_config,
             operator_config_path,
+            &catalog_targets,
             params.consumer,
             variant.as_deref(),
         )?;
@@ -4262,7 +4315,7 @@ async fn handle_select_request(
         let pin_harness = run_harness(&pin_key);
         let runner_pin_refusal = if host_run {
             host_runner_pin_refusal(
-                &operator_policy,
+                &catalog_targets,
                 if deferred_runner_pin {
                     Some("broca")
                 } else {
@@ -4274,7 +4327,7 @@ async fn handle_select_request(
         } else {
             let mapped = harness_context.mapped(&pin_key);
             host_runner_pin_refusal(
-                &operator_policy,
+                &catalog_targets,
                 Some(mapped.as_str()),
                 "this route maps to harness",
                 [pin],
@@ -4337,7 +4390,7 @@ async fn handle_select_request(
                     &routing_config,
                     concurrency_slots.as_ref(),
                     config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
-                    operator_config.score_aliases(),
+                    &catalog_targets,
                     &pin_availability,
                 )
             }
@@ -4351,6 +4404,7 @@ async fn handle_select_request(
                 &mut selected,
                 &operator_config,
                 operator_config_path,
+                &catalog_targets,
                 params.consumer,
                 explicit.as_deref(),
             );
@@ -4383,7 +4437,7 @@ async fn handle_select_request(
                     );
                     Some(
                         runner_for_route(
-                            &operator_policy,
+                            &catalog_targets,
                             broca_credentials,
                             store.as_ref(),
                             &session,
@@ -4632,6 +4686,7 @@ async fn handle_select_request(
                 &mut selected,
                 &operator_config,
                 operator_config_path,
+                &catalog_targets,
                 params.consumer,
                 None,
             );
@@ -4737,7 +4792,7 @@ async fn handle_select_request(
                             &decision_id,
                         );
                         match runner_for_route(
-                            &operator_policy,
+                            &catalog_targets,
                             broca_credentials,
                             store.as_ref(),
                             &session,
@@ -4890,16 +4945,20 @@ fn panel_availability(
 /// per-send credential pin, requested for a substrate that cannot carry one.
 const PROVIDER_REQUIRES_RUNNER_PIN: &str = "provider_requires_runner_pin";
 
-fn needs_runner_pin(policy: &ModelRoutingPolicyInput, provider: &str) -> bool {
-    key_pool::is_pool_provider(policy, provider)
+fn needs_runner_pin(
+    catalog_targets: &std::collections::BTreeMap<String, String>,
+    provider: &str,
+) -> bool {
+    key_pool::is_pool_provider(catalog_targets, provider)
 }
 
 /// The Broca launch target for a selected route: the plain translation for an
-/// ordinary provider. For a score-aliased key-pool provider it leases a key for
+/// ordinary provider. For a key-pool provider (one with no catalog rows that
+/// resolved through its credentials' `serves` vendor) it leases a key for
 /// `session` from the pool and returns the target that pins it, with the grant;
 /// a pool that cannot be resolved or has no admissible key refuses by name.
 fn runner_for_route(
-    policy: &ModelRoutingPolicyInput,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     credentials: &SharedBrocaCredentials,
     store: &SqliteRouteStateStore,
     session: &str,
@@ -4915,7 +4974,7 @@ fn runner_for_route(
     ),
     (String, String),
 > {
-    if !needs_runner_pin(policy, provider) {
+    if !needs_runner_pin(catalog_targets, provider) {
         let refused_here = entitlement_fences
             .iter()
             .any(|fence| fence.provider_id == provider);
@@ -4986,7 +5045,7 @@ fn runner_for_route(
         &key_pool::PoolCtx {
             store,
             credentials,
-            policy,
+            catalog_targets,
             now_ms: now_ms() as i64,
         },
         provider,
@@ -5014,7 +5073,7 @@ fn pool_session(task_id: Option<&str>, send_id: Option<&str>, fallback: &str) ->
 /// send would silently land on the provider's default logins. Refuse such pins
 /// by name for every other mapped harness.
 fn host_runner_pin_refusal<'a>(
-    policy: &ModelRoutingPolicyInput,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     requested_substrate: Option<&str>,
     substrate_source: &str,
     pinned_routes: impl IntoIterator<Item = &'a str>,
@@ -5024,7 +5083,7 @@ fn host_runner_pin_refusal<'a>(
     }
     pinned_routes.into_iter().find_map(|route| {
         let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
-        needs_runner_pin(policy, provider).then(|| {
+        needs_runner_pin(catalog_targets, provider).then(|| {
             format!(
                 "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, but {substrate_source} {}",
                 requested_substrate.unwrap_or("none")
@@ -5176,12 +5235,14 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
-    // Use the operator's score aliases and subscription coverage, never the
-    // caller's subscriptionKeys, to price and admit panel candidates.
-    prefrontal_routing_core::score_alias::append_alias_rows(
-        &mut prepared.facts,
-        &operator_policy.score_alias,
-    );
+    // Providers with no catalog rows borrow their catalog provider's rows;
+    // the operator's subscription coverage, never the caller's
+    // subscriptionKeys, prices and admits panel candidates.
+    let catalog_targets = broca_credentials
+        .lock()
+        .map(|credentials| credentials.catalog_targets(&prepared.facts))
+        .unwrap_or_default();
+    prefrontal_routing_core::score_alias::append_alias_rows(&mut prepared.facts, &catalog_targets);
     if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(&mut prepared.facts);
     }
@@ -5203,6 +5264,7 @@ async fn handle_select_panel(
         broca_credentials,
         &live_config,
         routing_config_path,
+        &catalog_targets,
         PANEL_DECISION_CONSUMER,
         Some(panel_consumer),
         None,
@@ -5217,15 +5279,15 @@ async fn handle_select_panel(
         broca_credentials,
     );
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
-    let resolved_policy = resolve_routing_policy(
+    let resolved_policy = resolve_routing_policy_with_catalog_targets(
         params.available_models.iter().cloned(),
         &ModelRoutingPolicyInput {
             subscription: operator_policy.subscription.clone(),
-            score_alias: operator_policy.score_alias.clone(),
             ..ModelRoutingPolicyInput::default()
         },
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(None, opencode_auth_path),
+        &catalog_targets,
     );
     let subscription_keys: HashSet<String> =
         resolved_policy.subscription_keys.into_iter().collect();
@@ -5273,22 +5335,21 @@ async fn handle_select_panel(
     let operator_exclude_keys =
         panel_policy::operator_exclusions(&prepared.facts, &operator_policy.exclude, group);
     let policy = panel_policy::class_policy(live_config.panels(), class);
-    let canonical_ids =
-        match panel_canonical_ids(store, &prepared.facts, &operator_policy.score_alias) {
-            Ok(canonical_ids) => canonical_ids,
-            Err(e) => {
-                return send_route_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "store_error",
-                    &format!("reading canonical model ids: {e}"),
-                )
-                .await;
-            }
-        };
+    let canonical_ids = match panel_canonical_ids(store, &prepared.facts, &catalog_targets) {
+        Ok(canonical_ids) => canonical_ids,
+        Err(e) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("reading canonical model ids: {e}"),
+            )
+            .await;
+        }
+    };
     let context = prefrontal_routing_core::panel::PanelSelectionContext {
         seed: params
             .seed
@@ -5374,6 +5435,7 @@ async fn handle_select_panel(
             &mut panel,
             &live_config,
             routing_config_path,
+            &catalog_targets,
             panel_consumer,
             &seat_models,
         );
@@ -5386,7 +5448,7 @@ async fn handle_select_panel(
                 let Some((provider, model)) = member.route_key.split_once('/') else {
                     continue;
                 };
-                if !needs_runner_pin(&operator_policy, provider) {
+                if !needs_runner_pin(&catalog_targets, provider) {
                     continue;
                 }
                 let variant = member
@@ -5401,7 +5463,7 @@ async fn handle_select_panel(
                     &key_pool::PoolCtx {
                         store: store.as_ref(),
                         credentials: broca_credentials,
-                        policy: &operator_policy,
+                        catalog_targets: &catalog_targets,
                         now_ms: now_ms() as i64,
                     },
                     provider,
@@ -5544,6 +5606,7 @@ fn apply_variant_policy(
     selected: &mut SelectedModelRoute,
     config: &config_overrides::LiveConfig,
     config_path: &Path,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     consumer: Option<select_policy::Consumer>,
     explicit: Option<&str>,
 ) -> variant_policy::VariantChoice {
@@ -5556,7 +5619,7 @@ fn apply_variant_policy(
     let curated = selected.prompt_params.variant.clone();
     let choice = variant_policy::resolve(
         groups,
-        config.score_aliases(),
+        catalog_targets,
         catalog.as_ref(),
         &variant_policy::VariantRequest {
             route_key: &selected.route_key,
@@ -5585,6 +5648,7 @@ fn apply_variant_policy(
     choice
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_provider_resets(
     snapshot: &mut ModelRouteStateSnapshot,
     facts: &[ModelFact],
@@ -5592,6 +5656,7 @@ fn apply_provider_resets(
     credentials: &SharedBrocaCredentials,
     config: &config_overrides::LiveConfig,
     path: &Path,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     consumer: Option<select_policy::Consumer>,
     explicit: Option<&str>,
 ) -> Result<(), ModuleError> {
@@ -5605,6 +5670,7 @@ fn apply_provider_resets(
         credentials,
         config,
         path,
+        catalog_targets,
         group,
         consumer,
         explicit,
@@ -5624,6 +5690,7 @@ fn apply_provider_resets_for_group(
     credentials: &SharedBrocaCredentials,
     config: &config_overrides::LiveConfig,
     path: &Path,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     group: &str,
     consumer: Option<select_policy::Consumer>,
     explicit: Option<&str>,
@@ -5644,7 +5711,7 @@ fn apply_provider_resets_for_group(
             .or(fact.variant.as_deref());
         let variant = variant_policy::resolve(
             config.variant_groups(),
-            config.score_aliases(),
+            catalog_targets,
             catalog.as_ref(),
             &variant_policy::VariantRequest {
                 route_key: &route.route_key,
@@ -5730,6 +5797,7 @@ fn apply_panel_variant_policy(
     panel: &mut SelectedPanel,
     config: &config_overrides::LiveConfig,
     config_path: &Path,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     consumer: select_policy::Consumer,
     seat_models: &HashMap<String, (String, String)>,
 ) {
@@ -5750,7 +5818,7 @@ fn apply_panel_variant_policy(
             .map(str::to_string);
         let choice = variant_policy::resolve(
             groups,
-            config.score_aliases(),
+            catalog_targets,
             catalog.as_ref(),
             &variant_policy::VariantRequest {
                 route_key,
@@ -14521,24 +14589,26 @@ mod tests {
         assert!(body.get("result").is_none());
     }
 
-    /// The routing file for the paid Anthropic API key: a provider whose rows are
-    /// borrowed from `anthropic` and which `exclude.all` keeps out of automatic
-    /// choice. Naming one of its models still admits it.
+    /// The routing file for the paid Anthropic API key: a provider with no
+    /// catalog rows, which borrows `anthropic`'s rows through its keys' `serves`
+    /// vendor and which `exclude.all` keeps out of automatic choice. Naming one
+    /// of its models still admits it.
     fn platform_operator_config(rig: &Rig) -> PathBuf {
         let path = rig.dir.join("prefrontal-routing.jsonc");
         std::fs::write(
             &path,
             r#"{ "model_routing": {
-                "exclude": { "all": ["anthropic-platform"] },
-                "score_alias": { "anthropic-platform": "anthropic" }
+                "exclude": { "all": ["anthropic-platform"] }
             } }"#,
         )
         .unwrap();
         path
     }
 
-    /// A vault listing whose rows map `provider_ids` as given. `account_id` is
-    /// the key's workspace, deliberately different from the id's label.
+    /// A vault listing whose rows map `provider_ids` as given. Each row serves
+    /// the vendor its id names (`apikey:anthropic:work` serves `anthropic`), as
+    /// the vault lists them. `account_id` is the key's workspace, deliberately
+    /// different from the id's label.
     fn platform_listing(rows: &[(&str, &[&str])]) -> SharedBrocaCredentials {
         let credentials = empty_broca_credentials();
         credentials.lock().unwrap().apply_listing(
@@ -14557,6 +14627,12 @@ mod tests {
                             .into(),
                             state: "active".into(),
                             provider_ids: providers.iter().map(|p| (*p).into()).collect(),
+                            serves: id
+                                .split(':')
+                                .nth(1)
+                                .map(str::to_string)
+                                .into_iter()
+                                .collect(),
                             account_id: Some("workspace-7".into()),
                             ..Default::default()
                         },
@@ -14875,7 +14951,6 @@ mod tests {
         }
         let config = rig.dir.join("prefrontal-routing.jsonc");
         std::fs::write(&config, json!({"model_routing": {
-            "score_alias": {"anthropic-platform": "anthropic"},
             "exclude": {"all": ["anthropic/claude-opus-5-5", "anthropic-platform/claude-sonnet-fallback"]},
             "panels": {"audit": {"topK": 2, "extra": 0, "by": "iq"}}
         }}).to_string()).unwrap();
@@ -14988,6 +15063,159 @@ mod tests {
                 .is_some(),
             "{unfilled}"
         );
+    }
+
+    /// A provider with no catalog rows of its own, shaped like the paid
+    /// Anthropic keys, resolves through its keys' `serves` vendor: it gets
+    /// that catalog provider's scores and prices, a pin on it is admitted and
+    /// its keys are leased. A provider whose keys serve two catalog vendors
+    /// resolves to neither: it has no rows, so no scores, no prices, no
+    /// selection and no lease. No routing config names either mapping.
+    #[tokio::test]
+    async fn a_provider_without_catalog_rows_borrows_through_its_keys_serves_vendor() {
+        let row = |id: &str, provider: &str, serves: &[&str]| {
+            cortexkit_claustrum_client::ListedCredential {
+                id: id.into(),
+                categories: vec!["llm-provider".into()],
+                credential_type: "apikey".into(),
+                auth_method: Some("apikey".into()),
+                state: "active".into(),
+                provider_ids: vec![provider.into()],
+                serves: serves.iter().map(|vendor| (*vendor).into()).collect(),
+                account_id: Some("workspace-7".into()),
+                ..Default::default()
+            }
+        };
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                credentials: vec![
+                    row(
+                        "apikey:anthropic:work",
+                        "anthropic-platform",
+                        &["anthropic"],
+                    ),
+                    row(
+                        "apikey:anthropic:mixed",
+                        "mixed-keys",
+                        &["anthropic", "openai"],
+                    ),
+                ],
+                view: "catalogless-view".into(),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        let rig = Rig::new("catalogless-provider");
+        let store: SharedStore = Arc::new(rig.open_store());
+        for (provider, model) in [("anthropic", "claude-opus-4-1"), ("openai", "gpt-5.5")] {
+            store
+                .upsert_fact(&fact(provider, model), FactSource::Override)
+                .unwrap();
+        }
+        let facts = store.get_facts().unwrap();
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact.provider_id == "anthropic-platform"
+                    || fact.provider_id == "mixed-keys"),
+            "neither provider has catalog rows of its own"
+        );
+
+        let resolution = credentials.lock().unwrap().catalog_resolution(&facts);
+        assert_eq!(
+            resolution.targets,
+            std::collections::BTreeMap::from([(
+                "anthropic-platform".to_string(),
+                "anthropic".to_string()
+            )])
+        );
+        assert_eq!(resolution.unresolved["mixed-keys"], ["anthropic", "openai"]);
+
+        // Scores: the borrowed row carries the catalog row's; the ambiguous
+        // provider gets no row at all.
+        let mut rows = facts.clone();
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut rows, &resolution.targets);
+        let find = |rows: &[ModelFact], provider: &str| {
+            rows.iter()
+                .find(|fact| fact.provider_id == provider && fact.model_id == "claude-opus-4-1")
+                .cloned()
+        };
+        let source = find(&rows, "anthropic").unwrap();
+        let borrowed = find(&rows, "anthropic-platform").expect("a borrowed row");
+        assert_eq!(borrowed.scores, source.scores);
+        assert!(!rows.iter().any(|fact| fact.provider_id == "mixed-keys"));
+
+        // Prices: the catalog provider's rates, under the key's own method.
+        {
+            let mut guard = credentials.lock().unwrap();
+            guard.refresh_serving_methods(
+                &account_quota::AccountQuotaState::default(),
+                &facts,
+                now_ms() as i64,
+            );
+            guard.publish_billing_catalog(
+                crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
+            );
+            guard.price_facts(&mut rows);
+        }
+        let plane = find(&rows, "anthropic-platform")
+            .unwrap()
+            .billing_plane
+            .expect("the borrowed row is priced");
+        assert_eq!(
+            (plane.provider_id.as_str(), plane.auth_method.as_str()),
+            ("anthropic", "apikey")
+        );
+        assert!(!plane.rates.is_empty(), "{plane:?}");
+
+        let config = platform_operator_config(&rig);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": method, "params": params}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        let pin = |route: &str| {
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 30, "eq": 0},
+                   "substrate": "broca", "modelPin": route, "taskId": "catalogless"})
+        };
+        let resolved = call(ROUTE_SELECT_OP, pin("anthropic-platform/claude-opus-4-1")).await;
+        assert_eq!(
+            resolved["result"]["selected"]["routeKey"], "anthropic-platform/claude-opus-4-1",
+            "{resolved}"
+        );
+        assert_eq!(
+            resolved["result"]["poolLease"]["credentialId"], "apikey:anthropic:work",
+            "{resolved}"
+        );
+        let ambiguous = call(ROUTE_SELECT_OP, pin("mixed-keys/claude-opus-4-1")).await;
+        assert!(ambiguous.get("result").is_none(), "{ambiguous}");
+
+        let lease = call(
+            "route.pool_acquire",
+            json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": "ses-a"}),
+        )
+        .await;
+        assert_eq!(
+            lease["result"]["credentialId"], "apikey:anthropic:work",
+            "{lease}"
+        );
+        let refused = call(
+            "route.pool_acquire",
+            json!({"provider": "mixed-keys", "model": "claude-opus-4-1", "session": "ses-b"}),
+        )
+        .await;
+        assert_eq!(refused["code"], key_pool::NOT_A_POOL_PROVIDER, "{refused}");
     }
 
     #[tokio::test]
@@ -15574,6 +15802,7 @@ mod tests {
                     credential_type: "apikey".into(),
                     state: "active".into(),
                     provider_ids: vec!["anthropic-platform".into()],
+                    serves: vec!["anthropic".into()],
                     account_id: None,
                     ..Default::default()
                 }],
@@ -15626,6 +15855,12 @@ mod tests {
                             .into(),
                             state: "active".into(),
                             provider_ids: providers.iter().map(|p| (*p).into()).collect(),
+                            serves: id
+                                .split(':')
+                                .nth(1)
+                                .map(str::to_string)
+                                .into_iter()
+                                .collect(),
                             account_id: account.map(str::to_string),
                             ..Default::default()
                         },

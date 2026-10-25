@@ -1813,14 +1813,9 @@ pub async fn account_quota_loop(
         // Account selection and pricing must agree on the serving login. Build
         // the method map after both roster and readings have been refreshed.
         if let (Ok(guard), Ok(facts)) = (state.lock(), store.get_facts()) {
-            // Score aliases come from the same operator file selection reads; a
-            // config edit reaches serving methods on this loop's next pass.
-            let score_alias = crate::config_overrides::read_operator_routing_policy(
-                &crate::config_overrides::config_path(),
-            )
-            .score_alias;
+            // Providers with no catalog rows resolve from this listing and these
+            // rows inside the refresh, so pricing follows the vault.
             if let Ok(mut credentials) = broca_credentials.lock() {
-                credentials.set_score_alias(score_alias);
                 credentials.refresh_serving_methods(&guard, &facts, now_ms());
             }
         }

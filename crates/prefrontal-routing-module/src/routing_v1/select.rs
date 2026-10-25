@@ -22,6 +22,7 @@ use cortexkit_role_routing::select::{
     parse_select_request_serving, Modality, RouteRef, RunnerRef, SelectAnswer, ToolsRequirement,
     EXPLANATION_MAX_CHARS,
 };
+use prefrontal_routing_core::launch_policy::resolve_routing_policy_with_catalog_targets;
 use prefrontal_routing_core::model_router::{
     select_model_route_with_availability, ModelRouteStateSnapshot, NoRouteError,
     RequiredCapabilities, RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
@@ -29,8 +30,7 @@ use prefrontal_routing_core::model_router::{
 use prefrontal_routing_core::provider_model_spec::{parse_spec_list, resolve_spec};
 use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
 use prefrontal_routing_core::{
-    fact_to_route, resolve_routing_policy, ModelFact, ModelRequirements, ModelRoute,
-    ModelRoutingPolicyInput, RoutingConfig,
+    fact_to_route, ModelFact, ModelRequirements, ModelRoute, ModelRoutingPolicyInput, RoutingConfig,
 };
 use prefrontal_routing_store::V1Decision;
 use serde_json::{json, Value};
@@ -119,11 +119,18 @@ pub(super) async fn select(
         quota_note: _,
     } = crate::prepare_selection_inputs(deps.quota_cache, deps.store, live_config.pricing())
         .map_err(store_refusal)?;
+    // Providers with no catalog rows of their own, each resolved to the
+    // catalog provider whose rows it borrows, read once for this selection.
+    let catalog_targets = deps
+        .broca_credentials
+        .lock()
+        .map(|credentials| credentials.catalog_targets(&facts))
+        .unwrap_or_default();
     let sources = SelectionPolicySources {
         live_config: &live_config,
         operator_config: &operator_config,
         operator_config_path: deps.operator_config_path,
-        operator_policy: &operator_policy,
+        catalog_targets: &catalog_targets,
     };
     let priced = crate::price_selection_inputs(
         &mut facts,
@@ -219,12 +226,14 @@ pub(super) async fn select(
     }
 
     // Subscription coverage, read the way every selection reads it: the
-    // operator's `subscription` list and the provider auth facts.
-    let subscription_keys: HashSet<String> = resolve_routing_policy(
+    // operator's `subscription` list and the provider auth facts. A provider
+    // resolved to another provider's catalog rows is never covered.
+    let subscription_keys: HashSet<String> = resolve_routing_policy_with_catalog_targets(
         capable.iter().map(|fact| fact_to_route(fact).route_key),
         &operator_policy,
         &ModelRoutingPolicyInput::default(),
         &crate::provider_auth_types(None, deps.opencode_auth_path),
+        &catalog_targets,
     )
     .subscription_keys
     .into_iter()
@@ -352,6 +361,7 @@ pub(super) async fn select(
         &mut selected,
         &operator_config,
         deps.operator_config_path,
+        &catalog_targets,
         legacy_consumer,
         explicit_variant.as_deref(),
     );
@@ -561,6 +571,7 @@ impl<'a> Selection<'a> {
             self.deps.broca_credentials,
             self.sources.operator_config,
             self.sources.operator_config_path,
+            self.sources.catalog_targets,
             self.consumer,
             self.legacy_consumer,
             variant.as_deref(),
@@ -577,7 +588,7 @@ impl<'a> Selection<'a> {
             self.routing_config,
             self.slots,
             catalog.as_ref(),
-            self.sources.operator_config.score_aliases(),
+            self.sources.catalog_targets,
             self.rejections,
         )
         .map_err(|refusal| refused(&refusal.code))?;

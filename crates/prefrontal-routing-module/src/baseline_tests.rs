@@ -126,11 +126,6 @@ impl World {
 
         let facts = store.get_facts().unwrap();
         let mut credentials = BrocaCredentials::default();
-        credentials.set_score_alias(
-            crate::config_overrides::live_config(&config_path)
-                .score_aliases()
-                .clone(),
-        );
         credentials.apply_listing(&listing, now);
         credentials.refresh_serving_methods(&accounts, &facts, now as i64);
         credentials.publish_billing_catalog(PlaneCatalog::ordinary_test_catalog(&facts));

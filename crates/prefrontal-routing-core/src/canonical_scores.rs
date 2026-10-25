@@ -306,6 +306,26 @@ mod tests {
     }
 
     #[test]
+    fn equal_model_ids_with_null_canonical_ids_share_no_score() {
+        // Without a canonical id the score key is the route's own
+        // provider/model, so a matching model id under another provider is a
+        // different model as far as scores go.
+        let mut facts = vec![
+            row(
+                "acme/shared-name-1",
+                1800.0,
+                1500.0,
+                ScoreProvenance::Override,
+            ),
+            unscored("reseller/shared-name-1"),
+        ];
+        let resolution = resolve_canonical_scores(&mut facts, &ids(&[None, None]));
+        assert_eq!(facts[1].scores.elo, 0.0);
+        assert_eq!(facts[1].score_provenance, ScoreProvenance::Unscored);
+        assert_eq!(resolution.borrowed_from, vec![None, None]);
+    }
+
+    #[test]
     fn a_routes_own_score_wins_and_the_disagreement_is_reported() {
         let mut facts = vec![
             row(

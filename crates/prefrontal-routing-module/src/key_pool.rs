@@ -1,5 +1,6 @@
-//! The key pool of score-aliased API-key providers (`anthropic-platform`): the
-//! routing operations core calls before every send that starts a run.
+//! The key pool of API-key providers with no catalog rows of their own
+//! (`anthropic-platform`): the routing operations core calls before every send
+//! that starts a run.
 //!
 //! - `route.pool_acquire` picks a key for one session's next run, sticking to
 //!   the session's prompt-cache workspace, and returns the launch target with
@@ -13,8 +14,9 @@
 //! naming every key's reason. There is no fallback to the subscription logins.
 
 use prefrontal_routing_core::key_pool::{PoolBlockedKey, EXPLICIT_PROVIDER_POOL_EXHAUSTED};
+use std::collections::BTreeMap;
+
 use prefrontal_routing_core::runner::RunnerModel;
-use prefrontal_routing_core::ModelRoutingPolicyInput;
 use prefrontal_routing_store::{
     PoolAcquire, PoolAcquireOutcome, PoolWallKind, SqliteRouteStateStore,
 };
@@ -61,13 +63,15 @@ fn refusal(code: &str, message: String) -> PoolRefusal {
     }
 }
 
-/// Whether `provider` is a key-pool provider: one that borrows another
-/// provider's rows through `score_alias`. Broca does not know such a name; it
-/// is reached only as one of the vault keys mapped to it, pinned on every send.
-/// Whether automatic selection may choose it is a separate question, answered
-/// by `model_routing.exclude`.
-pub fn is_pool_provider(policy: &ModelRoutingPolicyInput, provider: &str) -> bool {
-    prefrontal_routing_core::score_alias::alias_target(&policy.score_alias, provider).is_some()
+/// Whether `provider` is a key-pool provider: one with no catalog rows of its
+/// own that borrows a catalog provider's rows through its credentials' `serves`
+/// vendor (`catalog_targets`, from
+/// [`crate::broca_credentials::BrocaCredentials::catalog_targets`]). Broca does
+/// not know such a name; it is reached only as one of the vault keys mapped to
+/// it, pinned on every send. Whether automatic selection may choose it is a
+/// separate question, answered by `model_routing.exclude`.
+pub fn is_pool_provider(catalog_targets: &BTreeMap<String, String>, provider: &str) -> bool {
+    prefrontal_routing_core::score_alias::alias_target(catalog_targets, provider).is_some()
 }
 
 /// One granted key and the launch target that pins it.
@@ -94,7 +98,8 @@ impl PoolGrant {
 pub struct PoolCtx<'a> {
     pub store: &'a SqliteRouteStateStore,
     pub credentials: &'a SharedBrocaCredentials,
-    pub policy: &'a ModelRoutingPolicyInput,
+    /// Each provider with no catalog rows that resolved to a catalog provider.
+    pub catalog_targets: &'a BTreeMap<String, String>,
     pub now_ms: i64,
 }
 
@@ -135,16 +140,6 @@ pub fn acquire(
     variant: Option<&str>,
     session: &str,
 ) -> Result<PoolGrant, PoolRefusal> {
-    if !is_pool_provider(ctx.policy, provider) {
-        return Err(refusal(
-            NOT_A_POOL_PROVIDER,
-            format!("{provider} is not a key-pool provider (no model_routing.score_alias entry)"),
-        ));
-    }
-    let target =
-        prefrontal_routing_core::score_alias::alias_target(&ctx.policy.score_alias, provider)
-            .unwrap_or_default()
-            .to_string();
     let keys = ctx
         .credentials
         .lock()
@@ -157,9 +152,25 @@ pub fn acquire(
             )
         })?
         .pool_keys(provider, ctx.now_ms.max(0) as u64)
-        .map_err(|(code, message)| refusal(&code, message))?;
-    // A key that serves another provider than the one the alias borrows rows
-    // from would price and route on one provider and send on another.
+        .map_err(|(code, message)| refusal(&code, message));
+    let Some(target) =
+        prefrontal_routing_core::score_alias::alias_target(ctx.catalog_targets, provider)
+            .map(str::to_string)
+    else {
+        // Pool membership comes from the vault listing. When the listing is
+        // unread, stale or maps no key to the provider, that is the refusal:
+        // the provider may well resolve once the listing says so.
+        keys?;
+        return Err(refusal(
+            NOT_A_POOL_PROVIDER,
+            format!(
+                "{provider} is not a key-pool provider: it has catalog rows of its own, or its credentials' serves vendors name no single catalog provider"
+            ),
+        ));
+    };
+    let keys = keys?;
+    // A key that serves another provider than the one the provider borrows
+    // rows from would price and route on one provider and send on another.
     if let Some(stray) = keys.iter().find(|key| {
         prefrontal_routing_core::runner::RunnerAuthPin::from_credential_id(&key.credential_id)
             .is_none_or(|(served, _)| served != target)
@@ -167,7 +178,7 @@ pub fn acquire(
         return Err(refusal(
             EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED,
             format!(
-                "provider {provider} maps to credential {}, which is not a method:{target}[:account] id; model_routing.score_alias borrows its rows from {target}",
+                "provider {provider} maps to credential {}, which is not a method:{target}[:account] id; the provider borrows its rows from {target}",
                 stray.credential_id
             ),
         ));
