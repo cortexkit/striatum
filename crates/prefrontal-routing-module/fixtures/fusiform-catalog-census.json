@@ -1,0 +1,249 @@
+{
+  "about": [
+    "Fusiform catalog.get reply listing the providers and models the literal census (src/literal_census_tests.rs) forbids routing code to name.",
+    "Merged from the served Fusiform payloads (served-payloads.json), the curated Muse rows (muse-curated.json) and the frozen baseline catalog rows (routing-baseline-2026-10-24.json, which includes ollama-cloud), plus github-copilot, vercel, minimax and moonshotai rows for providers Fusiform serves that routing code used to name.",
+    "Keys are Fusiform's provider/model route keys; only the keys are read."
+  ],
+  "request": {
+    "name": "catalog.get",
+    "arguments": {
+      "include_retired": true,
+      "paged": false
+    }
+  },
+  "response": {
+    "catalog_version": 1,
+    "models": {
+      "alibaba-token-plan/qwen3.8-max": {
+        "existence": "present",
+        "model.canonical_id": "qwen/qwen3.8-max",
+        "model.family": "qwen"
+      },
+      "anthropic/claude-haiku-5-5": {
+        "existence": "present",
+        "model.canonical_id": "anthropic/claude-haiku-5-5",
+        "model.family": "claude"
+      },
+      "anthropic/claude-opus-5-5": {
+        "existence": "present",
+        "model.canonical_id": "anthropic/claude-opus-5-5",
+        "model.family": "claude"
+      },
+      "anthropic/claude-sonnet-4-5": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "claude-sonnet"
+      },
+      "anthropic/claude-sonnet-5-5": {
+        "existence": "present",
+        "model.canonical_id": "anthropic/claude-sonnet-5-5",
+        "model.family": "claude"
+      },
+      "anyapi/anthropic/claude-opus-4-6": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "claude-opus"
+      },
+      "deepseek/deepseek-flash": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "deepseek-flash"
+      },
+      "deepseek/deepseek-v4.1": {
+        "existence": "present",
+        "model.canonical_id": "deepseek/deepseek-v4.1",
+        "model.family": "deepseek"
+      },
+      "fireworks-ai/glm-5.2": {
+        "existence": "present",
+        "model.canonical_id": "zhipu/glm-5.2",
+        "model.family": "glm"
+      },
+      "github-copilot/gpt-5.6-luna": {
+        "existence": "present",
+        "model.canonical_id": "openai/gpt-5.6-luna",
+        "model.family": "gpt"
+      },
+      "google/antigravity-gemini-3.8-flash": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "gemini-flash"
+      },
+      "google/antigravity-gemini-4-argon": {
+        "existence": "present",
+        "model.canonical_id": "google/gemini-4-argon",
+        "model.family": "gemini"
+      },
+      "google/gemini-3.6-flash": {
+        "existence": "present",
+        "model.canonical_id": "google/gemini-3.6-flash",
+        "model.family": "gemini"
+      },
+      "greenpt/green-s": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": null
+      },
+      "inception/mercury-3": {
+        "existence": "present",
+        "model.canonical_id": "inception/mercury-3",
+        "model.family": "other"
+      },
+      "kimi-code-plan-global/k3": {
+        "existence": "present",
+        "model.canonical_id": "moonshot/kimi-k3",
+        "model.family": "kimi"
+      },
+      "kimi-code-plan-global/k3-256k": {
+        "existence": "present",
+        "model.canonical_id": "moonshot/kimi-k3",
+        "model.family": "kimi"
+      },
+      "kimi-code-plan-global/k3.1-pro": {
+        "existence": "present",
+        "model.canonical_id": "moonshot/kimi-k3.1-pro",
+        "model.family": "kimi"
+      },
+      "kimi-code-plan-global/k3.1-pro-highspeed": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "kimi"
+      },
+      "kimi-for-coding/kimi-k3": {
+        "existence": "present",
+        "model.canonical_id": "moonshot/kimi-k3",
+        "model.family": "kimi"
+      },
+      "meta/muse-spark-1.3-contributor": {
+        "existence": "present",
+        "model.canonical_id": "meta/muse-spark-1.3-contributor",
+        "model.family": "llama"
+      },
+      "meta/muse-wonder-full-1.0": {
+        "existence": "present",
+        "model.canonical_id": "meta/muse-wonder-full-1.0",
+        "model.family": "llama"
+      },
+      "minimax/minimax-m2": {
+        "existence": "present",
+        "model.canonical_id": "minimax/minimax-m2",
+        "model.family": "minimax"
+      },
+      "moonshotai/kimi-k3": {
+        "existence": "present",
+        "model.canonical_id": "moonshotai/kimi-k3",
+        "model.family": "kimi"
+      },
+      "nebius/Qwen/Qwen3-Next-80B-A3B-Thinking": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": null
+      },
+      "ollama-cloud/glm-5.2": {
+        "existence": "present",
+        "model.canonical_id": "zhipu/glm-5.2",
+        "model.family": "glm"
+      },
+      "openai/gpt-5.6-luna": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "gpt-luna"
+      },
+      "openai/gpt-5.6-sol": {
+        "existence": "present",
+        "model.canonical_id": "openai/gpt-5.6-sol",
+        "model.family": "gpt"
+      },
+      "openai/gpt-6-astra": {
+        "existence": "present",
+        "model.canonical_id": "openai/gpt-6-astra",
+        "model.family": "gpt"
+      },
+      "openai/gpt-6-luna": {
+        "existence": "present",
+        "model.canonical_id": "openai/gpt-6-luna",
+        "model.family": "gpt"
+      },
+      "openai/gpt-6-sol": {
+        "existence": "present",
+        "model.canonical_id": "openai/gpt-6-sol",
+        "model.family": "gpt"
+      },
+      "openai/gpt-6.1-sol": {
+        "existence": "present",
+        "model.canonical_id": "openai/gpt-6.1-sol",
+        "model.family": "gpt"
+      },
+      "openai/gpt-image-1": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "gpt-image"
+      },
+      "opencode-go/deepseek-v4.1-flash": {
+        "existence": "present",
+        "model.canonical_id": "deepseek/deepseek-v4.1-flash",
+        "model.family": "deepseek"
+      },
+      "opencode/big-pickle": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "glm"
+      },
+      "openrouter/moonshotai-kimi-k3": {
+        "existence": "present",
+        "model.canonical_id": "moonshot/kimi-k3",
+        "model.family": "kimi"
+      },
+      "synthetic-reseller/synthetic-glm": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "glm"
+      },
+      "synthetic-reseller/synthetic-glm-free": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": null
+      },
+      "synthetic/unknown-reasoning": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": null
+      },
+      "vercel/anthropic/claude-sonnet-4-5": {
+        "existence": "present",
+        "model.canonical_id": "anthropic/claude-sonnet-4-5",
+        "model.family": "claude"
+      },
+      "xai/grok-4.20-0309-non-reasoning": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "grok"
+      },
+      "xai/grok-4.5": {
+        "existence": "present",
+        "model.canonical_id": "xai/grok-4.5",
+        "model.family": "grok"
+      },
+      "xai/grok-4.7": {
+        "existence": "present",
+        "model.canonical_id": "xai/grok-4.7",
+        "model.family": "grok"
+      },
+      "xai/grok-build-0.1": {
+        "existence": "present",
+        "model.canonical_id": "xai/grok-build-0.1",
+        "model.family": "grok"
+      },
+      "zai/synthetic-glm": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": "glm"
+      },
+      "zhipuai/glm-4.5-flash": {
+        "existence": "present",
+        "model.canonical_id": null,
+        "model.family": null
+      }
+    }
+  }
+}

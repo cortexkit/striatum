@@ -27,6 +27,8 @@ mod credential_fences;
 mod engram_catalog;
 mod fusiform_catalog;
 mod key_pool;
+#[cfg(test)]
+mod literal_census_tests;
 mod model_resolution;
 mod panel_policy;
 mod quota_bus;
