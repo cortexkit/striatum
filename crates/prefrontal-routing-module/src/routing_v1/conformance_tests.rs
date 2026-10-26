@@ -75,6 +75,10 @@ impl Drop for Harness {
 
 impl Harness {
     pub(super) fn new(label: &str) -> Arc<Self> {
+        Self::new_at_version(label, None)
+    }
+
+    fn new_at_version(label: &str, version: Option<u32>) -> Arc<Self> {
         super::consumers::replace_catalog(&json!([]));
         let n = NEXT_HARNESS.fetch_add(1, Ordering::Relaxed);
         let dir = prefrontal_test_support::scratch_root().join(format!(
@@ -82,13 +86,20 @@ impl Harness {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        let descriptor = prefrontal_routing_store::dev_descriptor(
+            DEFAULT_MODULE_ID,
+            dir.join("store.db").to_string_lossy().into_owned(),
+        );
         let store = Arc::new(
-            prefrontal_routing_store::SqliteRouteStateStore::open(
-                &prefrontal_routing_store::dev_descriptor(
-                    DEFAULT_MODULE_ID,
-                    dir.join("store.db").to_string_lossy().into_owned(),
-                ),
-            )
+            match version {
+                Some(version) => {
+                    prefrontal_routing_store::SqliteRouteStateStore::open_at_version_for_test(
+                        &descriptor,
+                        version,
+                    )
+                }
+                None => prefrontal_routing_store::SqliteRouteStateStore::open(&descriptor),
+            }
             .unwrap(),
         );
         let auth_path = dir.join("auth.json");
@@ -789,4 +800,133 @@ fn conformance_fixture_tag_mismatch_stays_visible_until_upstream_fix() {
         error,
         "invalid declaration field runner.tool_capabilities[0]"
     );
+}
+
+#[tokio::test]
+async fn migration_065_restarts_replays_and_binds_preupgrade_admissions() {
+    use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
+    let harness = Harness::new_at_version("upgrade-062-admission", Some(62));
+    install_catalog(&harness, &fixture::catalog());
+    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
+    let request = json!({
+        "provider": fixture::SUBSCRIPTION_PROVIDER,
+        "model": "model-c",
+        "conversation_key": "upgrade-conversation",
+        "admission_id": "preupgrade-v1",
+    });
+    let first = runner.call("route.account_for", &request).await;
+    assert_eq!(first.0, FrameType::Response, "{}", first.1);
+    assert!(first.1["result"]["account"].is_object(), "{}", first.1);
+    let mut legacy = request.clone();
+    legacy["admission_id"] = json!("preupgrade-legacy");
+    legacy["conversation_key"] = json!("legacy-upgrade-conversation");
+    legacy["caller"] = json!({"runner": fixture::RUNNER_ONE});
+    let legacy_first = runner.call("route.account_for", &legacy).await;
+    assert_eq!(legacy_first.0, FrameType::Response, "{}", legacy_first.1);
+    drop(runner);
+
+    // Release the old store's writer lease before reopening the same file.
+    // The placeholder is a separate scratch database, never an upgrade input.
+    let mut state = Arc::try_unwrap(harness).ok().unwrap();
+    let descriptor = dev_descriptor(
+        DEFAULT_MODULE_ID,
+        state.dir.join("store.db").to_string_lossy(),
+    );
+    let placeholder = Arc::new(
+        SqliteRouteStateStore::open(&dev_descriptor(
+            "routing-upgrade-placeholder",
+            state.dir.join("placeholder/store.db").to_string_lossy(),
+        ))
+        .unwrap(),
+    );
+    drop(std::mem::replace(&mut state.store, placeholder));
+    state.store = Arc::new(SqliteRouteStateStore::open(&descriptor).unwrap());
+    state.route_epochs = tokio::sync::Mutex::new(RouteEpochs::new());
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = AccountQuotaState::default();
+    let harness = Arc::new(state);
+    install_catalog(&harness, &fixture::catalog());
+    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
+    assert_eq!(runner.call("route.account_for", &request).await.1, first.1);
+    assert_eq!(
+        runner.call("route.account_for", &legacy).await.1,
+        legacy_first.1
+    );
+    for mut conflicting in [request.clone(), legacy.clone()] {
+        conflicting["model"] = json!("different-model");
+        let conflict = runner.call("route.account_for", &conflicting).await;
+        assert_eq!(conflict.0, FrameType::Error, "{}", conflict.1);
+        assert_eq!(conflict.1["code"], "admission_conflict", "{}", conflict.1);
+    }
+    let observed = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id": "postupgrade-start", "kind": "admission_started",
+                "admission_id": "preupgrade-v1", "run_id": "upgraded-run",
+            }),
+        )
+        .await;
+    assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
+    assert_eq!(
+        observed.1["result"]["observation"]["bound"], true,
+        "{}",
+        observed.1
+    );
+    harness
+        .store()
+        .account_transaction(|tx| {
+            let principal = format!(
+                "reserved:{}",
+                fixture::RUNNER_ONE.trim_start_matches("reserved:")
+            );
+            let row = tx.admission(&principal, "preupgrade-v1")?.unwrap();
+            assert_eq!(row.state, "started");
+            assert_eq!(row.run_id.as_deref(), Some("upgraded-run"));
+            Ok(())
+        })
+        .unwrap();
+    let principal = format!(
+        "reserved:{}",
+        fixture::RUNNER_ONE.trim_start_matches("reserved:")
+    );
+    let reservation = harness
+        .store()
+        .account_transaction(|tx| tx.admission(&principal, "preupgrade-legacy"))
+        .unwrap()
+        .unwrap();
+    let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+    let ctx = account_selection::Ctx {
+        store: harness.store(),
+        accounts: crate::ACCOUNT_QUOTA.get(),
+        flags: harness.operator_config().account_flags(),
+        policy: &policy,
+        now_ms: reservation.admission_valid_until + 1,
+    };
+    let request = json!({"method":"route.account_for", "params": legacy});
+    let answer = account_selection::handle(
+        "route.account_for",
+        &serde_json::to_vec(&request).unwrap(),
+        &principal,
+        &ctx,
+    );
+    assert!(
+        matches!(answer, account_selection::OpReply::Result(_)),
+        "{answer:?}"
+    );
+    harness
+        .store()
+        .account_transaction(|tx| {
+            assert_eq!(
+                tx.admission(&principal, "preupgrade-legacy")?
+                    .unwrap()
+                    .state,
+                "expired"
+            );
+            assert_eq!(
+                tx.admission(&principal, "preupgrade-v1")?.unwrap().state,
+                "started"
+            );
+            Ok(())
+        })
+        .unwrap();
 }

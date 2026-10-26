@@ -6,7 +6,7 @@
 //! The decision itself is the row `route.select` writes into the decision
 //! ledger; this module only keeps what v1 adds to it.
 
-use prefrontal_routing_core::RouteStateResult;
+use prefrontal_routing_core::{accounts::AllowedAccountClass, RouteStateResult};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{err, SqliteRouteStateStore};
@@ -18,6 +18,7 @@ pub struct V1Decision {
     /// The route principal that selected it (`reserved:<module>`, ...).
     pub principal: String,
     pub consumer: String,
+    pub allowed_account_class: AllowedAccountClass,
     pub project_id: Option<String>,
     pub provider: String,
     pub model: String,
@@ -46,8 +47,8 @@ impl SqliteRouteStateStore {
                 tx.execute(
                     "INSERT INTO routing_v1_decision
                        (decision_id, principal, consumer, project_id, provider, model, variant,
-                        runner_module, affinity, created_at_ms, expires_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         decision.decision_id,
                         decision.principal,
@@ -60,6 +61,7 @@ impl SqliteRouteStateStore {
                         decision.affinity,
                         decision.created_at_ms,
                         decision.expires_at_ms,
+                        decision.allowed_account_class.as_str(),
                     ],
                 )?;
                 if let Some(affinity) = &decision.affinity {
@@ -92,7 +94,7 @@ impl SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 c.query_row(
                     "SELECT decision_id, principal, consumer, project_id, provider, model, variant,
-                            runner_module, affinity, created_at_ms, expires_at_ms
+                            runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class
                      FROM routing_v1_decision WHERE decision_id = ?1",
                     params![decision_id],
                     |row| {
@@ -108,6 +110,9 @@ impl SqliteRouteStateStore {
                             affinity: row.get(8)?,
                             created_at_ms: row.get(9)?,
                             expires_at_ms: row.get(10)?,
+                            allowed_account_class: AllowedAccountClass::parse(&row.get::<_, String>(11)?)
+                                .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                                    11, rusqlite::types::Type::Text, error.into()))?,
                         })
                     },
                 )
@@ -296,6 +301,7 @@ mod tests {
             decision_id: id.into(),
             principal: "reserved:consumer".into(),
             consumer: "summary".into(),
+            allowed_account_class: AllowedAccountClass::NotPayPerToken,
             project_id: None,
             provider: "p".into(),
             model: "m".into(),

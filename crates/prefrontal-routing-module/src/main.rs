@@ -29,7 +29,6 @@ mod fusiform_catalog;
 mod key_pool;
 mod model_resolution;
 mod panel_policy;
-mod provider_resets;
 mod quota_bus;
 mod quota_consumer;
 mod quota_events;
@@ -3384,19 +3383,15 @@ struct PricedSelection {
 /// Apply one selection's configuration to the facts and snapshot that
 /// [`prepare_selection_inputs`] read: the live overlays, the rows borrowed by
 /// providers with no catalog rows, Broca's billing-plane prices, the
-/// provider-confirmed resets recorded for `reset_group`, and the credential
-/// entitlement fences. Every route selection runs this same sequence, so a
+/// credential entitlement fences. Every route selection runs this same sequence, so a
 /// route fenced for one caller's selection is fenced for every other.
 #[allow(clippy::too_many_arguments)]
 fn price_selection_inputs(
     facts: &mut Vec<ModelFact>,
-    snapshot: &mut ModelRouteStateSnapshot,
     quota_signal_json: String,
     sources: &SelectionPolicySources<'_>,
     store: &SharedStore,
     broca_credentials: &SharedBrocaCredentials,
-    reset_group: Option<&str>,
-    consumer: Option<select_policy::Consumer>,
     credentialed: bool,
     priced_per_token: bool,
 ) -> Result<PricedSelection, ModuleError> {
@@ -3421,20 +3416,6 @@ fn price_selection_inputs(
         for fact in facts.iter_mut() {
             fact.subscription_multiplier = None;
         }
-    }
-    if let Some(group) = reset_group.filter(|_| credentialed) {
-        apply_provider_resets_for_group(
-            snapshot,
-            facts,
-            store,
-            broca_credentials,
-            sources.operator_config,
-            sources.operator_config_path,
-            sources.catalog_targets,
-            group,
-            consumer,
-            None,
-        )?;
     }
     // Credentials a provider refused permanently: automatic selection skips a
     // route no other credential serves, and launches the rest on another one.
@@ -4174,7 +4155,6 @@ async fn handle_select_request(
         subscription_plan_providers,
     } = price_selection_inputs(
         &mut facts,
-        &mut snapshot,
         quota_signal_json,
         &SelectionPolicySources {
             live_config: &live_config,
@@ -4184,8 +4164,6 @@ async fn handle_select_request(
         },
         store,
         broca_credentials,
-        variant_policy::consumer_group(params.consumer),
-        params.consumer,
         !host_run,
         priced_per_token,
     )?;
@@ -4446,26 +4424,7 @@ async fn handle_select_request(
             .and_then(|pin| pin.variant.clone())
             .or_else(|| work_model_pin::named_variant(pin, &facts));
         let (pin_key, pin_capacity) = work_model_pin::route_keys(pin, variant.as_deref(), &facts);
-        let mut pin_snapshot = snapshot.clone();
-        for state in pin_snapshot.by_route.values_mut() {
-            state.provider_reset_until = None;
-        }
-        let pin_facts: Vec<_> = facts
-            .iter()
-            .filter(|f| format!("{}/{}", f.provider_id, f.model_id) == pin_capacity)
-            .cloned()
-            .collect();
-        apply_provider_resets(
-            &mut pin_snapshot,
-            &pin_facts,
-            store,
-            broca_credentials,
-            &operator_config,
-            operator_config_path,
-            &catalog_targets,
-            params.consumer,
-            variant.as_deref(),
-        )?;
+        let pin_snapshot = snapshot.clone();
         let mut pin_availability = mapped_availability.rejected.clone();
         // When a pin refused for a timed wall can be admitted again, so a caller
         // that may not fall back can wait for that time instead of failing.
@@ -4630,7 +4589,6 @@ async fn handle_select_request(
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
-                            variant_policy::consumer_group(params.consumer),
                             &entitlement_fences,
                         )
                         .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
@@ -4663,7 +4621,7 @@ async fn handle_select_request(
                     selected.explanation.push(line.clone());
                 }
                 let write_started = Instant::now();
-                let decision = decision_input_for(
+                let mut decision = decision_input_for(
                     &target_agent,
                     &requirements,
                     Some(&selected),
@@ -4672,6 +4630,10 @@ async fn handle_select_request(
                     Some(&provenance),
                     Some(&policy_sources_line(&operator_policy)),
                 );
+                decision.allowed_account_class =
+                    prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
+                        priced_per_token,
+                    );
                 let decision_id = store
                     .record_decision_with_selection(
                         &decision,
@@ -4958,7 +4920,7 @@ async fn handle_select_request(
                 .extend(head_refusals.notes.iter().cloned());
             add_stage_ms(&timing.finish_ms, finish_started.elapsed());
             let write_started = Instant::now();
-            let decision = decision_input_for(
+            let mut decision = decision_input_for(
                 &target_agent,
                 &requirements,
                 Some(&selected),
@@ -4967,6 +4929,10 @@ async fn handle_select_request(
                 Some(&provenance),
                 Some(&policy_sources),
             );
+            decision.allowed_account_class =
+                prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
+                    priced_per_token,
+                );
             let recorded = store.record_decision_with_selection(
                 &decision,
                 if host_run {
@@ -5055,7 +5021,6 @@ async fn handle_select_request(
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
-                            variant_policy::consumer_group(params.consumer),
                             &entitlement_fences,
                         ) {
                             Ok((runner, _)) => result["runner"] = json!(runner),
@@ -5269,7 +5234,6 @@ fn runner_for_route(
     provider: &str,
     model: &str,
     variant: Option<&str>,
-    consumer: Option<&str>,
     entitlement_fences: &[prefrontal_routing_core::route_state_store::CredentialEntitlementFence],
 ) -> Result<
     (
@@ -5282,19 +5246,7 @@ fn runner_for_route(
         let refused_here = entitlement_fences
             .iter()
             .any(|fence| fence.provider_id == provider);
-        let reset_fences = match consumer {
-            Some(consumer) => {
-                let key = prefrontal_routing_core::make_route_key(provider, model, variant);
-                store
-                    .provider_reset_fences(consumer, now_ms() as i64)
-                    .map_err(|e| ("store_error".into(), e.to_string()))?
-                    .into_iter()
-                    .filter(|f| f.route_key == key)
-                    .collect::<Vec<_>>()
-            }
-            None => Vec::new(),
-        };
-        if !reset_fences.is_empty() || refused_here {
+        if refused_here {
             let facts = store
                 .get_facts()
                 .map_err(|e| ("store_error".into(), e.to_string()))?;
@@ -5304,29 +5256,12 @@ fn runner_for_route(
                 .and_then(|fact| credentials.lock().ok().map(|c| c.serving_identities(fact)))
                 .unwrap_or_default();
             // A credential the provider refused permanently is never launched
-            // on automatically; the others are checked for provider resets.
+            // on automatically.
             let entitled: Vec<(String, Option<String>)> =
                 credential_fences::entitled(entitlement_fences, provider, &identities)
                     .into_iter()
                     .cloned()
                     .collect();
-            if !reset_fences.is_empty() {
-                if let Some(id) = provider_resets::healthy_credential(&reset_fences, &entitled) {
-                    if let Some(runner) =
-                        prefrontal_routing_core::runner::RunnerModel::pinned(&id, model, variant)
-                    {
-                        return Ok((runner, None));
-                    }
-                }
-                return Err((
-                    "quota_exhausted".into(),
-                    format!(
-                        "provider reset for {} on {}",
-                        consumer.unwrap_or_default(),
-                        prefrontal_routing_core::make_route_key(provider, model, variant)
-                    ),
-                ));
-            }
             // Pin the launch to a credential the provider has not refused, so
             // Broca cannot fall back to the refused one.
             if let Some(runner) = entitled.first().and_then(|(id, _)| {
@@ -5551,28 +5486,12 @@ async fn handle_select_panel(
         credentials.price_facts(&mut prepared.facts);
     }
     live_config.apply(&mut prepared.facts);
-    // Seats are automatic choices for the class's consumer (see the variant
-    // policy below), and every seat's provider reset is fenced under the panel
-    // decision's consumer. Admission must see those fences, or a model whose
-    // account is out until a known reset keeps being seated and failing.
     let panel_consumer =
         if params.panel_spec.class == prefrontal_routing_core::panel::PanelClass::Lab {
             select_policy::Consumer::Lab
         } else {
             select_policy::Consumer::Athena
         };
-    apply_provider_resets_for_group(
-        &mut prepared.snapshot,
-        &prepared.facts,
-        store,
-        broca_credentials,
-        &live_config,
-        routing_config_path,
-        &catalog_targets,
-        PANEL_DECISION_CONSUMER,
-        Some(panel_consumer),
-        None,
-    )?;
     // Seats are automatic choices: a model no entitled credential serves is not seated.
     let entitlement_fences =
         credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?;
@@ -5952,114 +5871,6 @@ fn apply_variant_policy(
     choice
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_provider_resets(
-    snapshot: &mut ModelRouteStateSnapshot,
-    facts: &[ModelFact],
-    store: &SharedStore,
-    credentials: &SharedBrocaCredentials,
-    config: &config_overrides::LiveConfig,
-    path: &Path,
-    catalog_targets: &std::collections::BTreeMap<String, String>,
-    consumer: Option<select_policy::Consumer>,
-    explicit: Option<&str>,
-) -> Result<(), ModuleError> {
-    let Some(group) = variant_policy::consumer_group(consumer) else {
-        return Ok(());
-    };
-    apply_provider_resets_for_group(
-        snapshot,
-        facts,
-        store,
-        credentials,
-        config,
-        path,
-        catalog_targets,
-        group,
-        consumer,
-        explicit,
-    )
-}
-
-/// Install the live provider-reset fences recorded under `group` into the
-/// selection snapshot. `consumer` chooses the variant each route runs at, which
-/// is part of the fenced route key; it is separate from `group` because panel
-/// decisions record one consumer for every class while lab seats run at the lab
-/// consumer's variants.
-#[allow(clippy::too_many_arguments)]
-fn apply_provider_resets_for_group(
-    snapshot: &mut ModelRouteStateSnapshot,
-    facts: &[ModelFact],
-    store: &SharedStore,
-    credentials: &SharedBrocaCredentials,
-    config: &config_overrides::LiveConfig,
-    path: &Path,
-    catalog_targets: &std::collections::BTreeMap<String, String>,
-    group: &str,
-    consumer: Option<select_policy::Consumer>,
-    explicit: Option<&str>,
-) -> Result<(), ModuleError> {
-    let fences = store
-        .provider_reset_fences(group, snapshot.now as i64)
-        .map_err(|e| ModuleError::Message(e.to_string()))?;
-    if fences.is_empty() {
-        return Ok(());
-    }
-    let catalog = config_overrides::reasoning_catalog_for(path);
-    for fact in facts {
-        let route = prefrontal_routing_core::fact_to_route(fact);
-        let curated = fact
-            .prompt_defaults
-            .as_ref()
-            .and_then(|d| d.variant.as_deref())
-            .or(fact.variant.as_deref());
-        let variant = variant_policy::resolve(
-            config.variant_groups(),
-            catalog_targets,
-            catalog.as_ref(),
-            &variant_policy::VariantRequest {
-                route_key: &route.route_key,
-                provider_id: &fact.provider_id,
-                model_id: &fact.model_id,
-                explicit,
-                curated,
-                consumer,
-            },
-        )
-        .variant;
-        let key = prefrontal_routing_core::make_route_key(
-            &fact.provider_id,
-            &fact.model_id,
-            variant.as_deref(),
-        );
-        let matching: Vec<_> = fences
-            .iter()
-            .filter(|f| f.route_key == key)
-            .cloned()
-            .collect();
-        let identities = credentials
-            .lock()
-            .ok()
-            .map(|c| c.serving_identities(fact))
-            .unwrap_or_default();
-        if let Some(until) = provider_resets::blocked_until(&matching, &identities) {
-            snapshot
-                .by_route
-                .entry(route.route_key)
-                .or_default()
-                .provider_reset_until = Some(until as f64);
-            // Explicit pins can synthesize a variant route from a base catalog
-            // fact. Admission must see the fence under that executed key too.
-            snapshot
-                .by_route
-                .entry(key)
-                .or_default()
-                .provider_reset_until = Some(until as f64);
-        }
-    }
-    Ok(())
-}
-
 fn remember_provider_identity(
     store: &SharedStore,
     decision_id: &str,
@@ -6203,6 +6014,7 @@ fn panel_decision_input(
     });
     DecisionInput {
         consumer: Some(PANEL_DECISION_CONSUMER.into()),
+        allowed_account_class: Default::default(),
         allowed_providers_json: None,
         decision_id: None,
         decision_kind: "panel".into(),
@@ -6250,6 +6062,7 @@ fn decision_input_for(
     let policy_revision = provenance.map(|value| value.policy_revision.clone());
     match selected {
         Some(sel) => DecisionInput {
+            allowed_account_class: Default::default(),
             allowed_providers_json: params
                 .allowed_providers
                 .as_ref()
@@ -6292,6 +6105,7 @@ fn decision_input_for(
         None => {
             let failure = no_route.expect("a refusal decision must preserve its routing failure");
             DecisionInput {
+                allowed_account_class: Default::default(),
                 allowed_providers_json: params
                     .allowed_providers
                     .as_ref()
@@ -6369,22 +6183,6 @@ struct SetDecisionOutcomeParams {
     /// Exact terminal send error surfaced by the harness, when one was available.
     #[serde(default)]
     last_error: Option<String>,
-    /// The route one seat of a panel decision ran on. A panel decision covers
-    /// several seats and names no route of its own, so a seat's provider reset
-    /// can only be fenced on the right model when the caller names the seat.
-    /// Ignored for a decision that names its own route.
-    #[serde(default)]
-    seat_route: Option<SeatRouteParams>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SeatRouteParams {
-    /// The seat's route key as `route.select_panel` returned it.
-    route_key: String,
-    /// The reasoning variant the seat ran at, when it ran at one.
-    #[serde(default)]
-    variant: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6590,27 +6388,6 @@ async fn handle_set_decision_outcome(
                 corr,
                 "store_error",
                 &format!("set_decision_outcome: credential entitlement fence: {e}"),
-            )
-            .await;
-        }
-    }
-    if let (Some(seat), Some(provider)) = (params.seat_route.as_ref(), provider_outcome.as_ref()) {
-        if let Err(e) = store.record_panel_seat_provider_outcome(
-            &params.decision_id,
-            &seat.route_key,
-            seat.variant.as_deref(),
-            outcome == RouteOutcome::Completed,
-            provider,
-            observed_at_ms,
-        ) {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "store_error",
-                &format!("set_decision_outcome: panel seat provider outcome: {e}"),
             )
             .await;
         }
@@ -8205,190 +7982,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_reset_75h_skips_only_the_failed_consumer_then_expires() {
+    async fn legacy_provider_reset_does_not_block_automatic_or_pinned_selection() {
         use prefrontal_routing_core::route_state_store::ProviderOutcome;
-        let now = now_ms() as i64;
-        for (age_hours, has_reset) in [(0, true), (76, true), (0, false)] {
-            let rig = Rig::new("provider-reset-75h");
-            let mut primary = fact("google", "antigravity-gemini-3.8-flash");
-            primary.prompt_defaults =
-                Some(prefrontal_routing_core::model_facts::ModelPromptDefaults {
-                    variant: Some("high".into()),
-                    ..Default::default()
-                });
-            let fallback = fact("z-provider", "adequate-fallback");
-            let facts = [primary, fallback];
-            let params = |consumer: &str| {
-                json!({"consumer":consumer,"targetAgent":"mason",
-                "requirements":{"iq":30,"eq":0},"availableModels":["google/antigravity-gemini-3.8-flash","google/antigravity-gemini-3.8-flash/high","z-provider/adequate-fallback"]})
-            };
-            let operator_config = test_operator_config();
-            let path = operator_config.as_path();
-            let selected: serde_json::Value = serde_json::from_slice(
-                &run_select_against_rig(&rig, params("mason"), &facts, path)
-                    .await
-                    .body,
-            )
-            .unwrap();
-            assert_eq!(
-                selected["result"]["selected"]["model"]["providerID"], "google",
-                "{selected}"
-            );
-            let decision = selected["result"]["decisionID"].as_str().unwrap();
-            let observed = now - age_hours * 3_600_000;
-            let reset = observed + 75 * 3_600_000;
-            let store = rig.open_store();
-            store
-                .set_decision_outcome(
-                    decision,
-                    &DecisionOutcomeUpdate {
-                        outcome: RouteOutcome::Interrupted,
-                        last_error: Some(
-                            "account_limit_exhausted: class transient; HTTP 429".into(),
-                        ),
-                        observed_at_ms: observed,
-                        failure_backoff: Default::default(),
-                        provider_outcome: Some(ProviderOutcome {
-                            account_ref: "catalog-account-google-apikey".into(),
-                            credential_id: Some("catalog-credential-google-apikey".into()),
-                            resets_at_ms: has_reset.then_some(reset),
-                            credential_refusal: None,
-                        }),
-                    },
-                )
-                .unwrap();
-            drop(store);
-            let optimistic_quota = QuotaCache {
-                windows: vec![antigravity_reading(
-                    "catalog-account-google-apikey",
-                    &[
-                        ("gemini-weekly", 0.0, now as u64 + 7 * 24 * 3_600_000),
-                        ("gemini-5h", 0.0, now as u64 + 5 * 3_600_000),
-                    ],
-                )],
-                refreshed_at_ms: now_ms(),
-                available: true,
-                ..Default::default()
-            };
-            let next: serde_json::Value = serde_json::from_slice(
-                &run_select_against_rig_with_quota(
-                    &rig,
-                    params("mason"),
-                    &facts,
-                    path,
-                    optimistic_quota,
-                )
+        let rig = Rig::new("provider-reset-is-not-exhaustion");
+        let primary = fact("google", "antigravity-gemini-3.8-flash");
+        let fallback = fact("z-provider", "adequate-fallback");
+        let facts = [primary, fallback];
+        let params = json!({"consumer":"mason","targetAgent":"mason",
+            "requirements":{"iq":30,"eq":0},
+            "availableModels":["google/antigravity-gemini-3.8-flash","z-provider/adequate-fallback"]});
+        let config = test_operator_config();
+        let selected: serde_json::Value = serde_json::from_slice(
+            &run_select_against_rig(&rig, params.clone(), &facts, config.as_path())
                 .await
                 .body,
+        )
+        .unwrap();
+        assert_eq!(
+            selected["result"]["selected"]["model"]["providerID"], "google",
+            "{selected}"
+        );
+        let store = rig.open_store();
+        store
+            .set_decision_outcome(
+                selected["result"]["decisionID"].as_str().unwrap(),
+                &DecisionOutcomeUpdate {
+                    outcome: RouteOutcome::Interrupted,
+                    last_error: Some("account_limit_exhausted: transient HTTP 429".into()),
+                    observed_at_ms: 1_000,
+                    failure_backoff: Default::default(),
+                    provider_outcome: Some(ProviderOutcome {
+                        account_ref: "catalog-account-google-apikey".into(),
+                        credential_id: Some("catalog-credential-google-apikey".into()),
+                        resets_at_ms: Some(i64::MAX),
+                        credential_refusal: None,
+                    }),
+                },
             )
             .unwrap();
-            assert_eq!(
-                next["result"]["selected"]["model"]["providerID"],
-                if age_hours == 0 && has_reset {
-                    "z-provider"
-                } else {
-                    "google"
-                },
-                "{next}"
-            );
-            let smaller: serde_json::Value = serde_json::from_slice(
-                &run_select_against_rig(&rig, params("sidekick"), &facts, path)
+        drop(store);
+        for pinned in [false, true] {
+            let mut request = params.clone();
+            if pinned {
+                request["pin"] = json!({"model":"google/antigravity-gemini-3.8-flash"});
+                request["pin_fallback"] = json!("none");
+            }
+            let next: serde_json::Value = serde_json::from_slice(
+                &run_select_against_rig(&rig, request, &facts, config.as_path())
                     .await
                     .body,
             )
             .unwrap();
             assert_eq!(
-                smaller["result"]["selected"]["model"]["providerID"], "google",
-                "{smaller}"
+                next["result"]["selected"]["model"]["providerID"], "google",
+                "{next}"
             );
-            if age_hours == 0 && has_reset {
-                let mut pin = params("mason");
-                pin["pin"] =
-                    json!({"model":"google/antigravity-gemini-3.8-flash","variant":"high"});
-                pin["pin_fallback"] = json!("none");
-                let refused: serde_json::Value = serde_json::from_slice(
-                    &run_select_against_rig(&rig, pin.clone(), &facts, path)
-                        .await
-                        .body,
-                )
-                .unwrap();
-                assert!(refused["result"]["selected"].is_null(), "{refused}");
-                pin["pin"]["variant"] = json!("low");
-                let mut low = facts[0].clone();
-                low.variant = Some("low".into());
-                let pin_facts = [facts[0].clone(), facts[1].clone(), low];
-                pin["availableModels"] = json!([
-                    "google/antigravity-gemini-3.8-flash/high",
-                    "google/antigravity-gemini-3.8-flash/low",
-                    "z-provider/adequate-fallback"
-                ]);
-                let other_variant: serde_json::Value = serde_json::from_slice(
-                    &run_select_against_rig(&rig, pin, &pin_facts, path)
-                        .await
-                        .body,
-                )
-                .unwrap();
-                assert_eq!(
-                    other_variant["result"]["selected"]["promptParams"]["variant"], "low",
-                    "{other_variant}"
-                );
-                let store = rig.open_store();
-                assert_eq!(
-                    store.provider_reset_fences("mason", now).unwrap()[0].resets_at_ms,
-                    reset
-                );
-                let success = |consumer: &str, account: &str| {
-                    let id = store
-                        .record_decision(&DecisionInput {
-                            consumer: Some(consumer.into()),
-                            selected_provider_id: Some("google".into()),
-                            selected_model_id: Some("antigravity-gemini-3.8-flash".into()),
-                            selected_route_key: Some(
-                                "google/antigravity-gemini-3.8-flash/high".into(),
-                            ),
-                            selected_variant: Some("high".into()),
-                            ..Default::default()
-                        })
-                        .unwrap();
-                    store
-                        .set_decision_outcome(
-                            &id,
-                            &DecisionOutcomeUpdate {
-                                outcome: RouteOutcome::Completed,
-                                last_error: None,
-                                observed_at_ms: now + 1,
-                                failure_backoff: Default::default(),
-                                provider_outcome: Some(ProviderOutcome {
-                                    account_ref: account.into(),
-                                    credential_id: None,
-                                    resets_at_ms: None,
-                                    credential_refusal: None,
-                                }),
-                            },
-                        )
-                        .unwrap();
-                };
-                success("sidekick", "catalog-account-google-apikey");
-                success("mason", "other-account");
-                assert_eq!(store.provider_reset_fences("mason", now).unwrap().len(), 1);
-                success("mason", "catalog-account-google-apikey");
-                drop(store);
-                let recovered: serde_json::Value = serde_json::from_slice(
-                    &run_select_against_rig(&rig, params("mason"), &facts, path)
-                        .await
-                        .body,
-                )
-                .unwrap();
-                assert_eq!(
-                    recovered["result"]["selected"]["model"]["providerID"], "google",
-                    "{recovered}"
-                );
-            }
         }
     }
 
     #[tokio::test]
-    async fn provider_outcome_wire_uses_the_reset_and_frozen_success_identity() {
+    async fn provider_outcome_wire_records_terminal_outcomes_without_reset_fences() {
         use prefrontal_routing_core::route_state_store::ProviderOutcome;
         let rig = Rig::new("provider-reset-wire");
         let store = Arc::new(rig.open_store());
@@ -8460,14 +8113,20 @@ mod tests {
             let ack: serde_json::Value =
                 serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
             assert_eq!(ack["result"]["ok"], true, "{ack}");
-            let fences = store
-                .provider_reset_fences("mason", now_ms() as i64)
-                .unwrap();
-            if completing {
-                assert!(fences.is_empty());
-            } else {
-                assert_eq!(fences[0].resets_at_ms, reset);
-            }
+            let id = if completing { &recovery } else { &failed };
+            assert_eq!(
+                store
+                    .get_decision_by_id(id)
+                    .unwrap()
+                    .unwrap()
+                    .outcome
+                    .as_deref(),
+                Some(if completing {
+                    "completed"
+                } else {
+                    "interrupted"
+                }),
+            );
         }
     }
 
@@ -8761,15 +8420,10 @@ mod tests {
         assert_eq!(old.provider_outcome.unwrap().credential_refusal, None);
     }
 
-    /// Replay of a live panel defect: an audit panel kept seating Meta's Muse as its
-    /// random extra seat while Muse's subscription was out until a dated provider
-    /// reset. The seat's failure was reported against the shared panel decision,
-    /// which names no route, so no fence was written, and panel admission never read
-    /// the fences anyway. One seat's reset must now fence that seat's model for
-    /// later panels, leave every other seat and consumer alone, and lift at the
-    /// reset.
+    /// A panel seat's provider reset is outcome metadata, not confirmed quota
+    /// exhaustion. It must not remove that model from later panels.
     #[tokio::test]
-    async fn a_panel_seat_provider_reset_fences_that_model_from_later_panels_until_the_reset() {
+    async fn a_panel_seat_provider_reset_leaves_the_model_selectable() {
         let rig = Rig::new("panel-seat-provider-reset");
         let store = Arc::new(rig.open_store());
         let request = json!({
@@ -8828,8 +8482,8 @@ mod tests {
         let seat_variant = seat["promptParams"]["variant"].as_str().map(str::to_string);
         let decision = first["decisionID"].as_str().unwrap().to_string();
         let reset = now_ms() as i64 + 3 * 24 * 3_600_000;
-        // Another seat of the same panel settles first; the shared decision keeps
-        // that first outcome, and the failing seat's reset must not be lost behind it.
+        // The shared decision keeps its first terminal outcome even when another
+        // seat later reports a failure with a provider reset.
         report(
             &store,
             json!({"decisionID": decision, "outcome": "completed"}),
@@ -8847,51 +8501,8 @@ mod tests {
         )
         .await;
 
-        let fences = store
-            .provider_reset_fences(PANEL_DECISION_CONSUMER, now_ms() as i64)
-            .unwrap();
-        assert_eq!(fences.len(), 1, "{fences:?}");
-        assert_eq!(
-            fences[0].route_key,
-            prefrontal_routing_core::make_route_key(
-                "openai",
-                seat_route.strip_prefix("openai/").unwrap(),
-                seat_variant.as_deref()
-            ),
-            "only the failing seat's own route is fenced"
-        );
-        assert_eq!(fences[0].resets_at_ms, reset);
-        assert!(
-            store
-                .provider_reset_fences("mason", now_ms() as i64)
-                .unwrap()
-                .is_empty(),
-            "other consumers are not fenced"
-        );
-
-        let fenced = select(&store, &request).await;
-        assert!(!seated(&fenced).contains(&seat_route), "{fenced}");
-        assert!(
-            fenced["shortfall"]["causes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|cause| cause["model"] == seat_route.as_str()
-                    && cause["reason"] == "quota_exhausted"),
-            "the fenced seat is named as a quota wall: {fenced}"
-        );
-
-        // The provider's reset passes, so the fence expires and the model is
-        // seated again.
-        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
-        connection
-            .execute(
-                "UPDATE provider_reset_fences SET resets_at_ms=?1",
-                [now_ms() as i64 - 1],
-            )
-            .unwrap();
-        let lifted = select(&store, &request).await;
-        assert!(seated(&lifted).contains(&seat_route), "{lifted}");
+        let next = select(&store, &request).await;
+        assert!(seated(&next).contains(&seat_route), "{next}");
     }
 
     #[test]
@@ -14190,8 +13801,7 @@ mod tests {
         credentials
     }
 
-    /// Live replay (task bg_cb31294f57a0fb19, decision dec_b558f7480125,
-    /// 2026-10-23). A provider reset fence held one ChatGPT login
+    /// A live incident on 2026-10-23 held one ChatGPT login
     /// (`chatgpt:openai:live`) for masons on openai/gpt-6.1-sol/xhigh. Routing
     /// pinned the launch to the first serving credential the fence did not
     /// cover, which in vault order was the metered key `apikey:openai`: the
@@ -14199,12 +13809,10 @@ mod tests {
     /// selection, and the runs failed `credit_balance_exhausted` while routing
     /// had priced them on the ChatGPT plan.
     ///
-    /// The launch must stay on a ChatGPT login: here the first unfenced one.
-    /// Requirements are lowered to this fixture's score scale; the vault rows
-    /// and the fence row are the live ones (the reset is moved forward only if
-    /// the clock has passed it, so the fence is always in force).
+    /// The launch must stay on a ChatGPT login. A provider reset is not quota
+    /// evidence and must not trigger a credential pin or a metered fallback.
     #[tokio::test]
-    async fn a_reset_fence_on_one_chatgpt_login_never_pins_an_openai_launch_to_an_api_key() {
+    async fn a_provider_reset_does_not_override_runner_credential_choice() {
         let rig = Rig::new("openai-reset-fence-no-apikey-pin");
         let store = Arc::new(rig.open_store());
         let mut sol = fact("openai", "gpt-6.1-sol");
@@ -14213,30 +13821,35 @@ mod tests {
             ..Default::default()
         });
         store.upsert_fact(&sol, FactSource::Override).unwrap();
-        let resets_at_ms = 1_793_293_884_000_i64.max(now_ms() as i64 + 7 * 86_400_000);
-        rusqlite::Connection::open(rig.dir.join("store.db"))
-            .unwrap()
-            .execute(
-                "INSERT INTO provider_reset_fences \
-                 (route_key, consumer, account_ref, credential_id, resets_at_ms, observed_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    "openai/gpt-6.1-sol/xhigh",
-                    "mason",
-                    "00000000-0000-4000-8000-0000000000a4",
-                    "chatgpt:openai:live",
-                    resets_at_ms,
-                    1_792_761_620_444_i64
-                ],
+        let previous = store
+            .record_decision(&DecisionInput {
+                consumer: Some("mason".into()),
+                selected_provider_id: Some("openai".into()),
+                selected_model_id: Some("gpt-6.1-sol".into()),
+                selected_route_key: Some("openai/gpt-6.1-sol/xhigh".into()),
+                selected_variant: Some("xhigh".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .set_decision_outcome(
+                &previous,
+                &DecisionOutcomeUpdate {
+                    outcome: RouteOutcome::Interrupted,
+                    last_error: None,
+                    observed_at_ms: 1_000,
+                    failure_backoff: Default::default(),
+                    provider_outcome: Some(
+                        prefrontal_routing_core::route_state_store::ProviderOutcome {
+                            account_ref: "00000000-0000-4000-8000-0000000000a4".into(),
+                            credential_id: Some("chatgpt:openai:live".into()),
+                            resets_at_ms: Some(i64::MAX),
+                            credential_refusal: None,
+                        },
+                    ),
+                },
             )
             .unwrap();
-        assert_eq!(
-            store
-                .provider_reset_fences("mason", now_ms() as i64)
-                .unwrap()
-                .len(),
-            1
-        );
         let (result, _) = host_run_broca_select(
             &store,
             &live_openai_vault(),
@@ -14256,8 +13869,8 @@ mod tests {
         assert_eq!(result["runner"]["variant"], "xhigh", "{result}");
         assert_eq!(
             result["runner"]["auth"],
-            json!({"method": "chatgpt"}),
-            "the fence moves the launch to another ChatGPT login, never to an API key: {result}"
+            serde_json::Value::Null,
+            "a provider reset must not inject a credential pin: {result}"
         );
     }
 

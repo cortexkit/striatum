@@ -239,14 +239,6 @@ pub struct CredentialEntitlementFence {
     pub observed_at_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderResetFence {
-    pub route_key: String,
-    pub account_ref: String,
-    pub credential_id: Option<String>,
-    pub resets_at_ms: i64,
-}
-
 /// The route-local failure-backoff fields before an operator clears them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FailureBackoffState {
@@ -268,6 +260,7 @@ pub struct CooldownState {
 /// trait free of the scorer's wire shape.
 #[derive(Debug, Clone, Default)]
 pub struct DecisionInput {
+    pub allowed_account_class: crate::accounts::AllowedAccountClass,
     /// Request class supplied by the launcher, independent of the target agent.
     pub consumer: Option<String>,
     /// Allowed provider IDs for this selection; absent means no provider restriction.

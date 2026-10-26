@@ -96,10 +96,6 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "unexpired provider walls new routes inherit",
     ),
     (
-        "provider_reset_fences",
-        "provider-confirmed resets scoped to request class and serving identity",
-    ),
-    (
         "credential_entitlement_fences",
         "credentials a provider refused permanently (no entitlement, empty balance); \
          empty, routing selects them again and the next run repeats the refusal",

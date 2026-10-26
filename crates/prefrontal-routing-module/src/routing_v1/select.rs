@@ -1,8 +1,8 @@
 //! `route.select` for `routing/v1`.
 //!
 //! The selection itself is routing's existing core: the same facts, quota
-//! overlay, configuration overlays, billing-plane prices, provider resets,
-//! credential entitlement fences and operator exclusions every route
+//! overlay, configuration overlays, billing-plane prices, credential
+//! entitlement fences and operator exclusions every route
 //! selection reads ([`crate::prepare_selection_inputs`],
 //! [`crate::price_selection_inputs`]), the scorer
 //! ([`select_policy::select_candidates`]) and the pin admission
@@ -136,13 +136,10 @@ pub(super) async fn select(
     };
     let priced = crate::price_selection_inputs(
         &mut facts,
-        &mut snapshot,
         quota_signal_json,
         &sources,
         deps.store,
         deps.broca_credentials,
-        Some(&consumer),
-        legacy_consumer,
         true,
         priced_per_token,
     )
@@ -312,7 +309,6 @@ pub(super) async fn select(
     });
     let selection = Selection {
         consumer: &consumer,
-        legacy_consumer,
         priced_per_token,
         demand,
         required_capabilities,
@@ -420,6 +416,10 @@ pub(super) async fn select(
         Some(&crate::policy_sources_line(&operator_policy)),
     );
     decision.consumer = Some(consumer.clone());
+    decision.allowed_account_class =
+        prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
+            priced_per_token,
+        );
     let decision_id = deps
         .store
         .record_decision_with_selection(&decision, Some(&runner.module), None)
@@ -454,6 +454,7 @@ pub(super) async fn select(
             decision_id: decision_id.clone(),
             principal: caller.principal.clone(),
             consumer: consumer.clone(),
+            allowed_account_class: decision.allowed_account_class,
             project_id: caller
                 .scope
                 .as_ref()
@@ -512,7 +513,6 @@ pub(super) async fn select(
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
     consumer: &'a str,
-    legacy_consumer: Option<select_policy::Consumer>,
     priced_per_token: bool,
     demand: ModelRequirements,
     required_capabilities: Option<RequiredCapabilities>,
@@ -581,31 +581,7 @@ impl<'a> Selection<'a> {
         let variant = work_model_pin::named_variant(pin, self.facts);
         let (pin_key, pin_capacity) =
             work_model_pin::route_keys(pin, variant.as_deref(), self.facts);
-        // Provider resets are read again at the variant the pin names.
-        // Credential eligibility applies to pins just as to automatic choices.
-        let mut snapshot = self.snapshot.clone();
-        for state in snapshot.by_route.values_mut() {
-            state.provider_reset_until = None;
-        }
-        let pin_facts: Vec<ModelFact> = self
-            .facts
-            .iter()
-            .filter(|fact| fact_to_route(fact).capacity_key == pin_capacity)
-            .cloned()
-            .collect();
-        crate::apply_provider_resets_for_group(
-            &mut snapshot,
-            &pin_facts,
-            self.deps.store,
-            self.deps.broca_credentials,
-            self.sources.operator_config,
-            self.sources.operator_config_path,
-            self.sources.catalog_targets,
-            self.consumer,
-            self.legacy_consumer,
-            variant.as_deref(),
-        )
-        .map_err(|error| store_refusal(error.to_string()))?;
+        let snapshot = self.snapshot.clone();
         let refused = |reason: &str| {
             let (reason, reset) = pin_reason(reason, &snapshot, &pin_key, &pin_capacity, self.now);
             Refusal::pin_unavailable(pin, reason, reset)
@@ -664,12 +640,11 @@ fn pin_reason(
         snapshot.by_route.get(route_key),
         snapshot.by_capacity.get(capacity_key),
     ];
-    let deadline = |pick: fn(&prefrontal_routing_core::RouteRuntimeState) -> [Option<f64>; 2]| {
+    let deadline = |pick: fn(&prefrontal_routing_core::RouteRuntimeState) -> Option<f64>| {
         states
             .iter()
             .flatten()
-            .flat_map(|state| pick(state))
-            .flatten()
+            .filter_map(|state| pick(state))
             .filter(|until| *until > now)
             .max_by(f64::total_cmp)
             .map(|until| until as u64)
@@ -686,15 +661,15 @@ fn pin_reason(
         "credential_billing_exhausted" => (PinUnavailableReason::CredentialBillingExhausted, None),
         "cooldown_active" => (
             PinUnavailableReason::Cooldown,
-            deadline(|state| [state.cooldown_until, None]),
+            deadline(|state| state.cooldown_until),
         ),
         "backoff_active" => (
             PinUnavailableReason::Backoff,
-            deadline(|state| [state.failure_backoff_until, None]),
+            deadline(|state| state.failure_backoff_until),
         ),
         "quota_exhausted" | "account_pool_exhausted" => (
             PinUnavailableReason::QuotaExhausted,
-            deadline(|state| [state.quota_exhausted_until, state.provider_reset_until]),
+            deadline(|state| state.quota_exhausted_until),
         ),
         _ => (PinUnavailableReason::NotAvailable, None),
     }

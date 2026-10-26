@@ -12,7 +12,10 @@
 //! Old account history and runner observations are removed only by the
 //! bounded retention batches in `retention.rs`.
 
-use prefrontal_routing_core::RouteStateResult;
+use prefrontal_routing_core::{
+    accounts::{FenceScope, PoolKey},
+    RouteStateResult,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use super::{err, SqliteRouteStateStore};
@@ -179,6 +182,15 @@ pub struct AccountFenceRow {
     pub created_at: i64,
     pub cleared_at: Option<i64>,
     pub cleared_reason: Option<String>,
+}
+
+/// Pool identity and whole-account recovery requirements alongside the original
+/// exhaustion evidence. A missing key blocks the entire account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPoolFenceRow {
+    pub evidence: AccountFenceRow,
+    pub pool_key: Option<PoolKey>,
+    pub recovery_set: Vec<PoolKey>,
 }
 
 /// A runner's scoped not-found for one credential in one admission.
@@ -774,11 +786,31 @@ impl AccountTx<'_> {
     }
 
     pub fn insert_fence(&self, row: &AccountFenceRow) -> RouteStateResult<()> {
+        let pool_key = serde_json::from_str::<FenceScope>(&row.scope_json)
+            .ok()
+            .map(PoolKey::from);
+        self.insert_pool_fence(&AccountPoolFenceRow {
+            evidence: row.clone(),
+            pool_key,
+            recovery_set: Vec::new(),
+        })
+    }
+
+    /// Store the recovery set in the same transaction as the confirming evidence.
+    pub fn insert_pool_fence(&self, block: &AccountPoolFenceRow) -> RouteStateResult<()> {
+        let row = &block.evidence;
+        let pool_key = block
+            .pool_key
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(err)?;
+        let recovery_set = serde_json::to_string(&block.recovery_set).map_err(err)?;
         self.conn
             .execute(
                 &format!(
-                    "INSERT INTO account_fence ({FENCE_COLUMNS}) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                    "INSERT INTO account_fence ({FENCE_COLUMNS}, pool_key_json, recovery_set_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
                 ),
                 params![
                     row.fence_id,
@@ -794,10 +826,43 @@ impl AccountTx<'_> {
                     row.created_at,
                     row.cleared_at,
                     row.cleared_reason,
+                    pool_key,
+                    recovery_set,
                 ],
             )
             .map(|_| ())
             .map_err(err)
+    }
+
+    pub fn active_pool_fences(&self, provider: &str) -> RouteStateResult<Vec<AccountPoolFenceRow>> {
+        let mut statement = self
+            .conn
+            .prepare(&format!(
+                "SELECT {FENCE_COLUMNS}, pool_key_json, recovery_set_json FROM account_fence
+             WHERE provider=?1 AND cleared_at IS NULL ORDER BY created_at, fence_id"
+            ))
+            .map_err(err)?;
+        let rows = statement
+            .query_map([provider], |row| {
+                Ok((
+                    fence_from_row(row)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, String>(14)?,
+                ))
+            })
+            .map_err(err)?;
+        rows.map(|row| {
+            let (evidence, key, recovery) = row.map_err(err)?;
+            Ok(AccountPoolFenceRow {
+                evidence,
+                pool_key: key
+                    .map(|key| serde_json::from_str(&key))
+                    .transpose()
+                    .map_err(err)?,
+                recovery_set: serde_json::from_str(&recovery).map_err(err)?,
+            })
+        })
+        .collect()
     }
 
     /// The scoped not-found exclusions reported against this one admission.

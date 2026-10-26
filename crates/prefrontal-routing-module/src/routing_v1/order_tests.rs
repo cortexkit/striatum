@@ -435,3 +435,92 @@ async fn the_answer_carries_route_runner_variant_limits_decision_and_expiry() {
         "zeta-runner"
     );
 }
+
+#[tokio::test]
+async fn legacy_provider_reset_leaves_both_select_wires_and_pins_selectable() {
+    let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
+    harness.edit_config(|config| config["accounts"]["enabled"] = json!(false));
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let mut legacy = select("mason");
+    legacy["targetAgent"] = json!("mason");
+    legacy["executor"] = json!("broca");
+    legacy["substrate"] = json!("broca");
+    legacy["requirements"]["eq"] = json!(0);
+    let first = route.call("route.select", &legacy).await;
+    assert_eq!(legacy_route(&first), CHEAP);
+    let outcome = route
+        .call(
+            "route.set_decision_outcome",
+            &json!({
+                "decisionID": first.1["result"]["decisionID"],
+                "outcome": "interrupted",
+                "providerOutcome": {"accountRef": "account-a", "resetsAtMs": i64::MAX},
+            }),
+        )
+        .await;
+    assert_eq!(outcome.0, FrameType::Response, "{}", outcome.1);
+    assert_eq!(outcome.1["result"]["ok"], true, "{}", outcome.1);
+    assert_eq!(
+        route_of(&route.call("route.select", &select("mason")).await),
+        CHEAP
+    );
+    assert_eq!(
+        legacy_route(&route.call("route.select", &legacy).await),
+        CHEAP
+    );
+    let mut pinned = select("mason");
+    pinned["pin"] = json!(CHEAP);
+    assert_eq!(route_of(&route.call("route.select", &pinned).await), CHEAP);
+}
+
+#[tokio::test]
+async fn both_decision_wires_freeze_the_selected_account_class() {
+    use prefrontal_routing_core::accounts::AllowedAccountClass;
+    let harness = harness(&[(CHEAP, true, true, 200_000)]);
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let mut ids = Vec::new();
+    for pay_per_token in [false, true] {
+        harness.edit_config(|config| {
+            config["consumers"]["mason"]["pay_per_token"] = json!(pay_per_token)
+        });
+        let expected = if pay_per_token {
+            AllowedAccountClass::PricedPerTokenOnly
+        } else {
+            AllowedAccountClass::NotPayPerToken
+        };
+        let v1 = route.call("route.select", &select("mason")).await;
+        assert_eq!(route_of(&v1), CHEAP);
+        let id = v1.1["result"]["decision_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            harness
+                .store()
+                .v1_decision(&id)
+                .unwrap()
+                .unwrap()
+                .allowed_account_class,
+            expected
+        );
+        ids.push((id, expected));
+        let mut legacy = select("mason");
+        legacy["targetAgent"] = json!("mason");
+        legacy["executor"] = json!("broca");
+        legacy["substrate"] = json!("broca");
+        legacy["requirements"]["eq"] = json!(0);
+        let answer = route.call("route.select", &legacy).await;
+        assert_eq!(legacy_route(&answer), CHEAP);
+        ids.push((
+            answer.1["result"]["decisionID"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            expected,
+        ));
+    }
+    harness.edit_config(|config| config["consumers"]["mason"]["pay_per_token"] = json!(false));
+    for (id, expected) in ids {
+        assert_eq!(
+            harness.store().decision_account_class(&id).unwrap(),
+            Some(expected)
+        );
+    }
+}

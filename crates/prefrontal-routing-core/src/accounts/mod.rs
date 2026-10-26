@@ -17,6 +17,7 @@ pub mod decide;
 pub mod decision;
 pub mod eligibility;
 pub mod evidence;
+pub mod pools;
 pub mod types;
 
 pub use decide::decide;
@@ -26,6 +27,7 @@ pub use decision::{
     InvalidationReason, Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode,
     RequestedAccountIgnored, RequestedAccountNote, RosterNote, ScopedListState, WindowWeight,
 };
+pub use pools::{AllowedAccountClass, PoolKey, PoolScope};
 pub use types::{
     AccountRef, AccountRequest, AccountView, AdmissionDemand, AdmissionState, AllocatorPolicy,
     AllocatorState, CallerKind, CandidateRef, ConfirmationSource, ConversationAffinity,

@@ -53,7 +53,7 @@ pub use account_selection::AccountServingCounts;
 pub use account_selection::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
     AccountExclusionRow, AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow,
-    AccountTx, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
+    AccountPoolFenceRow, AccountTx, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
 };
 
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
@@ -205,6 +205,7 @@ const MIGRATION_061: &str = include_str!("../migrations/061_allowed_providers.sq
 const MIGRATION_062: &str = include_str!("../migrations/062_routing_v1.sql");
 /// The project and session folder the daemon stamped on a decision's scope.
 const MIGRATION_064: &str = include_str!("../migrations/064_decision_scope_attribution.sql");
+const MIGRATION_065: &str = include_str!("../migrations/065_routing_policy_end_state.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -260,7 +261,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 63] {
+fn route_state_migrations() -> [Migration; 64] {
     [
         Migration {
             version: 1,
@@ -513,6 +514,10 @@ fn route_state_migrations() -> [Migration; 63] {
         Migration {
             version: 64,
             statements: MIGRATION_064,
+        },
+        Migration {
+            version: 65,
+            statements: MIGRATION_065,
         },
     ]
 }
@@ -993,6 +998,26 @@ impl SqliteRouteStateStore {
     /// lease location is derived by the lib from the descriptor's db path (one
     /// lease per database, by construction), so there is no lease-dir to pass.
     pub fn open(descriptor: &StorageDescriptor) -> RouteStateResult<Self> {
+        Self::open_with_migrations(descriptor, &route_state_migrations())
+    }
+
+    /// Build an older on-disk schema for upgrade tests that exercise live callers.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn open_at_version_for_test(
+        descriptor: &StorageDescriptor,
+        version: u32,
+    ) -> RouteStateResult<Self> {
+        let migrations: Vec<_> = route_state_migrations()
+            .into_iter()
+            .filter(|migration| migration.version <= version)
+            .collect();
+        Self::open_with_migrations(descriptor, &migrations)
+    }
+
+    fn open_with_migrations(
+        descriptor: &StorageDescriptor,
+        migrations: &[Migration],
+    ) -> RouteStateResult<Self> {
         let store = open_sqlite(descriptor).map_err(err)?;
         // Migration 58 rebuilds `account_pin` while `account_admission` holds a
         // foreign key to it; with enforcement on, dropping the old table would
@@ -1008,7 +1033,7 @@ impl SqliteRouteStateStore {
         // migrate as a silent no-op and then serve a schema the binary cannot
         // query. The route-state chain rebuilds tables and re-keys facts, so an
         // ahead store is refused here, naming both versions.
-        let migration = store.migrate(ROUTE_STATE_NAMESPACE, &route_state_migrations());
+        let migration = store.migrate(ROUTE_STATE_NAMESPACE, migrations);
         store
             .with_conn(|conn| {
                 conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -1912,21 +1937,6 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Live provider-confirmed resets for one consumer, excluding expired fences.
-    pub fn provider_reset_fences(
-        &self,
-        consumer: &str,
-        now: i64,
-    ) -> RouteStateResult<Vec<prefrontal_routing_core::route_state_store::ProviderResetFence>> {
-        self.store.with_conn(|c: &Connection| {
-            let mut stmt = c.prepare("SELECT route_key, account_ref, credential_id, resets_at_ms FROM provider_reset_fences WHERE consumer=?1 AND resets_at_ms>?2")?;
-            let rows = stmt.query_map(params![consumer, now], |row| Ok(prefrontal_routing_core::route_state_store::ProviderResetFence {
-                route_key: row.get(0)?, account_ref: row.get(1)?, credential_id: row.get(2)?, resets_at_ms: row.get(3)?,
-            }))?;
-            rows.collect::<Result<Vec<_>, _>>()
-        }).map_err(err)
-    }
-
     /// Record that the provider permanently refused `credential_id`.
     ///
     /// A repeated report for the same pair keeps the first observation and the
@@ -2027,67 +2037,6 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Apply the provider evidence of one panel seat to the fences of the panel
-    /// decision's consumer.
-    ///
-    /// One panel selection is one decision covering every seat, and it names no
-    /// selected route, so `set_decision_outcome` cannot tell which model a seat's
-    /// account wall belongs to and keeps only the first seat's outcome. The caller
-    /// names the route the seat ran on (`seat_route_key`, as the panel returned it,
-    /// and the variant the seat ran at); the fence is written for that route alone,
-    /// for every seat that reports, so the other seats of the same panel are not
-    /// fenced and a second seat's wall is not lost behind the first seat's outcome.
-    ///
-    /// Returns whether the decision is a panel decision this applied to. A
-    /// decision that names its own route is left to `set_decision_outcome`, which
-    /// fences the route that decision chose; an unknown decision changes nothing.
-    pub fn record_panel_seat_provider_outcome(
-        &self,
-        decision_id: &str,
-        seat_route_key: &str,
-        seat_variant: Option<&str>,
-        completed: bool,
-        provider: &prefrontal_routing_core::route_state_store::ProviderOutcome,
-        observed_at_ms: i64,
-    ) -> RouteStateResult<bool> {
-        if provider.account_ref.trim().is_empty() || seat_route_key.trim().is_empty() {
-            return Ok(false);
-        }
-        self.store
-            .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
-                let consumer: Option<Option<String>> = tx
-                    .query_row(
-                        "SELECT consumer FROM model_route_decisions
-                         WHERE id=?1 AND decision_kind='panel' AND selected_route_key IS NULL",
-                        [decision_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let Some(Some(consumer)) = consumer else {
-                    return Ok(false);
-                };
-                let (provider_id, model_id, catalog_variant) =
-                    route_identity(&tx, seat_route_key, None)?;
-                let executed_route = prefrontal_routing_core::make_route_key(
-                    &provider_id,
-                    &model_id,
-                    seat_variant.or(catalog_variant.as_deref()),
-                );
-                write_provider_reset_fence(
-                    &tx,
-                    &executed_route,
-                    &consumer,
-                    provider,
-                    completed,
-                    observed_at_ms,
-                )?;
-                tx.commit()?;
-                Ok(true)
-            })
-            .map_err(err)
-    }
-
     pub fn set_decision_provider_identity(
         &self,
         decision_id: &str,
@@ -2151,8 +2100,8 @@ impl SqliteRouteStateStore {
                          selected_model_id, selected_variant, score_json, rejected_json, explanation_json,
                          quota_signal_json, policy_revision, anchor_version, catalog_fingerprint, created_at,
                          selected_harness, selected_workload, consumer, allowed_providers_json,
-                         project_id, workdir
-                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
+                         project_id, workdir, allowed_account_class
+                       ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
@@ -2181,12 +2130,36 @@ impl SqliteRouteStateStore {
                         input.allowed_providers_json,
                         input.project_id,
                         input.workdir,
+                        input.allowed_account_class.as_str(),
                     ],
                 )?;
                 Ok(())
             })
             .map_err(err)?;
         Ok(id_ret)
+    }
+
+    /// Read the account-class authority frozen when this decision was selected.
+    pub fn decision_account_class(
+        &self,
+        decision_id: &str,
+    ) -> RouteStateResult<Option<prefrontal_routing_core::accounts::AllowedAccountClass>> {
+        let value: Option<String> = self
+            .store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT allowed_account_class FROM model_route_decisions WHERE id=?1",
+                    [decision_id],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .map_err(err)?;
+        value
+            .map(|value| {
+                prefrontal_routing_core::accounts::AllowedAccountClass::parse(&value).map_err(err)
+            })
+            .transpose()
     }
 
     /// Look up one decision by its durable id for a diagnostic explanation.
@@ -3447,22 +3420,6 @@ impl RouteStateStore for SqliteRouteStateStore {
                     return Ok(());
                 }
 
-                if let Some(provider) = update.provider_outcome.as_ref().filter(|p| !p.account_ref.trim().is_empty()) {
-                    let scope: (Option<String>, Option<String>, Option<String>, Option<String>) = tx.query_row(
-                        "SELECT consumer, selected_provider_id, selected_model_id, selected_variant FROM model_route_decisions WHERE id=?1",
-                        [decision_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
-                    if let (Some(consumer), Some(provider_id), Some(model_id), variant) = scope {
-                        let executed_route = prefrontal_routing_core::make_route_key(&provider_id, &model_id, variant.as_deref());
-                        write_provider_reset_fence(
-                            &tx,
-                            &executed_route,
-                            &consumer,
-                            provider,
-                            update.outcome == prefrontal_routing_core::RouteOutcome::Completed,
-                            update.observed_at_ms,
-                        )?;
-                    }
-                }
 
                 tx.execute(
                     "UPDATE model_route_decisions
@@ -4288,33 +4245,6 @@ fn route_identity(
     Ok(split_route_key(route_key))
 }
 
-/// Record or lift one provider-reset fence on `executed_route` for `consumer`.
-///
-/// A completed run on the account proves its window has room again, so it lifts
-/// any fence observed no later than the run. A failure with a provider reset still
-/// ahead fences that account until the reset; a repeated report keeps the later of
-/// the two resets, so replaying a report is harmless.
-fn write_provider_reset_fence(
-    connection: &Connection,
-    executed_route: &str,
-    consumer: &str,
-    provider: &prefrontal_routing_core::route_state_store::ProviderOutcome,
-    completed: bool,
-    observed_at_ms: i64,
-) -> rusqlite::Result<()> {
-    if completed {
-        connection.execute("DELETE FROM provider_reset_fences WHERE route_key=?1 AND consumer=?2 AND (account_ref=?3 OR (credential_id IS NOT NULL AND credential_id=?5)) AND observed_at_ms<=?4",
-            params![executed_route, consumer, provider.account_ref, observed_at_ms, provider.credential_id])?;
-    } else if let Some(reset) = provider.resets_at_ms.filter(|at| *at > observed_at_ms) {
-        connection.execute("INSERT INTO provider_reset_fences (route_key,consumer,account_ref,credential_id,resets_at_ms,observed_at_ms)
-            VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(route_key,consumer,account_ref) DO UPDATE SET
-            credential_id=excluded.credential_id, resets_at_ms=MAX(provider_reset_fences.resets_at_ms,excluded.resets_at_ms),
-            observed_at_ms=MAX(provider_reset_fences.observed_at_ms,excluded.observed_at_ms)",
-            params![executed_route, consumer, provider.account_ref, provider.credential_id, reset, observed_at_ms])?;
-    }
-    Ok(())
-}
-
 /// A short unique-ish id (12 hex chars), process-monotonic + time-seeded. Avoids a
 /// uuid dependency for decision ids (their uniqueness needs are local).
 fn short_id() -> String {
@@ -4384,6 +4314,263 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_065_preserves_062_evidence_and_freezes_historical_classes() {
+        use prefrontal_routing_core::accounts::{AllowedAccountClass, ModelFamily, PoolScope};
+        let scratch = prefrontal_test_support::ScratchDir::new("routing-policy-065");
+        let descriptor = dev_descriptor(
+            "routing-policy-065",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let legacy = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 62).unwrap();
+        let observed_at = 1_000_000;
+        legacy.store.with_conn(|c| {
+            populate_account_tables(c, observed_at)?;
+            for (id, consumer) in [("cm", Some("codemode")), ("fl", Some("flow")), ("ma", Some("mason")), ("null", None)] {
+                insert_ledger_row(c, id, None, observed_at, 2)?;
+                c.execute("UPDATE model_route_decisions SET consumer=?2 WHERE id=?1", params![id, consumer])?;
+                c.execute("INSERT INTO routing_v1_decision (decision_id, principal, consumer, provider, model,
+                    runner_module, affinity, created_at_ms, expires_at_ms)
+                    VALUES (?1, 'owner', ?2, 'p', 'm', 'runner', 'conversation', ?3, ?4)",
+                    params![id, consumer.unwrap_or("other"), observed_at, observed_at+60_000])?;
+            }
+            for (id, scope) in [
+                ("general", r#"{"kind":"general","value":"seven_day"}"#),
+                ("short", r#"{"kind":"general","value":"five_hour"}"#),
+                ("reported", r#"{"kind":"general","value":{"reported":90}}"#),
+                ("family", r#"{"kind":"family","value":"opus"}"#),
+                ("unknown", r#"{"kind":"unknown_scope","value":"fable"}"#),
+            ] {
+                let evidence = format!(r#"{{"account_id":"a","scope":{scope},"observed_at_ms":{observed_at},"reset":{{"kind":"at","at_ms":2000000}},"retry_hint_ms":null,"source":"raw_header"}}"#);
+                c.execute("INSERT INTO account_fence (fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at)
+                    VALUES (?1,'anthropic','a',?2,?3,'raw_header',?4,'p',?4)", params![id,scope,evidence,observed_at])?;
+            }
+            c.execute_batch("INSERT INTO routing_v1_affinity VALUES ('owner','mason','conversation','ma',1000000,NULL);
+                INSERT INTO routing_v1_report VALUES ('ma','report','report body','report answer',1000000);
+                INSERT INTO routing_v1_admission VALUES ('runner','admission','original body','original answer',1000000);
+                INSERT INTO credential_entitlement_fences VALUES ('p','cred','ENTITLEMENT_ERROR','listing',1000000);
+                INSERT INTO provider_reset_fences VALUES ('p/m','mason','a','cred',2000000,1000000);")?;
+            Ok(())
+        }).unwrap();
+        let old_admission = legacy
+            .account_transaction(|tx| tx.admission("p", "adm-1"))
+            .unwrap()
+            .unwrap();
+        let old_fences = legacy
+            .account_transaction(|tx| tx.active_fences("anthropic"))
+            .unwrap();
+        drop(legacy);
+
+        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        drop(migrated);
+        let restarted = SqliteRouteStateStore::open(&descriptor).unwrap();
+        assert_eq!(
+            restarted
+                .account_transaction(|tx| tx.admission("p", "adm-1"))
+                .unwrap(),
+            Some(old_admission)
+        );
+        let blocks = restarted
+            .account_transaction(|tx| tx.active_pool_fences("anthropic"))
+            .unwrap();
+        for block in &blocks {
+            assert_eq!(
+                &block.evidence,
+                old_fences
+                    .iter()
+                    .find(|row| row.fence_id == block.evidence.fence_id)
+                    .unwrap()
+            );
+            assert!(block.recovery_set.is_empty());
+            if block.evidence.fence_id == "fence-1" {
+                continue;
+            }
+            let key = block.pool_key.as_ref().unwrap();
+            assert_eq!(key.name, None);
+            match block.evidence.fence_id.as_str() {
+                "general" => {
+                    assert_eq!(key.window_minutes, Some(10080));
+                    assert_eq!(key.scope, PoolScope::EveryModel);
+                }
+                "short" => {
+                    assert_eq!(key.window_minutes, Some(300));
+                    assert_eq!(key.scope, PoolScope::EveryModel);
+                }
+                "reported" => {
+                    assert_eq!(key.window_minutes, Some(90));
+                    assert_eq!(key.scope, PoolScope::EveryModel);
+                }
+                "family" => {
+                    assert_eq!(key.window_minutes, None);
+                    assert_eq!(key.scope, PoolScope::Family(ModelFamily::Opus));
+                }
+                "unknown" => {
+                    assert_eq!(key.window_minutes, None);
+                    assert_eq!(key.scope, PoolScope::Family(ModelFamily::Fable));
+                }
+                other => panic!("unexpected fence: {other}"),
+            }
+        }
+        assert_eq!(blocks.len(), 6);
+        for (id, expected) in [
+            ("cm", AllowedAccountClass::PricedPerTokenOnly),
+            ("fl", AllowedAccountClass::PricedPerTokenOnly),
+            ("ma", AllowedAccountClass::NotPayPerToken),
+            ("null", AllowedAccountClass::NotPayPerToken),
+        ] {
+            assert_eq!(
+                restarted.decision_account_class(id).unwrap(),
+                Some(expected)
+            );
+            assert_eq!(
+                restarted
+                    .v1_decision(id)
+                    .unwrap()
+                    .unwrap()
+                    .allowed_account_class,
+                expected
+            );
+        }
+        assert_eq!(
+            restarted
+                .v1_affinity_decision("owner", "mason", "conversation")
+                .unwrap()
+                .unwrap()
+                .decision_id,
+            "ma"
+        );
+        assert_eq!(
+            restarted.v1_report("ma").unwrap().unwrap().answer_json,
+            "report answer"
+        );
+        let standing = restarted
+            .v1_admission("runner", "admission")
+            .unwrap()
+            .unwrap();
+        assert_eq!(standing.body_json, "original body");
+        assert_eq!(standing.answer_json, "original answer");
+        assert_eq!(
+            restarted
+                .v1_record_admission(
+                    "runner",
+                    "admission",
+                    &V1Recorded {
+                        body_json: "different body".into(),
+                        answer_json: "different answer".into()
+                    },
+                    2_000_000
+                )
+                .unwrap(),
+            standing
+        );
+        assert_eq!(restarted.account_serving_counts().unwrap().holds, 0);
+        assert_eq!(
+            restarted.credential_entitlement_fences().unwrap()[0].code,
+            "ENTITLEMENT_ERROR"
+        );
+        restarted
+            .store
+            .with_conn(|c| {
+                let dropped: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name='provider_reset_fences'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(dropped, 0);
+                assert_eq!(
+                    c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_065_upgrades_a_deployed_064_database() {
+        let scratch = prefrontal_test_support::ScratchDir::new("routing-migration-064");
+        let descriptor = dev_descriptor(
+            "routing-migration-064",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let legacy = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 64).unwrap();
+        legacy
+            .store
+            .with_conn(|c| {
+                insert_ledger_row(c, "deployed", None, 1_000, 2)?;
+                c.execute(
+                    "UPDATE model_route_decisions SET consumer='codemode' WHERE id='deployed'",
+                    [],
+                )
+            })
+            .unwrap();
+        drop(legacy);
+        let upgraded = SqliteRouteStateStore::open(&descriptor).unwrap();
+        assert_eq!(
+            upgraded.decision_account_class("deployed").unwrap(),
+            Some(prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly)
+        );
+    }
+
+    #[test]
+    fn whole_account_recovery_set_survives_restart() {
+        use prefrontal_routing_core::accounts::{ModelFamily, PoolKey, PoolScope};
+        let scratch = prefrontal_test_support::ScratchDir::new("routing-pool-recovery");
+        let descriptor = dev_descriptor(
+            "routing-pool-recovery",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let block = AccountPoolFenceRow {
+            evidence: AccountFenceRow {
+                fence_id: "whole".into(),
+                provider: "p".into(),
+                account_id: "a".into(),
+                scope_json: "null".into(),
+                fence_json: "{}".into(),
+                source: "observation".into(),
+                observed_at: 1_000,
+                principal: "runner".into(),
+                admission_id: None,
+                observation_id: None,
+                created_at: 2_000,
+                cleared_at: None,
+                cleared_reason: None,
+            },
+            pool_key: None,
+            recovery_set: vec![
+                PoolKey {
+                    window_minutes: None,
+                    scope: PoolScope::Family(ModelFamily::Opus),
+                    name: None,
+                },
+                PoolKey {
+                    window_minutes: Some(90),
+                    scope: PoolScope::EveryModel,
+                    name: Some("pool-p".into()),
+                },
+                PoolKey {
+                    window_minutes: Some(90),
+                    scope: PoolScope::EveryModel,
+                    name: Some("pool-q".into()),
+                },
+            ],
+        };
+        store
+            .account_transaction(|tx| tx.insert_pool_fence(&block))
+            .unwrap();
+        drop(store);
+        let restarted = SqliteRouteStateStore::open(&descriptor).unwrap();
+        assert_eq!(
+            restarted
+                .account_transaction(|tx| tx.active_pool_fences("p"))
+                .unwrap(),
+            vec![block]
+        );
     }
 
     fn legacy_account_wall_error() -> String {
@@ -6037,12 +6224,19 @@ mod tests {
         migrated
             .store
             .with_conn(|c| {
-                assert_eq!(route_state_version(c)?, 64);
+                assert_eq!(route_state_version(c)?, 65);
                 assert_eq!(
                     history_foreign_keys(c),
                     ["account_admission -> account_pin"]
                 );
-                assert_eq!(rebuilt_table_shape(c), legacy_shape);
+                let shape: Vec<_> = rebuilt_table_shape(c)
+                    .into_iter()
+                    .filter(|line| {
+                        !line.starts_with("account_fence column pool_key_json ")
+                            && !line.starts_with("account_fence column recovery_set_json ")
+                    })
+                    .collect();
+                assert_eq!(shape, legacy_shape);
                 let integrity: String =
                     c.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
                 assert_eq!(integrity, "ok");
@@ -6056,7 +6250,7 @@ mod tests {
                     ("account_decision", 1),
                     ("account_pin", 1),
                     ("account_admission", 1),
-                    ("account_hold", 1),
+                    ("account_hold", 0),
                     ("account_observation", 2),
                     ("account_fence", 1),
                     ("account_principal_exclusion", 1),
