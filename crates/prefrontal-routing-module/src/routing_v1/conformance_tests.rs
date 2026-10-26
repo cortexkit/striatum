@@ -546,20 +546,9 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
                 {"wire_api":"messages", "auth_method":"apikey"},
                 {"wire_api":"messages", "auth_method":"oauth"}
             ]);
-            // The kit's search.web/v1 tag is accepted in select requests but
-            // not in manifests. Keep only shared-validator-approved tags so
-            // that invalid fixture metadata cannot discard harness facts.
-            let capabilities: Vec<_> = policy["tool_capabilities"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|tag| {
-                    super::runners::parse_declaration(&json!({"runner": {
-                        "pairs": pairs, "tool_capabilities": [tag]
-                    }}))
-                    .is_ok()
-                })
-                .collect();
+            // Pass the fixture's tags through unchanged, so an invalid fixture tag
+            // fails here rather than being filtered out of the declaration.
+            let capabilities = policy["tool_capabilities"].clone();
             json!({
                 "module_id": runner.module, "nonce_verified": true,
                 "role_declarations": {"routing/v1": {"runner": {
@@ -738,12 +727,6 @@ const NOT_YET_SERVED: &[&str] = &[
     "affinity_holds_until_failure_report",
 ];
 
-/// Conformance 0.6.0 asks runner-two to declare search.web/v1, but routing
-/// 0.4.1 accepts web.search/v1 instead. Keep the check failing visibly in the
-/// kit report until either upstream release fixes the disagreement. The exact
-/// failing-list assertion and the fixture-tag test both turn red when fixed.
-const KNOWN_KIT_MISMATCHES: &[&str] = &["tool_capabilities_matched_by_tag"];
-
 /// Checks not applicable to the declared capability groups, in kit run order.
 /// The undeclared-harness refusal is inapplicable because `select_harness` is
 /// served. Hold checks remain inapplicable until `select_hold_control` and
@@ -761,44 +744,24 @@ const NOT_APPLICABLE: &[&str] = &[
     "hold_account_for_applies_recorded_cap",
 ];
 
-/// Every served check except [`KNOWN_KIT_MISMATCHES`] passes; exactly those
-/// mismatches and [`NOT_YET_SERVED`] fail, and [`NOT_APPLICABLE`] are inapplicable:
-/// a newly failing check, or a listed check that now passes or runs, breaks
-/// the test. A failing check names the contract rule it holds the provider
-/// to.
+/// Every served check passes; exactly [`NOT_YET_SERVED`] fail, and
+/// [`NOT_APPLICABLE`] are inapplicable: a newly failing check, or a listed
+/// check that now passes or runs, breaks the test. A failing check names the
+/// contract rule it holds the provider to.
 #[tokio::test]
-async fn routing_v1_conformance_kit_matches_served_checks_and_known_mismatch() {
+async fn routing_v1_conformance_kit_matches_served_checks() {
     let subject = KitSubject {
         harness: Mutex::new(Harness::new("kit")),
     };
     let report = run_suite(&subject).await;
     eprintln!("{}", report.render());
     assert_eq!(report.checks.len(), CHECKS.len());
-    let expected_failures: Vec<_> = NOT_YET_SERVED
-        .iter()
-        .chain(KNOWN_KIT_MISMATCHES)
-        .copied()
-        .collect();
-    assert_eq!(report.failing(), expected_failures, "{}", report.render());
+    assert_eq!(report.failing(), NOT_YET_SERVED, "{}", report.render());
     assert_eq!(
         report.not_applicable(),
         NOT_APPLICABLE,
         "{}",
         report.render()
-    );
-}
-
-#[test]
-fn conformance_fixture_tag_mismatch_stays_visible_until_upstream_fix() {
-    let slot = json!({"runner": {
-        "pairs": [{"wire_api":"messages", "auth_method":"apikey"}],
-        "tool_capabilities": [fixture::TAG_TWO]
-    }});
-    let error = super::runners::parse_declaration(&slot)
-        .expect_err("remove the known kit mismatch once its fixture tag is accepted");
-    assert_eq!(
-        error,
-        "invalid declaration field runner.tool_capabilities[0]"
     );
 }
 
