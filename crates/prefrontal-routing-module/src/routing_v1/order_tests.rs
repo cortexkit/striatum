@@ -205,7 +205,7 @@ async fn request_and_project_pins_beat_a_continuing_conversation_on_the_live_han
         (PIN, true, true, 200_000),
     ]);
     harness.edit_config(|config| {
-        config["accounts"]["enabled"] = json!(false);
+        config.as_object_mut().unwrap().remove("accounts");
     });
     let route = harness
         .bind(reserved("example-consumer"), Some("order-project"))
@@ -294,6 +294,7 @@ async fn pay_per_token_follows_the_consumer_flag_not_the_name() {
 
     harness.edit_config(|config| {
         config["consumers"]["mason"]["pay_per_token"] = json!(true);
+        config["providers"]["cheap-provider"]["subscription"] = json!(true);
     });
     let priced = route.call("route.select", &select("mason")).await;
     assert_eq!(route_of(&priced), DEAR, "{}", priced.1);
@@ -439,7 +440,9 @@ async fn the_answer_carries_route_runner_variant_limits_decision_and_expiry() {
 #[tokio::test]
 async fn legacy_provider_reset_leaves_both_select_wires_and_pins_selectable() {
     let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
-    harness.edit_config(|config| config["accounts"]["enabled"] = json!(false));
+    harness.edit_config(|config| {
+        config.as_object_mut().unwrap().remove("accounts");
+    });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let mut legacy = select("mason");
     legacy["targetAgent"] = json!("mason");

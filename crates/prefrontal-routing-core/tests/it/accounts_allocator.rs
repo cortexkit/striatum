@@ -1284,8 +1284,8 @@ fn no_candidate_reply_follows_step_six_precedence() {
         ));
         st
     };
-    // Unknown, reserve-limited, exhausted and re-auth: quota unknown wins,
-    // retrying after a jittered 60 s.
+    // An absent reading permits ordinary work; reserve-limited, exhausted and
+    // re-auth siblings do not turn absence into a quota refusal.
     let decision = decide(
         &request(),
         &fenced_state(vec![
@@ -1296,8 +1296,16 @@ fn no_candidate_reply_follows_step_six_precedence() {
         ]),
         NOW,
     );
-    assert_eq!(refused(&decision), RefusalCode::AccountQuotaUnknown);
-    assert_eq!(decision.refusal().unwrap().retry_after_s, Some(66));
+    assert_eq!(admitted(&decision), "acct-a");
+    let absent = decision
+        .explanation
+        .accounts
+        .iter()
+        .find(|note| note.account_id == "acct-a")
+        .unwrap();
+    assert_eq!(absent.exclusions, vec![ExclusionReason::QuotaMissing]);
+    assert!(absent.window_weights.is_empty());
+    assert!(absent.age_band.is_none());
 
     // Reserve-limited, exhausted and re-auth: reserve limited, retrying at the
     // earliest reset (5h, two hours away) plus 60 s.

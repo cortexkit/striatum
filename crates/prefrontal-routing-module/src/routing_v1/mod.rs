@@ -32,6 +32,8 @@ pub(crate) mod runners;
 mod select;
 
 #[cfg(test)]
+mod account_classes_tests;
+#[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
 mod consumers_tests;
@@ -270,14 +272,24 @@ fn account_ctx<'a>(
     deps: &'a Deps<'a>,
     flags: crate::config_overrides::AccountSelectionFlags,
     policy: &'a prefrontal_routing_core::accounts::AllocatorPolicy,
-) -> account_selection::Ctx<'a> {
-    account_selection::Ctx {
+) -> Result<account_selection::Ctx<'a>, Refusal> {
+    Ok(account_selection::Ctx {
         store: deps.store.as_ref(),
         accounts: crate::ACCOUNT_QUOTA.get(),
         flags,
         policy,
         now_ms: now_ms() as i64,
-    }
+        classes: Some(
+            account_selection::ClassContext::load(
+                deps.store,
+                deps.broca_credentials,
+                operator_config(deps),
+                crate::ACCOUNT_QUOTA.get(),
+                now_ms() as i64,
+            )
+            .map_err(store_refusal)?,
+        ),
+    })
 }
 
 /// The routing configuration (`model_routing`) the v1 ops read.

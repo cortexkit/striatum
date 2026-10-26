@@ -417,6 +417,14 @@ pub struct ProviderPolicy {
     pub subscription_multiplier: Option<f64>,
     pub keep_free_percent: Option<f64>,
     pub models: Option<Vec<String>>,
+    pub accounts: ProviderAccountsPolicy,
+}
+
+/// Account-class policy is opt-in: subscription exhaustion must not spend money.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderAccountsPolicy {
+    pub metered_fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]

@@ -20,12 +20,13 @@ fn entry<'a>(root: &'a mut Map<String, Value>, section: &str, key: &str) -> &'a 
 }
 
 /// Convert a parsed document, retaining operational tuning not replaced by the
-/// entity policy. Already-converted documents are unchanged.
+/// entity policy. Earlier entity-policy documents lose the retired account flag.
 pub fn convert_value(value: Value) -> Result<Value, String> {
     let mut root = value
         .as_object()
         .cloned()
         .ok_or("routing config must be an object")?;
+    remove_account_flag(&mut root)?;
     if !root.contains_key("model_routing")
         && !root.contains_key("account_selection")
         && ["models", "providers", "runners", "consumers", "accounts"]
@@ -267,8 +268,22 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     root.extend(old);
     if let Some(accounts) = root.remove("account_selection") {
         root.insert("accounts".into(), accounts);
+        remove_account_flag(&mut root)?;
     }
     Ok(Value::Object(root))
+}
+
+fn remove_account_flag(root: &mut Map<String, Value>) -> Result<(), String> {
+    if let Some(accounts) = root.get_mut("accounts") {
+        let accounts = accounts
+            .as_object_mut()
+            .ok_or("accounts must be an object")?;
+        accounts.remove("enabled");
+        if accounts.is_empty() {
+            root.remove("accounts");
+        }
+    }
+    Ok(())
 }
 
 pub fn convert(document: &str) -> Result<String, String> {

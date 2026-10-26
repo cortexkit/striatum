@@ -199,7 +199,7 @@ mod consumer_and_pin {
     }
 
     #[tokio::test]
-    async fn codemode_prefers_metered_over_higher_scoring_subscription_but_mason_does_not() {
+    async fn codemode_is_metered_with_either_legacy_consumer_spelling_but_mason_uses_subscription() {
         let rig = PolicyRig::new(json!({}));
         let mut subscription = fact("openai", "pin");
         subscription.scores.elo = 90.0;
@@ -215,7 +215,7 @@ mod consumer_and_pin {
         params.as_object_mut().unwrap().remove("consumer");
         params["targetAgent"] = json!("codemode");
         let reply = rig.select_with_planes(params, &planes).await;
-        assert_eq!(reply["result"]["selected"]["capacityKey"], "openai/pin", "{reply}");
+        assert_eq!(reply["result"]["selected"]["capacityKey"], "fallback/safe", "{reply}");
     }
 
     #[tokio::test]

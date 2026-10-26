@@ -1014,6 +1014,35 @@ impl SqliteRouteStateStore {
         Self::open_with_migrations(descriptor, &migrations)
     }
 
+    /// Seed the decision columns an older build wrote, without supplying a
+    /// payment class. Upgrade tests must exercise the migration's own backfill.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn seed_preupgrade_decision_for_test(
+        &self,
+        decision: &V1Decision,
+        v1_binding: bool,
+    ) -> RouteStateResult<()> {
+        self.store.with_conn(|connection| {
+            connection.execute(
+                "INSERT INTO model_route_decisions (id, target_agent, consumer, requirements_json,
+                 selected_route_key, selected_provider_id, selected_model_id, score_json,
+                 rejected_json, anchor_version, created_at)
+                 VALUES (?1, ?2, ?2, '{}', ?3, ?4, ?5, '{}', '[]', 1, ?6)",
+                params![decision.decision_id, decision.consumer, format!("{}/{}", decision.provider, decision.model),
+                    decision.provider, decision.model, decision.created_at_ms],
+            )?;
+            if v1_binding {
+                connection.execute(
+                    "INSERT INTO routing_v1_decision (decision_id, principal, consumer, provider, model,
+                     runner_module, created_at_ms, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![decision.decision_id, decision.principal, decision.consumer, decision.provider,
+                        decision.model, decision.runner_module, decision.created_at_ms, decision.expires_at_ms],
+                )?;
+            }
+            Ok(())
+        }).map_err(err)
+    }
+
     fn open_with_migrations(
         descriptor: &StorageDescriptor,
         migrations: &[Migration],

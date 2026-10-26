@@ -293,6 +293,16 @@ fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
     if value.get("aa").is_some() {
         return Err("config_key_removed: aa; delete this key".into());
     }
+    if value
+        .get("accounts")
+        .and_then(|accounts| accounts.get("enabled"))
+        .is_some()
+    {
+        return Err(format!(
+            "old routing config key accounts.enabled; run {} <input> <output>",
+            crate::config_convert::COMMAND
+        ));
+    }
     for key in ["model_routing", "account_selection", "pins", "score_alias"] {
         if value.get(key).is_some() {
             return Err(format!(
@@ -592,7 +602,14 @@ impl LiveConfig {
     }
 
     pub fn account_flags(&self) -> AccountSelectionFlags {
-        self.config.accounts
+        AccountSelectionFlags { enabled: true }
+    }
+
+    pub(crate) fn metered_fallback(&self, provider: &str) -> bool {
+        self.config
+            .providers
+            .get(provider)
+            .is_some_and(|policy| policy.accounts.metered_fallback)
     }
 
     /// The `routing/v1` consumer ids, in id order.
@@ -869,7 +886,7 @@ struct RoutingConfigFile {
     #[serde(default)]
     catalog: CatalogSection,
     #[serde(default)]
-    accounts: AccountSelectionFlags,
+    accounts: RemovedAccountFlags,
 }
 
 /// Regenerate with `cargo run -p prefrontal-routing-module --bin ck-prefrontal-routing -- --print-config-schema`.
@@ -877,13 +894,15 @@ pub fn routing_config_schema() -> String {
     serde_json::to_string_pretty(&schemars::schema_for!(RoutingConfigFile)).unwrap() + "\n"
 }
 
-/// Controls account selection and usage reports through `accounts.enabled`.
-/// Off unless the file turns it on.
+#[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RemovedAccountFlags {}
+
+/// Internal account-operation settings. Account selection always serves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AccountSelectionFlags {
-    /// Serve `route.account_for` and accept its reports. Off: every account
-    /// operation refuses with `account_selection_disabled`.
+    /// Retained for internal callers; the runtime loader always enables serving.
     #[serde(default)]
     pub enabled: bool,
 }

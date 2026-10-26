@@ -925,15 +925,23 @@ impl<'a> Allocator<'a> {
             // whatever its sign bit; numbers compare by value. A partial
             // comparison that called NaN equal to everything made the order
             // depend on input position, and could make the sort panic.
-            score(a)
-                .is_nan()
-                .cmp(&score(b).is_nan())
-                .then_with(|| score(a).total_cmp(&score(b)))
+            // Known headroom is preferred to an absent reading; absent accounts
+            // remain available when no measured account can serve the request.
+            a.view
+                .quota
+                .is_none()
+                .cmp(&b.view.quota.is_none())
                 .then_with(|| {
-                    self.order_index(&a.view.account_id)
-                        .cmp(&self.order_index(&b.view.account_id))
+                    score(a)
+                        .is_nan()
+                        .cmp(&score(b).is_nan())
+                        .then_with(|| score(a).total_cmp(&score(b)))
+                        .then_with(|| {
+                            self.order_index(&a.view.account_id)
+                                .cmp(&self.order_index(&b.view.account_id))
+                        })
+                        .then_with(|| a.view.account_id.cmp(&b.view.account_id))
                 })
-                .then_with(|| a.view.account_id.cmp(&b.view.account_id))
         });
         let best = eligible[0];
         let best_score = best.note.score.unwrap_or(f64::INFINITY);

@@ -133,7 +133,7 @@ pub(super) fn account_for(
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
     let policy = AllocatorPolicy::default();
-    let ctx = account_ctx(deps, flags, &policy);
+    let ctx = account_ctx(deps, flags, &policy)?;
     let answer = match account_selection::handle(ACCOUNT_FOR_OP, &body, &caller.principal, &ctx) {
         OpReply::Result(result) => admission_answer(&result, &request)?,
         OpReply::Error {
@@ -261,6 +261,14 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
         other => Refusal::new(RefusalCode::parse(other), message.clone()),
     };
     refusal.message = message;
+    if code == "no_eligible_account" {
+        if let Some(reset) = detail
+            .and_then(|detail| detail.get("reset_at_ms"))
+            .filter(|reset| !reset.is_null())
+        {
+            refusal.detail.insert("reset_at_ms".into(), reset.clone());
+        }
+    }
     refusal
 }
 
@@ -302,7 +310,7 @@ pub(super) fn account_observe(
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
     let policy = AllocatorPolicy::default();
-    let ctx = account_ctx(deps, flags, &policy);
+    let ctx = account_ctx(deps, flags, &policy)?;
     let reply = account_selection::handle(ACCOUNT_OBSERVE_OP, &body, &caller.principal, &ctx);
     // Rate-limit headers feed routing's quota view exactly as the older op's do.
     if let (Some(shared), Some(observation)) = (

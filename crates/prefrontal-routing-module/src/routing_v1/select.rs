@@ -270,6 +270,7 @@ pub(super) async fn select(
         priced.subscription_plan_providers.as_ref(),
         &operator_policy,
         &catalog_targets,
+        priced.classes.as_ref(),
     );
     let available = candidates.available;
     let subscription_keys = candidates.subscription_keys;
@@ -598,10 +599,11 @@ impl<'a> Selection<'a> {
         )
         .map_err(|refusal| refused(&refusal.code))?;
         let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
-        account_selection::preflight_model(
-            &super::account_ctx(self.deps, self.account_flags, &policy),
+        account_selection::preflight_model_for_class(
+            &super::account_ctx(self.deps, self.account_flags, &policy)?,
             &selected.model.provider_id,
             &selected.model.model_id,
+            self.priced_per_token,
         )
         .map_err(|(code, _)| refused(&code))?;
         Ok(selected)
