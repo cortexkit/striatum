@@ -273,7 +273,7 @@ type RouteEpochs = HashMap<u16, u32>;
 /// example `reserved:broca` for the supervised Broca module), by channel, with
 /// the epoch it was bound under. The account-selection operations namespace
 /// admissions and affinity by it and accept a report only for an admission
-/// they issued to the same identity; no other operation reads it. It is a
+/// they issued to the same identity; consumer admission also reads it. It is a
 /// process global so the shared request handler keeps its signature.
 static ROUTE_PRINCIPALS: OnceLock<Mutex<HashMap<u16, (u32, String)>>> = OnceLock::new();
 
@@ -301,6 +301,24 @@ fn route_principal(channel: u16, epoch: u32) -> String {
 /// scope. The daemon sends both only to a target that provides
 /// `scope-workdir/v1`, so a scope it stamped without them records nothing.
 static ROUTE_SCOPES: OnceLock<Mutex<HashMap<u16, (u32, Option<DecisionScope>)>>> = OnceLock::new();
+
+/// Authorization is kept separately from decision-ledger metadata so a scope
+/// without a project id still carries its daemon-attested owner and permission.
+static ROUTE_SCOPE_AUTHORITY: OnceLock<
+    Mutex<HashMap<u16, (u32, Option<routing_v1::ScopeAuthority>)>>,
+> = OnceLock::new();
+
+fn route_scope_authority(channel: u16, epoch: u32) -> Option<routing_v1::ScopeAuthority> {
+    ROUTE_SCOPE_AUTHORITY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|map| {
+            map.get(&channel)
+                .filter(|(bound, _)| *bound == epoch)
+                .and_then(|(_, scope)| scope.clone())
+        })
+}
 
 fn route_scopes() -> &'static Mutex<HashMap<u16, (u32, Option<DecisionScope>)>> {
     ROUTE_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -338,6 +356,14 @@ fn clear_route_scope(channel: u16, epoch: u32) {
             map.remove(&channel);
         }
     }
+    if let Ok(mut map) = ROUTE_SCOPE_AUTHORITY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        if map.get(&channel).is_some_and(|(bound, _)| *bound == epoch) {
+            map.remove(&channel);
+        }
+    }
 }
 
 /// The scope the request on `channel` was bound under, when it still holds
@@ -354,6 +380,14 @@ fn clear_route_epoch(route_epochs: &mut RouteEpochs, channel: u16, epoch: u32) {
     if route_epochs.get(&channel) == Some(&epoch) {
         route_epochs.remove(&channel);
         clear_route_scope(channel, epoch);
+        if let Ok(mut principals) = route_principals().lock() {
+            if principals
+                .get(&channel)
+                .is_some_and(|(bound, _)| *bound == epoch)
+            {
+                principals.remove(&channel);
+            }
+        }
     }
 }
 
@@ -1611,6 +1645,25 @@ async fn handle_control_request(
                 epoch,
                 DecisionScope::from_stamp(scope.as_ref()),
             );
+            if let Ok(mut map) = ROUTE_SCOPE_AUTHORITY
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+            {
+                map.insert(
+                    route_channel,
+                    (
+                        epoch,
+                        scope.as_ref().map(|stamp| routing_v1::ScopeAuthority {
+                            owner: account_selection::principal_label(Some(&stamp.owner)),
+                            reference: stamp.scope_ref.clone(),
+                            kind: stamp.kind.clone(),
+                            scope_epoch: stamp.scope_epoch,
+                            project_id: stamp.project_id.clone(),
+                            owner_authorized: stamp.owner_authorized,
+                        }),
+                    ),
+                );
+            }
             // The catalog is machine-global, but the wire identity is binding-specific.
             // Install it only after the accepted bind ACK is queued.
             let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
@@ -1672,6 +1725,7 @@ async fn handle_control_request(
                     .map(|health| health.snapshot(now_ms()))
                     .unwrap_or_else(|_| json!({ "reach": "never-reached", "lastError": "health lock poisoned" })),
                 "quota": quota_metrics,
+                "consumerDeclarations": routing_v1::consumers::health(),
             }));
             let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(ModuleError::Json)?;
@@ -3837,6 +3891,34 @@ async fn handle_select_request(
             },
         );
         return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
+    }
+    if envelope.method == ROUTE_SELECT_OP {
+        if let Ok(request) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
+            let params = &request["params"];
+            let consumer = routing_v1::consumers::legacy_consumer(params);
+            if !routing_v1::consumers::legacy_core_consumer(consumer) {
+                let operator = config_overrides::live_config(operator_config_path);
+                let consumers = routing_v1::consumers::effective(&operator);
+                // Preserve the legacy decoder's invalid_request for malformed
+                // enum values. A known non-core name still faces ownership first.
+                let invalid_legacy_consumer = params.get("consumer").is_some_and(|value| {
+                    serde_json::from_value::<Option<select_policy::Consumer>>(value.clone())
+                        .is_err()
+                }) && !consumers.knows(consumer);
+                if let Err(refusal) = if invalid_legacy_consumer {
+                    Ok(())
+                } else {
+                    consumers.admit(consumer, &routing_v1::Caller::for_route(channel, epoch))
+                } {
+                    let body = ErrorBody {
+                        code: refusal.code.as_str().to_owned(),
+                        message: refusal.message,
+                        detail: Some(serde_json::Value::Object(refusal.detail)),
+                    };
+                    return send_route_error_body(writer, ver, channel, epoch, corr, body).await;
+                }
+            }
+        }
     }
     let host_request = envelope.method == ROUTE_SELECT_OP
         && serde_json::from_slice::<SelectBody>(&frame.body)
@@ -9591,6 +9673,7 @@ mod tests {
         // Legacy wire fixtures exercise executor availability from an explicit
         // list or Broca substrate. Launch-mapping tests use their own fixture.
         if request["method"] == ROUTE_SELECT_OP {
+            authorize_legacy_policy_fixture(&request["params"], operator_config_path);
             request["params"]
                 .as_object_mut()
                 .unwrap()
@@ -9623,6 +9706,27 @@ mod tests {
         .await
         .unwrap();
         rx.recv().await.unwrap()
+    }
+
+    /// Policy fixtures own their legacy target labels. Admission itself is
+    /// exercised by the route-bound routing/v1 harness, not these policy helpers.
+    pub(super) fn authorize_legacy_policy_fixture(params: &serde_json::Value, config_path: &Path) {
+        if let Some(target) = params["targetAgent"].as_str() {
+            let operator = config_overrides::live_config(config_path);
+            let owner = operator
+                .consumer_owners()
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| "prefrontal-core".into());
+            routing_v1::consumers::replace_catalog(&json!([{
+                "module_id": owner, "nonce_verified": true,
+                "role_declarations": {"routing/v1": {"consumers": [{"name": target}]}}
+            }]));
+            route_principals()
+                .lock()
+                .unwrap()
+                .insert(7, (1, format!("reserved:{owner}")));
+        }
     }
 
     /// Explicitly ignored: reads live Fusiform metadata, but all route.select

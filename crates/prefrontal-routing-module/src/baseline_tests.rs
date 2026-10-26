@@ -96,7 +96,17 @@ impl World {
             .expect("open the routing store"),
         );
         let config_path = dir.join("prefrontal-routing.jsonc");
-        crate::test_config::write(&config_path, config).unwrap();
+        let mut fixture_config: Value = serde_json::from_str(
+            &crate::config_convert::convert(config).expect("the fixture config converts"),
+        )
+        .unwrap();
+        // Authorize the fixture's attested callers without changing its frozen
+        // requests, policy choices, or expected execution identities.
+        fixture_config["consumers"]["mc_dream_curate"]["owner"] = json!("magic-context");
+        fixture_config["consumers"]["mason"]["owner"] = json!("prefrontal-core");
+        fixture_config["consumers"]["codemode"]["owner"] = json!("prefrontal-core");
+        crate::test_config::write(&config_path, serde_json::to_vec(&fixture_config).unwrap())
+            .unwrap();
         let auth_path = dir.join("auth.json");
         std::fs::write(&auth_path, baseline["auth_json"].to_string()).unwrap();
 

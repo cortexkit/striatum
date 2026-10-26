@@ -70,7 +70,12 @@ async fn configured() -> (std::sync::Arc<Harness>, Route) {
     harness.edit_config(|config| {
         config["consumers"] = consumers
             .iter()
-            .map(|id| ((*id).to_owned(), json!({})))
+            .map(|id| {
+                (
+                    (*id).to_owned(),
+                    json!({"owner": fixture::CONSUMER.trim_start_matches("reserved:")}),
+                )
+            })
             .collect::<serde_json::Map<String, serde_json::Value>>()
             .into();
     });

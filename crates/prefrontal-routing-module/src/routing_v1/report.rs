@@ -33,9 +33,14 @@ pub(super) fn report(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         .store
         .v1_decision(&request.decision_id)
         .map_err(store_refusal)?;
-    if decision.is_none_or(|decision| decision.principal != caller.principal) {
+    if decision
+        .as_ref()
+        .is_none_or(|decision| decision.principal != caller.principal)
+    {
         return Err(Refusal::unknown_decision());
     }
+    super::consumers::effective(&super::operator_config(deps))
+        .admit(&decision.unwrap().consumer, caller)?;
     // Bodies are compared as decoded: the canonical encoding leaves absent
     // and null members out alike and fixes the member order.
     let body_json = serde_json::to_string(&request)
