@@ -1968,9 +1968,11 @@ impl SqliteRouteStateStore {
 
     /// Record that the provider permanently refused `credential_id`.
     ///
-    /// A repeated report for the same pair keeps the first observation and the
-    /// fingerprint it was recorded against, so a replay cannot move the fence onto
-    /// a newer listing; a fingerprint is filled in only where none was known.
+    /// A repeated report for the same pair renews the observation time and the
+    /// reported code, so a fence that keeps failing stays fresh and its next
+    /// recheck probe waits another interval; the fingerprint it was recorded
+    /// against is kept, so a replay cannot move the fence onto a newer listing.
+    /// A fingerprint is filled in only where none was known.
     pub fn record_credential_entitlement_fence(
         &self,
         refusal: &prefrontal_routing_core::route_state_store::CredentialRefusal,
@@ -1987,6 +1989,8 @@ impl SqliteRouteStateStore {
                        (provider_id, credential_id, code, listing_fingerprint, observed_at_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(provider_id, credential_id) DO UPDATE SET
+                       code = excluded.code,
+                       observed_at_ms = excluded.observed_at_ms,
                        listing_fingerprint = COALESCE(
                          credential_entitlement_fences.listing_fingerprint,
                          excluded.listing_fingerprint)",
@@ -2026,6 +2030,85 @@ impl SqliteRouteStateStore {
                     )
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(err)
+    }
+
+    /// Renew a fence's observation clock without changing its code or listing
+    /// fingerprint. A recheck probe consumes its interval this way: admitting
+    /// the probe stamps the fence fresh, so no second probe is admitted until
+    /// another interval passes or an outcome lifts or renews it.
+    pub fn touch_credential_entitlement_fence(
+        &self,
+        provider_id: &str,
+        credential_id: &str,
+        observed_at_ms: i64,
+    ) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "UPDATE credential_entitlement_fences SET observed_at_ms = ?3
+                      WHERE provider_id = ?1 AND credential_id = ?2",
+                    params![provider_id, credential_id, observed_at_ms],
+                )
+            })
+            .map_err(err)
+    }
+
+    /// End the fence on one (provider, credential) pair, as a successful run on
+    /// that pair proves the credential serves again; returns how many ended.
+    pub fn clear_credential_entitlement_fence(
+        &self,
+        provider_id: &str,
+        credential_id: &str,
+    ) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "DELETE FROM credential_entitlement_fences
+                      WHERE provider_id = ?1 AND credential_id = ?2",
+                    params![provider_id, credential_id],
+                )
+            })
+            .map_err(err)
+    }
+
+    /// End every fence naming `credential_id`, on every provider it is fenced
+    /// for, as an operator does right after topping the credential up; returns
+    /// the fences that were lifted, ordered by provider, so the reply can name
+    /// what the lift removed.
+    pub fn clear_credential_entitlement_fences_for_credential(
+        &self,
+        credential_id: &str,
+    ) -> RouteStateResult<Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>>
+    {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(
+                    "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
+                      FROM credential_entitlement_fences WHERE credential_id = ?1
+                      ORDER BY provider_id",
+                )?;
+                let lifted: Vec<
+                    prefrontal_routing_core::route_state_store::CredentialEntitlementFence,
+                > = stmt
+                    .query_map([credential_id], |row| {
+                        Ok(
+                            prefrontal_routing_core::route_state_store::CredentialEntitlementFence {
+                                provider_id: row.get(0)?,
+                                credential_id: row.get(1)?,
+                                code: row.get(2)?,
+                                listing_fingerprint: row.get(3)?,
+                                observed_at_ms: row.get(4)?,
+                            },
+                        )
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                c.execute(
+                    "DELETE FROM credential_entitlement_fences WHERE credential_id = ?1",
+                    [credential_id],
+                )?;
+                Ok(lifted)
             })
             .map_err(err)
     }

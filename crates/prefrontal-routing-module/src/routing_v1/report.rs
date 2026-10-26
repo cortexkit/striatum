@@ -81,6 +81,31 @@ pub(super) fn report(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
             },
         )
         .map_err(store_refusal)?;
+    // A completed run proves the credential it launched on serves again: lift
+    // the fence on that pair, if any. The remembered serving identity names
+    // the credential; the report's own claim is the fallback.
+    if request.outcome == Outcome::Completed {
+        let credential = deps
+            .store
+            .decision_provider_identity(&request.decision_id)
+            .map_err(store_refusal)?
+            .and_then(|identity| identity.credential_id)
+            .or_else(|| request.credential_id.clone());
+        if let Some(credential) = credential {
+            let decision = deps
+                .store
+                .v1_decision(&request.decision_id)
+                .map_err(store_refusal)?;
+            if let Some(decision) = decision {
+                crate::credential_fences::lift_after_success(
+                    deps.store,
+                    &decision.provider,
+                    &credential,
+                )
+                .map_err(store_refusal)?;
+            }
+        }
+    }
 
     // One report per decision, so the decision names its report.
     let report_id = format!("report:{}", request.decision_id);

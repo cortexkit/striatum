@@ -400,6 +400,7 @@ fn demand_prices_only_the_class_that_account_for_may_serve() {
             crate::select_policy::CandidateSource::Vault {
                 credentials: &credentials,
                 fences: &priced.entitlement_fences,
+                stale: &[],
                 defer_pool_pin: false,
             },
             Some(crate::select_policy::Consumer::Mason),

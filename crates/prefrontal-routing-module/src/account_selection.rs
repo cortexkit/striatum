@@ -377,10 +377,15 @@ impl ClassContext {
         row: &cortexkit_claustrum_client::ListedCredential,
         fact: &prefrontal_routing_core::ModelFact,
     ) -> bool {
-        !self
-            .refusals
-            .iter()
-            .any(|fence| fence.provider_id == fact.provider_id && fence.credential_id == row.id)
+        // A stale fence is probe-eligible: selection may admit one request on
+        // it, so the account classes keep the credential too. Fresh fences
+        // still exclude it everywhere.
+        !self.refusals.iter().any(|fence| {
+            fence.provider_id == fact.provider_id
+                && fence.credential_id == row.id
+                && self.now_ms.saturating_sub(fence.observed_at_ms)
+                    <= crate::credential_fences::FENCE_PROBE_RECHECK_MS
+        })
     }
 
     fn usable(

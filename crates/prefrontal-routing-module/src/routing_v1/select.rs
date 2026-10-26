@@ -262,6 +262,7 @@ pub(super) async fn select(
         select_policy::CandidateSource::Vault {
             credentials: deps.broca_credentials,
             fences: &priced.entitlement_fences,
+            stale: &priced.probe_fences,
             defer_pool_pin: false,
         },
         legacy_consumer,
@@ -385,6 +386,53 @@ pub(super) async fn select(
             return Err(no_route_refusal(&no_route, now));
         }
     };
+    // A stale-fenced route picked here probes that credential: stamp the
+    // fences fresh so no second probe follows within the interval, and record
+    // the probe on the decision. Pool-backed routes keep every live fence, so
+    // they never probe through this surface.
+    {
+        let full: Vec<_> = priced
+            .entitlement_fences
+            .iter()
+            .chain(priced.probe_fences.iter())
+            .cloned()
+            .collect();
+        if let Some(fact) = facts.iter().find(|fact| {
+            fact.provider_id == selected.model.provider_id
+                && fact.model_id == selected.model.model_id
+        }) {
+            let identities = deps
+                .broca_credentials
+                .lock()
+                .map(|credentials| credentials.serving_identities(fact))
+                .unwrap_or_default();
+            let probed = crate::credential_fences::probe_credentials(
+                &full,
+                &priced.entitlement_fences,
+                &selected.model.provider_id,
+                &identities,
+            );
+            if !probed.is_empty()
+                && !crate::needs_runner_pin(&catalog_targets, &selected.model.provider_id)
+            {
+                for credential in &probed {
+                    deps.store
+                        .touch_credential_entitlement_fence(
+                            &selected.model.provider_id,
+                            credential,
+                            now as i64,
+                        )
+                        .map_err(store_refusal)?;
+                }
+                selected
+                    .explanation
+                    .push(crate::credential_fences::probe_note(
+                        &selected.model.provider_id,
+                        &probed.join(", "),
+                    ));
+            }
+        }
+    }
     let variant_choice = crate::apply_variant_policy(
         &mut selected,
         &operator_config,
