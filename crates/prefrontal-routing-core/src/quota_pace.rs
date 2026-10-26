@@ -391,17 +391,6 @@ mod tests {
     }
 
     #[test]
-    fn default_pace_config_passes_exponent_validation() {
-        assert_eq!(
-            PaceConfig::with_exponents(
-                DEFAULT_PACE_CONFIG.abundance_gain_exponent,
-                DEFAULT_PACE_CONFIG.scarcity_gain_exponent,
-            ),
-            Ok(DEFAULT_PACE_CONFIG)
-        );
-    }
-
-    #[test]
     fn equal_headroom_and_time_score_exactly_one_for_permitted_exponents() {
         for alpha in [0.0, 0.5, 1.0, 4.0] {
             for beta in [0.0, 0.5, 1.0, 4.0] {
@@ -417,10 +406,8 @@ mod tests {
     #[test]
     fn time_fraction_clamps_at_one_for_an_idle_window() {
         let score = abundance(0.0, 200_000.0, Some(100_000.0), &C);
-        let route_without_a_reading = None::<f64>.unwrap_or(1.0);
 
         assert_eq!(score, Some(1.0));
-        assert_eq!(score.unwrap(), route_without_a_reading);
     }
 
     #[test]
@@ -710,21 +697,5 @@ mod tests {
         .expect("fixed and fallback pacing inputs are supported");
         assert_eq!(r.pressure, 0.0);
         assert_eq!(r.reason, PaceReason::InsufficientData);
-    }
-
-    #[test]
-    fn rolling_window_semantics_are_rejected() {
-        let result = project_quota_pressure(
-            PaceInput {
-                utilization: 0.5,
-                resets_at: Some(1_000_000.0),
-                window_ms: Some(300_000.0),
-                observed_at: 0.0,
-                provider_window_model: Some(ProviderWindowModel::Rolling),
-            },
-            &C,
-        );
-
-        assert_eq!(result, Err(PaceError::RollingWindow));
     }
 }

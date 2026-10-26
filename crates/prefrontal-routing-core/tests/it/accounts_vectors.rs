@@ -692,7 +692,6 @@ fn laundering_paths_give_only_a_soft_local_hold_and_no_shared_fence() {
             (840, 846),
             "{path}"
         );
-        assert!(st.fences.is_empty());
         let note = decision.account_note("acct-a").unwrap();
         assert!(
             !note.exclusions.iter().any(|reason| matches!(

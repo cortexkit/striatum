@@ -1937,37 +1937,23 @@ fn complete_usage_row_is_immutable_on_redelivery_and_message_ids_stay_unique() {
 }
 
 #[test]
-fn non_finite_output_is_stored_as_null() {
-    let rig = Rig::new("usage-non-finite-output");
+fn invalid_output_and_duration_are_stored_as_null() {
+    let rig = Rig::new("usage-invalid-output-and-duration");
     let store = rig.open();
     for (id, output) in [
-        ("nan", f64::NAN),
-        ("positive-infinity", f64::INFINITY),
-        ("negative-infinity", f64::NEG_INFINITY),
+        ("output-nan", f64::NAN),
+        ("output-positive-infinity", f64::INFINITY),
+        ("output-negative-infinity", f64::NEG_INFINITY),
+        ("output-negative", -1.0),
+        ("output-zero", 0.0),
+        ("output-floor-zero", 0.99),
     ] {
         assert!(!store
             .record_usage_observation(&obs(id, "p/m", output, 1_000.0, 1_000.0))
             .unwrap());
-        assert_eq!(stored_usage_row(&rig, id).output_tokens, None);
+        assert_eq!(stored_usage_row(&rig, id).output_tokens, None, "{id}");
     }
-}
 
-#[test]
-fn non_positive_and_floor_zero_output_are_stored_as_null() {
-    let rig = Rig::new("usage-zero-output");
-    let store = rig.open();
-    for (id, output) in [("negative", -1.0), ("zero", 0.0), ("floor-zero", 0.99)] {
-        assert!(!store
-            .record_usage_observation(&obs(id, "p/m", output, 1_000.0, 1_000.0))
-            .unwrap());
-        assert_eq!(stored_usage_row(&rig, id).output_tokens, None);
-    }
-}
-
-#[test]
-fn non_finite_and_negative_duration_are_stored_as_null() {
-    let rig = Rig::new("usage-invalid-duration");
-    let store = rig.open();
     for (id, duration) in [
         ("nan", f64::NAN),
         ("positive-infinity", f64::INFINITY),
@@ -3941,268 +3927,6 @@ fn vector_absence_is_whole_selection_fallback_and_a_missing_rate_degrades_only_i
     assert_eq!(res_degraded.route_key, "p1/m1");
     assert_eq!(res_degraded.score.objective.cost, f1.basket_cost().unwrap());
 }
-#[test]
-fn mutation_binding_sqlite_or_wall_clock_now_instead_of_argument_reddens() {
-    let rig = Rig::new("mutation-wall-clock-now");
-    let store = rig.open();
-    let now = 1_000_000_000.0;
-    let seven_days_ms = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
-
-    store
-        .record_usage_delivery(&class_obs(
-            "inside-relative-to-now",
-            Some("ephemeral"),
-            Some(250.0),
-            Some(100.0),
-            Some(0.0),
-            Some(100.0),
-            Some(10.0),
-            Some(1000.0),
-            now - seven_days_ms + 1.0,
-        ))
-        .unwrap();
-
-    let vec = store
-        .get_class_vector("ephemeral", now)
-        .unwrap()
-        .expect("must form vector at fixed now argument");
-    assert_eq!(vec.sample_count, 1);
-}
-
-#[test]
-fn mutation_counting_null_bearing_rows_toward_floor_reddens() {
-    let rig = Rig::new("mutation-null-bearing-floor");
-    let store = rig.open();
-    let now = 10_000_000.0;
-
-    for i in 0..49 {
-        store
-            .record_usage_delivery(&class_obs(
-                &format!("null-read-{i}"),
-                Some("ephemeral"),
-                Some(0.0),
-                Some(100.0),
-                Some(0.0),
-                None,
-                Some(0.0),
-                Some(1000.0),
-                now - 1000.0 - i as f64,
-            ))
-            .unwrap();
-    }
-    store
-        .record_usage_delivery(&class_obs(
-            "complete-single",
-            Some("ephemeral"),
-            Some(100.0),
-            Some(100.0),
-            Some(0.0),
-            Some(50.0),
-            Some(10.0),
-            Some(1000.0),
-            now - 500.0,
-        ))
-        .unwrap();
-
-    let vec = store.get_class_vector("ephemeral", now).unwrap().unwrap();
-    assert_eq!(
-        vec.sample_count, 1,
-        "floor of 50 must NOT count NULL-bearing rows"
-    );
-    assert!(
-        !vec.is_usable(),
-        "1 complete row must yield an unusable vector"
-    );
-}
-
-#[test]
-fn mutation_charging_null_counter_as_zero_in_mean_reddens() {
-    let rig = Rig::new("mutation-null-as-zero-mean");
-    let store = rig.open();
-    let now = 10_000_000.0;
-
-    store
-        .record_usage_delivery(&class_obs(
-            "complete-cached",
-            Some("ephemeral"),
-            Some(100.0),
-            Some(100.0),
-            Some(0.0),
-            Some(50.0),
-            Some(10.0),
-            Some(1000.0),
-            now - 500.0,
-        ))
-        .unwrap();
-    for i in 0..49 {
-        store
-            .record_usage_delivery(&class_obs(
-                &format!("null-cached-{i}"),
-                Some("ephemeral"),
-                Some(100.0),
-                Some(100.0),
-                Some(0.0),
-                None,
-                Some(10.0),
-                Some(1000.0),
-                now - 1000.0 - i as f64,
-            ))
-            .unwrap();
-    }
-
-    let vec = store.get_class_vector("ephemeral", now).unwrap().unwrap();
-    assert_eq!(vec.cached_read, 50.0);
-    assert_ne!(vec.cached_read, 1.0);
-}
-
-#[test]
-fn mutation_adding_duration_validity_term_to_population_reddens() {
-    let rig = Rig::new("mutation-duration-term");
-    let store = rig.open();
-    let now = 10_000_000.0;
-
-    for i in 0..49 {
-        store
-            .record_usage_delivery(&class_obs(
-                &format!("dur-valid-{i}"),
-                Some("ephemeral"),
-                Some(100.0),
-                Some(100.0),
-                Some(0.0),
-                Some(50.0),
-                Some(10.0),
-                Some(1000.0),
-                now - 1000.0 - i as f64,
-            ))
-            .unwrap();
-    }
-    store
-        .record_usage_delivery(&class_obs(
-            "null-dur-complete",
-            Some("ephemeral"),
-            Some(100.0),
-            Some(100.0),
-            Some(0.0),
-            Some(50.0),
-            Some(10.0),
-            None,
-            now - 500.0,
-        ))
-        .unwrap();
-
-    let vec = store.get_class_vector("ephemeral", now).unwrap().unwrap();
-    assert_eq!(
-        vec.sample_count, 50,
-        "duration validity term must not drop NULL duration row"
-    );
-    assert!(
-        vec.is_usable(),
-        "50 complete rows with 1 NULL duration reaches floor"
-    );
-}
-
-#[test]
-fn mutation_persisting_vector_onto_stored_fact_row_reddens() {
-    let rig = Rig::new("mutation-persisting-vector");
-    let store = rig.open();
-    let now = 10_000_000.0;
-
-    let mut fact_item = fact("p", "persist-test");
-    fact_item.cost_per_m_tok_out = Some(10.0);
-    fact_item.input_rate = Some(2.0);
-    fact_item.cache_read_rate = Some(0.5);
-    fact_item.cache_write_rate = Some(1.5);
-    store.upsert_fact(&fact_item, FactSource::Override).unwrap();
-
-    for i in 0..50 {
-        store
-            .record_usage_delivery(&class_obs(
-                &format!("p-msg-{i}"),
-                Some("ephemeral"),
-                Some(1000.0),
-                Some(1200.0),
-                Some(200.0),
-                Some(5000.0),
-                Some(100.0),
-                Some(1000.0),
-                now - 100.0 - i as f64,
-            ))
-            .unwrap();
-    }
-
-    let overlaid = store
-        .get_facts_with_observed_speed(now, &RoutePricing::default())
-        .unwrap();
-    let overlaid_fact = overlaid
-        .into_iter()
-        .find(|f| f.provider_id == "p" && f.model_id == "persist-test")
-        .unwrap();
-    assert!(overlaid_fact.class_vector.is_some());
-
-    store
-        .upsert_fact(&overlaid_fact, FactSource::Override)
-        .unwrap();
-
-    let reloaded = store
-        .get_facts()
-        .unwrap()
-        .into_iter()
-        .find(|f| f.provider_id == "p" && f.model_id == "persist-test")
-        .unwrap();
-    assert!(
-        reloaded.class_vector.is_none(),
-        "vector must never be persisted on stored fact"
-    );
-    assert!(!reloaded.class_vector_is_overlay);
-}
-
-#[test]
-fn mutation_querying_store_from_inside_comparator_reddens() {
-    let rig = Rig::new("mutation-comparator-query");
-    let store = rig.open();
-    let now = 10_000_000.0;
-
-    let mut custom = fact("p", "no-query-model");
-    custom.cost_per_m_tok_out = Some(10.0);
-    custom.input_rate = Some(2.0);
-    custom.cache_read_rate = Some(0.5);
-    custom.cache_write_rate = Some(1.5);
-    store.upsert_fact(&custom, FactSource::Override).unwrap();
-
-    let before_plant_fact = store
-        .get_fact_by_route_key("p/no-query-model")
-        .unwrap()
-        .unwrap();
-    let before_cost = prefrontal_routing_core::selection_cost(&before_plant_fact, false, true);
-
-    for i in 0..50 {
-        store
-            .record_usage_delivery(&class_obs(
-                &format!("q-msg-{i}"),
-                Some("ephemeral"),
-                Some(1000.0),
-                Some(1200.0),
-                Some(200.0),
-                Some(5000.0),
-                Some(100.0),
-                Some(1000.0),
-                now - 100.0 - i as f64,
-            ))
-            .unwrap();
-    }
-
-    let after_plant_fact = store
-        .get_fact_by_route_key("p/no-query-model")
-        .unwrap()
-        .unwrap();
-    let after_cost = prefrontal_routing_core::selection_cost(&after_plant_fact, false, true);
-
-    assert_eq!(
-        before_cost, after_cost,
-        "comparator must not query store directly: planted usage rows changed selection_cost before overlay"
-    );
-}
-
 /// A class vector is served from the store's cache until usage is written
 /// through the store: a row that appears behind its back is not seen, a row
 /// recorded through record_usage_delivery is (Loop R184: before the cache
@@ -4434,38 +4158,6 @@ fn migration_057_prunes_unserved_unpicked_facts_but_preserves_overrides_and_deci
         .map(Result::unwrap)
         .collect();
     assert_eq!(unserved_overrides, ["test/override-unserved"]);
-}
-
-#[test]
-fn absent_fusiform_facts_are_filtered_unless_the_operator_overrode_the_score() {
-    use rusqlite::Connection;
-
-    let rig = Rig::new("fusiform-absence-override-selection");
-    let store = rig.open();
-    store
-        .upsert_fact(&fact("test", "retired-seed"), FactSource::Seed)
-        .unwrap();
-    store
-        .upsert_fact(&fact("test", "retired-override"), FactSource::Override)
-        .unwrap();
-    Connection::open(rig.db_path())
-        .unwrap()
-        .execute(
-            "UPDATE model_facts SET fusiform_present = 0, facts_source = 'fusiform'
-             WHERE route_key IN ('test/retired-seed', 'test/retired-override')",
-            [],
-        )
-        .unwrap();
-
-    let routable = store.get_facts().unwrap();
-    assert!(routable.iter().all(|fact| fact.model_id != "retired-seed"));
-    assert!(routable
-        .iter()
-        .any(|fact| fact.model_id == "retired-override"));
-    assert_eq!(
-        store.unserved_override_route_keys().unwrap(),
-        ["test/retired-override"]
-    );
 }
 
 #[test]

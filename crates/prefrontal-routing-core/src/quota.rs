@@ -793,12 +793,6 @@ mod tests {
 
     const NOW_MS: f64 = 1_893_456_000_000.0; // 2030-01-01T00:00:00Z
 
-    fn pace_config_with_skew_ms(skew_ms: f64) -> PaceConfig {
-        let mut config = DEFAULT_PACE_CONFIG;
-        config.skew_ms = skew_ms;
-        config
-    }
-
     fn fact(provider: &str, model: &str, speed: f64) -> ModelFact {
         ModelFact {
             billing_plane: None,
@@ -894,12 +888,6 @@ mod tests {
             (actual - expected).abs() < 1e-12,
             "expected abundance {expected}, got {actual}"
         );
-    }
-
-    #[test]
-    fn pace_fixture_varies_skew_by_copy_and_assign() {
-        let config = pace_config_with_skew_ms(250.0);
-        assert_eq!(config.skew_ms, 250.0);
     }
 
     #[test]

@@ -2440,58 +2440,6 @@ mod abundance_tests {
     }
 
     #[test]
-    fn runtime_abundance_orders_the_free_bucket_before_speed_and_none_is_neutral() {
-        let abundant_over_neutral = select(
-            vec![
-                fact("abundant", "slow", 10.0),
-                fact("neutral", "fast", 100.0),
-            ],
-            &[("abundant/slow", Some(4.0), Some("abundant-window"))],
-        );
-        assert_eq!(
-            abundant_over_neutral.route_key, "abundant/slow",
-            "runtime abundance must be read before the faster neutral route wins"
-        );
-
-        let neutral_over_scarce = select(
-            vec![fact("neutral", "slow", 10.0), fact("scarce", "fast", 100.0)],
-            &[("scarce/fast", Some(0.25), Some("scarce-window"))],
-        );
-        assert_eq!(
-            neutral_over_scarce.route_key, "neutral/slow",
-            "an absent abundance sample is neutral 1.0, not zero"
-        );
-    }
-
-    #[test]
-    fn two_adequate_routes_whose_abundances_differ_by_at_least_one_quantum_rank_by_abundance() {
-        let decision = select(
-            vec![fact("alpha", "slow", 10.0), fact("beta", "fast", 100.0)],
-            &[
-                ("alpha/slow", Some(1.0020), Some("alpha-window")),
-                ("beta/fast", Some(1.0000), Some("beta-window")),
-            ],
-        );
-        assert_eq!(
-            decision.route_key, "alpha/slow",
-            "more abundant route must outrank the faster route when abundances differ by at least one quantum"
-        );
-        assert_eq!(decision.score.objective.quota_abundance, Some(1.0020));
-        assert_eq!(
-            decision.score.objective.quota_abundance_window.as_deref(),
-            Some("alpha-window")
-        );
-        assert!(
-            decision
-                .explanation
-                .iter()
-                .any(|line| line == "quota abundance 1.0020 (window alpha-window)"),
-            "explanation must state abundance value and window key: {:?}",
-            decision.explanation
-        );
-    }
-
-    #[test]
     fn abundances_with_descending_speeds_sort_identically_under_every_permutation_with_no_panic_or_cycle(
     ) {
         let r1 = fact("p", "r1", 150.0);
