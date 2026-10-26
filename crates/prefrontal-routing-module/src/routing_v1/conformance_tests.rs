@@ -618,11 +618,6 @@ impl RoutingSubject for KitSubject {
                     (
                         consumer.id.clone(),
                         json!({
-                            "owner": if consumer.id == fixture::DECLARED {
-                                fixture::DECLARING_PRINCIPAL.trim_start_matches("reserved:")
-                            } else {
-                                fixture::CONSUMER.trim_start_matches("reserved:")
-                            },
                             "pay_per_token": consumer.priced_only,
                             "iq": consumer.requirements.iq,
                             "eq": consumer.requirements.defaults.eq,
@@ -712,9 +707,7 @@ impl RoutingSubject for KitSubject {
 /// (`parent_conversation_key`, `pool`, `eligibility`, `request_input_tokens`),
 /// which the v1 account ops and report still refuse as unknown members. The
 /// operator-override check needs a configurable max_output_tokens demand,
-/// which the current consumer config schema does not expose. The
-/// unverified-declaration check expects config-only names to be available to
-/// unrelated callers, contrary to routing's explicit configured-owner rule.
+/// which the current consumer config schema does not expose.
 /// Each is expected to fail until routing serves it; the work that makes one
 /// pass removes it here, and the full-kit verdict holds once the list is empty.
 /// The `affinity_holds_until_failure_report` check in
@@ -731,7 +724,6 @@ const NOT_YET_SERVED: &[&str] = &[
     "parent_body_admission_conflict",
     "new_report_members_conflict",
     "operator_config_overrides_declared_default",
-    "declared_consumer_unverified_entry_ignored",
     "affinity_holds_until_failure_report",
 ];
 

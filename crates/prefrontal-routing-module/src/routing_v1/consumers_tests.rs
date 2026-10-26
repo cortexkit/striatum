@@ -32,6 +32,41 @@ fn select(consumer: &str) -> Value {
     json!({"consumer": consumer, "requirements": {"iq": 30}})
 }
 
+#[tokio::test]
+async fn ownerless_config_consumer_is_selectable_by_unrelated_callers() {
+    let harness = harness();
+    let consumer = "example.public";
+    harness.edit_config(|config| config["consumers"][consumer] = json!({}));
+    for principal in [
+        reserved("first-unrelated"),
+        reserved("second-unrelated"),
+        Value::Null,
+    ] {
+        let route = harness.bind(principal, None).await;
+        let reply = route.call("route.select", &select(consumer)).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    }
+
+    let channel = harness.reserve_channel();
+    let old_route = scoped(&harness, "unrelated-owner", false, channel, 1).await;
+    let captured = Caller::for_route(channel, 1);
+    let dispatched = old_route.request_frame("route.select", &select(consumer));
+    scoped(&harness, "unrelated-owner", false, channel, 2).await;
+    refused(
+        harness.finish_dispatched(dispatched).await,
+        "consumer_not_owned",
+        consumer,
+    );
+    assert_eq!(
+        consumers::effective(&harness.operator_config())
+            .admit(consumer, &captured)
+            .unwrap_err()
+            .code
+            .as_str(),
+        "consumer_not_owned"
+    );
+}
+
 fn refused(reply: (FrameType, Value), code: &str, consumer: &str) {
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     assert_eq!(reply.1["code"], code, "{}", reply.1);
