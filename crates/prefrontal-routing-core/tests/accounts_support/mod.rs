@@ -41,6 +41,7 @@ pub fn reading(five_used: f64, seven_used: f64) -> QuotaReading {
         seven_day: Some(window(seven_used, ResetTime::At(NOW + 72 * HOUR), 10_080)),
         general_windows: None,
         scoped: ScopedList::Missing,
+        pool_windows: None,
     }
 }
 
@@ -100,6 +101,7 @@ pub fn request() -> AccountRequest {
         requested_account: None,
         preferred_existing_account: None,
         hold_wait_max_s: 900,
+        pool: None,
     }
 }
 
@@ -121,11 +123,15 @@ pub fn affinity(account: &str, model: &str, generation: u64) -> ConversationAffi
     }
 }
 
+/// A block keyed by the pool a pre-pool fence scope migrates to, confirmed at
+/// `NOW`. A reading observed at the same instant never lifts it, so the
+/// builders' readings (observed at `NOW` or earlier) leave it standing.
 pub fn fence(account: &str, scope: FenceScope, reset: ResetTime) -> Fence {
     Fence {
         account_id: account.into(),
-        scope,
-        observed_at_ms: NOW - MINUTE,
+        pool: Some(scope.into()),
+        recovery_set: Vec::new(),
+        observed_at_ms: NOW,
         reset,
         retry_hint_ms: None,
         source: prefrontal_routing_core::accounts::ConfirmationSource::BrocaAccountLimit,

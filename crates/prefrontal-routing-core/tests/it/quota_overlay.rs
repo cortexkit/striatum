@@ -138,7 +138,7 @@ fn rolling_window_discriminator_is_typed_as_an_unsupported_pacing_model() {
             }
         }
     }));
-    let extracted = extract_windows(&entry, "openai", "codex", &[])
+    let extracted = extract_windows(&entry, "codex", &[])
         .pop()
         .expect("rolling provider window is still decoded for typed refusal");
 
@@ -647,7 +647,7 @@ fn windowless_usage_with_empty_balance_pool_walls_without_reset() {
     }));
 
     assert!(
-        extract_windows(&entry, "balance-provider", "balance-wire", &[]).is_empty(),
+        extract_windows(&entry, "balance-wire", &[]).is_empty(),
         "usage={{}} stays no-signal for the rate-window arm even when spend is present"
     );
     let snap = overlay(&[entry], &facts);

@@ -585,7 +585,7 @@ pub fn merge_quota_overlay_with(
             Some(caps) => caps,
             None => &empty,
         };
-        let extracted = extract_windows(entry, join.provider_id, &entry.provider, provider_caps);
+        let extracted = extract_windows(entry, &entry.provider, provider_caps);
 
         let account_key = (
             join.provider_id.to_string(),
@@ -1285,25 +1285,35 @@ mod tests {
         );
     }
 
+    // Replaces `antigravity_entry_without_extra_rate_windows_keeps_todays_behaviour`.
+    // Extraction used to dispatch on the `google` provider id, which extracted
+    // nothing from an Antigravity entry without extra windows. Windows are now
+    // read by the reading's shape: without extra windows, the entry is an
+    // aggregate reading, and its aggregate walls the routes the join reaches.
     #[test]
-    fn antigravity_entry_without_extra_rate_windows_keeps_todays_behaviour() {
+    fn an_antigravity_entry_without_extra_rate_windows_is_read_as_its_aggregate() {
         let facts = antigravity_facts();
-        // The misleading aggregate alone, as before pools were read.
+        let reset = "2030-01-01T01:00:00Z";
         let entry = usage(serde_json::json!({
             "provider": "antigravity",
             "account": "only",
             "usage": { "primary": {
                 "usedPercent": 100.0,
-                "resetsAt": "2030-01-01T01:00:00Z",
+                "resetsAt": reset,
                 "windowMinutes": 300
             }}
         }));
         let snapshot = antigravity_overlay(&[entry], &facts);
-        assert!(
-            snapshot.by_capacity.is_empty(),
-            "no extraRateWindows: no Antigravity signal at all, as before"
+        assert_eq!(
+            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until,
+            Some(ms(reset)),
+            "the aggregate walls the Antigravity routes"
         );
-        assert_eq!(select(facts, snapshot), AG_GEMINI);
+        assert!(
+            !snapshot.by_capacity.contains_key(API_GEMINI),
+            "the join still reaches only the Antigravity route family"
+        );
+        assert_ne!(select(facts, snapshot), AG_GEMINI);
     }
 
     #[test]
