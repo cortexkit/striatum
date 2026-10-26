@@ -2377,18 +2377,43 @@ mod abundance_tests {
             fact_with_cost_and_elo("inadequate", "model", 50.0, Some(0.0), 200.0),
         ];
         let choose = |preference: Option<&str>, full: bool, exclude: bool| {
-            select_with(facts.clone(), &[], SelectOptions {
-                requirements: Some(ModelRequirements { iq: 90.0, eq: 20.0 }),
-                exclude_route_keys: if exclude { vec!["preferred/model".into()] } else { vec![] },
-                slots: Some(ConcurrencySlots::new(if full {
-                    vec![crate::slot_saturation::ConcurrencySlotState { key:"preferred/model".into(), running:1, limit:1, queued:1 }]
-                } else { vec![] }).with_preferred_capacity(preference.map(str::to_string))),
-                ..Default::default()
-            }).capacity_key
+            select_with(
+                facts.clone(),
+                &[],
+                SelectOptions {
+                    requirements: Some(ModelRequirements { iq: 90.0, eq: 20.0 }),
+                    exclude_route_keys: if exclude {
+                        vec!["preferred/model".into()]
+                    } else {
+                        vec![]
+                    },
+                    slots: Some(
+                        ConcurrencySlots::new(if full {
+                            vec![crate::slot_saturation::ConcurrencySlotState {
+                                key: "preferred/model".into(),
+                                running: 1,
+                                limit: 1,
+                                queued: 1,
+                            }]
+                        } else {
+                            vec![]
+                        })
+                        .with_preferred_capacity(preference.map(str::to_string)),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .capacity_key
         };
         assert_eq!(choose(None, false, false), "cheap/model");
-        assert_eq!(choose(Some("preferred/model"), false, false), "preferred/model");
-        assert_eq!(choose(Some("inadequate/model"), false, false), "cheap/model");
+        assert_eq!(
+            choose(Some("preferred/model"), false, false),
+            "preferred/model"
+        );
+        assert_eq!(
+            choose(Some("inadequate/model"), false, false),
+            "cheap/model"
+        );
         assert_eq!(choose(Some("preferred/model"), false, true), "cheap/model");
         assert_eq!(choose(Some("preferred/model"), true, false), "cheap/model");
     }

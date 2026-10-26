@@ -154,8 +154,10 @@ pub fn pick_unsaturated(
         return (0, None);
     };
     if let Some(preferred) = slots.preferred_capacity_key.as_deref() {
-        if let Some(index) = ordered.iter().position(|(_, capacity)| *capacity == preferred
-            && slots.saturated(capacity).is_none()) {
+        if let Some(index) = ordered
+            .iter()
+            .position(|(_, capacity)| *capacity == preferred && slots.saturated(capacity).is_none())
+        {
             return (index, None);
         }
     }
