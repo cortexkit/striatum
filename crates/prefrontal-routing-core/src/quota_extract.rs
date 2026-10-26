@@ -363,14 +363,7 @@ pub fn account_rate_windows(
             .filter(|(_, pool, _)| {
                 capacity_key.is_none_or(|key| antigravity_pool_for_capacity(key) == Some(*pool))
             })
-            .filter_map(|(extra, _, period)| {
-                let mut window = extra.window.clone()?;
-                window.window_kind = extra.window_kind.clone().or(window.window_kind);
-                window.window_minutes = window
-                    .window_minutes
-                    .or(Some((period.window_ms() / 60_000.0) as i64));
-                Some(("extra", window))
-            })
+            .filter_map(|(extra, _, period)| Some(("extra", pool_rate_window(extra, period)?)))
             .collect();
     }
     [
@@ -383,13 +376,49 @@ pub fn account_rate_windows(
     .collect()
 }
 
+/// A pool window's rate window, its period filling in a length or kind the
+/// producer left out.
+fn pool_rate_window(extra: &ExtraWindow, period: PoolPeriod) -> Option<RateWindow> {
+    let mut window = extra.window.clone()?;
+    window.window_kind = extra.window_kind.clone().or(window.window_kind);
+    window.window_minutes = window
+        .window_minutes
+        .or(Some((period.window_ms() / 60_000.0) as i64));
+    Some(window)
+}
+
+/// Every window of an account's whole reading, each with the pool it meters:
+/// a reading's pool windows when it carries any, each named by its pool, and
+/// otherwise its unnamed aggregate windows. Block recovery reads these, so a
+/// block on one pool can be lifted by that pool's window alone.
+pub fn named_account_windows(
+    usage: &crate::quota::Usage,
+) -> Vec<(Option<&'static str>, RateWindow)> {
+    let pools: Vec<_> = usage
+        .extra_rate_windows
+        .iter()
+        .flatten()
+        .filter_map(|extra| {
+            let (pool, period) = antigravity_pool_window(extra)?;
+            Some((Some(pool), pool_rate_window(extra, period)?))
+        })
+        .collect();
+    if !pools.is_empty() {
+        return pools;
+    }
+    [&usage.primary, &usage.secondary, &usage.tertiary]
+        .into_iter()
+        .filter_map(|window| window.as_ref().map(|window| (None, window.clone())))
+        .collect()
+}
+
 pub fn is_account_pool_window(extra: &ExtraWindow) -> bool {
     antigravity_pool_window(extra).is_some()
 }
 
-/// A reading that carries `extra_rate_windows` (Antigravity, for one): its
-/// aggregate windows are ignored, because a pooled account's aggregate reflects
-/// pools the routed models may not draw on. Pool windows (`gemini-5h`,
+/// The windows of a pooled or per-model reading (Antigravity, for one), whose
+/// aggregate windows are ignored because they reflect pools the routed models
+/// may not draw on. Pool windows (`gemini-5h`,
 /// `3p-weekly`, ...) are emitted pool-scoped, so they pressure and wall exactly
 /// the routed models that draw on that pool. Any other window is mapped by
 /// title to its matching capacity key, capacity-key-scoped; unmatched titles
@@ -444,25 +473,27 @@ fn extra_window_extractor(
 }
 
 /// Extract the windows for one provider-usage entry by the reading's shape,
-/// never by provider id: a reading carrying a non-empty `extra_rate_windows`
-/// list yields its pool and per-model windows, and any other reading its
-/// aggregate windows. So the same reading body yields the same windows under
-/// any provider id.
+/// never by provider id. A reading whose `extra_rate_windows` carry pool
+/// windows, or per-model windows whose titles name routed capacities, yields
+/// those windows and its aggregate is ignored. Any other reading yields its
+/// aggregate windows, so extra windows that name neither (such as a family's
+/// scoped window beside the aggregates) leave a reading aggregate. The same
+/// reading body yields the same pools under any provider id.
 pub fn extract_windows(
     entry: &ProviderUsage,
     cb_provider_name: &str,
     capacity_keys: &[String],
 ) -> Vec<ExtractedWindow> {
-    match entry
+    let extra = entry
         .usage
         .as_ref()
         .and_then(|usage| usage.extra_rate_windows.as_deref())
-    {
-        Some(extra) if !extra.is_empty() => {
-            extra_window_extractor(extra, cb_provider_name, capacity_keys)
-        }
-        _ => aggregate_account_extractor(entry, cb_provider_name),
+        .unwrap_or_default();
+    let per_model = extra_window_extractor(extra, cb_provider_name, capacity_keys);
+    if !per_model.is_empty() || extra.iter().any(is_account_pool_window) {
+        return per_model;
     }
+    aggregate_account_extractor(entry, cb_provider_name)
 }
 
 // ── minimal RFC3339 parse (no chrono dep in -core) ─────────────────────────
@@ -1229,17 +1260,26 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let first = pools(&two_pool_entry("antigravity"), "antigravity");
-        let names: std::collections::BTreeSet<_> =
-            first.iter().filter_map(|(pool, _, _)| pool.clone()).collect();
+        let names: std::collections::BTreeSet<_> = first
+            .iter()
+            .filter_map(|(pool, _, _)| pool.clone())
+            .collect();
         assert_eq!(
             names,
             ["3p".to_string(), "gemini".to_string()].into(),
             "two pools, neither named five_hour nor seven_day"
         );
-        assert_eq!(first.len(), 4, "each pool keeps its five-hour and weekly window");
+        assert_eq!(
+            first.len(),
+            4,
+            "each pool keeps its five-hour and weekly window"
+        );
         // The same body under another provider name and wire name yields the
         // same pools: nothing here reads the provider.
-        assert_eq!(first, pools(&two_pool_entry("some-other-vendor"), "other-wire"));
+        assert_eq!(
+            first,
+            pools(&two_pool_entry("some-other-vendor"), "other-wire")
+        );
     }
 
     #[test]

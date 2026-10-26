@@ -16,8 +16,8 @@ use super::evidence::{hold_until, retry_after_with_jitter};
 use super::pools::{block_end, PoolKey, PoolScope};
 use super::types::{
     AccountRef, AccountRequest, AccountView, AdmissionState, AllocatorPolicy, AllocatorState,
-    ConversationAffinity, CredentialRecord, EpochMs, Fence, ModelFamily,
-    OperatorOverride, QuotaReading, ResetTime,
+    ConversationAffinity, CredentialRecord, EpochMs, Fence, ModelFamily, OperatorOverride,
+    QuotaReading, ResetTime,
 };
 
 fn previous_pin(affinity: &ConversationAffinity) -> PreviousPin {
@@ -538,16 +538,13 @@ impl<'a> Allocator<'a> {
         }
         // Standing blocks last, so that at an equal reset a confirmed block,
         // not a reading, is named as the hold's basis.
-        blockers.extend(fences
-            .iter()
-            .map(|fence| Blocker {
-                reset: fence.reset,
-                basis: HoldBasis::ConfirmedFence,
-                leave: InvalidationReason::ConfirmedExhaustion {
-                    pool: fence.pool.clone(),
-                },
-            }),
-        );
+        blockers.extend(fences.iter().map(|fence| Blocker {
+            reset: fence.reset,
+            basis: HoldBasis::ConfirmedFence,
+            leave: InvalidationReason::ConfirmedExhaustion {
+                pool: fence.pool.clone(),
+            },
+        }));
         // The hold rule (design, "Accounts"): the window that blocks
         // continuation decides, whatever kind of window it is. With several,
         // the account frees only when the last of them resets, so a blocker

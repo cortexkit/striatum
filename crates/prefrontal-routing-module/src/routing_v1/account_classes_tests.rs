@@ -150,9 +150,11 @@ fn assert_credential(reply: &(FrameType, Value), credential: &str) {
 }
 
 fn exhaust_oauth(harness: &Harness, provider: &str) {
+    let scope = FenceScope::General(GeneralWindow::FiveHour);
     let fence = Fence {
         account_id: "oauth-account".into(),
-        scope: FenceScope::General(GeneralWindow::FiveHour),
+        pool: Some(scope.into()),
+        recovery_set: Vec::new(),
         observed_at_ms: NOW as i64,
         reset: ResetTime::At(NOW as i64 + 600_000),
         retry_hint_ms: None,
@@ -165,7 +167,7 @@ fn exhaust_oauth(harness: &Harness, provider: &str) {
                 fence_id: "class-fence".into(),
                 provider: provider.into(),
                 account_id: fence.account_id.clone(),
-                scope_json: serde_json::to_string(&fence.scope).unwrap(),
+                scope_json: serde_json::to_string(&scope).unwrap(),
                 fence_json: serde_json::to_string(&fence).unwrap(),
                 source: "broca_limit_exhausted".into(),
                 observed_at: NOW as i64,

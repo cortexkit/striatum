@@ -296,7 +296,8 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
             };
             // A report naming no pool blocks the whole account, whatever
             // provider it came from.
-            let pool = PoolKey::for_report(limit_window.as_deref(), pool.as_deref(), *requested_family);
+            let pool =
+                PoolKey::for_report(limit_window.as_deref(), pool.as_deref(), *requested_family);
             fence(
                 pool,
                 *observed_at_ms,

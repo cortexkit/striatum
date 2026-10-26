@@ -37,9 +37,7 @@ pub fn validate_pool_name(name: &str) -> Result<(), String> {
         .chars()
         .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')))
     {
-        return Err(format!(
-            "a pool name uses only [a-z0-9._-], found {bad:?}"
-        ));
+        return Err(format!("a pool name uses only [a-z0-9._-], found {bad:?}"));
     }
     Ok(())
 }
@@ -601,15 +599,25 @@ mod tests {
             Some(key(Some(300), PoolScope::EveryModel, Some("gemini"))),
             ResetTime::Missing,
         );
-        assert!(gemini.applies_to("antigravity-gemini-3.6-flash", ModelFamily::Other, Some("gemini")));
+        assert!(gemini.applies_to(
+            "antigravity-gemini-3.6-flash",
+            ModelFamily::Other,
+            Some("gemini")
+        ));
         assert!(!gemini.applies_to("antigravity-claude-opus", ModelFamily::Other, Some("3p")));
         assert!(block(None, ResetTime::Missing).applies_to("any", ModelFamily::Other, Some("3p")));
     }
 
     #[test]
     fn named_pools_of_equal_length_and_scope_stay_separate() {
-        let a = block(Some(key(Some(300), PoolScope::EveryModel, Some("a"))), ResetTime::Missing);
-        let only_b = reading(NOW - MINUTE, &[(Some("b"), 300, 10.0), (Some("a"), 300, 100.0)]);
+        let a = block(
+            Some(key(Some(300), PoolScope::EveryModel, Some("a"))),
+            ResetTime::Missing,
+        );
+        let only_b = reading(
+            NOW - MINUTE,
+            &[(Some("b"), 300, 10.0), (Some("a"), 300, 100.0)],
+        );
         assert_eq!(ends(&a, &only_b), None, "headroom in b never lifts a");
         let a_free = reading(NOW - MINUTE, &[(Some("a"), 300, 10.0)]);
         assert_eq!(ends(&a, &a_free), Some(BlockEnd::Reading));
@@ -621,9 +629,15 @@ mod tests {
     #[test]
     fn named_unknown_length_pools_stay_separate_and_lift_by_name_once_a_length_is_stated() {
         let scope = PoolScope::Family(ModelFamily::Opus);
-        let x = block(Some(key(None, scope.clone(), Some("x"))), ResetTime::Missing);
+        let x = block(
+            Some(key(None, scope.clone(), Some("x"))),
+            ResetTime::Missing,
+        );
         let y = block(Some(key(None, scope, Some("y"))), ResetTime::Missing);
-        let x_free = reading(NOW - MINUTE, &[(Some("x"), 1440, 5.0), (Some("y"), 1440, 100.0)]);
+        let x_free = reading(
+            NOW - MINUTE,
+            &[(Some("x"), 1440, 5.0), (Some("y"), 1440, 100.0)],
+        );
         assert_eq!(ends(&x, &x_free), Some(BlockEnd::Reading));
         assert_eq!(ends(&y, &x_free), None, "headroom in x never lifts y");
     }
@@ -648,9 +662,20 @@ mod tests {
             ResetTime::At(NOW + 3 * HOUR),
         );
         let free = |observed_at| reading(observed_at, &[(None, 10080, 10.0)]);
-        assert_eq!(ends(&fence, &free(fence.observed_at_ms + 1)), Some(BlockEnd::Reading));
-        assert_eq!(ends(&fence, &free(fence.observed_at_ms - 1)), None, "older headroom");
-        assert_eq!(ends(&fence, &free(fence.observed_at_ms)), None, "equal timestamps");
+        assert_eq!(
+            ends(&fence, &free(fence.observed_at_ms + 1)),
+            Some(BlockEnd::Reading)
+        );
+        assert_eq!(
+            ends(&fence, &free(fence.observed_at_ms - 1)),
+            None,
+            "older headroom"
+        );
+        assert_eq!(
+            ends(&fence, &free(fence.observed_at_ms)),
+            None,
+            "equal timestamps"
+        );
         // Later than the block but 20 minutes old is not fresh.
         let mut late = fence.clone();
         late.observed_at_ms = NOW - 30 * MINUTE;
@@ -680,7 +705,12 @@ mod tests {
         let mut hinted = unknown.clone();
         hinted.retry_hint_ms = Some(unknown.observed_at_ms + 30 * MINUTE);
         assert_eq!(
-            block_end(&hinted, None, unknown.observed_at_ms + 30 * MINUTE - 1, &policy),
+            block_end(
+                &hinted,
+                None,
+                unknown.observed_at_ms + 30 * MINUTE - 1,
+                &policy
+            ),
             None
         );
         assert_eq!(
@@ -697,7 +727,10 @@ mod tests {
         whole.recovery_set = vec![p, q];
         let at = NOW - MINUTE;
         assert_eq!(
-            ends(&whole, &reading(at, &[(Some("p"), 300, 10.0), (Some("q"), 300, 20.0)])),
+            ends(
+                &whole,
+                &reading(at, &[(Some("p"), 300, 10.0), (Some("q"), 300, 20.0)])
+            ),
             Some(BlockEnd::Reading)
         );
         for partial in [
@@ -715,7 +748,10 @@ mod tests {
             Some(BlockEnd::Reading)
         );
         assert_eq!(
-            ends(&empty, &reading(at, &[(Some("p"), 300, 10.0), (None, 10080, 99.5)])),
+            ends(
+                &empty,
+                &reading(at, &[(Some("p"), 300, 10.0), (None, 10080, 99.5)])
+            ),
             None,
             "a window inside its reserve"
         );
@@ -742,14 +778,21 @@ mod tests {
             resets_at: ResetTime::Missing,
         }]);
         assert_eq!(ends(&fence, &spent), None);
-        assert_eq!(ends(&fence, &reading(NOW - MINUTE, &[])), None, "at least one window");
+        assert_eq!(
+            ends(&fence, &reading(NOW - MINUTE, &[])),
+            None,
+            "at least one window"
+        );
     }
 
     #[test]
     fn a_later_reading_adds_the_keys_it_reports_to_the_recovery_set() {
         let policy = AllocatorPolicy::default();
         let whole = block(None, ResetTime::Missing);
-        let first = reading(NOW - MINUTE, &[(Some("p"), 300, 10.0), (Some("q"), 300, 100.0)]);
+        let first = reading(
+            NOW - MINUTE,
+            &[(Some("p"), 300, 10.0), (Some("q"), 300, 100.0)],
+        );
         let grown = grown_recovery_set(&whole, Some(&first), NOW, &policy).expect("grows");
         assert_eq!(grown.len(), 2);
         let mut stored = whole.clone();
@@ -757,7 +800,10 @@ mod tests {
         // The next reading omits q, so it no longer lifts the block.
         let second = reading(NOW, &[(Some("p"), 300, 10.0)]);
         assert_eq!(block_end(&stored, Some(&second), NOW, &policy), None);
-        assert_eq!(grown_recovery_set(&stored, Some(&second), NOW, &policy), None);
+        assert_eq!(
+            grown_recovery_set(&stored, Some(&second), NOW, &policy),
+            None
+        );
         // An older reading adds nothing.
         let older = reading(whole.observed_at_ms - 1, &[(Some("r"), 300, 10.0)]);
         assert_eq!(grown_recovery_set(&whole, Some(&older), NOW, &policy), None);

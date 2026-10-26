@@ -9,9 +9,9 @@ mod accounts_support;
 use accounts_support::*;
 use prefrontal_routing_core::accounts::{
     decide, AccountRef, AdmissionState, AdmitReason, AffinityNote, AffinityOutcome, AgeBand,
-    ApplicableWindow, CallerKind, CredentialRecord, Decision, ExclusionReason, FenceScope, PoolKey,
+    ApplicableWindow, CallerKind, CredentialRecord, Decision, ExclusionReason, FenceScope,
     GeneralWindow, HoldBasis, ImportNote, InvalidationReason, ModelFamily, ModelReach,
-    OperatorOverride, OverrideNote, PreviousPin, PrincipalExclusion, RefusalCode,
+    OperatorOverride, OverrideNote, PoolKey, PreviousPin, PrincipalExclusion, RefusalCode,
     RequestedAccountIgnored, RequestedAccountNote, ResetTime, ScopedList, ScopedListState,
     ScopedWindow, StaleDisclosure,
 };
@@ -671,7 +671,13 @@ fn any_blocking_window_holds_within_the_bound_and_moves_beyond_it() {
         st.affinity = Some(affinity("acct-a", model, 3));
         st
     };
-    let seven_day = |reset| fence("acct-a", FenceScope::General(GeneralWindow::SevenDay), reset);
+    let seven_day = |reset| {
+        fence(
+            "acct-a",
+            FenceScope::General(GeneralWindow::SevenDay),
+            reset,
+        )
+    };
     // A 7-day window resetting in 10 minutes holds.
     let mut st = pool("claude-sonnet-5");
     st.fences.push(seven_day(ResetTime::At(NOW + 10 * MINUTE)));
@@ -725,7 +731,11 @@ fn a_block_ends_at_its_reset_or_on_newer_headroom() {
         let mut fresh = reading(0.0, seven_used);
         fresh.observed_at_ms = Some(observed_at_ms);
         let mut st = state(vec![account("acct-a", Some(fresh))]);
-        let mut block = fence("acct-a", FenceScope::General(GeneralWindow::SevenDay), reset);
+        let mut block = fence(
+            "acct-a",
+            FenceScope::General(GeneralWindow::SevenDay),
+            reset,
+        );
         block.observed_at_ms = NOW - 2 * MINUTE;
         st.fences.push(block);
         st
@@ -1684,7 +1694,11 @@ fn every_decision_is_machine_readable() {
 #[test]
 fn an_exhausted_pool_leaves_the_other_pools_models_selectable() {
     let mut st = state(vec![account("acct-a", Some(reading(10.0, 10.0)))]);
-    let mut gemini = fence("acct-a", FenceScope::General(GeneralWindow::FiveHour), ResetTime::Missing);
+    let mut gemini = fence(
+        "acct-a",
+        FenceScope::General(GeneralWindow::FiveHour),
+        ResetTime::Missing,
+    );
     gemini.pool = Some(PoolKey {
         window_minutes: Some(300),
         scope: prefrontal_routing_core::accounts::PoolScope::EveryModel,
@@ -1713,19 +1727,35 @@ fn without_readings_a_block_ends_at_its_reset_or_its_retry_time() {
         st.fences.push(block);
         decide(&request(), &st, at)
     };
-    let mut whole = fence("acct-a", FenceScope::General(GeneralWindow::FiveHour), ResetTime::Missing);
+    let mut whole = fence(
+        "acct-a",
+        FenceScope::General(GeneralWindow::FiveHour),
+        ResetTime::Missing,
+    );
     whole.pool = None;
     let six_hours = NOW + 6 * HOUR;
-    assert_eq!(refused(&blocked(whole.clone(), six_hours - 1)), RefusalCode::AccountPoolExhausted);
+    assert_eq!(
+        refused(&blocked(whole.clone(), six_hours - 1)),
+        RefusalCode::AccountPoolExhausted
+    );
     assert_eq!(admitted(&blocked(whole.clone(), six_hours)), "acct-a");
 
     let mut hinted = whole.clone();
     hinted.retry_hint_ms = Some(NOW + 30 * MINUTE);
-    assert_eq!(refused(&blocked(hinted.clone(), NOW + 29 * MINUTE)), RefusalCode::AccountPoolExhausted);
+    assert_eq!(
+        refused(&blocked(hinted.clone(), NOW + 29 * MINUTE)),
+        RefusalCode::AccountPoolExhausted
+    );
     assert_eq!(admitted(&blocked(hinted, NOW + 30 * MINUTE)), "acct-a");
 
     let mut reset = whole;
     reset.reset = ResetTime::At(NOW + 10 * MINUTE);
-    assert_eq!(refused(&blocked(reset.clone(), NOW + 10 * MINUTE)), RefusalCode::AccountPoolExhausted);
-    assert_eq!(admitted(&blocked(reset, NOW + 10 * MINUTE + 1000)), "acct-a");
+    assert_eq!(
+        refused(&blocked(reset.clone(), NOW + 10 * MINUTE)),
+        RefusalCode::AccountPoolExhausted
+    );
+    assert_eq!(
+        admitted(&blocked(reset, NOW + 10 * MINUTE + 1000)),
+        "acct-a"
+    );
 }

@@ -215,11 +215,7 @@ fn reset_vectors_hold_exact_bounds() {
     assert_eq!(rows.len(), 7);
     for row in rows {
         let id = row["id"].as_str().unwrap();
-        let held = hold_until(
-            reset_from(&row["resetsAt"]),
-            NOW,
-            policy.short_hold_max_ms,
-        );
+        let held = hold_until(reset_from(&row["resetsAt"]), NOW, policy.short_hold_max_ms);
         let expected = &row["decision"];
         match expected["action"].as_str().unwrap() {
             "hold" => {
@@ -592,7 +588,11 @@ fn broca_limit_windows_map_to_pool_keys_and_retry_after_is_not_a_reset() {
     assert_eq!(seven.pool, Some(PoolKey::general(GeneralWindow::SevenDay)));
     // An exhaustion naming no pool blocks the whole account, whatever the
     // provider (a ChatGPT `usage_limit_reached` names none either).
-    let windowless = confirmed(confirm_exhaustion(&broca(None, None, Some(ResetSource::Header))));
+    let windowless = confirmed(confirm_exhaustion(&broca(
+        None,
+        None,
+        Some(ResetSource::Header),
+    )));
     assert_eq!(windowless.pool, None);
     let hinted = confirmed(confirm_exhaustion(&broca(
         Some("five_hour"),
@@ -613,7 +613,11 @@ fn broca_limit_windows_map_to_pool_keys_and_retry_after_is_not_a_reset() {
         })
     );
     // The report's pool member names the pool; its window gives the length.
-    let pooled = confirmed(confirm_exhaustion(&broca(Some("seven_day"), Some("3p"), None)));
+    let pooled = confirmed(confirm_exhaustion(&broca(
+        Some("seven_day"),
+        Some("3p"),
+        None,
+    )));
     assert_eq!(
         pooled.pool,
         Some(PoolKey {
