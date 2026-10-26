@@ -124,7 +124,6 @@ mod consumer_and_pin {
                 &self.path,
                 &self.path,
                 &credentials,
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();

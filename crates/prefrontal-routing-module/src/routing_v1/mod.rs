@@ -99,7 +99,6 @@ pub(crate) struct Deps<'a> {
     pub routing_config_path: &'a Path,
     pub operator_config_path: &'a Path,
     pub broca_credentials: &'a SharedBrocaCredentials,
-    pub opencode_auth_path: &'a Path,
 }
 
 /// The caller of one request, read from its route.

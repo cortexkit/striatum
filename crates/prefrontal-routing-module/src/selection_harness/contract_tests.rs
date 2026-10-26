@@ -60,7 +60,6 @@ impl HarnessRig {
             &self.config,
             &self.config,
             credentials,
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();

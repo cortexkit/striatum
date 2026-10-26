@@ -119,7 +119,6 @@ async fn session_authority_requires_a_current_head_scope_and_verified_host_capab
         routing_config_path: path,
         operator_config_path: path,
         broca_credentials: &credentials,
-        opencode_auth_path: path,
     };
     assert_eq!(
         super::accounts::account_for(&request("stale"), &caller, &deps)

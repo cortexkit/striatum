@@ -69,7 +69,6 @@ mod class_panel_policy {
                 &self.path,
                 &self.path,
                 &empty_broca_credentials(),
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();

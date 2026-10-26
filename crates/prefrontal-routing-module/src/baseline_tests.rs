@@ -63,7 +63,6 @@ struct World {
     dir: PathBuf,
     store: SharedStore,
     config_path: PathBuf,
-    auth_path: PathBuf,
     credentials: SharedBrocaCredentials,
     quota_cache: SharedQuotaCache,
 }
@@ -107,8 +106,6 @@ impl World {
         fixture_config["consumers"]["codemode"]["owner"] = json!("prefrontal-core");
         crate::test_config::write(&config_path, serde_json::to_vec(&fixture_config).unwrap())
             .unwrap();
-        let auth_path = dir.join("auth.json");
-        std::fs::write(&auth_path, baseline["auth_json"].to_string()).unwrap();
 
         let listing = decode_listing(baseline["credential_listing"].clone()).await;
         let mapped: HashSet<String> = listing
@@ -162,7 +159,6 @@ impl World {
             dir,
             store,
             config_path,
-            auth_path,
             credentials: Arc::new(Mutex::new(credentials)),
             quota_cache: Arc::new(Mutex::new(cache)),
         }
@@ -191,7 +187,6 @@ impl World {
             &self.config_path,
             &self.config_path,
             &self.credentials,
-            &self.auth_path,
         )
         .await
         .expect("the handler answers");
@@ -230,7 +225,6 @@ impl World {
                 routing_config_path: &self.config_path,
                 operator_config_path: &self.config_path,
                 broca_credentials: &self.credentials,
-                opencode_auth_path: &self.auth_path,
             },
         )
         .await

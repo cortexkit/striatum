@@ -928,7 +928,6 @@ mod tests {
         let resolved = crate::resolve_select_request(
             &params,
             &Default::default(),
-            Path::new("/unused/host-auth.json"),
         )
         .unwrap();
         let sub: std::collections::HashSet<String> =

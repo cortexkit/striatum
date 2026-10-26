@@ -1283,8 +1283,6 @@ where
     let override_path = config_overrides::config_path();
     // Selection policy and model-fact overrides share the routing-owned file.
     let operator_config_path = override_path.clone();
-    // OpenCode owns this file; routing reads only each provider's auth kind.
-    let opencode_auth_path = config_overrides::auth_json_path();
     config_overrides::live_config(&override_path);
     loops.spawn(
         "config refresh",
@@ -1338,7 +1336,6 @@ where
             &override_path,
             &operator_config_path,
             &broca_credentials,
-            &opencode_auth_path,
             &catalog_health,
         )
         .await?
@@ -1436,7 +1433,6 @@ async fn handle_frame(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
-    opencode_auth_path: &Path,
     catalog_health: &SharedCatalogHealth,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
@@ -1487,7 +1483,6 @@ async fn handle_frame(
             let routing_config_path = routing_config_path.to_path_buf();
             let operator_config_path = operator_config_path.to_path_buf();
             let broca_credentials = Arc::clone(broca_credentials);
-            let opencode_auth_path = opencode_auth_path.to_path_buf();
             let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
             tokio::spawn(async move {
                 answer_route_request(
@@ -1510,7 +1505,6 @@ async fn handle_frame(
                                     routing_config_path: &routing_config_path,
                                     operator_config_path: &operator_config_path,
                                     broca_credentials: &broca_credentials,
-                                    opencode_auth_path: &opencode_auth_path,
                                 },
                             )
                             .await;
@@ -1525,7 +1519,6 @@ async fn handle_frame(
                             &routing_config_path,
                             &operator_config_path,
                             &broca_credentials,
-                            &opencode_auth_path,
                         )
                         .await
                     },
@@ -2023,7 +2016,6 @@ struct ResolvedSelectRequest {
 /// each serving credential directly from the vault in the shared candidate pass.
 fn provider_auth_types(
     raw: Option<&HashMap<String, String>>,
-    _opencode_auth_path: &Path,
 ) -> HashMap<String, String> {
     raw.cloned().unwrap_or_default()
 }
@@ -2188,13 +2180,11 @@ fn no_route_error(
 fn resolve_select_request(
     params: &SelectParams,
     operator_policy: &ModelRoutingPolicyInput,
-    opencode_auth_path: &Path,
 ) -> Result<ResolvedSelectRequest, NoRouteError> {
     resolve_select_request_with_catalog_targets(
         params,
         operator_policy,
         &std::collections::BTreeMap::new(),
-        opencode_auth_path,
     )
 }
 
@@ -2205,7 +2195,6 @@ fn resolve_select_request_with_catalog_targets(
     params: &SelectParams,
     operator_policy: &ModelRoutingPolicyInput,
     catalog_targets: &std::collections::BTreeMap<String, String>,
-    opencode_auth_path: &Path,
 ) -> Result<ResolvedSelectRequest, NoRouteError> {
     let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
         (requirements, params.required_capabilities)
@@ -2253,7 +2242,7 @@ fn resolve_select_request_with_catalog_targets(
         params.available_models.iter().cloned(),
         &availability_policy,
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
+        &provider_auth_types(params.provider_auth_types.as_ref()),
         catalog_targets,
     );
     let uses_host_availability = (params.executor.is_some() || params.is_host_run())
@@ -3132,7 +3121,6 @@ async fn handle_resolve_policy(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     operator_config_path: &Path,
-    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -3160,7 +3148,7 @@ async fn handle_resolve_policy(
         params.available_models,
         &operator_policy,
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
+        &provider_auth_types(params.provider_auth_types.as_ref()),
     );
     let body = serde_json::to_vec(&json!({ "result": resolved })).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
@@ -3672,7 +3660,6 @@ async fn handle_select_request(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
-    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let timing = RouteSelectTimingGuard::new();
     let live_config_started = Instant::now();
@@ -3844,7 +3831,7 @@ async fn handle_select_request(
         return handle_route_decisions_list(frame, writer, store).await;
     }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
-        return handle_resolve_policy(frame, writer, operator_config_path, opencode_auth_path)
+        return handle_resolve_policy(frame, writer, operator_config_path)
             .await;
     }
     if envelope.method == ROUTE_MODEL_FACT_OP {
@@ -3868,7 +3855,6 @@ async fn handle_select_request(
             writer,
             store,
             operator_config_path,
-            opencode_auth_path,
         )
         .await;
     }
@@ -3997,7 +3983,6 @@ async fn handle_select_request(
             routing_config_path,
             operator_config_path,
             broca_credentials,
-            opencode_auth_path,
         )
         .await;
     }
@@ -4138,7 +4123,6 @@ async fn handle_select_request(
         &params,
         &operator_policy,
         &catalog_targets,
-        opencode_auth_path,
     ) {
         Ok(resolved) => {
             add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
@@ -5494,7 +5478,6 @@ async fn handle_select_panel(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
-    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -5582,7 +5565,7 @@ async fn handle_select_panel(
             ..ModelRoutingPolicyInput::default()
         },
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(None, opencode_auth_path),
+        &provider_auth_types(None),
         &catalog_targets,
     );
     let subscription_keys: HashSet<String> =
@@ -9275,7 +9258,6 @@ mod tests {
                     &config,
                     &config,
                     &credentials,
-                    &rig.dir.join("absent-auth.json"),
                 )
                 .await
                 .unwrap();
@@ -9303,15 +9285,14 @@ mod tests {
 
     #[test]
     fn an_auth_json_oauth_claim_is_not_a_non_host_auth_fact() {
-        let rig = Rig::new("ignored-auth-json");
-        let path = rig.dir.join("auth.json");
-        std::fs::write(&path, r#"{"example":{"type":"oauth"}}"#).unwrap();
-        assert!(provider_auth_types(None, &path).is_empty());
+        // Routing takes no auth file path at all: host auth kinds come only
+        // from the request.
+        assert!(provider_auth_types(None).is_empty());
         assert_eq!(
-            provider_auth_types(
-                Some(&HashMap::from([("example".into(), "apikey".into())])),
-                &path
-            )["example"],
+            provider_auth_types(Some(&HashMap::from([(
+                "example".into(),
+                "apikey".into()
+            )])))["example"],
             "apikey"
         );
     }
@@ -9733,7 +9714,6 @@ mod tests {
                     &rig.dir.join("routing.jsonc"),
                     &rig.dir.join("operator.jsonc"),
                     &broca_credentials,
-                    &rig.dir.join("auth.json"),
                     &catalog_health,
                 )
                 .await
@@ -9860,20 +9840,6 @@ mod tests {
         credentials
     }
 
-    /// An inert legacy auth path under the scratch root. Selection must not read
-    /// credential types from this file.
-    fn empty_opencode_auth() -> PathBuf {
-        static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        PATH.get_or_init(|| {
-            let path = prefrontal_test_support::scratch_root().join(format!(
-                "prefrontal-routing-empty-opencode-auth-{}.json",
-                std::process::id()
-            ));
-            std::fs::write(&path, "{}").unwrap();
-            path
-        })
-        .clone()
-    }
 
     fn test_operator_config() -> PathBuf {
         static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -9987,7 +9953,6 @@ mod tests {
             &test_operator_config(),
             operator_config_path,
             broca_credentials,
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -10049,9 +10014,6 @@ mod tests {
         );
         let credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
         let routing_config = config_overrides::config_path();
-        // The roster is non-secret metadata; never read the operator's secret
-        // OpenCode auth file in a replay. Subscription policy remains live.
-        let auth_path = empty_opencode_auth();
         let mut report = Vec::new();
         for (phase, cache) in [
             ("before_ordinary_catalog", &before_credentials),
@@ -10104,7 +10066,6 @@ mod tests {
                     &routing_config,
                     &routing_config,
                     cache,
-                    &auth_path,
                 )
                 .await
                 .unwrap();
@@ -11717,7 +11678,6 @@ mod tests {
             &test_operator_config(),
             operator_config_path,
             &catalog_broca_credentials(&store),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -11762,7 +11722,6 @@ mod tests {
             &test_operator_config(),
             &test_operator_config(),
             &catalog_broca_credentials(&store),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -11859,7 +11818,6 @@ mod tests {
             &test_operator_config(),
             &test_operator_config(),
             &catalog_broca_credentials(&store),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -12517,7 +12475,6 @@ mod tests {
             &test_operator_config(),
             &test_operator_config(),
             &catalog_broca_credentials(store),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -12602,7 +12559,6 @@ mod tests {
             &test_operator_config(),
             &test_operator_config(),
             &catalog_broca_credentials(&store),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -12710,7 +12666,6 @@ mod tests {
             &Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
                 &quota_decides_facts(),
             ))),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -12788,7 +12743,6 @@ mod tests {
             &test_operator_config(),
             &test_operator_config(),
             &catalog_broca_credentials(store),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -14008,7 +13962,6 @@ mod tests {
                 &test_operator_config(),
                 &test_operator_config(),
                 &catalog_broca_credentials(&store),
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -14351,7 +14304,6 @@ mod tests {
                 &test_operator_config(),
                 &test_operator_config(),
                 &broca_credentials,
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -14412,7 +14364,6 @@ mod tests {
             &test_operator_config(),
             &test_operator_config(),
             credentials,
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -14973,7 +14924,6 @@ mod tests {
             &test_operator_config(),
             &test_operator_config(),
             &empty_broca_credentials(),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -15742,7 +15692,6 @@ mod tests {
                     &config,
                     &config,
                     &credentials,
-                    &empty_opencode_auth(),
                 )
                 .await
                 .unwrap();
@@ -17333,7 +17282,6 @@ mod tests {
                 path,
                 path,
                 credentials,
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -17428,7 +17376,6 @@ mod tests {
                 config_path,
                 &test_operator_config(),
                 &catalog_broca_credentials(store),
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -18436,7 +18383,6 @@ mod tests {
                 &rig.dir.join("routing.jsonc"),
                 &rig.dir.join("operator.jsonc"),
                 &empty_broca_credentials(),
-                &rig.dir.join("auth.json"),
                 &Arc::new(Mutex::new(CatalogReachHealth::new(600_000))),
             )
             .await

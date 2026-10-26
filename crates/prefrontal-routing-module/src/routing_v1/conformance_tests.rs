@@ -57,7 +57,6 @@ pub(super) struct Harness {
     quota_cache: SharedQuotaCache,
     broca_credentials: Mutex<SharedBrocaCredentials>,
     catalog_health: crate::SharedCatalogHealth,
-    auth_path: PathBuf,
     /// The routing configuration file requests read. Every change is written
     /// to a new file so no cached reading of an older one is ever served.
     config_path: Mutex<PathBuf>,
@@ -102,8 +101,6 @@ impl Harness {
             }
             .unwrap(),
         );
-        let auth_path = dir.join("auth.json");
-        std::fs::write(&auth_path, "{}").unwrap();
         let harness = Arc::new(Self {
             store,
             quota_cache: Arc::new(Mutex::new(QuotaCache::default())),
@@ -111,7 +108,6 @@ impl Harness {
                 BrocaCredentials::api_test_credentials(&[]),
             ))),
             catalog_health: Arc::new(Mutex::new(CatalogReachHealth::new(600_000))),
-            auth_path,
             config_path: Mutex::new(dir.join("routing-0.jsonc")),
             config: Mutex::new(
                 crate::config_convert::convert_value(json!({
@@ -283,7 +279,6 @@ impl Harness {
             &config_path,
             &config_path,
             &broca_credentials,
-            &self.auth_path,
             &self.catalog_health,
         )
         .await
@@ -311,7 +306,6 @@ impl Harness {
                 routing_config_path: &config_path,
                 operator_config_path: &config_path,
                 broca_credentials: &credentials,
-                opencode_auth_path: &self.auth_path,
             },
         )
         .await
