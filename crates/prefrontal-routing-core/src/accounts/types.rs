@@ -433,7 +433,8 @@ pub struct AccountRequest {
     pub preferred_existing_account: Option<AccountRef>,
     pub hold_wait_max_s: u64,
     /// The quota pool the requested model draws on, as the runner or the
-    /// reading names it. `None` means the account is one pool.
+    /// reading names it. `None` means no pool is supplied or known for the
+    /// requested model, so every pool block in its scope applies.
     #[serde(default)]
     pub pool: Option<String>,
 }
