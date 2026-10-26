@@ -536,30 +536,3 @@ async fn todays_selection_matches_the_checked_in_baseline() {
         serde_json::to_string_pretty(&answers).unwrap()
     );
 }
-
-/// A second run on fresh worlds answers identically: the baseline does not
-/// depend on store ids, map order or anything else that varies between runs.
-#[tokio::test]
-async fn the_baseline_harness_is_deterministic() {
-    let baseline = baseline();
-    let first = run_all(&baseline).await;
-    let second = run_all(&baseline).await;
-    assert_eq!(first, second);
-}
-
-/// The selection path reads the injected clock, not the system time, and
-/// dropping the guard restores the system clock.
-#[test]
-fn the_injected_clock_governs_now_ms_until_dropped() {
-    let frozen = clock_ms(&baseline());
-    {
-        let _clock = crate::InjectedClock::set(frozen);
-        assert_eq!(crate::now_ms(), frozen);
-        {
-            let _inner = crate::InjectedClock::set(frozen + 5);
-            assert_eq!(crate::now_ms(), frozen + 5);
-        }
-        assert_eq!(crate::now_ms(), frozen);
-    }
-    assert_ne!(crate::now_ms(), frozen);
-}

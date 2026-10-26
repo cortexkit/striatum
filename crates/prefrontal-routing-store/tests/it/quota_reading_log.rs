@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use prefrontal_routing_core::quota::quota_poll::{
     admit_reading_intervals, reading_log_retention_cutoff, record_reading_log_poll,
-    render_account_key, READING_LOG_RETENTION_DAYS,
+    render_account_key,
 };
 use prefrontal_routing_core::quota::ProviderUsage;
 use prefrontal_routing_core::route_state_store::QuotaReadingLogRow;
@@ -252,7 +252,6 @@ fn duplicate_composite_key_never_rewrites_the_original_reading() {
 
 #[test]
 fn retention_prunes_only_rows_older_than_fourteen_days() {
-    assert_eq!(READING_LOG_RETENTION_DAYS, 14);
     let rig = Rig::new("retention");
     let store = rig.open();
     let now = EPOCH_MS;

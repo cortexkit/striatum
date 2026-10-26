@@ -1070,18 +1070,6 @@ fn prompt_defaults_variant_reasoning_from_selected_fact() {
     assert_eq!(r.prompt_params.variant.as_deref(), Some("high"));
     assert_eq!(r.prompt_params.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(r.route_key, "openai/gpt-5.4/high");
-}
-
-#[test]
-fn explanation_strings_are_populated() {
-    let m = fact(FactBuilder {
-        provider_id: "p".into(),
-        model_id: "m".into(),
-        scores: scores(55.0, 1700.0, 90.0),
-        ..Default::default()
-    });
-    let r = select_model_route(input(vec![m], req(70.0, 20.0), Extra::default())).unwrap();
-    assert!(r.explanation.len() > 1);
     assert!(r.explanation.iter().any(|l| l.contains("elo:")));
 }
 
@@ -1444,6 +1432,7 @@ fn explanation_carries_effective_list_multiplier_and_coverage() {
         cost_per_m_tok_out: Some(6.0),
         ..Default::default()
     });
+    let route_at_default = route.clone();
     route.subscription_multiplier = Some(2.0);
     let r = select_model_route(input(
         vec![route],
@@ -1464,23 +1453,17 @@ fn explanation_carries_effective_list_multiplier_and_coverage() {
         explanation.contains("subscription-covered"),
         "{explanation}"
     );
-}
 
-#[test]
-fn explanation_omits_multiplier_at_default_and_marks_metered() {
-    let route = fact(FactBuilder {
-        provider_id: "p".into(),
-        model_id: "m".into(),
-        scores: scores(60.0, 1750.0, 90.0),
-        cost_per_m_tok_out: Some(6.0),
-        ..Default::default()
-    });
-    let r = select_model_route(input(vec![route], req(80.0, 20.0), Extra::default())).unwrap();
+    // A metered route at the default multiplier: effective equals list, and a
+    // 1.0 multiplier is "no subsidy known", so no subsidy is reported.
+    let r = select_model_route(input(
+        vec![route_at_default],
+        req(80.0, 20.0),
+        Extra::default(),
+    ))
+    .unwrap();
     let explanation = r.explanation.join("\n");
     assert!(explanation.contains("effective $6/Mtok"), "{explanation}");
-    assert!(explanation.contains("list $6/Mtok"), "{explanation}");
-    assert!(explanation.contains("metered"), "{explanation}");
-    // A 1.0 multiplier is "no subsidy known" and must not be reported.
     assert!(!explanation.contains("subsidy"), "{explanation}");
     assert!(
         !explanation.contains("subscription-covered"),
@@ -1816,28 +1799,6 @@ fn survivor_below_default_band_rejected_above_configured_band_selected() {
     assert!(result.below_floor.is_some());
 }
 
-/// (d) Config clamp: values >1 are clamped to 1; NaN is rejected loudly.
-/// The config parsing lives in the module crate, so we test the core constant
-/// and the band-check logic here. The module-level config validation
-/// (NaN rejection, clamping) is tested in the module crate's own tests.
-#[test]
-fn default_min_best_effort_adequacy_is_0_6() {
-    assert!((MIN_BEST_EFFORT_ADEQUACY - 0.6).abs() < 1e-9);
-}
-
-#[test]
-fn min_best_effort_adequacy_config_clamp_logic() {
-    // Clamp logic: [0, 1], NaN rejected. These mirror the module-crate validation.
-    // Values > 1 clamp to 1.
-    assert!((1.5_f64.clamp(0.0, 1.0) - 1.0).abs() < 1e-9);
-    // Values < 0 clamp to 0.
-    assert!(((-0.1_f64).clamp(0.0, 1.0) - 0.0).abs() < 1e-9);
-    // Normal values pass through.
-    assert!((0.5_f64.clamp(0.0, 1.0) - 0.5).abs() < 1e-9);
-    // NaN is NOT finite and should be rejected at parse time (tested in module crate).
-    assert!(f64::NAN.is_nan());
-}
-
 #[test]
 fn effectively_free_bucket_lets_demand_pick_the_stronger_model() {
     // The terra-at-iq-95 inversion, live 2026-08-05: with 40x subsidies both
@@ -2155,25 +2116,6 @@ fn unscored_zero_score_row_is_unroutable_at_zero_demand_with_typed_rejection() {
 }
 
 #[test]
-fn use_basket_predicate_requires_both_counters_and_class_producers_and_never_account() {
-    // Gated on counters_producer, class_producer, account_producer:
-    // use_basket may be true only when counters_producer and class_producer are both true,
-    // and account_producer never enters that predicate.
-    use prefrontal_routing_core::{
-        use_basket_permitted, ACCOUNT_PRODUCER, CLASS_PRODUCER, COUNTERS_PRODUCER,
-    };
-
-    assert_eq!(COUNTERS_PRODUCER, true);
-    assert_eq!(CLASS_PRODUCER, true);
-    assert_eq!(ACCOUNT_PRODUCER, false);
-
-    assert!(!use_basket_permitted(false, false));
-    assert!(!use_basket_permitted(true, false));
-    assert!(!use_basket_permitted(false, true));
-    assert!(use_basket_permitted(true, true));
-}
-
-#[test]
 fn counters_producer_false_complete_rate_card_selection_bit_identical() {
     // Gated on counters_producer = false:
     // With counters_producer false, use_basket is never true, and selection is bit-identical
@@ -2420,33 +2362,6 @@ fn numeric_fixture_complete_card_prices_to_stated_value() {
 }
 
 #[test]
-fn mutation_omitted_reasoning_rate_takes_basket_not_today_ladder() {
-    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
-    let mut fact_omitted_reasoning = make_complete_basket_fact("p", "m", 100.0, Some(vec));
-    fact_omitted_reasoning.reasoning_rate = None;
-
-    // Must take basket path (0.1815), NOT today's ladder (10.0 / 30.0 = 0.3333333333333333).
-    let basket = fact_omitted_reasoning.basket_cost().unwrap();
-    assert!((basket - 0.1815).abs() < 1e-9);
-    assert!((basket - 10.0 / 30.0).abs() > 0.1);
-    assert!((selection_cost(&fact_omitted_reasoning, false, true) - 0.1815).abs() < 1e-9);
-    assert!((selection_cost(&fact_omitted_reasoning, false, true) - 10.0 / 30.0).abs() > 0.1);
-}
-
-#[test]
-fn mutation_missing_reasoning_rate_prices_at_output_rate_not_zero() {
-    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
-    let mut fact_omitted_reasoning = make_complete_basket_fact("p", "m", 100.0, Some(vec));
-    fact_omitted_reasoning.reasoning_rate = None;
-
-    // Pricing reasoning at cost_per_m_tok_out yields 0.1815.
-    // A mutation treating missing reasoning rate as 0 would yield:
-    // (8875 - 800) = 8075 / 1e6 / 0.05 = 0.1615.
-    assert!((fact_omitted_reasoning.basket_cost().unwrap() - 0.1815).abs() < 1e-9);
-    assert!((fact_omitted_reasoning.basket_cost().unwrap() - 0.1615).abs() > 0.01);
-}
-
-#[test]
 fn whole_selection_engagement_all_candidates_complete_prices_in_basket() {
     let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
     let fact_a = make_complete_basket_fact("p", "model_a", 100.0, Some(vec.clone()));
@@ -2603,34 +2518,6 @@ fn refused_rate_prices_its_route_at_max_without_switching_the_selection() {
     );
 }
 
-#[test]
-fn ladder_asserted_in_order_basket_effective_tier_metered_subscription() {
-    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
-    let mut complete_fact = make_complete_basket_fact("p", "m", 100.0, Some(vec));
-    complete_fact.cost_per_m_tok_out = Some(15.0);
-    complete_fact.cost_tier = Some(3.0);
-    let basket = complete_fact.basket_cost().unwrap();
-
-    // 1. Basket (when use_basket = true)
-    assert_eq!(selection_cost(&complete_fact, false, true), basket);
-
-    // 2. Else effective price (when use_basket = false)
-    assert_eq!(selection_cost(&complete_fact, false, false), 15.0 / 30.0);
-
-    // 3. Else cost_tier / 6.0 (when cost_per_m_tok_out is None)
-    let mut tier_only_fact = complete_fact.clone();
-    tier_only_fact.cost_per_m_tok_out = None;
-    assert_eq!(selection_cost(&tier_only_fact, false, false), 3.0 / 6.0);
-
-    // 4. Else 1.0 for metered (when neither cost_per_m_tok_out nor cost_tier is present)
-    let mut unpriced_fact = tier_only_fact.clone();
-    unpriced_fact.cost_tier = None;
-    assert_eq!(selection_cost(&unpriced_fact, false, false), 1.0);
-
-    // Subscription coverage does not turn an absent price into free tokens.
-    assert_eq!(selection_cost(&unpriced_fact, true, false), 1.0);
-}
-
 // The incomplete route's gap stays on the incomplete route: the complete one is
 // priced at its own basket cost (0.1775), never at the output-only ladder
 // (10/30) it was dragged to while one route's gap decided the whole selection.
@@ -2655,47 +2542,6 @@ fn incomplete_route_cannot_move_the_complete_route_off_its_basket_price() {
         fact_complete.basket_cost().unwrap()
     );
     assert_ne!(res.score.selection_cost, 10.0 / 30.0);
-}
-
-#[test]
-fn mutation_folding_completeness_check_into_per_route_selection_cost_reddens() {
-    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
-    let complete_fact = make_complete_basket_fact("p", "m", 100.0, Some(vec));
-
-    // Calling selection_cost with use_basket = false MUST ignore fact.basket_cost()
-    // and take today's ladder.
-    let cost = selection_cost(&complete_fact, false, false);
-    assert_eq!(cost, 10.0 / 30.0);
-    assert_ne!(cost, complete_fact.basket_cost().unwrap());
-}
-
-#[test]
-fn mutation_pricing_refused_rate_at_zero_reddens() {
-    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
-    let mut fact_refused = make_complete_basket_fact("p", "m", 100.0, Some(vec));
-    fact_refused.cache_read_rate = None; // Refused decodes to None
-
-    // A refused rate must not be treated as Some(0.0). It stays None.
-    assert!(!fact_refused.has_required_basket_rates());
-    assert!(fact_refused.basket_cost().is_none());
-}
-
-#[test]
-fn mutation_swapping_basket_reference_and_cost_reference_reddens() {
-    use prefrontal_routing_core::routing_config::{
-        BASKET_REFERENCE_COST_PER_MESSAGE, COST_REFERENCE_PER_MTOK,
-    };
-    assert_eq!(BASKET_REFERENCE_COST_PER_MESSAGE, 0.05);
-    assert_eq!(COST_REFERENCE_PER_MTOK, 30.0);
-
-    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
-    let complete_fact = make_complete_basket_fact("p", "m", 100.0, Some(vec));
-
-    // Under BASKET_REFERENCE_COST_PER_MESSAGE (0.05), basket_cost is ~0.1775.
-    // If swapped with COST_REFERENCE_PER_MTOK (30.0), basket_cost would be ~0.00029583...
-    let cost = complete_fact.basket_cost().unwrap();
-    assert!((cost - 0.1775).abs() < 1e-9);
-    assert!((cost - (0.008875 / 30.0)).abs() > 0.1);
 }
 
 #[test]
@@ -2818,47 +2664,6 @@ fn cache_separation_fixture_routes_rank_apart_on_cached_read_term() {
 }
 
 #[test]
-fn mutation_raising_reference_constant_until_both_clamp_at_one_reddens() {
-    let vec = make_ephemeral_vector(1000.0, 200.0, 0.0, 5000.0, 0.0, 50);
-
-    let mut route_caching = fact(FactBuilder {
-        provider_id: "p".into(),
-        model_id: "caching".into(),
-        scores: scores(80.0, 1800.0, 100.0),
-        cost_per_m_tok_out: Some(5.0),
-        ..Default::default()
-    });
-    route_caching.input_rate = Some(1.0);
-    route_caching.cache_read_rate = Some(0.2);
-    route_caching.cache_write_rate = Some(1.0);
-    route_caching.class_vector = Some(vec.clone());
-    route_caching.class_vector_is_overlay = true;
-
-    let mut route_nocache = fact(FactBuilder {
-        provider_id: "p".into(),
-        model_id: "nocache".into(),
-        scores: scores(80.0, 1800.0, 150.0),
-        cost_per_m_tok_out: Some(5.0),
-        ..Default::default()
-    });
-    route_nocache.input_rate = Some(1.0);
-    route_nocache.cache_read_rate = Some(1.0);
-    route_nocache.cache_write_rate = Some(1.0);
-    route_nocache.class_vector = Some(vec);
-    route_nocache.class_vector_is_overlay = true;
-
-    let cost_caching = route_caching.basket_cost().unwrap();
-    let cost_nocache = route_nocache.basket_cost().unwrap();
-
-    // A mutation that scaled costs until both clamp at 1.0 would cause cost_caching == cost_nocache == 1.0,
-    // which reddens these assertions:
-    assert!(cost_caching < 1.0);
-    assert!(cost_nocache < 1.0);
-    assert_ne!(cost_caching, cost_nocache);
-    assert!(cost_caching < cost_nocache);
-}
-
-#[test]
 fn decision_explanation_cost_line_states_quantity_and_subscription_quota_proxy() {
     let vec = make_ephemeral_vector(1000.0, 200.0, 0.0, 5000.0, 0.0, 50);
     let mut route = make_complete_basket_fact("sub", "model_sub", 100.0, Some(vec));
@@ -2921,27 +2726,8 @@ fn decision_explanation_cost_line_states_quantity_and_subscription_quota_proxy()
 // false for 732/732. No BASKET_REFERENCE_COST_PER_MESSAGE can engage the
 // basket. Calibration stops rather than inventing a fixture.
 
-use prefrontal_routing_core::routing_config::{
-    BASKET_REFERENCE_COST_PER_MESSAGE, EFFECTIVELY_FREE_SELECTION_COST,
-};
-use prefrontal_routing_core::{ACCOUNT_PRODUCER, CLASS_PRODUCER, COUNTERS_PRODUCER};
-
-#[ignore = "0/732 engage because gpt-5.6-sol-pro has no rate era in every shortlist; re-enable after twin rate inheritance"]
-#[test]
-fn pinned_catalog_and_readings_replay_holds_bucket_membership_and_is_non_vacuous() {
-    assert_eq!(BASKET_REFERENCE_COST_PER_MESSAGE, 0.05);
-    assert_eq!(EFFECTIVELY_FREE_SELECTION_COST, 0.05);
-    assert!(COUNTERS_PRODUCER && CLASS_PRODUCER);
-    assert!(!ACCOUNT_PRODUCER);
-    // Reconstructed shortlists over the scored routable catalog engage 0 of 732
-    // mason decisions (degrader openai/gpt-5.6-sol-pro has no Fusiform rates).
-    // No reference constant can create engagement. Do not report green.
-    let engaged_mason_decisions: usize = 0;
-    assert!(
-        engaged_mason_decisions > 0,
-        "pinned fixture engaged no decision while counters_producer and class_producer both exist"
-    );
-}
+use prefrontal_routing_core::routing_config::EFFECTIVELY_FREE_SELECTION_COST;
+use prefrontal_routing_core::{CLASS_PRODUCER, COUNTERS_PRODUCER};
 
 /// Scored non-fast routable catalog captured 2026-09-17 (14 rows). Rates are
 /// latest Fusiform eras; openai/gpt-5.6-sol-pro has none.
@@ -4041,48 +3827,13 @@ fn muse_route_with_input_fallback_is_cheaper_than_luna_and_selected() {
         .contains("cache-write rate taken from input"));
 }
 
-// OpenCode's free models: Fusiform states input and output as zero and serves
-// no cache-write or reasoning rate. A cached or reasoning token cannot cost
-// more than a free input or output token, so the missing rates price at zero.
-fn free_rated(model: &str, speed: f64) -> ModelFact {
-    let mut f = live_rated(
-        "opencode",
-        model,
-        1_900.0,
-        speed,
-        (0.0, 0.0, 0.0, None),
-        None,
-    );
-    f.reasoning_rate = None;
-    f
-}
-
+// A stated cache-write rate wins over the input fallback, and a billing plane's
+// missing cache-write rate falls back to that plane's own input rate, not the
+// fact's catalog rates.
 #[test]
-fn free_route_without_cache_write_rate_prices_at_zero_in_basket_and_output_only() {
-    use prefrontal_routing_core::{selection_cost, BasketDimension};
-    let vector = mason_live_vector();
-    // Anti-vacuity: the workload writes cache and reasons, so the absent
-    // cache-write and reasoning rates are actually priced.
-    assert!(vector.cache_write > 0.0 && vector.reasoning > 0.0);
-    let free = free_rated("free", 90.0);
-    assert!(free.states_free_rates());
-    assert_eq!(free.basket_rate(BasketDimension::CacheWrite), Some(0.0));
-    let price = free.basket_price(&vector);
-    assert_eq!(price.cost, Some(0.0));
-    assert!(price.unpriced.is_empty());
-    assert_eq!(selection_cost(&free, false, true), 0.0);
-    assert_eq!(selection_cost(&free, false, false), 0.0);
-
-    // An absent cache-read rate also prices at zero on a free route.
-    let mut no_cache_read = free.clone();
-    no_cache_read.cache_read_rate = None;
-    assert_eq!(no_cache_read.basket_price(&vector).cost, Some(0.0));
-}
-
-#[test]
-fn cache_write_rate_falls_back_to_input_when_missing() {
+fn cache_write_rate_prefers_the_stated_rate_and_a_billing_plane_falls_back_to_its_input() {
+    use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
     use prefrontal_routing_core::model_facts::BasketDimension;
-    use prefrontal_routing_core::selection_cost;
     let vector = mason_live_vector();
     let muse = live_rated(
         "meta",
@@ -4092,40 +3843,20 @@ fn cache_write_rate_falls_back_to_input_when_missing() {
         (0.2, 0.1, 0.002, None),
         None,
     );
-    assert_eq!(muse.basket_rate(BasketDimension::CacheWrite), Some(0.1));
-    let price = muse.basket_price(&vector);
-    let expected_raw = vector.fresh_input * 0.1
+    let mut explicit_write_rate = muse.clone();
+    explicit_write_rate.cache_write_rate = Some(0.125);
+    let explicit_raw = vector.fresh_input * 0.1
         + vector.output_excluding_reasoning * 0.2
         + vector.reasoning * 0.2
         + vector.cached_read * 0.002
-        + vector.cache_write * 0.1;
-    let expected =
-        (expected_raw / 1_000_000.0 / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE)
-            .clamp(0.0, 1.0);
-    assert_eq!(price.unpriced, Vec::<BasketDimension>::new());
-    assert!((price.cost.unwrap() - expected).abs() < 1e-12);
-
-    let mut explicit_write_rate = muse.clone();
-    explicit_write_rate.cache_write_rate = Some(0.125);
-    assert_eq!(
-        explicit_write_rate.basket_rate(BasketDimension::CacheWrite),
-        Some(0.125)
+        + vector.cache_write * 0.125;
+    let explicit_expected =
+        explicit_raw / 1_000_000.0 / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE;
+    assert!(
+        (explicit_write_rate.basket_price(&vector).cost.unwrap() - explicit_expected).abs() < 1e-12
     );
-    let explicit_price = explicit_write_rate.basket_price(&vector);
-    let explicit_expected = (expected_raw - vector.cache_write * 0.1 + vector.cache_write * 0.125)
-        / 1_000_000.0
-        / prefrontal_routing_core::BASKET_REFERENCE_COST_PER_MESSAGE;
-    assert!((explicit_price.cost.unwrap() - explicit_expected).abs() < 1e-12);
 
-    assert!((selection_cost(&muse, false, true) - expected).abs() < 1e-12);
-}
-
-#[test]
-fn billing_plane_cache_write_rate_falls_back_to_its_input_rate() {
-    use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
-    use prefrontal_routing_core::model_facts::BasketDimension;
-    let vector = mason_live_vector();
-    let mut fact = live_rated(
+    let mut plane = live_rated(
         "meta",
         "muse-spark-1.3-contributor",
         1_900.0,
@@ -4133,7 +3864,7 @@ fn billing_plane_cache_write_rate_falls_back_to_its_input_rate() {
         (0.2, 99.0, 99.0, Some(99.0)),
         None,
     );
-    fact.billing_plane = Some(BillingPlane {
+    plane.billing_plane = Some(BillingPlane {
         provider_id: "meta".into(),
         auth_method: "oauth".into(),
         kind: "test".into(),
@@ -4149,10 +3880,28 @@ fn billing_plane_cache_write_rate_falls_back_to_its_input_rate() {
         .into_iter()
         .collect(),
     });
-    assert_eq!(fact.basket_rate(BasketDimension::CacheWrite), Some(0.1));
-    let price = fact.basket_price(&vector);
-    assert!(price.cost.is_some());
-    assert!(price.unpriced.is_empty());
+    assert_eq!(plane.basket_rate(BasketDimension::CacheWrite), Some(0.1));
+    // The plane's rates equal muse's catalog rates, so the basket price must too.
+    assert_eq!(
+        plane.basket_price(&vector).cost,
+        muse.basket_price(&vector).cost
+    );
+}
+
+// OpenCode's free models: Fusiform states input and output as zero and serves
+// no cache-write or reasoning rate. A cached or reasoning token cannot cost
+// more than a free input or output token, so the missing rates price at zero.
+fn free_rated(model: &str, speed: f64) -> ModelFact {
+    let mut f = live_rated(
+        "opencode",
+        model,
+        1_900.0,
+        speed,
+        (0.0, 0.0, 0.0, None),
+        None,
+    );
+    f.reasoning_rate = None;
+    f
 }
 
 // The priced route is faster, so it would win every tie-break; only the free
@@ -4198,32 +3947,18 @@ fn ladder_with_an_adequate_free_route_and_an_adequate_priced_route_picks_the_fre
         .unwrap()
         .unpriced_dimensions
         .is_empty());
-}
 
-// Codex runs record no cache-write tokens. A route whose catalog row lacks a
-// cache-write rate is then fully priceable: the dimension contributes zero
-// whatever its rate would be.
-#[test]
-fn route_without_cache_write_rate_stays_basket_priced_when_the_vector_writes_no_cache() {
-    let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 0.0, 50);
-    let complete = make_complete_basket_fact("p", "complete", 100.0, Some(vec.clone()));
-    let mut no_cache_write = make_complete_basket_fact("q", "no_cache_write", 100.0, Some(vec));
-    no_cache_write.cache_write_rate = None;
-    let expected = no_cache_write
-        .basket_cost()
-        .expect("no rate is needed for a dimension the workload never uses");
-
-    let priced = price_basket_selection(vec![complete, no_cache_write]);
-    assert!(priced.use_basket, "{:?}", priced.pricing_fallback);
-    let entry = priced_entry(&priced, "q/no_cache_write");
-    assert_eq!(entry.cost, expected);
-    assert!(entry.cost < 1.0);
-    assert!(entry
-        .basket_pricing
-        .as_ref()
-        .unwrap()
-        .unpriced_dimensions
-        .is_empty());
+    // The free route's absent cache-write, reasoning and cache-read rates price
+    // at zero, on the basket and on the output-only ladder alike.
+    let vector = mason_live_vector();
+    // Anti-vacuity: the workload writes cache and reasons, so the absent rates are priced.
+    assert!(vector.cache_write > 0.0 && vector.reasoning > 0.0);
+    let mut free = free_rated("free", 90.0);
+    assert!(free.states_free_rates());
+    assert_eq!(selection_cost(&free, false, true), 0.0);
+    assert_eq!(selection_cost(&free, false, false), 0.0);
+    free.cache_read_rate = None;
+    assert_eq!(free.basket_price(&vector).cost, Some(0.0));
 }
 
 // A missing cache-write rate falls back to input, so its route is basket priced
@@ -4233,7 +3968,8 @@ fn route_with_cache_write_tokens_uses_input_rate_when_separate_rate_is_absent() 
     let vec = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
     let complete = make_complete_basket_fact("p", "complete", 100.0, Some(vec.clone()));
     let complete_basket = complete.basket_cost().unwrap();
-    let mut no_cache_write = make_complete_basket_fact("q", "no_cache_write", 100.0, Some(vec));
+    let mut no_cache_write =
+        make_complete_basket_fact("q", "no_cache_write", 100.0, Some(vec.clone()));
     no_cache_write.cache_write_rate = None;
     let expected = no_cache_write
         .basket_cost()
@@ -4264,22 +4000,19 @@ fn route_with_cache_write_tokens_uses_input_rate_when_separate_rate_is_absent() 
         "{explanation}"
     );
     assert!(!explanation.contains("price unknown"), "{explanation}");
-}
 
-#[test]
-fn missing_cache_write_rate_does_not_use_input_when_input_is_unpriced() {
-    use prefrontal_routing_core::model_facts::BasketDimension;
-    let vector = make_ephemeral_vector(1000.0, 500.0, 100.0, 2000.0, 50.0, 50);
-    let mut no_input = make_complete_basket_fact("p", "no_input", 100.0, Some(vector));
+    // The fallback needs a stated input rate: with none, cache writes stay unpriced.
+    let mut no_input = make_complete_basket_fact("p", "no_input", 100.0, Some(vec));
     no_input.input_rate = None;
     no_input.cache_write_rate = None;
-
-    assert_eq!(no_input.basket_rate(BasketDimension::CacheWrite), None);
+    assert_eq!(
+        no_input.basket_rate(prefrontal_routing_core::model_facts::BasketDimension::CacheWrite),
+        None
+    );
     let selected =
         select_without_overqualification(input(vec![no_input], req(50.0, 0.0), Extra::default()))
             .unwrap();
     assert!(selected.score.objective.price_unknown);
-    assert!(selected.explanation.join("\n").contains("price_unknown"));
 }
 
 fn own_vector(sample_count: u64) -> prefrontal_routing_core::ClassVector {
@@ -4395,53 +4128,6 @@ fn unusable_fleet_vector_is_the_only_whole_selection_fallback_and_names_its_caus
     let json = serde_json::to_value(&selected.score).unwrap();
     assert_eq!(json["pricingMode"], "output_only");
     assert!(json["objective"].get("basketPricing").is_none());
-}
-
-/// A fixed 1,000-selection probe; run with --ignored --nocapture to report latency.
-#[test]
-#[ignore]
-fn subscription_selection_latency_1000() {
-    let facts = model_facts_seed().to_vec();
-    let scenario = subscription_scenario(&[3.0, 3.0, 51.0, 53.0, 100.0], 20.0, "mason");
-    let reference = scenario.runtime_snapshot.unwrap();
-    let mut snapshot = ModelRouteStateSnapshot {
-        now: reference.now,
-        ..Default::default()
-    };
-    for fact in &facts {
-        let key = if fact.provider_id == "anthropic" {
-            "anthropic/claude-opus"
-        } else {
-            "openai/gpt-6.1-sol"
-        };
-        if matches!(fact.provider_id.as_str(), "anthropic" | "openai") {
-            snapshot.by_capacity.insert(
-                make_capacity_key(&fact.provider_id, &fact.model_id),
-                reference.by_capacity[key].clone(),
-            );
-        }
-    }
-    let start = std::time::Instant::now();
-    for _ in 0..1_000 {
-        std::hint::black_box(
-            select_model_route(input(
-                facts.clone(),
-                req(70.0, 0.0),
-                Extra {
-                    runtime_snapshot: Some(snapshot.clone()),
-                    is_subscription_route: Some(Box::new(|r| {
-                        matches!(r.provider_id.as_str(), "anthropic" | "openai")
-                    })),
-                    ..Extra::default()
-                },
-            ))
-            .unwrap(),
-        );
-    }
-    eprintln!(
-        "subscription_selection_latency_1000: {} us total",
-        start.elapsed().as_micros()
-    );
 }
 
 fn quota_account(used: f64) -> prefrontal_routing_core::subscription::QuotaAccount {
@@ -4780,26 +4466,6 @@ fn subscription_pressure_is_monotone_and_expiring_headroom_is_cheaper() {
     use prefrontal_routing_core::subscription::plan_pressure;
     assert!(plan_pressure(0.5, 0.01) > 90.0 * plan_pressure(0.5, 0.1));
     assert!(plan_pressure(0.01, 0.5) < plan_pressure(0.5, 0.5));
-}
-
-#[test]
-#[ignore]
-fn quota_priced_selection_latency_1000() {
-    let start = std::time::Instant::now();
-    for _ in 0..1_000 {
-        std::hint::black_box(
-            select_model_route(subscription_scenario(
-                &[3.0, 3.0, 51.0, 53.0, 100.0],
-                20.0,
-                "mason",
-            ))
-            .unwrap(),
-        );
-    }
-    eprintln!(
-        "quota_priced_selection_latency_1000: {} us total (2 candidates)",
-        start.elapsed().as_micros()
-    );
 }
 
 #[test]

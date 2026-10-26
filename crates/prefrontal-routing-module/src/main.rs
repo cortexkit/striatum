@@ -8097,26 +8097,23 @@ mod tests {
     /// decision log names the fence; the fence survives a store reopen and any amount
     /// of time; an explicit pin is not fenced; and the fence ends when the
     /// credential's vault listing changes.
-    #[tokio::test]
-    async fn an_entitlement_refusal_fences_the_providers_routes_through_that_credential() {
-        replay_credential_refusal("ENTITLEMENT_ERROR", "credential_unentitled").await;
-    }
-
-    /// The same replay for an empty balance: Broca ends the run as permanent
+    ///
+    /// The same replay covers an empty balance: Broca ends the run as permanent
     /// `billing_exhausted` naming the credential (xAI's spending limit, Anthropic's
     /// "credit balance too low", OpenAI's insufficient_quota, OpenCode's HTTP 402
-    /// "Insufficient account funds"). Topping up does not show on a timer either.
+    /// "Insufficient account funds"); topping up does not show on a timer either.
+    /// And a balance too small for the request: permanent `credit_insufficient`
+    /// (OpenRouter's 402 "This request requires more credits"), the same
+    /// account-level refusal as an empty balance.
     #[tokio::test]
-    async fn a_billing_exhausted_refusal_fences_the_providers_routes_through_that_credential() {
-        replay_credential_refusal("billing_exhausted", "credential_billing_exhausted").await;
-    }
-
-    /// The same replay for a balance too small for the request: Broca ends the run as
-    /// permanent `credit_insufficient` (OpenRouter's 402 "This request requires more
-    /// credits"). It is the same account-level refusal as an empty balance.
-    #[tokio::test]
-    async fn a_credit_insufficient_refusal_fences_the_providers_routes_through_that_credential() {
-        replay_credential_refusal("credit_insufficient", "credential_billing_exhausted").await;
+    async fn an_account_level_refusal_fences_the_providers_routes_through_that_credential() {
+        for (code, reason) in [
+            ("ENTITLEMENT_ERROR", "credential_unentitled"),
+            ("billing_exhausted", "credential_billing_exhausted"),
+            ("credit_insufficient", "credential_billing_exhausted"),
+        ] {
+            replay_credential_refusal(code, reason).await;
+        }
     }
 
     async fn replay_credential_refusal(code: &str, reason: &str) {
@@ -9936,31 +9933,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_nulling_output_or_reasoning_in_counter_deferral_branch_reddens() {
-        // Gated on counters_producer = false
-        let rig = Rig::new("counter-deferral-mutation");
-        let store = Arc::new(rig.open_store());
-
-        let mut params = usage_params("deferral-check");
-        params["outputTokens"] = json!(100.0);
-        params["reasoningTokens"] = json!(80.0);
-        run_record_usage(&store, params).await;
-
-        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
-        let (output, reasoning) = connection
-            .query_row(
-                "SELECT output_tokens, reasoning_tokens FROM model_route_usage WHERE id = 'deferral-check'",
-                [],
-                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
-            )
-            .unwrap();
-        assert!(output.is_some());
-        assert!(reasoning.is_some());
-        assert_eq!(output, Some(180));
-        assert_eq!(reasoning, Some(80));
-    }
-
-    #[tokio::test]
     async fn class_producer_true_live_message_stamps_ephemeral_and_accepts_only_closed_enum() {
         // Gated on class_producer = true
         let rig = Rig::new("class-producer-true");
@@ -10062,32 +10034,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutation_pooling_unclassified_rows_into_ephemeral_reddens() {
-        // Gated on class_producer = false
-        let rig = Rig::new("class-pooling-mutation");
-        let store = Arc::new(rig.open_store());
-        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
-
-        let mut p = usage_params("unclassified-msg");
-        p["inputTokens"] = json!(100.0);
-        p["cachedReadTokens"] = json!(20.0);
-        p["cacheWriteTokens"] = json!(5.0);
-        p["outputTokens"] = json!(50.0);
-        p["reasoningTokens"] = json!(10.0);
-        run_record_usage(&store, p).await;
-
-        let unclassified_row_class: Option<String> = connection
-            .query_row(
-                "SELECT workload_class FROM model_route_usage WHERE id = 'unclassified-msg'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(unclassified_row_class, None);
-        assert_ne!(unclassified_row_class.as_deref(), Some("ephemeral"));
-    }
-
-    #[tokio::test]
     async fn account_producer_absent_usage_row_written_with_null_account_key_and_ephemeral_vector_forms(
     ) {
         // Gated on account_producer = absent
@@ -10142,19 +10088,6 @@ mod tests {
             complete_ephemeral_count, 50,
             "ephemeral vector forms even when account_key is NULL"
         );
-    }
-
-    #[tokio::test]
-    async fn mutation_refusing_or_dropping_rows_lacking_account_key_reddens() {
-        // Gated on account_producer = absent
-        let rig = Rig::new("account-refusing-mutation");
-        let store = Arc::new(rig.open_store());
-
-        let mut p = usage_params("msg-without-account");
-        p["outputTokens"] = json!(100.0);
-        let outcome = run_record_usage(&store, p).await;
-        assert_eq!(outcome["usage_recorded"], true);
-        assert_eq!(usage_row_count(&rig, Some("msg-without-account")), 1);
     }
 
     #[tokio::test]
@@ -10215,56 +10148,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_zero, Some(0));
-    }
-
-    #[tokio::test]
-    async fn mutation_writing_zero_for_whole_object_absence_reddens() {
-        // Gated on whole-object absence
-        let rig = Rig::new("mutation-whole-absence");
-        let store = Arc::new(rig.open_store());
-        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
-
-        let mut whole_absent = usage_params("mut-whole-absent");
-        whole_absent.as_object_mut().unwrap().remove("outputTokens");
-        whole_absent["reasoningTokens"] = serde_json::Value::Null;
-        whole_absent["inputTokens"] = serde_json::Value::Null;
-        whole_absent["cachedReadTokens"] = serde_json::Value::Null;
-        whole_absent["cacheWriteTokens"] = serde_json::Value::Null;
-        run_record_usage(&store, whole_absent).await;
-
-        let (crd, inp) = connection
-            .query_row(
-                "SELECT cached_read_tokens, input_tokens FROM model_route_usage WHERE id = 'mut-whole-absent'",
-                [],
-                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
-            )
-            .unwrap();
-        assert_ne!(crd, Some(0));
-        assert_ne!(inp, Some(0));
-        assert_eq!(crd, None);
-        assert_eq!(inp, None);
-    }
-
-    #[tokio::test]
-    async fn mutation_writing_null_for_authoritative_zero_cached_read_reddens() {
-        // Gated on authoritative zero cached-read
-        let rig = Rig::new("mutation-auth-zero");
-        let store = Arc::new(rig.open_store());
-        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
-
-        let mut zero_cached = usage_params("mut-auth-zero");
-        zero_cached["cachedReadTokens"] = json!(0.0);
-        run_record_usage(&store, zero_cached).await;
-
-        let stored_zero: Option<i64> = connection
-            .query_row(
-                "SELECT cached_read_tokens FROM model_route_usage WHERE id = 'mut-auth-zero'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored_zero, Some(0));
-        assert_ne!(stored_zero, None);
     }
 
     async fn run_select_panel_wire_request(

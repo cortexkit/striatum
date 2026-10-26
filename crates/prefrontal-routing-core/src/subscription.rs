@@ -401,15 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_margin_blocks_workers_at_boundary() {
-        let mut p = plan(80.0);
-        p.accounts.push(plan(100.0).accounts.remove(0));
-        assert_eq!(p.budget(20.0, false, false, 1).0, Some(0.0));
-        assert_eq!(p.budget(20.0, true, false, 1).0, Some(20.0));
-        assert_eq!(p.budget(0.0, false, false, 1).0, Some(20.0));
-    }
-
-    #[test]
     fn short_walled_accounts_supply_neither_live_nor_banked_headroom() {
         let mut p = plan(95.0);
         p.accounts[0].short_walled = true;

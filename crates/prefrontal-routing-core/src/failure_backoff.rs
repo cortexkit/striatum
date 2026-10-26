@@ -440,33 +440,25 @@ mod tests {
     }
 
     #[test]
-    fn user_abort_cancelled_is_excluded_from_the_terminal_send_failure_outcome_filter() {
-        assert!(!is_terminal_send_failure(RouteOutcome::Cancelled));
-        assert_eq!(
-            failure_backoff_transition(
-                2,
-                RouteOutcome::Cancelled,
-                Some("user aborted"),
-                1_000,
-                FailureBackoffConfig::default(),
-            ),
-            FailureBackoffTransition::Unchanged
-        );
-    }
-
-    #[test]
-    fn harness_interruption_is_excluded_from_the_terminal_send_failure_outcome_filter() {
-        assert!(!is_terminal_send_failure(RouteOutcome::Interrupted));
-        assert_eq!(
-            failure_backoff_transition(
-                2,
-                RouteOutcome::Interrupted,
-                Some("harness stopped"),
-                1_000,
-                FailureBackoffConfig::default(),
-            ),
-            FailureBackoffTransition::Unchanged
-        );
+    fn user_abort_and_harness_interruption_are_excluded_from_the_terminal_send_failure_outcome_filter(
+    ) {
+        for (outcome, reason) in [
+            (RouteOutcome::Cancelled, "user aborted"),
+            (RouteOutcome::Interrupted, "harness stopped"),
+        ] {
+            assert!(!is_terminal_send_failure(outcome), "{outcome:?}");
+            assert_eq!(
+                failure_backoff_transition(
+                    2,
+                    outcome,
+                    Some(reason),
+                    1_000,
+                    FailureBackoffConfig::default(),
+                ),
+                FailureBackoffTransition::Unchanged,
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]

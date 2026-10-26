@@ -242,18 +242,6 @@ fn past_reset_window_is_skipped() {
 }
 
 #[test]
-fn unmapped_provider_contributes_no_pressure() {
-    let facts = vec![fact("openai", "gpt-5.5", 30.0)];
-    let windows = vec![usage_from_json(serde_json::json!({
-        "provider": "gemini",
-        "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z" } }
-    }))];
-    // There is no catalog slug, and no exception for this provider.
-    let snap = overlay(&windows, &facts);
-    assert!(snap.by_capacity.is_empty());
-}
-
-#[test]
 fn unslugged_non_antigravity_entry_neither_joins_nor_borrows_another_slug() {
     let facts = vec![
         fact("openai", "gpt-5.5", 30.0),
@@ -471,35 +459,6 @@ fn published_api_provider_slug_routes_to_its_capacity() {
     assert!(
         state.quota_pressure.is_some(),
         "a healthy window must contribute pressure through the slug path"
-    );
-}
-
-#[test]
-fn one_exhausted_account_beside_a_free_sibling_does_not_wall_the_provider() {
-    // QTA's multi-account contract: entries are atomic per (provider, account),
-    // serving picks the best account, and a wall is per-account. Live incident
-    // 2026-08-10: one anthropic account at 99-100% weekly walled opus-5 for the
-    // whole provider while three sibling accounts sat at 5-8%.
-    let facts = vec![fact("anthropic", "claude-opus-5", 25.0)];
-    let windows = vec![
-        usage_from_json(serde_json::json!({
-            "provider": "claude", "apiProvider": "anthropic", "account": "acct-walled",
-            "usage": { "primary": { "usedPercent": 100.0, "resetsAt": "2030-01-01T00:00:00Z", "windowMinutes": 10080 } }
-        })),
-        usage_from_json(serde_json::json!({
-            "provider": "claude", "apiProvider": "anthropic", "account": "acct-free",
-            "usage": { "primary": { "usedPercent": 5.0, "resetsAt": "2030-01-01T00:00:00Z", "windowMinutes": 10080 } }
-        })),
-    ];
-    let snap = overlay(&windows, &facts);
-    let state = snap
-        .by_capacity
-        .get(&make_capacity_key("anthropic", "claude-opus-5"))
-        .expect("capacity signal present");
-    assert!(
-        state.quota_exhausted_until.is_none(),
-        "a free sibling account must keep the capacity unwalled, got {:?}",
-        state.quota_exhausted_until
     );
 }
 

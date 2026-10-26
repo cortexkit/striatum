@@ -108,24 +108,9 @@ fn invalid_startup(document: &str, token: &str) {
     assert!(!message.contains("missing-connection-file"), "{message}");
 }
 
-#[test]
-fn exclude_shape_refuses_startup() {
-    invalid_startup(r#"{"model_routing":{"exclude":[]}}"#, "exclude_shape");
-}
-
-#[test]
-fn config_key_removed_refuses_startup() {
-    invalid_startup(r#"{"aa":{}}"#, "config_key_removed");
-}
-
-#[test]
-fn account_selection_shadow_refuses_startup_with_the_delete_remedy() {
-    invalid_startup(
-        r#"{"account_selection":{"enabled":true,"shadow":true}}"#,
-        "config_key_removed: account_selection.shadow; delete it; account selection serves directly",
-    );
-}
-
+// The in-process `refusal_case!` contract tests in `config_overrides` check
+// every refusal message on first load and on reload. One binary spawn here is
+// enough to prove that a refusal stops startup before the daemon connection.
 #[test]
 fn explicit_only_providers_refuses_startup_with_the_exclude_remedy() {
     invalid_startup(
@@ -133,12 +118,6 @@ fn explicit_only_providers_refuses_startup_with_the_exclude_remedy() {
         "config_key_removed: model_routing.explicit_only_providers; list the provider in model_routing.exclude.all; pins still work",
     );
 }
-
-#[test]
-fn unknown_key_refuses_startup() {
-    invalid_startup(r#"{"model_routing":{"unknown":true}}"#, "unknown field");
-}
-
 #[test]
 fn absent_routing_file_with_xdg_does_not_read_home_legacy_file() {
     let home = Home::new();

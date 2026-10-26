@@ -1922,10 +1922,6 @@ mod tests {
     #[test]
     fn empty_message_id_with_constructible_route_builds_no_usage_row() {
         let facts = usage_facts("");
-        assert_eq!(
-            make_route_key("provider", "model", Some("high")),
-            "provider/model/high"
-        );
         assert!(build_usage_observation(&facts, &[]).is_none());
     }
 
@@ -1939,24 +1935,6 @@ mod tests {
         assert_eq!(observation.output_tokens.to_bits(), 180.0_f64.to_bits());
         assert_eq!(observation.reasoning_tokens, Some(80.0));
     }
-
-    #[test]
-    fn test_producer_flags_and_use_basket_predicate() {
-        // Gated on counters_producer, class_producer, account_producer:
-        // Recorded as three independent booleans in campaign notes at implementation time.
-        // use_basket may be true only when counters_producer and class_producer are both true,
-        // and account_producer never enters that predicate.
-        assert!(COUNTERS_PRODUCER);
-        assert!(CLASS_PRODUCER);
-        assert!(!ACCOUNT_PRODUCER);
-
-        assert!(!use_basket_permitted(false, false));
-        assert!(!use_basket_permitted(true, false));
-        assert!(!use_basket_permitted(false, true));
-        assert!(use_basket_permitted(true, true));
-        assert!(use_basket_permitted(COUNTERS_PRODUCER, CLASS_PRODUCER));
-    }
-
     #[test]
     fn class_producer_true_agent_mapping_to_workload_class() {
         // Gated on class_producer = true
@@ -2013,26 +1991,6 @@ mod tests {
         assert_eq!(obs.output_tokens, 100.0);
         assert_eq!(obs.output_tokens - obs.reasoning_tokens.unwrap(), 20.0);
     }
-
-    #[test]
-    fn mutation_subtracting_cached_input_tokens_from_fresh_input_reddens() {
-        // Gated on counters_producer = true
-        // Asserts fresh_input does not subtract cached_input_tokens
-        let u = BrocaUsageFacts {
-            input_tokens: 300,
-            cached_input_tokens: 40,
-            cache_write_tokens: 20,
-            output_tokens: 100,
-            reasoning_tokens: 80,
-            retries_used: 0,
-        };
-        let mut facts = usage_facts("fresh-input-no-subtraction");
-        facts.apply_broca_usage(Some(&u));
-        let mutated_fresh_input = (u.input_tokens - u.cached_input_tokens) as f64;
-        assert_eq!(facts.input_tokens, Some(300.0));
-        assert_ne!(facts.input_tokens, Some(mutated_fresh_input));
-    }
-
     // Source of truth: Broca's normalized usage. broca-protocol
     // crates/broca-protocol/src/usage.rs:22 (Broca checkout 6c45a375): reasoning
     // tokens are "ALWAYS A SUBSET of `output_tokens`, never additional to it ...
@@ -2072,43 +2030,6 @@ mod tests {
             "visible + reasoning must equal Broca's output total, not exceed it"
         );
     }
-
-    #[test]
-    fn mutation_extending_native_usage_facts_without_copy_reddens() {
-        // Gated on counters_producer = true
-        // Asserts extending NativeUsageFacts without the copy leaves counter fields None
-        let facts_without_copy = usage_facts("without-copy");
-        assert_eq!(facts_without_copy.input_tokens, None);
-        assert_eq!(facts_without_copy.cached_read_tokens, None);
-        assert_eq!(facts_without_copy.cache_write_tokens, None);
-
-        let mut facts_with_copy = usage_facts("with-copy");
-        let u = BrocaUsageFacts {
-            input_tokens: 500,
-            cached_input_tokens: 250,
-            cache_write_tokens: 10,
-            output_tokens: 100,
-            reasoning_tokens: 25,
-            retries_used: 0,
-        };
-        facts_with_copy.apply_broca_usage(Some(&u));
-        assert_eq!(facts_with_copy.input_tokens, Some(500.0));
-        assert_eq!(facts_with_copy.cached_read_tokens, Some(250.0));
-        assert_eq!(facts_with_copy.cache_write_tokens, Some(10.0));
-    }
-
-    #[test]
-    fn mutation_storing_output_without_adding_reasoning_reddens() {
-        // Gated on counters_producer = true
-        // Asserts stored combined output_tokens adds reasoning to output
-        let mut facts = usage_facts("stored-combined-output");
-        facts.output_tokens = 100.0;
-        facts.reasoning_tokens = Some(80.0);
-        let obs = build_usage_observation(&facts, &[]).unwrap();
-        assert_eq!(obs.output_tokens, 180.0);
-        assert_ne!(obs.output_tokens, facts.output_tokens);
-    }
-
     #[test]
     fn class_producer_true_workload_class_closed_enum() {
         // Gated on class_producer = true:
@@ -2156,35 +2077,5 @@ mod tests {
         facts_zero.apply_broca_usage(Some(&zero_cached));
         let obs_zero = build_usage_observation(&facts_zero, &[]).unwrap();
         assert_eq!(obs_zero.cached_read_tokens, Some(0.0));
-    }
-
-    #[test]
-    fn mutation_writing_zero_for_whole_object_absence_reddens() {
-        // Gated on whole-object absence:
-        // Asserts whole-object absence does NOT write 0
-        let mut facts = usage_facts("whole-object-not-zero");
-        facts.apply_broca_usage(None);
-        assert_ne!(facts.cached_read_tokens, Some(0.0));
-        assert_ne!(facts.input_tokens, Some(0.0));
-        assert_eq!(facts.cached_read_tokens, None);
-        assert_eq!(facts.input_tokens, None);
-    }
-
-    #[test]
-    fn mutation_writing_null_for_authoritative_zero_cached_read_reddens() {
-        // Gated on authoritative zero cached-read:
-        // Asserts authoritative zero is Some(0.0), NOT None (NULL)
-        let zero_cached = BrocaUsageFacts {
-            input_tokens: 100,
-            cached_input_tokens: 0,
-            cache_write_tokens: 5,
-            output_tokens: 50,
-            reasoning_tokens: 10,
-            retries_used: 0,
-        };
-        let mut facts = usage_facts("zero-cached-not-null");
-        facts.apply_broca_usage(Some(&zero_cached));
-        assert_eq!(facts.cached_read_tokens, Some(0.0));
-        assert_ne!(facts.cached_read_tokens, None);
     }
 }

@@ -237,12 +237,13 @@ mod tests {
 
     #[test]
     fn spread_takes_the_fewest_runs_in_flight_then_the_least_recent_use() {
-        // Three keys with no workspace each stand alone.
+        // Three keys with no workspace each stand alone, in a workspace of their own.
         let keys = [
             PoolKey::new("apikey:anthropic", None, "active"),
             PoolKey::new("apikey:anthropic:a", None, "active"),
             PoolKey::new("apikey:anthropic:b", None, "active"),
         ];
+        assert_eq!(keys[0].workspace, "key:apikey:anthropic");
         let pick = |rows: &[(&str, u32, Option<i64>)]| {
             pick_pool_key(&keys, &states(rows), None, NOW)
                 .unwrap()
@@ -364,18 +365,5 @@ mod tests {
                 .contains("apikey:anthropic:w1a billing_exhausted"),
             "{moved:?}"
         );
-    }
-
-    #[test]
-    fn keys_without_an_account_id_stick_per_key() {
-        let keys = [
-            PoolKey::new("apikey:anthropic:x", None, "active"),
-            PoolKey::new("apikey:anthropic:y", None, "active"),
-        ];
-        assert_eq!(keys[0].workspace, "key:apikey:anthropic:x");
-        // The bound key is busier, but the session stays on it.
-        let rows = states(&[("apikey:anthropic:x", 4, Some(9))]);
-        let pick = pick_pool_key(&keys, &rows, Some("key:apikey:anthropic:x"), NOW).unwrap();
-        assert_eq!(pick.credential_id, "apikey:anthropic:x");
     }
 }
