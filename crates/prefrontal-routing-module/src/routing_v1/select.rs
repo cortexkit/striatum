@@ -49,6 +49,7 @@ const MEMBERS: &[&str] = &[
     "correlation_id",
     "concurrency_slots",
     "detail",
+    "harness",
 ];
 
 /// How long an answer stays current routing. A report after this is still
@@ -181,8 +182,24 @@ pub(super) async fn select(
                 .is_none_or(|listed| listed.contains(&runner.module))
         })
         .collect();
+    let runners: Vec<RunnerPolicy> = runners
+        .into_iter()
+        .filter(|runner| {
+            request.harness.as_deref().is_none_or(|harness| {
+                registry
+                    .get(&runner.module)
+                    .is_some_and(|runner| runner.harnesses.iter().any(|hosted| hosted == harness))
+            })
+        })
+        .collect();
     if runners.is_empty() {
-        return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
+        return Err(if let Some(harness) = &request.harness {
+            let mut refusal = Refusal::no_route(NoRouteReason::HarnessUnavailable, None);
+            refusal.message = format!("no session-starting runner declares harness {harness}");
+            refusal
+        } else {
+            Refusal::no_route(NoRouteReason::NoAvailableModel, None)
+        });
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -452,10 +469,17 @@ pub(super) async fn select(
         runner.module,
         basis.as_str()
     ));
+    let mut runner_ref = RunnerRef::new(runner.module.clone(), route.clone());
+    if let Some(harness) = registry
+        .get(&runner.module)
+        .and_then(|runner| runner.selection_harness(request.harness.as_deref()))
+    {
+        runner_ref = runner_ref.with_harness(harness);
+    }
     let answer = SelectAnswer {
         decision_id,
         route: route.clone(),
-        runner: RunnerRef::new(runner.module.clone(), route),
+        runner: runner_ref,
         context_window: fact
             .and_then(|fact| fact.context_window)
             .map_or(0, |window| window as u64),

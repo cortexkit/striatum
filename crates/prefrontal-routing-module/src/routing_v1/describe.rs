@@ -9,12 +9,11 @@ use super::{operator_config, Deps};
 use crate::select_policy;
 
 /// The optional routing/v1 groups this provider serves, listed in
-/// `role.describe` as `capabilities` and passed to the `route.select`
-/// validator, so the two always agree. None yet: without
-/// `select_hold_control` the validator refuses a select carrying `hold_ok`
-/// or `hold_wait_max_s` by name, and callers do not send them. Add the group
-/// here when select answers a blocked ladder entry under the hold rule.
-pub(super) const CAPABILITIES: &[&str] = &[];
+/// `role.describe` as `capabilities` and passed to `parse_select_request_serving`,
+/// so the two always agree. Harnesses come from runner declarations.
+/// Hold control remains unsupported: `hold_ok` and
+/// `hold_wait_max_s` are still refused by name.
+pub(super) const CAPABILITIES: &[&str] = &[cortexkit_role_routing::capabilities::SELECT_HARNESS];
 
 /// Params are ignored: the role defines `{}` and no refusal for this op.
 pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {

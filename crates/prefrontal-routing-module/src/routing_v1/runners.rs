@@ -26,10 +26,38 @@ pub(crate) struct EffectiveRunner {
     pub standing_limits: Option<StandingLimits>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pairs: Option<Vec<RunnerPair>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub harnesses: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_harness: Option<String>,
+    #[serde(skip_serializing_if = "is_true")]
+    pub starts_sessions: bool,
     #[serde(skip)]
     route_policy: Option<Vec<String>>,
     #[serde(skip)]
     reachable_models: BTreeSet<String>,
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+impl EffectiveRunner {
+    pub(crate) fn selection_harness(&self, requested: Option<&str>) -> Option<String> {
+        if let Some(requested) = requested {
+            return self
+                .harnesses
+                .iter()
+                .find(|harness| harness.as_str() == requested)
+                .cloned();
+        }
+        self.default_harness
+            .clone()
+            .or_else(|| match self.harnesses.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,6 +140,11 @@ impl Registry {
                     follows_account_choice,
                     standing_limits,
                     pairs: declaration.map(|declaration| declaration.pairs.clone()),
+                    harnesses: declaration
+                        .and_then(|d| d.harnesses.clone())
+                        .unwrap_or_default(),
+                    default_harness: declaration.and_then(|d| d.default_harness.clone()),
+                    starts_sessions: declaration.is_none_or(|d| d.starts_sessions),
                     route_policy,
                     reachable_models,
                 }
@@ -123,6 +156,9 @@ impl Registry {
     pub(crate) fn policies(&self) -> Vec<RunnerPolicy> {
         self.entries
             .iter()
+            // Non-starting runners remain available through get() for
+            // route.account_for, but cannot be selected to start sessions.
+            .filter(|runner| runner.starts_sessions)
             .map(|runner| runner.policy.clone())
             .collect()
     }
