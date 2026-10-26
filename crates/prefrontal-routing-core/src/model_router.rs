@@ -2304,6 +2304,7 @@ mod abundance_tests {
         is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
         prefer_prompt_cache: bool,
         providers_without_prompt_cache: HashSet<String>,
+        slots: Option<ConcurrencySlots>,
     }
 
     fn select_with(
@@ -2331,7 +2332,7 @@ mod abundance_tests {
         // Every fixture route sits at the frontier and the default demand is
         // iq 20, so the over-qualification term would be equal for all of
         // them; it is switched off so the bucket ordering under test is reached.
-        select_model_route_with_config(
+        select_model_route_with_availability(
             SelectModelRouteInput {
                 target_agent: "mason".into(),
                 requirements: options
@@ -2354,6 +2355,9 @@ mod abundance_tests {
                 providers_without_prompt_cache: options.providers_without_prompt_cache,
             },
             &crate::routing_config::ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION,
+            options.slots.as_ref(),
+            &[],
+            &HashMap::new(),
         )
         .expect("fixture has an admissible route")
     }
@@ -2363,6 +2367,30 @@ mod abundance_tests {
         states: &[(&str, Option<f64>, Option<&str>)],
     ) -> SelectedModelRoute {
         select_with(facts, states, SelectOptions::default())
+    }
+
+    #[test]
+    fn yielded_capacity_preference_preserves_quality_exclusions_and_saturation() {
+        let facts = vec![
+            fact_with_cost_and_elo("cheap", "model", 50.0, Some(1.0), 1_800.0),
+            fact_with_cost_and_elo("preferred", "model", 50.0, Some(2.0), 1_800.0),
+            fact_with_cost_and_elo("inadequate", "model", 50.0, Some(0.0), 200.0),
+        ];
+        let choose = |preference: Option<&str>, full: bool, exclude: bool| {
+            select_with(facts.clone(), &[], SelectOptions {
+                requirements: Some(ModelRequirements { iq: 90.0, eq: 20.0 }),
+                exclude_route_keys: if exclude { vec!["preferred/model".into()] } else { vec![] },
+                slots: Some(ConcurrencySlots::new(if full {
+                    vec![crate::slot_saturation::ConcurrencySlotState { key:"preferred/model".into(), running:1, limit:1, queued:1 }]
+                } else { vec![] }).with_preferred_capacity(preference.map(str::to_string))),
+                ..Default::default()
+            }).capacity_key
+        };
+        assert_eq!(choose(None, false, false), "cheap/model");
+        assert_eq!(choose(Some("preferred/model"), false, false), "preferred/model");
+        assert_eq!(choose(Some("inadequate/model"), false, false), "cheap/model");
+        assert_eq!(choose(Some("preferred/model"), false, true), "cheap/model");
+        assert_eq!(choose(Some("preferred/model"), true, false), "cheap/model");
     }
 
     #[test]

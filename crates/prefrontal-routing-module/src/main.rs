@@ -1766,6 +1766,8 @@ struct SelectParams {
     /// limited by these slots) leaves the selection unchanged.
     #[serde(default)]
     concurrency_slots: Option<Vec<ConcurrencySlotState>>,
+    #[serde(default, rename = "preferCapacityKey")]
+    preferred_capacity_key: Option<String>,
 }
 
 impl SelectParams {
@@ -4187,7 +4189,10 @@ async fn handle_select_request(
     let prefer_prompt_cache = params.prefer_prompt_cache;
 
     let min_best_effort_adequacy = live_config.min_band();
-    let concurrency_slots = params.concurrency_slots.clone().map(ConcurrencySlots::new);
+    let concurrency_slots = if params.concurrency_slots.is_some() || params.preferred_capacity_key.is_some() {
+        Some(ConcurrencySlots::new(params.concurrency_slots.clone().unwrap_or_default())
+            .with_preferred_capacity(params.preferred_capacity_key.clone()))
+    } else { None };
 
     let admission_pin = params
         .pin
@@ -15852,6 +15857,20 @@ mod tests {
             "explicit_provider_credential_unresolved",
             "an unread listing is unresolved, not a default key"
         );
+    }
+
+    #[tokio::test]
+    async fn route_select_prefers_a_yielded_adequate_capacity_without_a_model_pin() {
+        let mut params = saturation_select_params(None);
+        params["preferCapacityKey"] = json!("openai/fixture-dear");
+        let (response, rig) = run_select_wire_request("slot-owner-preference", params.clone(), &saturation_facts()).await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["selected"]["capacityKey"], "openai/fixture-dear");
+        params["concurrencySlots"] = json!([{"key":"openai/fixture-dear","running":1,"limit":1}]);
+        let fallback = run_select_against_rig(&rig, params, &saturation_facts(), &PathBuf::from("/nonexistent/prefrontal-routing.jsonc")).await;
+        let body: serde_json::Value = serde_json::from_slice(&fallback.body).unwrap();
+        assert_eq!(body["result"]["selected"]["capacityKey"], "anthropic/fixture-cheap");
     }
 
     #[tokio::test]

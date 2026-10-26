@@ -65,6 +65,7 @@ impl ConcurrencySlotState {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConcurrencySlots {
     by_key: HashMap<String, ConcurrencySlotState>,
+    preferred_capacity_key: Option<String>,
 }
 
 impl ConcurrencySlots {
@@ -74,7 +75,15 @@ impl ConcurrencySlots {
                 .into_iter()
                 .map(|state| (state.key.clone(), state))
                 .collect(),
+            preferred_capacity_key: None,
         }
+    }
+
+    /// Prefer a freed capacity only after the router has built its quality shortlist.
+    /// Counts remain truthful, and a full or unqualified preference changes nothing.
+    pub fn with_preferred_capacity(mut self, capacity_key: Option<String>) -> Self {
+        self.preferred_capacity_key = capacity_key;
+        self
     }
 
     /// The slot for `capacity_key` when it is full; `None` when it has room or
@@ -144,6 +153,12 @@ pub fn pick_unsaturated(
     let Some(slots) = slots else {
         return (0, None);
     };
+    if let Some(preferred) = slots.preferred_capacity_key.as_deref() {
+        if let Some(index) = ordered.iter().position(|(_, capacity)| *capacity == preferred
+            && slots.saturated(capacity).is_none()) {
+            return (index, None);
+        }
+    }
     let mut skipped = Vec::new();
     for (index, (route_key, capacity_key)) in ordered.iter().enumerate() {
         match slots.saturated(capacity_key) {
