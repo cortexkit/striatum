@@ -1873,7 +1873,7 @@ impl AccountForParams {
     }
 
     fn caller_kind(&self) -> CallerKind {
-        if self.caller.runner.eq_ignore_ascii_case("broca") {
+        if self.caller.runner.eq_ignore_ascii_case(crate::legacy_wire::BROCA) {
             CallerKind::Broca
         } else {
             CallerKind::Plugin
@@ -1896,7 +1896,7 @@ impl AccountForParams {
             conversation_key: self.conversation_key.clone(),
             // Broca falls back to `broca:<run_id>` when a direct caller sent no
             // conversation key; such a run has no affinity across sends.
-            conversation_key_source: if self.conversation_key.starts_with("broca:") {
+            conversation_key_source: if self.conversation_key.starts_with(crate::legacy_wire::BROCA_RUN_KEY_PREFIX) {
                 ConversationKeySource::BrocaRunFallback
             } else {
                 ConversationKeySource::Caller
@@ -3871,6 +3871,10 @@ mod tests {
                 required_capabilities: None,
                 available_models: [route.to_string()].into_iter().collect(),
                 availability_substrate: prefrontal_routing_core::AvailabilitySubstrate::Broca,
+                availability_label: crate::legacy_wire::availability_label(
+                    prefrontal_routing_core::AvailabilitySubstrate::Broca,
+                )
+                .to_string(),
                 is_subscription_route: None,
             })
             .unwrap()

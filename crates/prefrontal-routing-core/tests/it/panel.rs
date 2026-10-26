@@ -87,6 +87,7 @@ fn panel_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInput
         roster: roster(&facts),
         available_models: availability(&facts),
         availability_substrate: AvailabilitySubstrate::Host,
+        availability_label: "host".to_string(),
         panel_spec,
         facts,
         runtime_snapshot: None,
@@ -104,6 +105,7 @@ fn n_pick_input(facts: Vec<ModelFact>, panel_spec: PanelSpec) -> SelectPanelInpu
         roster: Vec::new(),
         available_models: availability(&facts),
         availability_substrate: AvailabilitySubstrate::Host,
+        availability_label: "host".to_string(),
         panel_spec,
         facts,
         runtime_snapshot: None,
@@ -472,6 +474,7 @@ fn admission_is_shared_not_reimplemented() {
         required_capabilities: capabilities,
         available_models: available,
         availability_substrate: AvailabilitySubstrate::Host,
+        availability_label: "host".to_string(),
         is_subscription_route: None,
     })
     .unwrap();
@@ -528,6 +531,7 @@ fn admission_is_shared_not_reimplemented() {
         operator_exclude_keys: Vec::new(),
         required_capabilities: None,
         availability_substrate: AvailabilitySubstrate::Host,
+        availability_label: "host".to_string(),
         is_subscription_route: None,
     })
     .unwrap();
@@ -542,11 +546,14 @@ fn admission_is_shared_not_reimplemented() {
 /// have different fixes. The cause names the list that was consulted.
 #[test]
 fn an_availability_rejection_names_the_substrate_whose_list_was_consulted() {
-    let detail_for = |substrate: AvailabilitySubstrate| {
+    // The caller names the list it consulted; core carries that label on every
+    // availability rejection verbatim.
+    let detail_for = |substrate: AvailabilitySubstrate, label: &str| {
         let facts = vec![fact("absent", 1_700.0, Some("a"))];
         let mut input = panel_input(facts, spec(1, 0.0, PanelDiversity::None));
         input.available_models = HashSet::new();
         input.availability_substrate = substrate;
+        input.availability_label = label.to_string();
         let causes = select_panel(input)
             .unwrap()
             .shortfall
@@ -561,16 +568,19 @@ fn an_availability_rejection_names_the_substrate_whose_list_was_consulted() {
     };
 
     assert_eq!(
-        detail_for(AvailabilitySubstrate::Host),
+        detail_for(AvailabilitySubstrate::Host, "host"),
         Some("host".to_string())
     );
     assert_eq!(
-        detail_for(AvailabilitySubstrate::Broca),
-        Some("broca".to_string())
+        detail_for(AvailabilitySubstrate::Broca, "runner reach"),
+        Some("runner reach".to_string())
     );
     assert_eq!(
-        detail_for(AvailabilitySubstrate::BrocaServedCatalog),
-        Some("broca reachability unknown: judged against served catalog".to_string())
+        detail_for(
+            AvailabilitySubstrate::BrocaServedCatalog,
+            "reachability unknown: judged against served catalog"
+        ),
+        Some("reachability unknown: judged against served catalog".to_string())
     );
 }
 
@@ -822,6 +832,7 @@ fn shortfall_precedence_and_empty_success() {
         facts: vec![unavailable],
         available_models: HashSet::new(),
         availability_substrate: AvailabilitySubstrate::Host,
+        availability_label: "host".to_string(),
         runtime_snapshot: None,
         exclude_route_keys: Vec::new(),
         operator_exclude_keys: Vec::new(),

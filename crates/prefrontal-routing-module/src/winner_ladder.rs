@@ -84,7 +84,7 @@ const LADDER_TARGET_AGENT: &str = "mason";
 pub(crate) const SUBSTRATE_HOST: &str = "opencode-host";
 /// Selections that send through Broca: `route.select_panel` and `route.select`
 /// called with substrate broca.
-pub(crate) const SUBSTRATE_BROCA: &str = "broca";
+pub(crate) const SUBSTRATE_BROCA: &str = crate::legacy_wire::BROCA;
 /// Caller class of `route.select_panel` recordings: panels carry no target agent.
 pub(crate) const CALLER_CLASS_PANEL: &str = "panel";
 

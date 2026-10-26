@@ -136,6 +136,7 @@ fn main() {
                 required_capabilities: None,
                 available_models: [route.clone()].into_iter().collect(),
                 availability_substrate: prefrontal_routing_core::AvailabilitySubstrate::Broca,
+                availability_label: "served".to_string(),
                 is_subscription_route: None,
             })
             .unwrap();

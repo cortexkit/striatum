@@ -27,6 +27,7 @@ mod credential_fences;
 mod engram_catalog;
 mod fusiform_catalog;
 mod key_pool;
+mod legacy_wire;
 #[cfg(test)]
 mod literal_census_tests;
 mod model_resolution;
@@ -4119,7 +4120,12 @@ async fn handle_select_request(
         // Resolved providers are reachable through their own credentials, so
         // their borrowed rows join the served-route join.
         prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &catalog_targets);
-        select_availability(Some("broca"), Vec::new(), &facts, broca_credentials)
+        select_availability(
+            Some(legacy_wire::BROCA),
+            Vec::new(),
+            &facts,
+            broca_credentials,
+        )
     };
     timing.add_snapshot_closure(snapshot_started.elapsed());
     // A host-run selection judged on the caller's own list never consulted
@@ -4366,7 +4372,7 @@ async fn handle_select_request(
         if host_run {
             Some(
                 if deferred_runner_pin {
-                    "broca"
+                    legacy_wire::BROCA
                 } else {
                     params
                         .harness
@@ -4525,7 +4531,7 @@ async fn handle_select_request(
             host_runner_pin_refusal(
                 &catalog_targets,
                 if deferred_runner_pin {
-                    Some("broca")
+                    Some(legacy_wire::BROCA)
                 } else {
                     params.substrate.as_deref()
                 },
@@ -4733,7 +4739,7 @@ async fn handle_select_request(
                     result["pin_rejected"] = serde_json::Value::Null;
                 }
                 if deferred_runner_pin {
-                    result["requiredSubstrate"] = json!("broca");
+                    result["requiredSubstrate"] = json!(legacy_wire::BROCA);
                 }
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
@@ -5375,15 +5381,25 @@ fn host_runner_pin_refusal<'a>(
         let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
         needs_runner_pin(catalog_targets, provider).then(|| {
             format!(
-                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, but {substrate_source} {}",
+                "{route}: provider {provider} needs a per-send credential pin that only the {} runner carries, but {substrate_source} {}",
+                runner_title(legacy_wire::BROCA),
                 requested_substrate.unwrap_or("none")
             )
         })
     })
 }
 
+/// A runner's name as prose capitalizes it: `broca` reads as `Broca`.
+fn runner_title(runner: &str) -> String {
+    let mut chars = runner.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
-    requested_substrate.map(str::trim) == Some("broca")
+    requested_substrate.map(str::trim) == Some(legacy_wire::BROCA)
 }
 
 /// The Broca routes a caller's model list admits: a route stays when the list
@@ -5457,7 +5473,12 @@ fn select_availability(
     let (models, fallback) = broca_served_routes(facts, broca_credentials);
     let note = match fallback {
         Some(reason) => format!("availability unknown: {reason}; routed over all {} served catalog routes", models.len()),
-        None => format!("availability: broca ({} served catalog routes on providers Broca holds a credential for)", models.len()),
+        None => format!(
+            "availability: {runner} ({} served catalog routes on providers {} holds a credential for)",
+            models.len(),
+            runner_title(legacy_wire::BROCA),
+            runner = legacy_wire::BROCA,
+        ),
     };
     SelectAvailability {
         models,
@@ -5679,6 +5700,8 @@ async fn handle_select_panel(
                 required_capabilities: params.required_capabilities,
                 available_models: mapped_availability.models.clone(),
                 availability_substrate,
+                availability_label: legacy_wire::availability_label(availability_substrate)
+                    .to_string(),
                 is_subscription_route: Some(Box::new(|route: &ModelRoute| {
                     subscription_keys.contains(&route.route_key)
                         || subscription_keys.contains(&route.capacity_key)
@@ -5822,7 +5845,7 @@ async fn handle_select_panel(
         &provenance,
         &policy_sources_line(&operator_policy),
     );
-    let decision_id = match store.record_decision_with_selection(&decision, Some("broca"), None) {
+    let decision_id = match store.record_decision_with_selection(&decision, Some(legacy_wire::BROCA), None) {
         Ok(id) => id,
         Err(e) => {
             return send_route_error(
@@ -5846,7 +5869,7 @@ async fn handle_select_panel(
         .as_array_mut()
         .expect("panel members are an array")
     {
-        member["harness"] = json!("broca");
+        member["harness"] = json!(legacy_wire::BROCA);
     }
     if let Some(shortfall) = &panel.shortfall {
         result
@@ -6061,7 +6084,7 @@ fn panel_decision_input(
         "selection": "class_policy",
         "policy": panel.policy,
         "policySources": policy_sources,
-        "availability": availability.as_str(),
+        "availability": legacy_wire::availability_label(availability),
         "workload": "workload: athena",
     });
     DecisionInput {

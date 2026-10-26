@@ -707,18 +707,22 @@ impl BrocaCredentials {
     }
 
     fn fallback_reason(&self, now_ms: u64) -> Option<String> {
+        // The legacy shapes judge reach for the Broca runner from this listing.
+        let runner = crate::legacy_wire::BROCA;
         let Some(reached_at_ms) = self.reached_at_ms else {
-            return Some("broca reachability unknown: credential listing unavailable".into());
+            return Some(format!(
+                "{runner} reachability unknown: credential listing unavailable"
+            ));
         };
         if now_ms.saturating_sub(reached_at_ms) > MAX_AGE_MS {
-            return Some(
-                "broca reachability unknown: credential listing stale (over 15 minutes)".into(),
-            );
+            return Some(format!(
+                "{runner} reachability unknown: credential listing stale (over 15 minutes)"
+            ));
         }
         if self.providers.is_empty() {
-            return Some(
-                "broca reachability unknown: no credentials map to catalog providers".into(),
-            );
+            return Some(format!(
+                "{runner} reachability unknown: no credentials map to catalog providers"
+            ));
         }
         None
     }
@@ -728,7 +732,8 @@ impl BrocaCredentials {
         report.detail = self.fallback_reason(now_ms).or_else(|| {
             (self.unreadable > 0).then(|| {
                 format!(
-                    "broca reachability: {} unreadable credential rows skipped",
+                    "{} reachability: {} unreadable credential rows skipped",
+                    crate::legacy_wire::BROCA,
                     self.unreadable
                 )
             })

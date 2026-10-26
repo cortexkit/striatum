@@ -72,10 +72,25 @@ impl Workload {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// The legacy `executor` request value. Its one accepted spelling is the
+/// legacy wire's Broca name.
+#[derive(Debug)]
 pub(crate) enum Executor {
-    #[serde(rename = "broca")]
     Broca,
+}
+
+impl<'de> Deserialize<'de> for Executor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value == crate::legacy_wire::BROCA {
+            Ok(Self::Broca)
+        } else {
+            Err(serde::de::Error::unknown_variant(
+                &value,
+                &[crate::legacy_wire::BROCA],
+            ))
+        }
+    }
 }
 
 pub(crate) struct SelectionHarness<'a> {
@@ -110,8 +125,9 @@ impl SelectionHarness<'_> {
         }
         if self.executor && harness != Harness::Broca {
             return Some(format!(
-                "harness {} is not the executor broca",
-                harness.as_str()
+                "harness {} is not the executor {}",
+                harness.as_str(),
+                crate::legacy_wire::BROCA
             ));
         }
         let models = if self.executor {

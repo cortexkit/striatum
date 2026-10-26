@@ -20,7 +20,7 @@
 //! Out of scope are test code (files whose names end in `_tests.rs`, modules
 //! and items compiled only under `#[cfg(test)]`, and `#[test]` functions), data
 //! files such as `data/config_convert_defaults.json` (only `.rs` files are
-//! read), and the functions in [`EXEMPT_FUNCTIONS`].
+//! read), and the items in [`EXEMPTIONS`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -30,41 +30,79 @@ use serde_json::Value;
 /// Runner ids. Runners declare themselves; routing code never names one.
 const RUNNER_IDS: &[&str] = &["broca", "opencode", "pi"];
 
-/// One function the census does not read, named by file, optional `impl`
-/// type and function name.
+/// One item the census does not read.
 struct Exemption {
     /// Path relative to the workspace `crates/` directory.
     file: &'static str,
-    /// The type of the `impl` block holding the function, for methods.
-    impl_type: Option<&'static str>,
-    function: &'static str,
+    item: ExemptItem,
 }
 
-/// The only functions the census does not read.
-///
-/// The first four are the Anthropic header path: they parse and forward the
-/// raw `anthropic-ratelimit-unified-` headers runners send, provider-id checks
-/// included, and stay until runners send normalized readings.
-const EXEMPT_FUNCTIONS: &[Exemption] = &[
+enum ExemptItem {
+    /// A function, with the type of the `impl` block holding it for methods.
+    Function {
+        impl_type: Option<&'static str>,
+        name: &'static str,
+    },
+    /// A `const` item.
+    Const(&'static str),
+    /// The whole module that `file` holds.
+    Module,
+}
+
+/// The only items the census does not read.
+const EXEMPTIONS: &[Exemption] = &[
+    // The Anthropic header path: these four functions parse and forward the raw
+    // `anthropic-ratelimit-unified-` headers runners send, provider-id checks
+    // included, and stay until runners send normalized readings.
     Exemption {
         file: "prefrontal-routing-module/src/usage_observe.rs",
-        impl_type: None,
-        function: "observation_for_admission",
+        item: ExemptItem::Function {
+            impl_type: None,
+            name: "observation_for_admission",
+        },
     },
     Exemption {
         file: "prefrontal-routing-module/src/usage_observe.rs",
-        impl_type: Some("HeaderSignature"),
-        function: "from_headers",
+        item: ExemptItem::Function {
+            impl_type: Some("HeaderSignature"),
+            name: "from_headers",
+        },
     },
     Exemption {
         file: "prefrontal-routing-module/src/account_selection.rs",
-        impl_type: None,
-        function: "usage_observation",
+        item: ExemptItem::Function {
+            impl_type: None,
+            name: "usage_observation",
+        },
     },
     Exemption {
         file: "prefrontal-routing-module/src/account_selection.rs",
-        impl_type: None,
-        function: "header_fences",
+        item: ExemptItem::Function {
+            impl_type: None,
+            name: "header_fences",
+        },
+    },
+    // The runner names fixed by the legacy route.select, route.select_panel
+    // and account wire shapes, which today's core sends and decision rows
+    // store. The module is deleted with those shapes (board item 22616ba9).
+    Exemption {
+        file: "prefrontal-routing-module/src/legacy_wire.rs",
+        item: ExemptItem::Module,
+    },
+    // Model-family names, not provider references: the stored and wire
+    // spellings of each grand family (some equal a provider id, such as
+    // `deepseek`), and the historical store spellings (`anthropic`, `openai`)
+    // that the versioned family normalization migration still accepts.
+    Exemption {
+        file: "prefrontal-routing-core/src/model_facts.rs",
+        item: ExemptItem::Function {
+            impl_type: Some("GrandFamily"),
+            name: "as_str",
+        },
+    },
+    Exemption {
+        file: "prefrontal-routing-core/src/model_facts.rs",
+        item: ExemptItem::Const("GRAND_FAMILY_NORMALIZATIONS"),
     },
 ];
 
@@ -597,29 +635,41 @@ fn function_ranges(code: &[u8], name: &str, within: (usize, usize)) -> Vec<(usiz
     ranges
 }
 
-/// The exempt function ranges in one file. Each exemption must name exactly
-/// one function, so a rename or a second same-named function fails loudly
-/// instead of silently widening or dropping the exemption.
+/// Byte ranges of every `const NAME` item, through its `;`.
+fn const_ranges(code: &[u8], name: &str) -> Vec<(usize, usize)> {
+    (0..code.len())
+        .filter(|&at| word_at(code, at, b"const"))
+        .filter(|&at| word_at(code, skip_whitespace(code, at + 5), name.as_bytes()))
+        .map(|at| (at, item_end(code, at)))
+        .collect()
+}
+
+/// The exempt item ranges in one file. Each exemption must name exactly one
+/// item, so a rename or a second same-named item fails loudly instead of
+/// silently widening or dropping the exemption.
 fn exempt_ranges(rel_path: &str, code: &[u8]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
-    for exemption in EXEMPT_FUNCTIONS.iter().filter(|e| e.file == rel_path) {
-        let scopes = match exemption.impl_type {
-            Some(type_name) => impl_blocks(code, type_name),
-            None => vec![(0, code.len())],
+    for exemption in EXEMPTIONS.iter().filter(|e| e.file == rel_path) {
+        let (found, described) = match exemption.item {
+            ExemptItem::Function { impl_type, name } => {
+                let scopes = match impl_type {
+                    Some(type_name) => impl_blocks(code, type_name),
+                    None => vec![(0, code.len())],
+                };
+                let found = scopes
+                    .into_iter()
+                    .flat_map(|scope| function_ranges(code, name, scope))
+                    .collect::<Vec<_>>();
+                let owner = impl_type.map(|ty| format!("{ty}::")).unwrap_or_default();
+                (found, format!("function {owner}{name}"))
+            }
+            ExemptItem::Const(name) => (const_ranges(code, name), format!("const {name}")),
+            ExemptItem::Module => (vec![(0, code.len())], "module".to_string()),
         };
-        let found = scopes
-            .into_iter()
-            .flat_map(|scope| function_ranges(code, exemption.function, scope))
-            .collect::<Vec<_>>();
         assert_eq!(
             found.len(),
             1,
-            "{rel_path}: exempt function {}{} must exist exactly once",
-            exemption
-                .impl_type
-                .map(|ty| format!("{ty}::"))
-                .unwrap_or_default(),
-            exemption.function
+            "{rel_path}: exempt {described} must exist exactly once"
         );
         ranges.extend(found);
     }
@@ -760,7 +810,17 @@ fn render(findings: &[Finding]) -> String {
 #[test]
 fn routing_sources_name_no_provider_model_or_runner() {
     let ids = listed_ids();
-    let findings = census(&scanned_files(), &ids);
+    let files = scanned_files();
+    // An exemption whose file is gone would hide nothing, but it would also
+    // stop saying what the exempt code is; keep the list true.
+    for exemption in EXEMPTIONS {
+        assert!(
+            files.iter().any(|(path, _)| path == exemption.file),
+            "exempt file {} is not among the scanned sources",
+            exemption.file
+        );
+    }
+    let findings = census(&files, &ids);
     assert!(
         findings.is_empty(),
         "routing code names a provider, model or runner id in a string literal; \
@@ -910,9 +970,16 @@ fn every_scanned_file_is_read_except_test_modules() {
         .map(|(path, _)| path.as_str())
         .filter(|path| !flagged.contains(*path))
         .collect::<Vec<_>>();
+    let exempt_modules = EXEMPTIONS
+        .iter()
+        .filter(|exemption| matches!(exemption.item, ExemptItem::Module))
+        .map(|exemption| exemption.file)
+        .collect::<BTreeSet<_>>();
     for path in &unread {
         assert!(
-            path.ends_with("/tests.rs") || path.ends_with("/test_config.rs"),
+            path.ends_with("/tests.rs")
+                || path.ends_with("/test_config.rs")
+                || exempt_modules.contains(path),
             "the census does not read {path}, which is not a test module"
         );
     }
