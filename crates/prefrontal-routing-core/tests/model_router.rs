@@ -3948,8 +3948,9 @@ fn ladder_with_an_adequate_free_route_and_an_adequate_priced_route_picks_the_fre
         .unpriced_dimensions
         .is_empty());
 
-    // The free route's absent cache-write, reasoning and cache-read rates price
-    // at zero, on the basket and on the output-only ladder alike.
+    // The basket prices the free route's absent cache-write, reasoning and
+    // cache-read rates at zero; the output-only ladder is zero too because the
+    // route states a zero output rate.
     let vector = mason_live_vector();
     // Anti-vacuity: the workload writes cache and reasons, so the absent rates are priced.
     assert!(vector.cache_write > 0.0 && vector.reasoning > 0.0);
