@@ -10,7 +10,8 @@
 //! `extra_rate_windows[]` at low utilization, so the aggregate must be IGNORED and
 //! the scoped windows mapped to specific capacity keys instead. Antigravity's
 //! scoped windows are POOLS (`gemini-5h`, `3p-weekly`, ...) shared by a model
-//! family, mapped through `ANTIGRAVITY_POOL_BY_MODEL_FAMILY`.
+//! family, mapped through `ANTIGRAVITY_POOL_BY_MODEL_FAMILY`, plus narrower
+//! pools for single models (`ANTIGRAVITY_POOL_BY_MODEL_PREFIX`).
 
 use crate::quota::{ExtraWindow, ProviderUsage, RateWindow};
 use crate::quota_pace::ProviderWindowModel;
@@ -241,12 +242,28 @@ const ANTIGRAVITY_MODEL_PREFIX: &str = "antigravity-";
 /// `3p-weekly`. Gemini
 /// models use the `gemini` pool; third-party models served through Antigravity
 /// (Claude, GPT) use the `3p` pool. A model whose family is not listed here gets
-/// no pool signal rather than a guessed one.
+/// no pool signal rather than a guessed one. Some models additionally draw on a
+/// narrower pool; see `ANTIGRAVITY_POOL_BY_MODEL_PREFIX`.
 pub const ANTIGRAVITY_POOL_BY_MODEL_FAMILY: &[(&str, &str)] =
     &[("gemini", "gemini"), ("claude", "3p"), ("gpt", "3p")];
 
-/// The Antigravity pool a routing capacity key draws on, if it is an
-/// Antigravity-served model of a known family.
+/// Pools that meter only some models of a family, keyed by a prefix of the
+/// routing model id. A model matching a prefix draws on that pool IN ADDITION
+/// to its family pool, so both pools gate it.
+///
+/// Source: QTA (Insula's owner), confirmed 2026-10-24. A paid Antigravity Pro
+/// account publishes a separate weekly Gemini 4 Argon limit as window id
+/// `gemini-argon-wtu-weekly`, on top of the ordinary Gemini pool windows that
+/// Argon also counts against. Ultra and free accounts publish no such window;
+/// for them Argon is gated by the Gemini pool alone. No other Gemini model
+/// draws on the Argon pool, so its exhaustion never walls them.
+pub const ANTIGRAVITY_POOL_BY_MODEL_PREFIX: &[(&str, &str)] =
+    &[("antigravity-gemini-4-argon", "gemini-argon")];
+
+/// The family-wide Antigravity pool a routing capacity key draws on, if it is
+/// an Antigravity-served model of a known family. Model-specific pools from
+/// `ANTIGRAVITY_POOL_BY_MODEL_PREFIX` are not included; use
+/// `antigravity_capacity_draws_on_pool` to ask about any pool.
 pub fn antigravity_pool_for_capacity(capacity_key: &str) -> Option<&'static str> {
     let model_id = capacity_key
         .split_once('/')
@@ -271,11 +288,25 @@ pub fn requires_account_pool(capacity_key: &str) -> bool {
         .starts_with(ANTIGRAVITY_MODEL_PREFIX)
 }
 
+/// Whether a routing capacity key draws on the named Antigravity pool, either
+/// as its family pool or as a model-specific pool.
+pub fn antigravity_capacity_draws_on_pool(capacity_key: &str, pool: &str) -> bool {
+    if antigravity_pool_for_capacity(capacity_key) == Some(pool) {
+        return true;
+    }
+    let model_id = capacity_key
+        .split_once('/')
+        .map_or(capacity_key, |(_, model)| model);
+    ANTIGRAVITY_POOL_BY_MODEL_PREFIX
+        .iter()
+        .any(|(prefix, prefix_pool)| *prefix_pool == pool && model_id.starts_with(prefix))
+}
+
 /// The routed capacities that draw on one Antigravity pool.
 pub fn antigravity_pool_capacities(pool: &str, capacity_keys: &[String]) -> Vec<String> {
     capacity_keys
         .iter()
-        .filter(|key| antigravity_pool_for_capacity(key) == Some(pool))
+        .filter(|key| antigravity_capacity_draws_on_pool(key, pool))
         .cloned()
         .collect()
 }
@@ -307,15 +338,22 @@ impl PoolPeriod {
 }
 
 /// The Antigravity pool window ids, each with the pool it meters and its period.
-/// Only these exact ids are pool windows. Antigravity also publishes separately
-/// metered allowances under other ids, some starting with `gemini-` (QTA: paid
-/// Pro accounts get a weekly Gemini 4 Argon quota); reading one of those as the
-/// `gemini` pool would let its exhaustion wall every Gemini route.
+/// Only these exact ids are pool windows. Antigravity publishes separately
+/// metered allowances under ids that start with `gemini-`; reading one of those
+/// as the `gemini` pool would let its exhaustion wall every Gemini route. The
+/// paid Pro Gemini 4 Argon weekly limit (`gemini-argon-wtu-weekly`) is its own
+/// `gemini-argon` pool, which only Argon routes draw on. No five-hour Argon
+/// window exists.
 const ANTIGRAVITY_POOL_WINDOW_IDS: &[(&str, &str, PoolPeriod)] = &[
     ("gemini-5h", "gemini", PoolPeriod::FiveHour),
     ("gemini-weekly", "gemini", PoolPeriod::Weekly),
     ("3p-5h", "3p", PoolPeriod::FiveHour),
     ("3p-weekly", "3p", PoolPeriod::Weekly),
+    (
+        "gemini-argon-wtu-weekly",
+        "gemini-argon",
+        PoolPeriod::Weekly,
+    ),
 ];
 
 /// Recognize an Antigravity pool window by its exact id. The id fixes both the
@@ -366,7 +404,7 @@ pub fn account_rate_windows(
         return pools
             .into_iter()
             .filter(|(_, pool, _)| {
-                capacity_key.is_none_or(|key| antigravity_pool_for_capacity(key) == Some(*pool))
+                capacity_key.is_none_or(|key| antigravity_capacity_draws_on_pool(key, pool))
             })
             .filter_map(|(extra, _, period)| {
                 let mut window = extra.window.clone()?;
@@ -1039,6 +1077,13 @@ mod tests {
             ),
             ("3p-5h", "3p", PoolPeriod::FiveHour, "five_hour", "weekly"),
             ("3p-weekly", "3p", PoolPeriod::Weekly, "weekly", "five_hour"),
+            (
+                "gemini-argon-wtu-weekly",
+                "gemini-argon",
+                PoolPeriod::Weekly,
+                "weekly",
+                "five_hour",
+            ),
         ];
         for (id, pool, period, agreeing, contradicting) in expected {
             assert_eq!(
@@ -1064,15 +1109,22 @@ mod tests {
                 Some((pool, period))
             );
         }
-        // A pool-looking id that is not one of the four is not a pool window.
+        // A pool-looking id that is not in the table is not a pool window.
         assert_eq!(antigravity_pool_window(&item("gemini-flash", None)), None);
         assert_eq!(antigravity_pool_window(&item("other-5h", None)), None);
-        // Every pool the ids name is one some routed model family draws on.
+        // No five-hour Argon window exists, so none is guessed from the weekly id.
+        assert_eq!(
+            antigravity_pool_window(&item("gemini-argon-wtu-5h", None)),
+            None
+        );
+        // Every pool the ids name is one some routed model family or model
+        // prefix draws on.
         for (_, pool, _) in ANTIGRAVITY_POOL_WINDOW_IDS {
             assert!(
                 ANTIGRAVITY_POOL_BY_MODEL_FAMILY
                     .iter()
-                    .any(|(_, family_pool)| family_pool == pool),
+                    .chain(ANTIGRAVITY_POOL_BY_MODEL_PREFIX)
+                    .any(|(_, mapped_pool)| mapped_pool == pool),
                 "{pool}"
             );
         }
@@ -1080,10 +1132,10 @@ mod tests {
 
     #[test]
     fn antigravity_unknown_gemini_buckets_never_pressure_gemini_capacities() {
-        // QTA: paid Pro accounts publish a separately metered weekly Gemini 4
-        // Argon allowance under a new bucket id that may start with `gemini-`.
-        // Read as the `gemini` weekly pool, an exhausted Argon allowance would
-        // wall every Gemini route. Each exhausted unknown bucket below carries
+        // Antigravity publishes separately metered allowances under bucket ids
+        // that start with `gemini-` (the Pro Argon weekly limit is one, under
+        // its own known id). An unknown one read as the `gemini` weekly pool
+        // would wall every Gemini route. Each exhausted unknown bucket below carries
         // windowKind weekly; the only recognized Gemini pool window in this
         // entry is `gemini-5h`, and it alone may reach Gemini capacities.
         let unknown_ids = [
@@ -1155,6 +1207,99 @@ mod tests {
             let used: Vec<f64> = reported.iter().map(|(_, w)| w.used_percent).collect();
             assert_eq!(used, vec![25.0], "{capacity_key} reads only gemini-5h");
         }
+    }
+
+    #[test]
+    fn antigravity_argon_weekly_window_reaches_argon_routes_only() {
+        // A paid Pro account reads its separate Gemini 4 Argon weekly limit as
+        // `gemini-argon-wtu-weekly`. Argon routes draw on it and still on the
+        // ordinary Gemini pool; every other Gemini route ignores it.
+        let argon = "google/antigravity-gemini-4-argon";
+        let argon_variant = "google/antigravity-gemini-4-argon-thinking";
+        let gemini = "google/antigravity-gemini-3.6-flash";
+        assert!(antigravity_capacity_draws_on_pool(argon, "gemini-argon"));
+        assert!(antigravity_capacity_draws_on_pool(
+            argon_variant,
+            "gemini-argon"
+        ));
+        assert!(antigravity_capacity_draws_on_pool(argon, "gemini"));
+        assert!(!antigravity_capacity_draws_on_pool(gemini, "gemini-argon"));
+        assert!(!antigravity_capacity_draws_on_pool(
+            "google/gemini-4-argon",
+            "gemini-argon"
+        ));
+        let caps = vec![argon.to_string(), gemini.to_string()];
+        assert_eq!(
+            antigravity_pool_capacities("gemini-argon", &caps),
+            vec![argon.to_string()]
+        );
+        assert_eq!(antigravity_pool_capacities("gemini", &caps), caps);
+
+        let window = |id: &str, used: f64| ExtraWindow {
+            title: Some(format!("{id} title")),
+            id: Some(id.into()),
+            window: Some(win(used, "2026-01-01T00:00:00Z", None)),
+            window_kind: Some(
+                if id.ends_with("5h") {
+                    "five_hour"
+                } else {
+                    "weekly"
+                }
+                .into(),
+            ),
+        };
+        let usage = Usage {
+            primary: None,
+            secondary: None,
+            tertiary: None,
+            extra_rate_windows: Some(vec![
+                window("gemini-5h", 10.0),
+                window("gemini-weekly", 20.0),
+                window("gemini-argon-wtu-weekly", 100.0),
+            ]),
+        };
+        let read = |capacity_key: &str| -> Vec<(f64, Option<i64>)> {
+            account_rate_windows(&usage, Some(capacity_key))
+                .into_iter()
+                .map(|(_, w)| (w.used_percent, w.window_minutes))
+                .collect()
+        };
+        assert_eq!(
+            read(argon),
+            vec![
+                (10.0, Some(300)),
+                (20.0, Some(10_080)),
+                (100.0, Some(10_080))
+            ]
+        );
+        assert_eq!(read(gemini), vec![(10.0, Some(300)), (20.0, Some(10_080))]);
+
+        let entry = ProviderUsage {
+            stale: None,
+            fetched_at: None,
+            api_provider: None,
+            provider: "antigravity".into(),
+            account: None,
+            source: None,
+            usage: Some(usage),
+            spend: Vec::new(),
+            error: None,
+            error_class: None,
+            saved_resets: None,
+        };
+        let argon_pool: Vec<_> = extract_windows(&entry, "google", "antigravity", &caps)
+            .into_iter()
+            .filter(|w| w.applies_key.as_deref() == Some("gemini-argon"))
+            .map(|w| (w.window_key, w.scope_kind, w.window_ms))
+            .collect();
+        assert_eq!(
+            argon_pool,
+            vec![(
+                "codexbar:antigravity:gemini-argon-wtu-weekly".to_string(),
+                WindowScopeKind::AntigravityPool,
+                Some(10_080.0 * 60_000.0)
+            )]
+        );
     }
 
     #[test]

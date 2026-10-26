@@ -1248,6 +1248,67 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_exhausted_argon_weekly_walls_argon_but_not_other_gemini() {
+        // A paid Pro account: Gemini pool free, separate Argon weekly limit spent.
+        let facts = vec![
+            fact("google", "antigravity-gemini-4-argon", 50.0),
+            fact("google", "antigravity-gemini-3.8-flash", 50.0),
+        ];
+        let argon_reset = "2030-01-06T00:00:00Z";
+        let pro = antigravity_account(
+            "pro",
+            &[
+                ("gemini-5h", 10.0, "2030-01-01T04:00:00Z"),
+                ("gemini-weekly", 20.0, "2030-01-05T00:00:00Z"),
+                ("gemini-argon-wtu-weekly", 100.0, argon_reset),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[pro.clone()], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_ARGON].quota_exhausted_until,
+            Some(ms(argon_reset)),
+            "the spent Argon weekly limit walls Argon"
+        );
+        assert_eq!(
+            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until, None,
+            "the Argon limit never walls another Gemini route"
+        );
+
+        // Argon still counts against the Gemini pool: a spent Gemini 5h window
+        // walls it even though its own Argon window is free.
+        let gemini_spent = antigravity_account(
+            "pro",
+            &[
+                ("gemini-5h", 100.0, "2030-01-01T01:00:00Z"),
+                ("gemini-argon-wtu-weekly", 5.0, argon_reset),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[gemini_spent], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_ARGON].quota_exhausted_until,
+            Some(ms("2030-01-01T01:00:00Z"))
+        );
+
+        // An Ultra account publishes no Argon window: the Gemini windows alone
+        // gate Argon there, and with them free the route stays open.
+        let ultra = antigravity_account(
+            "ultra",
+            &[
+                ("gemini-5h", 10.0, "2030-01-01T04:00:00Z"),
+                ("gemini-weekly", 20.0, "2030-01-05T00:00:00Z"),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[ultra.clone()], &facts);
+        assert_eq!(snapshot.by_capacity[AG_ARGON].quota_exhausted_until, None);
+        assert!(snapshot.by_capacity[AG_ARGON].quota_pressure.is_some());
+        let snapshot = antigravity_overlay(&[pro, ultra], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_ARGON].quota_exhausted_until, None,
+            "the Ultra account keeps Argon open beside a Pro account whose Argon limit is spent"
+        );
+    }
+
+    #[test]
     fn antigravity_pool_walls_only_when_every_account_is_walled() {
         let facts = antigravity_facts();
         // Live 2026-10-02: one account's 5h pool spent, the other's weekly spent.

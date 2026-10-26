@@ -3209,6 +3209,94 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_pro_argon_weekly_limit_gates_argon_only() {
+        // A paid Pro account publishes its separate Gemini 4 Argon weekly limit
+        // as `gemini-argon-wtu-weekly`; Ultra and free accounts publish none.
+        let entry = |account: &str, gemini_weekly: f64, argon: Option<f64>| {
+            let mut windows = vec![
+                json!({"id": "gemini-5h", "windowKind": "five_hour", "window": {"usedPercent": 10.0, "windowMinutes": 300}}),
+                json!({"id": "gemini-weekly", "windowKind": "weekly", "window": {"usedPercent": gemini_weekly, "windowMinutes": 10080}}),
+            ];
+            if let Some(used) = argon {
+                windows.push(json!({"id": "gemini-argon-wtu-weekly", "windowKind": "weekly", "window": {"usedPercent": used, "windowMinutes": 10080}}));
+            }
+            json!({
+                "provider": "antigravity", "apiProvider": "google", "account": account,
+                "source": "oauth", "fetchedAt": "2026-09-29T11:59:00Z",
+                "usage": {"extraRateWindows": windows}
+            })
+        };
+        let admit = |rig: &Fixture, id: &str, model: &str| {
+            let mut params = admit_params(id, id, "broca");
+            params["provider"] = json!("google");
+            params["model"] = json!(model);
+            params["affinity_model"] = json!(model);
+            rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params)
+        };
+        const ARGON: &str = "antigravity-gemini-4-argon";
+        const GEMINI: &str = "antigravity-gemini-3.8-flash";
+
+        // Both accounts are Pro with the Argon limit spent: Argon is refused,
+        // while another Gemini route is still admitted on the same accounts.
+        let pro = provider_fixture(
+            "argon-pro",
+            "antigravity",
+            vec![
+                entry(ACCOUNT_A, 20.0, Some(100.0)),
+                entry(ACCOUNT_B, 30.0, Some(100.0)),
+            ],
+        );
+        let refused = admit(&pro, "argon-pro", ARGON);
+        assert!(
+            refused.code().is_some(),
+            "a spent Argon weekly limit refuses Argon: {refused:?}"
+        );
+        assert!(preflight_model(&pro.ctx(true, NOW), "google", ARGON).is_err());
+        let admitted = result(admit(&pro, "gemini-pro", GEMINI));
+        assert_eq!(admitted["account"]["account_id"], ACCOUNT_A);
+        let state = pro.accounts.lock().unwrap();
+        let report = account_quota::build_report(
+            &state.readings,
+            state.roster.as_ref(),
+            &state.roster_poll,
+            NOW,
+        );
+        assert!(
+            report.alarms.is_empty(),
+            "the Argon window is a known pool, not an unmapped scope: {:?}",
+            report.alarms
+        );
+        drop(state);
+
+        // Account A has no Argon window (Ultra): its Gemini windows alone admit
+        // Argon, beside a Pro account whose Argon limit is spent.
+        let mixed = provider_fixture(
+            "argon-mixed",
+            "antigravity",
+            vec![
+                entry(ACCOUNT_A, 20.0, None),
+                entry(ACCOUNT_B, 10.0, Some(100.0)),
+            ],
+        );
+        let admitted = result(admit(&mixed, "argon-mixed", ARGON));
+        assert_eq!(admitted["account"]["account_id"], ACCOUNT_A);
+
+        // The same account's Gemini windows still gate Argon: with its Gemini
+        // weekly pool spent, Argon has no account left.
+        let ultra_spent = provider_fixture(
+            "argon-ultra-spent",
+            "antigravity",
+            vec![
+                entry(ACCOUNT_A, 100.0, None),
+                entry(ACCOUNT_B, 10.0, Some(100.0)),
+            ],
+        );
+        assert!(admit(&ultra_spent, "argon-ultra-spent", ARGON)
+            .code()
+            .is_some());
+    }
+
+    #[test]
     fn vendorless_reading_is_unmapped_and_never_borrows_a_siblings_vendor() {
         let mut missing = reported_entry("codex", Value::Null, ACCOUNT_A, "weekly", 10080, 0.0);
         missing.as_object_mut().unwrap().remove("apiProvider");
