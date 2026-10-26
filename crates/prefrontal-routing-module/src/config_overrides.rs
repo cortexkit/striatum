@@ -407,6 +407,16 @@ fn live_config_at_with_reporter(
 }
 
 fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
+    if config.accounts.metered_fallback {
+        return Err(
+            "metered_fallback must be explicitly enabled under providers.<id>.accounts".into(),
+        );
+    }
+    allocator_policy_from(&config.accounts, None)?;
+    for (provider, entry) in &config.providers {
+        allocator_policy_from(&config.accounts, Some(&entry.accounts))
+            .map_err(|error| format!("providers.{provider}.accounts: {error}"))?;
+    }
     let section = &config.model_routing;
     if section
         .demand_exponent
@@ -886,7 +896,7 @@ struct RoutingConfigFile {
     #[serde(default)]
     catalog: CatalogSection,
     #[serde(default)]
-    accounts: RemovedAccountFlags,
+    accounts: crate::config_policy::ProviderAccountsPolicy,
 }
 
 /// Regenerate with `cargo run -p prefrontal-routing-module --bin ck-prefrontal-routing -- --print-config-schema`.
@@ -894,9 +904,166 @@ pub fn routing_config_schema() -> String {
     serde_json::to_string_pretty(&schemars::schema_for!(RoutingConfigFile)).unwrap() + "\n"
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct RemovedAccountFlags {}
+fn allocator_policy_from(
+    defaults: &crate::config_policy::ProviderAccountsPolicy,
+    provider: Option<&crate::config_policy::ProviderAccountsPolicy>,
+) -> Result<prefrontal_routing_core::accounts::AllocatorPolicy, String> {
+    use prefrontal_routing_core::accounts::{
+        AccountStrategy, AllocatorPolicy, PoolFloor, PoolKey, PoolScope,
+    };
+    let mut policy = AllocatorPolicy::default();
+    for source in std::iter::once(defaults).chain(provider) {
+        if let Some(strategy) = &source.strategy {
+            policy.strategy = match strategy.as_str() {
+                "sticky" => AccountStrategy::Sticky,
+                "round_robin" => AccountStrategy::RoundRobin,
+                "hybrid" => AccountStrategy::Hybrid,
+                "ordered" => AccountStrategy::Ordered,
+                _ => return Err("strategy must be sticky, round_robin, hybrid or ordered".into()),
+            };
+        }
+        if let Some(order) = &source.order {
+            policy.account_order = order.clone();
+        }
+        if let Some(order) = &source.ordered {
+            policy.fallback_first = match order.as_str() {
+                "main-first" => false,
+                "fallback-first" => true,
+                _ => return Err("ordered must be main-first or fallback-first".into()),
+            };
+        }
+        if let Some(floor) = source.soft_quota_remaining_percent {
+            if !floor.is_finite() || !(0.0..=100.0).contains(&floor) {
+                return Err("soft_quota_remaining_percent must be in 0..100".into());
+            }
+            policy.soft_quota_remaining_percent = Some(floor);
+        }
+        if let Some(floors) = &source.floors {
+            policy.pool_floors = floors
+                .iter()
+                .map(|floor| {
+                    if let Some(pool) = &floor.pool {
+                        prefrontal_routing_core::accounts::validate_pool_name(pool)?;
+                    }
+                    if !floor.remaining_percent.is_finite()
+                        || !(0.0..=100.0).contains(&floor.remaining_percent)
+                    {
+                        return Err("floor remaining_percent must be in 0..100".into());
+                    }
+                    if floor.pool.is_none() && floor.window_minutes.is_none() {
+                        return Err("floor needs a pool or window_minutes".into());
+                    }
+                    Ok(PoolFloor {
+                        key: PoolKey {
+                            name: floor.pool.clone(),
+                            window_minutes: floor.window_minutes,
+                            scope: floor.model.as_ref().map_or(PoolScope::EveryModel, |model| {
+                                PoolScope::Models(std::iter::once(model.clone()).collect())
+                            }),
+                        },
+                        remaining_percent: floor.remaining_percent,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+        }
+        if let Some(duration) = &source.max_hold {
+            policy.max_hold_s = duration.seconds()?;
+        }
+        if let Some(duration) = &source.hold_when_reset_within {
+            policy.short_hold_max_ms = i64::try_from(duration.seconds()?)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1000))
+                .ok_or("hold_when_reset_within too large")?;
+        }
+        if let Some(duration) = &source.unknown_reset_retry {
+            policy.unknown_reset_retry_ms = i64::try_from(duration.seconds()?)
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1000))
+                .ok_or("unknown_reset_retry too large")?;
+        }
+        if let Some(limit) = source.spend_budget {
+            if !limit.is_finite() || limit <= 0.0 {
+                return Err("spend_budget must be positive".into());
+            }
+            policy.spend_budget = Some(limit);
+        }
+        if let Some(enabled) = source.paid_credits {
+            policy.paid_credits = enabled;
+        }
+        if let Some(reset) = source.spend_budget_reset_at_ms {
+            policy.spend_budget_reset_at_ms = Some(reset);
+        }
+    }
+    Ok(policy)
+}
+
+impl LiveConfig {
+    pub(crate) fn effective_account_policies(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.config
+                .providers
+                .keys()
+                .map(|provider| {
+                    (
+                        provider.clone(),
+                        serde_json::to_value(self.allocator_policy(provider))
+                            .expect("account policy serializes"),
+                    )
+                })
+                .collect(),
+        )
+    }
+    pub(crate) fn allocator_policy(
+        &self,
+        provider: &str,
+    ) -> prefrontal_routing_core::accounts::AllocatorPolicy {
+        allocator_policy_from(
+            &self.config.accounts,
+            self.config
+                .providers
+                .get(provider)
+                .map(|provider| &provider.accounts),
+        )
+        .expect("account policies are validated before publishing the config")
+    }
+}
+
+#[cfg(test)]
+mod account_policy_config_tests {
+    use super::*;
+
+    #[test]
+    fn provider_account_policy_overrides_defaults_without_weakening_the_schema() {
+        let config=parse_config(r#"{
+            "accounts":{"max_hold":"90s","hold_when_reset_within":"15m"},
+            "providers":{"synthetic":{"accounts":{"strategy":"hybrid","max_hold":"30s",
+                "soft_quota_remaining_percent":10,"floors":[{"pool":"pool-a","window_minutes":300,"remaining_percent":5}],
+                "spend_budget":20,"spend_budget_reset_at_ms":1800000600000,"paid_credits":true,"unknown_reset_retry":"2h"}}}
+        }"#).unwrap();
+        let policy = allocator_policy_from(
+            &config.accounts,
+            Some(&config.providers["synthetic"].accounts),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.strategy,
+            prefrontal_routing_core::accounts::AccountStrategy::Hybrid
+        );
+        assert_eq!(policy.max_hold_s, 30);
+        assert_eq!(policy.short_hold_max_ms, 900_000);
+        assert_eq!(policy.unknown_reset_retry_ms, 7_200_000);
+        assert_eq!(policy.pool_floors[0].key.name.as_deref(), Some("pool-a"));
+        assert_eq!(policy.spend_budget, Some(20.0));
+        assert!(policy.paid_credits);
+        for invalid in [
+            r#"{"providers":{"p":{"accounts":{"strategy":"random"}}}}"#,
+            r#"{"providers":{"p":{"accounts":{"max_hold":"tomorrow"}}}}"#,
+            r#"{"providers":{"p":{"accounts":{"unknown_policy":true}}}}"#,
+        ] {
+            assert!(parse_config(invalid).is_err(), "{invalid}");
+        }
+    }
+}
 
 /// Internal account-operation settings. Account selection always serves.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

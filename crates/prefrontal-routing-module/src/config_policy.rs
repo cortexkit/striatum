@@ -420,11 +420,62 @@ pub struct ProviderPolicy {
     pub accounts: ProviderAccountsPolicy,
 }
 
-/// Account-class policy is opt-in: subscription exhaustion must not spend money.
+/// Per-provider account controls. Metered fallback requires explicit opt-in.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderAccountsPolicy {
     pub metered_fallback: bool,
+    pub strategy: Option<String>,
+    pub order: Option<Vec<String>>,
+    pub ordered: Option<String>,
+    pub soft_quota_remaining_percent: Option<f64>,
+    pub floors: Option<Vec<AccountPoolFloor>>,
+    pub max_hold: Option<AccountDuration>,
+    pub hold_when_reset_within: Option<AccountDuration>,
+    pub unknown_reset_retry: Option<AccountDuration>,
+    pub spend_budget: Option<f64>,
+    pub spend_budget_reset_at_ms: Option<i64>,
+    pub paid_credits: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AccountDuration {
+    Seconds(u64),
+    Text(String),
+}
+
+impl AccountDuration {
+    pub fn seconds(&self) -> Result<u64, String> {
+        match self {
+            Self::Seconds(seconds) => Ok(*seconds),
+            Self::Text(text) => {
+                let (number, factor) = if let Some(number) = text.strip_suffix('s') {
+                    (number, 1)
+                } else if let Some(number) = text.strip_suffix('m') {
+                    (number, 60)
+                } else if let Some(number) = text.strip_suffix('h') {
+                    (number, 3600)
+                } else {
+                    return Err("duration must use s, m or h".into());
+                };
+                number
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|number| number.checked_mul(factor))
+                    .ok_or_else(|| "duration must be a non-negative whole number of seconds".into())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountPoolFloor {
+    pub pool: Option<String>,
+    pub window_minutes: Option<u32>,
+    pub model: Option<String>,
+    pub remaining_percent: f64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]

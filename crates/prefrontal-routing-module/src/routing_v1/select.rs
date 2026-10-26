@@ -50,6 +50,8 @@ const MEMBERS: &[&str] = &[
     "concurrency_slots",
     "detail",
     "harness",
+    "hold_ok",
+    "hold_wait_max_s",
 ];
 
 /// How long an answer stays current routing. A report after this is still
@@ -254,6 +256,9 @@ pub(super) async fn select(
         .iter()
         .map(|fact| fact_to_route(fact).route_key)
         .collect();
+    if let Some(classes) = &priced.classes {
+        classes.apply_eligibility(&mut snapshot, &facts, priced_per_token);
+    }
     let candidates = select_policy::prepare_candidates(
         &facts,
         &mut snapshot,
@@ -273,6 +278,26 @@ pub(super) async fn select(
         priced.classes.as_ref(),
     );
     let available = candidates.available;
+    let mut usable = available.clone();
+    if let Some(classes) = &priced.classes {
+        for fact in &facts {
+            if !matches!(
+                classes
+                    .probe(
+                        &fact.provider_id,
+                        &fact.model_id,
+                        priced_per_token,
+                        false,
+                        None,
+                        "demand-preflight"
+                    )
+                    .outcome,
+                prefrontal_routing_core::accounts::Outcome::Admit(_)
+            ) {
+                usable.remove(&prefrontal_routing_core::fact_to_route(fact).route_key);
+            }
+        }
+    }
     let subscription_keys = candidates.subscription_keys;
     let rejections = candidates.rejected;
 
@@ -329,6 +354,12 @@ pub(super) async fn select(
         account_flags: live_config.account_flags(),
         scope: caller.scope.clone(),
         now,
+        hold_ok: params
+            .get("hold_ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        hold_wait_max_s: params.get("hold_wait_max_s").and_then(Value::as_u64),
+        conversation_key: request.affinity.as_deref().unwrap_or("select"),
     };
 
     let project_pin = caller
@@ -350,13 +381,60 @@ pub(super) async fn select(
     // Request pin, then project pin, then the continuing model, then the mode.
     // A pin does not fall through. The continuing model does, once it is no
     // longer allowed. Legacy targetAgent bodies never reach this surface.
-    let ordered = selection.pass().select(
-        &available,
-        request.pin.as_deref(),
-        project_pin.as_deref(),
-        continuing.as_deref(),
-        |pin| selection.pin(pin, &available),
-    );
+    let ladder_choice = if request.pin.is_none()
+        && project_pin.is_none()
+        && continuing.is_none()
+        && consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
+    {
+        let mut result = None;
+        let mut fallback_hold = None;
+        for entry in consumer_policy.ladder.iter().flatten() {
+            let Some(route) = RouteRef::parse_pin(entry) else {
+                continue;
+            };
+            let subset = available
+                .iter()
+                .filter(|key| {
+                    *key == &route.route_key()
+                        || key.starts_with(&format!("{}/", route.route_key()))
+                })
+                .cloned()
+                .collect();
+            if let Ok(selected) = selection.pass().score(&subset) {
+                match selection.account_check(&selected) {
+                    Ok(()) => {
+                        result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
+                        break;
+                    }
+                    Err(refusal) if refusal.code.as_str() == "account_hold" => {
+                        if selection.hold_ok {
+                            result = Some(Err(select_policy::OrderFailure::Pin(refusal)));
+                            break;
+                        }
+                        if fallback_hold.as_ref().is_none_or(|previous: &Refusal| {
+                            previous.detail.get("reset_at_ms").and_then(Value::as_i64)
+                                > refusal.detail.get("reset_at_ms").and_then(Value::as_i64)
+                        }) {
+                            fallback_hold = Some(refusal);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        result.or_else(|| fallback_hold.map(|hold| Err(select_policy::OrderFailure::Pin(hold))))
+    } else {
+        None
+    };
+    let ordered = ladder_choice.unwrap_or_else(|| {
+        selection.pass().select(
+            &usable,
+            request.pin.as_deref(),
+            project_pin.as_deref(),
+            continuing.as_deref(),
+            |pin| selection.pin(pin, &available),
+        )
+    });
     let (mut selected, basis, explicit_variant) = match ordered {
         Ok((selected, order)) => {
             let explicit = match order {
@@ -513,6 +591,9 @@ pub(super) async fn select(
 
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
+    hold_ok: bool,
+    hold_wait_max_s: Option<u64>,
+    conversation_key: &'a str,
     consumer: &'a str,
     priced_per_token: bool,
     demand: ModelRequirements,
@@ -598,15 +679,49 @@ impl<'a> Selection<'a> {
             self.rejections,
         )
         .map_err(|refusal| refused(&refusal.code))?;
-        let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+        self.account_check(&selected)?;
+        Ok(selected)
+    }
+
+    fn account_check(&self, selected: &SelectedModelRoute) -> Result<(), Refusal> {
+        let policy = self
+            .sources
+            .operator_config
+            .allocator_policy(&selected.model.provider_id);
+        let ctx = super::account_ctx(self.deps, self.account_flags, &policy)?;
+        if let Some(classes) = &ctx.classes {
+            match classes
+                .probe(
+                    &selected.model.provider_id,
+                    &selected.model.model_id,
+                    self.priced_per_token,
+                    true,
+                    self.hold_wait_max_s,
+                    self.conversation_key,
+                )
+                .outcome
+            {
+                prefrontal_routing_core::accounts::Outcome::Admit(_) => return Ok(()),
+                prefrontal_routing_core::accounts::Outcome::Hold(hold) => {
+                    let mut refusal = Refusal::account_hold(hold.reset_at_ms.max(0) as u64);
+                    refusal
+                        .detail
+                        .insert("retry_after_s".into(), json!(hold.retry_after_s));
+                    refusal
+                        .detail
+                        .insert("reset_at_ms".into(), json!(hold.reset_at_ms));
+                    return Err(refusal);
+                }
+                _ => {}
+            }
+        }
         account_selection::preflight_model_for_class(
-            &super::account_ctx(self.deps, self.account_flags, &policy)?,
+            &ctx,
             &selected.model.provider_id,
             &selected.model.model_id,
             self.priced_per_token,
         )
-        .map_err(|(code, _)| refused(&code))?;
-        Ok(selected)
+        .map_err(|(code, message)| provider_refusal(&code, message))
     }
 
     /// Record a refused selection in the ledger, as every selection does.

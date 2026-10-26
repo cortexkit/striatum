@@ -23,7 +23,7 @@ use prefrontal_routing_core::accounts::evidence::{
     ExhaustionObservation, FrameOrigin, ObservationKind, ResetSource, WindowEvidence,
 };
 use prefrontal_routing_core::accounts::{
-    block_end, decide, grown_recovery_set, recovery_set_from, validate_pool_name, AccountRef,
+    block_end, grown_recovery_set, recovery_set_from, validate_pool_name, AccountRef,
     AccountRequest, AccountView, AdmissionDemand, AdmissionState, AffinityOutcome, AllocatorPolicy,
     AllocatorState, ApplicableWindow, CallerKind, CandidateRef, ConfirmationSource,
     ConversationAffinity, ConversationKeySource, CredentialRecord, Decision, EpochMs, Fence,
@@ -155,6 +155,15 @@ pub struct Ctx<'a> {
     pub classes: Option<ClassContext>,
 }
 
+impl Ctx<'_> {
+    fn provider_policy(&self, provider: &str) -> AllocatorPolicy {
+        self.classes.as_ref().map_or_else(
+            || self.policy.clone(),
+            |classes| classes.config.allocator_policy(provider),
+        )
+    }
+}
+
 /// One immutable vault/config/catalog view shared by selection and allocation.
 #[derive(Clone)]
 pub(crate) struct ClassContext {
@@ -165,6 +174,8 @@ pub(crate) struct ClassContext {
     pub quota: AccountQuotaState,
     pub fences: BTreeMap<String, Vec<Fence>>,
     pub now_ms: i64,
+    eligibility: Vec<prefrontal_routing_store::AccountEligibilityFact>,
+    size_refusals: Vec<prefrontal_routing_store::AccountSizeRefusal>,
     catalog: BTreeSet<String>,
     targets: BTreeMap<String, String>,
 }
@@ -250,6 +261,27 @@ impl ClassContext {
             .lock()
             .map_err(|error| error.to_string())?
             .clone();
+        if credentials.listing_version().is_some() {
+            let listings = credentials
+                .listed_credentials()
+                .iter()
+                .filter_map(|row| match credentials.listing_fingerprint(&row.id) {
+                    crate::broca_credentials::ListingLookup::Listed(fingerprint) => {
+                        Some((row.id.clone(), fingerprint))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            store
+                .reconcile_account_eligibility(&listings)
+                .map_err(|error| error.to_string())?;
+        }
+        let eligibility = store
+            .account_eligibility()
+            .map_err(|error| error.to_string())?;
+        let size_refusals = store
+            .account_size_refusals(now_ms)
+            .map_err(|error| error.to_string())?;
         let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
         let targets = credentials.catalog_targets(&facts);
         prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
@@ -275,6 +307,8 @@ impl ClassContext {
             quota,
             fences,
             now_ms,
+            eligibility,
+            size_refusals,
             catalog,
             targets,
         })
@@ -377,7 +411,11 @@ impl ClassContext {
         row: &cortexkit_claustrum_client::ListedCredential,
         fact: &prefrontal_routing_core::ModelFact,
     ) -> bool {
-        !self
+        !self.eligibility.iter().any(|fact_| {
+            fact_.provider == fact.provider_id
+                && fact_.credential_id == row.id
+                && (fact_.model.is_empty() || fact_.model == fact.model_id)
+        }) && !self
             .refusals
             .iter()
             .any(|fence| fence.provider_id == fact.provider_id && fence.credential_id == row.id)
@@ -391,9 +429,36 @@ impl ClassContext {
         if !self.eligible(row, fact) {
             return false;
         }
-        let roster = self.roster(vec![self.view(row, fact)]);
+        let specs = prefrontal_routing_core::provider_model_spec::parse_spec_list(
+            &self.config.operator_policy().subscription,
+        );
+        let key = format!("{}/{}", fact.provider_id, fact.model_id);
+        let covered = |row: &cortexkit_claustrum_client::ListedCredential| {
+            !self.targets.contains_key(&fact.provider_id)
+                && prefrontal_routing_core::provider_model_spec::resolve_spec(
+                    &specs,
+                    &key,
+                    row.credential_type == "oauth",
+                )
+        };
+        let roster = self.roster(
+            self.credentials
+                .listed_credentials()
+                .iter()
+                .filter(|other| {
+                    covered(other) == covered(row)
+                        && self.eligible(other, fact)
+                        && crate::broca_credentials::credential_serves_fact(
+                            other,
+                            fact,
+                            &self.catalog,
+                        )
+                })
+                .map(|other| self.view(other, fact))
+                .collect(),
+        );
         matches!(
-            decide(
+            prefrontal_routing_core::accounts::decide_with_context(
                 &synthetic_request(&fact.provider_id, &fact.model_id, "class-preflight".into()),
                 &AllocatorState {
                     roster: Some(roster),
@@ -406,12 +471,13 @@ impl ClassContext {
                     principal_exclusions: Vec::new(),
                     admissions: Vec::new(),
                     operator_override: None,
-                    policy: AllocatorPolicy::default(),
+                    policy: self.config.allocator_policy(&fact.provider_id),
                 },
-                self.now_ms
+                self.now_ms,
+                &self.allocation_context(&fact.provider_id, &fact.model_id),
             )
             .outcome,
-            Outcome::Admit(_)
+            Outcome::Admit(admission) if admission.account_id == row.account_id.as_deref().unwrap_or(&row.id)
         )
     }
 
@@ -461,6 +527,275 @@ impl ClassContext {
             .find(|row| row.id == credential)
             .and_then(|row| row.auth_method.as_deref())
             .unwrap_or("unknown")
+    }
+
+    pub(crate) fn probe(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        hold_ok: bool,
+        wait: Option<u64>,
+        conversation: &str,
+    ) -> Decision {
+        let mut request = synthetic_request(provider, model, conversation.into());
+        if let Some(wait) = wait {
+            request.hold_wait_max_s = wait;
+        }
+        let mut inputs = self.allocation_context(provider, model);
+        inputs.hold_ok = Some(hold_ok);
+        prefrontal_routing_core::accounts::decide_with_context(
+            &request,
+            &AllocatorState {
+                roster: self.roster_for(provider, model, priced).roster,
+                affinity: None,
+                fences: self.fences.get(provider).cloned().unwrap_or_default(),
+                principal_exclusions: Vec::new(),
+                admissions: Vec::new(),
+                operator_override: None,
+                policy: self.config.allocator_policy(provider),
+            },
+            self.now_ms,
+            &inputs,
+        )
+    }
+
+    pub(crate) fn refusal_mark(
+        &self,
+        fact: &prefrontal_routing_core::ModelFact,
+        priced: bool,
+    ) -> Option<prefrontal_routing_core::CredentialRefusalMark> {
+        if !self
+            .credentials
+            .listed_credentials()
+            .iter()
+            .any(|row| crate::broca_credentials::credential_serves_fact(row, fact, &self.catalog))
+        {
+            return None;
+        }
+        let class = self.class(fact, priced);
+        if class.rows.iter().any(|row| self.eligible(row, fact)) {
+            return None;
+        }
+        let refused: Vec<_> = class.rows.iter().map(|row| row.id.clone()).collect();
+        let reason = if !refused.is_empty()
+            && class.rows.iter().all(|row| {
+                self.refusals.iter().any(|refusal| {
+                    refusal.provider_id == fact.provider_id && refusal.credential_id == row.id
+                })
+            }) {
+            crate::credential_fences::rejection_reason(&self.refusals, &fact.provider_id, &refused)
+        } else {
+            "no_eligible_account"
+        };
+        Some(prefrontal_routing_core::CredentialRefusalMark {
+            reason,
+            credential_ids: refused,
+        })
+    }
+
+    pub(crate) fn apply_eligibility(
+        &self,
+        snapshot: &mut prefrontal_routing_core::ModelRouteStateSnapshot,
+        facts: &[prefrontal_routing_core::ModelFact],
+        priced: bool,
+    ) {
+        for fact in facts {
+            if let Some(mark) = self.refusal_mark(fact, priced) {
+                snapshot
+                    .by_capacity
+                    .entry(prefrontal_routing_core::make_capacity_key(
+                        &fact.provider_id,
+                        &fact.model_id,
+                    ))
+                    .or_default()
+                    .credential_refusal = Some(mark);
+            }
+        }
+    }
+
+    pub(crate) fn launch_credential(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+    ) -> Result<String, (String, String)> {
+        match self
+            .probe(provider, model, priced, false, None, "launch-preflight")
+            .outcome
+        {
+            Outcome::Admit(admission) => Ok(admission.credential_id),
+            _ => Err((
+                "no_eligible_account".into(),
+                format!("{provider}/{model}: no eligible account"),
+            )),
+        }
+    }
+
+    pub(crate) fn needs_credential_pin(&self, provider: &str, model: &str) -> bool {
+        self.refusals
+            .iter()
+            .any(|fact| fact.provider_id == provider)
+            || self.eligibility.iter().any(|fact| {
+                fact.provider == provider && (fact.model.is_empty() || fact.model == model)
+            })
+            || self
+                .size_refusals
+                .iter()
+                .any(|fact| fact.provider == provider && fact.model == model)
+    }
+
+    fn allocation_context(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> prefrontal_routing_core::accounts::AllocationContext {
+        let mut context = prefrontal_routing_core::accounts::AllocationContext::default();
+        let class = self
+            .facts
+            .iter()
+            .find(|fact| fact.provider_id == provider && fact.model_id == model);
+        if let Some(fact) = class {
+            for row in self.credentials.listed_credentials().iter().filter(|row| {
+                crate::broca_credentials::credential_serves_fact(row, fact, &self.catalog)
+            }) {
+                let account = row.account_id.as_deref().unwrap_or(&row.id);
+                if let Some(reading) = self
+                    .quota
+                    .readings
+                    .readings
+                    .values()
+                    .filter(|reading| {
+                        reading.account_id == account && reading.tombstoned_at_ms.is_none()
+                    })
+                    .max_by_key(|reading| {
+                        reading
+                            .entry
+                            .get("fetchedAt")
+                            .and_then(Value::as_str)
+                            .and_then(account_quota::parse_rfc3339_ms)
+                    })
+                {
+                    add_spend_inputs(&mut context, account, &reading.entry);
+                }
+            }
+        }
+        context
+    }
+
+    fn restrict_size(&self, roster: &mut RosterBuild, provider: &str, model: &str, tokens: u64) {
+        let class = prefrontal_routing_core::accounts::input_size_class(tokens);
+        if let Some(roster) = &mut roster.roster {
+            for view in &mut roster.accounts {
+                view.credentials.retain(|credential| {
+                    !self.size_refusals.iter().any(|fact| {
+                        fact.provider == provider
+                            && fact.model == model
+                            && fact.credential_id == credential.credential_id
+                            && fact.size_class == class
+                    })
+                });
+            }
+            roster.accounts.retain(|view| !view.credentials.is_empty());
+        }
+    }
+}
+
+fn add_spend_inputs(
+    context: &mut prefrontal_routing_core::accounts::AllocationContext,
+    account: &str,
+    entry: &Value,
+) {
+    use prefrontal_routing_core::accounts::{CreditReading, SpendReading};
+    let Some(at) = entry
+        .get("fetchedAt")
+        .and_then(Value::as_str)
+        .and_then(account_quota::parse_rfc3339_ms)
+    else {
+        return;
+    };
+    if entry
+        .get("errorClass")
+        .is_some_and(|value| !value.is_null())
+        || entry.get("error").is_some_and(|value| !value.is_null())
+        || entry.get("stale").is_some_and(|value| !value.is_null())
+    {
+        return;
+    }
+    for pool in entry
+        .get("spend")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let amount = |key: &str| {
+            pool.get(key)
+                .and_then(|value| {
+                    serde_json::from_value::<prefrontal_routing_core::quota::SpendBalance>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .map(|balance| balance.minor as f64 * 10_f64.powi(-balance.exponent))
+        };
+        if matches!(
+            pool.get("id").and_then(Value::as_str),
+            Some("extra_usage" | "credits")
+        ) {
+            let spendable = pool.get("spendable").and_then(Value::as_bool) != Some(false)
+                && amount("remaining").map_or(
+                    pool.get("spendable").and_then(Value::as_bool) == Some(true),
+                    |remaining| remaining > 0.0,
+                );
+            context.credits.insert(
+                account.to_owned(),
+                CreditReading {
+                    observed_at_ms: at,
+                    spendable,
+                },
+            );
+        } else if let (Some(total), Some(remaining)) = (amount("total"), amount("remaining")) {
+            context.spend.insert(
+                account.to_owned(),
+                SpendReading {
+                    used: (total - remaining).max(0.0),
+                    reset_at_ms: None,
+                },
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod spend_input_tests {
+    use super::*;
+
+    #[test]
+    fn absent_or_failed_spend_readings_do_not_authorize_credits() {
+        let at = 1_800_000_000_000;
+        let entry = json!({"fetchedAt":rfc3339(at),"spend":[{"id":"credits","remaining":{"minor":100,"exponent":0,"unit":"credit"}}]});
+        for unusable in [
+            json!({}),
+            json!({"fetchedAt":rfc3339(at)}),
+            {
+                let mut failed = entry.clone();
+                failed["errorClass"] = json!("upstream_failed");
+                failed
+            },
+            {
+                let mut stale = entry.clone();
+                stale["stale"] = json!({"class":"upstream_failed"});
+                stale
+            },
+        ] {
+            let mut context = prefrontal_routing_core::accounts::AllocationContext::default();
+            add_spend_inputs(&mut context, "a", &unusable);
+            assert!(context.credits.is_empty(), "{unusable}");
+        }
+        let mut context = prefrontal_routing_core::accounts::AllocationContext::default();
+        add_spend_inputs(&mut context, "a", &entry);
+        assert!(context.credits["a"].spendable);
+        assert_eq!(context.credits["a"].observed_at_ms, at);
     }
 }
 
@@ -599,6 +934,8 @@ fn fingerprint(params: &AccountForParams) -> String {
         preferred_existing_account: Option<AccountRef>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pool: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_conversation_key: Option<&'a str>,
     }
     let identity = AdmissionIdentity {
         provider: normalize(&params.provider),
@@ -617,6 +954,7 @@ fn fingerprint(params: &AccountForParams) -> String {
             .as_ref()
             .and_then(AccountRefParams::to_ref),
         pool: params.pool.as_deref(),
+        parent_conversation_key: params.parent_conversation_key.as_deref(),
     };
     let encoded = serde_json::to_vec(&identity).expect("admission identity is serializable");
     hex(&Sha256::digest(&encoded))
@@ -1106,7 +1444,7 @@ fn refresh_blocks(
 pub(crate) fn refresh_all_blocks(
     store: &SqliteRouteStateStore,
     state: &AccountQuotaState,
-    policy: &AllocatorPolicy,
+    config: &crate::config_overrides::LiveConfig,
     now: EpochMs,
 ) -> RouteStateResult<()> {
     store.account_transaction(|tx| {
@@ -1115,7 +1453,13 @@ pub(crate) fn refresh_all_blocks(
                 .roster
                 .map(|roster| roster.accounts)
                 .unwrap_or_default();
-            refresh_blocks(tx, &provider, &accounts, now, policy)?;
+            refresh_blocks(
+                tx,
+                &provider,
+                &accounts,
+                now,
+                &config.allocator_policy(&provider),
+            )?;
         }
         Ok(())
     })
@@ -1351,6 +1695,12 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 struct AccountForParams {
+    #[serde(default)]
+    parent_conversation_key: Option<String>,
+    #[serde(default)]
+    hold_ok: Option<bool>,
+    #[serde(default)]
+    request_input_tokens: Option<u64>,
     provider: String,
     model: String,
     #[serde(default)]
@@ -1764,7 +2114,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             Err(error) => return store_error(error),
         },
     };
-    let roster = match ctx.classes.as_ref() {
+    let mut roster = match ctx.classes.as_ref() {
         Some(classes) => classes.roster_for(
             &provider,
             &normalize(&parsed.model),
@@ -1772,6 +2122,16 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         ),
         None => roster_for_model(ctx, &provider, Some(&normalize(&parsed.model))),
     };
+    if let Some(classes) = &ctx.classes {
+        classes.restrict_size(
+            &mut roster,
+            &provider,
+            &normalize(&parsed.model),
+            parsed
+                .request_input_tokens
+                .unwrap_or_else(|| parsed.initial_input_bytes.div_ceil(4)),
+        );
+    }
     if !roster
         .roster
         .as_ref()
@@ -1849,11 +2209,18 @@ pub(crate) fn preflight_model_for_class(
         return Ok(());
     }
     let request = synthetic_request(provider, model, "worker-model-preflight".into());
+    let policy = ctx.provider_policy(provider);
+    let inputs = ctx
+        .classes
+        .as_ref()
+        .map_or_else(Default::default, |classes| {
+            classes.allocation_context(provider, model)
+        });
     let (decision, fences) = ctx
         .store
         .account_transaction(|tx| {
             let fences = load_fences(tx, provider)?;
-            let decision = decide(
+            let decision = prefrontal_routing_core::accounts::decide_with_context(
                 &request,
                 &AllocatorState {
                     roster: roster.roster.clone(),
@@ -1862,9 +2229,10 @@ pub(crate) fn preflight_model_for_class(
                     principal_exclusions: Vec::new(),
                     admissions: load_demand(tx, provider)?,
                     operator_override: None,
-                    policy: ctx.policy.clone(),
+                    policy: policy.clone(),
                 },
                 ctx.now_ms,
+                &inputs,
             );
             Ok((decision, fences))
         })
@@ -1946,6 +2314,7 @@ fn serve(
     request_fingerprint: &str,
 ) -> RouteStateResult<OpReply> {
     let now = ctx.now_ms;
+    let policy = ctx.provider_policy(provider);
     if let Some(existing) = tx.admission(principal, &params.admission_id)? {
         return replay(tx, principal, existing, request_fingerprint, now);
     }
@@ -1970,7 +2339,7 @@ fn serve(
             .as_ref()
             .map_or(&[][..], |roster| &roster.accounts),
         now,
-        ctx.policy,
+        &policy,
     )?;
     let state = AllocatorState {
         roster: roster.roster.clone(),
@@ -1981,10 +2350,22 @@ fn serve(
         principal_exclusions: load_exclusions(tx, principal, &params.admission_id)?,
         admissions: load_demand(tx, provider)?,
         operator_override: None,
-        policy: ctx.policy.clone(),
+        policy,
     };
     let request = params.request(principal, affinity_row.is_none());
-    let decision = decide(&request, &state, now);
+    let mut inputs = ctx
+        .classes
+        .as_ref()
+        .map_or_else(Default::default, |classes| {
+            classes.allocation_context(provider, &params.model)
+        });
+    inputs.hold_ok = params.hold_ok;
+    if let Some(parent) = &params.parent_conversation_key {
+        let hash = conversation_hash(&salt, principal, parent);
+        inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider)?;
+    }
+    let decision =
+        prefrontal_routing_core::accounts::decide_with_context(&request, &state, now, &inputs);
     let decision_id = new_id("acd");
     tx.insert_decision(&decision_record(RecordInput {
         decision_id: &decision_id,
@@ -2435,6 +2816,7 @@ struct ProviderRosterFacts {
 }
 
 const OBSERVATION_KINDS: &[&str] = &[
+    "used_account",
     "admission_started",
     "run_finished",
     "attempt",
@@ -2606,9 +2988,18 @@ fn record_observation(
     if !OBSERVATION_KINDS.contains(&parsed.kind.as_str()) {
         effects.push(json!({ "effect": "advisory", "why": "unknown observation kind" }));
     } else if let (true, Some(row)) = (bound, admission.as_ref()) {
+        let policy = ctx.provider_policy(&row.provider);
+        let scoped_ctx = Ctx {
+            store: ctx.store,
+            accounts: ctx.accounts,
+            flags: ctx.flags,
+            policy: &policy,
+            now_ms: ctx.now_ms,
+            classes: ctx.classes.clone(),
+        };
         apply_bound_observation(
             tx,
-            ctx,
+            &scoped_ctx,
             principal,
             parsed,
             row,
@@ -2701,6 +3092,26 @@ fn apply_bound_observation(
                 .get(&admission.provider)
                 .cloned()
                 .unwrap_or_default();
+            if credential_id != admission.credential_id {
+                effects.push(json!({"effect":"advisory", "why":"credential differs from the bound admission"}));
+                return Ok(());
+            }
+            let listing_fingerprint = ctx.classes.as_ref().and_then(|classes| {
+                match classes.credentials.listing_fingerprint(credential_id) {
+                    crate::broca_credentials::ListingLookup::Listed(fingerprint) => {
+                        Some(fingerprint)
+                    }
+                    _ => None,
+                }
+            });
+            tx.record_eligibility(&prefrontal_routing_store::AccountEligibilityFact {
+                provider: admission.provider.clone(),
+                credential_id: credential_id.into(),
+                model: admission.model.clone(),
+                listing_fingerprint,
+                code: "model_not_on_account".into(),
+                observed_at: parsed.observed_at_ms.unwrap_or(now),
+            })?;
             tx.insert_exclusion(&AccountExclusionRow {
                 principal: principal.to_string(),
                 admission_id: id.clone(),
@@ -4914,6 +5325,10 @@ mod tests {
                 only_on(&first, id, &format!("broca:{id}")),
             )
         };
+        assert_eq!(
+            at(NOW + 1001, "trial-before-reset").code(),
+            Some("account_hold")
+        );
         assert!(
             at(reset, "trial-2").code().is_some(),
             "blocked until the reset passes"

@@ -776,7 +776,7 @@ fn generated_schema_is_current_and_closed() {
         "PanelPolicy",
         "SynthesizerPin",
         "CatalogSection",
-        "RemovedAccountFlags",
+        "AccountPoolFloor",
         "ProviderAccountsPolicy",
         "ModelFactOverride",
         "OverqualificationSection",
@@ -790,6 +790,14 @@ fn generated_schema_is_current_and_closed() {
     }
     let properties = &schema["properties"];
     assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
+    let retired = super::validate_document(r#"{"accounts":{"enabled":false}}"#).unwrap_err();
+    assert!(retired.contains("accounts.enabled"));
+    assert!(retired.contains(crate::config_convert::COMMAND));
+    assert!(schema["$defs"]["AccountDuration"]["anyOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|variant| variant["type"] != "object"));
     assert!(schema["$defs"]["RemovedAccountFlags"]
         .get("properties")
         .is_none());

@@ -69,6 +69,8 @@ pub enum ExclusionTier {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum ExclusionReason {
+    SpendBudget,
+    PolicyFloor,
     UnsupportedModel,
     NotInRunnerCandidates,
     /// Every runner-listed record is refused for this principal.
@@ -150,9 +152,11 @@ impl ExclusionReason {
             | InvalidPercent { .. }
             | WindowResetElapsed { .. }
             | ScopeUnmapped { .. } => ExclusionTier::QuotaUnknown,
-            ScopeExhausted { .. } | BelowReserve { .. } | BelowBrocaFloor { .. } => {
-                ExclusionTier::Reserve
-            }
+            ScopeExhausted { .. }
+            | BelowReserve { .. }
+            | BelowBrocaFloor { .. }
+            | SpendBudget
+            | PolicyFloor => ExclusionTier::Reserve,
         }
     }
 }
@@ -212,6 +216,8 @@ impl AccountNote {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum InvalidationReason {
+    PolicyFloor,
+    SpendBudget,
     UserModelChange,
     IdleExpired,
     /// The account or credential is gone from the roster.
@@ -352,6 +358,7 @@ pub struct Explanation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmitReason {
+    PaidCredits,
     /// Existing affinity retained.
     StickyHit,
     /// A validated `preferred_existing_account` import became the affinity.

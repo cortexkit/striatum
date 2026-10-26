@@ -4,8 +4,21 @@
   "type": "object",
   "properties": {
     "accounts": {
-      "$ref": "#/$defs/RemovedAccountFlags",
-      "default": {}
+      "$ref": "#/$defs/ProviderAccountsPolicy",
+      "default": {
+        "floors": null,
+        "hold_when_reset_within": null,
+        "max_hold": null,
+        "metered_fallback": false,
+        "order": null,
+        "ordered": null,
+        "paid_credits": null,
+        "soft_quota_remaining_percent": null,
+        "spend_budget": null,
+        "spend_budget_reset_at_ms": null,
+        "strategy": null,
+        "unknown_reset_retry": null
+      }
     },
     "catalog": {
       "$ref": "#/$defs/CatalogSection",
@@ -166,6 +179,51 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "AccountDuration": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "AccountPoolFloor": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "window_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "remaining_percent"
+      ]
+    },
     "CatalogSection": {
       "type": "object",
       "properties": {
@@ -777,12 +835,110 @@
       "additionalProperties": false
     },
     "ProviderAccountsPolicy": {
-      "description": "Account-class policy is opt-in: subscription exhaustion must not spend money.",
+      "description": "Per-provider account controls. Metered fallback requires explicit opt-in.",
       "type": "object",
       "properties": {
+        "floors": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "$ref": "#/$defs/AccountPoolFloor"
+          }
+        },
+        "hold_when_reset_within": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_hold": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "metered_fallback": {
           "type": "boolean",
           "default": false
+        },
+        "order": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "ordered": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "paid_credits": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "soft_quota_remaining_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "spend_budget": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "spend_budget_reset_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "strategy": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "unknown_reset_retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "additionalProperties": false
@@ -793,7 +949,18 @@
         "accounts": {
           "$ref": "#/$defs/ProviderAccountsPolicy",
           "default": {
-            "metered_fallback": false
+            "floors": null,
+            "hold_when_reset_within": null,
+            "max_hold": null,
+            "metered_fallback": false,
+            "order": null,
+            "ordered": null,
+            "paid_credits": null,
+            "soft_quota_remaining_percent": null,
+            "spend_budget": null,
+            "spend_budget_reset_at_ms": null,
+            "strategy": null,
+            "unknown_reset_retry": null
           }
         },
         "keep_free_percent": {
@@ -873,10 +1040,6 @@
         "eq",
         "cost"
       ]
-    },
-    "RemovedAccountFlags": {
-      "type": "object",
-      "additionalProperties": false
     },
     "RunnerPolicy": {
       "description": "A runner module `routing/v1` answers with (`runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",

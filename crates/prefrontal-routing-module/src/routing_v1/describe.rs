@@ -11,9 +11,10 @@ use crate::select_policy;
 /// The optional routing/v1 groups this provider serves, listed in
 /// `role.describe` as `capabilities` and passed to `parse_select_request_serving`,
 /// so the two always agree. Harnesses come from runner declarations.
-/// Hold control remains unsupported: `hold_ok` and
-/// `hold_wait_max_s` are still refused by name.
-pub(super) const CAPABILITIES: &[&str] = &[cortexkit_role_routing::capabilities::SELECT_HARNESS];
+pub(super) const CAPABILITIES: &[&str] = &[
+    cortexkit_role_routing::capabilities::SELECT_HARNESS,
+    "select_hold_control",
+];
 
 /// Params are ignored: the role defines `{}` and no refusal for this op.
 pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
@@ -44,5 +45,6 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         .map_err(|error| super::provider_refusal("internal_error", error.to_string()))?;
     value["runners"] = serde_json::to_value(super::runners::effective(deps).entries)
         .map_err(|error| super::provider_refusal("internal_error", error.to_string()))?;
+    value["account_policies"] = config.effective_account_policies();
     Ok(value)
 }

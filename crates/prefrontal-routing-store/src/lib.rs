@@ -52,8 +52,9 @@ pub use routing_v1::{V1Decision, V1Recorded};
 pub use account_selection::AccountServingCounts;
 pub use account_selection::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
-    AccountExclusionRow, AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow,
-    AccountPoolFenceRow, AccountTx, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
+    AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountHoldRow,
+    AccountObservationRow, AccountPinRow, AccountPoolFenceRow, AccountSizeRefusal, AccountTx,
+    ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
 };
 
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
@@ -206,6 +207,7 @@ const MIGRATION_062: &str = include_str!("../migrations/062_routing_v1.sql");
 /// The project and session folder the daemon stamped on a decision's scope.
 const MIGRATION_064: &str = include_str!("../migrations/064_decision_scope_attribution.sql");
 const MIGRATION_065: &str = include_str!("../migrations/065_routing_policy_end_state.sql");
+const MIGRATION_066: &str = include_str!("../migrations/066_account_eligibility.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -261,7 +263,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 64] {
+fn route_state_migrations() -> [Migration; 65] {
     [
         Migration {
             version: 1,
@@ -518,6 +520,10 @@ fn route_state_migrations() -> [Migration; 64] {
         Migration {
             version: 65,
             statements: MIGRATION_065,
+        },
+        Migration {
+            version: 66,
+            statements: MIGRATION_066,
         },
     ]
 }

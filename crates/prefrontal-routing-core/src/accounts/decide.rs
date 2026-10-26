@@ -13,6 +13,7 @@ use super::eligibility::{
     age_band, evaluate_quota, fable_freshly_exhausted, scope_check, QuotaEval,
 };
 use super::evidence::{hold_until, retry_after_with_jitter};
+use super::policy::{AccountStrategy, AllocationContext};
 use super::pools::{block_end, PoolKey, PoolScope};
 use super::types::{
     AccountRef, AccountRequest, AccountView, AdmissionState, AllocatorPolicy, AllocatorState,
@@ -35,6 +36,15 @@ fn normalize(value: &str) -> String {
 
 /// Decides which account serves this admission.
 pub fn decide(request: &AccountRequest, state: &AllocatorState, now: EpochMs) -> Decision {
+    decide_with_context(request, state, now, &AllocationContext::default())
+}
+
+pub fn decide_with_context(
+    request: &AccountRequest,
+    state: &AllocatorState,
+    now: EpochMs,
+    context: &AllocationContext,
+) -> Decision {
     let policy = &state.policy;
     let provider = normalize(&request.provider);
     let model = normalize(&request.model);
@@ -88,6 +98,8 @@ pub fn decide(request: &AccountRequest, state: &AllocatorState, now: EpochMs) ->
         request,
         state,
         policy,
+        context,
+        credit_mode: false,
         now,
         model,
         affinity_model,
@@ -166,6 +178,8 @@ struct Allocator<'a> {
     request: &'a AccountRequest,
     state: &'a AllocatorState,
     policy: &'a AllocatorPolicy,
+    context: &'a AllocationContext,
+    credit_mode: bool,
     now: EpochMs,
     model: String,
     affinity_model: String,
@@ -180,11 +194,19 @@ impl<'a> Allocator<'a> {
     // the operator override; then existing affinity; then a one-time import;
     // then `requested_account`; then scoring.
     fn run(mut self) -> Decision {
+        self.credit_mode = self.policy.paid_credits
+            && !self.views.is_empty()
+            && self.views.iter().all(|view| self.free_exhausted(view));
         if let Some(override_) = &self.state.operator_override {
             return self.operator_override(override_);
         }
         let mut previous = None;
         if let Some(affinity) = &self.state.affinity {
+            if self.policy.strategy == AccountStrategy::Ordered
+                || self.policy.strategy == AccountStrategy::RoundRobin
+            {
+                return self.cold(Some(previous_pin(affinity)));
+            }
             match self.evaluate_affinity(affinity, true) {
                 AffinityVerdict::Retain { degraded } => {
                     return self.sticky_hit(affinity, degraded);
@@ -289,6 +311,9 @@ impl<'a> Allocator<'a> {
     /// after it shows headroom on its pool (design, "Blocks are driven by
     /// evidence").
     fn fences_for(&self, account_id: &str) -> Vec<&'a Fence> {
+        if self.using_credits(account_id) {
+            return Vec::new();
+        }
         let reading = self
             .views
             .iter()
@@ -363,6 +388,9 @@ impl<'a> Allocator<'a> {
             }
         }
         let mut pools: Vec<&Option<PoolKey>> = Vec::new();
+        if self.budget_blocked(&view.account_id) {
+            reasons.push(ExclusionReason::SpendBudget);
+        }
         for fence in self.fences_for(&view.account_id) {
             if !pools.contains(&&fence.pool) {
                 pools.push(&fence.pool);
@@ -380,13 +408,111 @@ impl<'a> Allocator<'a> {
     }
 
     fn evaluate_quota(&self, view: &AccountView) -> QuotaEval {
-        evaluate_quota(
-            view.quota.as_ref(),
+        let mut quota = evaluate_quota(
+            if self.using_credits(&view.account_id) {
+                None
+            } else {
+                view.quota.as_ref()
+            },
             self.family,
             self.request.caller,
             self.now,
             self.policy,
-        )
+        );
+        if !self.using_credits(&view.account_id) {
+            if let Some(reading) = view
+                .quota
+                .as_ref()
+                .filter(|reading| super::pools::fresh_for_recovery(reading, self.now, self.policy))
+            {
+                let soft = self.views.len() > 1
+                    && self
+                        .policy
+                        .soft_quota_remaining_percent
+                        .is_some_and(|floor| {
+                            reading
+                                .required_windows()
+                                .iter()
+                                .filter_map(|id| reading.window(*id))
+                                .any(|window| 100.0 - window.used_percent < floor)
+                        });
+                if soft || self.pool_floor_failed(view) {
+                    quota.reserve.push(ExclusionReason::PolicyFloor);
+                }
+            }
+        }
+        quota
+    }
+
+    fn pool_floor_failed(&self, view: &AccountView) -> bool {
+        view.quota
+            .as_ref()
+            .filter(|reading| super::pools::fresh_for_recovery(reading, self.now, self.policy))
+            .is_some_and(|reading| {
+                self.policy.pool_floors.iter().any(|floor| {
+                    floor.key.scope.applies_to(&self.model, self.family)
+                        && (reading
+                            .pool_windows
+                            .as_ref()
+                            .into_iter()
+                            .flatten()
+                            .any(|window| {
+                                floor.key.name == window.pool
+                                    && floor
+                                        .key
+                                        .window_minutes
+                                        .is_none_or(|minutes| minutes == window.window_minutes)
+                                    && 100.0 - window.used_percent < floor.remaining_percent
+                            })
+                            || (floor.key.name.is_none()
+                                && reading
+                                    .required_windows()
+                                    .iter()
+                                    .filter_map(|id| reading.window(*id))
+                                    .any(|window| {
+                                        floor.key.window_minutes == Some(window.window_minutes)
+                                            && 100.0 - window.used_percent < floor.remaining_percent
+                                    })))
+                })
+            })
+    }
+
+    fn using_credits(&self, account: &str) -> bool {
+        self.credit_mode
+            && self.context.credits.get(account).is_some_and(|credit| {
+                credit.spendable && (0..15 * 60_000).contains(&(self.now - credit.observed_at_ms))
+            })
+    }
+
+    fn budget_blocked(&self, account: &str) -> bool {
+        self.policy.spend_budget.is_some_and(|limit| {
+            self.context.spend.get(account).is_some_and(|spend| {
+                spend.used.is_finite()
+                    && spend.used >= limit
+                    && spend
+                        .reset_at_ms
+                        .or(self.policy.spend_budget_reset_at_ms)
+                        .is_none_or(|reset| reset > self.now)
+            })
+        })
+    }
+
+    fn free_exhausted(&self, view: &AccountView) -> bool {
+        let hard = self.hard_filters(view, None);
+        if hard
+            .reasons
+            .iter()
+            .any(|reason| !matches!(reason, ExclusionReason::ConfirmedFence { .. }))
+        {
+            return false;
+        }
+        if !self.fences_for(&view.account_id).is_empty() {
+            return true;
+        }
+        view.quota.as_ref().filter(|reading| super::pools::fresh_for_recovery(reading, self.now, self.policy)).is_some_and(|reading| {
+            reading.required_windows().iter().filter_map(|id| reading.window(*id)).any(|window| window.used_percent >= 100.0 && window.resets_at.at_ms().is_none_or(|reset| reset > self.now))
+            || matches!(&reading.scoped, super::types::ScopedList::Listed(windows) if windows.iter().any(|window| self.policy.family_for_scope(window)==Some(self.family) && window.used_percent>=100.0))
+        })
     }
 
     fn evaluate_cold(&self, view: &'a AccountView) -> ColdEval<'a> {
@@ -496,6 +622,11 @@ impl<'a> Allocator<'a> {
             }
         };
 
+        if view.is_some_and(|view| {
+            !self.using_credits(&view.account_id) && self.pool_floor_failed(view)
+        }) {
+            return Leave(InvalidationReason::PolicyFloor);
+        }
         let fences = self.fences_for(&affinity.account_id);
         let reading = view
             .and_then(|view| view.quota.as_ref())
@@ -506,7 +637,20 @@ impl<'a> Allocator<'a> {
         // this conversation: they create no fence and are re-evaluated at
         // every admission, so a newer reading below 100 ends them.
         let mut blockers: Vec<Blocker> = Vec::new();
-        if let Some(reading) = reading {
+        if self.budget_blocked(&affinity.account_id) {
+            blockers.push(Blocker {
+                reset: self
+                    .context
+                    .spend
+                    .get(&affinity.account_id)
+                    .and_then(|spend| spend.reset_at_ms)
+                    .or(self.policy.spend_budget_reset_at_ms)
+                    .map_or(ResetTime::Missing, ResetTime::At),
+                basis: HoldBasis::ProactiveReading,
+                leave: InvalidationReason::SpendBudget,
+            });
+        }
+        if let Some(reading) = reading.filter(|_| !self.using_credits(&affinity.account_id)) {
             let check = scope_check(self.family, &reading.scoped, self.policy);
             if check.matched && !check.passes {
                 let reset = match &reading.scoped {
@@ -555,6 +699,11 @@ impl<'a> Allocator<'a> {
             ResetTime::Missing | ResetTime::Unparsable => (2, 0),
         });
         if let Some(blocker) = deciding {
+            if self.context.hold_ok == Some(false)
+                || self.policy.strategy == AccountStrategy::Ordered
+            {
+                return Leave(blocker.leave.clone());
+            }
             let Some((reset_at_ms, base_retry_after_s)) =
                 hold_until(blocker.reset, self.now, self.policy.short_hold_max_ms)
             else {
@@ -562,7 +711,7 @@ impl<'a> Allocator<'a> {
             };
             let retry_after_s =
                 retry_after_with_jitter(&self.request.conversation_key, base_retry_after_s as f64);
-            if retry_after_s > self.request.hold_wait_max_s {
+            if retry_after_s > self.request.hold_wait_max_s.min(self.policy.max_hold_s) {
                 return Leave(InvalidationReason::HoldExceedsWait { retry_after_s });
             }
             return AffinityVerdict::Hold(Hold {
@@ -879,10 +1028,72 @@ impl<'a> Allocator<'a> {
             .filter(|eval| eval.eligible())
             .collect();
         if eligible.is_empty() {
+            let holds: Option<Vec<Hold>> = survivors
+                .iter()
+                .map(|eval| {
+                    let affinity = ConversationAffinity {
+                        account_id: eval.view.account_id.clone(),
+                        credential_id: eval.hard.credential_id.clone()?,
+                        affinity_model: self.affinity_model.clone(),
+                        pin_id: String::new(),
+                        pin_generation: 0,
+                        expires_at_ms: EpochMs::MAX,
+                        lease_active: false,
+                    };
+                    match self.evaluate_affinity(&affinity, false) {
+                        AffinityVerdict::Hold(hold) => Some(hold),
+                        _ => None,
+                    }
+                })
+                .collect();
+            if let Some(hold) =
+                holds.and_then(|holds| holds.into_iter().min_by_key(|hold| hold.reset_at_ms))
+            {
+                return Decision {
+                    outcome: Outcome::Hold(hold),
+                    explanation: self.explanation,
+                };
+            }
             let (code, retry) = self.no_candidate(&survivors);
             return refuse(self.explanation, code, retry);
         }
+        if eligible.len() > 1 {
+            if let Some(parent) = &self.context.parent_account_id {
+                if eligible.iter().any(|eval| &eval.view.account_id != parent) {
+                    eligible.retain(|eval| &eval.view.account_id != parent);
+                }
+            }
+        }
         eligible.sort_by(|a, b| {
+            let order = || {
+                let order = self
+                    .order_index(&a.view.account_id)
+                    .cmp(&self.order_index(&b.view.account_id))
+                    .then_with(|| a.view.account_id.cmp(&b.view.account_id));
+                if self.policy.fallback_first {
+                    order.reverse()
+                } else {
+                    order
+                }
+            };
+            if self.policy.strategy == AccountStrategy::Ordered {
+                return order();
+            }
+            if matches!(
+                self.policy.strategy,
+                AccountStrategy::RoundRobin | AccountStrategy::Hybrid
+            ) {
+                let count = |id: &str| {
+                    self.state
+                        .admissions
+                        .iter()
+                        .filter(|admission| admission.account_id == id)
+                        .count()
+                };
+                return count(&a.view.account_id)
+                    .cmp(&count(&b.view.account_id))
+                    .then_with(order);
+            }
             let score = |eval: &ColdEval| eval.note.score.unwrap_or(f64::INFINITY);
             // A score that is not a number never outranks a numeric one,
             // whatever its sign bit; numbers compare by value. A partial
@@ -1104,6 +1315,11 @@ impl<'a> Allocator<'a> {
         affinity: AffinityOutcome,
         reading: Option<&QuotaReading>,
     ) -> Decision {
+        let reason = if self.using_credits(account_id) {
+            AdmitReason::PaidCredits
+        } else {
+            reason
+        };
         let observed_at_ms = reading.and_then(|reading| reading.observed_at_ms);
         let band = age_band(observed_at_ms, self.now, self.policy)
             .ok()

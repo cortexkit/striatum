@@ -3445,13 +3445,9 @@ fn price_selection_inputs(
             fact.subscription_multiplier = None;
         }
     }
-    // Credentials a provider refused permanently: automatic selection skips a
-    // route no other credential serves, and launches the rest on another one.
-    let entitlement_fences = if credentialed {
-        credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?
-    } else {
-        Vec::new()
-    };
+    // Eligibility is resolved by account choice; selection never reads the
+    // credential-refusal table as an independent route-level restriction.
+    let entitlement_fences = Vec::new();
     Ok(PricedSelection {
         routing_config: outcome.routing_config,
         provenance,
@@ -4281,6 +4277,9 @@ async fn handle_select_request(
         harness_context.availability(&facts)
     };
     let host_auth = params.provider_auth_types.clone().unwrap_or_default();
+    if let Some(classes) = &classes {
+        classes.apply_eligibility(&mut snapshot, &facts, priced_per_token);
+    }
     let candidates = select_policy::prepare_candidates(
         &facts,
         &mut snapshot,
@@ -4644,7 +4643,8 @@ async fn handle_select_request(
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
-                            &entitlement_fences,
+                            classes.as_ref(),
+                            priced_per_token,
                         )
                         .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
                     )
@@ -5076,7 +5076,8 @@ async fn handle_select_request(
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
-                            &entitlement_fences,
+                            classes.as_ref(),
+                            priced_per_token,
                         ) {
                             Ok((runner, _)) => result["runner"] = json!(runner),
                             Err((code, message)) => {
@@ -5289,7 +5290,8 @@ fn runner_for_route(
     provider: &str,
     model: &str,
     variant: Option<&str>,
-    entitlement_fences: &[prefrontal_routing_core::route_state_store::CredentialEntitlementFence],
+    classes: Option<&account_selection::ClassContext>,
+    priced_per_token: bool,
 ) -> Result<
     (
         prefrontal_routing_core::runner::RunnerModel,
@@ -5298,37 +5300,15 @@ fn runner_for_route(
     (String, String),
 > {
     if !needs_runner_pin(catalog_targets, provider) {
-        let refused_here = entitlement_fences
-            .iter()
-            .any(|fence| fence.provider_id == provider);
-        if refused_here {
-            let facts = store
-                .get_facts()
-                .map_err(|e| ("store_error".into(), e.to_string()))?;
-            let identities = facts
-                .iter()
-                .find(|f| f.provider_id == provider && f.model_id == model)
-                .and_then(|fact| credentials.lock().ok().map(|c| c.serving_identities(fact)))
-                .unwrap_or_default();
-            // A credential the provider refused permanently is never launched
-            // on automatically.
-            let entitled: Vec<(String, Option<String>)> =
-                credential_fences::entitled(entitlement_fences, provider, &identities)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-            // Pin the launch to a credential the provider has not refused, so
-            // Broca cannot fall back to the refused one.
-            if let Some(runner) = entitled.first().and_then(|(id, _)| {
-                prefrontal_routing_core::runner::RunnerModel::pinned(id, model, variant)
-            }) {
+        if let Some(classes) =
+            classes.filter(|classes| classes.needs_credential_pin(provider, model))
+        {
+            let id = classes.launch_credential(provider, model, priced_per_token)?;
+            if let Some(runner) =
+                prefrontal_routing_core::runner::RunnerModel::pinned(&id, model, variant)
+            {
                 return Ok((runner, None));
             }
-            let refused = credential_fences::unentitled(entitlement_fences, provider, &identities);
-            return Err((
-                credential_fences::rejection_reason(entitlement_fences, provider, &refused).into(),
-                refused.join(","),
-            ));
         }
         return Ok((
             prefrontal_routing_core::runner::RunnerModel::broca(provider, model, variant),
@@ -5547,15 +5527,16 @@ async fn handle_select_panel(
         } else {
             select_policy::Consumer::Athena
         };
-    // Seats are automatic choices: a model no entitled credential serves is not seated.
-    let entitlement_fences =
-        credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?;
-    credential_fences::apply(
-        &mut prepared.snapshot,
-        &prepared.facts,
-        &entitlement_fences,
+    let classes = account_selection::ClassContext::read(
+        store,
         broca_credentials,
-    );
+        live_config.clone(),
+        ACCOUNT_QUOTA.get(),
+        prepared.facts.clone(),
+        now_ms() as i64,
+    )
+    .map_err(ModuleError::Message)?;
+    classes.apply_eligibility(&mut prepared.snapshot, &prepared.facts, false);
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     let resolved_policy = resolve_routing_policy_with_catalog_targets(
         params.available_models.iter().cloned(),
@@ -6372,7 +6353,7 @@ async fn handle_set_decision_outcome(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
-    routing_config_path: &Path,
+    _routing_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
@@ -6409,7 +6390,6 @@ async fn handle_set_decision_outcome(
         )
         .await;
     };
-    let failure_backoff = config_overrides::live_config(routing_config_path).failure_backoff();
     let mut provider_outcome = params.provider_outcome;
     if let Some(provider) = provider_outcome
         .as_mut()
@@ -6453,14 +6433,17 @@ async fn handle_set_decision_outcome(
             .await;
         }
     }
-    let update = DecisionOutcomeUpdate {
-        provider_outcome,
-        outcome,
-        last_error: params.last_error,
-        observed_at_ms,
-        failure_backoff,
+    let outcome = match outcome {
+        RouteOutcome::Completed => RouteOutcome::Completed,
+        RouteOutcome::Cancelled => RouteOutcome::Cancelled,
+        _ => RouteOutcome::Error,
     };
-    match store.set_decision_outcome(&params.decision_id, &update) {
+    match store.record_routing_outcome(
+        &params.decision_id,
+        &outcome,
+        params.last_error.as_deref(),
+        observed_at_ms,
+    ) {
         Ok(()) => send_ok(writer, ver, channel, epoch, corr).await,
         Err(e) => {
             send_route_error(

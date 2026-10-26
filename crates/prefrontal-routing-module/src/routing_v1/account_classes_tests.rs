@@ -630,6 +630,463 @@ fn oauth_reading(used_percent: f64) {
 }
 
 #[tokio::test]
+async fn provider_strategies_never_escape_the_subscription_class() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for strategy in ["round_robin", "ordered"] {
+        let (harness, _) = setup("synthetic", false);
+        oauth_reading(10.0);
+        harness.edit_config(|config| config["providers"]["synthetic"]["accounts"] = json!({
+            "strategy":strategy,"ordered":"fallback-first","order":["oauth-account","apikey-account"],
+            "max_hold":"30s","hold_when_reset_within":"15m","unknown_reset_retry":"2h"
+        }));
+        let runner = harness.bind(reserved(RUNNER), None).await;
+        for index in 0..10 {
+            assert_credential(
+                &runner
+                    .call(
+                        "route.account_for",
+                        &account_request("synthetic", &format!("{strategy}-{index}")),
+                    )
+                    .await,
+                "oauth:test",
+            );
+        }
+        exhaust_oauth(&harness, "synthetic");
+        let blocked = runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", &format!("{strategy}-blocked")),
+            )
+            .await;
+        assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+        assert!(
+            matches!(
+                blocked.1["code"].as_str(),
+                Some("account_hold" | "no_eligible_account")
+            ),
+            "{}",
+            blocked.1
+        );
+        harness.edit_config(|config| {
+            config["providers"]["synthetic"]["accounts"]["metered_fallback"] = json!(true)
+        });
+        assert_credential(
+            &runner
+                .call(
+                    "route.account_for",
+                    &account_request("synthetic", &format!("{strategy}-fallback")),
+                )
+                .await,
+            "apikey:test",
+        );
+    }
+}
+
+#[tokio::test]
+async fn child_uses_another_account_only_after_parent_use_is_reported() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    harness.edit_config(|config| config["providers"]["synthetic"]["subscription"] = json!(false));
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let parent=runner.call("route.account_for",&json!({"provider":"synthetic","model":"model","conversation_key":"parent","admission_id":"parent"})).await;
+    assert_eq!(parent.0, FrameType::Response, "{}", parent.1);
+    let parent_account = parent.1["result"]["account"]["account_id"]
+        .as_str()
+        .unwrap();
+    let started=runner.call("route.account_observe",&json!({"event_id":"parent-start","kind":"admission_started","admission_id":"parent","run_id":"run","served_account_id":parent_account})).await;
+    assert_eq!(started.0, FrameType::Response, "{}", started.1);
+    let child=runner.call("route.account_for",&json!({"provider":"synthetic","model":"model","conversation_key":"child","parent_conversation_key":"parent","admission_id":"child"})).await;
+    assert_eq!(child.0, FrameType::Response, "{}", child.1);
+    assert_ne!(
+        child.1["result"]["account"]["account_id"],
+        parent.1["result"]["account"]["account_id"]
+    );
+    let conflict=runner.call("route.account_for",&json!({"provider":"synthetic","model":"model","conversation_key":"child","parent_conversation_key":"different-parent","admission_id":"child"})).await;
+    assert_eq!(conflict.1["code"], "admission_conflict", "{}", conflict.1);
+}
+
+#[tokio::test]
+async fn model_eligibility_applies_to_pins_and_clears_with_the_vault_listing() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let first = crate::tests::fact("synthetic", "model");
+    let mut other = crate::tests::fact("synthetic", "other");
+    other.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
+    harness.install_facts(&[first.clone(), other.clone()]);
+    catalog_fact(&harness, &other);
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[first, other]),
+    );
+    harness.set_credentials(credentials.clone());
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let admitted = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "not-found"),
+        )
+        .await;
+    assert_credential(&admitted, "oauth:test");
+    let observed=runner.call("route.account_observe",&json!({"event_id":"not-found","kind":"scoped_not_found","admission_id":"not-found","credential_id":"oauth:test","view_digest":"mixed-vault"})).await;
+    assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
+    assert_eq!(harness.store().account_eligibility().unwrap().len(), 1);
+    let pin = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30},"pin":"synthetic/model"}),
+        )
+        .await;
+    assert_eq!(pin.0, FrameType::Error, "{}", pin.1);
+    assert_ne!(pin.1["code"], "account_hold");
+    let next = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "not-found-next"),
+        )
+        .await;
+    assert_eq!(next.1["code"], "no_eligible_account", "{}", next.1);
+    let mut unaffected = account_request("synthetic", "404-other-model");
+    unaffected["model"] = json!("other");
+    assert_credential(
+        &runner.call("route.account_for", &unaffected).await,
+        "oauth:test",
+    );
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.iter_mut()
+        .find(|row| row.id == "oauth:test")
+        .unwrap()
+        .plan_tier = Some("changed-plan".into());
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "changed-vault".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials);
+    assert_credential(
+        &runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "listed-again"),
+            )
+            .await,
+        "oauth:test",
+    );
+    assert!(harness.store().account_eligibility().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn report_eligibility_is_model_or_account_scoped_and_never_a_hold() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let mut other = crate::tests::fact("synthetic", "other");
+    other.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
+    let first = crate::tests::fact("synthetic", "model");
+    harness.install_facts(&[first.clone(), other.clone()]);
+    catalog_fact(&harness, &other);
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[first, other]),
+    );
+    harness.set_credentials(credentials);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    for (index, scope) in ["model", "account"].into_iter().enumerate() {
+        let pin = if scope == "model" {
+            "synthetic/other"
+        } else {
+            "synthetic/model"
+        };
+        let decision = caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30},"pin":pin}),
+            )
+            .await;
+        assert_eq!(decision.0, FrameType::Response, "{}", decision.1);
+        let report=caller.call("route.report",&json!({"decision_id":decision.1["result"]["decision_id"],"outcome":"refused","credential_id":"oauth:test","eligibility":{"scope":scope,"code":"not_on_plan"}})).await;
+        assert_eq!(report.0, FrameType::Response, "{}", report.1);
+        let mut request = account_request("synthetic", &format!("eligibility-{index}"));
+        if scope == "model" {
+            assert_credential(
+                &runner.call("route.account_for", &request).await,
+                "oauth:test",
+            );
+        } else {
+            let answer = runner.call("route.account_for", &request).await;
+            assert_eq!(answer.1["code"], "no_eligible_account", "{}", answer.1);
+        }
+        request["model"] = json!("other");
+        request["admission_id"] = json!(format!("other-{index}"));
+        let answer = runner.call("route.account_for", &request).await;
+        assert_eq!(answer.1["code"], "no_eligible_account", "{}", answer.1);
+    }
+}
+
+#[tokio::test]
+async fn size_shaped_429_restricts_only_its_input_band_and_success_clears_it() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let select = json!({"consumer":"mason","requirements":{"iq":30},"pin":"synthetic/model"});
+    let decision = caller.call("route.select", &select).await;
+    assert_eq!(decision.0, FrameType::Response, "{}", decision.1);
+    let report=caller.call("route.report",&json!({"decision_id":decision.1["result"]["decision_id"],"outcome":"refused","credential_id":"oauth:test","runner_code":"size_shaped_429","request_input_tokens":169_000,"reset_at_ms":NOW+600_000})).await;
+    assert_eq!(report.0, FrameType::Response, "{}", report.1);
+    let mut large = account_request("synthetic", "large");
+    large["initial_input_bytes"] = json!(169_000 * 4);
+    let blocked = runner.call("route.account_for", &large).await;
+    assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
+    let mut small = account_request("synthetic", "small");
+    small["initial_input_bytes"] = json!(4096 * 4);
+    assert_credential(
+        &runner.call("route.account_for", &small).await,
+        "oauth:test",
+    );
+    let next = caller.call("route.select", &select).await;
+    assert_eq!(next.0, FrameType::Response, "{}", next.1);
+    let _later = crate::InjectedClock::set(NOW + 1);
+    let success=caller.call("route.report",&json!({"decision_id":next.1["result"]["decision_id"],"outcome":"completed","credential_id":"oauth:test","request_input_tokens":169_000})).await;
+    assert_eq!(success.0, FrameType::Response, "{}", success.1);
+    large["admission_id"] = json!("large-after-success");
+    assert_credential(
+        &runner.call("route.account_for", &large).await,
+        "oauth:test",
+    );
+}
+
+#[tokio::test]
+async fn entitlement_is_credential_wide_and_old_billing_refusals_keep_other_keys_usable() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let mut rows = credentials.listed_credentials().to_vec();
+    for row in &mut rows {
+        row.credential_type = "apikey".into();
+        row.auth_method = Some("apikey".into());
+    }
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "two-keys".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials.clone());
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let caller = harness.bind(reserved(OWNER), None).await;
+    for (index, code) in ["billing_exhausted", "ENTITLEMENT_ERROR"]
+        .into_iter()
+        .enumerate()
+    {
+        crate::credential_fences::record(
+            harness.store(),
+            &Arc::new(std::sync::Mutex::new(credentials.clone())),
+            &CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "apikey:test".into(),
+                code: code.into(),
+            },
+            NOW as i64 - 20 * 60_000,
+        )
+        .unwrap();
+        assert_credential(
+            &runner
+                .call(
+                    "route.account_for",
+                    &account_request("synthetic", &format!("other-key-{index}")),
+                )
+                .await,
+            "oauth:test",
+        );
+        let selected = caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30}}),
+            )
+            .await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        let mut bound = account_request("synthetic", &format!("bound-other-key-{index}"));
+        bound["decision_id"] = selected.1["result"]["decision_id"].clone();
+        assert_credential(
+            &runner.call("route.account_for", &bound).await,
+            "oauth:test",
+        );
+    }
+    let mut other = crate::tests::fact("synthetic", "other");
+    other.auth_methods = Some(vec!["apikey".into()]);
+    let first = crate::tests::fact("synthetic", "model");
+    harness.install_facts(&[first.clone(), other.clone()]);
+    catalog_fact(&harness, &other);
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[first, other]),
+    );
+    harness.set_credentials(credentials.clone());
+    let mut request = account_request("synthetic", "other-model");
+    request["model"] = json!("other");
+    assert_credential(
+        &runner.call("route.account_for", &request).await,
+        "oauth:test",
+    );
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.iter_mut()
+        .find(|row| row.id == "apikey:test")
+        .unwrap()
+        .plan_tier = Some("new".into());
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "new-listing".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials);
+    assert_credential(
+        &runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "key-restored"),
+            )
+            .await,
+        "apikey:test",
+    );
+}
+
+#[tokio::test]
+async fn ladder_holds_a_blocked_entry_but_demand_and_no_wait_use_the_next_model() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let first = crate::tests::fact("synthetic", "model");
+    let mut other = crate::tests::fact("secondary", "model");
+    other.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
+    harness.install_facts(&[first.clone(), other.clone()]);
+    catalog_fact(&harness, &other);
+    let mut rows = credentials.listed_credentials().to_vec();
+    for row in &mut rows {
+        row.provider_ids.push("secondary".into());
+    }
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "two-providers".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[first, other]),
+    );
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| config["consumers"]["mason"]=json!({"owner":OWNER,"mode":"ladder","ladder":["synthetic/model","secondary/model"]}));
+    exhaust_oauth(&harness, "synthetic");
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let request = json!({"consumer":"mason","requirements":{"iq":30}});
+    let held = caller.call("route.select", &request).await;
+    assert_eq!(held.1["code"], "account_hold", "{}", held.1);
+    let mut no_wait = request.clone();
+    no_wait["hold_ok"] = json!(false);
+    let moved = caller.call("route.select", &no_wait).await;
+    assert_eq!(moved.0, FrameType::Response, "{}", moved.1);
+    assert_eq!(moved.1["result"]["route"]["provider"], "secondary");
+    harness
+        .edit_config(|config| config["providers"]["synthetic"]["accounts"]["max_hold"] = json!(30));
+    let moved = caller.call("route.select", &request).await;
+    assert_eq!(moved.0, FrameType::Response, "{}", moved.1);
+    assert_eq!(moved.1["result"]["route"]["provider"], "secondary");
+    harness.edit_config(|config| config["consumers"]["mason"]["mode"] = json!("demand"));
+    let demand = caller.call("route.select", &request).await;
+    assert_eq!(demand.0, FrameType::Response, "{}", demand.1);
+    assert_eq!(demand.1["result"]["route"]["provider"], "secondary");
+}
+
+#[tokio::test]
+async fn paid_credit_readings_are_explicit_fresh_inputs_and_refusals_cannot_rewrite_them() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    oauth_reading(100.0);
+    let state = crate::ACCOUNT_QUOTA.get().unwrap();
+    {
+        let mut guard = state.lock().unwrap();
+        let reading = guard.readings.readings.values_mut().next().unwrap();
+        reading.entry["spend"] = json!([{"id":"credits","label":"Credits","funding":"purchased","basis":"reported","remaining":{"minor":100,"exponent":0,"unit":"credit"}}]);
+    }
+    harness.edit_config(|config| {
+        config["providers"]["synthetic"]["accounts"]["paid_credits"] = json!(true)
+    });
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let admitted = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "credits"),
+        )
+        .await;
+    assert_credential(&admitted, "oauth:test");
+    assert_eq!(
+        admitted.1["result"]["reason"]["code"], "paid_credits",
+        "{}",
+        admitted.1
+    );
+    let before = state.lock().unwrap().readings.readings.clone();
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let second = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(second.0, FrameType::Response, "{}", second.1);
+    for (decision, code) in [
+        (selected, "credit_insufficient"),
+        (second, "billing_exhausted"),
+    ] {
+        let refused=caller.call("route.report",&json!({"decision_id":decision.1["result"]["decision_id"],"outcome":"refused","credential_id":"oauth:test","runner_code":code})).await;
+        assert_eq!(refused.0, FrameType::Response, "{}", refused.1);
+        assert_eq!(
+            state.lock().unwrap().readings.readings,
+            before,
+            "refusal is not a credit reading"
+        );
+    }
+    let blocked = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "credits-refused"),
+        )
+        .await;
+    assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
+}
+
+#[tokio::test]
+async fn failure_reports_with_resets_remain_advisory_and_keep_the_model_sticky() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let request = json!({"consumer":"mason","requirements":{"iq":30},"affinity":"sticky"});
+    let first = caller.call("route.select", &request).await;
+    assert_eq!(first.0, FrameType::Response, "{}", first.1);
+    let report=caller.call("route.report",&json!({"decision_id":first.1["result"]["decision_id"],"outcome":"failed","runner_code":"unconfirmed_429","reset_at_ms":NOW+3_600_000})).await;
+    assert_eq!(report.0, FrameType::Response, "{}", report.1);
+    let second = caller.call("route.select", &request).await;
+    assert_eq!(second.0, FrameType::Response, "{}", second.1);
+    assert_eq!(second.1["result"]["route"], first.1["result"]["route"]);
+    assert!(harness
+        .store()
+        .account_size_refusals(NOW as i64)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn absent_readings_admit_without_fabricated_quota_and_known_headroom_orders_first() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = setup("synthetic", false);

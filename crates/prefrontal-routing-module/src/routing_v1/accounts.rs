@@ -16,7 +16,6 @@ use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::observe::{
     parse_account_observe_request, AccountObserveAnswer, Observation,
 };
-use prefrontal_routing_core::accounts::AllocatorPolicy;
 use prefrontal_routing_store::V1Recorded;
 use serde_json::{json, Value};
 
@@ -38,6 +37,8 @@ const FOR_MEMBERS: &[&str] = &[
     "requested_account",
     "hold_wait_max_s",
     "decision_id",
+    "parent_conversation_key",
+    "pool",
 ];
 
 const OBSERVE_MEMBERS: &[&str] = &[
@@ -54,6 +55,7 @@ const OBSERVE_MEMBERS: &[&str] = &[
     "limit_window",
     "resets_at_ms",
     "resets_at_source",
+    "pool",
 ];
 
 /// The calling runner's module, when the caller is an attested runner.
@@ -124,6 +126,14 @@ pub(super) fn account_for(
         ("requested_account", json!(request.requested_account)),
         ("hold_wait_max_s", json!(request.hold_wait_max_s)),
         ("model_decision_id", json!(request.decision_id)),
+        (
+            "parent_conversation_key",
+            params
+                .get("parent_conversation_key")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        ("pool", params.get("pool").cloned().unwrap_or(Value::Null)),
     ] {
         if !value.is_null() {
             legacy[member] = value;
@@ -132,7 +142,8 @@ pub(super) fn account_for(
     let body = serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": legacy }))
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
-    let policy = AllocatorPolicy::default();
+    let policy =
+        config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
     let ctx = account_ctx(deps, flags, &policy)?;
     let answer = match account_selection::handle(ACCOUNT_FOR_OP, &body, &caller.principal, &ctx) {
         OpReply::Result(result) => admission_answer(&result, &request)?,
@@ -309,7 +320,7 @@ pub(super) fn account_observe(
     let body = serde_json::to_vec(&json!({ "method": ACCOUNT_OBSERVE_OP, "params": legacy }))
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
-    let policy = AllocatorPolicy::default();
+    let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
     let ctx = account_ctx(deps, flags, &policy)?;
     let reply = account_selection::handle(ACCOUNT_OBSERVE_OP, &body, &caller.principal, &ctx);
     // Rate-limit headers feed routing's quota view exactly as the older op's do.

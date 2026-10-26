@@ -1819,7 +1819,7 @@ pub async fn account_quota_loop(
             if let Err(error) = crate::account_selection::refresh_all_blocks(
                 &store,
                 &snapshot,
-                &prefrontal_routing_core::accounts::AllocatorPolicy::default(),
+                &crate::config_overrides::live_config(&crate::config_overrides::config_path()),
                 now_ms(),
             ) {
                 tracing::warn!(error = %error, "account blocks not refreshed");

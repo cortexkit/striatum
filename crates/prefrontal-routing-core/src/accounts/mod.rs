@@ -19,15 +19,22 @@ pub mod decide;
 pub mod decision;
 pub mod eligibility;
 pub mod evidence;
+pub mod policy;
 pub mod pools;
 pub mod types;
 
-pub use decide::decide;
+#[cfg(test)]
+mod policy_tests;
+
+pub use decide::{decide, decide_with_context};
 pub use decision::{
     AccountNote, Admission, AdmitReason, AffinityNote, AffinityOutcome, AgeBand, ApplicableWindow,
     Decision, ExclusionReason, ExclusionTier, Explanation, Hold, HoldBasis, ImportNote,
     InvalidationReason, Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode,
     RequestedAccountIgnored, RequestedAccountNote, RosterNote, ScopedListState, WindowWeight,
+};
+pub use policy::{
+    input_size_class, AccountStrategy, AllocationContext, CreditReading, PoolFloor, SpendReading,
 };
 pub use pools::{
     block_end, grown_recovery_set, recovery_set_from, validate_pool_name, AllowedAccountClass,

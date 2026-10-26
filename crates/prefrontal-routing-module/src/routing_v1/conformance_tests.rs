@@ -703,10 +703,9 @@ impl RoutingSubject for KitSubject {
 }
 
 /// Kit checks this module does not serve yet, in the kit's run order. The
-/// first seven need the account-op members routing/v1 0.2.0 added
-/// (`parent_conversation_key`, `pool`, `eligibility`, `request_input_tokens`),
-/// which the v1 account ops and report still refuse as unknown members. The
-/// operator-override check needs a configurable max_output_tokens demand,
+/// parent-preference check treats an unstarted reservation as a used-account
+/// report; routing only avoids a parent's account after a runner reports use.
+/// The operator-override check needs a configurable max_output_tokens demand,
 /// which the current consumer config schema does not expose.
 /// Each is expected to fail until routing serves it; the work that makes one
 /// pass removes it here, and the full-kit verdict holds once the list is empty.
@@ -717,22 +716,10 @@ impl RoutingSubject for KitSubject {
 /// asserts that a continuing conversation keeps its route after a failure.
 const NOT_YET_SERVED: &[&str] = &[
     "parent_account_preference",
-    "parent_account_fallback",
-    "eligibility_never_holds_or_exhausts",
-    "unknown_pool_accepted",
-    "pool_body_admission_conflict",
-    "parent_body_admission_conflict",
-    "new_report_members_conflict",
     "operator_config_overrides_declared_default",
     "affinity_holds_until_failure_report",
-];
-
-/// Checks not applicable to the declared capability groups, in kit run order.
-/// The undeclared-harness refusal is inapplicable because `select_harness` is
-/// served. Hold checks remain inapplicable until `select_hold_control` and
-/// the subject's hold hooks are implemented.
-const NOT_APPLICABLE: &[&str] = &[
-    "undeclared_harness_group_refuses_member",
+    // The live handler serves hold control; the kit subject still needs its
+    // provider-policy and block-setup hooks before these checks can drive it.
     "hold_answers_blocked_entry_within_limits",
     "hold_moves_when_reset_beyond_window",
     "hold_moves_when_reset_unknown",
@@ -743,6 +730,10 @@ const NOT_APPLICABLE: &[&str] = &[
     "hold_demand_mode_skips_blocked_model",
     "hold_account_for_applies_recorded_cap",
 ];
+
+/// The undeclared-harness refusal check applies only to providers that do not
+/// advertise `select_harness`; this provider advertises and serves that group.
+const NOT_APPLICABLE: &[&str] = &["undeclared_harness_group_refuses_member"];
 
 /// Every served check passes; exactly [`NOT_YET_SERVED`] fail, and
 /// [`NOT_APPLICABLE`] are inapplicable: a newly failing check, or a listed

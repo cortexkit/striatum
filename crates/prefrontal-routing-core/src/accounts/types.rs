@@ -458,6 +458,22 @@ pub struct ModelFamilyMapping {
 /// initial values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AllocatorPolicy {
+    #[serde(default)]
+    pub strategy: super::policy::AccountStrategy,
+    #[serde(default)]
+    pub fallback_first: bool,
+    #[serde(default)]
+    pub soft_quota_remaining_percent: Option<f64>,
+    #[serde(default)]
+    pub pool_floors: Vec<super::policy::PoolFloor>,
+    #[serde(default)]
+    pub spend_budget: Option<f64>,
+    #[serde(default)]
+    pub spend_budget_reset_at_ms: Option<EpochMs>,
+    #[serde(default = "default_paid_credits")]
+    pub paid_credits: bool,
+    #[serde(default = "default_max_hold_s")]
+    pub max_hold_s: u64,
     pub policy_version: u32,
     /// Reserve on the general 5h window, in percentage points (live sidecar value 1).
     pub reserve_five_hour: f64,
@@ -515,6 +531,14 @@ fn default_unknown_reset_retry_ms() -> i64 {
     crate::quota::NO_RESET_REPROBE_HORIZON_MS as i64
 }
 
+fn default_max_hold_s() -> u64 {
+    900
+}
+
+fn default_paid_credits() -> bool {
+    true
+}
+
 impl Default for AllocatorPolicy {
     fn default() -> Self {
         let family = |model: &str, family| ModelFamilyMapping {
@@ -522,6 +546,14 @@ impl Default for AllocatorPolicy {
             family,
         };
         Self {
+            strategy: super::policy::AccountStrategy::Sticky,
+            fallback_first: false,
+            soft_quota_remaining_percent: None,
+            pool_floors: Vec::new(),
+            spend_budget: None,
+            spend_budget_reset_at_ms: None,
+            paid_credits: default_paid_credits(),
+            max_hold_s: default_max_hold_s(),
             policy_version: 2,
             reserve_five_hour: 1.0,
             reserve_seven_day: 1.0,

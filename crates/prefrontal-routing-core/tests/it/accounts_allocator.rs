@@ -470,6 +470,8 @@ fn soft_proactive_hold_bounds_and_reevaluation() {
             account("acct-b", Some(reading(10.0, 10.0))),
         ]);
         st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
+        // This reset-boundary fixture also permits the jittered 906-second wait.
+        st.policy.max_hold_s = 906;
         st
     };
     let full_100 = |reset| {

@@ -25,6 +25,270 @@ use super::{err, SqliteRouteStateStore};
 /// retired shadow mode; retention purges those rows.)
 pub const DECISION_MODE_SERVE: &str = "serve";
 
+#[cfg(test)]
+mod account_fact_tests {
+    use super::*;
+
+    #[test]
+    fn eligibility_survives_restart_and_clears_only_on_listing_change() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-eligibility-clear");
+        let descriptor = crate::dev_descriptor(
+            "account-eligibility-clear",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        store
+            .record_account_eligibility(&AccountEligibilityFact {
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: "m".into(),
+                listing_fingerprint: Some("v1".into()),
+                code: "404".into(),
+                observed_at: 1,
+            })
+            .unwrap();
+        drop(store);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v1".into())])
+            .unwrap();
+        assert_eq!(store.account_eligibility().unwrap().len(), 1);
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            .unwrap();
+        assert!(store.account_eligibility().unwrap().is_empty());
+        store
+            .record_account_eligibility(&AccountEligibilityFact {
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: String::new(),
+                listing_fingerprint: None,
+                code: "ineligible".into(),
+                observed_at: 2,
+            })
+            .unwrap();
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            .unwrap();
+        assert_eq!(
+            store.account_eligibility().unwrap()[0]
+                .listing_fingerprint
+                .as_deref(),
+            Some("v2")
+        );
+        store.reconcile_account_eligibility(&[]).unwrap();
+        assert!(store.account_eligibility().unwrap().is_empty());
+    }
+
+    #[test]
+    fn size_refusals_expire_or_clear_on_later_success_in_the_same_band() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-size-clear");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "account-size-clear",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let fact = AccountSizeRefusal {
+            provider: "p".into(),
+            credential_id: "c".into(),
+            model: "m".into(),
+            size_class: 17,
+            expires_at: 100,
+            observed_at: 10,
+        };
+        store.record_account_size_refusal(&fact).unwrap();
+        store
+            .clear_account_size_refusal("p", "c", "m", 17, 10)
+            .unwrap();
+        store
+            .clear_account_size_refusal("p", "c", "m", 12, 11)
+            .unwrap();
+        assert_eq!(store.account_size_refusals(11).unwrap().len(), 1);
+        store
+            .clear_account_size_refusal("p", "c", "m", 17, 12)
+            .unwrap();
+        assert!(store.account_size_refusals(12).unwrap().is_empty());
+        store.record_account_size_refusal(&fact).unwrap();
+        assert!(store.account_size_refusals(100).unwrap().is_empty());
+        assert!(
+            store.account_size_refusals(0).unwrap().is_empty(),
+            "expiry deletes the row"
+        );
+    }
+}
+
+/// An account/model fact, valid only for the credential listing it was read on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountEligibilityFact {
+    pub provider: String,
+    pub credential_id: String,
+    /// Empty means every model on the provider.
+    pub model: String,
+    pub listing_fingerprint: Option<String>,
+    pub code: String,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSizeRefusal {
+    pub provider: String,
+    pub credential_id: String,
+    pub model: String,
+    pub size_class: u32,
+    pub expires_at: i64,
+    pub observed_at: i64,
+}
+
+impl SqliteRouteStateStore {
+    /// A run outcome is an audit fact, not quota or model-health evidence.
+    pub fn record_routing_outcome(
+        &self,
+        decision: &str,
+        outcome: &prefrontal_routing_core::RouteOutcome,
+        error: Option<&str>,
+        at: i64,
+    ) -> RouteStateResult<()> {
+        self.store.with_conn(|conn: &Connection| {
+            conn.execute("UPDATE model_route_decisions SET outcome=?1,outcome_at=?2,outcome_error=?3 WHERE id=?4",
+                params![outcome.as_str(),at,error,decision]).map(|_| ())
+        }).map_err(err)
+    }
+
+    pub fn record_account_eligibility(
+        &self,
+        fact: &AccountEligibilityFact,
+    ) -> RouteStateResult<()> {
+        self.account_transaction(|tx| tx.record_eligibility(fact))
+    }
+}
+
+impl AccountTx<'_> {
+    pub fn record_eligibility(&self, fact: &AccountEligibilityFact) -> RouteStateResult<()> {
+        self.conn.execute(
+                "INSERT INTO account_eligibility VALUES (?1,?2,?3,?4,?5,?6) \
+                 ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
+                 listing_fingerprint=excluded.listing_fingerprint,code=excluded.code,observed_at=excluded.observed_at \
+                 WHERE excluded.observed_at >= account_eligibility.observed_at",
+                params![fact.provider, fact.credential_id, fact.model, fact.listing_fingerprint, fact.code, fact.observed_at],
+            ).map(|_| ()).map_err(err)
+    }
+
+    /// Prefer a parent's account only after a runner reported using it. The
+    /// reported serving account wins over a reservation the runner did not use.
+    pub fn parent_used_account(
+        &self,
+        principal: &str,
+        hash: &str,
+        provider: &str,
+    ) -> RouteStateResult<Option<String>> {
+        self.conn.query_row("SELECT COALESCE(json_extract(o.observation_json,'$.served_account_id'),a.account_id) \
+            FROM account_observation o JOIN account_admission a ON a.principal=o.principal AND a.admission_id=o.admission_id \
+            WHERE a.principal=?1 AND a.conversation_hash=?2 AND a.provider=?3 \
+              AND o.kind IN ('admission_started','run_finished','used_account','attempt') \
+            ORDER BY o.received_at DESC,o.rowid DESC LIMIT 1", params![principal,hash,provider], |row| row.get(0)).optional().map_err(err)
+    }
+}
+
+impl SqliteRouteStateStore {
+    /// Reconcile facts only after a successful vault listing. Unknown listing
+    /// state must not erase a previously established eligibility restriction.
+    pub fn reconcile_account_eligibility(
+        &self,
+        listings: &[(String, String)],
+    ) -> RouteStateResult<()> {
+        self.store.with_conn(|conn: &Connection| {
+            if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(()); }
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let credentials = {
+                let mut statement = tx.prepare("SELECT DISTINCT credential_id FROM account_eligibility")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for credential in credentials {
+                match listings.iter().find(|(id, _)| id == &credential) {
+                    Some((_, fingerprint)) => {
+                        tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1 AND listing_fingerprint IS NOT NULL AND listing_fingerprint<>?2", params![credential, fingerprint])?;
+                        tx.execute("UPDATE account_eligibility SET listing_fingerprint=?2 WHERE credential_id=?1 AND listing_fingerprint IS NULL", params![credential, fingerprint])?;
+                    }
+                    None => { tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1", [&credential])?; }
+                }
+            }
+            tx.commit()
+        }).map_err(err)
+    }
+
+    pub fn account_eligibility(&self) -> RouteStateResult<Vec<AccountEligibilityFact>> {
+        self.store.with_conn(|conn: &Connection| {
+            if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(Vec::new()); }
+            let mut statement = conn.prepare("SELECT provider,credential_id,model,listing_fingerprint,code,observed_at FROM account_eligibility ORDER BY provider,credential_id,model")?;
+            let rows = statement.query_map([], |row| Ok(AccountEligibilityFact {
+                provider: row.get(0)?, credential_id: row.get(1)?, model: row.get(2)?,
+                listing_fingerprint: row.get(3)?, code: row.get(4)?, observed_at: row.get(5)?,
+            }))?;
+            rows.collect()
+        }).map_err(err)
+    }
+
+    pub fn record_account_size_refusal(&self, fact: &AccountSizeRefusal) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.execute(
+                    "INSERT INTO account_size_refusal VALUES (?1,?2,?3,?4,?5,?6) \
+                ON CONFLICT (provider,credential_id,model,size_class) DO UPDATE SET \
+                expires_at=excluded.expires_at,observed_at=excluded.observed_at \
+                WHERE excluded.observed_at >= account_size_refusal.observed_at",
+                    params![
+                        fact.provider,
+                        fact.credential_id,
+                        fact.model,
+                        fact.size_class,
+                        fact.expires_at,
+                        fact.observed_at
+                    ],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
+    /// Expired refusals are removed on reads, not just ignored in memory.
+    pub fn account_size_refusals(&self, now: i64) -> RouteStateResult<Vec<AccountSizeRefusal>> {
+        self.store.with_conn(|conn: &Connection| {
+            if !account_fact_table_exists(conn, "account_size_refusal")? { return Ok(Vec::new()); }
+            conn.execute("DELETE FROM account_size_refusal WHERE expires_at<=?1", [now])?;
+            let mut statement = conn.prepare("SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_size_refusal")?;
+            let rows = statement.query_map([], |row| Ok(AccountSizeRefusal {
+                provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,size_class: row.get(3)?,expires_at: row.get(4)?,observed_at: row.get(5)?,
+            }))?;
+            rows.collect()
+        }).map_err(err)
+    }
+
+    pub fn clear_account_size_refusal(
+        &self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        size_class: u32,
+        observed_at: i64,
+    ) -> RouteStateResult<()> {
+        self.store.with_conn(|conn: &Connection| {
+            conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",
+                params![provider,credential,model,size_class,observed_at]).map(|_| ())
+        }).map_err(err)
+    }
+}
+
+// Upgrade fixtures issue admissions on the old schema before reopening it with
+// migrations enabled. Absence of the new fact tables means no such facts exist.
+fn account_fact_table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
 /// One recorded account decision. `decision_json` is the allocator's whole
 /// decision (outcome and explanation); `context_json` is what the caller of
 /// the allocator wants kept beside it (the trigger, roster gaps, a triggering
