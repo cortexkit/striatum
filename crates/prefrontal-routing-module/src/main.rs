@@ -4278,7 +4278,12 @@ async fn handle_select_request(
     };
     let host_auth = params.provider_auth_types.clone().unwrap_or_default();
     if let Some(classes) = &classes {
-        classes.apply_eligibility(&mut snapshot, &facts, priced_per_token);
+        classes.apply_eligibility(
+            &mut snapshot,
+            &facts,
+            priced_per_token,
+            params.pin.is_some() || params.model_pin.is_some(),
+        );
     }
     let candidates = select_policy::prepare_candidates(
         &facts,
@@ -5536,7 +5541,7 @@ async fn handle_select_panel(
         now_ms() as i64,
     )
     .map_err(ModuleError::Message)?;
-    classes.apply_eligibility(&mut prepared.snapshot, &prepared.facts, false);
+    classes.apply_eligibility(&mut prepared.snapshot, &prepared.facts, false, false);
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     let resolved_policy = resolve_routing_policy_with_catalog_targets(
         params.available_models.iter().cloned(),
@@ -6433,11 +6438,6 @@ async fn handle_set_decision_outcome(
             .await;
         }
     }
-    let outcome = match outcome {
-        RouteOutcome::Completed => RouteOutcome::Completed,
-        RouteOutcome::Cancelled => RouteOutcome::Cancelled,
-        _ => RouteOutcome::Error,
-    };
     match store.record_routing_outcome(
         &params.decision_id,
         &outcome,

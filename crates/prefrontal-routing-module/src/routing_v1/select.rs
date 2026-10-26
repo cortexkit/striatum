@@ -257,7 +257,7 @@ pub(super) async fn select(
         .map(|fact| fact_to_route(fact).route_key)
         .collect();
     if let Some(classes) = &priced.classes {
-        classes.apply_eligibility(&mut snapshot, &facts, priced_per_token);
+        classes.apply_eligibility(&mut snapshot, &facts, priced_per_token, false);
     }
     let candidates = select_policy::prepare_candidates(
         &facts,

@@ -599,8 +599,12 @@ impl ClassContext {
         snapshot: &mut prefrontal_routing_core::ModelRouteStateSnapshot,
         facts: &[prefrontal_routing_core::ModelFact],
         priced: bool,
+        defer_pool_pin: bool,
     ) {
         for fact in facts {
+            if defer_pool_pin && self.targets.contains_key(&fact.provider_id) {
+                continue;
+            }
             if let Some(mark) = self.refusal_mark(fact, priced) {
                 snapshot
                     .by_capacity

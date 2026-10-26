@@ -184,6 +184,24 @@ fn strategies_order_within_the_supplied_account_class() {
 }
 
 #[test]
+fn absent_quota_still_spreads_new_sticky_conversations() {
+    let mut state = state(&["a", "b"]);
+    state.admissions.push(AdmissionDemand {
+        account_id: "a".into(),
+        state: AdmissionState::Reserved,
+        request_bytes: 4096,
+        committed_at_ms: NOW,
+    });
+    assert_eq!(chosen(decide(&request(), &state, NOW)), "b");
+    state.affinity = Some(affinity());
+    assert_eq!(
+        chosen(decide(&request(), &state, NOW)),
+        "a",
+        "existing affinity remains sticky"
+    );
+}
+
+#[test]
 fn credits_require_all_exhausted_and_a_reading_under_fifteen_minutes() {
     let mut state = state(&["a", "b"]);
     state.policy.paid_credits = true;

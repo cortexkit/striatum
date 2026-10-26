@@ -927,17 +927,16 @@ impl<'a> Allocator<'a> {
         // An admission counts until a reading taken `reflection_lag` after its
         // commit could reflect it. Released admissions never count; expired
         // ones keep counting so a lost `started` report cannot hide a run.
-        let Some(point) = observation_point else {
-            return 0;
-        };
-        let cutoff = point - self.policy.reflection_lag_ms;
+        // Without a reading, none of the admitted work is known to have been
+        // reflected yet. Keep charging it so new conversations still spread.
+        let cutoff = observation_point.map(|point| point - self.policy.reflection_lag_ms);
         self.state
             .admissions
             .iter()
             .filter(|admission| {
                 admission.account_id == account_id
                     && admission.state != AdmissionState::Released
-                    && admission.committed_at_ms > cutoff
+                    && cutoff.is_none_or(|cutoff| admission.committed_at_ms > cutoff)
             })
             .map(|admission| admission.request_bytes)
             .sum()

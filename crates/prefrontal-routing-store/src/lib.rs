@@ -6259,7 +6259,10 @@ mod tests {
         migrated
             .store
             .with_conn(|c| {
-                assert_eq!(route_state_version(c)?, 65);
+                assert_eq!(
+                    route_state_version(c)?,
+                    route_state_migrations().last().unwrap().version as i64
+                );
                 assert_eq!(
                     history_foreign_keys(c),
                     ["account_admission -> account_pin"]
