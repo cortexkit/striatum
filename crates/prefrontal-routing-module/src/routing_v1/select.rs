@@ -89,9 +89,10 @@ pub(super) async fn select(
     let live_config = config_overrides::live_config(deps.routing_config_path);
     let operator_config = operator_config(deps);
     let consumer = request.consumer.clone();
-    if !operator_config.v1_consumers().contains(&consumer) {
-        return Err(Refusal::unknown_consumer(consumer));
-    }
+    let consumers = super::consumers::effective(&operator_config);
+    consumers.admit(&consumer, caller)?;
+    let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
+    let request = parse_select_request_serving(&effective_params, super::describe::CAPABILITIES)?;
     if !crate::broca_credentials::wait_for_billing_catalog(deps.broca_credentials, BILLING_WAIT)
         .await
     {
@@ -108,7 +109,7 @@ pub(super) async fn select(
     let consumer_policy = operator_config.consumer_policy(
         &consumer,
         &crate::config_policy::ConsumerPolicy::default(),
-        &std::collections::BTreeMap::new(),
+        &consumers.policies,
     );
     let priced_per_token = select_policy::priced_per_token(&consumer_policy, legacy_consumer);
     let crate::PreparedSelectionInputs {
@@ -260,9 +261,17 @@ pub(super) async fn select(
     let subscription_keys = candidates.subscription_keys;
     let rejections = candidates.rejected;
 
+    // Operator score targets allow fractions; keep them in the internal demand
+    // rather than sending them through the integer-only request validator.
+    let operator_demand =
+        operator_config.consumer_policy(&consumer, &Default::default(), &Default::default());
     let demand = ModelRequirements {
-        iq: f64::from(requirements.iq),
-        eq: f64::from(requirements.eq.unwrap_or(0)),
+        iq: operator_demand
+            .iq
+            .unwrap_or_else(|| f64::from(requirements.iq)),
+        eq: operator_demand
+            .eq
+            .unwrap_or_else(|| f64::from(requirements.eq.unwrap_or(0))),
     };
     let vision = modalities.contains(&Modality::Image);
     let required_capabilities = match (vision, requirements.context_window) {

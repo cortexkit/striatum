@@ -212,6 +212,7 @@ pub(crate) async fn refresh_loop(
         })
         .await;
         if let Ok(Ok(modules)) = result {
+            super::consumers::replace_catalog(&modules);
             let declarations = declarations_from_catalog(&modules);
             if let Ok(mut credentials) = credentials.lock() {
                 credentials.runner_declarations = declarations;

@@ -605,6 +605,22 @@ impl LiveConfig {
             .collect()
     }
 
+    /// Operator owners add exact-name claims too, so conflicting owners lock
+    /// the name instead of letting either source override the other.
+    pub(crate) fn consumer_owners(&self) -> BTreeMap<String, String> {
+        self.config
+            .consumers
+            .iter()
+            .filter(|(name, _)| !crate::config_policy::is_slot(name))
+            .filter_map(|(name, policy)| {
+                policy
+                    .owner
+                    .as_ref()
+                    .map(|owner| (name.clone(), owner.clone()))
+            })
+            .collect()
+    }
+
     /// The `routing/v1` runners, in preference order.
     pub fn v1_runners(&self) -> Vec<RunnerPolicy> {
         self.config.runners.clone()

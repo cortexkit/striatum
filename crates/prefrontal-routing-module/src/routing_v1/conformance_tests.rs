@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
 use cortexkit_role_routing_conformance::{
-    fixture, run_suite, Catalog, ConsumerConfig, Reply, RouteFailure, RouteStamp, RoutingRoute,
-    RoutingSubject, CHECKS,
+    fixture, run_suite, Catalog, CatalogModule, ConsumerConfig, Reply, RouteFailure, RouteStamp,
+    RoutingRoute, RoutingSubject, CHECKS,
 };
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::route_state_store::FactSource;
@@ -75,6 +75,7 @@ impl Drop for Harness {
 
 impl Harness {
     pub(super) fn new(label: &str) -> Arc<Self> {
+        super::consumers::replace_catalog(&json!([]));
         let n = NEXT_HARNESS.fetch_add(1, Ordering::Relaxed);
         let dir = prefrontal_test_support::scratch_root().join(format!(
             "prefrontal-routing-v1-{label}-{}-{n}",
@@ -112,7 +113,11 @@ impl Harness {
             next_channel: AtomicU16::new(100),
             dir,
         });
-        harness.edit_config(|_| {});
+        harness.edit_config(|config| {
+            for policy in config["consumers"].as_object_mut().unwrap().values_mut() {
+                policy["owner"] = json!(fixture::CONSUMER.trim_start_matches("reserved:"));
+            }
+        });
         // The allocator reads the process-wide account state the module's
         // vault and quota loops keep; a fresh harness starts it empty.
         *crate::ACCOUNT_QUOTA
@@ -124,6 +129,10 @@ impl Harness {
 
     pub(super) fn store(&self) -> &SharedStore {
         &self.store
+    }
+
+    pub(super) fn operator_config(&self) -> Arc<crate::config_overrides::LiveConfig> {
+        crate::config_overrides::live_config(&self.config_path.lock().unwrap())
     }
 
     /// Change the routing configuration and publish it as a new file.
@@ -273,6 +282,35 @@ impl Harness {
         drop(writer);
         replies.recv().await.expect("every request gets a reply")
     }
+
+    /// Run a pre-rebind request frame through the production handler after a
+    /// rebind, bypassing only the transport's stale-frame drop.
+    pub(super) async fn finish_dispatched(&self, frame: Frame) -> (FrameType, Value) {
+        let (writer, mut replies) = mpsc::channel(4);
+        let config_path = self.config_path.lock().unwrap().clone();
+        let credentials = Arc::clone(&self.broca_credentials.lock().unwrap());
+        let epoch = frame.header.epoch;
+        super::serve(
+            frame,
+            epoch,
+            &writer,
+            &super::Deps {
+                quota_cache: &self.quota_cache,
+                store: &self.store,
+                routing_config_path: &config_path,
+                operator_config_path: &config_path,
+                broca_credentials: &credentials,
+                opencode_auth_path: &self.auth_path,
+            },
+        )
+        .await
+        .unwrap();
+        let reply = replies.recv().await.unwrap();
+        (
+            reply.header.ty,
+            serde_json::from_slice(&reply.body).unwrap(),
+        )
+    }
 }
 
 /// One bound route to the module.
@@ -284,9 +322,8 @@ pub(super) struct Route {
 }
 
 impl Route {
-    /// Send `{method, params}` on this route; the reply frame's type and body.
-    pub(super) async fn call(&self, method: &str, params: &Value) -> (FrameType, Value) {
-        let frame = Frame::build(
+    pub(super) fn request_frame(&self, method: &str, params: &Value) -> Frame {
+        Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             self.channel,
@@ -294,7 +331,12 @@ impl Route {
             self.next_corr.fetch_add(1, Ordering::Relaxed),
             serde_json::to_vec(&json!({ "method": method, "params": params })).unwrap(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Send `{method, params}` on this route; the reply frame's type and body.
+    pub(super) async fn call(&self, method: &str, params: &Value) -> (FrameType, Value) {
+        let frame = self.request_frame(method, params);
         let reply = self.harness.handle(frame).await;
         (
             reply.header.ty,
@@ -333,7 +375,7 @@ impl RoutingRoute for Route {
 
 /// A route principal the daemon verified as `module`.
 pub(super) fn reserved(module: &str) -> Value {
-    json!({ "kind": "reserved", "module_id": module })
+    json!({ "kind": "reserved", "module_id": module.trim_start_matches("reserved:") })
 }
 
 /// A catalog model as a routing fact. `rank` orders the models by price, so
@@ -522,8 +564,16 @@ impl RoutingSubject for KitSubject {
                     (
                         consumer.id.clone(),
                         json!({
-                            "owner": fixture::CONSUMER.trim_start_matches("reserved:"),
+                            "owner": if consumer.id == fixture::DECLARED {
+                                fixture::DECLARING_PRINCIPAL.trim_start_matches("reserved:")
+                            } else {
+                                fixture::CONSUMER.trim_start_matches("reserved:")
+                            },
                             "pay_per_token": consumer.priced_only,
+                            "iq": consumer.requirements.iq,
+                            "eq": consumer.requirements.defaults.eq,
+                            "context_tokens": consumer.requirements.defaults.context_window,
+                            "tool_capabilities": consumer.requirements.defaults.tool_capabilities,
                         }),
                     )
                 })
@@ -535,6 +585,25 @@ impl RoutingSubject for KitSubject {
 
     async fn configure_catalog(&self, catalog: &Catalog) -> Result<(), String> {
         install_catalog(&self.harness(), catalog);
+        Ok(())
+    }
+
+    async fn configure_catalog_declarations(
+        &self,
+        modules: &[CatalogModule],
+    ) -> Result<(), String> {
+        super::consumers::replace_catalog(&Value::Array(
+            modules
+                .iter()
+                .map(|module| {
+                    json!({
+                        "module_id": module.principal.trim_start_matches("reserved:"),
+                        "nonce_verified": module.nonce_verified,
+                        "role_declarations": module.role_declarations,
+                    })
+                })
+                .collect(),
+        ));
         Ok(())
     }
 
@@ -565,6 +634,18 @@ impl RoutingSubject for KitSubject {
     }
 
     async fn route(&self, stamp: &RouteStamp) -> Result<Route, String> {
+        if let Some(scope) = &stamp.scope {
+            let harness = self.harness();
+            let channel = harness.reserve_channel();
+            let bind = json!({
+                "op": "route.bind", "route_channel": channel, "epoch": 1,
+                "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
+                "identity": { "project_root": prefrontal_test_support::scratch_root(), "harness": "routing-kit", "session": format!("session-{channel}") },
+                "principal": reserved(&stamp.principal),
+                "scope": { "owner": reserved(&scope.owner), "ref": scope.scope_ref, "scope_epoch": scope.scope_epoch, "kind": "ephemeral", "project_id": stamp.project_id, "owner_authorized": true },
+            });
+            return Ok(harness.bind_frame(bind, channel, 1).await);
+        }
         Ok(self
             .harness()
             .bind(reserved(&stamp.principal), stamp.project_id.as_deref())
@@ -576,8 +657,10 @@ impl RoutingSubject for KitSubject {
 /// first seven need the account-op members routing/v1 0.2.0 added
 /// (`parent_conversation_key`, `pool`, `eligibility`, `request_input_tokens`),
 /// which the v1 account ops and report still refuse as unknown members. The
-/// next six need consumer declarations read from the daemon catalog, which
-/// this subject's `configure_catalog_declarations` hook does not support yet.
+/// operator-override check needs a configurable max_output_tokens demand,
+/// which the current consumer config schema does not expose. The
+/// unverified-declaration check expects config-only names to be available to
+/// unrelated callers, contrary to routing's explicit configured-owner rule.
 /// The last needs `runner.harness` from a runner's own declaration. The shared
 /// runner declaration has no harness field, so answers omit it until the
 /// contract provides one.
@@ -595,12 +678,8 @@ const NOT_YET_SERVED: &[&str] = &[
     "pool_body_admission_conflict",
     "parent_body_admission_conflict",
     "new_report_members_conflict",
-    "declared_consumer_owner_uses_default",
-    "declared_consumer_scope_owner_admitted",
-    "declared_consumer_non_owner_refused",
     "operator_config_overrides_declared_default",
     "declared_consumer_unverified_entry_ignored",
-    "declared_consumer_conflict_refused",
     "affinity_holds_until_failure_report",
     "harness_only_when_declared",
 ];

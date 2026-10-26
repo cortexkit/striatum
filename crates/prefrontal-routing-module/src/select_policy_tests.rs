@@ -92,6 +92,7 @@ mod consumer_and_pin {
         }
 
         async fn select_with_listing(&self, params: serde_json::Value, planes: &[prefrontal_routing_core::billing::BillingPlane], plan_prices: serde_json::Value, listing: Option<cortexkit_claustrum_client::ScopedCredentialListing>) -> serde_json::Value {
+            crate::tests::authorize_legacy_policy_fixture(&params, &self.path);
             let frame = Frame::build(
                 FrameType::Request,
                 Flags::new(false, Priority::Interactive, false),

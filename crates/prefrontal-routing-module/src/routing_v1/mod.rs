@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod accounts;
+pub(crate) mod consumers;
 mod describe;
 mod report;
 pub(crate) mod runners;
@@ -32,6 +33,8 @@ mod select;
 
 #[cfg(test)]
 mod conformance_tests;
+#[cfg(test)]
+mod consumers_tests;
 #[cfg(test)]
 mod dispatch_tests;
 #[cfg(test)]
@@ -98,13 +101,45 @@ pub(crate) struct Deps<'a> {
 /// The caller of one request, read from its route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Caller {
+    /// The route binding is rechecked at admission, after any queued work.
+    pub binding: Option<(u16, u32)>,
     /// `reserved:<module>`, `direct`, `unverified` or `unattested`.
     pub principal: String,
     /// The scope the route is bound under; `None` for an unscoped route.
     pub scope: Option<crate::DecisionScope>,
+    /// Authority from the daemon's scope stamp, independent of ledger metadata.
+    pub scope_authority: Option<ScopeAuthority>,
+}
+
+/// Retain daemon-stamped authorization for consumer admission even when routing
+/// receives no project or workdir metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeAuthority {
+    pub owner: String,
+    pub reference: String,
+    pub kind: subc_protocol::scope::ScopeKind,
+    pub scope_epoch: u64,
+    pub project_id: Option<String>,
+    pub owner_authorized: bool,
 }
 
 impl Caller {
+    pub(crate) fn for_route(channel: u16, epoch: u32) -> Self {
+        Self {
+            binding: Some((channel, epoch)),
+            principal: crate::route_principal(channel, epoch),
+            scope: crate::route_scope(channel, epoch),
+            scope_authority: crate::route_scope_authority(channel, epoch),
+        }
+    }
+
+    fn binding_is_current(&self) -> bool {
+        self.binding.is_some_and(|(channel, epoch)| {
+            crate::route_principal(channel, epoch) == self.principal
+                && crate::route_scope_authority(channel, epoch) == self.scope_authority
+        })
+    }
+
     /// The module the daemon verified this caller to be, if it did.
     fn attested_module(&self) -> Option<&str> {
         self.principal
@@ -121,10 +156,7 @@ pub(crate) async fn serve(
     deps: &Deps<'_>,
 ) -> Result<(), ModuleError> {
     let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
-    let caller = Caller {
-        principal: crate::route_principal(channel, route_epoch),
-        scope: crate::route_scope(channel, route_epoch),
-    };
+    let caller = Caller::for_route(channel, route_epoch);
     let reply = match serde_json::from_slice::<Value>(&frame.body) {
         Ok(request) => {
             let method = request
