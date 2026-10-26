@@ -320,6 +320,7 @@ mod tests {
             fact.supports_tool_use = Some(tool_support);
             let input = SelectModelRouteInput {
                 target_agent: "mason".into(),
+                target_is_head: false,
                 requirements: ModelRequirements {
                     iq: 100.0,
                     eq: 100.0,
@@ -368,6 +369,7 @@ mod tests {
     fn pin_input(provider: &str, model: &str) -> SelectModelRouteInput<'static> {
         SelectModelRouteInput {
             target_agent: "mason".into(),
+            target_is_head: false,
             requirements: ModelRequirements { iq: 0.0, eq: 0.0 },
             available_models: HashSet::from([format!("{provider}/{model}")]),
             facts: vec![crate::tests::fact(provider, model)],

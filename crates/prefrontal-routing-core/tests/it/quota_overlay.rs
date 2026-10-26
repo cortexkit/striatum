@@ -428,6 +428,7 @@ fn exhausted_provider_loses_selection_to_unpressured_peer_end_to_end() {
     }
     let r = select_model_route(SelectModelRouteInput {
         target_agent: "mason".into(),
+        target_is_head: false,
         requirements: ModelRequirements { iq: 80.0, eq: 20.0 },
         available_models: available,
         facts: facts.clone(),
@@ -733,6 +734,7 @@ fn balance_only_positive_pool_keeps_provider_servable() {
     ]);
     let selected = select_model_route(SelectModelRouteInput {
         target_agent: "mason".into(),
+        target_is_head: false,
         requirements: ModelRequirements { iq: 80.0, eq: 20.0 },
         available_models: available,
         facts,
@@ -887,6 +889,7 @@ fn an_idle_account_keeps_its_provider_off_the_all_accounts_wall() {
             .collect();
         let result = select_model_route(SelectModelRouteInput {
             target_agent: "mason".into(),
+            target_is_head: false,
             requirements: ModelRequirements { iq: 80.0, eq: 20.0 },
             available_models: available,
             facts: facts.clone(),
@@ -968,6 +971,7 @@ fn an_exhausted_rolling_window_still_walls_its_route() {
             .collect();
         let result = select_model_route(SelectModelRouteInput {
             target_agent: "mason".into(),
+            target_is_head: false,
             requirements: ModelRequirements { iq: 50.0, eq: 50.0 },
             available_models: available,
             facts: facts.clone(),

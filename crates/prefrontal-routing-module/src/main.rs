@@ -17848,6 +17848,7 @@ mod tests {
         select_model_route_with_config(
             SelectModelRouteInput {
                 target_agent: "mason".to_string(),
+                target_is_head: false,
                 requirements: resolved.requirements,
                 available_models: observation.available.iter().cloned().collect(),
                 facts: rig

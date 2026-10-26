@@ -896,6 +896,10 @@ struct RoutingConfigFile {
     /// heuristic recognizes; see `ModelNamingConfig`.
     #[serde(default)]
     model_naming: ModelNamingConfig,
+    /// Target agents that are heads: operator-facing sessions that may spend
+    /// a subscription's kept-free reserve. Matched case-insensitively.
+    #[serde(default)]
+    head_agents: Vec<String>,
     #[serde(default)]
     catalog: CatalogSection,
     #[serde(default)]
@@ -1019,6 +1023,15 @@ impl LiveConfig {
                 .collect(),
         )
     }
+    /// Whether `agent` is a head under `head_agents`.
+    pub(crate) fn is_head_agent(&self, agent: &str) -> bool {
+        let agent = agent.trim();
+        self.config
+            .head_agents
+            .iter()
+            .any(|head| head.trim().eq_ignore_ascii_case(agent))
+    }
+
     /// The configured model-id spelling and capability families.
     pub(crate) fn model_naming(&self) -> prefrontal_routing_core::ModelNaming {
         self.config.model_naming.naming()

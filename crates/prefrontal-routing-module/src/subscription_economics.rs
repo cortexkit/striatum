@@ -456,6 +456,12 @@ fn overlay_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The head agents a converted config lists (`head_agents`).
+    fn head_agents_of_converted_config() -> Vec<String> {
+        serde_json::from_value(crate::config_convert::defaults()["head_agents"].clone())
+            .expect("converter head agents")
+    }
     use crate::account_quota::{RosterIdentity, StoredReading, VaultRoster};
     use sha2::{Digest, Sha256};
     const NOW: i64 = 1791507600000;
@@ -944,9 +950,13 @@ mod tests {
             )]),
             ..Default::default()
         };
+        let target_is_head = head_agents_of_converted_config()
+            .iter()
+            .any(|head| head == &params.target_agent);
         (
             SelectModelRouteInput {
                 target_agent: params.target_agent,
+                target_is_head,
                 requirements: resolved.requirements,
                 available_models: resolved.policy.available_models.into_iter().collect(),
                 facts: vec![fact],
@@ -1226,6 +1236,7 @@ mod tests {
         }
         select_model_route(SelectModelRouteInput {
             target_agent: "mason".into(),
+            target_is_head: false,
             requirements: prefrontal_routing_core::model_facts::ModelRequirements {
                 iq: 70.0,
                 eq: 0.0,

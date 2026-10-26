@@ -44,6 +44,7 @@ impl<'a> SelectionPass<'a> {
         let priced_per_token = self.priced_per_token;
         SelectModelRouteInput {
             target_agent: self.target_agent.to_owned(),
+            target_is_head: self.operator_config.is_head_agent(self.target_agent),
             requirements: self.requirements,
             available_models: available.clone(),
             facts: self.facts.to_vec(),

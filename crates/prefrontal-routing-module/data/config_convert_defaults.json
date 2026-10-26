@@ -54,5 +54,6 @@
       { "family": "mistral", "needles": ["mistral", "codestral"] },
       { "family": "llama", "needles": ["llama"] }
     ]
-  }
+  },
+  "head_agents": ["alfonso", "head", "opencode", "pi", "claude-code"]
 }

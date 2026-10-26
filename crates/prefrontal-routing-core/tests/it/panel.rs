@@ -431,6 +431,7 @@ fn admission_is_shared_not_reimplemented() {
     });
     let singular = select_model_route(SelectModelRouteInput {
         target_agent: "mason".into(),
+        target_is_head: false,
         requirements: ModelRequirements { iq: 50.0, eq: 10.0 },
         available_models: available.clone(),
         facts: facts.clone(),

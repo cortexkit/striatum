@@ -143,6 +143,7 @@ fn input<'a>(
         .unwrap_or_else(|| availability_of(&facts));
     SelectModelRouteInput {
         target_agent: "mason".to_string(),
+        target_is_head: false,
         requirements,
         available_models,
         facts,
@@ -4563,6 +4564,8 @@ fn subscription_scenario(
         },
     );
     input.target_agent = agent.into();
+    // Operator config lists the heads; this scenario's only head is `alfonso`.
+    input.target_is_head = agent == "alfonso";
     input
 }
 

@@ -1647,6 +1647,7 @@ fn persisted_double_mirror_break_glass_clears_only_the_rejected_candidate() {
     let available_models = std::collections::HashSet::from([route_key.clone()]);
     let blocked = select_model_route(SelectModelRouteInput {
         target_agent: "mason".into(),
+        target_is_head: false,
         requirements: ModelRequirements { iq: 10.0, eq: 0.0 },
         available_models: available_models.clone(),
         facts: vec![route.clone()],
@@ -1689,6 +1690,7 @@ fn persisted_double_mirror_break_glass_clears_only_the_rejected_candidate() {
 
     let selected = select_model_route(SelectModelRouteInput {
         target_agent: "mason".into(),
+        target_is_head: false,
         requirements: ModelRequirements { iq: 10.0, eq: 0.0 },
         available_models,
         facts: vec![route],
@@ -3877,6 +3879,7 @@ fn route_input<'a>(facts: Vec<ModelFact>) -> SelectModelRouteInput<'a> {
     }
     SelectModelRouteInput {
         target_agent: "mason".to_string(),
+        target_is_head: false,
         requirements: ModelRequirements { iq: 50.0, eq: 50.0 },
         available_models,
         facts,

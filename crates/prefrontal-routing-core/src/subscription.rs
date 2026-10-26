@@ -69,13 +69,6 @@ pub struct SubscriptionPricing {
     pub plan_tier: Option<String>,
 }
 
-pub fn is_head(agent: &str) -> bool {
-    matches!(
-        agent.trim().to_ascii_lowercase().as_str(),
-        "alfonso" | "head" | "opencode" | "pi" | "claude-code"
-    )
-}
-
 pub fn resolve_value(
     operator_multiplier: Option<f64>,
     measured: Option<&MeasuredValue>,

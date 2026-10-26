@@ -149,6 +149,10 @@ pub(crate) fn capability_rejection_reason(
 /// including the fixed keep-free margin for workers, rather than treating quota as free.
 pub struct SelectModelRouteInput<'a> {
     pub target_agent: String,
+    /// Whether the target agent is a head, an operator-facing session listed
+    /// under the operator config's `head_agents`. A head may spend a
+    /// subscription's kept-free reserve and is priced as one.
+    pub target_is_head: bool,
     pub requirements: ModelRequirements,
     /// Set of available routeKeys AND/OR capacityKeys the caller is logged into.
     pub available_models: HashSet<String>,
@@ -1475,7 +1479,7 @@ fn admit_and_price_shortlist(
         let permitted = !covered
             || subscription_budget_available(
                 &a.runtime,
-                crate::subscription::is_head(&input.target_agent),
+                input.target_is_head,
             );
         if !permitted {
             rejected.push(RejectedRoute {
@@ -1484,7 +1488,7 @@ fn admit_and_price_shortlist(
                 detail: a.runtime.subscription_pool.as_ref().map(|pool| {
                     pool.reserve_diagnostic(
                         pool.keep_free_percent,
-                        crate::subscription::is_head(&input.target_agent),
+                        input.target_is_head,
                     )
                 }),
                 credential_ids: Vec::new(),
@@ -1626,7 +1630,7 @@ fn admit_and_price_shortlist(
                 &a.runtime,
                 is_sub,
                 basis,
-                crate::subscription::is_head(&input.target_agent),
+                input.target_is_head,
             );
             apply_overqualification(
                 &mut breakdown,
@@ -2320,6 +2324,7 @@ mod abundance_tests {
         select_model_route_with_config(
             SelectModelRouteInput {
                 target_agent: "mason".into(),
+                target_is_head: false,
                 requirements: options
                     .requirements
                     .unwrap_or(ModelRequirements { iq: 20.0, eq: 20.0 }),
@@ -2848,6 +2853,7 @@ mod availability_credential_tests {
             .collect();
         let result = select_model_route(SelectModelRouteInput {
             target_agent: "fixture-consumer".into(),
+            target_is_head: false,
             requirements: ModelRequirements { iq: 20.0, eq: 20.0 },
             available_models: HashSet::new(),
             facts,

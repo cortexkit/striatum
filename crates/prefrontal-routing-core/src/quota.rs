@@ -870,6 +870,7 @@ mod tests {
         crate::model_router::select_model_route_with_config(
             SelectModelRouteInput {
                 target_agent: "mason".into(),
+                target_is_head: false,
                 requirements: ModelRequirements { iq: 20.0, eq: 20.0 },
                 available_models,
                 facts,

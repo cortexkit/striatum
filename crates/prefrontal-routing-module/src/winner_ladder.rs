@@ -457,6 +457,7 @@ pub(crate) fn compute_ladder(
                     select_model_route_with_config(
                         SelectModelRouteInput {
                             target_agent: LADDER_TARGET_AGENT.to_string(),
+                            target_is_head: live_config.is_head_agent(LADDER_TARGET_AGENT),
                             requirements: resolved.requirements,
                             available_models: available.clone(),
                             facts: facts.clone(),
