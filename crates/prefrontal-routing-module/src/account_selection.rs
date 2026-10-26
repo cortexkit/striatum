@@ -566,6 +566,78 @@ impl ClassContext {
         wait: Option<u64>,
         conversation: &str,
     ) -> Decision {
+        self.probe_with_policy(
+            provider,
+            model,
+            priced,
+            hold_ok,
+            wait,
+            conversation,
+            self.config.allocator_policy(provider),
+        )
+    }
+
+    /// Inspect exhaustion with the allocator's own filters. Relaxing wait limits
+    /// reveals a known reset; removing reserve floors distinguishes exhaustion
+    /// from policy headroom. Eligibility and missing evidence remain refusals.
+    pub(crate) fn blocked_reset(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+    ) -> Option<Option<i64>> {
+        let blocked = self.probe(provider, model, priced, false, None, "blocked-preflight");
+        if !blocked.refusal().is_some_and(|refusal| {
+            matches!(
+                refusal.code,
+                prefrontal_routing_core::accounts::RefusalCode::AccountPoolExhausted
+                    | prefrontal_routing_core::accounts::RefusalCode::AccountPoolReserveLimited
+            )
+        }) {
+            return None;
+        }
+        let mut policy = self.config.allocator_policy(provider);
+        policy.max_hold_s = i64::MAX as u64 / 1000;
+        policy.short_hold_max_ms = i64::MAX;
+        policy.reserve_five_hour = 0.0;
+        policy.reserve_seven_day = 0.0;
+        policy.reserve_scoped = 0.0;
+        policy.broca_floor_points = 0.0;
+        policy.soft_quota_remaining_percent = None;
+        policy.pool_floors.clear();
+        let reset = self.probe_with_policy(
+            provider,
+            model,
+            priced,
+            true,
+            Some(policy.max_hold_s),
+            "blocked-preflight",
+            policy,
+        );
+        if let Some(hold) = reset.hold() {
+            return Some(Some(hold.reset_at_ms));
+        }
+        let exhausted = !reset.explanation.accounts.is_empty()
+            && reset.explanation.accounts.iter().all(|account| {
+                account.exclusions.iter().any(|reason| matches!(reason,
+                prefrontal_routing_core::accounts::ExclusionReason::ConfirmedFence { .. }
+                | prefrontal_routing_core::accounts::ExclusionReason::ScopeExhausted { .. }
+                | prefrontal_routing_core::accounts::ExclusionReason::BelowReserve { .. }))
+            });
+        exhausted.then_some(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_with_policy(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        hold_ok: bool,
+        wait: Option<u64>,
+        conversation: &str,
+        policy: AllocatorPolicy,
+    ) -> Decision {
         let mut request = synthetic_request(provider, model, conversation.into());
         if let Some(wait) = wait {
             request.hold_wait_max_s = wait;
@@ -581,7 +653,7 @@ impl ClassContext {
                 principal_exclusions: Vec::new(),
                 admissions: Vec::new(),
                 operator_override: None,
-                policy: self.config.allocator_policy(provider),
+                policy,
             },
             self.now_ms,
             &inputs,
@@ -2404,7 +2476,7 @@ fn serve(
     inputs.hold_ok = params.hold_ok;
     if let Some(parent) = &params.parent_conversation_key {
         let hash = conversation_hash(&salt, principal, parent);
-        inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider)?;
+        inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
     }
     let decision = loop {
         let decision =

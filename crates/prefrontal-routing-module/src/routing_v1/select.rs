@@ -111,7 +111,11 @@ pub(super) async fn select(
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
     let consumer_policy = operator_config.consumer_policy(
         &consumer,
-        &crate::config_policy::ConsumerPolicy::default(),
+        &crate::config_policy::ConsumerPolicy {
+            iq: Some(f64::from(request.requirements.iq)),
+            eq: request.requirements.eq.map(f64::from),
+            ..Default::default()
+        },
         &consumers.policies,
     );
     let priced_per_token = select_policy::priced_per_token(&consumer_policy, legacy_consumer);
@@ -280,6 +284,7 @@ pub(super) async fn select(
     );
     let available = candidates.available;
     let mut usable = available.clone();
+    let mut account_blocks = HashMap::new();
     if let Some(classes) = &priced.classes {
         for fact in &facts {
             if !matches!(
@@ -296,6 +301,14 @@ pub(super) async fn select(
                 prefrontal_routing_core::accounts::Outcome::Admit(_)
             ) {
                 usable.remove(&prefrontal_routing_core::fact_to_route(fact).route_key);
+                if let Some(reset) =
+                    classes.blocked_reset(&fact.provider_id, &fact.model_id, priced_per_token)
+                {
+                    account_blocks.insert(
+                        prefrontal_routing_core::fact_to_route(fact).route_key,
+                        reset,
+                    );
+                }
             }
         }
     }
@@ -409,21 +422,25 @@ pub(super) async fn select(
                     }
                     Err(refusal) if refusal.code.as_str() == "account_hold" => {
                         if selection.hold_ok {
-                            result = Some(Err(select_policy::OrderFailure::Pin(refusal)));
+                            result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
                             break;
                         }
-                        if fallback_hold.as_ref().is_none_or(|previous: &Refusal| {
-                            previous.detail.get("reset_at_ms").and_then(Value::as_i64)
-                                > refusal.detail.get("reset_at_ms").and_then(Value::as_i64)
-                        }) {
-                            fallback_hold = Some(refusal);
+                        if fallback_hold.as_ref().is_none_or(
+                            |(_, previous): &(SelectedModelRoute, Refusal)| {
+                                previous.detail.get("reset_at_ms").and_then(Value::as_i64)
+                                    > refusal.detail.get("reset_at_ms").and_then(Value::as_i64)
+                            },
+                        ) {
+                            fallback_hold = Some((selected, refusal));
                         }
                     }
                     Err(_) => {}
                 }
             }
         }
-        result.or_else(|| fallback_hold.map(|hold| Err(select_policy::OrderFailure::Pin(hold))))
+        result.or_else(|| {
+            fallback_hold.map(|(selected, _)| Ok((selected, select_policy::OrderBasis::Mode)))
+        })
     } else {
         None
     };
@@ -461,6 +478,39 @@ pub(super) async fn select(
         Err(select_policy::OrderFailure::Pin(refusal)) => return Err(refusal),
         Err(select_policy::OrderFailure::Score(no_route)) => {
             selection.record_refusal(&no_route, &priced.provenance);
+            // Account preflight is separate from model scoring. Only name an
+            // account block when an otherwise adequate, policy-allowed model
+            // would have been selected without that block.
+            let mut resets = Vec::new();
+            let blocked: HashSet<_> = account_blocks
+                .iter()
+                .filter_map(|(key, reset)| {
+                    if consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
+                        && !consumer_policy.ladder.iter().flatten().any(|entry| {
+                            RouteRef::parse_pin(entry)
+                                .is_some_and(|route| route.route_key() == *key)
+                        })
+                    {
+                        return None;
+                    }
+                    if !available.contains(key)
+                        || selection
+                            .pass()
+                            .score(&HashSet::from([key.clone()]))
+                            .is_err()
+                    {
+                        return None;
+                    }
+                    resets.extend(*reset);
+                    Some(key.clone())
+                })
+                .collect();
+            if !blocked.is_empty() {
+                return Err(Refusal::no_route(
+                    NoRouteReason::parse("accounts_blocked"),
+                    resets.into_iter().min().map(|reset| reset.max(0) as u64),
+                ));
+            }
             return Err(no_route_refusal(&no_route, now));
         }
     };
@@ -496,6 +546,18 @@ pub(super) async fn select(
         Some(&crate::policy_sources_line(&operator_policy)),
     );
     decision.consumer = Some(consumer.clone());
+    // Selection chooses the route; account_for enforces its hold. Preserve the
+    // effective wait cap so later policy edits cannot widen this decision.
+    let max_hold_s = operator_config
+        .allocator_policy(&selected.model.provider_id)
+        .max_hold_s;
+    let hold_cap = request
+        .hold_wait_max_s
+        .map_or(max_hold_s, |cap| cap.min(max_hold_s));
+    let mut input: Value =
+        serde_json::from_str(&decision.requirements_json).map_err(store_refusal)?;
+    input["hold_wait_max_s"] = json!(hold_cap);
+    decision.requirements_json = input.to_string();
     decision.allowed_account_class =
         prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
             priced_per_token,
@@ -680,7 +742,11 @@ impl<'a> Selection<'a> {
             self.rejections,
         )
         .map_err(|refusal| refused(&refusal.code))?;
-        self.account_check(&selected)?;
+        if let Err(refusal) = self.account_check(&selected) {
+            if refusal.code.as_str() != "account_hold" {
+                return Err(refusal);
+            }
+        }
         Ok(selected)
     }
 

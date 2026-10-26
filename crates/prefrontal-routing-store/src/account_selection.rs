@@ -313,19 +313,31 @@ impl AccountTx<'_> {
             ).map(|_| ()).map_err(err)
     }
 
-    /// Prefer a parent's account only after a runner reported using it. The
-    /// reported serving account wins over a reservation the runner did not use.
+    /// A parent's latest admission holds its current account until its pin
+    /// lapses: the admission deadline before start, the lease deadline after.
     pub fn parent_used_account(
         &self,
         principal: &str,
         hash: &str,
         provider: &str,
+        now_ms: i64,
     ) -> RouteStateResult<Option<String>> {
-        self.conn.query_row("SELECT COALESCE(json_extract(o.observation_json,'$.served_account_id'),a.account_id) \
-            FROM account_observation o JOIN account_admission a ON a.principal=o.principal AND a.admission_id=o.admission_id \
-            WHERE a.principal=?1 AND a.conversation_hash=?2 AND a.provider=?3 \
-              AND o.kind IN ('admission_started','run_finished','used_account','attempt') \
-            ORDER BY o.received_at DESC,o.rowid DESC LIMIT 1", params![principal,hash,provider], |row| row.get(0)).optional().map_err(err)
+        self.conn
+            .query_row(
+                "SELECT a.account_id FROM (
+                SELECT * FROM account_admission
+                 WHERE principal=?1 AND conversation_hash=?2 AND provider=?3
+                 ORDER BY committed_at DESC, rowid DESC LIMIT 1
+             ) a JOIN account_affinity f
+               ON f.principal=a.principal AND f.conversation_hash=a.conversation_hash
+              AND f.provider=a.provider AND f.pin_id=a.pin_id AND f.pin_generation=a.pin_generation
+             WHERE (a.state='reserved' AND a.admission_valid_until>?4)
+                OR (a.state='started' AND a.lease_valid_until>?4)",
+                params![principal, hash, provider, now_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)
     }
 }
 

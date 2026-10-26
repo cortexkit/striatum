@@ -256,7 +256,7 @@ fn catalog_fact(harness: &Harness, fact: &prefrontal_routing_core::ModelFact) {
         .unwrap();
 }
 
-fn setup(provider: &str, converted_live: bool) -> (Arc<Harness>, BrocaCredentials) {
+pub(super) fn setup(provider: &str, converted_live: bool) -> (Arc<Harness>, BrocaCredentials) {
     setup_at_version(provider, converted_live, None)
 }
 
@@ -887,7 +887,7 @@ async fn provider_strategies_never_escape_the_subscription_class() {
 }
 
 #[tokio::test]
-async fn child_uses_another_account_only_after_parent_use_is_reported() {
+async fn child_avoids_the_parents_started_pin() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     harness.edit_config(|config| config["providers"]["synthetic"]["subscription"] = json!(false));
@@ -1189,7 +1189,13 @@ async fn ladder_holds_a_blocked_entry_but_demand_and_no_wait_use_the_next_model(
     let caller = harness.bind(reserved(OWNER), None).await;
     let request = json!({"consumer":"mason","requirements":{"iq":30}});
     let held = caller.call("route.select", &request).await;
-    assert_eq!(held.1["code"], "account_hold", "{}", held.1);
+    assert_eq!(held.0, FrameType::Response, "{}", held.1);
+    assert_eq!(held.1["result"]["route"]["provider"], "synthetic");
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut admission = account_request("synthetic", "selected-held-route");
+    admission["decision_id"] = held.1["result"]["decision_id"].clone();
+    let held_account = runner.call("route.account_for", &admission).await;
+    assert_eq!(held_account.1["code"], "account_hold", "{}", held_account.1);
     let mut no_wait = request.clone();
     no_wait["hold_ok"] = json!(false);
     let moved = caller.call("route.select", &no_wait).await;
@@ -1271,18 +1277,44 @@ async fn paid_credit_readings_are_explicit_fresh_inputs_and_refusals_cannot_rewr
 }
 
 #[tokio::test]
-async fn failure_reports_with_resets_remain_advisory_and_keep_the_model_sticky() {
+async fn failure_reports_with_resets_are_advisory_and_preserve_account_affinity() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let before_account = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "before-failure"),
+        )
+        .await;
+    assert_eq!(
+        before_account.0,
+        FrameType::Response,
+        "{}",
+        before_account.1
+    );
     let request = json!({"consumer":"mason","requirements":{"iq":30},"affinity":"sticky"});
     let first = caller.call("route.select", &request).await;
     assert_eq!(first.0, FrameType::Response, "{}", first.1);
     let report=caller.call("route.report",&json!({"decision_id":first.1["result"]["decision_id"],"outcome":"failed","runner_code":"unconfirmed_429","reset_at_ms":NOW+3_600_000})).await;
     assert_eq!(report.0, FrameType::Response, "{}", report.1);
+    assert!(harness
+        .store()
+        .v1_affinity_decision(&format!("reserved:{OWNER}"), "mason", "sticky")
+        .unwrap()
+        .is_none());
     let second = caller.call("route.select", &request).await;
     assert_eq!(second.0, FrameType::Response, "{}", second.1);
     assert_eq!(second.1["result"]["route"], first.1["result"]["route"]);
+    let mut request = account_request("synthetic", "after-failure");
+    request["conversation_key"] = json!("conversation-before-failure");
+    let after_account = runner.call("route.account_for", &request).await;
+    assert_eq!(after_account.0, FrameType::Response, "{}", after_account.1);
+    assert_eq!(
+        after_account.1["result"]["pin"]["id"],
+        before_account.1["result"]["pin"]["id"]
+    );
     assert!(harness
         .store()
         .account_size_refusals(NOW as i64)

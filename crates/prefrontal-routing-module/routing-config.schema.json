@@ -284,6 +284,15 @@
             "type": "string"
           }
         },
+        "max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
         "mode": {
           "anyOf": [
             {

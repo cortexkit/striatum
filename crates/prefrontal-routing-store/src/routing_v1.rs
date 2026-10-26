@@ -121,8 +121,8 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// The previous decision for an affinity key. A failure report does not
-    /// clear it; the preference stands until a later decision replaces it.
+    /// The previous decision for a live route affinity key. A failure report
+    /// ends that decision's preference, but never a newer decision's preference.
     pub fn v1_affinity_decision(
         &self,
         principal: &str,
@@ -167,21 +167,22 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Record the first report on a decision. A report, including a failure,
-    /// does not end the affinity preference: a continuing conversation keeps
-    /// its model until that model is no longer allowed. Returns the report
+    /// Record the first report on a decision. A failure ends route affinity
+    /// only while it still names this decision; account affinity is separate.
+    /// Returns the report
     /// that stands: this one, or one another caller recorded first.
     pub fn v1_record_report(
         &self,
         decision_id: &str,
         report_id: &str,
         recorded: &V1Recorded,
+        failed: bool,
         now_ms: i64,
     ) -> RouteStateResult<V1Recorded> {
         self.store
             .with_conn(|c: &Connection| {
                 let tx = c.unchecked_transaction()?;
-                let _inserted = tx.execute(
+                let inserted = tx.execute(
                     "INSERT INTO routing_v1_report
                        (decision_id, report_id, body_json, answer_json, created_at_ms)
                      VALUES (?1, ?2, ?3, ?4, ?5)
@@ -194,6 +195,13 @@ impl SqliteRouteStateStore {
                         now_ms
                     ],
                 )?;
+                if inserted == 1 && failed {
+                    tx.execute(
+                        "UPDATE routing_v1_affinity SET ended_at_ms=?2
+                         WHERE decision_id=?1 AND ended_at_ms IS NULL",
+                        params![decision_id, now_ms],
+                    )?;
+                }
                 let standing = tx.query_row(
                     "SELECT body_json, answer_json FROM routing_v1_report WHERE decision_id = ?1",
                     params![decision_id],
@@ -314,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn affinity_follows_the_last_decision_and_a_failure_report_keeps_it() {
+    fn a_failure_ends_only_its_current_route_affinity() {
         let store = store("affinity");
         store
             .v1_record_decision(&decision("d1", Some("k")))
@@ -333,7 +341,7 @@ mod tests {
             body_json: "{}".into(),
             answer_json: "{}".into(),
         };
-        store.v1_record_report("d1", "r1", &body, 5).unwrap();
+        store.v1_record_report("d1", "r1", &body, true, 5).unwrap();
         assert_eq!(
             store
                 .v1_affinity_decision("reserved:consumer", "summary", "k")
@@ -343,21 +351,27 @@ mod tests {
             "d2"
         );
 
-        // A failure report on the current decision does not end the preference.
-        store.v1_record_report("d2", "r2", &body, 6).unwrap();
-        assert_eq!(
-            store
-                .v1_affinity_decision("reserved:consumer", "summary", "k")
-                .unwrap()
-                .unwrap()
-                .decision_id,
-            "d2"
-        );
+        // A failure report on the current decision ends route affinity.
+        store.v1_record_report("d2", "r2", &body, true, 6).unwrap();
+        assert!(store
+            .v1_affinity_decision("reserved:consumer", "summary", "k")
+            .unwrap()
+            .is_none());
 
         // The next decision for the key starts the preference again.
         store
             .v1_record_decision(&decision("d3", Some("k")))
             .unwrap();
+        assert_eq!(
+            store
+                .v1_affinity_decision("reserved:consumer", "summary", "k")
+                .unwrap()
+                .unwrap()
+                .decision_id,
+            "d3"
+        );
+        store.v1_record_report("d2", "r2", &body, true, 7).unwrap();
+        store.v1_record_report("d3", "r3", &body, false, 8).unwrap();
         assert_eq!(
             store
                 .v1_affinity_decision("reserved:consumer", "summary", "k")
@@ -381,11 +395,15 @@ mod tests {
             answer_json: "a2".into(),
         };
         assert_eq!(
-            store.v1_record_report("d1", "r1", &first, 1).unwrap(),
+            store
+                .v1_record_report("d1", "r1", &first, false, 1)
+                .unwrap(),
             first
         );
         assert_eq!(
-            store.v1_record_report("d1", "r2", &second, 2).unwrap(),
+            store
+                .v1_record_report("d1", "r2", &second, true, 2)
+                .unwrap(),
             first
         );
         assert_eq!(store.v1_report("d1").unwrap(), Some(first.clone()));

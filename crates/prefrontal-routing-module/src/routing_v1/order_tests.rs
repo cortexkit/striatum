@@ -149,10 +149,10 @@ async fn a_fresh_ladder_takes_the_first_allowed_entry_and_demand_takes_the_cheap
 }
 
 /// A continuing conversation keeps its model when an earlier ladder entry
-/// recovers, when a cheaper model would now win, and after a failure report.
-/// It leaves once that model is no longer allowed.
+/// recovers or a cheaper model would now win. A failure ends route affinity,
+/// without cooling the route or changing account affinity.
 #[tokio::test]
-async fn a_continuing_conversation_keeps_its_model_until_it_is_not_allowed() {
+async fn a_continuing_conversation_keeps_its_model_until_failure_or_exclusion() {
     let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
     harness.edit_config(|config| {
         config["consumers"]["mason"]["mode"] = json!("ladder");
@@ -187,13 +187,13 @@ async fn a_continuing_conversation_keeps_its_model_until_it_is_not_allowed() {
         .await;
     assert_eq!(report.0, FrameType::Response, "{}", report.1);
     let after_failure = route.call("route.select", &sticky).await;
-    assert_eq!(route_of(&after_failure), DEAR, "{}", after_failure.1);
+    assert_eq!(route_of(&after_failure), CHEAP, "{}", after_failure.1);
 
     harness.edit_config(|config| {
-        config["models"][DEAR]["not_for"] = json!(["mason"]);
+        config["models"][CHEAP]["not_for"] = json!(["mason"]);
     });
     let left = route.call("route.select", &sticky).await;
-    assert_eq!(route_of(&left), CHEAP, "{}", left.1);
+    assert_eq!(route_of(&left), DEAR, "{}", left.1);
 }
 
 #[tokio::test]

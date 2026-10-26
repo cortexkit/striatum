@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
 use cortexkit_role_routing_conformance::{
-    fixture, run_suite, Catalog, CatalogModule, ConsumerConfig, Reply, RouteFailure, RouteStamp,
-    RoutingRoute, RoutingSubject, CHECKS,
+    fixture, run_suite, Catalog, CatalogModule, ConsumerConfig, ConsumerMode, HoldLimits, Reply,
+    RouteFailure, RouteStamp, RoutingRoute, RoutingSubject, CHECKS,
 };
 use prefrontal_routing_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use prefrontal_routing_core::route_state_store::FactSource;
@@ -451,6 +451,8 @@ fn account_state(
                 categories: vec!["llm-provider".into()],
                 credential_type: account.method.clone(),
                 auth_method: Some(account.method.clone()),
+                provider_ids: vec![account.provider.clone()],
+                serves: vec![account.provider.clone()],
                 refresh_adapter: Some(account.provider.clone()),
                 state: "active".into(),
                 record_version: 1,
@@ -564,6 +566,67 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
     {
         let shared = harness.broca_credentials.lock().unwrap().clone();
         let mut credentials = shared.lock().unwrap();
+        // Providers with explicit fixture accounts must have exactly those
+        // credentials, not the generated API-key stand-ins for catalog routes.
+        let mut rows: Vec<_> = credentials
+            .listed_credentials()
+            .iter()
+            .filter(|row| {
+                !catalog
+                    .accounts
+                    .iter()
+                    .any(|account| row.provider_ids.contains(&account.provider))
+            })
+            .cloned()
+            .collect();
+        rows.extend(catalog.accounts.iter().map(|account| ListedCredential {
+            id: account.credential_id.clone(),
+            account_id: Some(account.account_id.clone()),
+            credential_type: account.method.clone(),
+            auth_method: Some(account.method.clone()),
+            provider_ids: vec![account.provider.clone()],
+            serves: vec![account.provider.clone()],
+            categories: vec!["llm-provider".into()],
+            state: "active".into(),
+            ..Default::default()
+        }));
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "conformance-credentials".into(),
+                credentials: rows,
+                ..Default::default()
+            },
+            crate::now_ms(),
+        );
+        credentials.refresh_serving_methods(&Default::default(), &facts, crate::now_ms() as i64);
+        // Catalog order supplies the kit's synthetic price order on every
+        // serving method, including the OAuth accounts used by hold checks.
+        let billing_facts: Vec<_> = facts
+            .iter()
+            .flat_map(|fact| {
+                ["apikey", "oauth"].into_iter().map(move |method| {
+                    let mut fact = fact.clone();
+                    fact.billing_plane = Some(prefrontal_routing_core::billing::BillingPlane {
+                        provider_id: fact.provider_id.clone(),
+                        auth_method: method.into(),
+                        kind: "upstream".into(),
+                        selection_reason: "conformance fixture price".into(),
+                        rates: [(
+                            "rate.output".into(),
+                            prefrontal_routing_core::billing::BillingRate::Priced {
+                                rate: fact.cost_per_m_tok_out.unwrap(),
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                    });
+                    fact
+                })
+            })
+            .collect();
+        credentials.publish_billing_catalog(
+            crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&billing_facts),
+        );
         credentials.runner_declarations =
             super::runners::declarations_from_catalog(&json!(declarations));
         assert_eq!(credentials.runner_declarations.len(), catalog.runners.len());
@@ -622,6 +685,7 @@ impl RoutingSubject for KitSubject {
                             "iq": consumer.requirements.iq,
                             "eq": consumer.requirements.defaults.eq,
                             "context_tokens": consumer.requirements.defaults.context_window,
+                            "max_output_tokens": consumer.requirements.defaults.max_output_tokens,
                             "tool_capabilities": consumer.requirements.defaults.tool_capabilities,
                         }),
                     )
@@ -682,6 +746,82 @@ impl RoutingSubject for KitSubject {
             .map_err(|error| error.to_string())
     }
 
+    async fn configure_consumer_mode(
+        &self,
+        consumer: &str,
+        mode: &ConsumerMode,
+    ) -> Result<(), String> {
+        let (mode, entries) = match mode {
+            ConsumerMode::Demand => ("demand", None),
+            ConsumerMode::Ladder { entries } => ("ladder", Some(entries)),
+            _ => return Err("unsupported consumer mode".into()),
+        };
+        self.harness().edit_config(|config| {
+            config["consumers"][consumer]["mode"] = json!(mode);
+            if let Some(entries) = entries {
+                config["consumers"][consumer]["ladder"] = json!(entries);
+            } else {
+                config["consumers"][consumer]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("ladder");
+            }
+        });
+        Ok(())
+    }
+
+    async fn configure_hold_limits(
+        &self,
+        provider: &str,
+        limits: HoldLimits,
+    ) -> Result<(), String> {
+        self.harness().edit_config(|config| {
+            config["providers"][provider]["accounts"]["max_hold"] = json!(limits.max_hold_s);
+            config["providers"][provider]["accounts"]["hold_when_reset_within"] =
+                json!(limits.hold_when_reset_within_s);
+        });
+        Ok(())
+    }
+
+    async fn block_account(
+        &self,
+        account_id: &str,
+        reset_at_ms: Option<u64>,
+    ) -> Result<(), String> {
+        let reset = reset_at_ms
+            .map(|ms| {
+                i64::try_from(ms)
+                    .map(account_selection::rfc3339)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let mut quota = crate::ACCOUNT_QUOTA
+            .get()
+            .ok_or("account state missing")?
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let reading = quota
+            .readings
+            .readings
+            .get_mut(&(QUOTA_SOURCE.to_owned(), account_id.to_owned()))
+            .ok_or("account reading missing")?;
+        let now = account_selection::now_ms();
+        reading.received_at_ms = now;
+        reading.entry["fetchedAt"] = json!(account_selection::rfc3339(now));
+        for name in ["primary", "secondary"] {
+            let window = reading.entry["usage"][name]
+                .as_object_mut()
+                .ok_or("quota window missing")?;
+            window.insert("usedPercent".into(), json!(100.0));
+            if let Some(reset) = &reset {
+                window.insert("resetsAt".into(), json!(reset));
+            } else {
+                window.remove("resetsAt");
+            }
+        }
+        Ok(())
+    }
+
     async fn route(&self, stamp: &RouteStamp) -> Result<Route, String> {
         if let Some(scope) = &stamp.scope {
             let harness = self.harness();
@@ -702,34 +842,8 @@ impl RoutingSubject for KitSubject {
     }
 }
 
-/// Kit checks this module does not serve yet, in the kit's run order. The
-/// parent-preference check treats an unstarted reservation as a used-account
-/// report; routing only avoids a parent's account after a runner reports use.
-/// The operator-override check needs a configurable max_output_tokens demand,
-/// which the current consumer config schema does not expose.
-/// Each is expected to fail until routing serves it; the work that makes one
-/// pass removes it here, and the full-kit verdict holds once the list is empty.
-/// The `affinity_holds_until_failure_report` check in
-/// cortexkit-role-routing-conformance is a separate contract disagreement:
-/// it ends affinity on failure, while routing's continuing-conversation policy
-/// deliberately keeps it. `order_tests::a_continuing_conversation_keeps_its_model_until_it_is_not_allowed`
-/// asserts that a continuing conversation keeps its route after a failure.
-const NOT_YET_SERVED: &[&str] = &[
-    "parent_account_preference",
-    "operator_config_overrides_declared_default",
-    "affinity_holds_until_failure_report",
-    // The live handler serves hold control; the kit subject still needs its
-    // provider-policy and block-setup hooks before these checks can drive it.
-    "hold_answers_blocked_entry_within_limits",
-    "hold_moves_when_reset_beyond_window",
-    "hold_moves_when_reset_unknown",
-    "hold_moves_beyond_caller_cap",
-    "hold_ok_false_moves_to_usable_entry",
-    "hold_ok_false_falls_back_to_soonest_entry",
-    "hold_nothing_within_limit_accounts_blocked",
-    "hold_demand_mode_skips_blocked_model",
-    "hold_account_for_applies_recorded_cap",
-];
+/// No known failing checks. Inapplicable capability checks are listed separately.
+const NOT_YET_SERVED: &[&str] = &[];
 
 /// The undeclared-harness refusal check applies only to providers that do not
 /// advertise `select_harness`; this provider advertises and serves that group.

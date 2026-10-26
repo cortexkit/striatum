@@ -415,8 +415,8 @@ async fn fractional_operator_score_targets_do_not_cross_the_integer_wire_validat
 fn declaration_defaults_inherit_within_the_declaring_module_and_requests_override_them() {
     let catalog = consumers::Catalog::from_catalog(&json!([
         {"module_id": "module-a", "nonce_verified": true, "role_declarations": {"routing/v1": {"consumers": [
-            {"name": "example", "eq": 40, "context_window": 32000},
-            {"name": "example.worker", "eq": 50, "tools": "required"}
+             {"name": "example", "eq": 40, "context_window": 32000, "max_output_tokens":4096},
+             {"name": "example.worker", "eq": 50, "tools": "required", "max_output_tokens":8192}
         ]}}},
         entry("module-b", true, &["example.foreign"])
     ]));
@@ -425,12 +425,12 @@ fn declaration_defaults_inherit_within_the_declaring_module_and_requests_overrid
     let registry = catalog.effective(&config);
     let demands = registry.with_defaults(
         "example.worker",
-        &json!({"requirements": {"iq": 30, "eq": 0}}),
+        &json!({"requirements": {"iq": 30, "eq": 0, "max_output_tokens":2048}}),
         &config,
     );
     assert_eq!(
         demands["requirements"],
-        json!({"iq": 30, "eq": 0, "context_window": 32000, "tools": "required"})
+        json!({"iq": 30, "eq": 0, "context_window": 32000, "tools": "required", "max_output_tokens":2048})
     );
     let foreign = registry.with_defaults(
         "example.foreign",
@@ -438,6 +438,19 @@ fn declaration_defaults_inherit_within_the_declaring_module_and_requests_overrid
         &config,
     );
     assert_eq!(foreign["requirements"], json!({"iq": 30}));
+    let declared = registry.with_defaults(
+        "example.worker",
+        &json!({"requirements":{"iq":30}}),
+        &config,
+    );
+    assert_eq!(declared["requirements"]["max_output_tokens"], 8192);
+    harness.edit_config(|config| config["consumers"]["example"]["max_output_tokens"] = json!(1024));
+    let operator = registry.with_defaults(
+        "example.worker",
+        &json!({"requirements":{"iq":30,"max_output_tokens":2048}}),
+        &harness.operator_config(),
+    );
+    assert_eq!(operator["requirements"]["max_output_tokens"], 1024);
 }
 
 #[test]

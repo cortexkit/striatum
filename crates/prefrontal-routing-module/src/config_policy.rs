@@ -510,6 +510,7 @@ pub struct ConsumerPolicy {
     pub iq: Option<f64>,
     pub eq: Option<f64>,
     pub context_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
     pub tool_capabilities: Option<Vec<String>>,
 }
 

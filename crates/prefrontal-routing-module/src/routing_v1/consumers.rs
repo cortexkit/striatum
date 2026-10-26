@@ -17,6 +17,7 @@ use super::Caller;
 #[derive(Clone, Default)]
 pub(crate) struct Catalog {
     modules: BTreeMap<String, BTreeMap<String, DemandDefaults>>,
+    agent_hosts: BTreeSet<String>,
     issues: Vec<String>,
 }
 
@@ -53,6 +54,17 @@ impl Catalog {
             let Some(module) = entry.get("module_id").and_then(Value::as_str) else {
                 continue;
             };
+            if entry
+                .get("provides")
+                .and_then(Value::as_array)
+                .is_some_and(|provides| {
+                    provides
+                        .iter()
+                        .any(|capability| capability == "agent-host/v1")
+                })
+            {
+                catalog.agent_hosts.insert(module.to_owned());
+            }
             let Some(slot) = entry
                 .get("role_declarations")
                 .and_then(|roles| roles.get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY))
@@ -103,6 +115,7 @@ impl Catalog {
                     ConsumerPolicy {
                         eq: defaults.eq.map(f64::from),
                         context_tokens: defaults.context_window,
+                        max_output_tokens: defaults.max_output_tokens,
                         tool_capabilities: defaults.tool_capabilities.clone(),
                         ..Default::default()
                     },
@@ -129,6 +142,17 @@ pub(crate) fn effective(config: &LiveConfig) -> Registry {
         .read()
         .unwrap()
         .effective(config)
+}
+
+/// Capabilities come from verified daemon catalog entries, independently of
+/// whether the module declares routing consumers.
+pub(crate) fn provides_agent_host(module: &str) -> bool {
+    CATALOG
+        .get_or_init(Default::default)
+        .read()
+        .unwrap()
+        .agent_hosts
+        .contains(module)
 }
 
 impl Registry {
@@ -183,6 +207,10 @@ impl Registry {
             config.consumer_policy(consumer, &ConsumerPolicy::default(), &BTreeMap::new());
         for (name, value) in [
             ("context_window", operator.context_tokens.map(Value::from)),
+            (
+                "max_output_tokens",
+                operator.max_output_tokens.map(Value::from),
+            ),
             (
                 "tool_capabilities",
                 operator

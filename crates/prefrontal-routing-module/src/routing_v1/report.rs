@@ -125,6 +125,7 @@ pub(super) fn report_at(
                 body_json: body_json.clone(),
                 answer_json,
             },
+            request.outcome.is_failure(),
             now as i64,
         )
         .map_err(store_refusal)?;
