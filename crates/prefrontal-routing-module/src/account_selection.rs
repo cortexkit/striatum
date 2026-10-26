@@ -746,11 +746,11 @@ fn add_spend_inputs(
             pool.get("id").and_then(Value::as_str),
             Some("extra_usage" | "credits")
         ) {
-            let spendable = pool.get("spendable").and_then(Value::as_bool) != Some(false)
-                && amount("remaining").map_or(
-                    pool.get("spendable").and_then(Value::as_bool) == Some(true),
-                    |remaining| remaining > 0.0,
-                );
+            let Some(remaining) = amount("remaining").filter(|amount| amount.is_finite()) else {
+                continue;
+            };
+            let spendable =
+                pool.get("spendable").and_then(Value::as_bool) != Some(false) && remaining > 0.0;
             context.credits.insert(
                 account.to_owned(),
                 CreditReading {
@@ -781,6 +781,8 @@ mod spend_input_tests {
         for unusable in [
             json!({}),
             json!({"fetchedAt":rfc3339(at)}),
+            json!({"fetchedAt":rfc3339(at),"spend":[{"id":"credits","spendable":true}]}),
+            json!({"fetchedAt":rfc3339(at),"spend":[{"id":"extra_usage","spendable":true}]}),
             {
                 let mut failed = entry.clone();
                 failed["errorClass"] = json!("upstream_failed");
