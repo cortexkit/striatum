@@ -109,7 +109,14 @@ fn conversion_round_trip_keeps_every_policy_and_materializes_data_defaults() {
         Some("medium")
     );
     assert_eq!(loaded.project_pin("project", "mason"), Some("p/model:low"));
-    assert!(!loaded.account_flags().enabled);
+    assert!(loaded.account_flags().enabled);
+    assert!(converted
+        .get("accounts")
+        .and_then(|accounts| accounts.get("enabled"))
+        .is_none());
+    let error = parse_config(r#"{"accounts":{"enabled":false}}"#).unwrap_err();
+    assert!(error.contains("accounts.enabled"), "{error}");
+    assert!(error.contains(crate::config_convert::COMMAND), "{error}");
     assert!(loaded
         .v1_consumers()
         .iter()
@@ -146,6 +153,19 @@ fn conversion_round_trip_keeps_every_policy_and_materializes_data_defaults() {
         crate::config_convert::convert_value(converted.clone()).unwrap(),
         converted
     );
+}
+
+#[test]
+fn earlier_entity_config_loses_the_retired_flag_in_one_conversion() {
+    for enabled in [json!(false), json!(true), json!(null)] {
+        let input = json!({"providers":{"p":{}}, "accounts":{"enabled":enabled}});
+        let error = parse_config(&input.to_string()).unwrap_err();
+        assert!(error.contains("accounts.enabled"), "{error}");
+        assert!(error.contains(crate::config_convert::COMMAND), "{error}");
+        let converted = crate::config_convert::convert_value(input).unwrap();
+        assert!(converted.get("accounts").is_none());
+        assert!(parse_config(&converted.to_string()).is_ok());
+    }
 }
 
 #[test]

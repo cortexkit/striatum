@@ -200,6 +200,23 @@ impl BrocaCredentials {
         &self.listed
     }
 
+    pub(crate) fn listing_version(&self) -> Option<(&str, u64)> {
+        Some((self.view.as_deref()?, self.reached_at_ms?))
+    }
+
+    pub(crate) fn price_for_method(&self, fact: &mut ModelFact, auth_method: &str) {
+        let key = format!("{}/{}", fact.provider_id, fact.model_id);
+        let catalog_key =
+            prefrontal_routing_core::score_alias::catalog_key(&self.priced_targets, &key);
+        fact.billing_plane = Some(self.billing_catalog.for_route(
+            &catalog_key,
+            &ServingMethod {
+                auth_method: Some(auth_method.into()),
+                reason: "selected account class".into(),
+            },
+        ));
+    }
+
     /// The vault listing of one credential, reduced to the fields that could
     /// change whether a provider entitles it: the provider ids it is mapped to,
     /// its plan tier and its state. `Unknown` until routing has read a listing.
@@ -393,12 +410,12 @@ impl BrocaCredentials {
                 continue;
             }
             self.active += 1;
-            if credential.provider_ids.is_empty() {
+            let providers = credential_providers(credential, &self.catalog_providers);
+            if providers.is_empty() {
                 self.unmapped += 1;
                 self.unmapped_ids.push(credential.id.clone());
             }
-            self.providers
-                .extend(credential.provider_ids.iter().cloned());
+            self.providers.extend(providers);
         }
         self.catalog_wake.notify_one();
         true
@@ -499,6 +516,22 @@ impl BrocaCredentials {
         at_ms: i64,
     ) {
         self.catalog_providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        self.providers.clear();
+        self.unmapped_ids.clear();
+        for row in self.listed.iter().filter(|row| {
+            row.state == "active"
+                && row
+                    .categories
+                    .iter()
+                    .any(|category| category == "llm-provider")
+        }) {
+            let providers = credential_providers(row, &self.catalog_providers);
+            if providers.is_empty() {
+                self.unmapped_ids.push(row.id.clone());
+            }
+            self.providers.extend(providers);
+        }
+        self.unmapped = self.unmapped_ids.len();
         // Resolved providers have no stored rows; serve them the borrowed rows
         // selection will see so their credential method is known.
         self.priced_targets = self.catalog_targets(facts);

@@ -262,7 +262,7 @@ async fn legacy_core_selection_stays_open_but_non_core_cannot_borrow_target_agen
     let core = route
         .call(
             "route.select",
-            &json!({"targetAgent": "codemode", "requirements": {"iq": 30, "eq": 0}, "availableModels": ["example-provider/model-a"]}),
+            &json!({"targetAgent": "codemode", "executor":"broca", "substrate":"broca", "requirements": {"iq": 30, "eq": 0}, "availableModels": ["example-provider/model-a"]}),
         )
         .await;
     assert_eq!(core.0, FrameType::Response, "{}", core.1);

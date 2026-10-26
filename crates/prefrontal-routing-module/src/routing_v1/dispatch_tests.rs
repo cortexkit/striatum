@@ -149,23 +149,19 @@ fn admission(admission_id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn converted_disabled_account_selection_stays_disabled() {
+async fn converted_disabled_account_selection_serves_after_one_conversion() {
     let (harness, _) = configured().await;
     let converted = crate::config_convert::convert_value(json!({
         "account_selection": {"enabled": false}
     }))
     .unwrap();
-    harness.edit_config(|config| config["accounts"] = converted["accounts"].clone());
+    assert!(converted.get("accounts").is_none());
+    assert!(harness.operator_config().account_flags().enabled);
     let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
     let response = runner
         .call("route.account_for", &admission("disabled"))
         .await;
-    assert_eq!(response.0, FrameType::Error, "{}", response.1);
-    assert_eq!(
-        response.1["code"], "account_selection_disabled",
-        "{}",
-        response.1
-    );
+    assert_eq!(response.0, FrameType::Response, "{}", response.1);
 }
 
 #[tokio::test]

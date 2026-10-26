@@ -248,6 +248,8 @@ async fn unknown_magic_context_consumer_is_refused() {
 #[tokio::test]
 async fn codemode_and_flow_never_answer_a_subscription_plan_route() {
     let harness = harness(json!({ "prices": [{ "provider_id": "plan-provider" }] }));
+    harness
+        .edit_config(|config| config["providers"]["plan-provider"]["subscription"] = json!(true));
     let route = harness.bind(reserved("example-consumer"), None).await;
 
     // Without the rule the cheaper plan route wins.
@@ -271,13 +273,20 @@ async fn codemode_and_flow_never_answer_a_subscription_plan_route() {
 }
 
 #[tokio::test]
-async fn codemode_fails_closed_while_plan_membership_is_unknown() {
-    // No plan list has been read: no provider is known to be plan-free.
+async fn codemode_uses_a_known_metered_account_when_plan_membership_is_unknown() {
+    // The account class and metered plane prove privacy without a provider-wide plan list.
     let harness = harness(Value::Null);
     let route = harness.bind(reserved("example-consumer"), None).await;
     let reply = route.call("route.select", &select("codemode")).await;
-    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
+    assert_eq!(route_key(&reply), PLAN);
+    let runner = harness.bind(reserved("runner-one"), None).await;
+    let account = runner.call("route.account_for", &json!({"provider":"plan-provider", "model":"model-a",
+        "conversation_key":"unknown-plan", "admission_id":"unknown-plan", "decision_id":reply.1["result"]["decision_id"]})).await;
+    assert_eq!(account.0, FrameType::Response, "{}", account.1);
+    assert_eq!(
+        account.1["result"]["account"]["credential_id"],
+        "catalog-credential-plan-provider-apikey"
+    );
     let mason = route.call("route.select", &select("mason")).await;
     assert_eq!(route_key(&mason), PLAN);
 }

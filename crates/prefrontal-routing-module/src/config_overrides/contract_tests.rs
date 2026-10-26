@@ -776,7 +776,8 @@ fn generated_schema_is_current_and_closed() {
         "PanelPolicy",
         "SynthesizerPin",
         "CatalogSection",
-        "AccountSelectionFlags",
+        "RemovedAccountFlags",
+        "ProviderAccountsPolicy",
         "ModelFactOverride",
         "OverqualificationSection",
         "ModelFamilyRules",
@@ -788,6 +789,14 @@ fn generated_schema_is_current_and_closed() {
         );
     }
     let properties = &schema["properties"];
+    assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
+    assert!(schema["$defs"]["RemovedAccountFlags"]
+        .get("properties")
+        .is_none());
+    assert_eq!(
+        schema["$defs"]["ProviderAccountsPolicy"]["properties"]["metered_fallback"]["default"],
+        false
+    );
     assert!(properties
         .get("consecutiveTerminalFailureThreshold")
         .is_none());

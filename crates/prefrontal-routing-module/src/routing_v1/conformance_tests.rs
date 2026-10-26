@@ -78,7 +78,7 @@ impl Harness {
         Self::new_at_version(label, None)
     }
 
-    fn new_at_version(label: &str, version: Option<u32>) -> Arc<Self> {
+    pub(super) fn new_at_version(label: &str, version: Option<u32>) -> Arc<Self> {
         super::consumers::replace_catalog(&json!([]));
         let n = NEXT_HARNESS.fetch_add(1, Ordering::Relaxed);
         let dir = prefrontal_test_support::scratch_root().join(format!(
@@ -864,6 +864,7 @@ async fn migration_065_restarts_replays_and_binds_preupgrade_admissions() {
         flags: harness.operator_config().account_flags(),
         policy: &policy,
         now_ms: reservation.admission_valid_until + 1,
+        classes: None,
     };
     let request = json!({"method":"route.account_for", "params": legacy});
     let answer = account_selection::handle(
@@ -892,4 +893,29 @@ async fn migration_065_restarts_replays_and_binds_preupgrade_admissions() {
             Ok(())
         })
         .unwrap();
+}
+
+/// Reopen a released writer so migration tests exercise the real upgrade path.
+pub(super) fn upgrade_harness(harness: Arc<Harness>) -> Arc<Harness> {
+    let mut state = Arc::try_unwrap(harness)
+        .ok()
+        .expect("all test routes were dropped");
+    let descriptor = prefrontal_routing_store::dev_descriptor(
+        DEFAULT_MODULE_ID,
+        state.dir.join("store.db").to_string_lossy(),
+    );
+    let placeholder = Arc::new(
+        prefrontal_routing_store::SqliteRouteStateStore::open(
+            &prefrontal_routing_store::dev_descriptor(
+                "routing-class-upgrade-placeholder",
+                state.dir.join("placeholder/store.db").to_string_lossy(),
+            ),
+        )
+        .unwrap(),
+    );
+    drop(std::mem::replace(&mut state.store, placeholder));
+    state.store =
+        Arc::new(prefrontal_routing_store::SqliteRouteStateStore::open(&descriptor).unwrap());
+    state.route_epochs = tokio::sync::Mutex::new(RouteEpochs::new());
+    Arc::new(state)
 }

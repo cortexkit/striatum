@@ -3374,10 +3374,11 @@ struct PricedSelection {
     routing_config: prefrontal_routing_core::RoutingConfig,
     provenance: DecisionProvenance,
     entitlement_fences: Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>,
-    /// The providers known to publish a subscription plan, which a consumer
-    /// that must run priced per token never runs on
-    /// ([`select_policy::candidate_rejections`]); `None` until it is known.
+    /// Providers known to publish a subscription plan. Host-only payment
+    /// admission uses this list when it has no vault account class.
+    /// `None` means the plan listing is not known yet.
     subscription_plan_providers: Option<HashSet<String>>,
+    classes: Option<account_selection::ClassContext>,
 }
 
 /// Apply one selection's configuration to the facts and snapshot that
@@ -3395,6 +3396,21 @@ fn price_selection_inputs(
     credentialed: bool,
     priced_per_token: bool,
 ) -> Result<PricedSelection, ModuleError> {
+    let classes = if credentialed {
+        Some(
+            account_selection::ClassContext::read(
+                store,
+                broca_credentials,
+                Arc::new(sources.operator_config.clone()),
+                ACCOUNT_QUOTA.get(),
+                facts.clone(),
+                now_ms() as i64,
+            )
+            .map_err(ModuleError::Message)?,
+        )
+    } else {
+        None
+    };
     let outcome = sources.live_config.apply(facts);
     let provenance = DecisionProvenance {
         quota_signal_json,
@@ -3409,6 +3425,18 @@ fn price_selection_inputs(
     } else {
         None
     };
+    if let Some(classes) = &classes {
+        for fact in facts.iter_mut() {
+            let class = classes.class(fact, priced_per_token);
+            if let Some(method) = class
+                .rows
+                .first()
+                .and_then(|row| row.auth_method.as_deref())
+            {
+                classes.credentials.price_for_method(fact, method);
+            }
+        }
+    }
     sources.live_config.apply(facts);
     // A consumer priced per token is never priced as if a subscription
     // subsidised it. Only the consumer flag authorizes that payment class.
@@ -3429,6 +3457,7 @@ fn price_selection_inputs(
         provenance,
         entitlement_fences,
         subscription_plan_providers,
+        classes,
     })
 }
 
@@ -3752,6 +3781,16 @@ async fn handle_select_request(
             flags: live_config.account_flags(),
             policy: &policy,
             now_ms: account_selection::now_ms(),
+            classes: Some(
+                account_selection::ClassContext::load(
+                    store,
+                    broca_credentials,
+                    config_overrides::live_config(operator_config_path),
+                    ACCOUNT_QUOTA.get(),
+                    account_selection::now_ms(),
+                )
+                .map_err(ModuleError::Message)?,
+            ),
         };
         let reply = account_selection::handle(&envelope.method, &frame.body, &principal, &ctx);
         if envelope.method == account_selection::ACCOUNT_OBSERVE_OP {
@@ -4147,12 +4186,23 @@ async fn handle_select_request(
         &config_policy::ConsumerPolicy::default(),
         &std::collections::BTreeMap::new(),
     );
-    let priced_per_token = select_policy::priced_per_token(&consumer_policy, params.consumer);
+    // Consumer-less legacy requests keep their old routing policy, but codemode
+    // privacy must not depend on the caller spelling out a consumer member.
+    let payment_consumer = params
+        .consumer
+        .or_else(|| select_policy::Consumer::from_id(&params.target_agent));
+    let payment_policy = operator_config.consumer_policy(
+        variant_policy::consumer_group(payment_consumer).unwrap_or(""),
+        &config_policy::ConsumerPolicy::default(),
+        &std::collections::BTreeMap::new(),
+    );
+    let priced_per_token = select_policy::priced_per_token(&payment_policy, payment_consumer);
     let PricedSelection {
         routing_config,
         provenance,
         entitlement_fences,
         subscription_plan_providers,
+        classes,
     } = price_selection_inputs(
         &mut facts,
         quota_signal_json,
@@ -4253,6 +4303,7 @@ async fn handle_select_request(
         subscription_plan_providers.as_ref(),
         &operator_policy,
         &catalog_targets,
+        classes.as_ref(),
     );
     let subscription_keys = candidates.subscription_keys;
     let candidate_filters = candidates.filters;
@@ -4561,12 +4612,16 @@ async fn handle_select_request(
                 flags: live_config.account_flags(),
                 policy: &policy,
                 now_ms: now as i64,
+                classes: classes.clone(),
             };
-            if !host_run {
-                account_selection::preflight_model(
+            // Explicit catalog-less providers lease API keys through key_pool;
+            // its own admission must preserve the pool's typed refusal.
+            if !host_run && !catalog_targets.contains_key(&selected.model.provider_id) {
+                account_selection::preflight_model_for_class(
                     &ctx,
                     &selected.model.provider_id,
                     &selected.model.model_id,
+                    priced_per_token,
                 )
                 .map_err(|(code, message)| work_model_pin::Refusal { code, message })?;
             }
@@ -6060,6 +6115,12 @@ fn decision_input_for(
     let requirements_json = serde_json::to_string(requirements).unwrap_or_else(|_| "null".into());
     let quota_signal_json = provenance.map(|value| value.quota_signal_json.clone());
     let policy_revision = provenance.map(|value| value.policy_revision.clone());
+    let consumer = variant_policy::consumer_group(
+        params
+            .consumer
+            .or_else(|| select_policy::Consumer::from_id(target_agent)),
+    )
+    .map(str::to_string);
     match selected {
         Some(sel) => DecisionInput {
             allowed_account_class: Default::default(),
@@ -6067,7 +6128,7 @@ fn decision_input_for(
                 .allowed_providers
                 .as_ref()
                 .map(|ids| serde_json::to_string(ids).unwrap()),
-            consumer: variant_policy::consumer_group(params.consumer).map(str::to_string),
+            consumer,
             decision_id: None,
             decision_kind: "single".into(),
             task_id: params.task_id.clone(),
@@ -6110,7 +6171,7 @@ fn decision_input_for(
                     .allowed_providers
                     .as_ref()
                     .map(|ids| serde_json::to_string(ids).unwrap()),
-                consumer: variant_policy::consumer_group(params.consumer).map(str::to_string),
+                consumer,
                 decision_id: None,
                 decision_kind: "single".into(),
                 task_id: params.task_id.clone(),
@@ -7469,8 +7530,7 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
                     .to_string(),
             ),
         },
-        // The account-selection operations. Each refuses with
-        // `account_selection_disabled` until routing policy enables serving.
+        // Account-selection operations serve even before quota readings arrive.
         ManagementOperation {
             name: account_selection::ACCOUNT_FOR_OP.to_string(),
             kind: ManagementOperationKind::Mutate,
@@ -8556,7 +8616,7 @@ mod tests {
         let _clock = InjectedClock::set(1_800_000_000_000);
         let rig = Rig::new("host-candidate-isolation");
         let config = rig.dir.join("routing.jsonc");
-        crate::test_config::write(&config, r#"{"accounts":{"enabled":true}}"#).unwrap();
+        crate::test_config::write(&config, r#"{}"#).unwrap();
         assert!(
             config_overrides::live_config(&config)
                 .account_flags()

@@ -10,10 +10,7 @@
 //! Insula readings, and the stored affinity, fences, exclusions and demand),
 //! commits its result in one store transaction and renders the reply.
 //!
-//! One flag in the routing file gates everything (`account_selection.enabled`,
-//! off by default): with it off, every account operation except
-//! `route.account_status` refuses with `account_selection_disabled` and
-//! writes nothing. Every decision routing records is one it answered a
+//! Account selection always serves. Every decision routing records is one it answered a
 //! caller with (`mode = 'serve'`).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -154,6 +151,316 @@ pub struct Ctx<'a> {
     pub flags: AccountSelectionFlags,
     pub policy: &'a AllocatorPolicy,
     pub now_ms: i64,
+    pub classes: Option<ClassContext>,
+}
+
+/// One immutable vault/config/catalog view shared by selection and allocation.
+#[derive(Clone)]
+pub(crate) struct ClassContext {
+    pub credentials: crate::broca_credentials::BrocaCredentials,
+    pub config: std::sync::Arc<crate::config_overrides::LiveConfig>,
+    pub facts: Vec<prefrontal_routing_core::ModelFact>,
+    pub refusals: Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>,
+    pub quota: AccountQuotaState,
+    pub fences: BTreeMap<String, Vec<Fence>>,
+    pub now_ms: i64,
+    catalog: BTreeSet<String>,
+    targets: BTreeMap<String, String>,
+}
+
+pub(crate) struct RouteClass<'a> {
+    pub rows: Vec<&'a cortexkit_claustrum_client::ListedCredential>,
+    pub subscription: bool,
+}
+
+/// Coverage is established before eligibility. A refusal cannot turn an OAuth
+/// subscription into permission to spend on a metered key.
+pub(crate) fn resolve_class<'a>(
+    rows: &'a [cortexkit_claustrum_client::ListedCredential],
+    fact: &prefrontal_routing_core::ModelFact,
+    catalog: &BTreeSet<String>,
+    specs: &[prefrontal_routing_core::provider_model_spec::ParsedSpec],
+    borrowed: bool,
+    priced_per_token: bool,
+    metered_fallback: bool,
+    usable: impl Fn(&cortexkit_claustrum_client::ListedCredential) -> bool,
+) -> RouteClass<'a> {
+    let key = format!("{}/{}", fact.provider_id, fact.model_id);
+    let serving: Vec<_> = rows
+        .iter()
+        .filter(|row| crate::broca_credentials::credential_serves_fact(row, fact, catalog))
+        .collect();
+    let covered = |row: &&cortexkit_claustrum_client::ListedCredential| {
+        !borrowed
+            && prefrontal_routing_core::provider_model_spec::resolve_spec(
+                specs,
+                &key,
+                row.credential_type == "oauth",
+            )
+    };
+    let has_subscription = serving.iter().any(covered);
+    let can_fallback = metered_fallback
+        && serving
+            .iter()
+            .filter(|row| !covered(row))
+            .any(|row| usable(row));
+    let subscription = !priced_per_token
+        && has_subscription
+        && (!can_fallback
+            || serving
+                .iter()
+                .filter(|row| covered(row))
+                .any(|row| usable(row)));
+    RouteClass {
+        rows: serving
+            .into_iter()
+            .filter(|row| {
+                covered(row) == subscription
+                    && (!priced_per_token || row.auth_method.as_deref() == Some("apikey"))
+            })
+            .collect(),
+        subscription,
+    }
+}
+
+impl ClassContext {
+    pub(crate) fn load(
+        store: &SqliteRouteStateStore,
+        credentials: &crate::broca_credentials::SharedBrocaCredentials,
+        config: std::sync::Arc<crate::config_overrides::LiveConfig>,
+        accounts: Option<&SharedAccountQuota>,
+        now_ms: i64,
+    ) -> Result<Self, String> {
+        use prefrontal_routing_core::RouteStateStore;
+        let facts = store.get_facts().map_err(|error| error.to_string())?;
+        Self::read(store, credentials, config, accounts, facts, now_ms)
+    }
+
+    pub(crate) fn read(
+        store: &SqliteRouteStateStore,
+        credentials: &crate::broca_credentials::SharedBrocaCredentials,
+        config: std::sync::Arc<crate::config_overrides::LiveConfig>,
+        accounts: Option<&SharedAccountQuota>,
+        mut facts: Vec<prefrontal_routing_core::ModelFact>,
+        now_ms: i64,
+    ) -> Result<Self, String> {
+        let refusals = crate::credential_fences::live(store, credentials)?;
+        let credentials = credentials
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone();
+        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        let targets = credentials.catalog_targets(&facts);
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
+        let quota = accounts
+            .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
+            .unwrap_or_default();
+        let fences = store
+            .account_transaction(|tx| {
+                facts
+                    .iter()
+                    .map(|fact| fact.provider_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(|provider| Ok((provider.clone(), load_fences(tx, &provider)?)))
+                    .collect()
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            credentials,
+            config,
+            facts,
+            refusals,
+            quota,
+            fences,
+            now_ms,
+            catalog,
+            targets,
+        })
+    }
+
+    pub(crate) fn class(
+        &self,
+        fact: &prefrontal_routing_core::ModelFact,
+        priced_per_token: bool,
+    ) -> RouteClass<'_> {
+        let specs = prefrontal_routing_core::provider_model_spec::parse_spec_list(
+            &self.config.operator_policy().subscription,
+        );
+        resolve_class(
+            self.credentials.listed_credentials(),
+            fact,
+            &self.catalog,
+            &specs,
+            self.targets.contains_key(&fact.provider_id),
+            priced_per_token,
+            self.config.metered_fallback(&fact.provider_id),
+            |row| self.usable(row, fact),
+        )
+    }
+
+    fn view(
+        &self,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        fact: &prefrontal_routing_core::ModelFact,
+    ) -> AccountView {
+        let account_id = row.account_id.clone().unwrap_or_else(|| row.id.clone());
+        let capacity = format!("{}/{}", fact.provider_id, fact.model_id);
+        let reading = self
+            .quota
+            .readings
+            .readings
+            .values()
+            .filter(|reading| {
+                reading.account_id == account_id
+                    && reading.tombstoned_at_ms.is_none()
+                    && reading.routing_provider().is_some_and(|vendor| {
+                        vendor == fact.provider_id
+                            || self
+                                .targets
+                                .get(&fact.provider_id)
+                                .is_some_and(|target| target == vendor)
+                    })
+            })
+            .max_by_key(|reading| {
+                reading
+                    .entry
+                    .get("fetchedAt")
+                    .and_then(Value::as_str)
+                    .and_then(account_quota::parse_rfc3339_ms)
+            });
+        let usage = reading
+            .and_then(|reading| serde_json::from_value::<AccountEntry>(reading.entry.clone()).ok())
+            .and_then(|entry| entry.usage);
+        let pooled = usage
+            .as_ref()
+            .and_then(|usage| usage.extra_rate_windows.as_ref())
+            .into_iter()
+            .flatten()
+            .any(prefrontal_routing_core::quota_extract::is_account_pool_window);
+        let model_reach = if pooled {
+            ModelReach::Only(
+                usage
+                    .as_ref()
+                    .filter(|usage| {
+                        !prefrontal_routing_core::quota_extract::account_rate_windows(
+                            usage,
+                            Some(&capacity),
+                        )
+                        .is_empty()
+                    })
+                    .map(|_| fact.model_id.clone())
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            ModelReach::All
+        };
+        AccountView {
+            account_id,
+            routing_provider: fact.provider_id.clone(),
+            refresh_adapter: row.refresh_adapter.clone().unwrap_or_default(),
+            credentials: vec![CredentialRecord {
+                credential_id: row.id.clone(),
+                default_record: is_default_record(&row.id),
+                needs_reauth: false,
+            }],
+            model_reach,
+            quota: reading
+                .and_then(|reading| quota_reading_for_model(&reading.entry, Some(&capacity))),
+        }
+    }
+
+    fn eligible(
+        &self,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        fact: &prefrontal_routing_core::ModelFact,
+    ) -> bool {
+        !self
+            .refusals
+            .iter()
+            .any(|fence| fence.provider_id == fact.provider_id && fence.credential_id == row.id)
+    }
+
+    fn usable(
+        &self,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        fact: &prefrontal_routing_core::ModelFact,
+    ) -> bool {
+        if !self.eligible(row, fact) {
+            return false;
+        }
+        let roster = self.roster(vec![self.view(row, fact)]);
+        matches!(
+            decide(
+                &synthetic_request(&fact.provider_id, &fact.model_id, "class-preflight".into()),
+                &AllocatorState {
+                    roster: Some(roster),
+                    affinity: None,
+                    fences: self
+                        .fences
+                        .get(&fact.provider_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    principal_exclusions: Vec::new(),
+                    admissions: Vec::new(),
+                    operator_override: None,
+                    policy: AllocatorPolicy::default(),
+                },
+                self.now_ms
+            )
+            .outcome,
+            Outcome::Admit(_)
+        )
+    }
+
+    fn roster(&self, accounts: Vec<AccountView>) -> Roster {
+        let (view, at) = self
+            .credentials
+            .listing_version()
+            .unwrap_or(("unavailable", 0));
+        Roster {
+            view_digest: view.into(),
+            fetched_at_ms: at as i64,
+            accounts,
+        }
+    }
+
+    fn roster_for(&self, provider: &str, model: &str, priced_per_token: bool) -> RosterBuild {
+        let fact = self
+            .facts
+            .iter()
+            .find(|fact| fact.provider_id == provider && fact.model_id == model);
+        let mut accounts: BTreeMap<String, AccountView> = BTreeMap::new();
+        if let Some(fact) = fact {
+            for row in self
+                .class(fact, priced_per_token)
+                .rows
+                .into_iter()
+                .filter(|row| self.eligible(row, fact))
+            {
+                let view = self.view(row, fact);
+                if let Some(existing) = accounts.get_mut(&view.account_id) {
+                    existing.credentials.extend(view.credentials);
+                } else {
+                    accounts.insert(view.account_id.clone(), view);
+                }
+            }
+        }
+        RosterBuild {
+            roster: Some(self.roster(accounts.into_values().collect())),
+            context: json!({"provider": provider, "account_classes": true}),
+        }
+    }
+
+    fn method(&self, credential: &str) -> &str {
+        self.credentials
+            .listed_credentials()
+            .iter()
+            .find(|row| row.id == credential)
+            .and_then(|row| row.auth_method.as_deref())
+            .unwrap_or("unknown")
+    }
 }
 
 fn store_error(error: RouteStateStoreError) -> OpReply {
@@ -643,6 +950,9 @@ fn roster_for(ctx: &Ctx<'_>, provider: &str) -> RosterBuild {
 }
 
 fn roster_for_model(ctx: &Ctx<'_>, provider: &str, model: Option<&str>) -> RosterBuild {
+    if let (Some(classes), Some(model)) = (ctx.classes.as_ref(), model) {
+        return classes.roster_for(provider, model, false);
+    }
     match ctx.accounts.map(|state| state.lock()) {
         Some(Ok(guard)) => allocator_roster_for_model(&guard, provider, model, ctx.now_ms),
         Some(Err(_)) => RosterBuild {
@@ -922,10 +1232,9 @@ struct AccountForParams {
     initial_input_bytes: u64,
     #[serde(default)]
     initial_input_estimated: bool,
-    /// The id of the `route.select` decision that chose this model. Accepted
-    /// for the record; account choice does not read it.
+    /// Identifies the selection whose stored payment class constrains this
+    /// admission, regardless of later edits to the consumer's pay_per_token flag.
     #[serde(default)]
-    #[allow(dead_code)]
     model_decision_id: Option<String>,
     #[serde(default)]
     candidates: Option<CandidatesParams>,
@@ -1289,17 +1598,53 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Err(reply) => return reply,
     };
     let provider = normalize(&parsed.provider);
-    let roster = roster_for_model(ctx, &provider, Some(&normalize(&parsed.model)));
+    let request_fingerprint = fingerprint(&parsed);
+    match ctx.store.account_transaction(|tx| {
+        tx.admission(principal, &parsed.admission_id)?
+            .map(|row| replay(tx, principal, row, &request_fingerprint, ctx.now_ms))
+            .transpose()
+    }) {
+        Ok(Some(reply)) => return reply,
+        Ok(None) => {}
+        Err(error) => return store_error(error),
+    }
+    let class = match parsed.model_decision_id.as_deref() {
+        None => prefrontal_routing_core::accounts::AllowedAccountClass::NotPayPerToken,
+        Some(id) => match ctx.store.v1_decision(id) {
+            Ok(Some(decision)) => decision.allowed_account_class,
+            Ok(None) => match ctx.store.decision_account_class(id) {
+                Ok(Some(class)) => class,
+                Ok(None) => {
+                    return OpReply::error("unknown_decision", "selection decision does not exist")
+                }
+                Err(error) => return store_error(error),
+            },
+            Err(error) => return store_error(error),
+        },
+    };
+    let roster = match ctx.classes.as_ref() {
+        Some(classes) => classes.roster_for(
+            &provider,
+            &normalize(&parsed.model),
+            class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
+        ),
+        None => roster_for_model(ctx, &provider, Some(&normalize(&parsed.model))),
+    };
     if !roster
         .roster
         .as_ref()
         .is_some_and(|roster| !roster.accounts.is_empty())
     {
+        let code = if ctx.classes.is_some() {
+            "no_eligible_account"
+        } else {
+            "account_selection_unsupported"
+        };
         return OpReply::typed(
-            "account_selection_unsupported",
+            code,
             format!("routing selects no accounts for provider `{provider}`"),
             json!({
-                "code": "account_selection_unsupported",
+                "code": code,
                 "retry_after_s": null,
                 "decision_id": null,
                 "exclusions": [],
@@ -1308,7 +1653,6 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     }
     // The roster is read before the transaction: no lock or fetch happens
     // while the selection transaction is open.
-    let request_fingerprint = fingerprint(&parsed);
     ctx.store
         .account_transaction(|tx| {
             serve(
@@ -1326,21 +1670,40 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
 
 /// Check a cold worker launch without reserving an account or creating affinity.
 /// The runner still performs the usual atomic admission when it starts sending.
+#[cfg(test)]
 pub(crate) fn preflight_model(
     ctx: &Ctx<'_>,
     provider: &str,
     model: &str,
 ) -> Result<(), (String, String)> {
+    preflight_model_for_class(ctx, provider, model, false)
+}
+
+pub(crate) fn preflight_model_for_class(
+    ctx: &Ctx<'_>,
+    provider: &str,
+    model: &str,
+    priced_per_token: bool,
+) -> Result<(), (String, String)> {
     if !ctx.flags.enabled {
         return Ok(());
     }
-    let roster = roster_for_model(ctx, provider, Some(model));
+    let roster = ctx.classes.as_ref().map_or_else(
+        || roster_for_model(ctx, provider, Some(model)),
+        |classes| classes.roster_for(provider, model, priced_per_token),
+    );
     // Providers outside the account allocator retain their normal credential admission.
     if roster
         .roster
         .as_ref()
         .is_some_and(|roster| roster.accounts.is_empty())
     {
+        if ctx.classes.is_some() {
+            return Err((
+                "no_eligible_account".into(),
+                format!("{provider}/{model}: no eligible account"),
+            ));
+        }
         return Ok(());
     }
     let request = synthetic_request(provider, model, "worker-model-preflight".into());
@@ -1528,7 +1891,7 @@ fn serve(
                         "account_id": hold.account_id,
                         "credential_id": hold.credential_id,
                         "refresh_adapter": refresh_adapter,
-                        "method": "oauth",
+                        "method": ctx.classes.as_ref().map_or("oauth", |classes| classes.method(&hold.credential_id)),
                     },
                     "pin": { "id": hold.pin_id, "generation": hold.pin_generation },
                     "reset_at": rfc3339(hold.reset_at_ms),
@@ -1538,7 +1901,54 @@ fn serve(
             ))
         }
         Outcome::Refuse(refusal) => {
-            let code = refusal_code(refusal.code);
+            let code = if ctx.classes.is_some() {
+                "no_eligible_account"
+            } else {
+                refusal_code(refusal.code)
+            };
+            let family = ctx.policy.family_for_model(&params.model);
+            let reset = state
+                .fences
+                .iter()
+                .filter(|fence| fence.scope.applies_to(family))
+                .filter(|fence| {
+                    roster
+                        .roster
+                        .iter()
+                        .flat_map(|roster| &roster.accounts)
+                        .any(|account| account.account_id == fence.account_id)
+                })
+                .filter_map(|fence| fence.reset.at_ms())
+                .chain(
+                    roster
+                        .roster
+                        .iter()
+                        .flat_map(|roster| &roster.accounts)
+                        .filter_map(|account| account.quota.as_ref())
+                        .flat_map(|quota| {
+                            let mut dates: Vec<_> = quota
+                                .required_windows()
+                                .into_iter()
+                                .filter_map(|window| quota.window(window))
+                                .filter(|window| window.used_percent >= 100.0)
+                                .filter_map(|window| window.resets_at.at_ms())
+                                .collect();
+                            if let ScopedList::Listed(windows) = &quota.scoped {
+                                dates.extend(
+                                    windows
+                                        .iter()
+                                        .filter(|window| {
+                                            ctx.policy.family_for_scope(window) == Some(family)
+                                        })
+                                        .filter(|window| window.used_percent >= 100.0)
+                                        .filter_map(|window| window.resets_at.at_ms()),
+                                );
+                            }
+                            dates
+                        }),
+                )
+                .filter(|reset| *reset > now)
+                .min();
             Ok(OpReply::typed(
                 code,
                 format!("no account admitted: {code}"),
@@ -1547,6 +1957,7 @@ fn serve(
                     "retry_after_s": refusal.retry_after_s,
                     "decision_id": decision_id,
                     "exclusions": wire_exclusions(&decision),
+                    "reset_at_ms": reset,
                 }),
             ))
         }
@@ -1735,7 +2146,7 @@ fn commit_admission(
             "account_id": admission.account_id,
             "credential_id": admission.credential_id,
             "refresh_adapter": refresh_adapter,
-            "method": "oauth",
+            "method": ctx.classes.as_ref().map_or("oauth", |classes| classes.method(&admission.credential_id)),
         },
         "pin": {
             "id": pin_id,
@@ -2342,10 +2753,7 @@ fn synthetic_request(provider: &str, model: &str, key: String) -> AccountRequest
 }
 
 pub fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or(0)
+    crate::now_ms() as i64
 }
 
 #[cfg(test)]
@@ -2532,6 +2940,7 @@ mod tests {
                 flags: AccountSelectionFlags { enabled },
                 policy: &self.policy,
                 now_ms,
+                classes: None,
             }
         }
 
@@ -2559,7 +2968,7 @@ mod tests {
             "expected_pin": null,
             "initial_input_bytes": 12000,
             "initial_input_estimated": false,
-            "model_decision_id": "prior-route-decision-id",
+            "model_decision_id": null,
             "candidates": null,
             "requested_account": null,
             "hold_wait_max_s": 900
@@ -2885,6 +3294,17 @@ mod tests {
         assert_eq!(admitted["account"]["account_id"], ACCOUNT_B);
         assert_eq!(admitted["account"]["refresh_adapter"], "unrelated-adapter");
         params["provider"] = json!("untracked");
+        assert_eq!(
+            rig.call(
+                &rig.ctx(true, NOW),
+                "route.account_for",
+                BROCA,
+                params.clone()
+            )
+            .code(),
+            Some("admission_conflict")
+        );
+        params["admission_id"] = json!("unknown-provider-admit");
         assert_eq!(
             rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params)
                 .code(),

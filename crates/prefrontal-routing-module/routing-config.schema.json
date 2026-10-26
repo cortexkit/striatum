@@ -4,10 +4,8 @@
   "type": "object",
   "properties": {
     "accounts": {
-      "$ref": "#/$defs/AccountSelectionFlags",
-      "default": {
-        "enabled": false
-      }
+      "$ref": "#/$defs/RemovedAccountFlags",
+      "default": {}
     },
     "catalog": {
       "$ref": "#/$defs/CatalogSection",
@@ -168,18 +166,6 @@
   },
   "additionalProperties": false,
   "$defs": {
-    "AccountSelectionFlags": {
-      "description": "Controls account selection and usage reports through `accounts.enabled`.\nOff unless the file turns it on.",
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "description": "Serve `route.account_for` and accept its reports. Off: every account\noperation refuses with `account_selection_disabled`.",
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "additionalProperties": false
-    },
     "CatalogSection": {
       "type": "object",
       "properties": {
@@ -790,9 +776,26 @@
       },
       "additionalProperties": false
     },
+    "ProviderAccountsPolicy": {
+      "description": "Account-class policy is opt-in: subscription exhaustion must not spend money.",
+      "type": "object",
+      "properties": {
+        "metered_fallback": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
     "ProviderPolicy": {
       "type": "object",
       "properties": {
+        "accounts": {
+          "$ref": "#/$defs/ProviderAccountsPolicy",
+          "default": {
+            "metered_fallback": false
+          }
+        },
         "keep_free_percent": {
           "type": [
             "number",
@@ -870,6 +873,10 @@
         "eq",
         "cost"
       ]
+    },
+    "RemovedAccountFlags": {
+      "type": "object",
+      "additionalProperties": false
     },
     "RunnerPolicy": {
       "description": "A runner module `routing/v1` answers with (`runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",

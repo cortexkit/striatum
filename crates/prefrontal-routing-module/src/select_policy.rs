@@ -220,6 +220,7 @@ pub(crate) fn prepare_candidates(
     subscription_plan_providers: Option<&std::collections::HashSet<String>>,
     policy: &prefrontal_routing_core::launch_policy::ModelRoutingPolicyInput,
     catalog_targets: &std::collections::BTreeMap<String, String>,
+    classes: Option<&crate::account_selection::ClassContext>,
 ) -> Candidates {
     use prefrontal_routing_core::model_router::CredentialRefusalMark;
     use prefrontal_routing_core::provider_model_spec::{parse_spec_list, resolve_spec};
@@ -249,6 +250,7 @@ pub(crate) fn prepare_candidates(
                 priced_per_token,
                 allowed_providers,
                 subscription_plan_providers,
+                None,
             );
         }
         CandidateSource::Vault {
@@ -265,6 +267,7 @@ pub(crate) fn prepare_candidates(
                 .filter(|fact| !catalog_targets.contains_key(&fact.provider_id))
                 .map(|fact| fact.provider_id.clone())
                 .collect();
+            let mut metered_accounts = std::collections::HashSet::new();
             for fact in facts {
                 let route = fact_to_route(fact);
                 let provider_rows: Vec<_> = rows
@@ -293,26 +296,28 @@ pub(crate) fn prepare_candidates(
                         })
                     })
                     .collect();
-                let covered = |row: &&cortexkit_claustrum_client::ListedCredential| {
-                    !catalog_targets.contains_key(&fact.provider_id)
-                        && resolve_spec(&specs, &route.route_key, row.credential_type == "oauth")
-                };
-                // Account class is decided before fences: losing every oauth
-                // account must not silently authorize a priced-per-token key.
-                let subscription = serving.iter().any(covered);
-                if subscription && !priced_per_token {
+                let resolved = classes.map(|classes| classes.class(fact, priced_per_token));
+                let fallback = crate::account_selection::resolve_class(
+                    rows,
+                    fact,
+                    &catalog_providers,
+                    &specs,
+                    catalog_targets.contains_key(&fact.provider_id),
+                    priced_per_token,
+                    false,
+                    |_| true,
+                );
+                let resolved = resolved.as_ref().unwrap_or(&fallback);
+                if priced_per_token && !resolved.rows.is_empty() && !resolved.subscription {
+                    metered_accounts.insert(route.route_key.clone());
+                }
+                if resolved.subscription {
                     subscription_keys.insert(route.route_key.clone());
                 }
                 let class: Vec<_> = serving
                     .iter()
                     .copied()
-                    .filter(|row| {
-                        if priced_per_token {
-                            !covered(row)
-                        } else {
-                            !subscription || covered(row)
-                        }
-                    })
+                    .filter(|row| resolved.rows.iter().any(|allowed| allowed.id == row.id))
                     .collect();
                 let identities: Vec<_> = class
                     .iter()
@@ -363,6 +368,7 @@ pub(crate) fn prepare_candidates(
                 priced_per_token,
                 allowed_providers,
                 subscription_plan_providers,
+                Some(&metered_accounts),
             );
         }
     }
@@ -593,6 +599,7 @@ pub(crate) fn candidate_rejections(
         requires_metered(consumer),
         allowed_providers,
         subscription_plan_providers,
+        None,
     )
 }
 
@@ -602,6 +609,7 @@ fn candidate_rejections_priced(
     priced_per_token: bool,
     allowed_providers: Option<&[String]>,
     subscription_plan_providers: Option<&std::collections::HashSet<String>>,
+    metered_accounts: Option<&std::collections::HashSet<String>>,
 ) -> HashMap<String, String> {
     facts
         .iter()
@@ -613,10 +621,12 @@ fn candidate_rejections_priced(
             } else if priced_per_token
                 && !(fact.auth_methods.as_ref().is_some_and(|methods| methods.iter().any(|method| method == "apikey"))
                     && fact.billing_plane.as_ref().is_some_and(|plane| plane.is_api_metered())
-                    && subscription_plan_providers.is_some_and(|providers| !providers.contains(&fact.provider_id)))
+                    && metered_accounts.map_or_else(
+                        || subscription_plan_providers.is_some_and(|providers| !providers.contains(&fact.provider_id)),
+                        |routes| routes.contains(&fact_to_route(fact).route_key)))
             {
                 Some(format!(
-                    "consumer {} requires known apikey auth methods, a metered billing plane with a known output price, and known absence of a subscription plan",
+                    "consumer {} requires a priced-per-token account, known apikey auth methods and a metered billing plane with a known output price",
                     crate::variant_policy::consumer_group(consumer).unwrap_or("pay_per_token")
                 ))
             } else {
@@ -885,6 +895,7 @@ mod candidate_tests {
             None,
             &policy,
             &BTreeMap::new(),
+            None,
         );
         (result, snapshot)
     }
