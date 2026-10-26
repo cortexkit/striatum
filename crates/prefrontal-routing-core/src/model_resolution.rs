@@ -3,7 +3,7 @@
 //! The vectors in this module are direct ports of the TypeScript model pipeline,
 //! pin, fallback, alias, capability, compatibility, and speed-observation tests.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -314,9 +314,68 @@ pub struct VariantFact {
     pub variant: Option<String>,
 }
 
+/// How providers spell the model ids they serve, and which model families
+/// the capability heuristic recognizes by name. Operator config carries this
+/// (`model_naming`, written by the config converter); routing core names no
+/// provider and no family vocabulary of its own.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelNaming {
+    /// For a gateway serving other vendors' models as `vendor/model`: the
+    /// vendor of a bare model id, by the id's prefix. The first match wins.
+    #[serde(default)]
+    pub vendor_prefixes: Vec<VendorPrefix>,
+    /// The rewrites each provider applies to a model id, in order. A provider
+    /// with no entry serves ids as given.
+    #[serde(default)]
+    pub provider_rewrites: BTreeMap<String, Vec<ModelRewrite>>,
+    /// Model families recognized by a substring of the normalized model id,
+    /// each with the basic variants and no reasoning efforts. The first match
+    /// wins, after the built-in Claude-style and GPT-style families.
+    #[serde(default)]
+    pub basic_families: Vec<BasicFamily>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VendorPrefix {
+    pub prefix: String,
+    pub vendor: String,
+}
+
+/// One step of a provider's model-id spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRewrite {
+    /// Serve the id as `vendor/model`. An id that names its vendor keeps it; a
+    /// bare id takes the vendor its prefix names (`vendor_prefixes`) or, when
+    /// none does, is served exactly as given with no further rewrite.
+    VendorPrefix,
+    /// Spell a dashed two-part Claude-style version with a dot.
+    DotVersion,
+    /// Expand this bare alias to its `-preview` id.
+    PreviewAlias(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BasicFamily {
+    pub family: String,
+    pub needles: Vec<String>,
+}
+
+impl ModelNaming {
+    fn vendor_of(&self, model: &str) -> Option<&str> {
+        self.vendor_prefixes
+            .iter()
+            .find(|entry| model.starts_with(&entry.prefix))
+            .map(|entry| entry.vendor.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct FamilyDefinition {
-    family: &'static str,
+    family: String,
     variants: &'static [&'static str],
     reasoning_efforts: &'static [&'static str],
     supports_thinking: Option<bool>,
@@ -406,20 +465,6 @@ pub fn fuzzy_match_model(
         .map(|model| model.to_string())
 }
 
-fn infer_sub_provider(model: &str) -> Option<&'static str> {
-    [
-        ("claude-", "anthropic"),
-        ("gpt-", "openai"),
-        ("gemini-", "google"),
-        ("grok-", "xai"),
-        ("minimax-", "minimax"),
-        ("kimi-", "moonshotai"),
-        ("glm-", "zai"),
-    ]
-    .into_iter()
-    .find_map(|(prefix, provider)| model.starts_with(prefix).then_some(provider))
-}
-
 fn claude_version_dot(model: &str) -> String {
     normalize_model_name(model)
 }
@@ -444,31 +489,38 @@ fn expand_gemini_alias(model: &str, alias: &str) -> String {
     out
 }
 
-fn gateway_transforms(model: &str) -> String {
-    expand_gemini_alias(&claude_version_dot(model), "gemini-3.1-pro")
-}
-
-pub fn transform_model_for_provider(provider: &str, model: &str) -> String {
-    match provider {
-        "vercel" => {
-            if let Some((sub_provider, sub_model)) = model.split_once('/') {
-                return format!("{sub_provider}/{}", gateway_transforms(sub_model));
-            }
-            infer_sub_provider(model)
-                .map(|sub_provider| format!("{sub_provider}/{}", gateway_transforms(model)))
-                .unwrap_or_else(|| model.to_string())
+/// A model id as `provider` serves it, by the provider's configured rewrites.
+pub fn transform_model_for_provider(naming: &ModelNaming, provider: &str, model: &str) -> String {
+    let Some(rewrites) = naming.provider_rewrites.get(provider) else {
+        return model.to_string();
+    };
+    let mut vendor = None;
+    let mut spelled = model.to_string();
+    if rewrites.contains(&ModelRewrite::VendorPrefix) {
+        if let Some((named, rest)) = model.split_once('/') {
+            vendor = Some(named.to_string());
+            spelled = rest.to_string();
+        } else if let Some(inferred) = naming.vendor_of(model) {
+            vendor = Some(inferred.to_string());
+        } else {
+            return model.to_string();
         }
-        "github-copilot" => expand_gemini_alias(&gateway_transforms(model), "gemini-3-flash"),
-        "google" => expand_gemini_alias(
-            &expand_gemini_alias(model, "gemini-3.1-pro"),
-            "gemini-3-flash",
-        ),
-        "anthropic" => claude_version_dot(model),
-        _ => model.to_string(),
+    }
+    for rewrite in rewrites {
+        spelled = match rewrite {
+            ModelRewrite::VendorPrefix => spelled,
+            ModelRewrite::DotVersion => claude_version_dot(&spelled),
+            ModelRewrite::PreviewAlias(alias) => expand_gemini_alias(&spelled, alias),
+        };
+    }
+    match vendor {
+        Some(vendor) => format!("{vendor}/{spelled}"),
+        None => spelled,
     }
 }
 
 fn first_fallback(
+    naming: &ModelNaming,
     chain: &[FallbackEntry],
     attempted: Vec<String>,
 ) -> Option<ModelResolutionResult> {
@@ -477,7 +529,7 @@ fn first_fallback(
     Some(ModelResolutionResult {
         model: format!(
             "{provider}/{}",
-            transform_model_for_provider(provider, &entry.model)
+            transform_model_for_provider(naming, provider, &entry.model)
         ),
         provenance: "provider-fallback".to_string(),
         variant: entry.variant.clone(),
@@ -486,7 +538,10 @@ fn first_fallback(
     })
 }
 
-pub fn resolve_model_pipeline(request: &ModelResolutionRequest) -> Option<ModelResolutionResult> {
+pub fn resolve_model_pipeline(
+    request: &ModelResolutionRequest,
+    naming: &ModelNaming,
+) -> Option<ModelResolutionResult> {
     let mut attempted = Vec::new();
     if let Some(model) = normalized_nonempty(request.intent.ui_selected_model.as_deref()) {
         return Some(ModelResolutionResult {
@@ -547,7 +602,7 @@ pub fn resolve_model_pipeline(request: &ModelResolutionRequest) -> Option<ModelR
                     return Some(ModelResolutionResult {
                         model: format!(
                             "{provider}/{}",
-                            transform_model_for_provider(provider, model)
+                            transform_model_for_provider(naming, provider, model)
                         ),
                         provenance: "category-default".into(),
                         variant: None,
@@ -576,7 +631,7 @@ pub fn resolve_model_pipeline(request: &ModelResolutionRequest) -> Option<ModelR
                             return Some(ModelResolutionResult {
                                 model: format!(
                                     "{provider}/{}",
-                                    transform_model_for_provider(provider, model_id)
+                                    transform_model_for_provider(naming, provider, model_id)
                                 ),
                                 provenance: "provider-fallback".into(),
                                 variant: None,
@@ -615,7 +670,7 @@ pub fn resolve_model_pipeline(request: &ModelResolutionRequest) -> Option<ModelR
                             return Some(ModelResolutionResult {
                                 model: format!(
                                     "{provider}/{}",
-                                    transform_model_for_provider(provider, &entry.model)
+                                    transform_model_for_provider(naming, provider, &entry.model)
                                 ),
                                 provenance: "provider-fallback".into(),
                                 variant: entry.variant.clone(),
@@ -655,7 +710,7 @@ pub fn resolve_model_pipeline(request: &ModelResolutionRequest) -> Option<ModelR
         }
     }
     if request.policy.use_first_fallback_when_unresolved {
-        if let Some(result) = first_fallback(&request.policy.fallback_chain, attempted.clone()) {
+        if let Some(result) = first_fallback(naming, &request.policy.fallback_chain, attempted.clone()) {
             return Some(result);
         }
     }
@@ -815,18 +870,18 @@ pub fn resolve_model_id_alias(model_id: &str) -> ModelAliasResolution {
     }
 }
 
-fn heuristic_family(model_id: &str) -> Option<FamilyDefinition> {
+fn heuristic_family(naming: &ModelNaming, model_id: &str) -> Option<FamilyDefinition> {
     let normalized = normalize_model_name(model_id);
     let definition = if normalized.contains("claude") && normalized.contains("opus") {
         FamilyDefinition {
-            family: "claude-opus",
+            family: "claude-opus".into(),
             variants: OPUS_VARIANTS,
             reasoning_efforts: EMPTY,
             supports_thinking: Some(true),
         }
     } else if normalized.contains("claude") {
         FamilyDefinition {
-            family: "claude-non-opus",
+            family: "claude-non-opus".into(),
             variants: BASIC_VARIANTS,
             reasoning_efforts: EMPTY,
             supports_thinking: Some(true),
@@ -843,44 +898,41 @@ fn heuristic_family(model_id: &str) -> Option<FamilyDefinition> {
             .is_some_and(|value| value.is_ascii_digit())
     {
         FamilyDefinition {
-            family: "openai-reasoning",
+            family: "openai-reasoning".into(),
             variants: BASIC_VARIANTS,
             reasoning_efforts: OPENAI_REASONING,
             supports_thinking: None,
         }
     } else if normalized.contains("gpt-5") {
         FamilyDefinition {
-            family: "gpt-5",
+            family: "gpt-5".into(),
             variants: GPT5_VARIANTS,
             reasoning_efforts: GPT5_REASONING,
             supports_thinking: None,
         }
     } else if normalized.contains("gpt") {
         FamilyDefinition {
-            family: "gpt-legacy",
+            family: "gpt-legacy".into(),
             variants: BASIC_VARIANTS,
             reasoning_efforts: EMPTY,
             supports_thinking: None,
         }
     } else {
-        [
-            ("gemini", &["gemini"][..]),
-            ("qwen", &["qwen"][..]),
-            ("kimi", &["kimi", "k2"][..]),
-            ("glm", &["glm"][..]),
-            ("minimax", &["minimax"][..]),
-            ("deepseek", &["deepseek"][..]),
-            ("mistral", &["mistral", "codestral"][..]),
-            ("llama", &["llama"][..]),
-        ]
-        .into_iter()
-        .find(|(_, needles)| needles.iter().any(|needle| normalized.contains(needle)))
-        .map(|(family, _)| FamilyDefinition {
-            family,
-            variants: BASIC_VARIANTS,
-            reasoning_efforts: EMPTY,
-            supports_thinking: None,
-        })?
+        naming
+            .basic_families
+            .iter()
+            .find(|family| {
+                family
+                    .needles
+                    .iter()
+                    .any(|needle| normalized.contains(needle.as_str()))
+            })
+            .map(|family| FamilyDefinition {
+                family: family.family.clone(),
+                variants: BASIC_VARIANTS,
+                reasoning_efforts: EMPTY,
+                supports_thinking: None,
+            })?
     };
     Some(definition)
 }
@@ -977,7 +1029,10 @@ fn number_at(root: Option<&Map<String, Value>>, location: &str, key: &str) -> Op
         })
 }
 
-pub fn resolve_model_capabilities(input: &ModelCapabilitiesInput) -> ModelCapabilities {
+pub fn resolve_model_capabilities(
+    input: &ModelCapabilitiesInput,
+    naming: &ModelNaming,
+) -> ModelCapabilities {
     let alias = resolve_model_id_alias(&input.model_id);
     let runtime_root = object(input.runtime_model.as_ref());
     let runtime_entry = input
@@ -996,7 +1051,7 @@ pub fn resolve_model_capabilities(input: &ModelCapabilitiesInput) -> ModelCapabi
     } else {
         "none"
     };
-    let heuristic = heuristic_family(&alias.canonical_model_id);
+    let heuristic = heuristic_family(naming, &alias.canonical_model_id);
     let runtime_variants = runtime_variants(runtime_root);
     let runtime_reasoning = bool_at(runtime_root, &["reasoning"]);
     let runtime_thinking =
@@ -1147,8 +1202,9 @@ pub fn resolve_compatible_model_settings(
     model_id: &str,
     desired: &DesiredModelSettings,
     capabilities: Option<&ModelCapabilities>,
+    naming: &ModelNaming,
 ) -> ModelSettingsCompatibilityResult {
-    let heuristic = heuristic_family(model_id);
+    let heuristic = heuristic_family(naming, model_id);
     let family_known = heuristic.is_some()
         || capabilities
             .and_then(|value| value.family.as_ref())
@@ -1473,46 +1529,56 @@ pub fn build_model_speed_observation(
 mod tests {
     use super::*;
 
+    /// The model naming the config converter writes into operator config.
+    /// The TypeScript twin's vectors below hold for exactly these values.
+    fn naming() -> ModelNaming {
+        let defaults: Value = serde_json::from_str(include_str!(
+            "../../prefrontal-routing-module/data/config_convert_defaults.json"
+        ))
+        .unwrap();
+        serde_json::from_value(defaults["model_naming"].clone()).unwrap()
+    }
+
     /// A canonical preview id keeps its single suffix through every provider
     /// arm; a bare alias still expands; a tier suffix is left alone (Loop R183).
     #[test]
     fn gemini_alias_expansion_is_suffix_aware() {
         for provider in ["google", "github-copilot"] {
             assert_eq!(
-                transform_model_for_provider(provider, "gemini-3.1-pro-preview"),
+                transform_model_for_provider(&naming(), provider, "gemini-3.1-pro-preview"),
                 "gemini-3.1-pro-preview",
                 "{provider}"
             );
             assert_eq!(
-                transform_model_for_provider(provider, "gemini-3.1-pro"),
+                transform_model_for_provider(&naming(), provider, "gemini-3.1-pro"),
                 "gemini-3.1-pro-preview",
                 "{provider}"
             );
             assert_eq!(
-                transform_model_for_provider(provider, "gemini-3-flash-preview"),
+                transform_model_for_provider(&naming(), provider, "gemini-3-flash-preview"),
                 "gemini-3-flash-preview",
                 "{provider}"
             );
         }
         assert_eq!(
-            transform_model_for_provider("google", "gemini-3-flash"),
+            transform_model_for_provider(&naming(), "google", "gemini-3-flash"),
             "gemini-3-flash-preview"
         );
         assert_eq!(
-            transform_model_for_provider("google", "gemini-3.1-pro-high"),
+            transform_model_for_provider(&naming(), "google", "gemini-3.1-pro-high"),
             "gemini-3.1-pro-high"
         );
         assert_eq!(
-            transform_model_for_provider("vercel", "google/gemini-3.1-pro-preview"),
+            transform_model_for_provider(&naming(), "vercel", "google/gemini-3.1-pro-preview"),
             "google/gemini-3.1-pro-preview"
         );
         assert_eq!(
-            transform_model_for_provider("vercel", "google/gemini-3.1-pro"),
+            transform_model_for_provider(&naming(), "vercel", "google/gemini-3.1-pro"),
             "google/gemini-3.1-pro-preview"
         );
         // Applying the transform to its own output is a fixed point.
-        let once = transform_model_for_provider("google", "gemini-3.1-pro");
-        assert_eq!(transform_model_for_provider("google", &once), once);
+        let once = transform_model_for_provider(&naming(), "google", "gemini-3.1-pro");
+        assert_eq!(transform_model_for_provider(&naming(), "google", &once), once);
     }
 
     fn fallback(provider: &str, model: &str, variant: Option<&str>) -> FallbackEntry {
@@ -1562,7 +1628,7 @@ mod tests {
             },
             constraints: ModelResolutionConstraints::default(),
             policy: ModelResolutionPolicy::default(),
-        })
+        }, &naming())
         .unwrap();
         assert_eq!(result.model, "openai/gpt-5.3-codex");
         assert_eq!(result.provenance, "override");
@@ -1741,7 +1807,7 @@ mod tests {
             runtime_model: Some(json!({ "variants": { "low": {}, "medium": {}, "high": {} } })),
             bundled_snapshot: Some(bundled),
             ..Default::default()
-        });
+        }, &naming());
         assert_eq!(capabilities.canonical_model_id, "claude-opus-4-7");
         assert_eq!(
             capabilities.variants,
@@ -1757,7 +1823,7 @@ mod tests {
                 reasoning_effort: Some("high".into()),
                 ..Default::default()
             },
-            None,
+            None, &naming(),
         );
         assert_eq!(result.variant.as_deref(), Some("high"));
         assert!(result.reasoning_effort.is_none());
@@ -1784,7 +1850,7 @@ mod tests {
                     reasoning_effort: Some("high".into()),
                     ..Default::default()
                 },
-                None,
+                None, &naming(),
             );
             assert_eq!(result.variant.as_deref(), Some("high"), "{model}");
             assert!(result.reasoning_effort.is_none(), "{model}");
@@ -1796,7 +1862,7 @@ mod tests {
                 reasoning_effort: Some("xhigh".into()),
                 ..Default::default()
             },
-            None,
+            None, &naming(),
         );
         assert_eq!(gpt.variant.as_deref(), Some("xhigh"));
         assert_eq!(gpt.reasoning_effort.as_deref(), Some("xhigh"));

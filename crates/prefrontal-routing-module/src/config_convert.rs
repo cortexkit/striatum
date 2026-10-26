@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 
 pub const COMMAND: &str = "ck-prefrontal-routing config-convert";
 
-fn defaults() -> Value {
+pub(crate) fn defaults() -> Value {
     serde_json::from_str(include_str!("../data/config_convert_defaults.json"))
         .expect("converter defaults")
 }
@@ -266,10 +266,24 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     root.remove("pins");
     root.remove("score_alias");
     root.extend(old);
+    // Family rules are first-match-wins; the data file holds them as an
+    // ordered list, which keeps that order through any JSON round trip.
+    root.entry("model_families")
+        .or_insert_with(|| data["model_families"].clone());
+    root.entry("model_naming")
+        .or_insert_with(|| data["model_naming"].clone());
     if let Some(accounts) = root.remove("account_selection") {
         root.insert("accounts".into(), accounts);
         remove_account_flag(&mut root)?;
     }
+    let accounts = root
+        .entry("accounts")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("accounts must be an object")?;
+    accounts
+        .entry("model_families")
+        .or_insert_with(|| data["account_model_families"].clone());
     Ok(Value::Object(root))
 }
 
@@ -327,8 +341,17 @@ impl<'de> serde::Deserialize<'de> for OrderedFamilies {
                 }
                 Ok(OrderedFamilies(entries))
             }
+            // List-form rules are ordered already; the converted document
+            // writes them as the input value holds them.
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(OrderedFamilies::default())
+            }
         }
-        deserializer.deserialize_map(Visitor)
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -352,7 +375,9 @@ impl serde::Serialize for ConvertedDocument<'_> {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(Some(self.root.len()))?;
         for (key, value) in self.root {
-            if key == "model_families" {
+            // A document's own map-form rules keep their written order; the
+            // converter's list-form defaults are ordered already.
+            if key == "model_families" && !self.families.0.is_empty() {
                 map.serialize_entry(key, self.families)?;
             } else {
                 map.serialize_entry(key, value)?;

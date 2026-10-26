@@ -436,6 +436,52 @@ pub struct ProviderAccountsPolicy {
     pub spend_budget: Option<f64>,
     pub spend_budget_reset_at_ms: Option<i64>,
     pub paid_credits: Option<bool>,
+    /// The models that draw on a model-scoped quota family, by exact model
+    /// id. A model not listed counts as `other`.
+    pub model_families: Option<Vec<AccountModelFamily>>,
+}
+
+/// One model's quota family under `accounts.model_families`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountModelFamily {
+    pub model: String,
+    pub family: AccountQuotaFamily,
+}
+
+/// The model-scoped quota families account selection keeps apart.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountQuotaFamily {
+    Fable,
+    Mythos,
+    Opus,
+    Other,
+}
+
+impl AccountQuotaFamily {
+    pub fn family(self) -> prefrontal_routing_core::accounts::ModelFamily {
+        use prefrontal_routing_core::accounts::ModelFamily;
+        match self {
+            Self::Fable => ModelFamily::Fable,
+            Self::Mythos => ModelFamily::Mythos,
+            Self::Opus => ModelFamily::Opus,
+            Self::Other => ModelFamily::Other,
+        }
+    }
+}
+
+/// The policy's model-to-family map from `accounts.model_families`.
+pub fn account_model_families(
+    families: &[AccountModelFamily],
+) -> Vec<prefrontal_routing_core::accounts::ModelFamilyMapping> {
+    families
+        .iter()
+        .map(|entry| prefrontal_routing_core::accounts::ModelFamilyMapping {
+            model: entry.model.clone(),
+            family: entry.family.family(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

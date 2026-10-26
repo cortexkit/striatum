@@ -892,6 +892,10 @@ struct RoutingConfigFile {
     runners: Vec<RunnerPolicy>,
     #[serde(default)]
     model_families: ModelFamilyRules,
+    /// How providers spell model ids and which model families the capability
+    /// heuristic recognizes; see `ModelNamingConfig`.
+    #[serde(default)]
+    model_naming: ModelNamingConfig,
     #[serde(default)]
     catalog: CatalogSection,
     #[serde(default)]
@@ -992,6 +996,9 @@ fn allocator_policy_from(
         if let Some(reset) = source.spend_budget_reset_at_ms {
             policy.spend_budget_reset_at_ms = Some(reset);
         }
+        if let Some(families) = &source.model_families {
+            policy.model_families = crate::config_policy::account_model_families(families);
+        }
     }
     Ok(policy)
 }
@@ -1012,6 +1019,24 @@ impl LiveConfig {
                 .collect(),
         )
     }
+    /// The configured model-id spelling and capability families.
+    pub(crate) fn model_naming(&self) -> prefrontal_routing_core::ModelNaming {
+        self.config.model_naming.naming()
+    }
+
+    /// The model-to-family map of the top-level `accounts` section, for
+    /// account requests that are not tied to one provider's policy.
+    pub(crate) fn account_model_families(
+        &self,
+    ) -> Vec<prefrontal_routing_core::accounts::ModelFamilyMapping> {
+        self.config
+            .accounts
+            .model_families
+            .as_deref()
+            .map(crate::config_policy::account_model_families)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn allocator_policy(
         &self,
         provider: &str,
@@ -1081,6 +1106,92 @@ struct CatalogSection {
     poll_ms: Option<u64>,
 }
 
+/// Operator config for `prefrontal_routing_core::ModelNaming`, the model-id
+/// spelling `route.resolve_model` applies per provider and the model families
+/// `route.model_capabilities` recognizes by name. The config converter writes
+/// the shipped values from its data file.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ModelNamingConfig {
+    /// For a gateway serving other vendors' models as `vendor/model`: the
+    /// vendor of a bare model id, by the id's prefix. The first match wins.
+    #[serde(default)]
+    vendor_prefixes: Vec<VendorPrefixConfig>,
+    /// The rewrites each provider applies to a model id, in order.
+    #[serde(default)]
+    provider_rewrites: BTreeMap<String, Vec<ModelRewriteConfig>>,
+    /// Families recognized by a substring of the normalized model id, each
+    /// with the basic variants. The first match wins.
+    #[serde(default)]
+    basic_families: Vec<BasicFamilyConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct VendorPrefixConfig {
+    prefix: String,
+    vendor: String,
+}
+
+/// `vendor_prefix` serves the id as `vendor/model`; `dot_version` spells a
+/// dashed two-part Claude-style version with a dot; `{"preview_alias": a}`
+/// expands the bare alias `a` to its `-preview` id.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ModelRewriteConfig {
+    VendorPrefix,
+    DotVersion,
+    PreviewAlias(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BasicFamilyConfig {
+    family: String,
+    needles: Vec<String>,
+}
+
+impl ModelNamingConfig {
+    fn naming(&self) -> prefrontal_routing_core::ModelNaming {
+        use prefrontal_routing_core::{BasicFamily, ModelNaming, ModelRewrite, VendorPrefix};
+        ModelNaming {
+            vendor_prefixes: self
+                .vendor_prefixes
+                .iter()
+                .map(|entry| VendorPrefix {
+                    prefix: entry.prefix.clone(),
+                    vendor: entry.vendor.clone(),
+                })
+                .collect(),
+            provider_rewrites: self
+                .provider_rewrites
+                .iter()
+                .map(|(provider, rewrites)| {
+                    let rewrites = rewrites
+                        .iter()
+                        .map(|rewrite| match rewrite {
+                            ModelRewriteConfig::VendorPrefix => ModelRewrite::VendorPrefix,
+                            ModelRewriteConfig::DotVersion => ModelRewrite::DotVersion,
+                            ModelRewriteConfig::PreviewAlias(alias) => {
+                                ModelRewrite::PreviewAlias(alias.clone())
+                            }
+                        })
+                        .collect();
+                    (provider.clone(), rewrites)
+                })
+                .collect(),
+            basic_families: self
+                .basic_families
+                .iter()
+                .map(|family| BasicFamily {
+                    family: family.family.clone(),
+                    needles: family.needles.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelFamilyRule {
     family: GrandFamily,
@@ -1107,48 +1218,42 @@ impl JsonSchema for ModelFamilyRules {
     }
 
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let properties: serde_json::Map<String, serde_json::Value> = Self::default().0.iter().map(|rule| {
-            let family = serde_json::to_value(rule.family).unwrap().as_str().unwrap().to_owned();
-            (family, serde_json::json!({"type": "array", "items": {"type": "string", "pattern": "\\S"}}))
-        }).collect();
-        schemars::json_schema!({"type": "object", "additionalProperties": false, "properties": properties})
+        let globs = serde_json::json!({"type": "array", "items": {"type": "string", "pattern": "\\S"}});
+        let families: Vec<&str> = GrandFamily::ALL.iter().map(|family| family.as_str()).collect();
+        let properties: serde_json::Map<String, serde_json::Value> = families
+            .iter()
+            .map(|family| ((*family).to_owned(), globs.clone()))
+            .collect();
+        schemars::json_schema!({"oneOf": [
+            {"type": "object", "additionalProperties": false, "properties": properties},
+            {"type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["family", "globs"],
+                "properties": {"family": {"enum": families}, "globs": globs}
+            }}
+        ]})
     }
 }
 
+/// No rules unless the operator config writes them. The converter writes the
+/// shipped rules from its data file as an ordered list.
 impl Default for ModelFamilyRules {
     fn default() -> Self {
-        let rules = [
-            (
-                GrandFamily::Claude,
-                &["*/claude-*", "anthropic/*", "google/antigravity-claude-*"][..],
-            ),
-            (
-                GrandFamily::Gpt,
-                &["openai/*", "*/gpt-*", "*/o1*", "*/o3*", "*/o4*"][..],
-            ),
-            (GrandFamily::Gemini, &["*/gemini-*", "google/*"][..]),
-            (GrandFamily::Grok, &["*/grok-*", "xai/*"][..]),
-            (GrandFamily::Qwen, &["*/qwen*", "alibaba-*/*"][..]),
-            (
-                GrandFamily::Kimi,
-                &["*/kimi*", "moonshotai/*", "kimi-for-coding/*"][..],
-            ),
-            (GrandFamily::Glm, &["*/glm-*", "zai/*"][..]),
-            (GrandFamily::Deepseek, &["*/deepseek-*", "deepseek/*"][..]),
-            (GrandFamily::Minimax, &["*/minimax-*", "minimax/*"][..]),
-            (GrandFamily::Mistral, &["*/mistral-*", "mistral/*"][..]),
-            (GrandFamily::Llama, &["*/llama-*", "meta/*"][..]),
-            (GrandFamily::Other, &["*"][..]),
-        ];
-        Self(
-            rules
-                .into_iter()
-                .map(|(family, globs)| ModelFamilyRule {
-                    family,
-                    globs: globs.iter().map(|glob| (*glob).to_string()).collect(),
-                })
-                .collect(),
-        )
+        Self(Vec::new())
+    }
+}
+
+impl ModelFamilyRules {
+    fn rule(wire_family: String, globs: Vec<String>) -> Result<ModelFamilyRule, String> {
+        let family = GrandFamily::from_wire(&wire_family)
+            .ok_or_else(|| format!("unknown model_families key `{wire_family}`"))?;
+        if globs.iter().any(|glob| glob.trim().is_empty()) {
+            return Err(format!(
+                "model_families.{wire_family} entries must be non-empty route globs"
+            ));
+        }
+        Ok(ModelFamilyRule { family, globs })
     }
 }
 
@@ -1163,7 +1268,10 @@ impl<'de> Deserialize<'de> for ModelFamilyRules {
             type Value = ModelFamilyRules;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an ordered map of grand-family ids to route globs")
+                formatter.write_str(
+                    "an ordered map of grand-family ids to route globs, or a list of \
+                     {family, globs} rules",
+                )
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -1172,23 +1280,38 @@ impl<'de> Deserialize<'de> for ModelFamilyRules {
             {
                 let mut rules = Vec::new();
                 while let Some((wire_family, globs)) = map.next_entry::<String, Vec<String>>()? {
-                    let family = GrandFamily::from_wire(&wire_family).ok_or_else(|| {
-                        serde::de::Error::custom(format!(
-                            "unknown model_families key `{wire_family}`"
-                        ))
-                    })?;
-                    if globs.iter().any(|glob| glob.trim().is_empty()) {
-                        return Err(serde::de::Error::custom(format!(
-                            "model_families.{wire_family} entries must be non-empty route globs"
-                        )));
-                    }
-                    rules.push(ModelFamilyRule { family, globs });
+                    rules.push(
+                        ModelFamilyRules::rule(wire_family, globs)
+                            .map_err(serde::de::Error::custom)?,
+                    );
+                }
+                Ok(ModelFamilyRules(rules))
+            }
+
+            // The list form keeps first-match order through any JSON value
+            // round trip, which sorts object keys.
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Entry {
+                    family: String,
+                    globs: Vec<String>,
+                }
+                let mut rules = Vec::new();
+                while let Some(entry) = seq.next_element::<Entry>()? {
+                    rules.push(
+                        ModelFamilyRules::rule(entry.family, entry.globs)
+                            .map_err(serde::de::Error::custom)?,
+                    );
                 }
                 Ok(ModelFamilyRules(rules))
             }
         }
 
-        deserializer.deserialize_map(RulesVisitor)
+        deserializer.deserialize_any(RulesVisitor)
     }
 }
 

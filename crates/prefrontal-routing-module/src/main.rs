@@ -3766,7 +3766,10 @@ async fn handle_select_request(
 
     if account_selection::handles(&envelope.method) {
         let principal = route_principal(channel, epoch);
-        let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+        let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
+            model_families: live_config.account_model_families(),
+            ..Default::default()
+        };
         let ctx = account_selection::Ctx {
             store: store.as_ref(),
             accounts: ACCOUNT_QUOTA.get(),
@@ -3841,10 +3844,17 @@ async fn handle_select_request(
         return handle_model_facts(frame, writer, store, operator_config_path).await;
     }
     if envelope.method == model_resolution::RESOLVE_MODEL_OP {
-        return model_resolution::handle_resolve_model(frame, writer).await;
+        return model_resolution::handle_resolve_model(frame, writer, &live_config.model_naming())
+            .await;
     }
     if envelope.method == model_resolution::MODEL_CAPABILITIES_OP {
-        return model_resolution::handle_model_capabilities(frame, writer, store).await;
+        return model_resolution::handle_model_capabilities(
+            frame,
+            writer,
+            store,
+            &live_config.model_naming(),
+        )
+        .await;
     }
     if envelope.method == model_resolution::AGENT_MODEL_REQUIREMENTS_OP {
         return model_resolution::handle_agent_model_requirements(frame, writer).await;
@@ -4610,7 +4620,10 @@ async fn handle_select_request(
             (selected, choice)
         });
         let selection = selection.and_then(|(selected, variant_choice)| {
-            let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+            let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
+                model_families: live_config.account_model_families(),
+                ..Default::default()
+            };
             let ctx = account_selection::Ctx {
                 store: store.as_ref(),
                 accounts: ACCOUNT_QUOTA.get(),

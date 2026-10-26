@@ -178,7 +178,7 @@ fn adapt_scoped(quota: &Value) -> ScopedList {
 
 #[test]
 fn scope_vectors_family_scope_and_absent_scope_predicate() {
-    let policy = AllocatorPolicy::default();
+    let policy = policy();
     let value = vectors();
     let rows = value["scopes"].as_array().unwrap();
     assert_eq!(rows.len(), 9);

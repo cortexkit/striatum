@@ -155,7 +155,9 @@ async fn converted_disabled_account_selection_serves_after_one_conversion() {
         "account_selection": {"enabled": false}
     }))
     .unwrap();
-    assert!(converted.get("accounts").is_none());
+    // The converter writes the shipped account families into `accounts`, but
+    // never the retired flag.
+    assert!(converted["accounts"].get("enabled").is_none());
     assert!(harness.operator_config().account_flags().enabled);
     let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
     let response = runner

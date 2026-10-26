@@ -541,10 +541,6 @@ fn default_paid_credits() -> bool {
 
 impl Default for AllocatorPolicy {
     fn default() -> Self {
-        let family = |model: &str, family| ModelFamilyMapping {
-            model: model.to_string(),
-            family,
-        };
         Self {
             strategy: super::policy::AccountStrategy::Sticky,
             fallback_first: false,
@@ -576,16 +572,9 @@ impl Default for AllocatorPolicy {
             quota_unknown_retry_s: 60,
             pool_retry_margin_s: 60,
             pool_retry_fallback_s: 300,
-            model_families: vec![
-                family("claude-fable-5", ModelFamily::Fable),
-                family("claude-fable-5[1m]", ModelFamily::Fable),
-                family("claude-fable-5-1", ModelFamily::Fable),
-                family("claude-fable-5-1[1m]", ModelFamily::Fable),
-                family("claude-mythos-5-1", ModelFamily::Mythos),
-                family("claude-mythos-5-1[1m]", ModelFamily::Mythos),
-                family("claude-opus-5-5", ModelFamily::Opus),
-                family("claude-opus-5-5[1m]", ModelFamily::Opus),
-            ],
+            // Which models draw on a model-scoped quota family is operator
+            // config (`accounts.model_families`); routing core names no model.
+            model_families: Vec::new(),
             // Insula publishes the Fable window's id as upstream
             // `limits[].scope.model.id` when available, else the display name,
             // which today is `Fable`.

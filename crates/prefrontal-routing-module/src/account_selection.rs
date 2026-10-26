@@ -3538,6 +3538,18 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The account policy a converted config yields when the operator wrote no
+    /// account tuning: today's defaults with the shipped model-scoped families.
+    fn default_account_policy() -> prefrontal_routing_core::accounts::AllocatorPolicy {
+        let families: Vec<crate::config_policy::AccountModelFamily> =
+            serde_json::from_value(crate::config_convert::defaults()["account_model_families"].clone())
+                .expect("converter account families");
+        prefrontal_routing_core::accounts::AllocatorPolicy {
+            model_families: crate::config_policy::account_model_families(&families),
+            ..Default::default()
+        }
+    }
     use crate::account_quota::{apply_provider_reply, apply_roster_listing};
     use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
     use prefrontal_routing_store::dev_descriptor;
@@ -3698,7 +3710,7 @@ mod tests {
             store: Some(open_store(&dir)),
             dir,
             accounts: Arc::new(Mutex::new(state)),
-            policy: AllocatorPolicy::default(),
+            policy: default_account_policy(),
         }
     }
 
