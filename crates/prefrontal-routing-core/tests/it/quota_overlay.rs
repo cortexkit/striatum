@@ -78,6 +78,7 @@ fn overlay(windows: &[ProviderUsage], facts: &[ModelFact]) -> ModelRouteStateSna
         NOW,
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
+        &model_pools(),
     );
     snap
 }
@@ -204,6 +205,7 @@ fn exhausted_no_reset_uses_local_reprobe_horizon_and_low_utilization_recovers() 
         refreshed_now,
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
+        &model_pools(),
     );
     assert_eq!(
         first.by_capacity[&cap].quota_exhausted_until,
@@ -353,6 +355,7 @@ fn fresh_soft_pressure_lowers_stale_pressure() {
         NOW,
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
+        &model_pools(),
     );
 
     assert!(
@@ -400,6 +403,7 @@ fn hard_exhaustion_retained_until_future_reset_passes() {
         NOW,
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
+        &model_pools(),
     );
 
     assert_eq!(
@@ -1022,4 +1026,13 @@ fn an_exhausted_rolling_window_still_walls_its_route() {
         exhausted_rolling, "claude-opus-4-7",
         "an exhausted rolling route must not be selected just because its pacing is unprojectable"
     );
+}
+
+/// The model-specific quota pools the config converter writes.
+fn model_pools() -> Vec<prefrontal_routing_core::quota_extract::ModelPool> {
+    let defaults: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../prefrontal-routing-module/data/config_convert_defaults.json"
+    ))
+    .unwrap();
+    serde_json::from_value(defaults["quota_model_pools"].clone()).unwrap()
 }

@@ -310,7 +310,7 @@ fn setup_at_version(
         },
         NOW,
     );
-    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64);
+    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64, &[]);
     credentials.publish_billing_catalog(
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact, subscription]),
     );
@@ -765,7 +765,7 @@ async fn the_frozen_empty_mapping_joins_only_its_single_catalog_vendor() {
         },
         NOW,
     );
-    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64);
+    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64, &[]);
     assert!(credentials.mapped_providers().contains("openai"));
     assert_eq!(
         credentials.health_report(NOW).metrics.unwrap()["unmappedCredentialIds"],
@@ -804,7 +804,7 @@ async fn the_frozen_empty_mapping_joins_only_its_single_catalog_vendor() {
         },
         NOW,
     );
-    credentials.refresh_serving_methods(&Default::default(), &[fact, second], NOW as i64);
+    credentials.refresh_serving_methods(&Default::default(), &[fact, second], NOW as i64, &[]);
     assert!(!credentials.mapped_providers().contains("openai"));
     assert_eq!(
         credentials.health_report(NOW).metrics.unwrap()["unmappedCredentialIds"],

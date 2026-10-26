@@ -1854,6 +1854,7 @@ mod tests {
                 &crate::account_quota::AccountQuotaState::default(),
                 &facts,
                 1,
+                &[],
             );
             if methods.contains(&"oauth") {
                 assert!(cache
@@ -2323,7 +2324,7 @@ mod tests {
         let mut credentials = crate::broca_credentials::BrocaCredentials::default();
         credentials.apply_listing(&listing, 1);
         let mut facts = vec![crate::tests::fact("openai", "gpt-5.6-luna")];
-        credentials.refresh_serving_methods(&state, &facts, 1);
+        credentials.refresh_serving_methods(&state, &facts, 1, &[]);
         credentials.billing_catalog.pages.insert(
             ("openai".into(), "chatgpt".into()),
             decode_plane_get(&get_reply("chatgpt luna — named, unfiltered")).unwrap(),
@@ -2377,6 +2378,7 @@ mod tests {
                 &crate::account_quota::AccountQuotaState::default(),
                 &facts,
                 1,
+                &[],
             );
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

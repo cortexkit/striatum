@@ -710,7 +710,9 @@ pub fn resolve_model_pipeline(
         }
     }
     if request.policy.use_first_fallback_when_unresolved {
-        if let Some(result) = first_fallback(naming, &request.policy.fallback_chain, attempted.clone()) {
+        if let Some(result) =
+            first_fallback(naming, &request.policy.fallback_chain, attempted.clone())
+        {
             return Some(result);
         }
     }
@@ -1578,7 +1580,10 @@ mod tests {
         );
         // Applying the transform to its own output is a fixed point.
         let once = transform_model_for_provider(&naming(), "google", "gemini-3.1-pro");
-        assert_eq!(transform_model_for_provider(&naming(), "google", &once), once);
+        assert_eq!(
+            transform_model_for_provider(&naming(), "google", &once),
+            once
+        );
     }
 
     fn fallback(provider: &str, model: &str, variant: Option<&str>) -> FallbackEntry {
@@ -1621,14 +1626,17 @@ mod tests {
 
     #[test]
     fn model_resolution_pipeline_keeps_override_provenance_vector() {
-        let result = resolve_model_pipeline(&ModelResolutionRequest {
-            intent: ModelResolutionIntent {
-                user_model: Some("openai/gpt-5.3-codex".into()),
-                ..Default::default()
+        let result = resolve_model_pipeline(
+            &ModelResolutionRequest {
+                intent: ModelResolutionIntent {
+                    user_model: Some("openai/gpt-5.3-codex".into()),
+                    ..Default::default()
+                },
+                constraints: ModelResolutionConstraints::default(),
+                policy: ModelResolutionPolicy::default(),
             },
-            constraints: ModelResolutionConstraints::default(),
-            policy: ModelResolutionPolicy::default(),
-        }, &naming())
+            &naming(),
+        )
         .unwrap();
         assert_eq!(result.model, "openai/gpt-5.3-codex");
         assert_eq!(result.provenance, "override");
@@ -1801,13 +1809,16 @@ mod tests {
                 ..Default::default()
             },
         );
-        let capabilities = resolve_model_capabilities(&ModelCapabilitiesInput {
-            provider_id: "anthropic".into(),
-            model_id: "claude-opus-4-7-thinking".into(),
-            runtime_model: Some(json!({ "variants": { "low": {}, "medium": {}, "high": {} } })),
-            bundled_snapshot: Some(bundled),
-            ..Default::default()
-        }, &naming());
+        let capabilities = resolve_model_capabilities(
+            &ModelCapabilitiesInput {
+                provider_id: "anthropic".into(),
+                model_id: "claude-opus-4-7-thinking".into(),
+                runtime_model: Some(json!({ "variants": { "low": {}, "medium": {}, "high": {} } })),
+                bundled_snapshot: Some(bundled),
+                ..Default::default()
+            },
+            &naming(),
+        );
         assert_eq!(capabilities.canonical_model_id, "claude-opus-4-7");
         assert_eq!(
             capabilities.variants,
@@ -1823,7 +1834,8 @@ mod tests {
                 reasoning_effort: Some("high".into()),
                 ..Default::default()
             },
-            None, &naming(),
+            None,
+            &naming(),
         );
         assert_eq!(result.variant.as_deref(), Some("high"));
         assert!(result.reasoning_effort.is_none());
@@ -1850,7 +1862,8 @@ mod tests {
                     reasoning_effort: Some("high".into()),
                     ..Default::default()
                 },
-                None, &naming(),
+                None,
+                &naming(),
             );
             assert_eq!(result.variant.as_deref(), Some("high"), "{model}");
             assert!(result.reasoning_effort.is_none(), "{model}");
@@ -1862,7 +1875,8 @@ mod tests {
                 reasoning_effort: Some("xhigh".into()),
                 ..Default::default()
             },
-            None, &naming(),
+            None,
+            &naming(),
         );
         assert_eq!(gpt.variant.as_deref(), Some("xhigh"));
         assert_eq!(gpt.reasoning_effort.as_deref(), Some("xhigh"));

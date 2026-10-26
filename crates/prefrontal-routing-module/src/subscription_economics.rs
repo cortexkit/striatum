@@ -902,7 +902,7 @@ mod tests {
             },
             now as u64,
         );
-        credentials.refresh_serving_methods(&state, &[fact.clone()], now);
+        credentials.refresh_serving_methods(&state, &[fact.clone()], now, &[]);
         assert_eq!(
             credentials.plane_keys(),
             BTreeSet::from([("anthropic".into(), "oauth".into())])
@@ -931,11 +931,7 @@ mod tests {
             params["harness"] = json!(harness);
         }
         let params: crate::SelectParams = serde_json::from_value(params).unwrap();
-        let resolved = crate::resolve_select_request(
-            &params,
-            &Default::default(),
-        )
-        .unwrap();
+        let resolved = crate::resolve_select_request(&params, &Default::default()).unwrap();
         let sub: std::collections::HashSet<String> =
             resolved.policy.subscription_keys.into_iter().collect();
         assert_eq!(sub.is_empty(), harness == Some("pi"));

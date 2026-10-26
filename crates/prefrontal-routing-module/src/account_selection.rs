@@ -341,6 +341,7 @@ impl ClassContext {
     ) -> AccountView {
         let account_id = row.account_id.clone().unwrap_or_else(|| row.id.clone());
         let capacity = format!("{}/{}", fact.provider_id, fact.model_id);
+        let model_pools = self.config.quota_model_pools();
         let reading = self
             .quota
             .readings
@@ -381,6 +382,7 @@ impl ClassContext {
                         !prefrontal_routing_core::quota_extract::account_rate_windows(
                             usage,
                             Some(&capacity),
+                            &model_pools,
                         )
                         .is_empty()
                     })
@@ -401,8 +403,9 @@ impl ClassContext {
                 needs_reauth: false,
             }],
             model_reach,
-            quota: reading
-                .and_then(|reading| quota_reading_for_model(&reading.entry, Some(&capacity))),
+            quota: reading.and_then(|reading| {
+                quota_reading_for_model(&reading.entry, Some(&capacity), &model_pools)
+            }),
         }
     }
 
@@ -1139,12 +1142,20 @@ fn quota_window(window: &RateWindow) -> Option<QuotaWindow> {
 /// general period and its duration; scoped windows keep their producer id and
 /// length. Pooled windows are limited to the requested model's pools, while
 /// `pool_windows` keeps every pool of the whole reading for block recovery.
-fn quota_reading_for_model(entry: &Value, capacity_key: Option<&str>) -> Option<QuotaReading> {
+fn quota_reading_for_model(
+    entry: &Value,
+    capacity_key: Option<&str>,
+    model_pools: &[prefrontal_routing_core::quota_extract::ModelPool],
+) -> Option<QuotaReading> {
     let entry: AccountEntry = serde_json::from_value(entry.clone()).ok()?;
     let usage = entry.usage.as_ref();
     let reported = usage
         .map(|usage| {
-            prefrontal_routing_core::quota_extract::account_rate_windows(usage, capacity_key)
+            prefrontal_routing_core::quota_extract::account_rate_windows(
+                usage,
+                capacity_key,
+                model_pools,
+            )
         })
         .unwrap_or_default();
     let general_windows: Vec<_> = reported
@@ -1241,7 +1252,7 @@ fn quota_reading_for_model(entry: &Value, capacity_key: Option<&str>) -> Option<
 /// new cold work once it is too old, while existing affinity continues.
 #[cfg(test)]
 pub fn allocator_roster(state: &AccountQuotaState, provider: &str, now_ms: i64) -> RosterBuild {
-    allocator_roster_for_model(state, provider, None, now_ms)
+    allocator_roster_for_model(state, provider, None, now_ms, &[])
 }
 
 fn allocator_roster_for_model(
@@ -1249,6 +1260,7 @@ fn allocator_roster_for_model(
     provider: &str,
     model: Option<&str>,
     now_ms: i64,
+    model_pools: &[prefrontal_routing_core::quota_extract::ModelPool],
 ) -> RosterBuild {
     // Learn adapter/vendor relationships only from account-id joins. An adapter
     // is usable for unread siblings only when all its mapped readings agree.
@@ -1369,6 +1381,7 @@ fn allocator_roster_for_model(
                         !prefrontal_routing_core::quota_extract::account_rate_windows(
                             usage,
                             capacity_key.as_deref(),
+                            model_pools,
                         )
                         .is_empty()
                     });
@@ -1395,7 +1408,11 @@ fn allocator_roster_for_model(
                         .collect(),
                     model_reach,
                     quota: reading.and_then(|reading| {
-                        quota_reading_for_model(&reading.entry, capacity_key.as_deref())
+                        quota_reading_for_model(
+                            &reading.entry,
+                            capacity_key.as_deref(),
+                            model_pools,
+                        )
                     }),
                 }
             })
@@ -1429,7 +1446,9 @@ fn roster_for_model(ctx: &Ctx<'_>, provider: &str, model: Option<&str>) -> Roste
         return classes.roster_for(provider, model, false);
     }
     match ctx.accounts.map(|state| state.lock()) {
-        Some(Ok(guard)) => allocator_roster_for_model(&guard, provider, model, ctx.now_ms),
+        Some(Ok(guard)) => {
+            allocator_roster_for_model(&guard, provider, model, ctx.now_ms, &ctx.policy.model_pools)
+        }
         Some(Err(_)) => RosterBuild {
             roster: None,
             context: json!({ "provider": provider, "error": "account state lock poisoned" }),
@@ -1448,8 +1467,9 @@ pub(crate) fn billing_roster(
     provider: &str,
     model: &str,
     now_ms: i64,
+    model_pools: &[prefrontal_routing_core::quota_extract::ModelPool],
 ) -> Vec<AccountView> {
-    allocator_roster_for_model(state, provider, Some(model), now_ms)
+    allocator_roster_for_model(state, provider, Some(model), now_ms, model_pools)
         .roster
         .map(|roster| roster.accounts)
         .unwrap_or_default()
@@ -1563,7 +1583,7 @@ pub(crate) fn refresh_all_blocks(
 ) -> RouteStateResult<()> {
     store.account_transaction(|tx| {
         for provider in tx.active_fence_providers()? {
-            let accounts = allocator_roster_for_model(state, &provider, None, now)
+            let accounts = allocator_roster_for_model(state, &provider, None, now, &[])
                 .roster
                 .map(|roster| roster.accounts)
                 .unwrap_or_default();
@@ -1873,7 +1893,11 @@ impl AccountForParams {
     }
 
     fn caller_kind(&self) -> CallerKind {
-        if self.caller.runner.eq_ignore_ascii_case(crate::legacy_wire::BROCA) {
+        if self
+            .caller
+            .runner
+            .eq_ignore_ascii_case(crate::legacy_wire::BROCA)
+        {
             CallerKind::Broca
         } else {
             CallerKind::Plugin
@@ -1896,7 +1920,10 @@ impl AccountForParams {
             conversation_key: self.conversation_key.clone(),
             // Broca falls back to `broca:<run_id>` when a direct caller sent no
             // conversation key; such a run has no affinity across sends.
-            conversation_key_source: if self.conversation_key.starts_with(crate::legacy_wire::BROCA_RUN_KEY_PREFIX) {
+            conversation_key_source: if self
+                .conversation_key
+                .starts_with(crate::legacy_wire::BROCA_RUN_KEY_PREFIX)
+            {
                 ConversationKeySource::BrocaRunFallback
             } else {
                 ConversationKeySource::Caller
@@ -2061,7 +2088,7 @@ fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
         };
         // Like account placement, identity comes from the vault, not an
         // Insula-only reading or an email alias.
-        let built = allocator_roster_for_model(&state, &provider, None, ctx.now_ms);
+        let built = allocator_roster_for_model(&state, &provider, None, ctx.now_ms, &[]);
         let known = built.roster.as_ref().is_some_and(|roster| {
             roster
                 .accounts
@@ -2099,7 +2126,7 @@ fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
             return WarmReason::ReadingMissing;
         };
         observed_at = entry.fetched_at.clone();
-        let Some(reading) = quota_reading_for_model(&stored.entry, None) else {
+        let Some(reading) = quota_reading_for_model(&stored.entry, None, &[]) else {
             return WarmReason::ReadingMissing;
         };
         let freshness = assess_reading(Some(&reading), ctx.now_ms, ctx.policy);
@@ -2108,7 +2135,7 @@ fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
             // Use the allocator's topology: pooled readings ignore misleading
             // aggregate slots and infer pool durations from their producer ids.
             let reported =
-                prefrontal_routing_core::quota_extract::account_rate_windows(usage, None);
+                prefrontal_routing_core::quota_extract::account_rate_windows(usage, None, &[]);
             for (_, window) in reported.iter().filter(|(slot, _)| *slot != "extra") {
                 windows.push(status_window(window, None, None));
             }
@@ -3539,17 +3566,27 @@ pub fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    /// The model-specific quota pools the config converter writes.
+    fn shipped_model_pools() -> Vec<prefrontal_routing_core::quota_extract::ModelPool> {
+        serde_json::from_value(crate::config_convert::defaults()["quota_model_pools"].clone())
+            .expect("converter quota model pools")
+    }
+
     /// The account policy a converted config yields when the operator wrote no
-    /// account tuning: today's defaults with the shipped model-scoped families.
+    /// account tuning: today's defaults with the shipped model-scoped families
+    /// and model-specific quota pools.
     fn default_account_policy() -> prefrontal_routing_core::accounts::AllocatorPolicy {
-        let families: Vec<crate::config_policy::AccountModelFamily> =
-            serde_json::from_value(crate::config_convert::defaults()["account_model_families"].clone())
-                .expect("converter account families");
+        let families: Vec<crate::config_policy::AccountModelFamily> = serde_json::from_value(
+            crate::config_convert::defaults()["account_model_families"].clone(),
+        )
+        .expect("converter account families");
         prefrontal_routing_core::accounts::AllocatorPolicy {
             model_families: crate::config_policy::account_model_families(&families),
+            model_pools: shipped_model_pools(),
             ..Default::default()
         }
     }
+
     use crate::account_quota::{apply_provider_reply, apply_roster_listing};
     use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
     use prefrontal_routing_store::dev_descriptor;
@@ -3630,7 +3667,7 @@ mod tests {
         )
         .unwrap();
         let entry = &state.readings.readings.values().next().unwrap().entry;
-        let reading = quota_reading_for_model(entry, None).unwrap();
+        let reading = quota_reading_for_model(entry, None, &[]).unwrap();
         let evaluate = |reading: &QuotaReading, now| {
             evaluate_quota(
                 Some(reading),
@@ -3651,7 +3688,7 @@ mod tests {
 
         let mut past_reset = entry.clone();
         past_reset["usage"]["primary"]["resetsAt"] = json!("2026-09-29T12:01:00Z");
-        let reading = quota_reading_for_model(&past_reset, None).unwrap();
+        let reading = quota_reading_for_model(&past_reset, None, &[]).unwrap();
         let expired_window = evaluate(&reading, NOW + 2 * 60_000);
         assert!(!expired_window.eligible());
         assert!(expired_window
@@ -3865,7 +3902,12 @@ mod tests {
         let mut snapshot = fixture.store().build_snapshot(NOW as f64).unwrap();
         let windows: Vec<prefrontal_routing_core::ProviderUsage> =
             serde_json::from_value(json!([exhausted, healthy])).unwrap();
-        prefrontal_routing_core::merge_quota_overlay(&mut snapshot, &windows, &facts);
+        prefrontal_routing_core::merge_quota_overlay(
+            &mut snapshot,
+            &windows,
+            &facts,
+            &shipped_model_pools(),
+        );
         assert_eq!(snapshot.by_capacity[route].quota_exhausted_until, None);
         let seat = |snapshot| {
             prefrontal_routing_core::select_panel(prefrontal_routing_core::SelectPanelInput {
@@ -3896,7 +3938,12 @@ mod tests {
         healthy["usage"]["secondary"]["usedPercent"] = json!(100);
         let windows: Vec<prefrontal_routing_core::ProviderUsage> =
             serde_json::from_value(json!([exhausted, healthy])).unwrap();
-        prefrontal_routing_core::merge_quota_overlay(&mut snapshot, &windows, &facts);
+        prefrontal_routing_core::merge_quota_overlay(
+            &mut snapshot,
+            &windows,
+            &facts,
+            &shipped_model_pools(),
+        );
         assert!(seat(snapshot).members.is_empty());
     }
 

@@ -138,7 +138,12 @@ impl World {
         let facts = store.get_facts().unwrap();
         let mut credentials = BrocaCredentials::default();
         credentials.apply_listing(&listing, now);
-        credentials.refresh_serving_methods(&accounts, &facts, now as i64);
+        credentials.refresh_serving_methods(
+            &accounts,
+            &facts,
+            now as i64,
+            &crate::config_overrides::live_config(&config_path).quota_model_pools(),
+        );
         credentials.publish_billing_catalog(PlaneCatalog::ordinary_test_catalog(&facts));
         credentials.publish_plan_prices(&baseline["plan_prices"]);
 

@@ -780,7 +780,6 @@ fn generated_schema_is_current_and_closed() {
         "ProviderAccountsPolicy",
         "ModelFactOverride",
         "OverqualificationSection",
-        "ModelFamilyRules",
         "SubstrateGroups",
     ] {
         assert_eq!(
@@ -788,6 +787,12 @@ fn generated_schema_is_current_and_closed() {
             "{name}"
         );
     }
+    // Family rules take an ordered map or an ordered list; both forms are closed.
+    let family_forms = schema["$defs"]["ModelFamilyRules"]["oneOf"]
+        .as_array()
+        .expect("ModelFamilyRules has a map form and a list form");
+    assert_eq!(family_forms[0]["additionalProperties"], false);
+    assert_eq!(family_forms[1]["items"]["additionalProperties"], false);
     let properties = &schema["properties"];
     assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
     let retired = super::validate_document(r#"{"accounts":{"enabled":false}}"#).unwrap_err();

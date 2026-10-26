@@ -523,6 +523,10 @@ pub struct AllocatorPolicy {
     pub pool_retry_fallback_s: u64,
     pub model_families: Vec<ModelFamilyMapping>,
     pub scope_ids: Vec<ScopeIdMapping>,
+    /// Pools that meter only some models (operator config
+    /// `quota_model_pools`). Not part of the published policy.
+    #[serde(skip)]
+    pub model_pools: Vec<crate::quota_extract::ModelPool>,
 }
 
 /// Six hours, the quota overlay's own re-probe horizon for a window with no
@@ -575,6 +579,7 @@ impl Default for AllocatorPolicy {
             // Which models draw on a model-scoped quota family is operator
             // config (`accounts.model_families`); routing core names no model.
             model_families: Vec::new(),
+            model_pools: Vec::new(),
             // Insula publishes the Fable window's id as upstream
             // `limits[].scope.model.id` when available, else the display name,
             // which today is `Fable`.

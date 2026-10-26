@@ -611,7 +611,7 @@ fn write_quota_readings(
     let facts = store.get_facts().map_err(|e| e.to_string())?;
     let observed_at = i64::try_from(observed_at_ms).map_err(|e| e.to_string())?;
     for entry in fresh {
-        let Some(join) = prefrontal_routing_core::quota::quota_route_join(entry) else {
+        let Some(join) = prefrontal_routing_core::quota::quota_route_join(entry, &facts) else {
             continue;
         };
         let capacity_keys = prefrontal_routing_core::quota::quota_capacity_keys(entry, &facts);
@@ -1246,7 +1246,12 @@ where
         store.get_facts(),
         broca_credentials.lock(),
     ) {
-        credentials.refresh_serving_methods(&accounts, &facts, now_ms() as i64);
+        credentials.refresh_serving_methods(
+            &accounts,
+            &facts,
+            now_ms() as i64,
+            &config_overrides::live_config(&config_overrides::config_path()).quota_model_pools(),
+        );
     }
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
         let roster_resolver: Arc<dyn cortexkit_claustrum_client::CredentialResolver> = Arc::new(
@@ -1266,6 +1271,7 @@ where
                 Arc::clone(&store),
                 roster_resolver,
                 Arc::clone(&broca_credentials),
+                config_overrides::config_path(),
             ),
         );
     }
@@ -2014,9 +2020,7 @@ struct ResolvedSelectRequest {
 
 /// Host auth facts come only from the request. Non-host selection classifies
 /// each serving credential directly from the vault in the shared candidate pass.
-fn provider_auth_types(
-    raw: Option<&HashMap<String, String>>,
-) -> HashMap<String, String> {
+fn provider_auth_types(raw: Option<&HashMap<String, String>>) -> HashMap<String, String> {
     raw.cloned().unwrap_or_default()
 }
 
@@ -3288,6 +3292,7 @@ fn prepare_selection_inputs(
     quota_cache: &SharedQuotaCache,
     store: &SharedStore,
     pricing: &RoutePricing,
+    model_pools: &[prefrontal_routing_core::quota_extract::ModelPool],
 ) -> Result<PreparedSelectionInputs, String> {
     let now = now_ms() as f64;
     let facts = store
@@ -3326,7 +3331,7 @@ fn prepare_selection_inputs(
         .as_ref()
         .and_then(|_| stale_quota_age_ms(quota_refreshed_at_ms, now as u64));
     if let Some(windows) = quota_windows.as_ref().filter(|_| stale_age_ms.is_none()) {
-        merge_quota_overlay(&mut snapshot, windows, &facts);
+        merge_quota_overlay(&mut snapshot, windows, &facts, model_pools);
     }
     subscription_economics::overlay(&mut snapshot, &facts, now as i64, pricing);
     let quota_signal_json = quota_signal_json(
@@ -3768,6 +3773,7 @@ async fn handle_select_request(
         let principal = route_principal(channel, epoch);
         let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
             model_families: live_config.account_model_families(),
+            model_pools: live_config.quota_model_pools(),
             ..Default::default()
         };
         let ctx = account_selection::Ctx {
@@ -3834,8 +3840,7 @@ async fn handle_select_request(
         return handle_route_decisions_list(frame, writer, store).await;
     }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
-        return handle_resolve_policy(frame, writer, operator_config_path)
-            .await;
+        return handle_resolve_policy(frame, writer, operator_config_path).await;
     }
     if envelope.method == ROUTE_MODEL_FACT_OP {
         return handle_model_fact(frame, writer, store).await;
@@ -3860,13 +3865,7 @@ async fn handle_select_request(
         return model_resolution::handle_agent_model_requirements(frame, writer).await;
     }
     if envelope.method == available_models_text::OP {
-        return available_models_text::handle(
-            frame,
-            writer,
-            store,
-            operator_config_path,
-        )
-        .await;
+        return available_models_text::handle(frame, writer, store, operator_config_path).await;
     }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         let ladder_sources =
@@ -4172,7 +4171,12 @@ async fn handle_select_request(
     };
     let providers_without_prompt_cache = live_config.providers_without_prompt_cache();
     let snapshot_started = Instant::now();
-    let prepared = prepare_selection_inputs(quota_cache, store, live_config.pricing());
+    let prepared = prepare_selection_inputs(
+        quota_cache,
+        store,
+        live_config.pricing(),
+        &live_config.quota_model_pools(),
+    );
     timing.add_snapshot_closure(snapshot_started.elapsed());
     let PreparedSelectionInputs {
         now,
@@ -4622,6 +4626,7 @@ async fn handle_select_request(
         let selection = selection.and_then(|(selected, variant_choice)| {
             let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
                 model_families: live_config.account_model_families(),
+                model_pools: live_config.quota_model_pools(),
                 ..Default::default()
             };
             let ctx = account_selection::Ctx {
@@ -5530,7 +5535,12 @@ async fn handle_select_panel(
         )
         .await;
     }
-    let mut prepared = match prepare_selection_inputs(quota_cache, store, live_config.pricing()) {
+    let mut prepared = match prepare_selection_inputs(
+        quota_cache,
+        store,
+        live_config.pricing(),
+        &live_config.quota_model_pools(),
+    ) {
         Ok(prepared) => prepared,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
@@ -5841,21 +5851,22 @@ async fn handle_select_panel(
         &provenance,
         &policy_sources_line(&operator_policy),
     );
-    let decision_id = match store.record_decision_with_selection(&decision, Some(legacy_wire::BROCA), None) {
-        Ok(id) => id,
-        Err(e) => {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "store_error",
-                &format!("recording panel decision: {e}"),
-            )
-            .await;
-        }
-    };
+    let decision_id =
+        match store.record_decision_with_selection(&decision, Some(legacy_wire::BROCA), None) {
+            Ok(id) => id,
+            Err(e) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &format!("recording panel decision: {e}"),
+                )
+                .await;
+            }
+        };
     let mut result = json!({
         "members": &panel.members,
         "runnerUp": &panel.runner_up,
@@ -9302,10 +9313,8 @@ mod tests {
         // from the request.
         assert!(provider_auth_types(None).is_empty());
         assert_eq!(
-            provider_auth_types(Some(&HashMap::from([(
-                "example".into(),
-                "apikey".into()
-            )])))["example"],
+            provider_auth_types(Some(&HashMap::from([("example".into(), "apikey".into())])))
+                ["example"],
             "apikey"
         );
     }
@@ -9594,7 +9603,7 @@ mod tests {
 
         let quota = Arc::new(Mutex::new(QuotaCache::default()));
         let judged = |pricing: &RoutePricing| {
-            let prepared = prepare_selection_inputs(&quota, &store, pricing).unwrap();
+            let prepared = prepare_selection_inputs(&quota, &store, pricing, &[]).unwrap();
             let a = prepared
                 .facts
                 .iter()
@@ -9657,6 +9666,7 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &RoutePricing::default(),
+            &[],
         )
         .unwrap();
         let actual = prepared
@@ -9853,7 +9863,6 @@ mod tests {
         credentials
     }
 
-
     fn test_operator_config() -> PathBuf {
         static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         PATH.get_or_init(|| {
@@ -10039,6 +10048,7 @@ mod tests {
                         &state,
                         &store.get_facts().unwrap(),
                         now_ms() as i64,
+                        &[],
                     );
                     guard.mark_copy_listing_gap();
                 }
@@ -10051,7 +10061,12 @@ mod tests {
                     .await
                     .unwrap();
                 let mut guard = credentials.lock().unwrap();
-                guard.refresh_serving_methods(&state, &store.get_facts().unwrap(), now_ms() as i64);
+                guard.refresh_serving_methods(
+                    &state,
+                    &store.get_facts().unwrap(),
+                    now_ms() as i64,
+                    &[],
+                );
                 guard.mark_copy_listing_gap();
             }
             for iq in [70, 85] {
@@ -15872,6 +15887,7 @@ mod tests {
                 &account_quota::AccountQuotaState::default(),
                 &facts,
                 now_ms() as i64,
+                &[],
             );
             guard.publish_billing_catalog(
                 crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),

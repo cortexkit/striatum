@@ -55,5 +55,6 @@
       { "family": "llama", "needles": ["llama"] }
     ]
   },
-  "head_agents": ["alfonso", "head", "opencode", "pi", "claude-code"]
+  "head_agents": ["alfonso", "head", "opencode", "pi", "claude-code"],
+  "quota_model_pools": [{ "model_prefix": "antigravity-gemini-4-argon", "pool": "gemini-argon" }]
 }

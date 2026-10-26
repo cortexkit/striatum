@@ -98,11 +98,7 @@ pub(super) async fn handle(
         }
     };
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
-    let text = match render_from_store(
-        &params,
-        store.as_ref(),
-        &operator_policy,
-    ) {
+    let text = match render_from_store(&params, store.as_ref(), &operator_policy) {
         Ok(text) => text,
         Err(error) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &error)
@@ -607,12 +603,8 @@ mod tests {
     fn live_store_state_gates_available_models_render() {
         let rig = StoreRig::new("state-gate");
         let request = params(&["state/model"], &[]);
-        let before = render_from_store(
-            &request,
-            &rig.store,
-            &ModelRoutingPolicyInput::default(),
-        )
-        .unwrap();
+        let before =
+            render_from_store(&request, &rig.store, &ModelRoutingPolicyInput::default()).unwrap();
 
         rig.store
             .upsert_fact(
@@ -620,12 +612,8 @@ mod tests {
                 FactSource::Override,
             )
             .unwrap();
-        let after = render_from_store(
-            &request,
-            &rig.store,
-            &ModelRoutingPolicyInput::default(),
-        )
-        .unwrap();
+        let after =
+            render_from_store(&request, &rig.store, &ModelRoutingPolicyInput::default()).unwrap();
 
         assert_ne!(before, after);
         assert!(before.contains("Recommended head: none"));

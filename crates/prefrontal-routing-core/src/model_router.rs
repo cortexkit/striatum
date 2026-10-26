@@ -1476,20 +1476,13 @@ fn admit_and_price_shortlist(
 
     admissible.retain(|a| {
         let covered = subscription_route_covered(&a.route, input.is_subscription_route.as_deref());
-        let permitted = !covered
-            || subscription_budget_available(
-                &a.runtime,
-                input.target_is_head,
-            );
+        let permitted = !covered || subscription_budget_available(&a.runtime, input.target_is_head);
         if !permitted {
             rejected.push(RejectedRoute {
                 route_key: a.route.route_key.clone(),
                 reason: "subscription_reserve".into(),
                 detail: a.runtime.subscription_pool.as_ref().map(|pool| {
-                    pool.reserve_diagnostic(
-                        pool.keep_free_percent,
-                        input.target_is_head,
-                    )
+                    pool.reserve_diagnostic(pool.keep_free_percent, input.target_is_head)
                 }),
                 credential_ids: Vec::new(),
             });
@@ -1625,13 +1618,8 @@ fn admit_and_price_shortlist(
                     CostBasis::OutputOnly => a.route.fact.ephemeral_vector(),
                 },
             );
-            let (mut breakdown, mut notes) = compute_objective(
-                &a.route,
-                &a.runtime,
-                is_sub,
-                basis,
-                input.target_is_head,
-            );
+            let (mut breakdown, mut notes) =
+                compute_objective(&a.route, &a.runtime, is_sub, basis, input.target_is_head);
             apply_overqualification(
                 &mut breakdown,
                 &mut notes,

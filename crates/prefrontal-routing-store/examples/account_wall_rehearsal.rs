@@ -114,7 +114,7 @@ fn main() {
             &quota.windows_json,
         )
         .unwrap();
-        prefrontal_routing_core::merge_quota_overlay(&mut admitted_snapshot, &windows, &facts);
+        prefrontal_routing_core::merge_quota_overlay(&mut admitted_snapshot, &windows, &facts, &[]);
     }
     for (route, _, _, _, _) in eligible
         .into_iter()

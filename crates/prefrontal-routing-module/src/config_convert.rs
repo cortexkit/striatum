@@ -274,6 +274,8 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
         .or_insert_with(|| data["model_naming"].clone());
     root.entry("head_agents")
         .or_insert_with(|| data["head_agents"].clone());
+    root.entry("quota_model_pools")
+        .or_insert_with(|| data["quota_model_pools"].clone());
     if let Some(accounts) = root.remove("account_selection") {
         root.insert("accounts".into(), accounts);
         remove_account_flag(&mut root)?;

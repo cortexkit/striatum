@@ -900,6 +900,10 @@ struct RoutingConfigFile {
     /// a subscription's kept-free reserve. Matched case-insensitively.
     #[serde(default)]
     head_agents: Vec<String>,
+    /// Quota pools that meter only some models: a routed model whose id
+    /// starts with `model_prefix` draws on `pool` beside its family pool.
+    #[serde(default)]
+    quota_model_pools: Vec<QuotaModelPoolConfig>,
     #[serde(default)]
     catalog: CatalogSection,
     #[serde(default)]
@@ -1023,6 +1027,20 @@ impl LiveConfig {
                 .collect(),
         )
     }
+    /// The configured model-specific quota pools.
+    pub(crate) fn quota_model_pools(
+        &self,
+    ) -> Vec<prefrontal_routing_core::quota_extract::ModelPool> {
+        self.config
+            .quota_model_pools
+            .iter()
+            .map(|entry| prefrontal_routing_core::quota_extract::ModelPool {
+                model_prefix: entry.model_prefix.clone(),
+                pool: entry.pool.clone(),
+            })
+            .collect()
+    }
+
     /// Whether `agent` is a head under `head_agents`.
     pub(crate) fn is_head_agent(&self, agent: &str) -> bool {
         let agent = agent.trim();
@@ -1054,14 +1072,16 @@ impl LiveConfig {
         &self,
         provider: &str,
     ) -> prefrontal_routing_core::accounts::AllocatorPolicy {
-        allocator_policy_from(
+        let mut policy = allocator_policy_from(
             &self.config.accounts,
             self.config
                 .providers
                 .get(provider)
                 .map(|provider| &provider.accounts),
         )
-        .expect("account policies are validated before publishing the config")
+        .expect("account policies are validated before publishing the config");
+        policy.model_pools = self.quota_model_pools();
+        policy
     }
 }
 
@@ -1137,6 +1157,13 @@ struct ModelNamingConfig {
     /// with the basic variants. The first match wins.
     #[serde(default)]
     basic_families: Vec<BasicFamilyConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct QuotaModelPoolConfig {
+    model_prefix: String,
+    pool: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -1231,8 +1258,12 @@ impl JsonSchema for ModelFamilyRules {
     }
 
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let globs = serde_json::json!({"type": "array", "items": {"type": "string", "pattern": "\\S"}});
-        let families: Vec<&str> = GrandFamily::ALL.iter().map(|family| family.as_str()).collect();
+        let globs =
+            serde_json::json!({"type": "array", "items": {"type": "string", "pattern": "\\S"}});
+        let families: Vec<&str> = GrandFamily::ALL
+            .iter()
+            .map(|family| family.as_str())
+            .collect();
         let properties: serde_json::Map<String, serde_json::Value> = families
             .iter()
             .map(|family| ((*family).to_owned(), globs.clone()))

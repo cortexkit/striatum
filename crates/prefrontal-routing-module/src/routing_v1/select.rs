@@ -125,8 +125,13 @@ pub(super) async fn select(
         mut snapshot,
         quota_signal_json,
         quota_note: _,
-    } = crate::prepare_selection_inputs(deps.quota_cache, deps.store, live_config.pricing())
-        .map_err(store_refusal)?;
+    } = crate::prepare_selection_inputs(
+        deps.quota_cache,
+        deps.store,
+        live_config.pricing(),
+        &live_config.quota_model_pools(),
+    )
+    .map_err(store_refusal)?;
     // Providers with no catalog rows of their own, each resolved to the
     // catalog provider whose rows it borrows, read once for this selection.
     let catalog_targets = deps

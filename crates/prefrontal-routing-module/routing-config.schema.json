@@ -10,6 +10,7 @@
         "hold_when_reset_within": null,
         "max_hold": null,
         "metered_fallback": false,
+        "model_families": null,
         "order": null,
         "ordered": null,
         "paid_credits": null,
@@ -63,6 +64,14 @@
       },
       "default": {}
     },
+    "head_agents": {
+      "description": "Target agents that are heads: operator-facing sessions that may spend\na subscription's kept-free reserve. Matched case-insensitively.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
     "min_best_effort_adequacy": {
       "description": "Minimum adequacy for best-effort selection (sanity band). Default 0.6.\nClamped to [0, 1]; NaN is rejected loudly at parse time.",
       "type": [
@@ -74,59 +83,15 @@
     },
     "model_families": {
       "$ref": "#/$defs/ModelFamilyRules",
+      "default": {}
+    },
+    "model_naming": {
+      "description": "How providers spell model ids and which model families the capability\nheuristic recognizes; see `ModelNamingConfig`.",
+      "$ref": "#/$defs/ModelNamingConfig",
       "default": {
-        "claude": [
-          "*/claude-*",
-          "anthropic/*",
-          "google/antigravity-claude-*"
-        ],
-        "deepseek": [
-          "*/deepseek-*",
-          "deepseek/*"
-        ],
-        "gemini": [
-          "*/gemini-*",
-          "google/*"
-        ],
-        "glm": [
-          "*/glm-*",
-          "zai/*"
-        ],
-        "gpt": [
-          "openai/*",
-          "*/gpt-*",
-          "*/o1*",
-          "*/o3*",
-          "*/o4*"
-        ],
-        "grok": [
-          "*/grok-*",
-          "xai/*"
-        ],
-        "kimi": [
-          "*/kimi*",
-          "moonshotai/*",
-          "kimi-for-coding/*"
-        ],
-        "llama": [
-          "*/llama-*",
-          "meta/*"
-        ],
-        "minimax": [
-          "*/minimax-*",
-          "minimax/*"
-        ],
-        "mistral": [
-          "*/mistral-*",
-          "mistral/*"
-        ],
-        "other": [
-          "*"
-        ],
-        "qwen": [
-          "*/qwen*",
-          "alibaba-*/*"
-        ]
+        "basic_families": [],
+        "provider_rewrites": {},
+        "vendor_prefixes": []
       }
     },
     "models": {
@@ -156,6 +121,14 @@
         "$ref": "#/$defs/ProviderPolicy"
       },
       "default": {}
+    },
+    "quota_model_pools": {
+      "description": "Quota pools that meter only some models: a routed model whose id\nstarts with `model_prefix` draws on `pool` beside its family pool.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/QuotaModelPoolConfig"
+      }
     },
     "runners": {
       "type": "array",
@@ -191,6 +164,23 @@
         }
       ]
     },
+    "AccountModelFamily": {
+      "description": "One model's quota family under `accounts.model_families`.",
+      "type": "object",
+      "properties": {
+        "family": {
+          "$ref": "#/$defs/AccountQuotaFamily"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "family"
+      ]
+    },
     "AccountPoolFloor": {
       "type": "object",
       "properties": {
@@ -222,6 +212,35 @@
       "additionalProperties": false,
       "required": [
         "remaining_percent"
+      ]
+    },
+    "AccountQuotaFamily": {
+      "description": "The model-scoped quota families account selection keeps apart.",
+      "type": "string",
+      "enum": [
+        "fable",
+        "mythos",
+        "opus",
+        "other"
+      ]
+    },
+    "BasicFamilyConfig": {
+      "type": "object",
+      "properties": {
+        "family": {
+          "type": "string"
+        },
+        "needles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "needles"
       ]
     },
     "CatalogSection": {
@@ -497,94 +516,192 @@
       "additionalProperties": false
     },
     "ModelFamilyRules": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "claude": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "deepseek": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "gemini": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "glm": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "gpt": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "grok": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "kimi": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "llama": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "minimax": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "mistral": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "other": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "qwen": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "family": {
+                "enum": [
+                  "claude",
+                  "gpt",
+                  "gemini",
+                  "grok",
+                  "qwen",
+                  "kimi",
+                  "glm",
+                  "deepseek",
+                  "minimax",
+                  "mistral",
+                  "llama",
+                  "other"
+                ]
+              },
+              "globs": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "\\S"
+                }
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "family",
+              "globs"
+            ]
+          }
+        }
+      ]
+    },
+    "ModelNamingConfig": {
+      "description": "Operator config for `prefrontal_routing_core::ModelNaming`, the model-id\nspelling `route.resolve_model` applies per provider and the model families\n`route.model_capabilities` recognizes by name. The config converter writes\nthe shipped values from its data file.",
       "type": "object",
       "properties": {
-        "claude": {
+        "basic_families": {
+          "description": "Families recognized by a substring of the normalized model id, each\nwith the basic variants. The first match wins.",
           "type": "array",
+          "default": [],
           "items": {
-            "type": "string",
-            "pattern": "\\S"
+            "$ref": "#/$defs/BasicFamilyConfig"
           }
         },
-        "deepseek": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
+        "provider_rewrites": {
+          "description": "The rewrites each provider applies to a model id, in order.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/ModelRewriteConfig"
+            }
+          },
+          "default": {}
         },
-        "gemini": {
+        "vendor_prefixes": {
+          "description": "For a gateway serving other vendors' models as `vendor/model`: the\nvendor of a bare model id, by the id's prefix. The first match wins.",
           "type": "array",
+          "default": [],
           "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "glm": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "gpt": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "grok": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "kimi": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "llama": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "minimax": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "mistral": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "other": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "qwen": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
+            "$ref": "#/$defs/VendorPrefixConfig"
           }
         }
       },
       "additionalProperties": false
+    },
+    "ModelRewriteConfig": {
+      "description": "`vendor_prefix` serves the id as `vendor/model`; `dot_version` spells a\ndashed two-part Claude-style version with a dot; `{\"preview_alias\": a}`\nexpands the bare alias `a` to its `-preview` id.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "vendor_prefix",
+            "dot_version"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "preview_alias": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "preview_alias"
+          ]
+        }
+      ]
     },
     "OverqualificationSection": {
       "description": "`overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.\n`base: 0` switches the term off.",
@@ -883,6 +1000,17 @@
           "type": "boolean",
           "default": false
         },
+        "model_families": {
+          "description": "The models that draw on a model-scoped quota family, by exact model\nid. A model not listed counts as `other`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "$ref": "#/$defs/AccountModelFamily"
+          }
+        },
         "order": {
           "type": [
             "array",
@@ -962,6 +1090,7 @@
             "hold_when_reset_within": null,
             "max_hold": null,
             "metered_fallback": false,
+            "model_families": null,
             "order": null,
             "ordered": null,
             "paid_credits": null,
@@ -1041,6 +1170,22 @@
         }
       },
       "additionalProperties": false
+    },
+    "QuotaModelPoolConfig": {
+      "type": "object",
+      "properties": {
+        "model_prefix": {
+          "type": "string"
+        },
+        "pool": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model_prefix",
+        "pool"
+      ]
     },
     "Ranking": {
       "type": "string",
@@ -1434,6 +1579,22 @@
       "required": [
         "model",
         "variant"
+      ]
+    },
+    "VendorPrefixConfig": {
+      "type": "object",
+      "properties": {
+        "prefix": {
+          "type": "string"
+        },
+        "vendor": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "prefix",
+        "vendor"
       ]
     }
   }

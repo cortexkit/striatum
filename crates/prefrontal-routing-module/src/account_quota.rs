@@ -922,7 +922,7 @@ fn general_windows(usage: Option<&Usage>) -> Vec<WindowView> {
     let Some(usage) = usage else {
         return Vec::new();
     };
-    prefrontal_routing_core::quota_extract::account_rate_windows(usage, None)
+    prefrontal_routing_core::quota_extract::account_rate_windows(usage, None, &[])
         .into_iter()
         .map(|(slot, window)| window_view(slot, &window))
         .collect()
@@ -1772,6 +1772,7 @@ pub async fn account_quota_loop(
     store: Arc<SqliteRouteStateStore>,
     resolver: Arc<dyn CredentialResolver>,
     broca_credentials: crate::broca_credentials::SharedBrocaCredentials,
+    routing_config_path: PathBuf,
 ) {
     use prefrontal_routing_core::RouteStateStore as _;
     let project_root =
@@ -1831,8 +1832,10 @@ pub async fn account_quota_loop(
         if let (Ok(guard), Ok(facts)) = (state.lock(), store.get_facts()) {
             // Providers with no catalog rows resolve from this listing and these
             // rows inside the refresh, so pricing follows the vault.
+            let model_pools =
+                crate::config_overrides::live_config(&routing_config_path).quota_model_pools();
             if let Ok(mut credentials) = broca_credentials.lock() {
-                credentials.refresh_serving_methods(&guard, &facts, now_ms());
+                credentials.refresh_serving_methods(&guard, &facts, now_ms(), &model_pools);
             }
         }
         crate::subscription_economics::refresh(

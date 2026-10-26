@@ -514,6 +514,7 @@ impl BrocaCredentials {
         state: &crate::account_quota::AccountQuotaState,
         facts: &[ModelFact],
         at_ms: i64,
+        model_pools: &[prefrontal_routing_core::quota_extract::ModelPool],
     ) {
         self.catalog_providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
         self.providers.clear();
@@ -545,6 +546,7 @@ impl BrocaCredentials {
                     &fact.provider_id,
                     &fact.model_id,
                     at_ms,
+                    model_pools,
                 );
                 let methods = roster
                     .iter()
@@ -849,6 +851,7 @@ mod tests {
             &crate::account_quota::AccountQuotaState::default(),
             &[crate::tests::fact("openai", "example")],
             1,
+            &[],
         );
         assert_eq!(
             credentials.serving["openai/example"].auth_method.as_deref(),

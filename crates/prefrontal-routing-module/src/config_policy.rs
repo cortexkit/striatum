@@ -477,10 +477,12 @@ pub fn account_model_families(
 ) -> Vec<prefrontal_routing_core::accounts::ModelFamilyMapping> {
     families
         .iter()
-        .map(|entry| prefrontal_routing_core::accounts::ModelFamilyMapping {
-            model: entry.model.clone(),
-            family: entry.family.family(),
-        })
+        .map(
+            |entry| prefrontal_routing_core::accounts::ModelFamilyMapping {
+                model: entry.model.clone(),
+                family: entry.family.family(),
+            },
+        )
         .collect()
 }
 

@@ -111,7 +111,7 @@ mod consumer_and_pin {
             credentials.publish_plan_prices(&plan_prices);
             if let Some(listing) = listing {
                 credentials.apply_listing(&listing, now_ms());
-                credentials.refresh_serving_methods(&crate::account_quota::AccountQuotaState::default(), &facts, now_ms() as i64);
+                credentials.refresh_serving_methods(&crate::account_quota::AccountQuotaState::default(), &facts, now_ms() as i64, &[]);
             }
             let credentials = Arc::new(Mutex::new(credentials));
             handle_select_request(

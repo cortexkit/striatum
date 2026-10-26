@@ -288,11 +288,11 @@ fn capabilities_reply(
     let snapshot = snapshot_from_store(store, &params.provider_id, &params.model_id)?;
     let capabilities = resolve_model_capabilities(
         &ModelCapabilitiesInput {
-        provider_id: params.provider_id,
-        model_id: params.model_id.clone(),
-        runtime_model: params.runtime_model,
-        runtime_snapshot: Some(snapshot),
-        bundled_snapshot: None,
+            provider_id: params.provider_id,
+            model_id: params.model_id.clone(),
+            runtime_model: params.runtime_model,
+            runtime_snapshot: Some(snapshot),
+            bundled_snapshot: None,
         },
         naming,
     );
@@ -363,7 +363,8 @@ mod tests {
     /// The model naming a converted config carries: the converter's shipped
     /// vendor prefixes, provider rewrites and capability families.
     fn default_model_naming() -> prefrontal_routing_core::ModelNaming {
-        serde_json::from_value(crate::config_convert::defaults()["model_naming"].clone()).expect("converter model naming")
+        serde_json::from_value(crate::config_convert::defaults()["model_naming"].clone())
+            .expect("converter model naming")
     }
 
     #[test]
@@ -386,41 +387,47 @@ mod tests {
 
     #[test]
     fn model_resolution_wire_actions_keep_the_typescript_shapes() {
-        let pipeline = resolve(ResolveModelParams {
-            action: "pipeline".into(),
-            request: Some(ModelResolutionRequest {
-                intent: prefrontal_routing_core::ModelResolutionIntent {
-                    user_model: Some("openai/gpt-5.3-codex".into()),
-                    ..Default::default()
-                },
-                constraints: Default::default(),
-                policy: Default::default(),
-            }),
-            user_pin: None,
-            provider_id: None,
-            model_id: None,
-            fallback_chain: Vec::new(),
-            target: None,
-            available_models: Vec::new(),
-            providers: Vec::new(),
-            suggestion: None,
-        }, &default_model_naming())
+        let pipeline = resolve(
+            ResolveModelParams {
+                action: "pipeline".into(),
+                request: Some(ModelResolutionRequest {
+                    intent: prefrontal_routing_core::ModelResolutionIntent {
+                        user_model: Some("openai/gpt-5.3-codex".into()),
+                        ..Default::default()
+                    },
+                    constraints: Default::default(),
+                    policy: Default::default(),
+                }),
+                user_pin: None,
+                provider_id: None,
+                model_id: None,
+                fallback_chain: Vec::new(),
+                target: None,
+                available_models: Vec::new(),
+                providers: Vec::new(),
+                suggestion: None,
+            },
+            &default_model_naming(),
+        )
         .unwrap();
         assert_eq!(pipeline["resolution"]["provenance"], "override");
         assert_eq!(pipeline["resolution"]["model"], "openai/gpt-5.3-codex");
 
-        let suggestion = resolve(ResolveModelParams {
-            action: "suggestion".into(),
-            request: None,
-            user_pin: None,
-            provider_id: Some("anthropic".into()),
-            model_id: Some("claude-sonet-4".into()),
-            fallback_chain: Vec::new(),
-            target: None,
-            available_models: Vec::new(),
-            providers: Vec::new(),
-            suggestion: Some("claude-sonnet-4".into()),
-        }, &default_model_naming())
+        let suggestion = resolve(
+            ResolveModelParams {
+                action: "suggestion".into(),
+                request: None,
+                user_pin: None,
+                provider_id: Some("anthropic".into()),
+                model_id: Some("claude-sonet-4".into()),
+                fallback_chain: Vec::new(),
+                target: None,
+                available_models: Vec::new(),
+                providers: Vec::new(),
+                suggestion: Some("claude-sonnet-4".into()),
+            },
+            &default_model_naming(),
+        )
         .unwrap();
         assert_eq!(suggestion["model"]["modelID"], "claude-sonnet-4");
     }
@@ -457,7 +464,8 @@ mod tests {
 
         // No snapshot has been recorded yet, so the module states no validity
         // rather than a number the caller could mistake for one.
-        let unversioned = capabilities_reply(&store, request(), &default_model_naming()).expect("capabilities project");
+        let unversioned = capabilities_reply(&store, request(), &default_model_naming())
+            .expect("capabilities project");
         assert_eq!(unversioned["catalogVersion"], Value::Null);
         assert!(unversioned["capabilities"]["canonicalModelId"].is_string());
 
@@ -472,8 +480,8 @@ mod tests {
                 )
                 .expect("record a catalog snapshot");
             assert_eq!(
-                capabilities_reply(&store, request(), &default_model_naming()).expect("capabilities project")
-                    ["catalogVersion"],
+                capabilities_reply(&store, request(), &default_model_naming())
+                    .expect("capabilities project")["catalogVersion"],
                 json!(version),
                 "version {version} is a recorded snapshot, not an absent one"
             );

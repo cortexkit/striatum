@@ -592,7 +592,12 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
             },
             crate::now_ms(),
         );
-        credentials.refresh_serving_methods(&Default::default(), &facts, crate::now_ms() as i64);
+        credentials.refresh_serving_methods(
+            &Default::default(),
+            &facts,
+            crate::now_ms() as i64,
+            &[],
+        );
         // Catalog order supplies the kit's synthetic price order on every
         // serving method, including the OAuth accounts used by hold checks.
         let billing_facts: Vec<_> = facts
