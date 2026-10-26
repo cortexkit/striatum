@@ -1810,6 +1810,22 @@ pub async fn account_quota_loop(
             }
         }
 
+        // Readings that arrived since the last admission still end blocks and
+        // grow whole-account recovery sets.
+        // The state is copied first so no account lock is held while the
+        // store transaction is open.
+        let snapshot = state.lock().ok().map(|guard| guard.clone());
+        if let Some(snapshot) = snapshot {
+            if let Err(error) = crate::account_selection::refresh_all_blocks(
+                &store,
+                &snapshot,
+                &prefrontal_routing_core::accounts::AllocatorPolicy::default(),
+                now_ms(),
+            ) {
+                tracing::warn!(error = %error, "account blocks not refreshed");
+            }
+        }
+
         // Account selection and pricing must agree on the serving login. Build
         // the method map after both roster and readings have been refreshed.
         if let (Ok(guard), Ok(facts)) = (state.lock(), store.get_facts()) {

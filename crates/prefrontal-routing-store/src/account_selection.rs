@@ -865,6 +865,52 @@ impl AccountTx<'_> {
         .collect()
     }
 
+    /// Mark a standing block ended, recording when and why. Returns whether
+    /// the block was still standing.
+    pub fn clear_fence(&self, fence_id: &str, at: i64, reason: &str) -> RouteStateResult<bool> {
+        self.conn
+            .execute(
+                "UPDATE account_fence SET cleared_at = ?2, cleared_reason = ?3 \
+                 WHERE fence_id = ?1 AND cleared_at IS NULL",
+                params![fence_id, at, reason],
+            )
+            .map(|changed| changed > 0)
+            .map_err(err)
+    }
+
+    /// Replace a standing whole-account block's recovery set, which only
+    /// grows as later readings report more pools.
+    pub fn set_fence_recovery_set(
+        &self,
+        fence_id: &str,
+        recovery_set: &[PoolKey],
+    ) -> RouteStateResult<()> {
+        let recovery_set = serde_json::to_string(recovery_set).map_err(err)?;
+        self.conn
+            .execute(
+                "UPDATE account_fence SET recovery_set_json = ?2 \
+                 WHERE fence_id = ?1 AND cleared_at IS NULL",
+                params![fence_id, recovery_set],
+            )
+            .map(|_| ())
+            .map_err(err)
+    }
+
+    /// Every provider with at least one standing block.
+    pub fn active_fence_providers(&self) -> RouteStateResult<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT provider FROM account_fence WHERE cleared_at IS NULL \
+                 ORDER BY provider",
+            )
+            .map_err(err)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(err)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(err)
+    }
+
     /// The scoped not-found exclusions reported against this one admission.
     pub fn admission_exclusions(
         &self,

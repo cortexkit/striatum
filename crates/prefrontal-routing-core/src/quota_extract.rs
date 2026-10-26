@@ -224,11 +224,6 @@ fn slug(s: &str) -> String {
     }
 }
 
-/// Insula's provider name for Antigravity. Only its entries carry pooled windows;
-/// the `gemini` product also resolves to the `google` provider id but publishes
-/// per-model windows under different credentials, so it must never be pooled.
-const ANTIGRAVITY_WIRE_PROVIDER: &str = "antigravity";
-
 /// Routing model ids served through Antigravity start with this prefix
 /// (`google/antigravity-gemini-3.8-flash`, `google/antigravity-claude-opus-...`).
 const ANTIGRAVITY_MODEL_PREFIX: &str = "antigravity-";
@@ -406,14 +401,7 @@ pub fn account_rate_windows(
             .filter(|(_, pool, _)| {
                 capacity_key.is_none_or(|key| antigravity_capacity_draws_on_pool(key, pool))
             })
-            .filter_map(|(extra, _, period)| {
-                let mut window = extra.window.clone()?;
-                window.window_kind = extra.window_kind.clone().or(window.window_kind);
-                window.window_minutes = window
-                    .window_minutes
-                    .or(Some((period.window_ms() / 60_000.0) as i64));
-                Some(("extra", window))
-            })
+            .filter_map(|(extra, _, period)| Some(("extra", pool_rate_window(extra, period)?)))
             .collect();
     }
     [
@@ -426,54 +414,77 @@ pub fn account_rate_windows(
     .collect()
 }
 
+/// A pool window's rate window, its period filling in a length or kind the
+/// producer left out.
+fn pool_rate_window(extra: &ExtraWindow, period: PoolPeriod) -> Option<RateWindow> {
+    let mut window = extra.window.clone()?;
+    window.window_kind = extra.window_kind.clone().or(window.window_kind);
+    window.window_minutes = window
+        .window_minutes
+        .or(Some((period.window_ms() / 60_000.0) as i64));
+    Some(window)
+}
+
+/// Every window of an account's whole reading, each with the pool it meters:
+/// a reading's pool windows when it carries any, each named by its pool, and
+/// otherwise its unnamed aggregate windows. Block recovery reads these, so a
+/// block on one pool can be lifted by that pool's window alone.
+pub fn named_account_windows(
+    usage: &crate::quota::Usage,
+) -> Vec<(Option<&'static str>, RateWindow)> {
+    let pools: Vec<_> = usage
+        .extra_rate_windows
+        .iter()
+        .flatten()
+        .filter_map(|extra| {
+            let (pool, period) = antigravity_pool_window(extra)?;
+            Some((Some(pool), pool_rate_window(extra, period)?))
+        })
+        .collect();
+    if !pools.is_empty() {
+        return pools;
+    }
+    [&usage.primary, &usage.secondary, &usage.tertiary]
+        .into_iter()
+        .filter_map(|window| window.as_ref().map(|window| (None, window.clone())))
+        .collect()
+}
+
 pub fn is_account_pool_window(extra: &ExtraWindow) -> bool {
     antigravity_pool_window(extra).is_some()
 }
 
-/// Antigravity (Google AI Ultra): ignore the misleading aggregate windows. Pool
-/// windows in extra_rate_windows[] (`gemini-5h`, `3p-weekly`, ...) are emitted
-/// pool-scoped, so they pressure and wall exactly the routed models that draw on
-/// that pool. Any other window is mapped by title to its matching capacity key,
-/// capacity-key-scoped; unmatched titles (models we don't route to) are skipped.
-/// If extra_rate_windows is absent, emit NOTHING (correct-or-nothing) rather than
-/// fall back to the misleading aggregate.
-fn antigravity_per_model_extractor(
-    entry: &ProviderUsage,
+/// The windows of a pooled or per-model reading (Antigravity, for one), whose
+/// aggregate windows are ignored because they reflect pools the routed models
+/// may not draw on. Pool windows (`gemini-5h`,
+/// `3p-weekly`, ...) are emitted pool-scoped, so they pressure and wall exactly
+/// the routed models that draw on that pool. Any other window is mapped by
+/// title to its matching capacity key, capacity-key-scoped; unmatched titles
+/// (models we don't route to) are skipped.
+fn extra_window_extractor(
+    extra: &[ExtraWindow],
     cb_provider_name: &str,
     capacity_keys: &[String],
 ) -> Vec<ExtractedWindow> {
-    let Some(extra) = entry
-        .usage
-        .as_ref()
-        .and_then(|u| u.extra_rate_windows.as_ref())
-    else {
-        return Vec::new();
-    };
-    if extra.is_empty() {
-        return Vec::new();
-    }
-    let pooled_entry = cb_provider_name == ANTIGRAVITY_WIRE_PROVIDER;
     let mut out = Vec::new();
     for item in extra {
-        if pooled_entry {
-            if let (Some((pool, period)), Some(window), Some(id)) = (
-                antigravity_pool_window(item),
-                item.window.as_ref(),
-                item.id.as_deref(),
+        if let (Some((pool, period)), Some(window), Some(id)) = (
+            antigravity_pool_window(item),
+            item.window.as_ref(),
+            item.id.as_deref(),
+        ) {
+            if let Some(mut extracted) = rate_window_to_extracted(
+                Some(window),
+                format!("codexbar:{cb_provider_name}:{id}"),
+                WindowScopeKind::AntigravityPool,
+                Some(pool.to_string()),
             ) {
-                if let Some(mut extracted) = rate_window_to_extracted(
-                    Some(window),
-                    format!("codexbar:{cb_provider_name}:{id}"),
-                    WindowScopeKind::AntigravityPool,
-                    Some(pool.to_string()),
-                ) {
-                    // The period names the window length when the producer did
-                    // not publish `windowMinutes` itself.
-                    extracted.window_ms = extracted.window_ms.or(Some(period.window_ms()));
-                    out.push(extracted);
-                }
-                continue;
+                // The period names the window length when the producer did
+                // not publish `windowMinutes` itself.
+                extracted.window_ms = extracted.window_ms.or(Some(period.window_ms()));
+                out.push(extracted);
             }
+            continue;
         }
         let (Some(title), Some(window)) = (item.title.as_ref(), item.window.as_ref()) else {
             continue;
@@ -499,19 +510,28 @@ fn antigravity_per_model_extractor(
     out
 }
 
-/// Extract the windows for one provider-usage entry, dispatching to the
-/// provider-specific extractor (registry keyed by RESOLVED providerID; providers
-/// absent use the aggregate-account default).
+/// Extract the windows for one provider-usage entry by the reading's shape,
+/// never by provider id. A reading whose `extra_rate_windows` carry pool
+/// windows, or per-model windows whose titles name routed capacities, yields
+/// those windows and its aggregate is ignored. Any other reading yields its
+/// aggregate windows, so extra windows that name neither (such as a family's
+/// scoped window beside the aggregates) leave a reading aggregate. The same
+/// reading body yields the same pools under any provider id.
 pub fn extract_windows(
     entry: &ProviderUsage,
-    provider_id: &str,
     cb_provider_name: &str,
     capacity_keys: &[String],
 ) -> Vec<ExtractedWindow> {
-    match provider_id {
-        "google" => antigravity_per_model_extractor(entry, cb_provider_name, capacity_keys),
-        _ => aggregate_account_extractor(entry, cb_provider_name),
+    let extra = entry
+        .usage
+        .as_ref()
+        .and_then(|usage| usage.extra_rate_windows.as_deref())
+        .unwrap_or_default();
+    let per_model = extra_window_extractor(extra, cb_provider_name, capacity_keys);
+    if !per_model.is_empty() || extra.iter().any(is_account_pool_window) {
+        return per_model;
     }
+    aggregate_account_extractor(entry, cb_provider_name)
 }
 
 // ── minimal RFC3339 parse (no chrono dep in -core) ─────────────────────────
@@ -629,7 +649,7 @@ mod tests {
             error_class: None,
             saved_resets: None,
         };
-        let out = extract_windows(&entry, "openai", "codex", &[]);
+        let out = extract_windows(&entry, "codex", &[]);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|w| w.scope_kind == WindowScopeKind::Account));
         assert_eq!(out[0].window_key, "codexbar:codex:primary");
@@ -668,7 +688,7 @@ mod tests {
             saved_resets: None,
         };
 
-        let out = extract_windows(&entry, "ollama", "ollama", &[]);
+        let out = extract_windows(&entry, "ollama", &[]);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].utilization, 1.0);
@@ -709,7 +729,7 @@ mod tests {
             saved_resets: None,
         };
 
-        let out = extract_windows(&entry, "ollama", "ollama", &[]);
+        let out = extract_windows(&entry, "ollama", &[]);
         assert_eq!(out.len(), 1, "the account must stay represented");
         assert_eq!(out[0].utilization, 0.0, "idle is zero pressure");
         assert_eq!(out[0].resets_at, None, "and no recovery time is fabricated");
@@ -737,7 +757,7 @@ mod tests {
             saved_resets: None,
         };
 
-        let out = extract_windows(&entry, "ollama", "ollama", &[]);
+        let out = extract_windows(&entry, "ollama", &[]);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].utilization, 0.4);
@@ -804,7 +824,7 @@ mod tests {
             "google/antigravity-gemini-3.5-flash".to_string(),
             "google/antigravity-gemini-3.1-pro".to_string(),
         ];
-        let out = extract_windows(&entry, "google", "antigravity", &caps);
+        let out = extract_windows(&entry, "antigravity", &caps);
         // Only the matched Gemini Flash window: the aggregate + GPT-OSS are dropped.
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].scope_kind, WindowScopeKind::CapacityKey);
@@ -876,7 +896,7 @@ mod tests {
             saved_resets: None,
         };
         let caps = vec!["google/antigravity-gemini-3.6-flash".to_string()];
-        let out = extract_windows(&entry, "google", "antigravity", &caps);
+        let out = extract_windows(&entry, "antigravity", &caps);
         assert_eq!(out.len(), 1, "external pool skipped, gemini pool kept");
         assert_eq!(
             out[0].applies_key.as_deref(),
@@ -945,7 +965,7 @@ mod tests {
             "google/antigravity-gemini-3.5-flash".to_string(),
             "google/antigravity-gemini-3.6-flash".to_string(),
         ];
-        let out = extract_windows(&entry, "google", "gemini", &caps);
+        let out = extract_windows(&entry, "gemini", &caps);
         assert_eq!(
             out.len(),
             0,
@@ -1007,7 +1027,7 @@ mod tests {
             // The Gemini API product shares the provider id; no pool applies.
             "google/gemini-3.6-flash".to_string(),
         ];
-        let out = extract_windows(&entry, "google", "antigravity", &caps);
+        let out = extract_windows(&entry, "antigravity", &caps);
         let pools: Vec<(&str, Option<&str>, Option<f64>)> = out
             .iter()
             .map(|w| {
@@ -1186,7 +1206,7 @@ mod tests {
             "google/antigravity-gemini-3.1-pro".to_string(),
             "google/antigravity-claude-opus-4-6-thinking".to_string(),
         ];
-        let out = extract_windows(&entry, "google", "antigravity", &caps);
+        let out = extract_windows(&entry, "antigravity", &caps);
         let emitted: Vec<(&str, Option<&str>, f64)> = out
             .iter()
             .map(|w| {
@@ -1209,6 +1229,11 @@ mod tests {
         }
     }
 
+    // Replaces `antigravity_with_no_extras_emits_nothing`. Extraction used to
+    // dispatch on the provider id and the wire name, so an Antigravity entry
+    // without extra windows extracted nothing. Windows are now chosen by the
+    // reading's shape alone: a reading without extra windows is an aggregate
+    // reading, whichever provider sent it.
     #[test]
     fn antigravity_argon_weekly_window_reaches_argon_routes_only() {
         // A paid Pro account reads its separate Gemini 4 Argon weekly limit as
@@ -1287,7 +1312,7 @@ mod tests {
             error_class: None,
             saved_resets: None,
         };
-        let argon_pool: Vec<_> = extract_windows(&entry, "google", "antigravity", &caps)
+        let argon_pool: Vec<_> = extract_windows(&entry, "antigravity", &caps)
             .into_iter()
             .filter(|w| w.applies_key.as_deref() == Some("gemini-argon"))
             .map(|w| (w.window_key, w.scope_kind, w.window_ms))
@@ -1303,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_with_no_extras_emits_nothing() {
+    fn a_reading_without_extra_windows_yields_its_aggregate_windows() {
         let entry = ProviderUsage {
             stale: None,
             fetched_at: None,
@@ -1312,10 +1337,10 @@ mod tests {
             account: None,
             source: None,
             usage: Some(Usage {
-                primary: Some(win(100.0, "2026-01-01T00:00:00Z", None)),
+                primary: Some(win(100.0, "2026-01-01T00:00:00Z", Some(300))),
                 secondary: None,
                 tertiary: None,
-                extra_rate_windows: None,
+                extra_rate_windows: Some(Vec::new()),
             }),
             spend: Vec::new(),
             error: None,
@@ -1323,7 +1348,83 @@ mod tests {
             saved_resets: None,
         };
         let caps = vec!["google/antigravity-gemini-3.5-flash".to_string()];
-        assert!(extract_windows(&entry, "google", "antigravity", &caps).is_empty());
+        let out = extract_windows(&entry, "antigravity", &caps);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].scope_kind, WindowScopeKind::Account);
+        assert_eq!(out[0].window_key, "codexbar:antigravity:primary");
+    }
+
+    /// The body of an Antigravity reading with one Gemini and one third-party
+    /// pool, each with a five-hour and a weekly window.
+    fn two_pool_entry(provider: &str) -> ProviderUsage {
+        let pool = |id: &str, used: f64| ExtraWindow {
+            title: None,
+            id: Some(id.into()),
+            window: Some(win(used, "2026-01-01T00:00:00Z", None)),
+            window_kind: None,
+        };
+        ProviderUsage {
+            stale: None,
+            fetched_at: None,
+            api_provider: None,
+            provider: provider.into(),
+            account: None,
+            source: None,
+            usage: Some(Usage {
+                // An aggregate beside pools is not read.
+                primary: Some(win(100.0, "2026-01-01T00:00:00Z", Some(300))),
+                secondary: None,
+                tertiary: None,
+                extra_rate_windows: Some(vec![
+                    pool("gemini-5h", 10.0),
+                    pool("gemini-weekly", 20.0),
+                    pool("3p-5h", 100.0),
+                    pool("3p-weekly", 30.0),
+                ]),
+            }),
+            spend: Vec::new(),
+            error: None,
+            error_class: None,
+            saved_resets: None,
+        }
+    }
+
+    #[test]
+    fn an_antigravity_shaped_reading_yields_two_pools_under_any_provider() {
+        let caps = vec![
+            "google/antigravity-gemini-3.6-flash".to_string(),
+            "google/antigravity-claude-opus-4-6-thinking".to_string(),
+        ];
+        let pools = |entry: &ProviderUsage, wire: &str| {
+            extract_windows(entry, wire, &caps)
+                .into_iter()
+                .map(|w| {
+                    assert_eq!(w.scope_kind, WindowScopeKind::AntigravityPool);
+                    (w.applies_key, w.window_ms, w.utilization)
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = pools(&two_pool_entry("antigravity"), "antigravity");
+        let names: std::collections::BTreeSet<_> = first
+            .iter()
+            .filter_map(|(pool, _, _)| pool.clone())
+            .collect();
+        assert_eq!(
+            names,
+            ["3p".to_string(), "gemini".to_string()].into(),
+            "two pools, neither named five_hour nor seven_day"
+        );
+        assert_eq!(
+            first.len(),
+            4,
+            "each pool keeps its five-hour and weekly window"
+        );
+        // The same body under another provider name and wire name yields the
+        // same pools: nothing here reads the provider.
+        assert_eq!(
+            first,
+            pools(&two_pool_entry("some-other-vendor"), "other-wire")
+        );
     }
 
     #[test]

@@ -4,10 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::evidence::MigrateReason;
-use super::types::{
-    CandidateRef, ConversationKeySource, EpochMs, FenceScope, GeneralWindow, ModelFamily,
-};
+use super::pools::PoolKey;
+use super::types::{CandidateRef, ConversationKeySource, EpochMs, GeneralWindow, ModelFamily};
 
 /// Reading age band (design, "Insula input and conservative degraded behavior").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,8 +77,10 @@ pub enum ExclusionReason {
     },
     /// Every remaining record needs re-authorization.
     ReauthRequired,
+    /// A standing block on a pool the requested model draws on; `pool` is
+    /// `None` for a block on the whole account.
     ConfirmedFence {
-        scope: FenceScope,
+        pool: Option<PoolKey>,
     },
     QuotaMissing,
     EntryErrorClass {
@@ -222,11 +222,10 @@ pub enum InvalidationReason {
     NotInRunnerCandidates,
     PrincipalExcluded,
     ReauthRequired,
-    /// `account_limit_exhausted` with no window, for this family.
-    UnknownScopeFence,
-    /// Confirmed exhaustion on an applicable scope (reference reasons).
+    /// A confirmed block on an applicable pool (`None`: the whole account)
+    /// whose reset is unknown or too far away to hold for.
     ConfirmedExhaustion {
-        migrate: MigrateReason,
+        pool: Option<PoolKey>,
     },
     /// A full-band reading shows an applicable window at 100% used. This is a
     /// conversation-local move; it creates no fence.
@@ -421,9 +420,10 @@ pub struct Hold {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldBasis {
-    /// A confirmed 5h exhaustion fence on the account (shared state).
+    /// A confirmed block on the account (shared state).
     ConfirmedFence,
-    /// A full-band 5h reading at 100% used (possibly a rounded raw 0.995).
+    /// A full-band reading with a window at 100% used (possibly a rounded raw
+    /// 0.995).
     /// Soft and local to this conversation: it is not confirmation, creates
     /// no fence and grants no post-reset probe; each later admission
     /// re-evaluates it against the newest reading.

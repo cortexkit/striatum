@@ -7,12 +7,11 @@
 mod accounts_support;
 
 use accounts_support::*;
-use prefrontal_routing_core::accounts::evidence::MigrateReason;
 use prefrontal_routing_core::accounts::{
     decide, AccountRef, AdmissionState, AdmitReason, AffinityNote, AffinityOutcome, AgeBand,
     ApplicableWindow, CallerKind, CredentialRecord, Decision, ExclusionReason, FenceScope,
     GeneralWindow, HoldBasis, ImportNote, InvalidationReason, ModelFamily, ModelReach,
-    OperatorOverride, OverrideNote, PreviousPin, PrincipalExclusion, RefusalCode,
+    OperatorOverride, OverrideNote, PoolKey, PreviousPin, PrincipalExclusion, RefusalCode,
     RequestedAccountIgnored, RequestedAccountNote, ResetTime, ScopedList, ScopedListState,
     ScopedWindow, StaleDisclosure,
 };
@@ -454,7 +453,7 @@ fn confirmed_short_hold_returns_account_hold_within_the_callers_wait() {
         assert_eq!(
             invalidated(&decision),
             InvalidationReason::ConfirmedExhaustion {
-                migrate: MigrateReason::FiveHour
+                pool: Some(PoolKey::general(GeneralWindow::FiveHour))
             }
         );
     }
@@ -603,10 +602,12 @@ fn fresh_only_move_without_a_sibling_is_reserve_limited_with_no_new_pin() {
     }
 }
 
-/// With both a confirmed 5h fence and a fresh 5h 100% reading present and
-/// disagreeing on the reset, the confirmed fence governs the hold decision.
+/// With a confirmed 5h block and a fresh 5h 100% reading disagreeing on the
+/// reset, the account frees only at the later of the two, so the later reset
+/// decides the hold. This replaces the rule that the confirmed fence governs:
+/// whatever window blocks continuation decides.
 #[test]
-fn confirmed_five_hour_fence_governs_over_a_conflicting_fresh_reading() {
+fn the_latest_blocking_reset_decides_between_a_block_and_a_fresh_reading() {
     let pool = |fence_reset, reading_reset| {
         let mut fresh = reading(100.0, 10.0);
         fresh.five_hour.as_mut().unwrap().resets_at = reading_reset;
@@ -618,7 +619,7 @@ fn confirmed_five_hour_fence_governs_over_a_conflicting_fresh_reading() {
         st.fences.push(five_hour_fence("acct-a", fence_reset));
         st
     };
-    // Fence resets in 2 h, reading says 14 min: migrate, no soft hold.
+    // Block resets in 2 h, reading says 14 min: move, no soft hold.
     let st = pool(
         ResetTime::At(NOW + 2 * HOUR),
         ResetTime::At(NOW + 14 * MINUTE),
@@ -628,13 +629,27 @@ fn confirmed_five_hour_fence_governs_over_a_conflicting_fresh_reading() {
     assert_eq!(
         invalidated(&decision),
         InvalidationReason::ConfirmedExhaustion {
-            migrate: MigrateReason::FiveHour
+            pool: Some(PoolKey::general(GeneralWindow::FiveHour))
         }
     );
-    // Fence resets in 14 min, reading says 2 h: a confirmed hold.
+    // Block resets in 14 min, reading says 2 h: the reading's window still
+    // blocks after the block ends, so the conversation moves.
     let st = pool(
         ResetTime::At(NOW + 14 * MINUTE),
         ResetTime::At(NOW + 2 * HOUR),
+    );
+    let decision = decide(&request(), &st, NOW);
+    assert_eq!(admitted(&decision), "acct-b");
+    assert_eq!(
+        invalidated(&decision),
+        InvalidationReason::FreshFullReading {
+            window: ApplicableWindow::FiveHour
+        }
+    );
+    // Both 14 min away: a hold, on the confirmed block.
+    let st = pool(
+        ResetTime::At(NOW + 14 * MINUTE),
+        ResetTime::At(NOW + 14 * MINUTE),
     );
     let decision = decide(&request(), &st, NOW);
     let hold = decision.hold().expect("confirmed hold");
@@ -643,8 +658,11 @@ fn confirmed_five_hour_fence_governs_over_a_conflicting_fresh_reading() {
     assert_eq!(hold.retry_after_s, 846);
 }
 
+/// The hold rule looks only at the window that blocks continuation: a 7-day
+/// or model-scoped block resetting within the bound holds like a 5-hour one,
+/// and any block beyond the bound moves, with no fixed window order.
 #[test]
-fn confirmed_long_and_scoped_exhaustion_migrate_in_reference_order() {
+fn any_blocking_window_holds_within_the_bound_and_moves_beyond_it() {
     let pool = |model: &str| {
         let mut st = state(vec![
             account("acct-a", Some(reading(10.0, 10.0))),
@@ -653,23 +671,35 @@ fn confirmed_long_and_scoped_exhaustion_migrate_in_reference_order() {
         st.affinity = Some(affinity("acct-a", model, 3));
         st
     };
+    let seven_day = |reset| {
+        fence(
+            "acct-a",
+            FenceScope::General(GeneralWindow::SevenDay),
+            reset,
+        )
+    };
+    // A 7-day window resetting in 10 minutes holds.
     let mut st = pool("claude-sonnet-5");
-    st.fences.push(fence(
-        "acct-a",
-        FenceScope::General(GeneralWindow::SevenDay),
-        ResetTime::At(NOW + HOUR),
-    ));
+    st.fences.push(seven_day(ResetTime::At(NOW + 10 * MINUTE)));
+    let hold = decide(&request(), &st, NOW);
+    let hold = hold.hold().expect("a 7-day block 10 min from reset holds");
+    assert_eq!(hold.reset_at_ms, NOW + 10 * MINUTE);
+
+    // With a 5h block 5 minutes away and a 7d block an hour away, the 7d
+    // block is the one that blocks continuation: move.
+    let mut st = pool("claude-sonnet-5");
+    st.fences.push(seven_day(ResetTime::At(NOW + HOUR)));
     st.fences
         .push(five_hour_fence("acct-a", ResetTime::At(NOW + 5 * MINUTE)));
     let decision = decide(&request(), &st, NOW);
     assert_eq!(
         invalidated(&decision),
         InvalidationReason::ConfirmedExhaustion {
-            migrate: MigrateReason::SevenDay
+            pool: Some(PoolKey::general(GeneralWindow::SevenDay))
         }
     );
 
-    // A Fable fence moves a Fable conversation, never an Opus one.
+    // A Fable block moves a Fable conversation, never an Opus one.
     let fable_fence = fence(
         "acct-a",
         FenceScope::Family(ModelFamily::Fable),
@@ -681,7 +711,7 @@ fn confirmed_long_and_scoped_exhaustion_migrate_in_reference_order() {
     assert_eq!(
         invalidated(&decision),
         InvalidationReason::ConfirmedExhaustion {
-            migrate: MigrateReason::ModelScoped
+            pool: fable_fence.pool.clone()
         }
     );
     let mut st = pool("claude-opus-5-5");
@@ -690,22 +720,24 @@ fn confirmed_long_and_scoped_exhaustion_migrate_in_reference_order() {
     assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
 }
 
-/// A general fence whose reset has passed stops excluding the account once a
-/// reading observed after that reset shows the window below 100%. A reading
-/// from before the reset, or a reset still ahead, keeps the fence. Without the
-/// lift, an account stayed excluded long after its window reset.
+/// A block ends when its known reset passes, whatever the reading says, and a
+/// fresh reading observed after the block lifts it before the reset when it
+/// shows headroom on the blocked window. An older reading, or one observed at
+/// the same instant, does not. Replaces the earlier rule, under which only a
+/// post-reset reading lifted a passed general fence.
 #[test]
-fn post_reset_reading_lifts_a_passed_general_fence() {
-    let pool = |reset: ResetTime, observed_at_ms: i64| {
-        let mut fresh = reading(0.0, 0.0);
+fn a_block_ends_at_its_reset_or_on_newer_headroom() {
+    let pool = |reset: ResetTime, observed_at_ms: i64, seven_used: f64| {
+        let mut fresh = reading(0.0, seven_used);
         fresh.observed_at_ms = Some(observed_at_ms);
         let mut st = state(vec![account("acct-a", Some(fresh))]);
-        st.affinity = None;
-        st.fences.push(fence(
+        let mut block = fence(
             "acct-a",
             FenceScope::General(GeneralWindow::SevenDay),
             reset,
-        ));
+        );
+        block.observed_at_ms = NOW - 2 * MINUTE;
+        st.fences.push(block);
         st
     };
     let fenced = |decision: &Decision| {
@@ -713,46 +745,38 @@ fn post_reset_reading_lifts_a_passed_general_fence() {
             .iter()
             .any(|reason| matches!(reason, ExclusionReason::ConfirmedFence { .. }))
     };
+    let passed = ResetTime::At(NOW - HOUR);
+    let ahead = ResetTime::At(NOW + HOUR);
 
-    // Reset passed an hour ago and the reading came after it: the fence lifts.
-    let decision = decide(&request(), &pool(ResetTime::At(NOW - HOUR), NOW), NOW);
+    // The reset passed: the block ended, even with only an older reading.
+    let decision = decide(&request(), &pool(passed, NOW - 3 * MINUTE, 0.0), NOW);
     assert!(!fenced(&decision), "{decision:?}");
     assert_eq!(admitted(&decision), "acct-a");
 
-    // The reading predates the reset: it cannot show the new window.
-    let decision = decide(
-        &request(),
-        &pool(ResetTime::At(NOW - HOUR), NOW - 2 * HOUR),
-        NOW,
-    );
+    // Newer headroom lifts it before the reset.
+    let decision = decide(&request(), &pool(ahead, NOW - MINUTE, 0.0), NOW);
+    assert!(!fenced(&decision), "{decision:?}");
+    // Older headroom arriving late does not, nor does headroom observed at
+    // the same instant as the exhaustion.
+    for observed_at in [NOW - 3 * MINUTE, NOW - 2 * MINUTE] {
+        let decision = decide(&request(), &pool(ahead, observed_at, 0.0), NOW);
+        assert!(fenced(&decision), "{observed_at}: {decision:?}");
+    }
+    // A newer reading still at 100% on the blocked window keeps it.
+    let decision = decide(&request(), &pool(ahead, NOW - MINUTE, 100.0), NOW);
     assert!(fenced(&decision), "{decision:?}");
-
-    // The reset is still ahead: the confirmed exhaustion still governs.
-    let decision = decide(&request(), &pool(ResetTime::At(NOW + HOUR), NOW), NOW);
-    assert!(fenced(&decision), "{decision:?}");
-
-    // A fresh post-reset reading at 100% keeps the account fenced.
-    let mut full = pool(ResetTime::At(NOW - HOUR), NOW);
-    full.roster.as_mut().unwrap().accounts[0]
-        .quota
-        .as_mut()
-        .unwrap()
-        .seven_day
-        .as_mut()
-        .unwrap()
-        .used_percent = 100.0;
-    assert!(fenced(&decide(&request(), &full, NOW)));
 }
 
 #[test]
-fn unknown_scope_fence_moves_only_its_family() {
+fn a_migrated_unknown_scope_block_moves_only_its_family() {
     let mut st = state(vec![account("acct-a", Some(reading(10.0, 10.0)))]);
     st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
-    st.fences.push(fence(
+    let block = fence(
         "acct-a",
         FenceScope::UnknownScope(ModelFamily::Opus),
         ResetTime::Missing,
-    ));
+    );
+    st.fences.push(block.clone());
     let decision = decide(&request(), &st, NOW);
     assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
 
@@ -760,7 +784,7 @@ fn unknown_scope_fence_moves_only_its_family() {
     let decision = decide(&with_model(request(), "claude-opus-5-5"), &st, NOW);
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::UnknownScopeFence
+        InvalidationReason::ConfirmedExhaustion { pool: block.pool }
     );
     // Cold Opus work is blocked on that account too.
     assert_eq!(refused(&decision), RefusalCode::AccountPoolExhausted);
@@ -1663,4 +1687,75 @@ fn every_decision_is_machine_readable() {
     assert_eq!(value["explanation"]["accounts"][0]["account_id"], "acct-a");
     let back: Decision = serde_json::from_value(value).unwrap();
     assert_eq!(back, decision);
+}
+
+/// One account holds independent quota pools. A block on one pool restricts
+/// only the models drawing on it; another pool's models stay selectable.
+#[test]
+fn an_exhausted_pool_leaves_the_other_pools_models_selectable() {
+    let mut st = state(vec![account("acct-a", Some(reading(10.0, 10.0)))]);
+    let mut gemini = fence(
+        "acct-a",
+        FenceScope::General(GeneralWindow::FiveHour),
+        ResetTime::Missing,
+    );
+    gemini.pool = Some(PoolKey {
+        window_minutes: Some(300),
+        scope: prefrontal_routing_core::accounts::PoolScope::EveryModel,
+        name: Some("gemini".into()),
+    });
+    st.fences.push(gemini);
+    let mut third_party = request();
+    third_party.pool = Some("3p".into());
+    assert_eq!(admitted(&decide(&third_party, &st, NOW)), "acct-a");
+    let mut drawing = request();
+    drawing.pool = Some("gemini".into());
+    assert_eq!(
+        refused(&decide(&drawing, &st, NOW)),
+        RefusalCode::AccountPoolExhausted
+    );
+}
+
+/// With no readings at all, a confirmed exhaustion with no reset and no hint
+/// blocks the account until `unknown_reset_retry_ms` after confirmation, a
+/// Retry-After hint brings that forward, and a known reset ends the block one
+/// moment after it passes.
+#[test]
+fn without_readings_a_block_ends_at_its_reset_or_its_retry_time() {
+    let blocked = |block: prefrontal_routing_core::accounts::Fence, at: i64| {
+        let mut st = state(vec![account("acct-a", None)]);
+        st.fences.push(block);
+        decide(&request(), &st, at)
+    };
+    let mut whole = fence(
+        "acct-a",
+        FenceScope::General(GeneralWindow::FiveHour),
+        ResetTime::Missing,
+    );
+    whole.pool = None;
+    let six_hours = NOW + 6 * HOUR;
+    assert_eq!(
+        refused(&blocked(whole.clone(), six_hours - 1)),
+        RefusalCode::AccountPoolExhausted
+    );
+    assert_eq!(admitted(&blocked(whole.clone(), six_hours)), "acct-a");
+
+    let mut hinted = whole.clone();
+    hinted.retry_hint_ms = Some(NOW + 30 * MINUTE);
+    assert_eq!(
+        refused(&blocked(hinted.clone(), NOW + 29 * MINUTE)),
+        RefusalCode::AccountPoolExhausted
+    );
+    assert_eq!(admitted(&blocked(hinted, NOW + 30 * MINUTE)), "acct-a");
+
+    let mut reset = whole;
+    reset.reset = ResetTime::At(NOW + 10 * MINUTE);
+    assert_eq!(
+        refused(&blocked(reset.clone(), NOW + 10 * MINUTE)),
+        RefusalCode::AccountPoolExhausted
+    );
+    assert_eq!(
+        admitted(&blocked(reset, NOW + 10 * MINUTE + 1000)),
+        "acct-a"
+    );
 }

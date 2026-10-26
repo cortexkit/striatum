@@ -1,20 +1,22 @@
 //! Exhaustion evidence: header normalization, the three confirmation sources,
-//! the short-hold rule and the Retry-After jitter.
+//! the hold rule's reset check and the Retry-After jitter.
 //!
 //! Design reference: `docs/designs/account-selection.md`, "Exhaustion is
-//! evidence, not a status-word shortcut". The rounding, short-hold and jitter
+//! evidence, not a status-word shortcut". The rounding, reset-bound and jitter
 //! functions port anthropic-auth at b504bc84
 //! (`packages/core/src/quota-headers.ts:40`,
-//! `packages/core/src/sticky-routing.ts:369-413,422-428`) exactly; the golden
-//! vectors in `tests/fixtures/antauth-routing-vectors-b504bc84-20260929.json`
-//! pin them.
+//! `packages/core/src/sticky-routing.ts:369-413,422-428`); the golden vectors
+//! in `tests/fixtures/antauth-routing-vectors-b504bc84-20260929.json` pin
+//! them. The reference's fixed window order (model scope moves, 7d moves, 5h
+//! holds) is not ported: whatever window blocks continuation decides.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::pools::{PoolKey, PoolScope};
 use super::types::{
-    ConfirmationSource, EpochMs, Fence, FenceScope, GeneralWindow, ModelFamily, ObservationSource,
-    QuotaWindow, ResetTime,
+    ConfirmationSource, EpochMs, Fence, GeneralWindow, ModelFamily, ObservationSource, QuotaWindow,
+    ResetTime,
 };
 
 /// The reference's header normalization: `round(utilization * 100)` clamped to
@@ -149,11 +151,15 @@ pub struct RateLimitEvent {
 pub enum ObservationKind {
     /// Source 1: Broca's typed `account_limit_exhausted` for the frozen account.
     BrocaLimitExhausted {
-        provider: String,
         /// Verbatim value of the `anthropic-ratelimit-unified-representative-claim`
-        /// response header;
-        /// absent when the header was absent (and always for ChatGPT).
+        /// response header; absent when the header was absent. `five_hour`
+        /// and `seven_day` name the unnamed windows of that length; any other
+        /// value names a pool of unknown length.
         limit_window: Option<String>,
+        /// The quota pool the report names (the routing/v1 `pool` member);
+        /// absent when the account is one pool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool: Option<String>,
         requested_family: ModelFamily,
         resets_at_ms: Option<EpochMs>,
         resets_at_source: Option<ResetSource>,
@@ -212,12 +218,6 @@ pub enum ConfirmationOutcome {
         /// never used as a fence reset.
         transient_retry_after_s: Option<u64>,
     },
-    /// Broca reported a `limit_window` value routing has no mapping for. The
-    /// design names `seven_day` and `five_hour` and the absent case only, so
-    /// this is left for the caller to surface rather than guessed.
-    Unclassified {
-        limit_window: String,
-    },
 }
 
 fn not_confirmed(reason: NotConfirmedReason) -> ConfirmationOutcome {
@@ -227,11 +227,18 @@ fn not_confirmed(reason: NotConfirmedReason) -> ConfirmationOutcome {
     }
 }
 
-fn fence_scope(scope: EvidenceScope) -> FenceScope {
-    match scope {
-        EvidenceScope::General(window) => FenceScope::General(window),
-        EvidenceScope::Family(family) => FenceScope::Family(family),
-    }
+/// The pool key a window reading's scope names. A general window is the
+/// unnamed window of its length for every model; a family's scoped window is
+/// that family's unnamed key, its length not carried on the evidence.
+fn evidence_pool(scope: EvidenceScope) -> Option<PoolKey> {
+    Some(match scope {
+        EvidenceScope::General(window) => PoolKey::general(window),
+        EvidenceScope::Family(family) => PoolKey {
+            window_minutes: None,
+            scope: PoolScope::Family(family),
+            name: None,
+        },
+    })
 }
 
 /// Header-derived evidence value check: genuine frame, raw >= 1.0.
@@ -258,10 +265,13 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
         return not_confirmed(NotConfirmedReason::Unbound);
     }
     let fence =
-        |scope, observed_at_ms, reset, retry_hint_ms, source| ConfirmationOutcome::Confirmed {
+        |pool, observed_at_ms, reset, retry_hint_ms, source| ConfirmationOutcome::Confirmed {
             fence: Fence {
                 account_id: observation.account_id.clone(),
-                scope,
+                pool,
+                // The caller fills a whole-account block's recovery set from
+                // the account's latest fresh reading.
+                recovery_set: Vec::new(),
                 observed_at_ms,
                 reset,
                 retry_hint_ms,
@@ -270,8 +280,8 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
         };
     match &observation.kind {
         ObservationKind::BrocaLimitExhausted {
-            provider,
             limit_window,
+            pool,
             requested_family,
             resets_at_ms,
             resets_at_source,
@@ -284,25 +294,12 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
                 (Some(at), _) => (ResetTime::Missing, Some(*at)),
                 (None, _) => (ResetTime::Missing, None),
             };
-            let scope = if provider == "openai" {
-                // ChatGPT publishes a single weekly window, and its
-                // `usage_limit_reached` error names no window, so the wall maps
-                // to that one window.
-                FenceScope::General(GeneralWindow::SevenDay)
-            } else {
-                match limit_window.as_deref() {
-                    Some("five_hour") => FenceScope::General(GeneralWindow::FiveHour),
-                    Some("seven_day") => FenceScope::General(GeneralWindow::SevenDay),
-                    None => FenceScope::UnknownScope(*requested_family),
-                    Some(other) => {
-                        return ConfirmationOutcome::Unclassified {
-                            limit_window: other.to_string(),
-                        }
-                    }
-                }
-            };
+            // A report naming no pool blocks the whole account, whatever
+            // provider it came from.
+            let pool =
+                PoolKey::for_report(limit_window.as_deref(), pool.as_deref(), *requested_family);
             fence(
-                scope,
+                pool,
                 *observed_at_ms,
                 reset,
                 retry_hint,
@@ -334,7 +331,7 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
                     raw_utilization,
                 } => match header_value_confirms(frame, raw_utilization) {
                     Ok(()) => fence(
-                        fence_scope(reading.scope),
+                        evidence_pool(reading.scope),
                         reading.observed_at_ms,
                         reading.reset,
                         None,
@@ -345,7 +342,7 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
                 Derivation::Poll { used_percent } => {
                     if used_percent.is_finite() && used_percent >= 100.0 {
                         fence(
-                            fence_scope(reading.scope),
+                            evidence_pool(reading.scope),
                             reading.observed_at_ms,
                             reading.reset,
                             None,
@@ -370,7 +367,7 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
             };
             match header_value_confirms(frame, raw_utilization) {
                 Ok(()) => fence(
-                    fence_scope(reading.scope),
+                    evidence_pool(reading.scope),
                     reading.observed_at_ms,
                     reading.reset,
                     None,
@@ -382,65 +379,21 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
     }
 }
 
-/// Why an established conversation leaves its account on confirmed exhaustion.
-/// Serialized with the reference's spellings so the golden vectors compare
-/// directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum MigrateReason {
-    ModelScoped,
-    SevenDay,
-    FiveHour,
-}
-
-/// The reference's quota-failure decision over confirmed exhaustion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "action")]
-pub enum ExhaustionAction {
-    Retain,
-    /// Reason `five-hour-short-reset` in the reference.
-    Hold {
-        reset_at_ms: EpochMs,
-        base_retry_after_s: u64,
-    },
-    Migrate {
-        reason: MigrateReason,
-    },
-}
-
-/// Ports `decideStickyQuotaFailure`: model-scoped exhaustion migrates first,
-/// then 7d; a 5h exhaustion holds only when its reset is finite, strictly
-/// later than `now`, and at most `short_hold_max_ms` away. There is no
-/// clock-skew tolerance. `five_hour` is `Some(reset)` when the 5h window is
-/// confirmed exhausted.
-pub fn short_hold_rule(
-    scoped_exhausted: bool,
-    seven_day_exhausted: bool,
-    five_hour: Option<ResetTime>,
+/// The hold rule's reset check for the window that blocks continuation: it
+/// holds only when that window's reset is a known time strictly later than
+/// `now` and at most `hold_when_reset_within_ms` away, with no clock-skew
+/// tolerance. Returns the reset and the base Retry-After; `None` moves. A
+/// Retry-After hint is never a reset, so it never reaches this check.
+pub fn hold_until(
+    reset: ResetTime,
     now: EpochMs,
-    short_hold_max_ms: i64,
-) -> ExhaustionAction {
-    if scoped_exhausted {
-        return ExhaustionAction::Migrate {
-            reason: MigrateReason::ModelScoped,
-        };
-    }
-    if seven_day_exhausted {
-        return ExhaustionAction::Migrate {
-            reason: MigrateReason::SevenDay,
-        };
-    }
-    let Some(reset) = five_hour else {
-        return ExhaustionAction::Retain;
-    };
+    hold_when_reset_within_ms: i64,
+) -> Option<(EpochMs, u64)> {
     match reset.at_ms() {
-        Some(at) if at > now && at - now <= short_hold_max_ms => ExhaustionAction::Hold {
-            reset_at_ms: at,
-            base_retry_after_s: base_retry_after_s(at - now),
-        },
-        _ => ExhaustionAction::Migrate {
-            reason: MigrateReason::FiveHour,
-        },
+        Some(at) if at > now && at - now <= hold_when_reset_within_ms => {
+            Some((at, base_retry_after_s(at - now)))
+        }
+        _ => None,
     }
 }
 

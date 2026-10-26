@@ -12,38 +12,13 @@ use super::decision::{
 use super::eligibility::{
     age_band, evaluate_quota, fable_freshly_exhausted, scope_check, QuotaEval,
 };
-use super::evidence::{retry_after_with_jitter, short_hold_rule, ExhaustionAction, MigrateReason};
+use super::evidence::{hold_until, retry_after_with_jitter};
+use super::pools::{block_end, PoolKey, PoolScope};
 use super::types::{
     AccountRef, AccountRequest, AccountView, AdmissionState, AllocatorPolicy, AllocatorState,
-    ConversationAffinity, CredentialRecord, EpochMs, Fence, FenceScope, GeneralWindow, ModelFamily,
-    OperatorOverride, QuotaReading, ResetTime,
+    ConversationAffinity, CredentialRecord, EpochMs, Fence, ModelFamily, OperatorOverride,
+    QuotaReading, ResetTime,
 };
-
-/// Whether a fresh reading has superseded `fence`: its reset is a known time at
-/// or before `now`, the reading was observed after that reset, and the fenced
-/// general window reads below 100% used. Family and unknown-scope fences are
-/// kept: no reading is tied to their window here, so they stay until routing
-/// can lift them some other way (the design's single post-reset trial run, not
-/// built yet).
-fn cleared_by_post_reset_reading(
-    fence: &Fence,
-    reading: Option<&QuotaReading>,
-    now: EpochMs,
-) -> bool {
-    let (FenceScope::General(window), ResetTime::At(reset_at)) = (fence.scope, fence.reset) else {
-        return false;
-    };
-    let Some(reading) = reading else {
-        return false;
-    };
-    reset_at <= now
-        && reading
-            .observed_at_ms
-            .is_some_and(|observed| observed > reset_at)
-        && reading
-            .window(window)
-            .is_some_and(|w| w.used_percent.is_finite() && w.used_percent < 100.0)
-}
 
 fn previous_pin(affinity: &ConversationAffinity) -> PreviousPin {
     PreviousPin {
@@ -173,6 +148,14 @@ impl ColdEval<'_> {
     }
 }
 
+/// One thing that blocks a conversation's next request on its account.
+struct Blocker {
+    reset: ResetTime,
+    basis: HoldBasis,
+    /// Why the conversation leaves when this blocker decides and cannot hold.
+    leave: InvalidationReason,
+}
+
 enum AffinityVerdict {
     Retain { degraded: Vec<ExclusionReason> },
     Hold(Hold),
@@ -300,12 +283,11 @@ impl<'a> Allocator<'a> {
         })
     }
 
-    /// Fences on this account that restrict the requested family. A general
-    /// fence whose reset has passed stops restricting once a reading observed
-    /// after that reset shows the fenced window below 100% (design, "When the
-    /// reset time passes": a fresh post-reset reading clears the fence). Without
-    /// this, nothing ever lifted a fence and an account stayed excluded long
-    /// after its window reset.
+    /// Blocks on this account that restrict the requested model, newest
+    /// first. A block stops restricting once [`block_end`] says it ended: its
+    /// known reset passed, its retry time came, or a fresh reading observed
+    /// after it shows headroom on its pool (design, "Blocks are driven by
+    /// evidence").
     fn fences_for(&self, account_id: &str) -> Vec<&'a Fence> {
         let reading = self
             .views
@@ -316,8 +298,11 @@ impl<'a> Allocator<'a> {
             .state
             .fences
             .iter()
-            .filter(|fence| fence.account_id == account_id && fence.scope.applies_to(self.family))
-            .filter(|fence| !cleared_by_post_reset_reading(fence, reading, self.now))
+            .filter(|fence| {
+                fence.account_id == account_id
+                    && fence.applies_to(&self.model, self.family, self.request.pool.as_deref())
+            })
+            .filter(|fence| block_end(fence, reading, self.now, self.policy).is_none())
             .collect();
         fences.sort_by_key(|fence| std::cmp::Reverse(fence.observed_at_ms));
         fences
@@ -377,11 +362,13 @@ impl<'a> Allocator<'a> {
                 }
             }
         }
-        let mut scopes: Vec<FenceScope> = Vec::new();
+        let mut pools: Vec<&Option<PoolKey>> = Vec::new();
         for fence in self.fences_for(&view.account_id) {
-            if !scopes.contains(&fence.scope) {
-                scopes.push(fence.scope);
-                reasons.push(ExclusionReason::ConfirmedFence { scope: fence.scope });
+            if !pools.contains(&&fence.pool) {
+                pools.push(&fence.pool);
+                reasons.push(ExclusionReason::ConfirmedFence {
+                    pool: fence.pool.clone(),
+                });
             }
         }
         Hard {
@@ -510,108 +497,84 @@ impl<'a> Allocator<'a> {
         };
 
         let fences = self.fences_for(&affinity.account_id);
-        let has_fence = |scope: FenceScope| fences.iter().any(|fence| fence.scope == scope);
-        if fences
-            .iter()
-            .any(|fence| matches!(fence.scope, FenceScope::UnknownScope(_)))
-        {
-            return Leave(InvalidationReason::UnknownScopeFence);
-        }
         let reading = view
             .and_then(|view| view.quota.as_ref())
             .filter(|reading| self.fresh_full(reading));
-        let fresh_scoped = reading.is_some_and(|reading| {
+        // Everything that blocks this conversation's next request on its
+        // account: every standing block, and every window a full-band reading
+        // shows at 100% used. The reading-based ones are soft and local to
+        // this conversation: they create no fence and are re-evaluated at
+        // every admission, so a newer reading below 100 ends them.
+        let mut blockers: Vec<Blocker> = Vec::new();
+        if let Some(reading) = reading {
             let check = scope_check(self.family, &reading.scoped, self.policy);
-            check.matched && !check.passes
-        });
-        let fresh_full_used = |window: GeneralWindow| {
-            reading
-                .and_then(|reading| reading.window(window))
-                .is_some_and(|w| w.used_percent.is_finite() && w.used_percent >= 100.0)
-        };
-        let confirmed = |migrate| Leave(InvalidationReason::ConfirmedExhaustion { migrate });
-        let fresh = |window| Leave(InvalidationReason::FreshFullReading { window });
-
-        // The reference's order (anthropic-auth@b504bc84
-        // packages/core/src/sticky-routing.ts:369-413): model-scoped
-        // exhaustion, then 7d, migrate first, whether confirmed by a fence or
-        // shown by a full-band reading at 100%. Only then can a 5h exhaustion
-        // hold: a confirmed 5h fence, or failing that a full-band 5h reading at
-        // 100% (the reference's proactive pre-send check,
-        // packages/opencode/src/index.ts:7500-7535). The reading-based hold is
-        // soft and local to this conversation: it creates no fence, and it is
-        // re-evaluated at every admission, so a newer reading below 100 ends it.
-        let hold_or_leave = |reset: ResetTime, basis: HoldBasis| {
-            let action = short_hold_rule(
-                false,
-                false,
-                Some(reset),
-                self.now,
-                self.policy.short_hold_max_ms,
-            );
-            match action {
-                ExhaustionAction::Hold {
-                    reset_at_ms,
-                    base_retry_after_s,
-                } => {
-                    let retry_after_s = retry_after_with_jitter(
-                        &self.request.conversation_key,
-                        base_retry_after_s as f64,
-                    );
-                    if retry_after_s <= self.request.hold_wait_max_s {
-                        Some(AffinityVerdict::Hold(Hold {
-                            account_id: affinity.account_id.clone(),
-                            credential_id: affinity.credential_id.clone(),
-                            pin_id: affinity.pin_id.clone(),
-                            pin_generation: affinity.pin_generation,
-                            reset_at_ms,
-                            base_retry_after_s,
-                            retry_after_s,
-                            basis,
-                        }))
-                    } else {
-                        Some(Leave(InvalidationReason::HoldExceedsWait { retry_after_s }))
-                    }
-                }
-                // A missing, unparsable, past or distant reset never holds.
-                _ => None,
+            if check.matched && !check.passes {
+                let reset = match &reading.scoped {
+                    super::types::ScopedList::Listed(windows) => windows
+                        .iter()
+                        .find(|w| self.policy.family_for_scope(w) == Some(self.family))
+                        .map_or(ResetTime::Missing, |w| w.resets_at),
+                    super::types::ScopedList::Missing => ResetTime::Missing,
+                };
+                blockers.push(Blocker {
+                    reset,
+                    basis: HoldBasis::ProactiveReading,
+                    leave: InvalidationReason::FreshFullReading {
+                        window: ApplicableWindow::FamilyScope,
+                    },
+                });
             }
-        };
-        if has_fence(FenceScope::Family(self.family)) {
-            return confirmed(MigrateReason::ModelScoped);
+            for id in reading.required_windows() {
+                if let Some(window) = reading.window(id).filter(|window| {
+                    window.used_percent.is_finite() && window.used_percent >= 100.0
+                }) {
+                    blockers.push(Blocker {
+                        reset: window.resets_at,
+                        basis: HoldBasis::ProactiveReading,
+                        leave: InvalidationReason::FreshFullReading { window: id.into() },
+                    });
+                }
+            }
         }
-        if fresh_scoped {
-            return fresh(ApplicableWindow::FamilyScope);
-        }
-        if has_fence(FenceScope::General(GeneralWindow::SevenDay)) {
-            return confirmed(MigrateReason::SevenDay);
-        }
-        if fresh_full_used(GeneralWindow::SevenDay) {
-            return fresh(ApplicableWindow::SevenDay);
-        }
-        if let Some(window) = reading.and_then(|reading| {
-            reading.required_windows().into_iter().find(|id| {
-                matches!(id, GeneralWindow::Reported(_))
-                    && reading.window(*id).is_some_and(|window| {
-                        window.used_percent.is_finite() && window.used_percent >= 100.0
-                    })
-            })
-        }) {
-            return fresh(window.into());
-        }
-        if let Some(five_hour) = fences
-            .iter()
-            .find(|fence| fence.scope == FenceScope::General(GeneralWindow::FiveHour))
-        {
-            return hold_or_leave(five_hour.reset, HoldBasis::ConfirmedFence)
-                .unwrap_or_else(|| confirmed(MigrateReason::FiveHour));
-        }
-        if fresh_full_used(GeneralWindow::FiveHour) {
-            let reset = reading
-                .and_then(|reading| reading.window(GeneralWindow::FiveHour))
-                .map_or(ResetTime::Missing, |w| w.resets_at);
-            return hold_or_leave(reset, HoldBasis::ProactiveReading)
-                .unwrap_or_else(|| fresh(ApplicableWindow::FiveHour));
+        // Standing blocks last, so that at an equal reset a confirmed block,
+        // not a reading, is named as the hold's basis.
+        blockers.extend(fences.iter().map(|fence| Blocker {
+            reset: fence.reset,
+            basis: HoldBasis::ConfirmedFence,
+            leave: InvalidationReason::ConfirmedExhaustion {
+                pool: fence.pool.clone(),
+            },
+        }));
+        // The hold rule (design, "Accounts"): the window that blocks
+        // continuation decides, whatever kind of window it is. With several,
+        // the account frees only when the last of them resets, so a blocker
+        // with an unknown reset, or the latest known reset, decides.
+        let deciding = blockers.iter().max_by_key(|blocker| match blocker.reset {
+            ResetTime::At(at) => (1, at),
+            // Unknown recovery outranks every known reset.
+            ResetTime::Missing | ResetTime::Unparsable => (2, 0),
+        });
+        if let Some(blocker) = deciding {
+            let Some((reset_at_ms, base_retry_after_s)) =
+                hold_until(blocker.reset, self.now, self.policy.short_hold_max_ms)
+            else {
+                return Leave(blocker.leave.clone());
+            };
+            let retry_after_s =
+                retry_after_with_jitter(&self.request.conversation_key, base_retry_after_s as f64);
+            if retry_after_s > self.request.hold_wait_max_s {
+                return Leave(InvalidationReason::HoldExceedsWait { retry_after_s });
+            }
+            return AffinityVerdict::Hold(Hold {
+                account_id: affinity.account_id.clone(),
+                credential_id: affinity.credential_id.clone(),
+                pin_id: affinity.pin_id.clone(),
+                pin_generation: affinity.pin_generation,
+                reset_at_ms,
+                base_retry_after_s,
+                retry_after_s,
+                basis: blocker.basis,
+            });
         }
         // Existing authorized, non-fenced affinity continues under missing or
         // stale quota, with the degraded reason recorded.
@@ -1084,8 +1047,8 @@ impl<'a> Allocator<'a> {
             && accounts.iter().all(|eval| {
                 eval.reasons().any(|reason| match reason {
                     ExclusionReason::ScopeExhausted { .. } => true,
-                    ExclusionReason::ConfirmedFence { scope } => {
-                        *scope == FenceScope::Family(family)
+                    ExclusionReason::ConfirmedFence { pool } => {
+                        pool.as_ref().map(|key| &key.scope) == Some(&PoolScope::Family(family))
                     }
                     _ => false,
                 })
@@ -1114,11 +1077,11 @@ impl<'a> Allocator<'a> {
                 );
             }
             for fence in self.fences_for(&eval.view.account_id) {
-                let relevant = match fence.scope {
-                    FenceScope::General(_) => !scope_blocked,
-                    FenceScope::Family(_) => scope_blocked,
-                    FenceScope::UnknownScope(_) => false,
-                };
+                let family_block = matches!(
+                    fence.pool.as_ref().map(|key| &key.scope),
+                    Some(PoolScope::Family(_))
+                );
+                let relevant = family_block == scope_blocked;
                 if let (true, ResetTime::At(at)) = (relevant, fence.reset) {
                     resets.push(at);
                 }
