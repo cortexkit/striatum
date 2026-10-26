@@ -135,7 +135,16 @@ impl Caller {
 
     fn binding_is_current(&self) -> bool {
         self.binding.is_some_and(|(channel, epoch)| {
-            crate::route_principal(channel, epoch) == self.principal
+            // A missing route and a real unattested caller share a principal
+            // label, so require a stored binding with the matching epoch.
+            crate::route_principals()
+                .lock()
+                .ok()
+                .is_some_and(|principals| {
+                    principals.get(&channel).is_some_and(|(bound, principal)| {
+                        *bound == epoch && principal == &self.principal
+                    })
+                })
                 && crate::route_scope_authority(channel, epoch) == self.scope_authority
         })
     }

@@ -206,6 +206,10 @@ impl Registry {
         if !caller.binding_is_current() {
             return Err(Refusal::consumer_not_owned(consumer));
         }
+        // A config-only name without an owner adds no ownership restriction.
+        if owners.is_empty() {
+            return Ok(());
+        }
         if owners.len() == 1 {
             let owner = owners.first().unwrap();
             if caller.attested_module() == Some(owner.as_str())
