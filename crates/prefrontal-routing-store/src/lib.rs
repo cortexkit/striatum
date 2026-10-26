@@ -37,6 +37,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 mod account_selection;
+// The backup table classification is a test oracle: the store's integration
+// tests, the engram catalog test and the restore rehearsal example check the
+// shipped catalog against it, and no production path reads it.
+#[cfg(feature = "test-support")]
 pub mod backup;
 mod key_pool;
 mod reasoning_catalog;
