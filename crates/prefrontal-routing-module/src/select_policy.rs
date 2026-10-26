@@ -119,7 +119,14 @@ pub(crate) enum CandidateSource<'a> {
     },
     Vault {
         credentials: &'a crate::broca_credentials::SharedBrocaCredentials,
+        /// The fences selection enforces: live fences except the stale ones a
+        /// probe may admit.
         fences: &'a [prefrontal_routing_core::route_state_store::CredentialEntitlementFence],
+        /// The stale fences a probe may admit. Key-pool providers (those with
+        /// no catalog rows of their own) are still judged against every live
+        /// fence including these: the pool leases no probed key, so a stale
+        /// fence there holds until an operator lifts it.
+        stale: &'a [prefrontal_routing_core::route_state_store::CredentialEntitlementFence],
         /// Legacy pool pins report per-key lease failures through the pool's
         /// existing refusal adapter. Automatic and v1 selection reject here.
         defer_pool_pin: bool,
@@ -256,8 +263,11 @@ pub(crate) fn prepare_candidates(
         CandidateSource::Vault {
             credentials,
             fences,
+            stale,
             defer_pool_pin,
         } => {
+            let full: Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence> =
+                fences.iter().chain(stale.iter()).cloned().collect();
             let guard = credentials.lock().ok();
             let rows = guard
                 .as_ref()
@@ -323,12 +333,14 @@ pub(crate) fn prepare_candidates(
                     .iter()
                     .map(|row| (row.id.clone(), row.account_id.clone()))
                     .collect();
+                let pool_fact = catalog_targets.contains_key(&fact.provider_id);
+                // Pool facts are judged against every live fence: the pool
+                // leases no probed key, so exempting a stale fence here would
+                // only record a selection the launch then refuses.
+                let judged = if pool_fact { &full } else { fences };
                 let refused =
-                    crate::credential_fences::unentitled(fences, &fact.provider_id, &identities);
-                if class.is_empty()
-                    || (!refused.is_empty()
-                        && !(defer_pool_pin && catalog_targets.contains_key(&fact.provider_id)))
-                {
+                    crate::credential_fences::unentitled(judged, &fact.provider_id, &identities);
+                if class.is_empty() || (!refused.is_empty() && !(defer_pool_pin && pool_fact)) {
                     snapshot
                         .by_capacity
                         .entry(route.capacity_key.clone())
@@ -338,7 +350,7 @@ pub(crate) fn prepare_candidates(
                             "no_eligible_account"
                         } else {
                             crate::credential_fences::rejection_reason(
-                                fences,
+                                judged,
                                 &fact.provider_id,
                                 &refused,
                             )
@@ -887,6 +899,7 @@ mod candidate_tests {
             CandidateSource::Vault {
                 credentials: &credentials,
                 fences,
+                stale: &[],
                 defer_pool_pin: false,
             },
             Some(Consumer::Mason),

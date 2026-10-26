@@ -415,10 +415,43 @@ impl ClassContext {
             fact_.provider == fact.provider_id
                 && fact_.credential_id == row.id
                 && (fact_.model.is_empty() || fact_.model == fact.model_id)
-        }) && !self
-            .refusals
+        }) && !self.refusals.iter().any(|fence| {
+            fence.provider_id == fact.provider_id
+                && fence.credential_id == row.id
+                && (self.targets.contains_key(&fact.provider_id)
+                    || self.now_ms.saturating_sub(fence.observed_at_ms)
+                        <= crate::credential_fences::FENCE_PROBE_RECHECK_MS)
+        })
+    }
+
+    fn probe_eligible(&self, provider: &str, credential: &str) -> bool {
+        !self.targets.contains_key(provider)
+            && self.refusals.iter().any(|fence| {
+                fence.provider_id == provider
+                    && fence.credential_id == credential
+                    && self.now_ms.saturating_sub(fence.observed_at_ms)
+                        > crate::credential_fences::FENCE_PROBE_RECHECK_MS
+            })
+    }
+
+    /// A stale refusal is a fallback, never a reason to probe while an
+    /// unfenced eligible identity in the same payment class can serve.
+    fn eligible_rows<'a>(
+        &self,
+        rows: Vec<&'a cortexkit_claustrum_client::ListedCredential>,
+        fact: &prefrontal_routing_core::ModelFact,
+    ) -> Vec<&'a cortexkit_claustrum_client::ListedCredential> {
+        let mut rows: Vec<_> = rows
+            .into_iter()
+            .filter(|row| self.eligible(row, fact))
+            .collect();
+        if rows
             .iter()
-            .any(|fence| fence.provider_id == fact.provider_id && fence.credential_id == row.id)
+            .any(|row| !self.probe_eligible(&fact.provider_id, &row.id))
+        {
+            rows.retain(|row| !self.probe_eligible(&fact.provider_id, &row.id));
+        }
+        rows
     }
 
     fn usable(
@@ -441,19 +474,19 @@ impl ClassContext {
                     row.credential_type == "oauth",
                 )
         };
+        let rows = self
+            .credentials
+            .listed_credentials()
+            .iter()
+            .filter(|other| {
+                covered(other) == covered(row)
+                    && self.eligible(other, fact)
+                    && crate::broca_credentials::credential_serves_fact(other, fact, &self.catalog)
+            })
+            .collect();
         let roster = self.roster(
-            self.credentials
-                .listed_credentials()
-                .iter()
-                .filter(|other| {
-                    covered(other) == covered(row)
-                        && self.eligible(other, fact)
-                        && crate::broca_credentials::credential_serves_fact(
-                            other,
-                            fact,
-                            &self.catalog,
-                        )
-                })
+            self.eligible_rows(rows, fact)
+                .into_iter()
                 .map(|other| self.view(other, fact))
                 .collect(),
         );
@@ -500,12 +533,7 @@ impl ClassContext {
             .find(|fact| fact.provider_id == provider && fact.model_id == model);
         let mut accounts: BTreeMap<String, AccountView> = BTreeMap::new();
         if let Some(fact) = fact {
-            for row in self
-                .class(fact, priced_per_token)
-                .rows
-                .into_iter()
-                .filter(|row| self.eligible(row, fact))
-            {
+            for row in self.eligible_rows(self.class(fact, priced_per_token).rows, fact) {
                 let view = self.view(row, fact);
                 if let Some(existing) = accounts.get_mut(&view.account_id) {
                     existing.credentials.extend(view.credentials);
@@ -655,6 +683,14 @@ impl ClassContext {
         model: &str,
     ) -> prefrontal_routing_core::accounts::AllocationContext {
         let mut context = prefrontal_routing_core::accounts::AllocationContext::default();
+        for fence in self.refusals.iter().filter(|fence| {
+            fence.provider_id == provider && self.probe_eligible(provider, &fence.credential_id)
+        }) {
+            context.credential_probe_notes.insert(
+                fence.credential_id.clone(),
+                crate::credential_fences::probe_note(provider, &fence.credential_id),
+            );
+        }
         let class = self
             .facts
             .iter()
@@ -2347,7 +2383,7 @@ fn serve(
         now,
         &policy,
     )?;
-    let state = AllocatorState {
+    let mut state = AllocatorState {
         roster: roster.roster.clone(),
         affinity: affinity_row
             .as_ref()
@@ -2370,8 +2406,38 @@ fn serve(
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider)?;
     }
-    let decision =
-        prefrontal_routing_core::accounts::decide_with_context(&request, &state, now, &inputs);
+    let decision = loop {
+        let decision =
+            prefrontal_routing_core::accounts::decide_with_context(&request, &state, now, &inputs);
+        let Outcome::Admit(admission) = &decision.outcome else {
+            break decision;
+        };
+        let credential = admission.credential_id.clone();
+        if !inputs.credential_probe_notes.contains_key(&credential) {
+            break decision;
+        }
+        match tx.claim_credential_probe(
+            provider,
+            &credential,
+            now.saturating_sub(crate::credential_fences::FENCE_PROBE_RECHECK_MS),
+            now,
+        )? {
+            prefrontal_routing_store::CredentialProbeClaim::Claimed => break decision,
+            prefrontal_routing_store::CredentialProbeClaim::Unfenced => {
+                inputs.credential_probe_notes.remove(&credential);
+            }
+            prefrontal_routing_store::CredentialProbeClaim::Blocked => {
+                inputs.credential_probe_notes.remove(&credential);
+                if let Some(roster) = &mut state.roster {
+                    for account in &mut roster.accounts {
+                        account
+                            .credentials
+                            .retain(|record| record.credential_id != credential);
+                    }
+                }
+            }
+        }
+    };
     let decision_id = new_id("acd");
     tx.insert_decision(&decision_record(RecordInput {
         decision_id: &decision_id,
@@ -2680,7 +2746,7 @@ fn commit_admission(
         RequestMode::Reassign => moved,
     };
     let refresh_adapter = refresh_adapter_for(roster, &admission.account_id);
-    let reply = json!({
+    let mut reply = json!({
         "admission": { "id": params.admission_id, "state": "reserved" },
         "account": {
             "provider": provider,
@@ -2705,6 +2771,18 @@ fn commit_admission(
             "quota_age_band": admission.quota_age_band.map(|band| wire(&band)),
         },
     });
+    if let Some(note) = &decision.explanation.credential_fence_probe {
+        reply["reason"]["fence_probe"] = json!(note);
+    }
+    if let Some(model_decision) = &params.model_decision_id {
+        tx.bind_model_account(
+            model_decision,
+            provider,
+            &normalize(&params.model),
+            &admission.account_id,
+            &admission.credential_id,
+        )?;
+    }
     tx.insert_admission(&AccountAdmissionRow {
         principal: principal.to_string(),
         admission_id: params.admission_id.clone(),

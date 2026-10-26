@@ -19,6 +19,209 @@ const NOW: u64 = 1_800_000_000_000;
 const RUNNER: &str = "class-runner";
 const OWNER: &str = "class-owner";
 
+#[tokio::test]
+async fn credential_probe_admission_is_single_and_completion_heals_its_credential() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    let refusal = CredentialRefusal {
+        provider_id: "synthetic".into(),
+        credential_id: "oauth:test".into(),
+        code: "billing_exhausted".into(),
+    };
+    let recorded = NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS;
+    crate::credential_fences::record(harness.store(), &shared, &refusal, recorded).unwrap();
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let blocked = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "exactly-six-hours"),
+        )
+        .await;
+    assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
+    let _later = crate::InjectedClock::set(NOW + 1);
+    let config = harness.operator_config();
+    let policy = config.allocator_policy("synthetic");
+    let cached = crate::account_selection::ClassContext::load(
+        harness.store(),
+        &shared,
+        config,
+        crate::ACCOUNT_QUOTA.get(),
+        NOW as i64 + 1,
+    )
+    .unwrap();
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30},"pin":"synthetic/model"}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    assert_eq!(
+        harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms,
+        recorded,
+        "model preflight cannot consume the probe"
+    );
+    let mut request = account_request("synthetic", "probe");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_credential(&admitted, "oauth:test");
+    assert_eq!(
+        admitted.1["result"]["reason"]["code"],
+        "credential_fence_probe"
+    );
+    assert_eq!(
+        runner.call("route.account_for", &request).await,
+        admitted,
+        "replay does not spend another probe"
+    );
+    assert_eq!(
+        harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms,
+        NOW as i64 + 1
+    );
+    let account_decision = harness
+        .store()
+        .account_transaction(|tx| {
+            Ok(tx
+                .admission(&format!("reserved:{RUNNER}"), "probe")?
+                .unwrap()
+                .decision_id)
+        })
+        .unwrap();
+    let logged = harness
+        .store()
+        .account_decision(&account_decision)
+        .unwrap()
+        .unwrap();
+    let logged: Value = serde_json::from_str(&logged.decision_json).unwrap();
+    assert!(logged["explanation"]["credential_fence_probe"]
+        .as_str()
+        .unwrap()
+        .contains("oauth:test"));
+    let mut stale_request = account_request("synthetic", "racing-probe");
+    stale_request["caller"] = json!({"runner":RUNNER});
+    let body = serde_json::to_vec(
+        &json!({"method":crate::account_selection::ACCOUNT_FOR_OP,"params":stale_request}),
+    )
+    .unwrap();
+    let ctx = crate::account_selection::Ctx {
+        store: harness.store(),
+        accounts: crate::ACCOUNT_QUOTA.get(),
+        flags: crate::config_overrides::AccountSelectionFlags { enabled: true },
+        policy: &policy,
+        now_ms: NOW as i64 + 1,
+        classes: Some(cached),
+    };
+    assert_eq!(
+        crate::account_selection::handle(
+            crate::account_selection::ACCOUNT_FOR_OP,
+            &body,
+            &format!("reserved:{RUNNER}"),
+            &ctx
+        )
+        .code(),
+        Some("no_eligible_account"),
+        "a stale cached roster cannot reserve a second probe"
+    );
+    let completed = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":selected.1["result"]["decision_id"],"outcome":"completed"}),
+        )
+        .await;
+    assert_eq!(completed.0, FrameType::Response, "{}", completed.1);
+    assert!(harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .is_empty());
+    let healed = runner
+        .call("route.account_for", &account_request("synthetic", "healed"))
+        .await;
+    assert_credential(&healed, "oauth:test");
+    assert_ne!(
+        healed.1["result"]["reason"]["code"],
+        "credential_fence_probe"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_probe_is_a_fallback_and_an_entitlement_failure_renews_it() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    harness.edit_config(|config| {
+        config["providers"]["synthetic"]["subscription"] = json!(false);
+        config["providers"]["synthetic"]["accounts"] =
+            json!({"strategy":"ordered","order":["oauth-account","apikey-account"]});
+    });
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    let stale = NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1;
+    let refusal = |credential: &str| CredentialRefusal {
+        provider_id: "synthetic".into(),
+        credential_id: credential.into(),
+        code: "ENTITLEMENT_ERROR".into(),
+    };
+    crate::credential_fences::record(harness.store(), &shared, &refusal("oauth:test"), stale)
+        .unwrap();
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    assert_credential(
+        &runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "healthy-before-probe"),
+            )
+            .await,
+        "apikey:test",
+    );
+    assert_eq!(
+        harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms,
+        stale
+    );
+    crate::credential_fences::record(
+        harness.store(),
+        &shared,
+        &refusal("apikey:test"),
+        NOW as i64,
+    )
+    .unwrap();
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let mut request = account_request("synthetic", "entitlement-probe");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_credential(&admitted, "oauth:test");
+    assert_eq!(
+        admitted.1["result"]["reason"]["code"],
+        "credential_fence_probe"
+    );
+    let _later = crate::InjectedClock::set(NOW + 1);
+    let failed=caller.call("route.report",&json!({"decision_id":selected.1["result"]["decision_id"],"outcome":"failed","credential_id":"oauth:test","runner_code":"ENTITLEMENT_ERROR"})).await;
+    assert_eq!(failed.0, FrameType::Response, "{}", failed.1);
+    let fence = harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .into_iter()
+        .find(|fence| fence.credential_id == "oauth:test")
+        .unwrap();
+    assert_eq!(fence.observed_at_ms, NOW as i64 + 1);
+    assert_eq!(fence.code, "ENTITLEMENT_ERROR");
+    let blocked = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "after-entitlement-probe"),
+        )
+        .await;
+    assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
+}
+
 fn catalog_fact(harness: &Harness, fact: &prefrontal_routing_core::ModelFact) {
     use prefrontal_routing_store::{FusiformCatalogCursor, FusiformFactUpdate};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -400,6 +603,7 @@ fn demand_prices_only_the_class_that_account_for_may_serve() {
             crate::select_policy::CandidateSource::Vault {
                 credentials: &credentials,
                 fences: &priced.entitlement_fences,
+                stale: &[],
                 defer_pool_pin: false,
             },
             Some(crate::select_policy::Consumer::Mason),

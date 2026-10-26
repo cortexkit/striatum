@@ -140,6 +140,10 @@ const ROUTE_COOLDOWN_STATUS_OP: &str = "route.cooldown_status";
 const ROUTE_CLEAR_FAILURE_BACKOFF_OP: &str = "route.clear_failure_backoff";
 /// Lift a route-local cooldown and quota wall without resetting failure backoff.
 const ROUTE_CLEAR_COOLDOWN_OP: &str = "route.clear_cooldown";
+/// Lift every credential entitlement fence on one named vault credential at
+/// once, for use right after topping it up. Operator-only: only the `direct`
+/// and `reserved:callosum` principals may call it.
+const ROUTE_CLEAR_CREDENTIAL_FENCES_OP: &str = "route.clear_credential_fences";
 /// Observability op: reports whether the outbound quota-consumer connection is
 /// live and how fresh its windows are. Lets a consumer (and the e2e) confirm the
 /// module->module quota path actually round-tripped, not just that it didn't hang.
@@ -3373,6 +3377,8 @@ struct SelectionPolicySources<'a> {
 struct PricedSelection {
     routing_config: prefrontal_routing_core::RoutingConfig,
     provenance: DecisionProvenance,
+    /// Empty input for legacy candidate selection: account choice supplies
+    /// all credential eligibility decisions.
     entitlement_fences: Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>,
     /// Providers known to publish a subscription plan. Host-only payment
     /// admission uses this list when it has no vault account class.
@@ -3822,6 +3828,9 @@ async fn handle_select_request(
     if envelope.method == ROUTE_CLEAR_COOLDOWN_OP {
         return handle_clear_cooldown(frame, writer, store).await;
     }
+    if envelope.method == ROUTE_CLEAR_CREDENTIAL_FENCES_OP {
+        return handle_clear_credential_fences(frame, writer, store).await;
+    }
     if envelope.method == ROUTE_COOLDOWN_STATUS_OP {
         return handle_cooldown_status(frame, writer, store).await;
     }
@@ -4214,7 +4223,6 @@ async fn handle_select_request(
         priced_per_token,
     )?;
     add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
-
     let policy_started = Instant::now();
     let host_models: HashSet<String> = resolved_request
         .policy
@@ -4298,6 +4306,7 @@ async fn handle_select_request(
             select_policy::CandidateSource::Vault {
                 credentials: broca_credentials,
                 fences: &entitlement_fences,
+                stale: &[],
                 defer_pool_pin: params.pin.is_some() || params.model_pin.is_some(),
             }
         },
@@ -5275,7 +5284,7 @@ fn panel_availability(
 /// per-send credential pin, requested for a substrate that cannot carry one.
 const PROVIDER_REQUIRES_RUNNER_PIN: &str = "provider_requires_runner_pin";
 
-fn needs_runner_pin(
+pub(crate) fn needs_runner_pin(
     catalog_targets: &std::collections::BTreeMap<String, String>,
     provider: &str,
 ) -> bool {
@@ -6419,7 +6428,9 @@ async fn handle_set_decision_outcome(
     let observed_at_ms = now_ms() as i64;
     // A credential the provider refused permanently is fenced whatever the
     // decision ledger still holds: the report names the provider and the
-    // credential itself, and a replayed report changes nothing.
+    // credential itself. Recording renews a repeated refusal, so a fence that
+    // keeps failing stays fresh and its next recheck probe waits another
+    // interval.
     if let Some(refusal) = provider_outcome
         .as_ref()
         .and_then(|provider| provider.credential_refusal.as_ref())
@@ -6436,6 +6447,47 @@ async fn handle_set_decision_outcome(
                 &format!("set_decision_outcome: credential entitlement fence: {e}"),
             )
             .await;
+        }
+    }
+    // Only the credential that actually served the completed run is healed.
+    if outcome == RouteOutcome::Completed {
+        if let Some(credential) = provider_outcome
+            .as_ref()
+            .and_then(|provider| provider.credential_id.as_deref())
+        {
+            match store.get_decision_by_id(&params.decision_id) {
+                Ok(Some(decision)) => {
+                    if let Some(provider) = decision.selected_provider_id.as_deref() {
+                        if let Err(e) =
+                            credential_fences::lift_after_success(store, provider, credential)
+                        {
+                            return send_route_error(
+                                writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                "store_error",
+                                &format!("set_decision_outcome: lifting credential fence: {e}"),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return send_route_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "store_error",
+                        &format!("set_decision_outcome: reading decision: {e}"),
+                    )
+                    .await
+                }
+            }
         }
     }
     match store.record_routing_outcome(
@@ -7052,6 +7104,115 @@ async fn handle_clear_cooldown(
     send(writer, response).await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearCredentialFencesParams {
+    credential_id: String,
+}
+
+/// Whether the route's daemon-attested principal may lift credential fences:
+/// the operator on a shell on this machine (`direct`) or on the phone
+/// (`reserved:callosum`). Every other module principal, and unverified and
+/// unattested routes, are refused: lifting a fence sends the next request back
+/// to a credential the provider refused, which only the operator may order
+/// after topping it up.
+fn is_fence_lift_operator(principal: &str) -> bool {
+    principal == "direct" || principal == "reserved:callosum"
+}
+
+/// Lift every credential entitlement fence on one named vault credential at
+/// once, for use right after topping it up. Operator-only (see
+/// [`is_fence_lift_operator`]); the reply names what was lifted.
+async fn handle_clear_credential_fences(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let principal = route_principal(channel, epoch);
+    if !is_fence_lift_operator(&principal) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "not_permitted",
+            &format!(
+                "route.clear_credential_fences is operator-only: principal '{principal}' may not lift credential fences",
+            ),
+        )
+        .await;
+    }
+    let params: ClearCredentialFencesParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(body) => body.params,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("route.clear_credential_fences params not decodable: {error}"),
+                )
+                .await;
+            }
+        };
+    if params.credential_id.trim().is_empty() {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "route.clear_credential_fences credentialId must not be empty",
+        )
+        .await;
+    }
+    let lifted = match credential_fences::lift_for_operator(store, &params.credential_id) {
+        Ok(lifted) => lifted,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("route.clear_credential_fences: {error}"),
+            )
+            .await;
+        }
+    };
+    let body = serde_json::to_vec(&json!({ "result": {
+        "credentialId": params.credential_id,
+        "lifted": lifted.iter().map(|fence| json!({
+            "providerId": fence.provider_id,
+            "code": fence.code,
+        })).collect::<Vec<_>>(),
+    } }))
+    .map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
 async fn handle_record_cooldown(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -7352,6 +7513,7 @@ pub(crate) fn handles(method: &str) -> bool {
             | ROUTE_RECORD_COOLDOWN_OP
             | ROUTE_CLEAR_FAILURE_BACKOFF_OP
             | ROUTE_CLEAR_COOLDOWN_OP
+            | ROUTE_CLEAR_CREDENTIAL_FENCES_OP
             | ROUTE_COOLDOWN_STATUS_OP
             | ROUTE_EXPLAIN_OP
             | ROUTE_DECISIONS_LIST_OP
@@ -7484,6 +7646,14 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
             name: ROUTE_CLEAR_COOLDOWN_OP.to_string(),
             kind: ManagementOperationKind::Mutate,
             description: Some("Clear one route's cooldown and quota wall without changing failure backoff".to_string()),
+        },
+        ManagementOperation {
+            name: ROUTE_CLEAR_CREDENTIAL_FENCES_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Lift every credential entitlement fence on one vault credential, for use right after topping it up (operator-only: direct and reserved:callosum routes)"
+                    .to_string(),
+            ),
         },
         ManagementOperation {
             name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
@@ -8179,8 +8349,9 @@ mod tests {
     /// The retry went to another cline-pass model and got the same 403, because the
     /// refusal is about the account, not the model. The first refusal must now fence
     /// (cline-pass, apikey:cline-pass): the retry avoids every cline-pass route and the
-    /// decision log names the fence; the fence survives a store reopen and any amount
-    /// of time; an explicit pin is not fenced; and the fence ends when the
+    /// decision log names the fence; the fence survives a store reopen; a fence
+    /// older than the recheck interval admits exactly one probe, then holds
+    /// again; an explicit pin is not fenced; and the fence ends when the
     /// credential's vault listing changes.
     #[tokio::test]
     async fn an_entitlement_refusal_fences_the_providers_routes_through_that_credential() {
@@ -8190,7 +8361,8 @@ mod tests {
     /// The same replay for an empty balance: Broca ends the run as permanent
     /// `billing_exhausted` naming the credential (xAI's spending limit, Anthropic's
     /// "credit balance too low", OpenAI's insufficient_quota, OpenCode's HTTP 402
-    /// "Insufficient account funds"). Topping up does not show on a timer either.
+    /// "Insufficient account funds"). Topping up does not change the vault listing,
+    /// so the fence holds until the recheck admits one probe.
     #[tokio::test]
     async fn a_billing_exhausted_refusal_fences_the_providers_routes_through_that_credential() {
         replay_credential_refusal("billing_exhausted", "credential_billing_exhausted").await;
@@ -8262,7 +8434,10 @@ mod tests {
                 credentials,
             )
             .await;
-            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone()
+            let mut result =
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone();
+            admit_selected_account(store, credentials, &mut result);
+            result
         }
         let first = select(&store, &credentials, &request).await;
         assert_eq!(
@@ -8340,8 +8515,12 @@ mod tests {
             logged.rejected_json
         );
 
-        // The fence is routing state, not memory: it survives a store reopen. It
-        // has no expiry either: a fence recorded long ago still holds.
+        // The fence is routing state, not memory: it survives a store reopen. A
+        // fence recorded long ago admits one recheck probe, then holds again:
+        // model selection picks the fenced provider; the following account
+        // admission reserves and records its probe. The next selection is
+        // fenced until another interval passes or an outcome
+        // lifts or renews it.
         drop(store);
         rusqlite::Connection::open(rig.dir.join("store.db"))
             .unwrap()
@@ -8351,6 +8530,17 @@ mod tests {
             )
             .unwrap();
         store = Arc::new(rig.open_store());
+        let probe = select(&store, &credentials, &request).await;
+        assert_eq!(
+            probe["selected"]["model"]["providerID"], "cline-pass",
+            "a fence past the recheck interval admits exactly one probe: {probe}"
+        );
+        assert!(
+            probe["account_admission"]["reason"]["fence_probe"]
+                .as_str()
+                .is_some_and(|line| line.contains("fence probe")),
+            "the pick records its probe: {probe}"
+        );
         assert_fenced(&select(&store, &credentials, &request).await);
 
         // Naming a model cannot authorize a credential the provider refused.
@@ -8374,7 +8564,7 @@ mod tests {
         );
 
         // A change to the credential's vault listing (here its plan tier) is what can
-        // fix the refusal, so it ends the fence. No timer does.
+        // fix the refusal, so it ends the fence; a successful recheck probe does too.
         let changed = listing(Some("contributor"));
         let healed = select(&store, &changed, &request).await;
         assert_eq!(
@@ -8437,6 +8627,423 @@ mod tests {
             );
             assert_eq!(store.credential_entitlement_fences().unwrap().len(), 1);
         }
+    }
+
+    // Model selection does not spend a probe. The runner's subsequent account
+    // admission reserves it and records the actual serving identity.
+    fn admit_selected_account(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        selected: &mut serde_json::Value,
+    ) {
+        let provider = selected["selected"]["model"]["providerID"]
+            .as_str()
+            .unwrap();
+        let model = selected["selected"]["model"]["modelID"].as_str().unwrap();
+        let decision = selected["decisionID"].as_str().unwrap();
+        let config =
+            config_overrides::live_config(Path::new("/nonexistent/credential-fence-probe.jsonc"));
+        let policy = config.allocator_policy(provider);
+        let ctx = account_selection::Ctx {
+            store,
+            accounts: ACCOUNT_QUOTA.get(),
+            flags: config.account_flags(),
+            policy: &policy,
+            now_ms: now_ms() as i64,
+            classes: Some(
+                account_selection::ClassContext::load(
+                    store,
+                    credentials,
+                    config,
+                    ACCOUNT_QUOTA.get(),
+                    now_ms() as i64,
+                )
+                .unwrap(),
+            ),
+        };
+        let body=serde_json::to_vec(&json!({"method":account_selection::ACCOUNT_FOR_OP,"params":{
+            "provider":provider,"model":model,"model_decision_id":decision,"conversation_key":format!("probe-fixture:{decision}"),"admission_id":format!("probe-fixture:{decision}"),"caller":{"runner":"broca"}
+        }})).unwrap();
+        let reply = account_selection::handle(
+            account_selection::ACCOUNT_FOR_OP,
+            &body,
+            "reserved:broca",
+            &ctx,
+        );
+        let account_selection::OpReply::Result(admission) = reply else {
+            panic!("account admission failed: {reply:?}");
+        };
+        let logged = store
+            .account_decision(admission["reason"]["decision_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let logged: serde_json::Value = serde_json::from_str(&logged.decision_json).unwrap();
+        assert_eq!(
+            logged["explanation"]["credential_fence_probe"], admission["reason"]["fence_probe"],
+            "the admitted probe is durable"
+        );
+        selected["account_admission"] = admission;
+    }
+
+    async fn select_result(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        request: &serde_json::Value,
+    ) -> serde_json::Value {
+        let frame = run_route_wire_request_with_paths(
+            store,
+            request.clone(),
+            Path::new("/nonexistent/credential-fence-probe.jsonc"),
+            credentials,
+        )
+        .await;
+        let mut result =
+            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone();
+        admit_selected_account(store, credentials, &mut result);
+        result
+    }
+
+    async fn report_refusal(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        decision: &str,
+        code: &str,
+    ) {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": {
+                "decisionID": decision, "outcome": "error",
+                "lastError": format!("{code}: provider cline-pass refused credential apikey:cline-pass"),
+                "providerOutcome": {
+                    "accountRef": "apikey:cline-pass", "credentialId": "apikey:cline-pass", "resetsAtMs": null,
+                    "credentialRefusal": {"providerId": "cline-pass", "credentialId": "apikey:cline-pass", "code": code}
+                }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_set_decision_outcome(
+            frame,
+            &tx,
+            store,
+            Path::new("/nonexistent/credential-fence-probe.jsonc"),
+            credentials,
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(ack["result"]["ok"], true, "{ack}");
+    }
+
+    async fn report_completed(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        decision: &str,
+    ) {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": {
+                "decisionID": decision, "outcome": "completed",
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_set_decision_outcome(
+            frame,
+            &tx,
+            store,
+            Path::new("/nonexistent/credential-fence-probe.jsonc"),
+            credentials,
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(ack["result"]["ok"], true, "{ack}");
+    }
+
+    /// Fence (cline-pass, apikey:cline-pass) with `code` through a real select
+    /// plus an outcome report, returning the rig, store, credentials, the
+    /// automatic request that preferred cline-pass, and the fencing decision.
+    async fn billing_fenced_rig(
+        code: &str,
+    ) -> (
+        Rig,
+        SharedStore,
+        SharedBrocaCredentials,
+        serde_json::Value,
+        String,
+    ) {
+        let rig = Rig::new(&format!("credential-fence-probe-{code}"));
+        let store: SharedStore = Arc::new(rig.open_store());
+        let mut cheap = fact("cline-pass", "muse-spark-1.3-contributor");
+        cheap.cost_per_m_tok_out = Some(0.5);
+        let mut flash = fact("cline-pass", "deepseek-v4.1-flash");
+        flash.cost_per_m_tok_out = Some(0.6);
+        let mut fallback = fact("other", "fallback-model");
+        fallback.cost_per_m_tok_out = Some(40.0);
+        for fact in [&cheap, &flash, &fallback] {
+            store.upsert_fact(fact, FactSource::Override).unwrap();
+        }
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                credentials: [
+                    ("apikey:cline-pass", "cline-pass"),
+                    ("apikey:other", "other"),
+                ]
+                .into_iter()
+                .map(
+                    |(id, provider)| cortexkit_claustrum_client::ListedCredential {
+                        id: id.into(),
+                        categories: vec!["llm-provider".into()],
+                        credential_type: "apikey".into(),
+                        state: "active".into(),
+                        provider_ids: vec![provider.into()],
+                        plan_tier: None,
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+                view: format!("cline-pass-view-probe-{code}"),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        let request = json!({"method": ROUTE_SELECT_OP, "params": {
+            "consumer": "mason", "targetAgent": "mason", "requirements": {"iq": 30, "eq": 0},
+            "availableModels": ["cline-pass/muse-spark-1.3-contributor", "cline-pass/deepseek-v4.1-flash", "other/fallback-model"]}});
+        let first = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            first["selected"]["model"]["providerID"], "cline-pass",
+            "precondition: cline-pass wins before any refusal: {first}"
+        );
+        let decision = first["decisionID"].as_str().unwrap().to_string();
+        report_refusal(&store, &credentials, &decision, code).await;
+        let retry = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            retry["selected"]["model"]["providerID"], "other",
+            "precondition: the fence holds: {retry}"
+        );
+        (rig, store, credentials, request, decision)
+    }
+
+    fn age_fence_to_stale(store: &SharedStore) {
+        store
+            .touch_credential_entitlement_fence(
+                "cline-pass",
+                "apikey:cline-pass",
+                now_ms() as i64 - 7 * 60 * 60 * 1000,
+            )
+            .unwrap();
+    }
+
+    fn explanation_lines(result: &serde_json::Value) -> Vec<String> {
+        result["account_admission"]["reason"]["fence_probe"]
+            .as_str()
+            .map(str::to_string)
+            .into_iter()
+            .collect()
+    }
+
+    /// A probe that succeeds ends the fence: the next selection picks the
+    /// provider without recording another probe.
+    #[tokio::test]
+    async fn a_successful_probe_lifts_the_fence() {
+        let (_rig, store, credentials, request, _decision) =
+            billing_fenced_rig("billing_exhausted").await;
+        age_fence_to_stale(&store);
+        let probe = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            probe["selected"]["model"]["providerID"], "cline-pass",
+            "precondition: the probe is admitted: {probe}"
+        );
+        report_completed(&store, &credentials, probe["decisionID"].as_str().unwrap()).await;
+        assert!(
+            store.credential_entitlement_fences().unwrap().is_empty(),
+            "a successful probe lifts the fence"
+        );
+        let healed = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            healed["selected"]["model"]["providerID"], "cline-pass",
+            "{healed}"
+        );
+        assert!(
+            !explanation_lines(&healed)
+                .iter()
+                .any(|line| line.contains("fence probe")),
+            "no probe is recorded once the fence is gone: {healed}"
+        );
+    }
+
+    /// A probe that fails with a billing refusal renews the fence with a fresh
+    /// observation: it still holds, and the next probe waits another interval.
+    #[tokio::test]
+    async fn a_billing_failure_renews_the_fence() {
+        let (_rig, store, credentials, request, _decision) =
+            billing_fenced_rig("billing_exhausted").await;
+        age_fence_to_stale(&store);
+        let stale = store.credential_entitlement_fences().unwrap()[0].observed_at_ms;
+        let probe = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            probe["selected"]["model"]["providerID"], "cline-pass",
+            "precondition: the probe is admitted: {probe}"
+        );
+        let at_probe = store.credential_entitlement_fences().unwrap()[0].observed_at_ms;
+        assert!(
+            at_probe > stale,
+            "admitting the probe stamps the fence fresh"
+        );
+        report_refusal(
+            &store,
+            &credentials,
+            probe["decisionID"].as_str().unwrap(),
+            "billing_exhausted",
+        )
+        .await;
+        let fences = store.credential_entitlement_fences().unwrap();
+        assert_eq!(fences.len(), 1, "the failure keeps the fence");
+        assert!(
+            fences[0].observed_at_ms >= at_probe,
+            "the failure renews the fence with a fresh observation"
+        );
+        let retry = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            retry["selected"]["model"]["providerID"], "other",
+            "the renewed fence holds: {retry}"
+        );
+    }
+
+    async fn clear_fences_as(
+        store: &SharedStore,
+        channel: u16,
+        principal: &str,
+        credential: &str,
+    ) -> Frame {
+        route_principals()
+            .lock()
+            .unwrap()
+            .insert(channel, (1, principal.to_string()));
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method": ROUTE_CLEAR_CREDENTIAL_FENCES_OP,
+                "params": {"credentialId": credential}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_clear_credential_fences(frame, &tx, store)
+            .await
+            .unwrap();
+        rx.recv().await.unwrap()
+    }
+
+    /// The operator op lifts every fence on the named credential at once, for
+    /// use right after a top-up. Only the operator's own routes may call it:
+    /// any other module principal, and unverified routes, are refused.
+    #[tokio::test]
+    async fn the_operator_op_lifts_fences_and_refuses_non_operators() {
+        let rig = Rig::new("credential-fence-operator-lift");
+        let store: SharedStore = Arc::new(rig.open_store());
+        let refusal =
+            |provider: &str| prefrontal_routing_core::route_state_store::CredentialRefusal {
+                provider_id: provider.into(),
+                credential_id: "apikey:inception".into(),
+                code: "billing_exhausted".into(),
+            };
+        let credentials = empty_broca_credentials();
+        for provider in ["inception", "other"] {
+            credential_fences::record(&store, &credentials, &refusal(provider), now_ms() as i64)
+                .unwrap();
+        }
+        assert_eq!(store.credential_entitlement_fences().unwrap().len(), 2);
+        // The operator on a shell on this machine.
+        let reply = clear_fences_as(&store, 501, "direct", "apikey:inception").await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{reply:?}");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body["result"]["lifted"],
+            json!([
+                {"providerId": "inception", "code": "billing_exhausted"},
+                {"providerId": "other", "code": "billing_exhausted"},
+            ]),
+            "the reply names what was lifted: {body}"
+        );
+        assert!(store.credential_entitlement_fences().unwrap().is_empty());
+        // The operator on the phone.
+        credential_fences::record(&store, &credentials, &refusal("inception"), now_ms() as i64)
+            .unwrap();
+        let reply = clear_fences_as(&store, 502, "reserved:callosum", "apikey:inception").await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{reply:?}");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body["result"]["lifted"].as_array().unwrap().len(),
+            1,
+            "{body}"
+        );
+        assert!(store.credential_entitlement_fences().unwrap().is_empty());
+        // Any other module principal is refused, naming its principal.
+        credential_fences::record(&store, &credentials, &refusal("inception"), now_ms() as i64)
+            .unwrap();
+        let reply = clear_fences_as(&store, 503, "reserved:broca", "apikey:inception").await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{reply:?}");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "not_permitted", "{body}");
+        assert!(
+            body["message"].as_str().unwrap().contains("reserved:broca"),
+            "the refusal names the principal: {body}"
+        );
+        assert_eq!(store.credential_entitlement_fences().unwrap().len(), 1);
+        // So is an unverified route.
+        let reply = clear_fences_as(&store, 504, "unverified", "apikey:inception").await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{reply:?}");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "not_permitted", "{body}");
+        assert_eq!(store.credential_entitlement_fences().unwrap().len(), 1);
+    }
+
+    /// A strict pin on a stale-fenced model probes that same model: the pick
+    /// is the pinned route, never a different model the caller did not name.
+    #[tokio::test]
+    async fn a_strict_pin_probes_its_own_fenced_model() {
+        let (_rig, store, credentials, mut request, _decision) =
+            billing_fenced_rig("billing_exhausted").await;
+        age_fence_to_stale(&store);
+        request["params"]["modelPin"] = json!("cline-pass/deepseek-v4.1-flash");
+        let frame = run_route_wire_request_with_paths(
+            &store,
+            request,
+            Path::new("/nonexistent/credential-fence-pin-probe.jsonc"),
+            &credentials,
+        )
+        .await;
+        let mut body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(frame.header.ty, FrameType::Response, "{body}");
+        admit_selected_account(&store, &credentials, &mut body["result"]);
+        assert_eq!(
+            body["result"]["selected"]["routeKey"], "cline-pass/deepseek-v4.1-flash",
+            "a strict pin probes its own model, not another one: {body}"
+        );
+        assert!(
+            body["result"]["account_admission"]["reason"]["fence_probe"]
+                .as_str()
+                .is_some_and(|line| line.contains("fence probe")),
+            "the pick records its probe: {body}"
+        );
     }
 
     /// Routing deploys before core, and core may run against an older routing, so

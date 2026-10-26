@@ -116,6 +116,16 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     ),
     ("account_fence", "confirmed account exhaustion fences"),
     (
+        "account_eligibility",
+        "model/account eligibility facts retained until the credential listing changes; \
+         restoring them empty would repeat refusals already learned",
+    ),
+    (
+        "account_size_refusal",
+        "request-size restrictions retained until expiry or a later successful request; \
+         restoring them empty would repeat oversized requests already refused",
+    ),
+    (
         "account_principal_exclusion",
         "scoped credential exclusions",
     ),

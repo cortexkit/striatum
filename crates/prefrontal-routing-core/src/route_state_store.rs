@@ -228,7 +228,10 @@ pub struct CredentialRefusal {
 /// A stored (provider, credential) pair that routing does not select
 /// automatically. `listing_fingerprint` is the credential's vault listing
 /// (provider ids, plan tier and state) when the refusal arrived; the fence ends
-/// when the listing no longer matches it, never on a timer.
+/// when the listing no longer matches it, when a recheck probe on the pair
+/// succeeds, or when an operator lifts it. A stale fence (one whose refusal is
+/// older than the recheck interval) admits a single probe request, which renews
+/// its observation clock whether it succeeds or fails again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialEntitlementFence {
     pub provider_id: String,

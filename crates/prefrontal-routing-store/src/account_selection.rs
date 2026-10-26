@@ -25,9 +25,105 @@ use super::{err, SqliteRouteStateStore};
 /// retired shadow mode; retention purges those rows.)
 pub const DECISION_MODE_SERVE: &str = "serve";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialProbeClaim {
+    Claimed,
+    Unfenced,
+    Blocked,
+}
+
 #[cfg(test)]
 mod account_fact_tests {
     use super::*;
+
+    #[test]
+    fn stale_credential_probe_is_claimed_once_with_a_strict_cutoff() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-credential-probe");
+        let store = std::sync::Arc::new(
+            SqliteRouteStateStore::open(&crate::dev_descriptor(
+                "account-credential-probe",
+                scratch.path().join("store.db").to_string_lossy(),
+            ))
+            .unwrap(),
+        );
+        store
+            .record_credential_entitlement_fence(
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "c".into(),
+                    code: "billing_exhausted".into(),
+                },
+                Some("listing"),
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .account_transaction(|tx| tx.claim_credential_probe("p", "c", 100, 200))
+                .unwrap(),
+            CredentialProbeClaim::Blocked
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let attempts: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, 200))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let claims: Vec<_> = attempts
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| **claim == CredentialProbeClaim::Claimed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| **claim == CredentialProbeClaim::Blocked)
+                .count(),
+            7
+        );
+        store
+            .record_credential_entitlement_fence(
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "c".into(),
+                    code: "ENTITLEMENT_ERROR".into(),
+                },
+                Some("listing"),
+                150,
+            )
+            .unwrap();
+        assert_eq!(
+            store.credential_entitlement_fences().unwrap()[0].observed_at_ms,
+            200,
+            "a late refusal cannot rewind a reserved probe"
+        );
+        assert_eq!(
+            store
+                .account_transaction(|tx| tx.claim_credential_probe("p", "c", 151, 201))
+                .unwrap(),
+            CredentialProbeClaim::Blocked
+        );
+        store.clear_credential_entitlement_fence("p", "c").unwrap();
+        assert_eq!(
+            store
+                .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, 200))
+                .unwrap(),
+            CredentialProbeClaim::Unfenced
+        );
+    }
 
     #[test]
     fn eligibility_survives_restart_and_clears_only_on_listing_change() {
@@ -163,6 +259,50 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Reserve one stale credential probe in the same write transaction as
+    /// its admission. The strict cutoff also rejects a concurrently renewed
+    /// refusal or a probe already reserved from an older roster snapshot.
+    pub fn claim_credential_probe(
+        &self,
+        provider: &str,
+        credential: &str,
+        before: i64,
+        at: i64,
+    ) -> RouteStateResult<CredentialProbeClaim> {
+        let changed=self.conn.execute("UPDATE credential_entitlement_fences SET observed_at_ms=?4 WHERE provider_id=?1 AND credential_id=?2 AND observed_at_ms<?3",params![provider,credential,before,at]).map_err(err)?;
+        if changed > 0 {
+            return Ok(CredentialProbeClaim::Claimed);
+        }
+        let exists: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2)",params![provider,credential],|row|row.get(0)).map_err(err)?;
+        Ok(if exists {
+            CredentialProbeClaim::Blocked
+        } else {
+            CredentialProbeClaim::Unfenced
+        })
+    }
+
+    /// Freeze the admitted serving identity on the model decision so a later
+    /// completion report heals only the credential that actually ran.
+    pub fn bind_model_account(
+        &self,
+        decision: &str,
+        provider: &str,
+        model: &str,
+        account: &str,
+        credential: &str,
+    ) -> RouteStateResult<()> {
+        let identity = serde_json::to_string(
+            &prefrontal_routing_core::route_state_store::ProviderOutcome {
+                account_ref: account.into(),
+                credential_id: Some(credential.into()),
+                resets_at_ms: None,
+                credential_refusal: None,
+            },
+        )
+        .map_err(err)?;
+        self.conn.execute("UPDATE model_route_decisions SET provider_identity_json=?1 WHERE id=?2 AND selected_provider_id=?3 AND selected_model_id=?4",params![identity,decision,provider,model]).map(|_|()).map_err(err)
+    }
+
     pub fn record_eligibility(&self, fact: &AccountEligibilityFact) -> RouteStateResult<()> {
         self.conn.execute(
                 "INSERT INTO account_eligibility VALUES (?1,?2,?3,?4,?5,?6) \

@@ -327,6 +327,8 @@ pub struct RosterNote {
 /// The machine-readable explanation every decision carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Explanation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fence_probe: Option<String>,
     pub policy_version: u32,
     pub provider: String,
     pub model: String,
@@ -358,6 +360,7 @@ pub struct Explanation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmitReason {
+    CredentialFenceProbe,
     PaidCredits,
     /// Existing affinity retained.
     StickyHit,

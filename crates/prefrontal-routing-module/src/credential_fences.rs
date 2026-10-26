@@ -11,10 +11,13 @@
 //! another credential still serves is launched pinned to that other credential.
 //! Explicit pins require an eligible credential too.
 //!
-//! Waiting fixes neither refusal, so a fence has no expiry. It ends when the
-//! credential's vault listing (provider ids, plan tier or state) no longer matches
-//! the listing the refusal was recorded against, because changing the listing is
-//! what an operator does to fix it.
+//! A fence ends three ways. A change to the credential's vault listing (provider
+//! ids, plan tier or state) ends it at once, as today. A fence older than
+//! [`FENCE_PROBE_RECHECK_MS`] admits a single probe request on that credential:
+//! the probe stamps the fence fresh so no second probe follows within the
+//! interval, a successful outcome ends the fence, and a billing or entitlement
+//! failure renews it for another interval. An operator lifts every fence on a
+//! named credential at once, for use right after topping it up.
 
 use std::collections::HashSet;
 
@@ -26,6 +29,12 @@ use prefrontal_routing_core::{
 use prefrontal_routing_store::SqliteRouteStateStore;
 
 use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
+
+/// How long a billing or entitlement fence holds before routing admits one
+/// probe request on the fenced credential: six hours. Topping up a balance
+/// does not change the credential's vault listing, so without a recheck the
+/// fence would hold until the listing changed for an unrelated reason.
+pub(crate) const FENCE_PROBE_RECHECK_MS: i64 = 6 * 60 * 60 * 1000;
 
 /// Store a reported refusal against the credential's current vault listing.
 pub(crate) fn record(
@@ -106,6 +115,102 @@ pub(crate) fn live(
         }
     }
     Ok(live)
+}
+
+/// A fence whose refusal is older than the recheck interval: the next
+/// account admission may reserve one probe request on it and stamp it fresh.
+fn is_stale(fence: &CredentialEntitlementFence, now_ms: i64) -> bool {
+    now_ms.saturating_sub(fence.observed_at_ms) > FENCE_PROBE_RECHECK_MS
+}
+
+/// Split live fences into fresh restrictions and potential account-admission
+/// probes. Every fence counts as billing or entitlement: the reason
+/// a route refusal carries is one of the two, so age alone decides.
+pub(crate) fn split(
+    fences: &[CredentialEntitlementFence],
+    now_ms: i64,
+) -> (
+    Vec<CredentialEntitlementFence>,
+    Vec<CredentialEntitlementFence>,
+) {
+    let mut enforcing = Vec::new();
+    let mut stale = Vec::new();
+    for fence in fences {
+        if is_stale(fence, now_ms) {
+            stale.push(fence.clone());
+        } else {
+            enforcing.push(fence.clone());
+        }
+    }
+    (enforcing, stale)
+}
+
+/// The explanation line a probed pick carries in its decision.
+pub(crate) fn probe_note(provider_id: &str, credential_id: &str) -> String {
+    format!(
+        "fence probe: {provider_id} via {credential_id} is past the 6h entitlement recheck, admitting one probe request",
+    )
+}
+
+/// The stale-fenced credentials a probe of `provider_id` may launch on: every
+/// serving identity is fenced, but at least one only by a stale fence, so the
+/// route is selectable only as a probe. Empty when the route was never fenced
+/// or is still fenced by a fresh refusal.
+pub(crate) fn probe_credentials(
+    full: &[CredentialEntitlementFence],
+    enforcing: &[CredentialEntitlementFence],
+    provider_id: &str,
+    identities: &[(String, Option<String>)],
+) -> Vec<String> {
+    if unentitled(full, provider_id, identities).is_empty() {
+        return Vec::new();
+    }
+    let fresh: HashSet<&str> = enforcing
+        .iter()
+        .filter(|fence| fence.provider_id == provider_id)
+        .map(|fence| fence.credential_id.as_str())
+        .collect();
+    identities
+        .iter()
+        .filter(|(credential, _)| !fresh.contains(credential.as_str()))
+        .map(|(credential, _)| credential.clone())
+        .collect()
+}
+
+/// End the fence on the (provider, credential) pair a run just succeeded on.
+/// True when a fence was lifted.
+pub(crate) fn lift_after_success(
+    store: &SqliteRouteStateStore,
+    provider_id: &str,
+    credential_id: &str,
+) -> Result<bool, String> {
+    let lifted = store
+        .clear_credential_entitlement_fence(provider_id, credential_id)
+        .map_err(|e| e.to_string())?;
+    if lifted > 0 {
+        eprintln!(
+            "[prefrontal-routing] credential entitlement fence lifted provider={provider_id} credential={credential_id}: the probe run succeeded",
+        );
+    }
+    Ok(lifted > 0)
+}
+
+/// End every fence naming `credential_id`, as an operator does right after
+/// topping it up. Returns the fences that were lifted, ordered by provider.
+pub(crate) fn lift_for_operator(
+    store: &SqliteRouteStateStore,
+    credential_id: &str,
+) -> Result<Vec<CredentialEntitlementFence>, String> {
+    let lifted = store
+        .clear_credential_entitlement_fences_for_credential(credential_id)
+        .map_err(|e| e.to_string())?;
+    for fence in &lifted {
+        eprintln!(
+            "[prefrontal-routing] credential entitlement fence lifted provider={} credential={}: operator lift after top-up",
+            fence.provider_id, fence.credential_id
+        );
+    }
+    Ok(lifted)
 }
 
 /// The fenced credentials that make `provider_id`'s route unselectable: every

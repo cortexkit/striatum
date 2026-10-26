@@ -66,6 +66,7 @@ pub fn decide_with_context(
             .collect(),
     });
     let explanation = Explanation {
+        credential_fence_probe: None,
         policy_version: policy.policy_version,
         provider: provider.clone(),
         model: model.clone(),
@@ -1307,14 +1308,21 @@ impl<'a> Allocator<'a> {
     }
 
     fn admit(
-        self,
+        mut self,
         account_id: &str,
         credential_id: &str,
         reason: AdmitReason,
         affinity: AffinityOutcome,
         reading: Option<&QuotaReading>,
     ) -> Decision {
-        let reason = if self.using_credits(account_id) {
+        self.explanation.credential_fence_probe = self
+            .context
+            .credential_probe_notes
+            .get(credential_id)
+            .cloned();
+        let reason = if self.explanation.credential_fence_probe.is_some() {
+            AdmitReason::CredentialFenceProbe
+        } else if self.using_credits(account_id) {
             AdmitReason::PaidCredits
         } else {
             reason

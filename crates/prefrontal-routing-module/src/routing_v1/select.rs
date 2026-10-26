@@ -267,6 +267,7 @@ pub(super) async fn select(
         select_policy::CandidateSource::Vault {
             credentials: deps.broca_credentials,
             fences: &priced.entitlement_fences,
+            stale: &[],
             defer_pool_pin: false,
         },
         legacy_consumer,

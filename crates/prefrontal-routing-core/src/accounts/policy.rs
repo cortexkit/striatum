@@ -38,6 +38,7 @@ pub struct SpendReading {
 /// are left absent; in particular no report fabricates a credit balance.
 #[derive(Debug, Clone, Default)]
 pub struct AllocationContext {
+    pub credential_probe_notes: BTreeMap<String, String>,
     pub hold_ok: Option<bool>,
     pub parent_account_id: Option<String>,
     pub credits: BTreeMap<String, CreditReading>,
