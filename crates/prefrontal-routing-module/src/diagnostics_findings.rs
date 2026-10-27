@@ -643,7 +643,7 @@ fn refusal_hint(code: &str) -> String {
             "No account could serve the models this consumer needs: see this report's route_blocks (holds, pool blocks) and credential_fences for their providers."
         }
         "not_available" => {
-            "The models this consumer needs are not served by any provider Broca holds a usable credential for: check Broca's credentials and the consumer's allowed providers."
+            "The models this consumer needs are not served by any provider the runner holds a usable credential for: check the runner's credentials and the consumer's allowed providers."
         }
         "credential_billing_exhausted" | "credential_unentitled" => {
             "Every credential serving these models is fenced: see this report's credential_fences."
