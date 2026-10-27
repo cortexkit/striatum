@@ -928,7 +928,7 @@ async fn main() -> Result<(), ModuleError> {
     // the process; HELLO and the credential route read that cached answer.
     let _ = subc_os::launch_nonce();
     let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
-        StartupMode::PrintManifest => return print_manifest_operations(),
+        StartupMode::PrintManifest => return print_manifest(),
         StartupMode::CheckConfig => {
             let report = config_overrides::check_config_offline(
                 &config_overrides::config_path(),
@@ -7815,7 +7815,40 @@ struct PrintedManifestOperation {
     kind: &'static str,
 }
 
-fn print_manifest_operations() -> Result<(), ModuleError> {
+/// `--print-manifest` output, the same shape the core module prints: the whole
+/// manifest this build declares in HELLO, including the build provenance that
+/// `script/deploy-module.sh` reads to find the installed commit, plus the
+/// operation kinds the op-kinds generator reads.
+#[derive(Serialize)]
+struct PrintedManifest {
+    manifest: ModuleManifest,
+    operation_kinds: Vec<PrintedManifestOperation>,
+}
+
+fn print_manifest() -> Result<(), ModuleError> {
+    let output = printed_manifest_json(&printed_manifest_module_id())?;
+    println!("{output}");
+    Ok(())
+}
+
+/// The module id serving would declare: the same resolution as
+/// `ModuleConfig::from_env`, so the printed manifest matches the HELLO one.
+fn printed_manifest_module_id() -> String {
+    std::env::var(SUBC_MODULE_ID_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODULE_ID.to_string())
+}
+
+fn printed_manifest_json(module_id: &str) -> Result<String, ModuleError> {
+    serde_json::to_string(&PrintedManifest {
+        manifest: manifest(module_id),
+        operation_kinds: printed_operation_kinds(),
+    })
+    .map_err(ModuleError::Json)
+}
+
+fn printed_operation_kinds() -> Vec<PrintedManifestOperation> {
     let mut operations = served_operations()
         .into_iter()
         .map(|operation| {
@@ -7830,9 +7863,7 @@ fn print_manifest_operations() -> Result<(), ModuleError> {
         })
         .collect::<Vec<_>>();
     operations.sort_by(|left, right| left.name.cmp(&right.name));
-    let output = serde_json::to_string(&operations).map_err(ModuleError::Json)?;
-    println!("{output}");
-    Ok(())
+    operations
 }
 
 /// The module's capability manifest: a ManagementSurface exposing routing operations.
@@ -13864,6 +13895,71 @@ mod tests {
         assert_eq!(
             provenance.build_lock_digest.as_deref().map(str::len),
             Some(64)
+        );
+    }
+
+    #[test]
+    fn print_manifest_carries_the_whole_manifest_and_the_operation_kinds() {
+        let printed: serde_json::Value =
+            serde_json::from_str(&printed_manifest_json("print-manifest-test").unwrap()).unwrap();
+        let object = printed.as_object().expect("printed manifest is an object");
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["manifest", "operation_kinds"]
+        );
+
+        // The whole manifest HELLO declares, so the deploy script can read the
+        // installed build commit at manifest.provenance.build_git_sha.
+        let printed_manifest = &printed["manifest"];
+        assert_eq!(
+            printed_manifest,
+            &serde_json::to_value(manifest("print-manifest-test")).unwrap()
+        );
+        assert_eq!(printed_manifest["module_id"], "print-manifest-test");
+        let provenance = &printed_manifest["provenance"];
+        assert_eq!(
+            provenance["wire_crate_version"],
+            subc_protocol::SUBC_PROTOCOL_CRATE_VERSION
+        );
+        if env!("PREFRONTAL_BUILD_GIT_SHA") == "unknown" {
+            assert!(provenance["build_git_sha"].is_null());
+            assert_eq!(provenance["build_git_sha_absence_reason"], "never_derived");
+        } else if env!("PREFRONTAL_BUILD_GIT_DIRTY") == "true" {
+            assert!(provenance["build_git_sha"].is_null());
+            assert_eq!(provenance["build_git_sha_absence_reason"], "declined_dirty");
+        } else {
+            assert_eq!(
+                provenance["build_git_sha"],
+                env!("PREFRONTAL_BUILD_GIT_SHA")
+            );
+        }
+        assert_eq!(
+            provenance["build_lock_digest"].as_str().map(str::len),
+            Some(64)
+        );
+
+        // The op-kinds generator reads this list: every served operation once,
+        // sorted by name, as exactly { name, kind }.
+        let kinds = printed["operation_kinds"]
+            .as_array()
+            .expect("operation kinds printed");
+        let names = kinds
+            .iter()
+            .map(|operation| operation["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let mut expected = served_operations()
+            .into_iter()
+            .map(|operation| operation.name)
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(names, expected);
+        let route_select = kinds
+            .iter()
+            .find(|operation| operation["name"] == ROUTE_SELECT_OP)
+            .expect("route.select printed");
+        assert_eq!(
+            route_select,
+            &serde_json::json!({ "name": ROUTE_SELECT_OP, "kind": "mutate" })
         );
     }
 
