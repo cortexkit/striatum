@@ -20,11 +20,6 @@ mod common;
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use prefrontal_test_support::TestDaemon as Child;
-use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandle, ModuleHandler, RequestCtx};
-use subc_protocol::manifest::{
-    Concurrency, ExecutionMode, ManagementOperation, ManagementOperationKind, ModuleManifest,
-    ProviderRole, Tool, TrustTier,
-};
 
 use common::{
     connect_consumer, control_rpc, raw_route_frame, route_close, route_open, route_select,
@@ -43,138 +38,11 @@ struct RealDaemon {
     _fixtures: RoutingFixtures,
 }
 
-/// The stand-in Claustrum credential listing and Fusiform catalog that routing reads
-/// before it will select: every production daemon runs both, and routing refuses
-/// `route.select` until its first billing-plane load. The services stop on drop.
-pub(crate) struct RoutingFixtures {
-    _credentials: ModuleHandle,
-    credential_service: tokio::task::JoinHandle<()>,
-    _catalog: ModuleHandle,
-    catalog_service: tokio::task::JoinHandle<()>,
-}
+#[path = "../support/daemon_fixtures.rs"]
+mod daemon_fixtures;
 
-impl Drop for RoutingFixtures {
-    fn drop(&mut self) {
-        self.credential_service.abort();
-        self.catalog_service.abort();
-    }
-}
-
-struct FusiformCatalog;
-
-const FIXTURE_PROVIDERS: &[&str] = &["anthropic", "openai", "xai", "ollama-cloud"];
-
-impl FusiformCatalog {
-    fn seed_models() -> serde_json::Value {
-        let mut models = serde_json::Map::new();
-        for fact in prefrontal_routing_core::model_facts_seed() {
-            let mut model = serde_json::json!({
-                "existence":"present", "limit.context":fact.context_window.map(|n| n as u64),
-                "limit.output":fact.max_output_tokens, "capability.attachment":fact.supports_vision,
-                "capability.tool_call":fact.supports_tool_use,
-            });
-            if let Some(cost) = fact.cost_per_m_tok_out {
-                model["rate.output"] = serde_json::json!({
-                    "state":"priced", "currency":"USD", "units":(cost * 1_000_000_000.0).round() as i64, "exponent":9,
-                });
-            }
-            models.insert(format!("{}/{}", fact.provider_id, fact.model_id), model);
-        }
-        serde_json::Value::Object(models)
-    }
-
-    fn reply(request: &serde_json::Value) -> serde_json::Value {
-        let golden: serde_json::Value =
-            serde_json::from_str(include_str!("../../fixtures/catalog-paged.json")).unwrap();
-        let mut page = golden["response"].clone();
-        match request["name"].as_str().unwrap() {
-            "catalog.get" => {
-                if request["arguments"].get("auth_method").is_some() {
-                    let provider = request["arguments"]["provider_id"].as_str().unwrap();
-                    assert!(FIXTURE_PROVIDERS.contains(&provider));
-                    assert_eq!(
-                        request["arguments"],
-                        serde_json::json!({"include_retired":true,"provider_id":provider,"auth_method":"apikey"})
-                    );
-                    // No credential-specific rates are served here. no_coverage
-                    // lets API-key routes use the catalog's ordinary model prices.
-                    return serde_json::json!({"code":"no_coverage","message":"No billing plane declared in the seed fixture"});
-                }
-                let token = request["arguments"]["page_token"].as_str();
-                let mut expected = serde_json::json!({"include_retired":true,"paged":true});
-                if let Some(token) = token {
-                    assert_eq!(token, page["next_page_token"].as_str().unwrap());
-                    expected["page_token"] = serde_json::json!(token);
-                    // Serve the seed's prices for selection. The first page's
-                    // 000-page/m must not repeat: the client rejects duplicate models.
-                    page["models"] = Self::seed_models();
-                    page.as_object_mut().unwrap().remove("next_page_token");
-                }
-                assert_eq!(request["arguments"], expected);
-                serde_json::json!({"result":page})
-            }
-            "catalog.status" => {
-                assert_eq!(request["arguments"], serde_json::json!({"polls":1}));
-                serde_json::json!({"result":{"catalog_version":page["catalog_version"]}})
-            }
-            // Routing reads subscription plan prices on every economics refresh.
-            // Serve Fusiform's own recorded reply (the pinned served payloads).
-            "plan.prices" => {
-                assert_eq!(request["arguments"], serde_json::json!({}));
-                let served: serde_json::Value =
-                    serde_json::from_str(include_str!("../../fixtures/served-payloads.json"))
-                        .unwrap();
-                let recorded = &served["plan.prices — every curated row"];
-                assert_eq!(recorded["request"], *request);
-                serde_json::json!({"result":recorded["response"]})
-            }
-            other => panic!("unexpected Fusiform fixture tool: {other}"),
-        }
-    }
-}
-
-#[async_trait]
-impl ModuleHandler for FusiformCatalog {
-    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        let request = serde_json::from_slice(&body).unwrap();
-        HandlerOutcome::Response(serde_json::to_vec(&Self::reply(&request)).unwrap())
-    }
-}
-
-async fn serve_fusiform_catalog(
-    connection_file: &std::path::Path,
-) -> (ModuleHandle, tokio::task::JoinHandle<()>) {
-    let tools = ["catalog.get", "catalog.status", "plan.prices"]
-        .into_iter()
-        .map(|name| Tool {
-            name: name.into(),
-            description: None,
-            execution_mode: ExecutionMode::Pure,
-            schema: serde_json::json!({"type":"object"}),
-        })
-        .collect();
-    let manifest = ModuleManifest::builder("fusiform", "0.0.0")
-        .trust_tier(Some(TrustTier::FirstParty))
-        .protocol_ver(subc_protocol::PROTOCOL_VERSION)
-        .provides(vec![ProviderRole::ToolProvider {
-            tools,
-            identity_scope: Vec::new(),
-            concurrency: Concurrency::ModuleManaged,
-            emits_push: false,
-            sub_supervises: false,
-        }])
-        .build();
-    let (handle, serving) =
-        subc_client_rs::serve_with_handle(connection_file, manifest, FusiformCatalog)
-            .await
-            .expect("register fixture Fusiform catalog");
-    (
-        handle,
-        tokio::spawn(async move {
-            serving.await.expect("serve fixture Fusiform catalog");
-        }),
-    )
-}
+use daemon_fixtures::FusiformCatalog;
+pub(crate) use daemon_fixtures::RoutingFixtures;
 
 #[test]
 fn fusiform_fixture_serves_pinned_first_page_and_terminal_continuation() {
@@ -212,80 +80,6 @@ fn fusiform_fixture_serves_pinned_first_page_and_terminal_continuation() {
     assert!(prices["result"]["prices"]
         .as_array()
         .is_some_and(|rows| !rows.is_empty()));
-}
-
-struct CredentialMetadata;
-
-#[async_trait]
-impl ModuleHandler for CredentialMetadata {
-    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Insula, which the both-modules rig also runs, calls Claustrum's
-        // auth.watch_scoped. This stand-in models only the listing routing reads and
-        // refuses every other operation, so Insula sees an unavailable credential
-        // service instead of a panicked handler that never answers.
-        if request["method"] != "credential.list_scoped" {
-            return HandlerOutcome::Error {
-                code: "unknown_method".into(),
-                message: format!(
-                    "the stand-in Claustrum does not serve {}",
-                    request["method"]
-                ),
-            };
-        }
-        assert_eq!(request["params"], serde_json::json!({}));
-        let credentials: Vec<_> = FIXTURE_PROVIDERS
-            .iter()
-            .map(|provider| {
-                serde_json::json!({
-                    "id":format!("apikey:{provider}:routing-health-fixture"),
-                    // Claustrum's row shape for an API key (see
-                    // fixtures/claustrum-list-scoped.json): type and
-                    // auth_method are both "apikey".
-                    "categories":["llm-provider"], "type":"apikey", "auth_method":"apikey",
-                    "serves":[provider], "provider_ids":[provider], "state":"active",
-                    "record_version":1, "operations":["get"],
-                })
-            })
-            .collect();
-        HandlerOutcome::Response(
-            serde_json::to_vec(&serde_json::json!({
-                "result": {
-                    "view": "routing-health-fixture-v1",
-                    "credentials": credentials
-                }
-            }))
-            .unwrap(),
-        )
-    }
-}
-
-async fn serve_credential_metadata(
-    connection_file: &std::path::Path,
-) -> (ModuleHandle, tokio::task::JoinHandle<()>) {
-    let manifest = ModuleManifest::builder("claustrum", "0.0.0")
-        .trust_tier(Some(TrustTier::FirstParty))
-        .protocol_ver(subc_protocol::PROTOCOL_VERSION)
-        .provides(vec![ProviderRole::ManagementSurface {
-            concurrency: Concurrency::ModuleManaged,
-            operations: vec![ManagementOperation {
-                name: "credential.list_scoped".into(),
-                kind: ManagementOperationKind::Query,
-                description: None,
-            }],
-            config_schema: serde_json::json!({"type":"object"}),
-            observability: Vec::new(),
-            identity_scope: Vec::new(),
-        }])
-        .build();
-    let (handle, serving) =
-        subc_client_rs::serve_with_handle(connection_file, manifest, CredentialMetadata)
-            .await
-            .expect("register fixture credential metadata service");
-    let service = tokio::spawn(async move {
-        serving.await.expect("serve fixture credential metadata");
-    });
-    (handle, service)
 }
 
 impl RealDaemon {
@@ -374,14 +168,7 @@ async fn start_real_daemon() -> RealDaemon {
 pub(crate) async fn start_routing_fixtures(connection_file: &std::path::Path) -> RoutingFixtures {
     // Routing health requires a scoped credential listing for Broca reachability
     // (the health handler in src/main.rs). Supply metadata, never secret material.
-    let (credentials, credential_service) = serve_credential_metadata(connection_file).await;
-    let (catalog, catalog_service) = serve_fusiform_catalog(connection_file).await;
-    let fixtures = RoutingFixtures {
-        _credentials: credentials,
-        credential_service,
-        _catalog: catalog,
-        catalog_service,
-    };
+    let fixtures = daemon_fixtures::serve_routing_fixtures(connection_file).await;
     let mut consumer = connect_consumer(connection_file).await;
     wait_for_catalog(&mut consumer, "claustrum", SETUP_TIMEOUT).await;
     wait_for_catalog(&mut consumer, "fusiform", SETUP_TIMEOUT).await;
