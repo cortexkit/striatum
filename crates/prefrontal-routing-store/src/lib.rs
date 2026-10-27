@@ -764,8 +764,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
 /// Count every `model_facts` write made through this connection, so a cached
 /// catalog fingerprint can tell whether the catalog changed since it was
 /// computed. Returns `false` (and installs nothing) when the store has no
-/// `model_facts` table, which only happens for upgrade tests that open an
-/// older schema.
+/// `model_facts` table.
 ///
 /// The counter and triggers are TEMP objects: they live only on the store's
 /// one connection, are never written to the database file, and need no
@@ -918,7 +917,7 @@ pub struct SqliteRouteStateStore {
     /// Same-model score disagreements already logged by this process, so a
     /// read on every selection does not repeat the same warning.
     reported_score_conflicts: Mutex<HashSet<String>>,
-    /// The catalog fingerprint stamped on every decision row, kept with the
+    /// The catalog fingerprint stamped on each new decision row, kept with the
     /// catalog state it was computed from (see `CatalogFingerprintKey`). Before
     /// this cache, every decision write read and hashed every `model_facts` row.
     /// `None` until the first fingerprint is computed, and always `None` on a
