@@ -587,6 +587,14 @@ pub struct CatalogFact {
     /// states no identity.
     #[serde(rename = "canonicalID", skip_serializing_if = "Option::is_none")]
     pub canonical_id: Option<String>,
+    /// The reasoning efforts the catalog publishes for this model
+    /// (Fusiform's `capability.reasoning_options` effort values), which Broca
+    /// admits as a send's variant on any route of the model. Absent when the
+    /// catalog has not been read for them; empty when it publishes none. A
+    /// consumer stepping a seat's effort down reads its lower variants here: the
+    /// route rows themselves carry only the variants an operator configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
     /// The route whose operator score this row's Elo/EQ were read from, when the
     /// row has no score of its own and shares a canonical id with one that does.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1088,6 +1096,9 @@ impl SqliteRouteStateStore {
                             .get::<_, Option<i64>>("fusiform_present")?
                             .map(|value| value != 0),
                         canonical_id: row.get("canonical_id")?,
+                        reasoning_efforts: row
+                            .get::<_, Option<String>>("reasoning_efforts_json")?
+                            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok()),
                         score_borrowed_from: None,
                     })
                 })?;

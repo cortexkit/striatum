@@ -26,13 +26,93 @@ pub const SEAT_PROMPT_RESERVE_TOKENS: u64 = 16_000;
 /// Window assumed for a seat whose catalog fact carries none. It is deliberately
 /// small so an unknown model can shrink the package but never overfill a seat.
 pub const UNKNOWN_SEAT_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
-/// Output room assumed for a seat whose catalog fact carries no output ceiling.
-pub const UNKNOWN_SEAT_OUTPUT_TOKENS: u64 = 32_000;
-/// The most output a panel member is ever asked for. Some catalog rows carry a
-/// placeholder output ceiling equal to the context window (grok-4.7:
-/// 500,000/500,000), which would leave no room for any package, so the ceiling
-/// reserves what a member send actually requests, not the catalog figure.
-pub const PANEL_MEMBER_MAX_OUTPUT_TOKENS: u64 = 64_000;
+/// The output limit Broca itself applies to a route whose catalog output limit is
+/// unknown: missing, or a placeholder at least as large as the context window
+/// (Broca 0.3.125). Core omits `generation.max_output_tokens` for such a route so
+/// this fallback applies; core uses the value only where it has to assume an
+/// output size, such as reserving output room when sizing an evidence package.
+pub const BROCA_UNKNOWN_OUTPUT_FALLBACK_TOKENS: u64 = 32_000;
+/// Output room assumed for a seat whose catalog fact carries no output ceiling:
+/// the same figure Broca falls back to for that seat.
+pub const UNKNOWN_SEAT_OUTPUT_TOKENS: u64 = BROCA_UNKNOWN_OUTPUT_FALLBACK_TOKENS;
+/// Output room reserved for one seat when sizing the evidence package. Only the
+/// package budget uses it; it never caps what a seat is sent, which is the route's
+/// own catalog limit (see [`route_output_limit`]). Some catalog rows carry a
+/// placeholder output limit equal to the context window (grok-4.7:
+/// 500,000/500,000) that would leave no room for any package, so the reserve is
+/// bounded.
+pub const PACKAGE_OUTPUT_RESERVE_TOKENS: u64 = 64_000;
+/// Catalog output limits above this are sent but treated as suspect: Fusiform
+/// carries long-decode ceilings (openrouter's 943,718 for Gemini 4 Argon) that the
+/// provider may not honour, and Broca flags the same threshold.
+pub const SUSPECT_OUTPUT_LIMIT_TOKENS: u64 = 131_072;
+/// Room kept free between the estimated prompt plus the requested output and the
+/// context window, because the prompt figure is an estimate from its byte size.
+pub const OUTPUT_CONTEXT_MARGIN_TOKENS: u64 = 4_096;
+
+/// The output limit core sends for one route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteOutputLimit {
+    /// The catalog states no usable output limit (missing, a missing context
+    /// window, or a placeholder at least as large as the window). The send omits
+    /// `generation.max_output_tokens` and Broca applies its own fallback,
+    /// [`BROCA_UNKNOWN_OUTPUT_FALLBACK_TOKENS`].
+    Unknown,
+    /// Send `tokens`: the catalog's limit, lowered only as far as the prompt
+    /// estimate, the output and [`OUTPUT_CONTEXT_MARGIN_TOKENS`] need to fit the
+    /// window. `suspect` marks a catalog limit above
+    /// [`SUSPECT_OUTPUT_LIMIT_TOKENS`], which callers report so a wrong catalog
+    /// value gets corrected.
+    Send {
+        tokens: u64,
+        catalog: u64,
+        suspect: bool,
+    },
+}
+
+impl RouteOutputLimit {
+    /// The value to put in `generation.max_output_tokens`; `None` omits it.
+    pub fn tokens(self) -> Option<u64> {
+        match self {
+            Self::Unknown => None,
+            Self::Send { tokens, .. } => Some(tokens),
+        }
+    }
+}
+
+/// The output limit to send on a route whose catalog fact carries
+/// `catalog_output` and `context_window`, for a prompt of about `prompt_tokens`.
+///
+/// No fixed core ceiling applies: a seat that needs heavy thinking gets the
+/// model's whole published limit (Opus publishes 128k).
+pub fn route_output_limit(
+    catalog_output: Option<u64>,
+    context_window: Option<u64>,
+    prompt_tokens: u64,
+) -> RouteOutputLimit {
+    let (Some(output), Some(window)) = (
+        catalog_output.filter(|output| *output > 0),
+        context_window.filter(|window| *window > 0),
+    ) else {
+        return RouteOutputLimit::Unknown;
+    };
+    if output >= window {
+        return RouteOutputLimit::Unknown;
+    }
+    let room = window
+        .saturating_sub(prompt_tokens)
+        .saturating_sub(OUTPUT_CONTEXT_MARGIN_TOKENS);
+    if room == 0 {
+        // The prompt alone fills the window. Any limit sent would be refused as a
+        // context overflow, which Broca reports by name without a limit from core.
+        return RouteOutputLimit::Unknown;
+    }
+    RouteOutputLimit::Send {
+        tokens: output.min(room),
+        catalog: output,
+        suspect: output > SUSPECT_OUTPUT_LIMIT_TOKENS,
+    }
+}
 
 /// A package ceiling and the seat whose window set it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +154,7 @@ pub fn seat_package_ceiling(
     let window = known.unwrap_or(UNKNOWN_SEAT_CONTEXT_WINDOW_TOKENS);
     let output = max_output_tokens
         .unwrap_or(UNKNOWN_SEAT_OUTPUT_TOKENS)
-        .min(PANEL_MEMBER_MAX_OUTPUT_TOKENS);
+        .min(PACKAGE_OUTPUT_RESERVE_TOKENS);
     let tokens = window
         .saturating_sub(output)
         .saturating_sub(SEAT_PROMPT_RESERVE_TOKENS)
@@ -151,8 +231,8 @@ mod tests {
 
     #[test]
     fn a_placeholder_output_ceiling_equal_to_the_window_still_leaves_room() {
-        // grok-4.7's catalog row carries output 500,000 on a 500,000 window; a
-        // member send asks for at most 64,000, so that is what the ceiling reserves.
+        // grok-4.7's catalog row carries output 500,000 on a 500,000 window; the
+        // package reserves a bounded 64,000 for output rather than the placeholder.
         let ceiling = seat_package_ceiling("xai/grok-4.7", Some(500_000), Some(500_000));
         assert_eq!(ceiling.tokens, (500_000 - 64_000 - 16_000) / 2);
     }
@@ -172,5 +252,70 @@ mod tests {
         let ceiling = panel_rows_package_ceiling([round_zero, round_one]).unwrap();
         assert_eq!(ceiling.route_key, "b/small");
         assert_eq!(ceiling.tokens, (200_000 - 32_000 - 16_000) / 2);
+    }
+
+    #[test]
+    fn the_route_output_limit_passes_the_catalog_value_through() {
+        // Opus publishes 128,000 on a 1,000,000 window: the whole limit is sent,
+        // with no core ceiling below it.
+        assert_eq!(
+            route_output_limit(Some(128_000), Some(1_000_000), 200_000),
+            RouteOutputLimit::Send {
+                tokens: 128_000,
+                catalog: 128_000,
+                suspect: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_route_output_limit_is_clamped_to_fit_the_context_window() {
+        // 200,000 window, 150,000-token prompt: 200,000 - 150,000 - 4,096 remain.
+        assert_eq!(
+            route_output_limit(Some(128_000), Some(200_000), 150_000).tokens(),
+            Some(45_904)
+        );
+        // A prompt that fills the window leaves nothing to send.
+        assert_eq!(
+            route_output_limit(Some(128_000), Some(200_000), 199_000),
+            RouteOutputLimit::Unknown
+        );
+    }
+
+    #[test]
+    fn a_placeholder_or_missing_output_limit_is_unknown_and_omitted() {
+        assert_eq!(
+            route_output_limit(Some(1_048_576), Some(1_048_576), 10_000),
+            RouteOutputLimit::Unknown
+        );
+        assert_eq!(
+            route_output_limit(Some(500_000), Some(400_000), 10_000).tokens(),
+            None
+        );
+        assert_eq!(
+            route_output_limit(None, Some(1_000_000), 10_000).tokens(),
+            None
+        );
+        assert_eq!(
+            route_output_limit(Some(64_000), None, 10_000).tokens(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_long_decode_ceiling_below_the_window_is_sent_but_flagged_suspect() {
+        // openrouter's Gemini 4 Argon row: 943,718 output on a 1,048,576 window.
+        assert_eq!(
+            route_output_limit(Some(943_718), Some(1_048_576), 50_000),
+            RouteOutputLimit::Send {
+                tokens: 943_718,
+                catalog: 943_718,
+                suspect: true
+            }
+        );
+        assert!(matches!(
+            route_output_limit(Some(SUSPECT_OUTPUT_LIMIT_TOKENS), Some(1_000_000), 0),
+            RouteOutputLimit::Send { suspect: false, .. }
+        ));
     }
 }

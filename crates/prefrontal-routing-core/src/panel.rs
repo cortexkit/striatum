@@ -732,11 +732,11 @@ fn package_cause_detail(
     max_output_tokens: Option<u64>,
 ) -> String {
     use crate::package_ceiling::{
-        PANEL_MEMBER_MAX_OUTPUT_TOKENS, SEAT_PROMPT_RESERVE_TOKENS, UNKNOWN_SEAT_OUTPUT_TOKENS,
+        PACKAGE_OUTPUT_RESERVE_TOKENS, SEAT_PROMPT_RESERVE_TOKENS, UNKNOWN_SEAT_OUTPUT_TOKENS,
     };
     let output = max_output_tokens
         .unwrap_or(UNKNOWN_SEAT_OUTPUT_TOKENS)
-        .min(PANEL_MEMBER_MAX_OUTPUT_TOKENS);
+        .min(PACKAGE_OUTPUT_RESERVE_TOKENS);
     format!(
         "package {tokens} tokens exceeds {} ceiling {} tokens (window {}{}; output reserve {output}; prompt reserve {SEAT_PROMPT_RESERVE_TOKENS}; half of remaining window reserved for discussion)",
         ceiling.route_key, ceiling.tokens, ceiling.context_window,
