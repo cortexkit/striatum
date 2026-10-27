@@ -52,12 +52,11 @@ fn model(route_key: &str, iq: u8) -> CatalogModel {
 /// The catalog's rows: the catalog provider's own, and the row the key pool
 /// borrows from `POOL_VENDOR`.
 fn catalog_models() -> Vec<CatalogModel> {
-    vec![
-        // The key pool's route is the cheapest and the ablest, so it wins the
-        // v1 order and is the only route a high demand can use.
-        model(POOL_ROUTE, 95),
-        model(PLAIN, 40),
-    ]
+    // `catalog_fact` prices each row by its rank, so the first entry is the
+    // cheapest. The key pool's route is therefore both the cheapest and the
+    // ablest: it wins wherever it is allowed to decide, and it is the only
+    // route a high demand can use.
+    vec![model(POOL_ROUTE, 95), model(PLAIN, 40)]
 }
 
 /// One routing fact per catalog row, each with a billing plane.
