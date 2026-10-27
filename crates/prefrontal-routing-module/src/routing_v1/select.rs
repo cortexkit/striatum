@@ -432,14 +432,17 @@ pub(super) async fn select(
     {
         let mut result = None;
         let mut fallback_hold = None;
+        let mut skipped_key_pool = false;
         for entry in consumer_policy.ladder.iter().flatten() {
             let Some(route) = RouteRef::parse_pin(entry) else {
                 continue;
             };
-            // A ladder entry on a key-pool provider can never be answered here:
-            // say so instead of falling through to a generic refusal.
+            // A ladder entry on a key-pool provider cannot be answered here, but
+            // a later entry can be, so skip it and remember why: only a ladder
+            // that ends with nothing answered for this reason says so.
             if key_pool::is_pool_provider(&catalog_targets, &route.provider) {
-                return Err(key_pool_route_refusal());
+                skipped_key_pool = true;
+                continue;
             }
             let subset = available
                 .iter()
@@ -473,9 +476,16 @@ pub(super) async fn select(
                 }
             }
         }
-        result.or_else(|| {
-            fallback_hold.map(|(selected, _)| Ok((selected, select_policy::OrderBasis::Mode)))
-        })
+        result
+            .or_else(|| {
+                fallback_hold.map(|(selected, _)| Ok((selected, select_policy::OrderBasis::Mode)))
+            })
+            // A ladder whose only admissible entries were key-pool routes says so,
+            // rather than falling through to the automatic order.
+            .or_else(|| {
+                skipped_key_pool
+                    .then(|| Err(select_policy::OrderFailure::from(key_pool_route_refusal())))
+            })
     } else {
         None
     };
