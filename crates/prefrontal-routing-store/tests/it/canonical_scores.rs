@@ -407,3 +407,35 @@ fn upstream_status_survives_a_score_placement_and_reaches_new_variants() {
         .route_key
         .starts_with("opencode/muse-spark-1.3-contributor-free")));
 }
+
+/// The catalog inventory records each model's published reasoning efforts, even
+/// when the operator configured only one effort as a route (Gemini 4 Argon is
+/// configured only at `high`), so a consumer can lower a model's effort to one
+/// the catalog publishes.
+#[test]
+fn the_catalog_inventory_serves_the_published_reasoning_efforts() {
+    let rig = Rig::new("reasoning-efforts");
+    let store = rig.open();
+    let mut argon = served("google/antigravity-gemini-4-argon", None);
+    argon.reasoning_efforts = Some(vec!["low".into(), "medium".into(), "high".into()]);
+    let unread = served("google/gemini-3.5-flash", None);
+    ingest(&store, &[argon, unread]);
+
+    let inventory = store.get_catalog_facts().unwrap();
+    let row = |model: &str| {
+        inventory
+            .iter()
+            .find(|row| row.fact.provider_id == "google" && row.fact.model_id == model)
+            .unwrap_or_else(|| panic!("{model} is served"))
+    };
+    let argon = serde_json::to_value(row("antigravity-gemini-4-argon")).unwrap();
+    assert_eq!(
+        argon["reasoningEfforts"],
+        serde_json::json!(["low", "medium", "high"])
+    );
+    let unread = serde_json::to_value(row("gemini-3.5-flash")).unwrap();
+    assert!(
+        unread.get("reasoningEfforts").is_none(),
+        "a model the catalog stated no efforts for serves none"
+    );
+}
