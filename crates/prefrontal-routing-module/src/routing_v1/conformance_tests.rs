@@ -861,11 +861,12 @@ impl RoutingSubject for KitSubject {
 const NOT_YET_SERVED: &[&str] = &[];
 
 /// The undeclared-group refusal checks apply only to providers that do not
-/// advertise the group; this provider advertises and serves `select_harness`
-/// and `select_prefer`.
+/// advertise the group; this provider advertises and serves `select_harness`,
+/// `select_prefer` and `select_exclude_providers`.
 const NOT_APPLICABLE: &[&str] = &[
     "undeclared_harness_group_refuses_member",
     "undeclared_prefer_group_refuses_member",
+    "undeclared_exclude_providers_group_refuses_member",
 ];
 
 /// Every served check passes; exactly [`NOT_YET_SERVED`] fail, and

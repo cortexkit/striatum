@@ -100,6 +100,41 @@ async fn an_excluded_pin_falls_back_to_a_route_the_request_allows() {
     );
 }
 
+/// `exclude_providers` keeps every route of a listed provider out of the
+/// answer: the plain answer's provider is passed over for another provider,
+/// a pin on it is refused as excluded, and listing every provider leaves no
+/// route.
+#[tokio::test]
+async fn an_excluded_provider_is_never_answered_or_pinned() {
+    let (_harness, route) = configured().await;
+    let other = answered(&route, json!({"exclude_providers": ["example-provider"]})).await;
+    assert_eq!(
+        other["route"]["provider"], "example-subscription",
+        "{other}"
+    );
+
+    let pinned = route
+        .call(
+            "route.select",
+            &select_body(json!({"pin": MODEL_A, "exclude_providers": ["example-provider"]})),
+        )
+        .await;
+    assert_eq!(pinned.0, FrameType::Error, "{}", pinned.1);
+    assert_eq!(pinned.1["code"], "pin_unavailable", "{}", pinned.1);
+    assert_eq!(pinned.1["detail"]["reason"], "excluded", "{}", pinned.1);
+
+    let none = route
+        .call(
+            "route.select",
+            &select_body(
+                json!({"exclude_providers": ["example-provider", "example-subscription"]}),
+            ),
+        )
+        .await;
+    assert_eq!(none.0, FrameType::Error, "{}", none.1);
+    assert_eq!(none.1["code"], "no_route", "{}", none.1);
+}
+
 #[tokio::test]
 async fn prefer_answers_the_first_listed_adequate_route_in_list_order() {
     let (_harness, route) = configured().await;

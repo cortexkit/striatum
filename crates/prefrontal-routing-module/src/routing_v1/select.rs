@@ -44,6 +44,7 @@ const MEMBERS: &[&str] = &[
     "requirements",
     "pin",
     "exclude",
+    "exclude_providers",
     "runners",
     "affinity",
     "correlation_id",
@@ -373,7 +374,11 @@ pub(super) async fn select(
             min_context: Some(context.map_or(0.0, |floor| floor as f64)),
         }),
     };
-    let exclude: Vec<String> = request.exclude.clone().unwrap_or_default();
+    // The selection's exclusion matcher reads a bare provider id as every
+    // route of that provider, so `exclude_providers` joins the request's
+    // route-key exclusions in the one list every selection path reads.
+    let mut exclude: Vec<String> = request.exclude.clone().unwrap_or_default();
+    exclude.extend(request.exclude_providers.clone().unwrap_or_default());
     let consumer_exclude = operator_config.exclude_groups().named_group(&consumer);
     let slots = request.concurrency_slots.as_ref().map(|slots| {
         ConcurrencySlots::new(slots.iter().map(|slot| ConcurrencySlotState {
@@ -811,6 +816,7 @@ impl<'a> Selection<'a> {
         let parsed = RouteRef::parse_pin(pin)
             .ok_or_else(|| Refusal::pin_unavailable(pin, PinUnavailableReason::Invalid, None))?;
         if self.exclude.contains(&parsed.route_key())
+            || self.exclude.contains(&parsed.provider)
             || !self
                 .sources
                 .operator_config
