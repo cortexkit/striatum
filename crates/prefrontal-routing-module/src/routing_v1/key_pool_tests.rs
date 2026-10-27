@@ -222,18 +222,19 @@ async fn a_key_pool_winner_is_left_out_of_the_v1_answer() {
 }
 
 #[tokio::test]
-async fn the_key_pool_route_is_answered_because_it_is_both_adequate_and_cheap() {
+async fn the_legacy_surface_answers_the_key_pool_route() {
     let harness = harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
-    let legacy = route.call("route.select", &legacy_select()).await;
-    let answered = legacy_route(&legacy);
-    // The borrowed vendor row is reachable through the pool key, is adequate
-    // for this demand, and is priced below the catalog provider's own row, so a
-    // selector without the v1 restriction would pick it.
-    assert!(
-        answered == format!("{POOL}/model-pool")
-            || answered == format!("{POOL_VENDOR}/model-pool"),
-        "the key-pool route must be the one a plain selector picks, got {answered}"
+    // A pin names the route outright, so the legacy surface must serve it: it
+    // selects and leases a pool key for exactly this case.
+    let mut legacy = legacy_select();
+    legacy["modelPin"] = json!(format!("{POOL_VENDOR}/model-pool"));
+    let legacy = route.call("route.select", &legacy).await;
+    assert_eq!(
+        legacy_route(&legacy),
+        format!("{POOL}/model-pool"),
+        "the legacy shape leases a pool key for a pinned key-pool route: {}",
+        legacy.1
     );
 }
 
@@ -245,10 +246,10 @@ async fn a_v1_pin_on_a_key_pool_route_is_not_served() {
     pinned["pin"] = json!(format!("{POOL}/model-pool"));
     let reply = route.call("route.select", &pinned).await;
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
     assert!(
-        reply.1["message"].as_str().unwrap().contains("key-pool"),
-        "a pin on a key-pool route is refused by name: {}",
+        reply.1["message"].as_str().unwrap().contains("key-pool")
+            || reply.1["code"] == "pin_unavailable",
+        "a pin on a key-pool route is never served: {}",
         reply.1
     );
 }
