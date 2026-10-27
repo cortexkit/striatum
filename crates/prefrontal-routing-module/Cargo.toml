@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 build = "build.rs"
-description = "The prefrontal-routing subc module: registers a ManagementSurface, answers route.select over the subc wire by running the pure prefrontal-routing-core scorer against the model-facts seed (route-state store + module-to-module quota consumption land in later slices)."
+description = "The prefrontal-routing subc module: registers a ManagementSurface and serves route.select and the other route.* operations over the subc wire, running the pure prefrontal-routing-core scorer against the model catalog and route state kept in prefrontal-routing-store's SQLite store, with live quota readings consumed from the Insula module."
 
 [[bin]]
 name = "ck-prefrontal-routing"
