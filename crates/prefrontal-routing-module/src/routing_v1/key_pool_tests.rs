@@ -228,7 +228,7 @@ async fn the_legacy_surface_answers_the_key_pool_route() {
     // A pin names the route outright, so the legacy surface must serve it: it
     // selects and leases a pool key for exactly this case.
     let mut legacy = legacy_select();
-    legacy["modelPin"] = json!(format!("{POOL_VENDOR}/model-pool"));
+    legacy["modelPin"] = json!(format!("{POOL}/model-pool"));
     let legacy = route.call("route.select", &legacy).await;
     assert_eq!(
         legacy_route(&legacy),
