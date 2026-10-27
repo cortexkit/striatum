@@ -305,6 +305,13 @@ pub struct NativeUsageFacts {
     /// overstating it indefinitely.
     #[serde(default)]
     pub tool_elapsed_ms: Option<f64>,
+    /// The producer measured no model timing for these counts, for example a
+    /// whole run reported once, whose wall clock is mostly tool time. The
+    /// usage row then records no duration and is never a speed sample,
+    /// whatever `created_ms` and `tool_elapsed_ms` say; `completed_ms` is still
+    /// when the usage was observed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub untimed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1373,6 +1380,11 @@ fn resolved_usage_route(
 }
 
 fn usage_duration_ms(facts: &NativeUsageFacts) -> f64 {
+    // An unknown duration is not finite, which the store records as NULL and
+    // the speed checks refuse (see `UsageObservation::duration_ms`).
+    if facts.untimed {
+        return f64::NAN;
+    }
     let wall_duration = facts.completed_ms - facts.created_ms;
     let tool_elapsed = facts.tool_elapsed_ms.unwrap_or(0.0);
     let duration_ms = wall_duration - tool_elapsed;
@@ -1979,6 +1991,23 @@ mod tests {
             assert!(build_usage_observation(&facts, &[]).is_some());
             assert!(build_model_speed_observation(&facts, &[]).is_none());
         }
+    }
+
+    #[test]
+    fn untimed_usage_records_no_duration_and_is_never_a_speed_sample() {
+        // The same facts give a speed sample with timing, so only the flag
+        // can be what removes it.
+        let timed = usage_facts("untimed");
+        assert!(build_model_speed_observation(&timed, &[]).is_some());
+        let untimed = NativeUsageFacts {
+            untimed: true,
+            ..timed
+        };
+        let observation = build_usage_observation(&untimed, &[]).unwrap();
+        assert!(!observation.duration_ms.is_finite(), "{observation:?}");
+        assert_eq!(observation.output_tokens, 125.0);
+        assert_eq!(observation.observed_at, untimed.completed_ms);
+        assert!(build_model_speed_observation(&untimed, &[]).is_none());
     }
 
     #[test]

@@ -337,6 +337,9 @@ pub struct UsageObservation {
     pub reasoning_tokens: Option<f64>,
     pub cached_read_tokens: Option<f64>,
     pub cache_write_tokens: Option<f64>,
+    /// Model time for the output, in milliseconds. Not finite or negative
+    /// when unknown: the store then records no duration, and the row is never
+    /// a speed sample.
     pub duration_ms: f64,
     pub workload_class: Option<String>,
     pub account_key: Option<String>,

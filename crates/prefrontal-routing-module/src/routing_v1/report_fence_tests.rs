@@ -197,6 +197,42 @@ fn usage_column(harness: &Harness, decision: &str, column: &str) -> Option<i64> 
         .map(|value| value as i64)
 }
 
+/// Whether the report on `decision` wrote a usage-history row.
+fn usage_row_exists(harness: &Harness, decision: &str) -> bool {
+    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_route_usage WHERE id = ?1)",
+            [format!("routing-v1-report:{decision}")],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// How many usage rows of the route `decision`'s report row is filed under
+/// the observed-speed query takes as samples, over all time and with no
+/// minimum output or duration.
+fn speed_samples(harness: &Harness, decision: &str) -> usize {
+    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let route_key: String = connection
+        .query_row(
+            "SELECT route_key FROM model_route_usage WHERE id = ?1",
+            [format!("routing-v1-report:{decision}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut statement = connection
+        .prepare(prefrontal_routing_store::OBSERVED_SPEED_SAMPLES_SQL)
+        .unwrap();
+    statement
+        .query_map(
+            rusqlite::params![route_key, i64::MIN, i64::MAX, 0, 0, 1_000],
+            |_| Ok(()),
+        )
+        .unwrap()
+        .count()
+}
+
 #[tokio::test]
 async fn report_usage_joins_usage_history_and_an_absent_count_stays_unknown() {
     let (harness, route) = configured().await;
@@ -245,6 +281,42 @@ async fn report_usage_joins_usage_history_and_an_absent_count_stays_unknown() {
         usage_column(&harness, &decision, "duration_ms"),
         None,
         "a run's wall clock is never a speed sample"
+    );
+    assert_eq!(
+        speed_samples(&harness, &decision),
+        0,
+        "a report's usage row is never a speed sample"
+    );
+}
+
+#[tokio::test]
+async fn a_report_without_output_adds_no_usage_row_rather_than_a_zero_output() {
+    let (harness, route) = configured().await;
+    let decision = result(
+        route
+            .call(
+                "route.select",
+                &json!({"consumer": fixture::SUMMARY, "requirements": {"iq": 50}}),
+            )
+            .await,
+    )["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    result(
+        route
+            .call(
+                "route.report",
+                &json!({"decision_id": decision, "outcome": "completed", "usage": {
+                    "input_tokens": 100, "cached_input_tokens": 30, "duration_ms": 5_000,
+                }}),
+            )
+            .await,
+    );
+    assert!(harness.store().v1_report(&decision).unwrap().is_some());
+    assert!(
+        !usage_row_exists(&harness, &decision),
+        "an unknown output must not enter the history as zero"
     );
 }
 

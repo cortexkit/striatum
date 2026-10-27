@@ -8,7 +8,8 @@
 //! size-shaped refusals restrict only the account that actually served, and
 //! a failure with a future reset closes only the decision's route on that
 //! account until the reset, for at most 24 hours. Usage the report carries
-//! joins the route's usage history, with an absent count kept unknown.
+//! joins the route's usage history untimed, with an absent count kept
+//! unknown; a report without output adds no history row.
 
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::report::{
@@ -304,20 +305,25 @@ fn usage_row_id(decision_id: &str) -> String {
 
 /// Add a report's usage to the route's usage history, the table
 /// `route.record_usage` writes. A count the report leaves out stays unknown
-/// (NULL), never zero. `output_tokens` includes `reasoning_tokens` on the
+/// (NULL), never zero. The history's output count cannot be unknown, so a
+/// report without `output_tokens` adds no row: its counts stay only in the
+/// stored report body. `output_tokens` includes `reasoning_tokens` on the
 /// wire, as in the runner contract's usage; the history keeps visible output
 /// with reasoning beside it. `duration_ms` is the run's wall clock, mostly
-/// tool time on an agentic run, so the row is never a speed sample: the
-/// interval is recorded reversed, which the history stores as an unknown
-/// duration. The timing members stay in the stored report body.
+/// tool time on an agentic run, so the row is recorded untimed: it has no
+/// duration and is never a speed sample. The timing members stay in the
+/// stored report body.
 fn record_usage(
     usage: &cortexkit_role_routing::report::Usage,
     decision: &prefrontal_routing_store::V1Decision,
     deps: &Deps<'_>,
     now: u64,
 ) -> Result<(), Refusal> {
+    let Some(output) = usage.output_tokens else {
+        return Ok(());
+    };
     let reasoning = usage.reasoning_tokens;
-    let completed_ms = now as f64;
+    let observed_ms = now as f64;
     let facts = prefrontal_routing_core::NativeUsageFacts {
         message_id: usage_row_id(&decision.decision_id),
         provider_id: decision.provider.clone(),
@@ -325,14 +331,13 @@ fn record_usage(
         variant: decision.variant.clone(),
         agent: Some(decision.consumer.clone()),
         input_tokens: usage.input_tokens.map(|count| count as f64),
-        output_tokens: usage.output_tokens.map_or(0.0, |output| {
-            output.saturating_sub(reasoning.unwrap_or(0)) as f64
-        }),
+        output_tokens: output.saturating_sub(reasoning.unwrap_or(0)) as f64,
         reasoning_tokens: reasoning.map(|count| count as f64),
         cached_read_tokens: usage.cached_input_tokens.map(|count| count as f64),
         cache_write_tokens: usage.cache_write_tokens.map(|count| count as f64),
-        created_ms: completed_ms + 1.0,
-        completed_ms,
+        created_ms: observed_ms,
+        completed_ms: observed_ms,
+        untimed: true,
         ..Default::default()
     };
     let Some(observation) =
