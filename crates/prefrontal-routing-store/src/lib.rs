@@ -920,14 +920,9 @@ pub struct SqliteRouteStateStore {
     /// The catalog fingerprint stamped on each new decision row, kept with the
     /// catalog state it was computed from (see `CatalogFingerprintKey`). Before
     /// this cache, every decision write read and hashed every `model_facts` row.
-    /// `None` until the first fingerprint is computed, and always `None` on a
-    /// store opened at a version without the `model_facts` table, where nothing
-    /// tracks catalog changes.
+    /// `None` until a fingerprint is computed while the change tracking is in
+    /// place, and reset whenever that tracking has to be installed again.
     catalog_fingerprint: Mutex<Option<CachedCatalogFingerprint>>,
-    /// Whether `install_catalog_change_tracking` ran on this connection. Without
-    /// it a catalog write would leave the cached fingerprint looking current,
-    /// so every read computes the fingerprint fresh instead.
-    catalog_change_tracking: bool,
 }
 
 /// What a cached catalog fingerprint is valid for: this connection's count of
@@ -948,6 +943,21 @@ struct CachedCatalogFingerprint {
     fingerprint: String,
 }
 
+/// Read the current `CatalogFingerprintKey`. Fails when the write counter
+/// that `install_catalog_change_tracking` creates is missing on this
+/// connection.
+fn read_catalog_fingerprint_key(
+    connection: &Connection,
+) -> rusqlite::Result<CatalogFingerprintKey> {
+    Ok(CatalogFingerprintKey {
+        facts_writes: connection.query_row(
+            "SELECT writes FROM temp.catalog_facts_writes WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?,
+        data_version: connection.query_row("PRAGMA data_version", [], |row| row.get(0))?,
+    })
+}
 #[derive(Debug, Clone)]
 struct CachedClassVector {
     usage_generation: u64,
@@ -1190,16 +1200,17 @@ impl SqliteRouteStateStore {
             )));
         }
         validate_family_spellings(&store)?;
-        let catalog_change_tracking = store
-            .with_conn(install_catalog_change_tracking)
-            .map_err(err)?;
+        // A failure here costs only the cache: every fingerprint read finds the
+        // tracking missing, computes the value fresh and tries to install it again.
+        if let Err(error) = store.with_conn(install_catalog_change_tracking) {
+            tracing::warn!(%error, "catalog change tracking not installed at open; fingerprints are computed fresh until it is");
+        }
         Ok(Self {
             store,
             class_vectors: Mutex::new(HashMap::new()),
             usage_generation: AtomicU64::new(0),
             reported_score_conflicts: Mutex::new(HashSet::new()),
             catalog_fingerprint: Mutex::new(None),
-            catalog_change_tracking,
         })
     }
 
@@ -1224,17 +1235,20 @@ impl SqliteRouteStateStore {
     /// the write count the value was keyed on, so a later, different catalog
     /// could reach the same count and be served a fingerprint for rows that were
     /// never committed.
+    ///
+    /// The cache can never fail a caller that a fresh hash would not fail. If
+    /// the change tracking cannot be read (for example, the TEMP objects are
+    /// gone because the connection is no longer the one they were created on),
+    /// the value is computed fresh, is not cached, and the tracking is
+    /// installed again for the next read.
     fn current_catalog_fingerprint(&self, connection: &Connection) -> rusqlite::Result<String> {
-        if !self.catalog_change_tracking {
-            return calculate_catalog_fingerprint(connection);
-        }
-        let key = CatalogFingerprintKey {
-            facts_writes: connection.query_row(
-                "SELECT writes FROM catalog_facts_writes WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )?,
-            data_version: connection.query_row("PRAGMA data_version", [], |row| row.get(0))?,
+        let key = match read_catalog_fingerprint_key(connection) {
+            Ok(key) => key,
+            Err(cause) => {
+                let fingerprint = calculate_catalog_fingerprint(connection)?;
+                self.reinstall_catalog_change_tracking(connection, &cause);
+                return Ok(fingerprint);
+            }
         };
         let mut cache = self
             .catalog_fingerprint
@@ -1251,6 +1265,31 @@ impl SqliteRouteStateStore {
             });
         }
         Ok(fingerprint)
+    }
+
+    /// Install the catalog change tracking once more after reading it failed,
+    /// and forget the cached fingerprint. A recreated write counter starts from
+    /// zero, so without the reset it could climb back to the count of the
+    /// cached entry over a different catalog and serve that entry's value.
+    /// A failed install is only logged; the next read tries again.
+    fn reinstall_catalog_change_tracking(&self, connection: &Connection, cause: &rusqlite::Error) {
+        *self
+            .catalog_fingerprint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        match install_catalog_change_tracking(connection) {
+            Ok(true) => tracing::warn!(
+                %cause,
+                "catalog change tracking was missing on the store connection; reinstalled it"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                %cause,
+                %error,
+                "catalog change tracking is missing and could not be reinstalled; \
+                 fingerprints are computed fresh until it is"
+            ),
+        }
     }
 
     /// The reasoning-effort values the catalog publishes for every stored model.
@@ -6913,5 +6952,123 @@ mod tests {
         assert_ne!(fresh, uncommitted);
         assert_eq!(store.catalog_fingerprint().unwrap(), fresh);
         assert_eq!(stamped_fingerprint(&store, "after-rollback"), fresh);
+    }
+
+    fn cached_key(store: &SqliteRouteStateStore) -> Option<CatalogFingerprintKey> {
+        store
+            .catalog_fingerprint
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cached| cached.key)
+    }
+
+    fn facts_write_count(store: &SqliteRouteStateStore) -> i64 {
+        store
+            .store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT writes FROM temp.catalog_facts_writes WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap()
+    }
+
+    fn set_price(store: &SqliteRouteStateStore, route_key: &str, price: f64) {
+        store
+            .store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE model_facts SET cost_per_mtok_out = ?2 WHERE route_key = ?1",
+                    params![route_key, price],
+                )
+            })
+            .unwrap();
+    }
+
+    fn first_route_key(store: &SqliteRouteStateStore) -> String {
+        let fact = store.get_facts().unwrap().remove(0);
+        prefrontal_routing_core::make_route_key(
+            &fact.provider_id,
+            &fact.model_id,
+            fact.variant.as_deref(),
+        )
+    }
+
+    #[test]
+    fn a_missing_change_counter_falls_back_to_a_fresh_fingerprint_and_tracking_returns() {
+        let scratch = prefrontal_test_support::ScratchDir::new("catalog-fingerprint-lost-counter");
+        let store = fingerprint_test_store(&scratch, "catalog-fingerprint-lost-counter");
+        let route_key = first_route_key(&store);
+        store.catalog_fingerprint().unwrap();
+        assert!(cached_key(&store).is_some());
+
+        store
+            .store
+            .with_conn(|c| c.execute_batch("DROP TABLE temp.catalog_facts_writes"))
+            .unwrap();
+
+        // The decision still records, stamped with a fresh hash, and that
+        // value is not cached because the tracking was missing when it ran.
+        let fresh = fresh_catalog_fingerprint(&store);
+        assert_eq!(stamped_fingerprint(&store, "lost-counter"), fresh);
+        assert_eq!(cached_key(&store), None);
+
+        // The tracking is back: a later read is cached again, and a catalog
+        // write through plain SQL is both accepted and noticed.
+        assert_eq!(store.catalog_fingerprint().unwrap(), fresh);
+        assert!(cached_key(&store).is_some());
+        set_price(&store, &route_key, 4_321.0);
+        let after_write = fresh_catalog_fingerprint(&store);
+        assert_ne!(after_write, fresh);
+        assert_eq!(store.catalog_fingerprint().unwrap(), after_write);
+        assert_eq!(stamped_fingerprint(&store, "after-reinstall"), after_write);
+    }
+
+    #[test]
+    fn a_reinstalled_change_counter_never_serves_a_fingerprint_cached_before_the_loss() {
+        let scratch = prefrontal_test_support::ScratchDir::new("catalog-fingerprint-reinstall");
+        let store = fingerprint_test_store(&scratch, "catalog-fingerprint-reinstall");
+        let route_key = first_route_key(&store);
+        let start = facts_write_count(&store);
+        for price in [1.0, 2.0, 3.0] {
+            set_price(&store, &route_key, price);
+        }
+        let before_loss = store.catalog_fingerprint().unwrap();
+        let writes_before_loss = facts_write_count(&store);
+        assert_eq!(writes_before_loss, start + 3);
+
+        // Lose every TEMP object, as a replaced connection would, and change
+        // the catalog while nothing is counting.
+        store
+            .store
+            .with_conn(|c| {
+                c.execute_batch(
+                    "DROP TRIGGER temp.catalog_facts_writes_on_insert;
+                     DROP TRIGGER temp.catalog_facts_writes_on_update;
+                     DROP TRIGGER temp.catalog_facts_writes_on_delete;
+                     DROP TABLE temp.catalog_facts_writes;",
+                )
+            })
+            .unwrap();
+        set_price(&store, &route_key, 999.0);
+        assert_eq!(
+            stamped_fingerprint(&store, "after-loss"),
+            fresh_catalog_fingerprint(&store)
+        );
+
+        // The recreated counter starts from zero. Bring it back to the count
+        // the pre-loss entry was keyed on, over a different catalog: the read
+        // must hash these rows, not return the pre-loss value.
+        let restarted = facts_write_count(&store);
+        for price in 0..(writes_before_loss - restarted) {
+            set_price(&store, &route_key, 500.0 + price as f64);
+        }
+        assert_eq!(facts_write_count(&store), writes_before_loss);
+        let fresh = fresh_catalog_fingerprint(&store);
+        assert_ne!(fresh, before_loss);
+        assert_eq!(store.catalog_fingerprint().unwrap(), fresh);
     }
 }
