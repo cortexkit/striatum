@@ -218,6 +218,7 @@ const MIGRATION_064: &str = include_str!("../migrations/064_decision_scope_attri
 const MIGRATION_065: &str = include_str!("../migrations/065_routing_policy_end_state.sql");
 const MIGRATION_066: &str = include_str!("../migrations/066_account_eligibility.sql");
 const MIGRATION_067: &str = include_str!("../migrations/067_account_route_fence.sql");
+const MIGRATION_068: &str = include_str!("../migrations/068_account_demand_by_account.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -273,7 +274,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 66] {
+fn route_state_migrations() -> [Migration; 67] {
     [
         Migration {
             version: 1,
@@ -538,6 +539,10 @@ fn route_state_migrations() -> [Migration; 66] {
         Migration {
             version: 67,
             statements: MIGRATION_067,
+        },
+        Migration {
+            version: 68,
+            statements: MIGRATION_068,
         },
     ]
 }
@@ -6375,12 +6380,22 @@ mod tests {
                     history_foreign_keys(c),
                     ["account_admission -> account_pin"]
                 );
+                // Later migrations add the fence's pool columns and (068)
+                // rekey the demand index by account; the demand query-plan
+                // test checks that index's current shape.
+                let demand_index = "account_admission index account_admission_demand ";
                 let shape: Vec<_> = rebuilt_table_shape(c)
                     .into_iter()
                     .filter(|line| {
                         !line.starts_with("account_fence column pool_key_json ")
                             && !line.starts_with("account_fence column recovery_set_json ")
+                            && !line.starts_with(demand_index)
                     })
+                    .collect();
+                let legacy_shape: Vec<_> = legacy_shape
+                    .iter()
+                    .filter(|line| !line.starts_with(demand_index))
+                    .cloned()
                     .collect();
                 assert_eq!(shape, legacy_shape);
                 let integrity: String =

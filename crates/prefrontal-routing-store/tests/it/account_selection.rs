@@ -170,7 +170,7 @@ fn a_pin_and_its_admission_survive_a_store_reopen() {
                 tx.affinity(PRINCIPAL, CONVERSATION, "anthropic")?,
                 tx.admission(PRINCIPAL, "adm-1")?,
                 tx.active_fences("anthropic")?,
-                tx.demand("anthropic")?,
+                tx.demand("anthropic", "acct-a", None)?,
             ))
         })
         .unwrap();
@@ -268,7 +268,7 @@ fn a_failed_transaction_writes_nothing_and_release_happens_once() {
             Ok((
                 tx.mark_admission_released(PRINCIPAL, "adm-1", 2_000)?,
                 tx.mark_admission_released(PRINCIPAL, "adm-1", 3_000)?,
-                tx.demand("anthropic")?,
+                tx.demand("anthropic", "acct-a", None)?,
             ))
         })
         .unwrap();
@@ -287,7 +287,9 @@ fn account_demand_query_plan_uses_partial_covering_index_without_temp_btree() {
     for provider in ["anthropic", "openai", "custom"] {
         let mut statement = connection.prepare(&explain_sql).unwrap();
         let details = statement
-            .query_map(params![provider], |row| row.get::<_, String>(3))
+            .query_map(params![provider, "acct-a", 1_000], |row| {
+                row.get::<_, String>(3)
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
@@ -296,7 +298,7 @@ fn account_demand_query_plan_uses_partial_covering_index_without_temp_btree() {
             details.iter().any(|detail| {
                 detail.contains(
                     "SEARCH account_admission USING COVERING INDEX account_admission_demand",
-                ) && detail.contains("provider=?")
+                ) && detail.contains("provider=? AND account_id=? AND committed_at>?")
             }),
             "expected covering index search using account_admission_demand for {provider}, got {details:?}"
         );
@@ -369,37 +371,75 @@ fn account_demand_results_identical_with_and_without_covering_index() {
             adm6.request_bytes = 60_000;
             tx.insert_admission(&adm6)?;
 
+            // 7. anthropic, another account, charged=1, state='reserved'
+            let mut adm7 = admission("adm-7", "pin-1", "dec-1");
+            adm7.account_id = "acct-b".into();
+            adm7.committed_at = 2_500;
+            adm7.request_bytes = 70_000;
+            tx.insert_admission(&adm7)?;
+
             Ok(())
         })
         .unwrap();
+
+    // The floor is exclusive and the account is exact: anthropic's acct-a
+    // after 1_000 is adm-1 and adm-3 (adm-2 sits on the floor), in commit
+    // then admission-id order.
+    let after_floor = store
+        .account_transaction(|tx| tx.demand("anthropic", "acct-a", Some(1_000)))
+        .unwrap();
+    assert_eq!(
+        after_floor
+            .iter()
+            .map(|row| (row.state.as_str(), row.committed_at, row.request_bytes))
+            .collect::<Vec<_>>(),
+        vec![("reserved", 3_000, 10_000), ("finished", 3_000, 30_000)]
+    );
 
     let connection = Connection::open(rig.dir.join("store.db")).unwrap();
 
     let query_unindexed =
         "SELECT account_id, state, committed_at, request_bytes FROM account_admission NOT INDEXED \
-         WHERE provider = ?1 AND charged = 1 AND state != 'released' \
+         WHERE provider = ?1 AND account_id = ?2 AND charged = 1 AND state != 'released' \
+           AND committed_at > ?3 \
          ORDER BY committed_at, principal, admission_id";
-
-    for provider in ["anthropic", "openai", "other"] {
-        let indexed_demand = store.account_transaction(|tx| tx.demand(provider)).unwrap();
-
-        let mut statement = connection.prepare(query_unindexed).unwrap();
-        let unindexed_demand = statement
-            .query_map(params![provider], |row| {
-                Ok(AccountDemandRow {
-                    account_id: row.get(0)?,
-                    state: row.get(1)?,
-                    committed_at: row.get(2)?,
-                    request_bytes: row.get::<_, i64>(3)? as u64,
-                })
+    let cases = ["anthropic", "openai", "other"]
+        .into_iter()
+        .flat_map(|provider| {
+            ["acct-a", "acct-b"].into_iter().flat_map(move |account| {
+                [None, Some(999), Some(1_000), Some(2_999)]
+                    .into_iter()
+                    .map(move |floor| (provider, account, floor))
             })
+        })
+        .collect::<Vec<_>>();
+    let unindexed = |provider: &str, account: &str, floor: Option<i64>| {
+        let mut statement = connection.prepare(query_unindexed).unwrap();
+        statement
+            .query_map(
+                params![provider, account, floor.unwrap_or(i64::MIN)],
+                |row| {
+                    Ok(AccountDemandRow {
+                        account_id: row.get(0)?,
+                        state: row.get(1)?,
+                        committed_at: row.get(2)?,
+                        request_bytes: row.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
+            .unwrap()
+    };
 
+    for &(provider, account, floor) in &cases {
+        let indexed_demand = store
+            .account_transaction(|tx| tx.demand(provider, account, floor))
+            .unwrap();
         assert_eq!(
-            indexed_demand, unindexed_demand,
-            "demand results mismatch for provider {provider}"
+            indexed_demand,
+            unindexed(provider, account, floor),
+            "demand results mismatch for {provider}/{account} after {floor:?}"
         );
     }
 
@@ -408,26 +448,14 @@ fn account_demand_results_identical_with_and_without_covering_index() {
         .execute("DROP INDEX account_admission_demand", [])
         .unwrap();
 
-    for provider in ["anthropic", "openai", "other"] {
-        let demand_after_drop = store.account_transaction(|tx| tx.demand(provider)).unwrap();
-
-        let mut statement = connection.prepare(query_unindexed).unwrap();
-        let unindexed_demand = statement
-            .query_map(params![provider], |row| {
-                Ok(AccountDemandRow {
-                    account_id: row.get(0)?,
-                    state: row.get(1)?,
-                    committed_at: row.get(2)?,
-                    request_bytes: row.get::<_, i64>(3)? as u64,
-                })
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
+    for (provider, account, floor) in cases {
+        let demand_after_drop = store
+            .account_transaction(|tx| tx.demand(provider, account, floor))
             .unwrap();
-
         assert_eq!(
-            demand_after_drop, unindexed_demand,
-            "demand results mismatch after drop for provider {provider}"
+            demand_after_drop,
+            unindexed(provider, account, floor),
+            "demand results mismatch after drop for {provider}/{account} after {floor:?}"
         );
     }
 

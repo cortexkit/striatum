@@ -24,12 +24,12 @@ use prefrontal_routing_core::accounts::evidence::{
 };
 use prefrontal_routing_core::accounts::{
     block_end, grown_recovery_set, recovery_set_from, validate_pool_name, AccountRef,
-    AccountRequest, AccountView, AdmissionDemand, AdmissionState, AffinityOutcome, AllocatorPolicy,
-    AllocatorState, ApplicableWindow, CallerKind, CandidateRef, ConfirmationSource,
-    ConversationAffinity, ConversationKeySource, CredentialRecord, Decision, EpochMs, Fence,
-    GeneralWindow, ModelFamily, ModelReach, ObservationSource, Outcome, PoolWindowReading,
-    PrincipalExclusion, QuotaReading, QuotaWindow, RefusalCode, ResetTime, Roster,
-    RunnerCandidates, ScopedList, ScopedWindow, StaleDisclosure,
+    AccountRequest, AccountStrategy, AccountView, AdmissionDemand, AdmissionState, AffinityOutcome,
+    AllocatorPolicy, AllocatorState, ApplicableWindow, CallerKind, CandidateRef,
+    ConfirmationSource, ConversationAffinity, ConversationKeySource, CredentialRecord, Decision,
+    EpochMs, Fence, GeneralWindow, ModelFamily, ModelReach, ObservationSource, Outcome,
+    PoolWindowReading, PrincipalExclusion, QuotaReading, QuotaWindow, RefusalCode, ResetTime,
+    Roster, RunnerCandidates, ScopedList, ScopedWindow, StaleDisclosure,
 };
 use prefrontal_routing_core::quota::RateWindow;
 use prefrontal_routing_core::{RouteStateResult, RouteStateStoreError};
@@ -1682,20 +1682,79 @@ fn invalid_pool(pool: Option<&str>) -> Option<OpReply> {
     ))
 }
 
-fn load_demand(tx: &AccountTx<'_>, provider: &str) -> RouteStateResult<Vec<AdmissionDemand>> {
-    Ok(tx
-        .demand(provider)?
-        .into_iter()
-        .filter_map(|row| {
-            let state: AdmissionState = serde_json::from_value(json!(row.state)).ok()?;
-            Some(AdmissionDemand {
-                account_id: row.account_id,
-                state,
-                committed_at_ms: row.committed_at,
-                request_bytes: row.request_bytes,
-            })
-        })
-        .collect())
+/// The demand the allocator can charge to `roster`'s accounts. Each account's
+/// admissions are read from its [`demand_floor`] on, so a decision never
+/// loads history the allocator would ignore; admissions of accounts outside
+/// the roster are never read, because the allocator only prices roster
+/// accounts.
+fn load_demand(
+    tx: &AccountTx<'_>,
+    provider: &str,
+    roster: Option<&Roster>,
+    policy: &AllocatorPolicy,
+    context: &prefrontal_routing_core::accounts::AllocationContext,
+) -> RouteStateResult<Vec<AdmissionDemand>> {
+    // One read per account; a repeated account keeps its lowest floor.
+    let mut floors: BTreeMap<&str, Option<EpochMs>> = BTreeMap::new();
+    for view in roster.map_or(&[][..], |roster| &roster.accounts) {
+        let floor = demand_floor(view, policy, context);
+        floors
+            .entry(view.account_id.as_str())
+            .and_modify(|kept| *kept = kept.zip(floor).map(|(a, b)| a.min(b)))
+            .or_insert(floor);
+    }
+    let mut demand = Vec::new();
+    for (account_id, floor) in floors {
+        demand.extend(
+            tx.demand(provider, account_id, floor)?
+                .into_iter()
+                .filter_map(|row| {
+                    let state: AdmissionState = serde_json::from_value(json!(row.state)).ok()?;
+                    Some(AdmissionDemand {
+                        account_id: row.account_id,
+                        state,
+                        committed_at_ms: row.committed_at,
+                        request_bytes: row.request_bytes,
+                    })
+                }),
+        );
+    }
+    Ok(demand)
+}
+
+/// The commit time an admission charged to `view` must be after to still
+/// count in the allocator, or `None` when one of any age counts.
+///
+/// The allocator charges an account's non-released admissions committed
+/// after its quota reading less `reflection_lag_ms`: an older one is already
+/// reflected in the reading. With no reading (or no reading time) it charges
+/// every one. It also charges every one to an account it places on paid
+/// credits, because it then sets the reading aside. Credit placement needs
+/// `paid_credits` and a spendable credit reading for the account; when both
+/// hold, the whole history is kept, without repeating the allocator's further
+/// conditions for credit mode. The round-robin and hybrid strategies order
+/// accounts by how many admissions each holds, whatever their age, so they
+/// need the whole history too.
+fn demand_floor(
+    view: &AccountView,
+    policy: &AllocatorPolicy,
+    context: &prefrontal_routing_core::accounts::AllocationContext,
+) -> Option<EpochMs> {
+    let may_use_credits = policy.paid_credits
+        && context
+            .credits
+            .get(&view.account_id)
+            .is_some_and(|credit| credit.spendable);
+    if may_use_credits
+        || matches!(
+            policy.strategy,
+            AccountStrategy::RoundRobin | AccountStrategy::Hybrid
+        )
+    {
+        return None;
+    }
+    let observed_at = view.quota.as_ref()?.observed_at_ms?;
+    Some(observed_at.saturating_sub(policy.reflection_lag_ms))
 }
 
 fn load_exclusions(
@@ -2489,7 +2548,13 @@ pub(crate) fn preflight_model_for_class(
                     affinity: None,
                     fences: fences.clone(),
                     principal_exclusions: Vec::new(),
-                    admissions: load_demand(tx, provider)?,
+                    admissions: load_demand(
+                        tx,
+                        provider,
+                        roster.roster.as_ref(),
+                        &policy,
+                        &inputs,
+                    )?,
                     operator_override: None,
                     policy: policy.clone(),
                 },
@@ -2603,18 +2668,8 @@ fn serve(
         now,
         &policy,
     )?;
-    let mut state = AllocatorState {
-        roster: roster.roster.clone(),
-        affinity: affinity_row
-            .as_ref()
-            .map(|row| conversation_affinity(row, now)),
-        fences: load_fences(tx, provider)?,
-        principal_exclusions: load_exclusions(tx, principal, &params.admission_id)?,
-        admissions: load_demand(tx, provider)?,
-        operator_override: None,
-        policy,
-    };
-    let request = params.request(principal, affinity_row.is_none());
+    // The allocation context comes first: whether an account may go on paid
+    // credits decides how much of its demand history the allocator can use.
     let mut inputs = ctx
         .classes
         .as_ref()
@@ -2626,6 +2681,19 @@ fn serve(
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
     }
+    let admissions = load_demand(tx, provider, roster.roster.as_ref(), &policy, &inputs)?;
+    let mut state = AllocatorState {
+        roster: roster.roster.clone(),
+        affinity: affinity_row
+            .as_ref()
+            .map(|row| conversation_affinity(row, now)),
+        fences: load_fences(tx, provider)?,
+        principal_exclusions: load_exclusions(tx, principal, &params.admission_id)?,
+        admissions,
+        operator_override: None,
+        policy,
+    };
+    let request = params.request(principal, affinity_row.is_none());
     let decision = loop {
         let decision =
             prefrontal_routing_core::accounts::decide_with_context(&request, &state, now, &inputs);
@@ -5923,6 +5991,150 @@ mod tests {
             sonnet["affinity_model"] = json!("claude-sonnet-5");
             let sonnet = result(rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, sonnet));
             assert_eq!(sonnet["account"]["account_id"], account.as_str(), "{id}");
+        }
+    }
+
+    /// Demand is read per roster account from the commit time the allocator
+    /// still charges: after the account's reading less the reflection lag, or
+    /// from the start when the account has no reading, may go on paid
+    /// credits, or the strategy counts admissions of any age. Accounts outside
+    /// the roster are not read.
+    #[test]
+    fn demand_reads_each_roster_account_only_from_the_admissions_that_can_count() {
+        use prefrontal_routing_core::accounts::AllocationContext;
+        let fixture = fixture("demand-floor");
+        let store = fixture.store();
+        let sticky = AllocatorPolicy::default();
+        let observed = NOW - 30_000;
+        let floor = observed - sticky.reflection_lag_ms;
+        let admissions = [
+            ("reflected", ACCOUNT_A, floor - 1),
+            ("at-floor", ACCOUNT_A, floor),
+            ("pending", ACCOUNT_A, floor + 1),
+            ("unread", ACCOUNT_B, floor - 3_600_000),
+            ("outside-roster", INSULA_ONLY, NOW),
+        ];
+        store
+            .account_transaction(|tx| {
+                tx.insert_pin(&AccountPinRow {
+                    pin_id: "pin-1".into(),
+                    principal: BROCA.into(),
+                    conversation_hash: "conversation".into(),
+                    provider: "anthropic".into(),
+                    pin_generation: 1,
+                    affinity_model: "claude-opus-5-5".into(),
+                    account_id: ACCOUNT_A.into(),
+                    credential_id: "oauth:anthropic".into(),
+                    pin_mode: "run_frozen".into(),
+                    previous_pin_id: None,
+                    decision_id: "acd-1".into(),
+                    created_at: floor - 3_600_000,
+                })?;
+                for (admission_id, account_id, committed_at) in admissions {
+                    tx.insert_admission(&AccountAdmissionRow {
+                        principal: BROCA.into(),
+                        admission_id: admission_id.into(),
+                        request_fingerprint: "fp".into(),
+                        request_mode: "admit".into(),
+                        decision_id: "acd-1".into(),
+                        conversation_hash: "conversation".into(),
+                        provider: "anthropic".into(),
+                        model: "claude-opus-5-5".into(),
+                        account_id: account_id.into(),
+                        credential_id: "oauth:anthropic".into(),
+                        pin_id: "pin-1".into(),
+                        pin_generation: 1,
+                        state: "finished".into(),
+                        charged: true,
+                        request_bytes: 1_000,
+                        request_bytes_estimated: false,
+                        committed_at,
+                        admission_valid_until: committed_at + 60_000,
+                        lease_valid_until: committed_at + 120_000,
+                        reply_json: "{}".into(),
+                        run_id: None,
+                        started_at: None,
+                        started_late: false,
+                        released_at: None,
+                        finished_at: Some(committed_at + 1),
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let view = |account_id: &str, observed_at_ms: Option<i64>| AccountView {
+            account_id: account_id.into(),
+            routing_provider: "anthropic".into(),
+            refresh_adapter: "anthropic".into(),
+            credentials: Vec::new(),
+            model_reach: ModelReach::All,
+            quota: observed_at_ms.map(|observed_at_ms| QuotaReading {
+                observed_at_ms: Some(observed_at_ms),
+                error_class: None,
+                stale: None,
+                five_hour: None,
+                seven_day: None,
+                general_windows: None,
+                scoped: ScopedList::Missing,
+                pool_windows: None,
+            }),
+        };
+        let roster = Roster {
+            view_digest: "vault-view-1".into(),
+            fetched_at_ms: NOW,
+            accounts: vec![view(ACCOUNT_A, Some(observed)), view(ACCOUNT_B, None)],
+        };
+        let loaded = |policy: &AllocatorPolicy, context: &AllocationContext| {
+            store
+                .account_transaction(|tx| {
+                    load_demand(tx, "anthropic", Some(&roster), policy, context)
+                })
+                .unwrap()
+                .into_iter()
+                .map(|demand| (demand.account_id, demand.committed_at_ms))
+                .collect::<Vec<_>>()
+        };
+        let row = |account_id: &str, committed_at: i64| (account_id.to_string(), committed_at);
+        let credits = |spendable: bool| AllocationContext {
+            credits: BTreeMap::from([(
+                ACCOUNT_A.to_string(),
+                prefrontal_routing_core::accounts::CreditReading {
+                    observed_at_ms: NOW,
+                    spendable,
+                },
+            )]),
+            ..AllocationContext::default()
+        };
+
+        // A reading bounds its account; an account without one is read whole.
+        // A credit reading the allocator cannot spend changes nothing.
+        let bounded = vec![row(ACCOUNT_A, floor + 1), row(ACCOUNT_B, floor - 3_600_000)];
+        assert_eq!(loaded(&sticky, &AllocationContext::default()), bounded);
+        assert_eq!(loaded(&sticky, &credits(false)), bounded);
+        let no_credits = AllocatorPolicy {
+            paid_credits: false,
+            ..AllocatorPolicy::default()
+        };
+        assert_eq!(loaded(&no_credits, &credits(true)), bounded);
+        // Counting strategies, and an account that may go on paid credits,
+        // charge admissions of any age.
+        let every_roster_admission = vec![
+            row(ACCOUNT_A, floor - 1),
+            row(ACCOUNT_A, floor),
+            row(ACCOUNT_A, floor + 1),
+            row(ACCOUNT_B, floor - 3_600_000),
+        ];
+        assert_eq!(loaded(&sticky, &credits(true)), every_roster_admission);
+        for strategy in [AccountStrategy::RoundRobin, AccountStrategy::Hybrid] {
+            let policy = AllocatorPolicy {
+                strategy,
+                ..AllocatorPolicy::default()
+            };
+            assert_eq!(
+                loaded(&policy, &AllocationContext::default()),
+                every_roster_admission,
+                "{strategy:?}"
+            );
         }
     }
 }

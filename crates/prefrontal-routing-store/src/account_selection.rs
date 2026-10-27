@@ -868,9 +868,14 @@ fn observation_from_row(row: &Row<'_>) -> rusqlite::Result<AccountObservationRow
     })
 }
 
+/// One account's charged, non-released admissions committed after a floor.
+/// `account_admission_demand` (migration 068) is keyed provider, account,
+/// commit time, so the planner answers this with one covering range search
+/// in commit order, whatever the size of the older history.
 pub const ACCOUNT_DEMAND_SQL: &str =
     "SELECT account_id, state, committed_at, request_bytes FROM account_admission \
-     WHERE provider = ?1 AND charged = 1 AND state != 'released' \
+     WHERE provider = ?1 AND account_id = ?2 AND charged = 1 AND state != 'released' \
+       AND committed_at > ?3 \
      ORDER BY committed_at, principal, admission_id";
 
 /// The account-selection tables inside one open write transaction. Every
@@ -1071,18 +1076,29 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
-    /// Charged demand of every admission for `provider` that is not released.
-    pub fn demand(&self, provider: &str) -> RouteStateResult<Vec<AccountDemandRow>> {
+    /// Charged demand of `account_id`'s admissions for `provider` that are not
+    /// released and were committed after `committed_after` (Unix
+    /// milliseconds). `None` reads the account's whole stored history, for a
+    /// caller whose policy still counts admissions of any age.
+    pub fn demand(
+        &self,
+        provider: &str,
+        account_id: &str,
+        committed_after: Option<i64>,
+    ) -> RouteStateResult<Vec<AccountDemandRow>> {
         let mut statement = self.conn.prepare(ACCOUNT_DEMAND_SQL).map_err(err)?;
         let rows = statement
-            .query_map(params![provider], |row| {
-                Ok(AccountDemandRow {
-                    account_id: row.get(0)?,
-                    state: row.get(1)?,
-                    committed_at: row.get(2)?,
-                    request_bytes: to_u64(row.get(3)?),
-                })
-            })
+            .query_map(
+                params![provider, account_id, committed_after.unwrap_or(i64::MIN)],
+                |row| {
+                    Ok(AccountDemandRow {
+                        account_id: row.get(0)?,
+                        state: row.get(1)?,
+                        committed_at: row.get(2)?,
+                        request_bytes: to_u64(row.get(3)?),
+                    })
+                },
+            )
             .map_err(err)?;
         rows.collect::<rusqlite::Result<_>>().map_err(err)
     }
