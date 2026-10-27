@@ -210,6 +210,65 @@ fn legacy_route(reply: &(FrameType, Value)) -> String {
 /// plain entry: the key-pool entry is skipped, not allowed to refuse the whole
 /// select. Clearing `explicit_only` keeps the pool route out of the automatic
 /// order, so the only way the answer could be the pool route is the ladder.
+/// With no pin and no ladder, the key pool's route is the cheapest adequate
+/// one. Operator policy that keeps such a provider out of the automatic order
+/// is cleared first, so the only thing left that can keep it out of a v1 answer
+/// is the key-pool exclusion itself. The legacy surface still answers it.
+#[tokio::test]
+async fn the_automatic_order_skips_a_cheaper_key_pool_route_on_v1_but_not_on_legacy() {
+    let harness = harness();
+    harness.edit_config(|config| {
+        // Every exclusion naming the key-pool provider, so its borrowed route
+        // is a normal automatic candidate.
+        for group in ["exclude", "exclude_by_consumer", "consumers"] {
+            let _ = group;
+        }
+        let mut text = config.clone();
+        clear_pool_exclusions(&mut text);
+        *config = text;
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+
+    let v1 = route.call("route.select", &select("mason")).await;
+    assert_eq!(answered_route(&v1), PLAIN, "{}", v1.1);
+
+    let legacy = route.call("route.select", &legacy_select()).await;
+    assert_eq!(
+        legacy_route(&legacy),
+        format!("{POOL}/{POOL_MODEL_SHORT}"),
+        "the legacy shape still answers the cheaper key-pool route: {}",
+        legacy.1
+    );
+}
+
+/// Remove every operator exclusion entry whose spec names the key-pool
+/// provider or one of its routes, at any depth of the configuration.
+fn clear_pool_exclusions(value: &mut Value) {
+    match value {
+        Value::Array(entries) => {
+            entries.retain(|entry| {
+                entry.as_str().is_none_or(|spec| {
+                    let spec = spec.trim_start_matches('-').trim();
+                    let model = spec.split_once('/').map_or(spec, |(_, model)| model);
+                    !(spec.starts_with(POOL)
+                        || spec.starts_with(POOL_VENDOR)
+                        || spec.starts_with(&format!("-{POOL}"))
+                        || (model == POOL_MODEL_SHORT && spec.contains(POOL)))
+                })
+            });
+            for entry in entries.iter_mut() {
+                clear_pool_exclusions(entry);
+            }
+        }
+        Value::Object(map) => {
+            for entry in map.values_mut() {
+                clear_pool_exclusions(entry);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[tokio::test]
 async fn a_ladder_skips_a_key_pool_entry_and_answers_the_next_one() {
     let harness = harness();
