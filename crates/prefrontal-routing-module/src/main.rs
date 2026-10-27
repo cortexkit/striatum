@@ -16792,7 +16792,7 @@ mod tests {
             &rig,
             params,
             &saturation_facts(),
-            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
         )
         .await;
         let body: serde_json::Value = serde_json::from_slice(&fallback.body).unwrap();

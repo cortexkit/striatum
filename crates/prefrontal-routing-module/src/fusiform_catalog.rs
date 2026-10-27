@@ -3190,6 +3190,7 @@ mod multiplier_fallback_tests {
                 provider_ids: vec!["giraffe".into()],
                 refresh_adapter: Some("giraffe".into()),
                 credential_type: "oauth".into(),
+                auth_method: Some("oauth".into()),
                 state: "active".into(),
                 ..Default::default()
             }],
