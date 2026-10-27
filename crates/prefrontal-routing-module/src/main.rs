@@ -790,25 +790,43 @@ fn record_cooldown_params_error(params: &RecordCooldownParams) -> Option<String>
     None
 }
 
+/// Where this thread's diagnostics are collected in tests. A blocking thread
+/// that runs a route handler shares the buffer of the thread that dispatched
+/// the handler (see [`TestThreadState`]).
+#[cfg(test)]
+type OperatorWarnings = Arc<Mutex<Vec<String>>>;
+
 #[cfg(test)]
 thread_local! {
     /// Diagnostics written on this thread, so a test can assert that a failure
     /// it caused was reported to the operator.
-    static OPERATOR_WARNINGS: std::cell::RefCell<Vec<String>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static OPERATOR_WARNINGS: std::cell::RefCell<OperatorWarnings> =
+        std::cell::RefCell::new(OperatorWarnings::default());
 }
 
 /// Write one diagnostic line to the module's stderr log.
 fn warn_operator(line: String) {
     #[cfg(test)]
-    OPERATOR_WARNINGS.with(|lines| lines.borrow_mut().push(line.clone()));
+    OPERATOR_WARNINGS.with(|sink| {
+        sink.borrow()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(line.clone())
+    });
     eprintln!("{line}");
 }
 
 /// The diagnostics written on this thread since the last call.
 #[cfg(test)]
 fn take_operator_warnings() -> Vec<String> {
-    OPERATOR_WARNINGS.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+    OPERATOR_WARNINGS.with(|sink| {
+        std::mem::take(
+            &mut *sink
+                .borrow()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    })
 }
 
 /// Record the audit row for a selection that ended without a route. The
@@ -865,6 +883,50 @@ impl InjectedClock {
 impl Drop for InjectedClock {
     fn drop(&mut self) {
         INJECTED_NOW_MS.with(|clock| clock.set(self.previous));
+    }
+}
+
+/// The per-thread test state a route handler reads: the injected clock and
+/// the diagnostics buffer. Route handlers run on a blocking thread (see
+/// [`run_route_handler_off_async_workers`]), so the state of the thread that
+/// dispatched the handler is installed there for the handler's lifetime.
+#[cfg(test)]
+struct TestThreadState {
+    now_ms: Option<u64>,
+    warnings: OperatorWarnings,
+}
+
+#[cfg(test)]
+impl TestThreadState {
+    fn capture() -> Self {
+        Self {
+            now_ms: INJECTED_NOW_MS.with(std::cell::Cell::get),
+            warnings: OPERATOR_WARNINGS.with(|sink| Arc::clone(&sink.borrow())),
+        }
+    }
+
+    /// Make this the current thread's state until the returned guard drops,
+    /// which puts back what the thread had before. Blocking threads are reused,
+    /// so a handler's state must not outlive it.
+    fn install(self) -> InstalledTestThreadState {
+        InstalledTestThreadState(Some(TestThreadState {
+            now_ms: INJECTED_NOW_MS.with(|clock| clock.replace(self.now_ms)),
+            warnings: OPERATOR_WARNINGS.with(|sink| sink.replace(self.warnings)),
+        }))
+    }
+}
+
+/// Holds the state a thread had before [`TestThreadState::install`].
+#[cfg(test)]
+struct InstalledTestThreadState(Option<TestThreadState>);
+
+#[cfg(test)]
+impl Drop for InstalledTestThreadState {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            INJECTED_NOW_MS.with(|clock| clock.set(previous.now_ms));
+            OPERATOR_WARNINGS.with(|sink| *sink.borrow_mut() = previous.warnings);
+        }
     }
 }
 
@@ -1482,7 +1544,10 @@ async fn handle_frame(
                 return Ok(true);
             }
             // Data-plane request on a route channel. Spawn so a slow selection
-            // never head-of-line-blocks another route.
+            // never head-of-line-blocks another route, and run the handler on
+            // the blocking pool because it calls the SQLite store synchronously
+            // (see run_route_handler_off_async_workers). Reading frames and
+            // forwarding replies stay on this async task.
             let writer = writer.clone();
             let quota_cache = Arc::clone(quota_cache);
             let store = Arc::clone(store);
@@ -1492,13 +1557,8 @@ async fn handle_frame(
             let broca_credentials = Arc::clone(broca_credentials);
             let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
             tokio::spawn(async move {
-                answer_route_request(
-                    &writer,
-                    ver,
-                    channel,
-                    route_epoch,
-                    corr,
-                    |reply| async move {
+                answer_route_request(&writer, ver, channel, route_epoch, corr, |reply| {
+                    run_route_handler_off_async_workers(async move {
                         // A flow-scoped route reaches only the ops in
                         // diagnostics_findings::FLOW_SCOPE_OPS.
                         if let Some(refusal) = diagnostics_findings::flow_route_refusal(
@@ -1545,8 +1605,8 @@ async fn handle_frame(
                             &broca_credentials,
                         )
                         .await
-                    },
-                )
+                    })
+                })
                 .await;
             });
             Ok(true)
@@ -1617,6 +1677,43 @@ async fn answer_route_request<F, Fut>(
         warn_operator(format!(
             "[prefrontal-routing] WARN: route request on channel {channel} (corr {corr}) got no failure reply: {send_error}"
         ));
+    }
+}
+
+/// Run one route-channel request handler on Tokio's blocking pool and wait for
+/// its result.
+///
+/// Route handlers call the SQLite route-state store synchronously, and a store
+/// call can wait on disk I/O or on another connection's write lock. Run on an
+/// async worker, that wait would also stall every other task scheduled on the
+/// worker: other routes, the frame loop and the background loops. A blocking
+/// thread drives the handler instead, with `Handle::block_on`, so the handler
+/// code is unchanged: it awaits its reply sends exactly as before and writes in
+/// the same order. `block_in_place` is not an option because it panics on a
+/// current-thread runtime.
+///
+/// A panic in the handler is resumed here, so it ends this task just as it did
+/// when the handler ran on the task itself.
+async fn run_route_handler_off_async_workers<F>(handler: F) -> Result<(), ModuleError>
+where
+    F: std::future::Future<Output = Result<(), ModuleError>> + Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let test_thread = TestThreadState::capture();
+    let outcome = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _test_thread = test_thread.install();
+        runtime.block_on(handler)
+    })
+    .await;
+    match outcome {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        // The blocking pool cancels only while the runtime shuts down.
+        Err(error) => Err(ModuleError::Message(format!(
+            "route handler did not run to completion: {error}"
+        ))),
     }
 }
 
@@ -18680,6 +18777,104 @@ mod tests {
                     "decision {decision_id} for opencode-go/m-native-fast has no remembered serving identity: "
                 )) && line.contains("identity refused")),
                 "{warnings:?}"
+            );
+        }
+    }
+
+    /// Route handlers call the SQLite store synchronously. While one handler's
+    /// store write waits on another connection's write lock, the rest of the
+    /// runtime must keep running.
+    mod route_handler_isolation {
+        use super::*;
+        use rusqlite::OptionalExtension;
+
+        /// On a current-thread runtime, a handler run on the runtime's only
+        /// thread would stall every other task until its store call returned.
+        /// Progress is shown by message order: the other task answers while the
+        /// lock is still held, and the handler can only finish after release.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_route_handler_waiting_on_the_store_does_not_stall_other_tasks() {
+            let rig = Rig::new("route-handler-store-wait");
+            let store = Arc::new(rig.open_store());
+            let db = rig.dir.join("store.db");
+            // A second connection holds the database's write lock, so the
+            // handler's cooldown write waits inside the store call.
+            let lock_holder = rusqlite::Connection::open(&db).unwrap();
+            lock_holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+            let (writer, mut replies) = mpsc::channel(4);
+            let mut route_epochs = RouteEpochs::from([(7, 1)]);
+            let request = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                71,
+                serde_json::to_vec(&json!({
+                    "method": ROUTE_RECORD_COOLDOWN_OP,
+                    "params": {
+                        "routeKey": "p/m",
+                        "capacityKey": "p/m",
+                        "cooldownUntil": 1.0e15,
+                        "quotaPressure": 0.4,
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(handle_frame(
+                request,
+                &writer,
+                &Arc::new(Mutex::new(QuotaCache::default())),
+                &store,
+                &mut route_epochs,
+                &Arc::new(Mutex::new(None)),
+                &rig.dir.join("routing.jsonc"),
+                &rig.dir.join("operator.jsonc"),
+                &empty_broca_credentials(),
+                &Arc::new(Mutex::new(CatalogReachHealth::new(600_000))),
+            )
+            .await
+            .unwrap());
+
+            // Another task on the same runtime, queued behind the route
+            // request's task, answers one ping.
+            let (ping, pinged) = tokio::sync::oneshot::channel::<()>();
+            let (pong, ponged) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                pinged.await.unwrap();
+                pong.send(()).unwrap();
+            });
+            ping.send(()).unwrap();
+            ponged
+                .await
+                .expect("the other task answers while the handler waits on the store");
+            assert!(
+                replies.try_recv().is_err(),
+                "the handler cannot have finished while the write lock is held"
+            );
+
+            lock_holder.execute_batch("COMMIT").unwrap();
+            let reply = replies.recv().await.unwrap();
+            assert_eq!(
+                (reply.header.ty, reply.header.corr),
+                (FrameType::Response, 71),
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+            let pressure: Option<Option<f64>> = rusqlite::Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT quota_pressure FROM model_route_state WHERE route_key = 'p/m'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(
+                pressure,
+                Some(Some(0.4)),
+                "the write lands once the lock is free"
             );
         }
     }

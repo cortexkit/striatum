@@ -761,14 +761,30 @@ impl ConfigReloadWatch {
 /// Re-check the config and observed availability on an interval. Nothing is
 /// seeded at boot: the first comparison happens once a selection has reported
 /// what live routing can reach, against the baseline stored before the restart.
+/// Each check reads and writes the store and recomputes the ladder, so it runs
+/// on a blocking thread rather than on an async worker.
 pub(crate) async fn config_reload_watch_loop(
     store: Arc<SqliteRouteStateStore>,
     sources: LadderSources,
 ) {
+    let sources = Arc::new(sources);
     let mut watch = ConfigReloadWatch::new(&sources);
     loop {
         tokio::time::sleep(CONFIG_WATCH_INTERVAL).await;
-        watch.check(store.as_ref(), &sources);
+        let (check_store, check_sources) = (Arc::clone(&store), Arc::clone(&sources));
+        let checked = tokio::task::spawn_blocking(move || {
+            watch.check(&check_store, &check_sources);
+            watch
+        })
+        .await;
+        watch = match checked {
+            Ok(watch) => watch,
+            // A panicking check ends this loop, as it did when the check ran on
+            // the loop's own task.
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            // The blocking pool cancels only while the runtime shuts down.
+            Err(_) => return,
+        };
     }
 }
 
