@@ -38,11 +38,16 @@ use std::sync::Mutex;
 
 mod account_selection;
 pub mod backup;
+mod diagnostics;
 mod key_pool;
 mod reasoning_catalog;
 mod retention;
 mod routing_v1;
 
+pub use diagnostics::{
+    DiagnosticAccountBlock, DiagnosticAccountHold, DiagnosticDecision, DiagnosticKeyWall,
+    DiagnosticRouteWall,
+};
 pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
 pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
 pub use retention::AffinityRetentionBatch;

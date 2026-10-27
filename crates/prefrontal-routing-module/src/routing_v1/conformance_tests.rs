@@ -345,6 +345,16 @@ impl Route {
         .unwrap()
     }
 
+    /// Send `{method, params}` on this route; the reply frame's type and the
+    /// body bytes exactly as the module rendered them.
+    pub(super) async fn call_raw(&self, method: &str, params: &Value) -> (FrameType, Vec<u8>) {
+        let reply = self
+            .harness
+            .handle(self.request_frame(method, params))
+            .await;
+        (reply.header.ty, reply.body)
+    }
+
     /// Send `{method, params}` on this route; the reply frame's type and body.
     pub(super) async fn call(&self, method: &str, params: &Value) -> (FrameType, Value) {
         let frame = self.request_frame(method, params);
