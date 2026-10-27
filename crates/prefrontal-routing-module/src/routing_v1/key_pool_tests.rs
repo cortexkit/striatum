@@ -53,9 +53,10 @@ fn model(route_key: &str, iq: u8) -> CatalogModel {
 /// borrows from `POOL_VENDOR`.
 fn catalog_models() -> Vec<CatalogModel> {
     vec![
-        // The key pool's route is the cheapest, so it would win the v1 order.
-        model(POOL_ROUTE, 80),
-        model(PLAIN, 80),
+        // The key pool's route is the cheapest and the ablest, so it wins the
+        // v1 order and is the only route a high demand can use.
+        model(POOL_ROUTE, 95),
+        model(PLAIN, 40),
     ]
 }
 
@@ -226,14 +227,15 @@ async fn the_key_pool_route_is_still_answered_on_legacy_route_select() {
 async fn only_key_pool_routes_adequate_answers_the_typed_refusal_on_v1() {
     let harness = harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
-    harness.edit_config(|config| {
-        // Only the key pool's borrowed route stays reachable for mason: the
-        // catalog provider's own route is not for mason, and the pool vendor's
-        // row is only run by the pool key.
-        config["models"][PLAIN]["not_for"] = json!(["mason"]);
-        config["models"][POOL_ROUTE]["not_for"] = json!(["mason"]);
-    });
-    let v1 = route.call("route.select", &select("mason")).await;
+    // The key pool's route is the only one that meets the demand: the catalog
+    // provider's own route is adequate for less work than this pricier demand
+    // asks for, and the borrowed vendor row is only reachable through the pool.
+    let v1 = route
+        .call(
+            "route.select",
+            &json!({ "consumer": "mason", "requirements": { "iq": 95 } }),
+        )
+        .await;
     assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
     assert_eq!(v1.1["code"], "no_route", "{}", v1.1);
     assert_eq!(v1.1["detail"]["reason"], "no_available_model", "{}", v1.1);
