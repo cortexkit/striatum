@@ -205,10 +205,6 @@ fn legacy_route(reply: &(FrameType, Value)) -> String {
         .to_owned()
 }
 
-/// A ladder that names a key-pool route first, then a plain one, answers the
-/// plain entry: the key-pool entry is skipped, not allowed to refuse the whole
-/// select. Clearing `explicit_only` keeps the pool route out of the automatic
-/// order, so the only way the answer could be the pool route is the ladder.
 /// With no pin and no ladder, the key pool's route is the cheapest adequate
 /// one. Operator policy that keeps such a provider out of the automatic order
 /// is cleared first, so the only thing left that can keep it out of a v1 answer
@@ -216,16 +212,9 @@ fn legacy_route(reply: &(FrameType, Value)) -> String {
 #[tokio::test]
 async fn the_automatic_order_skips_a_cheaper_key_pool_route_on_v1_but_not_on_legacy() {
     let harness = harness();
-    harness.edit_config(|config| {
-        // Every exclusion naming the key-pool provider, so its borrowed route
-        // is a normal automatic candidate.
-        for group in ["exclude", "exclude_by_consumer", "consumers"] {
-            let _ = group;
-        }
-        let mut text = config.clone();
-        clear_pool_exclusions(&mut text);
-        *config = text;
-    });
+    // Clear every exclusion naming the key-pool provider, so its borrowed
+    // route is a normal automatic candidate.
+    harness.edit_config(clear_pool_exclusions);
     let route = harness.bind(reserved("example-consumer"), None).await;
 
     let v1 = route.call("route.select", &select("mason")).await;
@@ -268,6 +257,9 @@ fn clear_pool_exclusions(value: &mut Value) {
     }
 }
 
+/// A ladder that names a key-pool route first, then a plain one, answers the
+/// plain entry: the key-pool entry is skipped, not allowed to refuse the whole
+/// select.
 #[tokio::test]
 async fn a_ladder_skips_a_key_pool_entry_and_answers_the_next_one() {
     let harness = harness();
