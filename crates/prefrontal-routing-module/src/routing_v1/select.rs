@@ -273,7 +273,9 @@ pub(super) async fn select(
         .copied()
         .filter(|fact| key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))
         .collect();
-    let key_pool_only = key_pool_routes.len() == capable.len();
+    // Every route that could serve this request is a key-pool one: if any other
+    // route were adequate, the filter below would keep it.
+    let key_pool_only = !key_pool_routes.is_empty() && key_pool_routes.len() == capable.len();
     let capable: Vec<&ModelFact> = capable
         .into_iter()
         .filter(|fact| !key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))

@@ -55,11 +55,10 @@ fn model(route_key: &str, iq: u8) -> CatalogModel {
 /// The catalog's rows: the catalog provider's own, and the row the key pool
 /// borrows from `POOL_VENDOR`.
 fn catalog_models() -> Vec<CatalogModel> {
-    // `catalog_fact` prices each row by its rank, so the first entry is the
-    // cheapest. The key pool's route is therefore both the cheapest and the
-    // ablest: it wins wherever it is allowed to decide, and it is the only
+    // The key pool's route is both the ablest and (by the pricing below) the
+    // cheapest, so it wins wherever it is allowed to decide and is the only
     // route a high demand can use.
-    vec![model(POOL_ROUTE, 95), model(PLAIN, 40)]
+    vec![model(POOL_ROUTE, 100), model(PLAIN, 30)]
 }
 
 /// One routing fact per catalog row, each with a billing plane.
@@ -301,6 +300,55 @@ async fn a_ladder_of_only_key_pool_entries_refuses_by_name_on_v1() {
             .is_some_and(|message| message.contains("key-pool")),
         "the refusal names the key-pool lease: {}",
         v1.1
+    );
+}
+
+/// When the key pool's route is the only one that meets the demand, v1 answers
+/// the typed refusal and says why. The demand picks it by ability, not by a pin
+/// or a ladder, and the operator pin-only rule is cleared first so the automatic
+/// order is what meets the pool route.
+#[tokio::test]
+async fn only_a_key_pool_route_adequate_answers_the_typed_refusal_on_v1() {
+    let harness = harness();
+    harness.edit_config(|config| {
+        clear_pool_exclusions(config);
+        // The catalog provider's own route is not for mason any more, so the
+        // key pool's route is the only one left that can serve the request.
+        config["models"][PLAIN]["not_for"] = json!(["mason"]);
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+
+    let v1 = route.call("route.select", &select("mason")).await;
+    assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
+    assert_eq!(v1.1["code"], "no_route", "{}", v1.1);
+    assert_eq!(v1.1["detail"]["reason"], "no_available_model", "{}", v1.1);
+    // The only route left is the key pool's, and the refusal lists it among the
+    // routes v1 turned down rather than answering it.
+    let rejected = v1.1["detail"]["rejected"].as_array().unwrap();
+    let pool_route = format!("{POOL}/{POOL_MODEL_SHORT}");
+    assert!(
+        rejected
+            .iter()
+            .any(|row| row["routeKey"] == json!(pool_route)),
+        "the refusal names the key-pool route it will not serve: {}",
+        v1.1
+    );
+
+    // The same demand on the legacy shape still gets the key-pool route.
+    let legacy = route
+        .call(
+            "route.select",
+            &json!({
+                "targetAgent": "mason", "consumer": "mason", "executor": "broca",
+                "substrate": "broca", "requirements": {"iq": 100, "eq": 0},
+            }),
+        )
+        .await;
+    assert_eq!(
+        legacy_route(&legacy),
+        format!("{POOL}/{POOL_MODEL_SHORT}"),
+        "{}",
+        legacy.1
     );
 }
 
