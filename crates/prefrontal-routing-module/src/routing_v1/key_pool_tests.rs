@@ -210,15 +210,26 @@ fn legacy_route(reply: &(FrameType, Value)) -> String {
 }
 
 #[tokio::test]
-async fn a_key_pool_winner_is_left_out_of_the_v1_answer() {
+async fn a_ladder_entry_on_a_key_pool_route_is_not_answered_on_v1() {
     let harness = harness();
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["mode"] = json!("ladder");
+        config["consumers"]["mason"]["ladder"] = json!([format!("{POOL}/model-pool")]);
+    });
     let route = harness.bind(reserved("example-consumer"), None).await;
-    let answered = answered_route(&route.call("route.select", &select("mason")).await);
-    assert!(
-        !answered.starts_with(&format!("{POOL}/")) && !answered.contains("model-pool"),
-        "a key-pool route must not be answered on v1, got {answered}"
+    let v1 = route.call("route.select", &select("mason")).await;
+    assert_ne!(
+        v1.0, FrameType::Response,
+        "a ladder entry naming a key-pool route must not be answered on v1: {}",
+        v1.1
     );
-    assert_eq!(answered, PLAIN, "the catalog provider's own route wins");
+    assert!(
+        v1.1["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("key-pool")),
+        "the refusal names the key-pool lease: {}",
+        v1.1
+    );
 }
 
 #[tokio::test]
