@@ -111,7 +111,7 @@ fn paged_golden_request_and_response_bytes_are_pinned() {
 async fn paged_three_pages_apply_together_with_retired_models_and_curated_auth() {
     use prefrontal_routing_core::{FactSource, RouteStateStore as _};
     let rig = Rig::new("paged-three");
-    let store = rig.store();
+    let store = std::sync::Arc::new(rig.store());
     for provider in ["alpha", "beta", "zulu"] {
         store
             .upsert_fact(&crate::tests::fact(provider, "m"), FactSource::Seed)
@@ -249,7 +249,7 @@ async fn paged_catalog_changed_discards_partial_pages_and_restarts_from_page_one
 async fn paged_restart_limit_preserves_the_previous_store_and_cached_snapshot() {
     use prefrontal_routing_core::{FactSource, RouteStateStore as _};
     let rig = Rig::new("paged-limit");
-    let store = rig.store();
+    let store = std::sync::Arc::new(rig.store());
     store
         .upsert_fact(&crate::tests::fact("alpha", "m"), FactSource::Seed)
         .unwrap();

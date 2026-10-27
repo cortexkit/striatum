@@ -1437,24 +1437,70 @@ pub(crate) async fn ingest_before_upsert(
     Ok(())
 }
 
+/// Run one cycle's store work (catalog apply, family rules, ladder comparison,
+/// pruning) on a blocking thread, so the SQLite writes and the ladder
+/// computation never hold an async worker. A panic is resumed on the caller,
+/// as it was when the work ran on the loop's own task.
+async fn on_blocking_thread<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, FusiformCatalogError> + Send + 'static,
+) -> Result<T, FusiformCatalogError> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => result,
+        Err(failure) if failure.is_panic() => std::panic::resume_unwind(failure.into_panic()),
+        // The blocking pool cancels only while the runtime shuts down.
+        Err(failure) => Err(error(format!(
+            "catalog store work did not finish: {failure}"
+        ))),
+    }
+}
+
+/// The store half of a cycle that fetched a snapshot: apply it, then prune and
+/// report the routes Fusiform no longer serves.
+async fn apply_and_report(
+    store: &Arc<SqliteRouteStateStore>,
+    health: &SharedCatalogHealth,
+    snapshot: CatalogSnapshot,
+    family_config_path: Option<&Path>,
+    ladder: Option<&LadderSources>,
+    credentials: Option<crate::broca_credentials::SharedBrocaCredentials>,
+    context: &'static str,
+) -> Result<(), FusiformCatalogError> {
+    let (store, health) = (Arc::clone(store), Arc::clone(health));
+    let family_config_path = family_config_path.map(Path::to_path_buf);
+    let ladder = ladder.cloned();
+    on_blocking_thread(move || {
+        apply_catalog_snapshot(
+            &store,
+            &snapshot,
+            family_config_path.as_deref(),
+            ladder.as_ref(),
+            credentials.as_ref(),
+            context,
+        )?;
+        report_unserved_routes(&store, &health)
+    })
+    .await
+}
+
 async fn bootstrap_cycle<C: CatalogWire>(
     client: &mut C,
-    store: &SqliteRouteStateStore,
+    store: &Arc<SqliteRouteStateStore>,
     health: &SharedCatalogHealth,
     family_config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let snapshot = client.catalog_get().await?;
     client.refresh_planes(Some(&snapshot)).await?;
-    apply_catalog_snapshot(
+    apply_and_report(
         store,
-        &snapshot,
+        health,
+        snapshot,
         family_config_path,
         ladder,
-        client.credentials().as_ref(),
+        client.credentials(),
         "catalog.get",
-    )?;
-    report_unserved_routes(store, health)?;
+    )
+    .await?;
     if let Ok(mut health) = health.lock() {
         health.note_reached(now_ms());
     }
@@ -1464,7 +1510,7 @@ async fn bootstrap_cycle<C: CatalogWire>(
 
 async fn poll_cycle<C: CatalogWire>(
     client: &mut C,
-    store: &SqliteRouteStateStore,
+    store: &Arc<SqliteRouteStateStore>,
     health: &SharedCatalogHealth,
     family_config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
@@ -1473,24 +1519,29 @@ async fn poll_cycle<C: CatalogWire>(
     if let Ok(mut health) = health.lock() {
         health.note_reached(now_ms());
     }
-    let cursor = store
-        .fusiform_catalog_cursor()
-        .map_err(|reason| error(format!("read Fusiform cursor: {reason}")))?;
+    let cursor_store = Arc::clone(store);
+    let cursor = on_blocking_thread(move || {
+        cursor_store
+            .fusiform_catalog_cursor()
+            .map_err(|reason| error(format!("read Fusiform cursor: {reason}")))
+    })
+    .await?;
     let should_get = cursor
         .map(|cursor| status.catalog_version > cursor.catalog_version)
         .unwrap_or(true);
     let get_calls = if should_get {
         let snapshot = client.catalog_get().await?;
         client.refresh_planes(Some(&snapshot)).await?;
-        apply_catalog_snapshot(
+        apply_and_report(
             store,
-            &snapshot,
+            health,
+            snapshot,
             family_config_path,
             ladder,
-            client.credentials().as_ref(),
+            client.credentials(),
             "catalog replay",
-        )?;
-        report_unserved_routes(store, health)?;
+        )
+        .await?;
         1
     } else {
         client.refresh_planes(None).await?;
@@ -2363,7 +2414,7 @@ mod tests {
     async fn refusals_decode_without_failing_poll_and_planes_refresh_only_on_catalog_change() {
         use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let rig = Rig::new("plane-poll");
-        let store = rig.store();
+        let store = Arc::new(rig.store());
         let facts = vec![
             crate::tests::fact("google", "example"),
             crate::tests::fact("openai", "example"),
@@ -2795,7 +2846,7 @@ mod tests {
     #[tokio::test]
     async fn cursor_unchanged_skips_get_and_advance_issues_exactly_one_get() {
         let rig = Rig::new("cursor");
-        let store = rig.store();
+        let store = Arc::new(rig.store());
         let initial = decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
         store
             .apply_fusiform_catalog(&initial.facts, initial.cursor)
@@ -2842,7 +2893,7 @@ mod tests {
     #[tokio::test]
     async fn health_reach_flips_on_first_successful_catalog_get() {
         let rig = Rig::new("health");
-        let store = rig.store();
+        let store = Arc::new(rig.store());
         let snapshot = decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
         let health = Arc::new(Mutex::new(CatalogReachHealth::new(600_000)));
         assert_eq!(
@@ -2870,7 +2921,7 @@ mod tests {
         use prefrontal_routing_core::{FactSource, RouteStateStore as _};
 
         let rig = Rig::new("health-unserved-override");
-        let store = rig.store();
+        let store = Arc::new(rig.store());
         store
             .upsert_fact(
                 &crate::tests::fact("test", "unserved-override"),
@@ -2995,7 +3046,7 @@ mod tests {
         use prefrontal_routing_core::{FactSource, RouteStateStore as _};
 
         let rig = Rig::new("entry-isolation");
-        let store = rig.store();
+        let store = Arc::new(rig.store());
         for model in ["kept", "gone", "fine"] {
             store
                 .upsert_fact(&crate::tests::fact("test", model), FactSource::Seed)
