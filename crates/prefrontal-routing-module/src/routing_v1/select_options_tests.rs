@@ -1,0 +1,146 @@
+//! `route.select` with `pin_fallback` and `prefer`, over the module's frame
+//! handler with the conformance kit's consumers and catalog. In that catalog
+//! the plain select for [`fixture::SUMMARY`] answers the cheapest model,
+//! `example-provider/model-b`, and every model meets the plain demand.
+
+use cortexkit_role_routing_conformance::fixture;
+use serde_json::{json, Value};
+use subc_protocol::FrameType;
+
+use super::conformance_tests::Route;
+use super::dispatch_tests::configured;
+
+const MODEL_A: &str = "example-provider/model-a";
+const MODEL_B: &str = "example-provider/model-b";
+const MODEL_C: &str = "example-subscription/model-c";
+const MODEL_D: &str = "example-subscription/model-d";
+
+fn select_body(extra: Value) -> Value {
+    let mut body = json!({"consumer": fixture::SUMMARY, "requirements": {"iq": 50}});
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    body
+}
+
+async fn answered(route: &Route, extra: Value) -> Value {
+    let reply = route.call("route.select", &select_body(extra)).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    reply.1["result"].clone()
+}
+
+fn route_key(answer: &Value) -> String {
+    format!(
+        "{}/{}",
+        answer["route"]["provider"].as_str().unwrap(),
+        answer["route"]["model"].as_str().unwrap()
+    )
+}
+
+#[tokio::test]
+async fn an_unservable_pin_falls_back_only_when_asked_and_says_why() {
+    let (_harness, route) = configured().await;
+    let plain = answered(&route, json!({})).await;
+    assert_eq!(route_key(&plain), MODEL_B, "{plain}");
+    assert!(plain.get("pin_outcome").is_none(), "{plain}");
+
+    let missing = "example-provider/model-z";
+    let refused = route
+        .call("route.select", &select_body(json!({"pin": missing})))
+        .await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "pin_unavailable", "{}", refused.1);
+
+    let fell_back = answered(&route, json!({"pin": missing, "pin_fallback": "route"})).await;
+    assert_eq!(fell_back["pin_outcome"], "fell_back", "{fell_back}");
+    assert_eq!(
+        fell_back["detail"],
+        json!({"pin_reason": "unknown_model"}),
+        "the reason is given even when detail was not asked for: {fell_back}"
+    );
+    assert_eq!(route_key(&fell_back), route_key(&plain), "{fell_back}");
+
+    let asked = answered(
+        &route,
+        json!({"pin": missing, "pin_fallback": "route", "detail": true}),
+    )
+    .await;
+    assert_eq!(asked["detail"]["pin_reason"], "unknown_model", "{asked}");
+    assert!(asked["detail"]["basis"].is_string(), "{asked}");
+}
+
+#[tokio::test]
+async fn a_served_pin_is_labelled_pinned_with_or_without_fallback() {
+    let (_harness, route) = configured().await;
+    for extra in [
+        json!({"pin": MODEL_A}),
+        json!({"pin": MODEL_A, "pin_fallback": "route"}),
+    ] {
+        let pinned = answered(&route, extra.clone()).await;
+        assert_eq!(route_key(&pinned), MODEL_A, "{extra}: {pinned}");
+        assert_eq!(pinned["pin_outcome"], "pinned", "{extra}: {pinned}");
+        assert!(pinned.get("detail").is_none(), "{extra}: {pinned}");
+    }
+}
+
+#[tokio::test]
+async fn an_excluded_pin_falls_back_to_a_route_the_request_allows() {
+    let (_harness, route) = configured().await;
+    let fell_back = answered(
+        &route,
+        json!({"pin": MODEL_A, "pin_fallback": "route", "exclude": [MODEL_A, MODEL_B]}),
+    )
+    .await;
+    assert_eq!(fell_back["pin_outcome"], "fell_back", "{fell_back}");
+    assert_eq!(fell_back["detail"]["pin_reason"], "excluded", "{fell_back}");
+    let answered_key = route_key(&fell_back);
+    assert!(
+        answered_key != MODEL_A && answered_key != MODEL_B,
+        "a fallback still honours the request's exclusions: {fell_back}"
+    );
+}
+
+#[tokio::test]
+async fn prefer_answers_the_first_listed_adequate_route_in_list_order() {
+    let (_harness, route) = configured().await;
+    for (prefer, expected) in [
+        (json!([MODEL_D, MODEL_C]), MODEL_D),
+        (json!([MODEL_C, MODEL_D]), MODEL_C),
+        (json!(["example-provider/model-z", MODEL_A]), MODEL_A),
+    ] {
+        let preferred = answered(&route, json!({"prefer": prefer, "detail": true})).await;
+        assert_eq!(route_key(&preferred), expected, "{prefer}: {preferred}");
+        assert_eq!(
+            preferred["detail"]["basis"], "the request's preference among adequate routes",
+            "{preferred}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prefer_never_admits_a_route_the_request_would_not_get() {
+    let (_harness, route) = configured().await;
+    // Only model-c (64k output) meets a 40k output floor; model-a has 32k.
+    let floor = json!({"iq": 50, "context_window": 150_000, "max_output_tokens": 40_000});
+    let preferred = answered(&route, json!({"requirements": floor, "prefer": [MODEL_A]})).await;
+    assert_eq!(route_key(&preferred), MODEL_C, "{preferred}");
+
+    let excluded = answered(
+        &route,
+        json!({"prefer": [MODEL_D, MODEL_A], "exclude": [MODEL_D]}),
+    )
+    .await;
+    assert_eq!(
+        route_key(&excluded),
+        MODEL_A,
+        "an excluded listed route is skipped, the next listed one answered: {excluded}"
+    );
+}
+
+#[tokio::test]
+async fn a_pin_decides_before_prefer() {
+    let (_harness, route) = configured().await;
+    let pinned = answered(&route, json!({"pin": MODEL_A, "prefer": [MODEL_C]})).await;
+    assert_eq!(route_key(&pinned), MODEL_A, "{pinned}");
+    assert_eq!(pinned["pin_outcome"], "pinned", "{pinned}");
+}

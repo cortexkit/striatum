@@ -211,6 +211,38 @@ mod account_fact_tests {
             "expiry deletes the row"
         );
     }
+
+    #[test]
+    fn route_fences_keep_the_later_reset_and_end_at_it() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-route-fence");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "account-route-fence",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let fence = |until_ms, decision: &str| AccountRouteFence {
+            provider: "p".into(),
+            credential_id: "c".into(),
+            model: "m".into(),
+            until_ms,
+            decision_id: decision.into(),
+            recorded_at: 10,
+        };
+        store.record_account_route_fence(&fence(500, "d1")).unwrap();
+        store.record_account_route_fence(&fence(200, "d2")).unwrap();
+        assert_eq!(
+            store.account_route_fences(100).unwrap(),
+            vec![fence(500, "d1")],
+            "an earlier reset does not shorten a standing fence"
+        );
+        store.record_account_route_fence(&fence(900, "d3")).unwrap();
+        assert_eq!(store.account_route_fences(100).unwrap()[0].until_ms, 900);
+        assert!(store.account_route_fences(900).unwrap().is_empty());
+        assert!(
+            store.account_route_fences(0).unwrap().is_empty(),
+            "the end deletes the row"
+        );
+    }
 }
 
 /// An account/model fact, valid only for the credential listing it was read on.
@@ -233,6 +265,20 @@ pub struct AccountSizeRefusal {
     pub size_class: u32,
     pub expires_at: i64,
     pub observed_at: i64,
+}
+
+/// One route closed on one account until `until_ms`, from a failed routing/v1
+/// report that named the provider's reset. The account is the one the
+/// credential belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRouteFence {
+    pub provider: String,
+    pub credential_id: String,
+    pub model: String,
+    pub until_ms: i64,
+    /// The decision whose report set the fence, for diagnostics.
+    pub decision_id: String,
+    pub recorded_at: i64,
 }
 
 impl SqliteRouteStateStore {
@@ -427,6 +473,45 @@ impl SqliteRouteStateStore {
         self.store.with_conn(|conn: &Connection| {
             conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",
                 params![provider,credential,model,size_class,observed_at]).map(|_| ())
+        }).map_err(err)
+    }
+
+    /// Record a route fence. Two reports on the same route and credential
+    /// keep the later reset: each report fences until its own reset, so the
+    /// route stays closed until both have passed.
+    pub fn record_account_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.execute(
+                    "INSERT INTO account_route_fence VALUES (?1,?2,?3,?4,?5,?6) \
+                ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
+                until_ms=excluded.until_ms,decision_id=excluded.decision_id,recorded_at=excluded.recorded_at \
+                WHERE excluded.until_ms > account_route_fence.until_ms",
+                    params![
+                        fence.provider,
+                        fence.credential_id,
+                        fence.model,
+                        fence.until_ms,
+                        fence.decision_id,
+                        fence.recorded_at
+                    ],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
+    /// The route fences still standing at `now`. Ended fences are removed on
+    /// reads, not just ignored in memory.
+    pub fn account_route_fences(&self, now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
+        self.store.with_conn(|conn: &Connection| {
+            if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(Vec::new()); }
+            conn.execute("DELETE FROM account_route_fence WHERE until_ms<=?1", [now])?;
+            let mut statement = conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence ORDER BY provider,credential_id,model")?;
+            let rows = statement.query_map([], |row| Ok(AccountRouteFence {
+                provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,until_ms: row.get(3)?,decision_id: row.get(4)?,recorded_at: row.get(5)?,
+            }))?;
+            rows.collect()
         }).map_err(err)
     }
 }

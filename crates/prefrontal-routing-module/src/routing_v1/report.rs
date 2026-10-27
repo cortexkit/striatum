@@ -5,11 +5,16 @@
 //! first report on a decision stands: the same body again returns its
 //! answer, and a different body is `report_conflict`. Outcomes are audit
 //! facts, not evidence that quota is exhausted. Eligibility and explicitly
-//! size-shaped refusals restrict only the account that actually served.
+//! size-shaped refusals restrict only the account that actually served, and
+//! a failure with a future reset closes only the decision's route on that
+//! account until the reset, for at most 24 hours. Usage the report carries
+//! joins the route's usage history, with an absent count kept unknown.
 
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
-use cortexkit_role_routing::report::{parse_report_request, Outcome, ReportAnswer, ReportRequest};
-use prefrontal_routing_core::RouteOutcome;
+use cortexkit_role_routing::report::{
+    parse_report_request, Outcome, ReportAnswer, ReportRequest, RESET_FENCE_CAP_MS,
+};
+use prefrontal_routing_core::{RouteOutcome, RouteStateStore};
 use prefrontal_routing_store::V1Recorded;
 use serde_json::Value;
 
@@ -64,6 +69,9 @@ pub(super) fn report_at(
     }
 
     record_account_facts(params, &decision, deps, now as i64)?;
+    if let Some(usage) = &request.usage {
+        record_usage(usage, &decision, deps, now)?;
+    }
     deps.store
         .record_routing_outcome(
             &request.decision_id,
@@ -174,10 +182,43 @@ fn record_account_facts(
         .iter()
         .map(|fact| fact.provider_id.clone())
         .collect();
-    if !classes.credentials.listed_credentials().iter().any(|row| {
-        row.id == credential
-            && crate::broca_credentials::credential_serves_fact(row, fact, &catalog)
-    }) {
+    let serves = |credential: &str| {
+        classes.credentials.listed_credentials().iter().any(|row| {
+            row.id == credential
+                && crate::broca_credentials::credential_serves_fact(row, fact, &catalog)
+        })
+    };
+    // A failed run with a future reset closes this route on the account that
+    // served it, and nothing wider. The serving identity routing admitted for
+    // the decision names that account; the report's own claim is the
+    // fallback. A reset already past is a normal race ("retry in 5 s" landing
+    // 6 s later), so the failure stands with no fence.
+    if params["outcome"] == "failed" {
+        if let Some(reset) = params
+            .get("reset_at_ms")
+            .and_then(Value::as_i64)
+            .filter(|reset| *reset > now)
+        {
+            let served = identity
+                .as_ref()
+                .and_then(|identity| identity.credential_id.as_deref())
+                .or(Some(credential))
+                .filter(|served| serves(served));
+            if let Some(served) = served {
+                deps.store
+                    .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                        provider: decision.provider.clone(),
+                        credential_id: served.into(),
+                        model: decision.model.clone(),
+                        until_ms: reset.min(now.saturating_add(RESET_FENCE_CAP_MS as i64)),
+                        decision_id: decision.decision_id.clone(),
+                        recorded_at: now,
+                    })
+                    .map_err(store_refusal)?;
+            }
+        }
+    }
+    if !serves(credential) {
         return Ok(());
     }
     let fingerprint = match classes.credentials.listing_fingerprint(credential) {
@@ -253,6 +294,57 @@ fn record_account_facts(
         }
     }
     Ok(())
+}
+
+/// The usage-history row id of a v1 decision's report. One report stands per
+/// decision, and the row is keyed by this id, so usage is counted once.
+fn usage_row_id(decision_id: &str) -> String {
+    format!("routing-v1-report:{decision_id}")
+}
+
+/// Add a report's usage to the route's usage history, the table
+/// `route.record_usage` writes. A count the report leaves out stays unknown
+/// (NULL), never zero. `output_tokens` includes `reasoning_tokens` on the
+/// wire, as in the runner contract's usage; the history keeps visible output
+/// with reasoning beside it. `duration_ms` is the run's wall clock, mostly
+/// tool time on an agentic run, so the row is never a speed sample: the
+/// interval is recorded reversed, which the history stores as an unknown
+/// duration. The timing members stay in the stored report body.
+fn record_usage(
+    usage: &cortexkit_role_routing::report::Usage,
+    decision: &prefrontal_routing_store::V1Decision,
+    deps: &Deps<'_>,
+    now: u64,
+) -> Result<(), Refusal> {
+    let reasoning = usage.reasoning_tokens;
+    let completed_ms = now as f64;
+    let facts = prefrontal_routing_core::NativeUsageFacts {
+        message_id: usage_row_id(&decision.decision_id),
+        provider_id: decision.provider.clone(),
+        model_id: decision.model.clone(),
+        variant: decision.variant.clone(),
+        agent: Some(decision.consumer.clone()),
+        input_tokens: usage.input_tokens.map(|count| count as f64),
+        output_tokens: usage.output_tokens.map_or(0.0, |output| {
+            output.saturating_sub(reasoning.unwrap_or(0)) as f64
+        }),
+        reasoning_tokens: reasoning.map(|count| count as f64),
+        cached_read_tokens: usage.cached_input_tokens.map(|count| count as f64),
+        cache_write_tokens: usage.cache_write_tokens.map(|count| count as f64),
+        created_ms: completed_ms + 1.0,
+        completed_ms,
+        ..Default::default()
+    };
+    let Some(observation) =
+        crate::model_resolution::usage_observation_from_store(facts, deps.store)
+            .map_err(store_refusal)?
+    else {
+        return Ok(());
+    };
+    deps.store
+        .record_usage_delivery(&observation)
+        .map(|_| ())
+        .map_err(store_refusal)
 }
 
 /// The recorded first report's answer when `body_json` is the same body, and

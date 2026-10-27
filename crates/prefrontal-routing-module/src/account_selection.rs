@@ -176,6 +176,7 @@ pub(crate) struct ClassContext {
     pub now_ms: i64,
     eligibility: Vec<prefrontal_routing_store::AccountEligibilityFact>,
     size_refusals: Vec<prefrontal_routing_store::AccountSizeRefusal>,
+    route_fences: Vec<prefrontal_routing_store::AccountRouteFence>,
     catalog: BTreeSet<String>,
     targets: BTreeMap<String, String>,
 }
@@ -282,6 +283,9 @@ impl ClassContext {
         let size_refusals = store
             .account_size_refusals(now_ms)
             .map_err(|error| error.to_string())?;
+        let route_fences = store
+            .account_route_fences(now_ms)
+            .map_err(|error| error.to_string())?;
         let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
         let targets = credentials.catalog_targets(&facts);
         prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
@@ -309,6 +313,7 @@ impl ClassContext {
             now_ms,
             eligibility,
             size_refusals,
+            route_fences,
             catalog,
             targets,
         })
@@ -530,14 +535,33 @@ impl ClassContext {
     }
 
     fn roster_for(&self, provider: &str, model: &str, priced_per_token: bool) -> RosterBuild {
+        self.roster_and_fences_for(provider, model, priced_per_token)
+            .0
+    }
+
+    /// The roster for one route, and the accounts of its class left out of it
+    /// because a failed report fenced the route on them, each with when its
+    /// fence ends.
+    fn roster_and_fences_for(
+        &self,
+        provider: &str,
+        model: &str,
+        priced_per_token: bool,
+    ) -> (RosterBuild, BTreeMap<String, i64>) {
         let fact = self
             .facts
             .iter()
             .find(|fact| fact.provider_id == provider && fact.model_id == model);
+        let fenced = self.route_fenced_accounts(provider, model);
+        let mut skipped = BTreeMap::new();
         let mut accounts: BTreeMap<String, AccountView> = BTreeMap::new();
         if let Some(fact) = fact {
             for row in self.eligible_rows(self.class(fact, priced_per_token).rows, fact) {
                 let view = self.view(row, fact);
+                if let Some(until) = fenced.get(&view.account_id) {
+                    skipped.insert(view.account_id, *until);
+                    continue;
+                }
                 if let Some(existing) = accounts.get_mut(&view.account_id) {
                     existing.credentials.extend(view.credentials);
                 } else {
@@ -545,10 +569,34 @@ impl ClassContext {
                 }
             }
         }
-        RosterBuild {
-            roster: Some(self.roster(accounts.into_values().collect())),
-            context: json!({"provider": provider, "account_classes": true}),
+        (
+            RosterBuild {
+                roster: Some(self.roster(accounts.into_values().collect())),
+                context: json!({"provider": provider, "account_classes": true}),
+            },
+            skipped,
+        )
+    }
+
+    /// The accounts a failed report closed `provider`/`model` on, each with
+    /// when the fence ends. A fence names the credential that served; the
+    /// whole account it belongs to is closed for this route.
+    fn route_fenced_accounts(&self, provider: &str, model: &str) -> BTreeMap<String, i64> {
+        let mut fenced: BTreeMap<String, i64> = BTreeMap::new();
+        for fence in self.route_fences.iter().filter(|fence| {
+            fence.provider == provider && fence.model == model && fence.until_ms > self.now_ms
+        }) {
+            let account = self
+                .credentials
+                .listed_credentials()
+                .iter()
+                .find(|row| row.id == fence.credential_id)
+                .and_then(|row| row.account_id.clone())
+                .unwrap_or_else(|| fence.credential_id.clone());
+            let until = fenced.entry(account).or_insert(fence.until_ms);
+            *until = (*until).max(fence.until_ms);
         }
+        fenced
     }
 
     fn method(&self, credential: &str) -> &str {
@@ -589,6 +637,17 @@ impl ClassContext {
         model: &str,
         priced: bool,
     ) -> Option<Option<i64>> {
+        // A route closed by failed reports on every account of its class is
+        // blocked until the earliest of those fences ends.
+        let (roster, fenced) = self.roster_and_fences_for(provider, model, priced);
+        if !fenced.is_empty()
+            && roster
+                .roster
+                .as_ref()
+                .is_none_or(|roster| roster.accounts.is_empty())
+        {
+            return Some(fenced.values().min().copied());
+        }
         let blocked = self.probe(provider, model, priced, false, None, "blocked-preflight");
         if !blocked.refusal().is_some_and(|refusal| {
             matches!(
@@ -2255,12 +2314,17 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             Err(error) => return store_error(error),
         },
     };
+    let mut route_fenced = BTreeMap::new();
     let mut roster = match ctx.classes.as_ref() {
-        Some(classes) => classes.roster_for(
-            &provider,
-            &normalize(&parsed.model),
-            class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
-        ),
+        Some(classes) => {
+            let (roster, fenced) = classes.roster_and_fences_for(
+                &provider,
+                &normalize(&parsed.model),
+                class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
+            );
+            route_fenced = fenced;
+            roster
+        }
         None => roster_for_model(ctx, &provider, Some(&normalize(&parsed.model))),
     };
     if let Some(classes) = &ctx.classes {
@@ -2272,6 +2336,9 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 .request_input_tokens
                 .unwrap_or_else(|| parsed.initial_input_bytes.div_ceil(4)),
         );
+    }
+    if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
+        return reply;
     }
     if !roster
         .roster
@@ -2309,6 +2376,59 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             )
         })
         .unwrap_or_else(store_error)
+}
+
+/// The refusal for a request every account it could use is route-fenced on:
+/// `account_pool_exhausted`, timed by the earliest fence end among them, so
+/// the runner waits for the reset the failed report named. `None` while an
+/// open account the request may use is left, or when no fence is why none
+/// is.
+fn route_fence_refusal(
+    roster: &RosterBuild,
+    fenced: &BTreeMap<String, i64>,
+    params: &AccountForParams,
+    now: i64,
+) -> Option<OpReply> {
+    let wanted = |account: &str| {
+        params.candidates.as_ref().is_none_or(|candidates| {
+            candidates
+                .accounts
+                .iter()
+                .any(|candidate| candidate.account_id == account)
+        })
+    };
+    if roster
+        .roster
+        .iter()
+        .flat_map(|roster| &roster.accounts)
+        .any(|view| wanted(&view.account_id))
+    {
+        return None;
+    }
+    let until = fenced
+        .iter()
+        .filter(|(account, _)| wanted(account))
+        .map(|(_, until)| *until)
+        .min()?;
+    let retry_after_s = u64::try_from(until.saturating_sub(now))
+        .unwrap_or(0)
+        .div_ceil(1000);
+    Some(OpReply::typed(
+        "account_pool_exhausted",
+        format!(
+            "a failed report closed {}/{} on every account this request may use until {}",
+            params.provider,
+            params.model,
+            rfc3339(until)
+        ),
+        json!({
+            "code": "account_pool_exhausted",
+            "retry_after_s": retry_after_s,
+            "decision_id": null,
+            "exclusions": [],
+            "reset_at_ms": until,
+        }),
+    ))
 }
 
 /// Check a cold worker launch without reserving an account or creating affinity.

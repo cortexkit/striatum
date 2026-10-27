@@ -346,7 +346,14 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
     };
     let mut refusal = match code {
         "account_hold" => Refusal::account_hold(wait_until().unwrap_or_else(now_ms)),
-        "account_pool_exhausted" => Refusal::account_pool_exhausted(wait_until()),
+        "account_pool_exhausted" => Refusal::account_pool_exhausted(
+            // A route fence states its end exactly; the allocator's own
+            // exhaustion states only a wait.
+            detail
+                .and_then(|detail| detail.get("reset_at_ms"))
+                .and_then(Value::as_u64)
+                .or_else(wait_until),
+        ),
         "invalid_request" => Refusal::invalid_request("params", message.clone()),
         "store_error" => Refusal::new(RefusalCode::AccountSelectionUnavailable, message.clone()),
         other => Refusal::new(RefusalCode::parse(other), message.clone()),

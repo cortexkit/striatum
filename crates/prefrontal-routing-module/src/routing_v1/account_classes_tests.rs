@@ -1276,8 +1276,14 @@ async fn paid_credit_readings_are_explicit_fresh_inputs_and_refusals_cannot_rewr
     assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
 }
 
+/// Contract 0.5.0: a failed report with a future reset fences the decision's
+/// route on the account that served it until the reset. Before 0.5.0 such a
+/// report was only advisory and this test pinned that the same route and
+/// account were answered again; the contract now says the opposite. What still
+/// holds: the failure ends affinity, the fence is not a size refusal, and the
+/// refusals name the reset so callers wait for it.
 #[tokio::test]
-async fn failure_reports_with_resets_are_advisory_and_preserve_account_affinity() {
+async fn failure_reports_with_resets_fence_the_route_on_the_serving_account() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     let caller = harness.bind(reserved(OWNER), None).await;
@@ -1297,23 +1303,43 @@ async fn failure_reports_with_resets_are_advisory_and_preserve_account_affinity(
     let request = json!({"consumer":"mason","requirements":{"iq":30},"affinity":"sticky"});
     let first = caller.call("route.select", &request).await;
     assert_eq!(first.0, FrameType::Response, "{}", first.1);
-    let report=caller.call("route.report",&json!({"decision_id":first.1["result"]["decision_id"],"outcome":"failed","runner_code":"unconfirmed_429","reset_at_ms":NOW+3_600_000})).await;
+    let reset = NOW + 3_600_000;
+    let report=caller.call("route.report",&json!({"decision_id":first.1["result"]["decision_id"],"outcome":"failed","runner_code":"unconfirmed_429","reset_at_ms":reset})).await;
     assert_eq!(report.0, FrameType::Response, "{}", report.1);
     assert!(harness
         .store()
         .v1_affinity_decision(&format!("reserved:{OWNER}"), "mason", "sticky")
         .unwrap()
         .is_none());
+    // The only route's only account is fenced: selection names the reset.
     let second = caller.call("route.select", &request).await;
-    assert_eq!(second.0, FrameType::Response, "{}", second.1);
-    assert_eq!(second.1["result"]["route"], first.1["result"]["route"]);
+    assert_eq!(second.0, FrameType::Error, "{}", second.1);
+    assert_eq!(second.1["code"], "no_route", "{}", second.1);
+    assert_eq!(
+        second.1["detail"]["reason"], "accounts_blocked",
+        "{}",
+        second.1
+    );
+    assert_eq!(
+        second.1["detail"]["reset_at_ms"],
+        json!(reset),
+        "{}",
+        second.1
+    );
     let mut request = account_request("synthetic", "after-failure");
     request["conversation_key"] = json!("conversation-before-failure");
     let after_account = runner.call("route.account_for", &request).await;
-    assert_eq!(after_account.0, FrameType::Response, "{}", after_account.1);
+    assert_eq!(after_account.0, FrameType::Error, "{}", after_account.1);
     assert_eq!(
-        after_account.1["result"]["pin"]["id"],
-        before_account.1["result"]["pin"]["id"]
+        after_account.1["code"], "account_pool_exhausted",
+        "{}",
+        after_account.1
+    );
+    assert_eq!(
+        after_account.1["detail"]["reset_at_ms"],
+        json!(reset),
+        "{}",
+        after_account.1
     );
     assert!(harness
         .store()

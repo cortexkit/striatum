@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal};
 use cortexkit_role_routing::select::{
-    parse_select_request_serving, Modality, RouteRef, RunnerRef, SelectAnswer, ToolsRequirement,
-    EXPLANATION_MAX_CHARS,
+    parse_select_request_serving, Modality, PinFallback, PinOutcome, RouteRef, RunnerRef,
+    SelectAnswer, ToolsRequirement, EXPLANATION_MAX_CHARS,
 };
 use prefrontal_routing_core::model_router::{
     ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
@@ -52,6 +52,8 @@ const MEMBERS: &[&str] = &[
     "harness",
     "hold_ok",
     "hold_wait_max_s",
+    "pin_fallback",
+    "prefer",
 ];
 
 /// How long an answer stays current routing. A report after this is still
@@ -71,6 +73,7 @@ enum Basis {
     RequestPin,
     ProjectPin,
     Affinity,
+    Preferred,
     Automatic,
 }
 
@@ -80,6 +83,7 @@ impl Basis {
             Basis::RequestPin => "the request's pin",
             Basis::ProjectPin => "the project's operator pin",
             Basis::Affinity => "affinity with the previous decision",
+            Basis::Preferred => "the request's preference among adequate routes",
             Basis::Automatic => "the lowest-cost route that meets the requirements",
         }
     }
@@ -425,9 +429,23 @@ pub(super) async fn select(
         .as_ref()
         .map(|previous| format!("{}/{}", previous.provider, previous.model));
     // Request pin, then project pin, then the continuing model, then the mode.
-    // A pin does not fall through. The continuing model does, once it is no
-    // longer allowed. Legacy targetAgent bodies never reach this surface.
-    let ladder_choice = if request.pin.is_none()
+    // A pin does not fall through unless the request asks for it with
+    // `pin_fallback: "route"`: then a pin that cannot be served is dropped
+    // before the order runs, and the order runs as for an unpinned request.
+    // The continuing model falls through once it is no longer allowed. Legacy
+    // targetAgent bodies never reach this surface.
+    let mut request_pin = request.pin.clone();
+    let mut pin_reason = None;
+    if request.pin_fallback == Some(PinFallback::Route) {
+        if let Some(Err(refusal)) = request_pin
+            .as_deref()
+            .map(|pin| selection.pin(pin, &available))
+        {
+            pin_reason = Some(refused_pin_reason(&refusal));
+            request_pin = None;
+        }
+    }
+    let ladder_choice = if request_pin.is_none()
         && project_pin.is_none()
         && continuing.is_none()
         && consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
@@ -491,15 +509,39 @@ pub(super) async fn select(
     } else {
         None
     };
-    let ordered = ladder_choice.unwrap_or_else(|| {
+    let mut ordered = ladder_choice.unwrap_or_else(|| {
         selection.pass().select(
             &usable,
-            request.pin.as_deref(),
+            request_pin.as_deref(),
             project_pin.as_deref(),
             continuing.as_deref(),
             |pin| selection.pin(pin, &available),
         )
     });
+    // `pin_outcome` is answered exactly when the request pinned: `fell_back`
+    // when its pin was dropped above, `pinned` when the pin was served.
+    let pin_outcome = request.pin.as_ref().map(|_| {
+        if pin_reason.is_some() {
+            PinOutcome::FellBack
+        } else {
+            PinOutcome::Pinned
+        }
+    });
+    // `prefer` ranks within the automatic order only: a pin, the continuing
+    // model and an operator ladder each decide before it. A listed route is
+    // answered only when it alone would be an adequate answer to this same
+    // request, so the preference never admits a route the request would not
+    // otherwise get.
+    let mut preferred = false;
+    let laddered = consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder);
+    if let (Ok((normal, select_policy::OrderBasis::Mode)), Some(prefer), false) =
+        (&ordered, &request.prefer, laddered)
+    {
+        if let Some(listed) = selection.preferred(&usable, prefer, normal) {
+            ordered = Ok((listed, select_policy::OrderBasis::Mode));
+            preferred = true;
+        }
+    }
     let (mut selected, basis, explicit_variant) = match ordered {
         Ok((selected, order)) => {
             let explicit = match order {
@@ -518,6 +560,7 @@ pub(super) async fn select(
                 select_policy::OrderBasis::RequestPin => Basis::RequestPin,
                 select_policy::OrderBasis::ProjectPin => Basis::ProjectPin,
                 select_policy::OrderBasis::Continuing => Basis::Affinity,
+                select_policy::OrderBasis::Mode if preferred => Basis::Preferred,
                 select_policy::OrderBasis::Mode => Basis::Automatic,
             };
             (selected, basis, explicit)
@@ -675,26 +718,35 @@ pub(super) async fn select(
     {
         runner_ref = runner_ref.with_harness(harness);
     }
-    let answer = SelectAnswer {
+    let mut answer = SelectAnswer::new(
         decision_id,
-        route: route.clone(),
-        runner: runner_ref,
-        context_window: fact
-            .and_then(|fact| fact.context_window)
+        route.clone(),
+        runner_ref,
+        fact.and_then(|fact| fact.context_window)
             .map_or(0, |window| window as u64),
-        max_output_tokens: fact.and_then(|fact| fact.max_output_tokens).unwrap_or(0),
+        fact.and_then(|fact| fact.max_output_tokens).unwrap_or(0),
         expires_at_ms,
         explanation,
-        detail: (request.detail == Some(true)).then(|| {
-            json!({
-                "basis": basis.as_str(),
-                "explanation": selected.explanation,
-                "rejected": selected.rejected,
-                "score": selected.score,
-                "variant": variant_choice,
-            })
-        }),
-    };
+    );
+    let mut detail = (request.detail == Some(true)).then(|| {
+        json!({
+            "basis": basis.as_str(),
+            "explanation": selected.explanation,
+            "rejected": selected.rejected,
+            "score": selected.score,
+            "variant": variant_choice,
+        })
+    });
+    // A fell-back answer always says why the pin was skipped, asked or not.
+    if let Some(reason) = pin_reason {
+        detail.get_or_insert_with(|| json!({}))["pin_reason"] = json!(reason);
+    }
+    if let Some(detail) = detail {
+        answer = answer.with_detail(detail);
+    }
+    if let Some(outcome) = pin_outcome {
+        answer = answer.with_pin_outcome(outcome);
+    }
     serde_json::to_value(answer)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))
 }
@@ -795,6 +847,34 @@ impl<'a> Selection<'a> {
             }
         }
         Ok(selected)
+    }
+
+    /// The first `prefer` entry, in list order, that would itself be an
+    /// adequate answer to this request among the `usable` routes: it clears the
+    /// adequacy floor, and it does not queue on a full concurrency slot unless
+    /// the `normal` answer queues too. `None` keeps the normal answer.
+    fn preferred(
+        &self,
+        usable: &HashSet<String>,
+        prefer: &[String],
+        normal: &SelectedModelRoute,
+    ) -> Option<SelectedModelRoute> {
+        let normal_queues = normal
+            .slot_saturation
+            .as_ref()
+            .is_some_and(|saturation| saturation.queued_on.is_some());
+        prefer.iter().find_map(|entry| {
+            let only = select_policy::routes_matching(usable, entry);
+            if only.is_empty() {
+                return None;
+            }
+            let listed = self.pass().score(&only).ok()?;
+            let queues = listed
+                .slot_saturation
+                .as_ref()
+                .is_some_and(|saturation| saturation.queued_on.is_some());
+            (listed.below_floor.is_none() && (normal_queues || !queues)).then_some(listed)
+        })
     }
 
     fn account_check(&self, selected: &SelectedModelRoute) -> Result<(), Refusal> {
@@ -909,6 +989,18 @@ fn pin_reason(
         ),
         _ => (PinUnavailableReason::NotAvailable, None),
     }
+}
+
+/// Why a pin could not be served, for `detail.pin_reason` on a fell-back
+/// answer: a `pin_unavailable` refusal's own reason, otherwise the refusal
+/// code (an account or key-pool refusal of the pinned route).
+fn refused_pin_reason(refusal: &Refusal) -> String {
+    refusal
+        .detail
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|_| refusal.code == cortexkit_role_routing::errors::RefusalCode::PinUnavailable)
+        .map_or_else(|| refusal.code.as_str().to_owned(), str::to_owned)
 }
 
 /// The scorer's failure as a v1 `no_route`. Only the routes blocked by

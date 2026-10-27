@@ -138,6 +138,11 @@ impl Harness {
         &self.store
     }
 
+    /// The store's database file, for tests that read a table directly.
+    pub(super) fn store_path(&self) -> PathBuf {
+        self.dir.join("store.db")
+    }
+
     pub(super) fn operator_config(&self) -> Arc<crate::config_overrides::LiveConfig> {
         crate::config_overrides::live_config(&self.config_path.lock().unwrap())
     }
@@ -851,12 +856,26 @@ impl RoutingSubject for KitSubject {
     }
 }
 
-/// No known failing checks. Inapplicable capability checks are listed separately.
-const NOT_YET_SERVED: &[&str] = &[];
+/// Known failing checks, each waiting on a kit question taken to SUBC.
+///
+/// `prefer_never_admits_inadequate_route` ends with `{iq: 100, prefer}` and
+/// requires `no_route`, because every kit model has iq 80. Routing maps
+/// demand relative to the strongest routable fact
+/// (`prefrontal_routing_core::route_scoring`), so iq 100 is always met by the
+/// best routable model, and contract 0.5.0 §5.1 leaves that mapping to the
+/// provider ("task demand, which the provider maps onto its own model
+/// facts"). Open question to SUBC: may the kit assume an absolute iq scale?
+/// The first half of that check, a preferred model inadequate on output, is
+/// covered by `select_options_tests`.
+const NOT_YET_SERVED: &[&str] = &["prefer_never_admits_inadequate_route"];
 
-/// The undeclared-harness refusal check applies only to providers that do not
-/// advertise `select_harness`; this provider advertises and serves that group.
-const NOT_APPLICABLE: &[&str] = &["undeclared_harness_group_refuses_member"];
+/// The undeclared-group refusal checks apply only to providers that do not
+/// advertise the group; this provider advertises and serves `select_harness`
+/// and `select_prefer`.
+const NOT_APPLICABLE: &[&str] = &[
+    "undeclared_harness_group_refuses_member",
+    "undeclared_prefer_group_refuses_member",
+];
 
 /// Every served check passes; exactly [`NOT_YET_SERVED`] fail, and
 /// [`NOT_APPLICABLE`] are inapplicable: a newly failing check, or a listed

@@ -126,6 +126,12 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
          restoring them empty would repeat oversized requests already refused",
     ),
     (
+        "account_route_fence",
+        "route-and-account fences from failed reports with a reset, at most 24 hours long; \
+         restoring them empty would send work to an account the provider said is closed \
+         for that route until its reset",
+    ),
+    (
         "account_principal_exclusion",
         "scoped credential exclusions",
     ),

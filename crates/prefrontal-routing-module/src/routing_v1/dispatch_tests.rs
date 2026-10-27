@@ -61,7 +61,7 @@ fn the_manifest_registers_one_selection_pass() {
 }
 
 /// A harness with the kit's consumers and catalog, and a consumer route.
-async fn configured() -> (std::sync::Arc<Harness>, Route) {
+pub(super) async fn configured() -> (std::sync::Arc<Harness>, Route) {
     let harness = Harness::new("dispatch");
     let consumers: Vec<String> = fixture::consumers()
         .into_iter()
