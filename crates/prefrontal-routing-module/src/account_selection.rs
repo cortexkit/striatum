@@ -637,8 +637,9 @@ impl ClassContext {
         model: &str,
         priced: bool,
     ) -> Option<Option<i64>> {
-        // A route closed by failed reports on every account of its class is
-        // blocked until the earliest of those fences ends.
+        // `fenced` holds the accounts of this route's class that route fences
+        // left out of the roster. When none is left, every account the class
+        // has is fenced, so the route is blocked until the earliest fence ends.
         let (roster, fenced) = self.roster_and_fences_for(provider, model, priced);
         if !fenced.is_empty()
             && roster

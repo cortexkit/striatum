@@ -856,7 +856,8 @@ impl RoutingSubject for KitSubject {
     }
 }
 
-/// Known failing checks, each waiting on a kit question taken to SUBC.
+/// Known failing checks, each waiting on an open question about the kit
+/// itself, raised with the kit's maintainers.
 ///
 /// `prefer_never_admits_inadequate_route` ends with `{iq: 100, prefer}` and
 /// requires `no_route`, because every kit model has iq 80. Routing maps
@@ -864,7 +865,7 @@ impl RoutingSubject for KitSubject {
 /// (`prefrontal_routing_core::route_scoring`), so iq 100 is always met by the
 /// best routable model, and contract 0.5.0 §5.1 leaves that mapping to the
 /// provider ("task demand, which the provider maps onto its own model
-/// facts"). Open question to SUBC: may the kit assume an absolute iq scale?
+/// facts"). Open question: may the kit assume an absolute iq scale?
 /// The first half of that check, a preferred model inadequate on output, is
 /// covered by `select_options_tests`.
 const NOT_YET_SERVED: &[&str] = &["prefer_never_admits_inadequate_route"];
