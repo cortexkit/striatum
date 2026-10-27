@@ -3,7 +3,8 @@
 //! Implements `prefrontal-routing-core::RouteStateStore` over the shared
 //! `cortexkit-store` lib: the lib owns the single-writer lease, the durable
 //! pragmas, and the namespace-keyed migration runner; this crate owns the
-//! `route_state` migration set (DDL + the 33-fact seed) and the domain queries.
+//! `route_state` migration set (the schema, the curated catalog seed and its
+//! later revisions) and the domain queries.
 //! `-core` stays rusqlite-free; the backend lives here (postgres sibling later).
 //!
 //! Ported from the Alfonso TS plugin's `ModelRouteStore`
@@ -760,6 +761,55 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
     Ok(hex[..16].to_string())
 }
 
+/// Count every `model_facts` write made through this connection, so a cached
+/// catalog fingerprint can tell whether the catalog changed since it was
+/// computed. Returns `false` (and installs nothing) when the store has no
+/// `model_facts` table, which only happens for upgrade tests that open an
+/// older schema.
+///
+/// The counter and triggers are TEMP objects: they live only on the store's
+/// one connection, are never written to the database file, and need no
+/// migration. Triggers catch every writer, including ones added later and
+/// plain SQL, which a list of Rust call sites that clear the cache would not.
+/// Writes from other connections are covered by `PRAGMA data_version` in
+/// `CatalogFingerprintKey` instead.
+fn install_catalog_change_tracking(connection: &Connection) -> rusqlite::Result<bool> {
+    let has_facts: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM main.sqlite_schema
+                        WHERE type = 'table' AND name = 'model_facts')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_facts {
+        return Ok(false);
+    }
+    // An unqualified table name in a TEMP trigger resolves to the temp schema
+    // first, so the triggers update this counter and watch `main.model_facts`.
+    connection.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS catalog_facts_writes (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           writes INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO temp.catalog_facts_writes (singleton, writes) VALUES (1, 0);
+         CREATE TEMP TRIGGER IF NOT EXISTS catalog_facts_writes_on_insert
+         AFTER INSERT ON model_facts
+         BEGIN
+           UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1;
+         END;
+         CREATE TEMP TRIGGER IF NOT EXISTS catalog_facts_writes_on_update
+         AFTER UPDATE ON model_facts
+         BEGIN
+           UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1;
+         END;
+         CREATE TEMP TRIGGER IF NOT EXISTS catalog_facts_writes_on_delete
+         AFTER DELETE ON model_facts
+         BEGIN
+           UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1;
+         END;",
+    )?;
+    Ok(true)
+}
+
 /// Decode a stored `model_facts.scores_json`. Every reader of stored scores goes
 /// through this one decoder so they all see the same values: a row that is not
 /// a complete `{elo, eq, speed}` object reads as zero scores (unscored) rather
@@ -868,6 +918,35 @@ pub struct SqliteRouteStateStore {
     /// Same-model score disagreements already logged by this process, so a
     /// read on every selection does not repeat the same warning.
     reported_score_conflicts: Mutex<HashSet<String>>,
+    /// The catalog fingerprint stamped on every decision row, kept with the
+    /// catalog state it was computed from (see `CatalogFingerprintKey`). Before
+    /// this cache, every decision write read and hashed every `model_facts` row.
+    /// `None` until the first fingerprint is computed, and always `None` on a
+    /// store opened at a version without the `model_facts` table, where nothing
+    /// tracks catalog changes.
+    catalog_fingerprint: Mutex<Option<CachedCatalogFingerprint>>,
+    /// Whether `install_catalog_change_tracking` ran on this connection. Without
+    /// it a catalog write would leave the cached fingerprint looking current,
+    /// so every read computes the fingerprint fresh instead.
+    catalog_change_tracking: bool,
+}
+
+/// What a cached catalog fingerprint is valid for: this connection's count of
+/// `model_facts` writes (bumped by the temporary triggers that
+/// `install_catalog_change_tracking` creates) and SQLite's `data_version`,
+/// which moves when another connection commits a change to the database file.
+/// While both are unchanged, `model_facts` holds what it held when the
+/// fingerprint was computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CatalogFingerprintKey {
+    facts_writes: i64,
+    data_version: i64,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCatalogFingerprint {
+    key: CatalogFingerprintKey,
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1112,11 +1191,16 @@ impl SqliteRouteStateStore {
             )));
         }
         validate_family_spellings(&store)?;
+        let catalog_change_tracking = store
+            .with_conn(install_catalog_change_tracking)
+            .map_err(err)?;
         Ok(Self {
             store,
             class_vectors: Mutex::new(HashMap::new()),
             usage_generation: AtomicU64::new(0),
             reported_score_conflicts: Mutex::new(HashSet::new()),
+            catalog_fingerprint: Mutex::new(None),
+            catalog_change_tracking,
         })
     }
 
@@ -1129,8 +1213,45 @@ impl SqliteRouteStateStore {
     /// The fingerprint for the catalog currently available to routing decisions.
     pub fn catalog_fingerprint(&self) -> RouteStateResult<String> {
         self.store
-            .with_conn(|connection: &Connection| calculate_catalog_fingerprint(connection))
+            .with_conn(|connection: &Connection| self.current_catalog_fingerprint(connection))
             .map_err(err)
+    }
+
+    /// The catalog fingerprint as `calculate_catalog_fingerprint` would compute
+    /// it now, reusing the last computed value while `model_facts` is unchanged.
+    ///
+    /// A value computed inside an open transaction is returned but not kept:
+    /// that transaction may still roll back, and the rollback would also undo
+    /// the write count the value was keyed on, so a later, different catalog
+    /// could reach the same count and be served a fingerprint for rows that were
+    /// never committed.
+    fn current_catalog_fingerprint(&self, connection: &Connection) -> rusqlite::Result<String> {
+        if !self.catalog_change_tracking {
+            return calculate_catalog_fingerprint(connection);
+        }
+        let key = CatalogFingerprintKey {
+            facts_writes: connection.query_row(
+                "SELECT writes FROM catalog_facts_writes WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?,
+            data_version: connection.query_row("PRAGMA data_version", [], |row| row.get(0))?,
+        };
+        let mut cache = self
+            .catalog_fingerprint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.as_ref().filter(|cached| cached.key == key) {
+            return Ok(cached.fingerprint.clone());
+        }
+        let fingerprint = calculate_catalog_fingerprint(connection)?;
+        if connection.is_autocommit() {
+            *cache = Some(CachedCatalogFingerprint {
+                key,
+                fingerprint: fingerprint.clone(),
+            });
+        }
+        Ok(fingerprint)
     }
 
     /// The reasoning-effort values the catalog publishes for every stored model.
@@ -1511,6 +1632,24 @@ impl SqliteRouteStateStore {
                         params![cursor.catalog_version, now_ms(), retained_json],
                     )?;
                 }
+                // Every stored (provider, model) pair, read once for the whole
+                // batch. A live catalog carries thousands of entries, and asking
+                // SQLite per entry whether its pair or its provider is already
+                // stored cost two counting queries each. A row minted below is
+                // added here too, so a later entry in the same batch sees it
+                // exactly as a fresh query would.
+                let mut stored_models: HashMap<String, HashSet<String>> = HashMap::new();
+                {
+                    let mut statement =
+                        tx.prepare("SELECT provider_id, model_id FROM model_facts")?;
+                    let pairs = statement.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                    for pair in pairs {
+                        let (provider_id, model_id) = pair?;
+                        stored_models.entry(provider_id).or_default().insert(model_id);
+                    }
+                }
                 for fact in facts {
                     if fact.model_id.ends_with("-fast") {
                         // The request service rejects -fast IDs at admission, so routing must not retain them.
@@ -1538,13 +1677,10 @@ impl SqliteRouteStateStore {
                         &fact.model_id,
                         None,
                     );
-                    let matching_rows: i64 = tx.query_row(
-                        "SELECT COUNT(*) FROM model_facts
-                         WHERE provider_id = ?1 AND model_id = ?2",
-                        params![fact.provider_id, fact.model_id],
-                        |row| row.get(0),
-                    )?;
-                    if matching_rows == 0 {
+                    let pair_stored = stored_models
+                        .get(&fact.provider_id)
+                        .is_some_and(|models| models.contains(&fact.model_id));
+                    if !pair_stored {
                         // A model first seen already withdrawn has nothing to route and
                         // nothing for the operator to place; minting it would only add a
                         // dead row per retired model under every routed provider.
@@ -1556,12 +1692,8 @@ impl SqliteRouteStateStore {
                         // Importing every provider would turn route.list_unscored
                         // into thousands of unrelated rows instead of an operator
                         // worklist, and deepen every selection's candidate scan.
-                        let known_provider: i64 = tx.query_row(
-                            "SELECT COUNT(*) FROM model_facts WHERE provider_id = ?1",
-                            params![fact.provider_id],
-                            |row| row.get(0),
-                        )?;
-                        if known_provider == 0 && !mapped_providers.contains(&fact.provider_id) {
+                        let known_provider = stored_models.contains_key(&fact.provider_id);
+                        if !known_provider && !mapped_providers.contains(&fact.provider_id) {
                             continue;
                         }
                         tx.execute(
@@ -1611,6 +1743,10 @@ impl SqliteRouteStateStore {
                                 fact.upstream_status,
                             ],
                         )?;
+                        stored_models
+                            .entry(fact.provider_id.clone())
+                            .or_default()
+                            .insert(fact.model_id.clone());
                         // The model_facts insert trigger has already created this route's
                         // state row, inheriting any live provider wall and its cause.
                         derive_provider_key(&fact.provider_id).ok_or_else(|| {
@@ -2235,7 +2371,7 @@ impl SqliteRouteStateStore {
         let rejected_json = bound_rejected_json(&input.rejected_json);
         self.store
             .with_conn(|c: &Connection| {
-                let catalog_fingerprint = calculate_catalog_fingerprint(c)?;
+                let catalog_fingerprint = self.current_catalog_fingerprint(c)?;
                 c.execute(
                      "INSERT INTO model_route_decisions (
                          id, decision_kind, task_id, parent_session_id, harness, project_root, send_id,
@@ -6581,5 +6717,202 @@ mod tests {
 
         drop(store);
         remove_observed_speed_test_store(&path);
+    }
+
+    fn fingerprint_test_store(
+        scratch: &prefrontal_test_support::ScratchDir,
+        label: &str,
+    ) -> SqliteRouteStateStore {
+        SqliteRouteStateStore::open(&dev_descriptor(
+            label,
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap()
+    }
+
+    /// The fingerprint hashed from `model_facts` as it is now, bypassing the cache.
+    fn fresh_catalog_fingerprint(store: &SqliteRouteStateStore) -> String {
+        store
+            .store
+            .with_conn(calculate_catalog_fingerprint)
+            .unwrap()
+    }
+
+    /// Record a decision and read back the fingerprint its ledger row carries.
+    fn stamped_fingerprint(store: &SqliteRouteStateStore, task_id: &str) -> String {
+        let id = store
+            .record_decision(&DecisionInput {
+                task_id: Some(task_id.to_string()),
+                target_agent: "mason".into(),
+                requirements_json: "{}".into(),
+                score_json: "{}".into(),
+                rejected_json: "[]".into(),
+                anchor_version: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT catalog_fingerprint FROM model_route_decisions WHERE id = ?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap()
+    }
+
+    /// After a catalog write: the served and stamped fingerprints equal a fresh
+    /// hash of the catalog, both before and after the value is cached, and the
+    /// write produced a fingerprint not seen before.
+    fn assert_fingerprint_follows(
+        store: &SqliteRouteStateStore,
+        label: &str,
+        seen: &mut Vec<String>,
+    ) {
+        let fresh = fresh_catalog_fingerprint(store);
+        assert_eq!(
+            stamped_fingerprint(store, label),
+            fresh,
+            "{label}: first decision"
+        );
+        assert_eq!(store.catalog_fingerprint().unwrap(), fresh, "{label}: read");
+        assert_eq!(
+            stamped_fingerprint(store, &format!("{label}-again")),
+            fresh,
+            "{label}: decision served from the cache"
+        );
+        assert!(
+            !seen.contains(&fresh),
+            "{label}: the catalog write must change the fingerprint"
+        );
+        seen.push(fresh);
+    }
+
+    #[test]
+    fn cached_catalog_fingerprint_equals_a_fresh_hash_after_every_kind_of_catalog_write() {
+        let scratch = prefrontal_test_support::ScratchDir::new("catalog-fingerprint-cache");
+        let store = fingerprint_test_store(&scratch, "catalog-fingerprint-cache");
+        let mut seen = Vec::new();
+        assert_fingerprint_follows(&store, "seeded catalog", &mut seen);
+
+        let mut fact = store.get_facts().unwrap().remove(0);
+        let route_key = prefrontal_routing_core::make_route_key(
+            &fact.provider_id,
+            &fact.model_id,
+            fact.variant.as_deref(),
+        );
+        fact.scores.elo += 1.0;
+        store.upsert_fact(&fact, FactSource::Override).unwrap();
+        assert_fingerprint_follows(&store, "operator upsert", &mut seen);
+
+        store
+            .apply_fusiform_catalog(
+                &[FusiformFactUpdate {
+                    auth_methods: None,
+                    provider_id: fact.provider_id.clone(),
+                    model_id: "fingerprint-cache-probe".to_string(),
+                    present: true,
+                    context_window: Some(64_000.0),
+                    max_output_tokens: Some(4_096),
+                    cost_tier: Some(1.0),
+                    cost_per_mtok_out: Some(1.0),
+                    input_rate: None,
+                    cache_read_rate: None,
+                    cache_write_rate: None,
+                    reasoning_rate: None,
+                    supports_vision: Some(false),
+                    supports_tool_use: Some(true),
+                    reasoning_efforts: None,
+                    canonical_id: None,
+                    upstream_status: None,
+                }],
+                FusiformCatalogCursor {
+                    catalog_version: 3,
+                    resolved_at_ms: 300,
+                },
+            )
+            .unwrap();
+        assert_fingerprint_follows(&store, "fusiform apply", &mut seen);
+
+        // Plain SQL on the store's own connection, which no Rust writer method
+        // sees: only the change tracking on the connection can notice it.
+        store
+            .store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE model_facts SET excluded = 1 WHERE route_key = ?1",
+                    [&route_key],
+                )
+            })
+            .unwrap();
+        assert_fingerprint_follows(&store, "plain SQL update", &mut seen);
+
+        store
+            .delete_fact(&prefrontal_routing_core::make_route_key(
+                &fact.provider_id,
+                "fingerprint-cache-probe",
+                None,
+            ))
+            .unwrap();
+        assert_fingerprint_follows(&store, "fact delete", &mut seen);
+
+        // A commit from a different connection to the same database file.
+        Connection::open(scratch.path().join("store.db"))
+            .unwrap()
+            .execute(
+                "UPDATE model_facts SET cost_per_mtok_out = 987.0 WHERE route_key = ?1",
+                [&route_key],
+            )
+            .unwrap();
+        assert_fingerprint_follows(&store, "other connection", &mut seen);
+    }
+
+    #[test]
+    fn a_fingerprint_read_inside_a_rolled_back_catalog_write_is_never_reused() {
+        let scratch = prefrontal_test_support::ScratchDir::new("catalog-fingerprint-rollback");
+        let store = fingerprint_test_store(&scratch, "catalog-fingerprint-rollback");
+        let committed = store.catalog_fingerprint().unwrap();
+        let fact = store.get_facts().unwrap().remove(0);
+        let route_key = prefrontal_routing_core::make_route_key(
+            &fact.provider_id,
+            &fact.model_id,
+            fact.variant.as_deref(),
+        );
+
+        let uncommitted = store
+            .store
+            .with_conn(|c| {
+                let tx = c.unchecked_transaction()?;
+                tx.execute(
+                    "UPDATE model_facts SET excluded = 1 - excluded WHERE route_key = ?1",
+                    [&route_key],
+                )?;
+                let inside = store.current_catalog_fingerprint(&tx)?;
+                assert_eq!(inside, calculate_catalog_fingerprint(&tx)?);
+                tx.rollback()?;
+                Ok(inside)
+            })
+            .unwrap();
+        assert_ne!(uncommitted, committed);
+        assert_eq!(store.catalog_fingerprint().unwrap(), committed);
+
+        // The rollback also undid the write count, so this single committed
+        // write brings the count back to what the rolled-back read saw. The
+        // value must come from the committed rows, not from that read.
+        store
+            .store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE model_facts SET cost_per_mtok_out = 123.0 WHERE route_key = ?1",
+                    [&route_key],
+                )
+            })
+            .unwrap();
+        let fresh = fresh_catalog_fingerprint(&store);
+        assert_ne!(fresh, uncommitted);
+        assert_eq!(store.catalog_fingerprint().unwrap(), fresh);
+        assert_eq!(stamped_fingerprint(&store, "after-rollback"), fresh);
     }
 }

@@ -3333,6 +3333,71 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
     );
 }
 
+/// The apply reads the stored (provider, model) pairs once per batch, so a row
+/// minted early in a batch must count as stored for the rest of it: a second
+/// entry for the same pair updates that row instead of minting it again, and
+/// unknown providers stay out.
+#[test]
+fn fusiform_apply_treats_a_pair_minted_earlier_in_the_batch_as_stored() {
+    let rig = Rig::new("fusiform-batch-repeat");
+    let store = rig.open();
+    let entry = |provider: &str, model: &str, context_window: f64| FusiformFactUpdate {
+        auth_methods: None,
+        provider_id: provider.to_string(),
+        model_id: model.to_string(),
+        present: true,
+        context_window: Some(context_window),
+        max_output_tokens: Some(4_096),
+        cost_tier: Some(1.0),
+        cost_per_mtok_out: Some(1.0),
+        input_rate: None,
+        cache_read_rate: None,
+        cache_write_rate: None,
+        reasoning_rate: None,
+        supports_vision: Some(false),
+        supports_tool_use: Some(true),
+        reasoning_efforts: None,
+        canonical_id: None,
+        upstream_status: None,
+    };
+    let before = store.get_catalog_facts().unwrap().len();
+
+    store
+        .apply_fusiform_catalog_for_providers(
+            &[
+                entry("mapped-provider", "model-a", 1_000.0),
+                entry("mapped-provider", "model-a", 2_000.0),
+                entry("mapped-provider", "model-b", 3_000.0),
+                entry("anthropic", "claude-batch-repeat", 4_000.0),
+                entry("anthropic", "claude-batch-repeat", 5_000.0),
+                entry("unmapped-provider", "model-c", 6_000.0),
+            ],
+            FusiformCatalogCursor {
+                catalog_version: 11,
+                resolved_at_ms: 1_100,
+            },
+            &std::collections::HashSet::from(["mapped-provider".to_string()]),
+        )
+        .unwrap();
+
+    let rows = store.get_catalog_facts().unwrap();
+    assert_eq!(rows.len(), before + 3, "three distinct pairs are minted");
+    let context = |provider: &str, model: &str| {
+        let matching = rows
+            .iter()
+            .filter(|row| row.fact.provider_id == provider && row.fact.model_id == model)
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{provider}/{model} has one row");
+        matching[0].fact.context_window
+    };
+    assert_eq!(context("mapped-provider", "model-a"), Some(2_000.0));
+    assert_eq!(context("mapped-provider", "model-b"), Some(3_000.0));
+    assert_eq!(context("anthropic", "claude-batch-repeat"), Some(5_000.0));
+    assert!(!rows
+        .iter()
+        .any(|row| row.fact.provider_id == "unmapped-provider"));
+}
+
 #[test]
 fn fusiform_cursor_is_committed_with_the_applied_snapshot() {
     let rig = Rig::new("fusiform-cursor");

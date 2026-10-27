@@ -3,7 +3,7 @@ name = "prefrontal-routing-core"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Pure model-routing core for Alfonso: the saturating-adequacy quality gate + cost-primary objective scorer, the route-state types, and (next slice) the SQLite route-state store. Wire-agnostic: knows nothing about subc."
+description = "Pure model-routing core for Alfonso: the saturating-adequacy quality gate + cost-primary objective scorer, the model-facts and route-state types, quota, account and failure-backoff policy, and the RouteStateStore trait that prefrontal-routing-store implements over SQLite. Wire-agnostic and rusqlite-free: knows nothing about subc."
 
 [dependencies]
 serde = { workspace = true }
