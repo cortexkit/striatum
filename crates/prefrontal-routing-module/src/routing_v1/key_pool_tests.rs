@@ -52,7 +52,11 @@ fn model(route_key: &str, iq: u8) -> CatalogModel {
 /// The catalog's rows: the catalog provider's own, and the row the key pool
 /// borrows from `POOL_VENDOR`.
 fn catalog_models() -> Vec<CatalogModel> {
-    vec![model(PLAIN, 80), model(POOL_ROUTE, 40)]
+    vec![
+        // The key pool's route is the cheapest, so it would win the v1 order.
+        model(POOL_ROUTE, 80),
+        model(PLAIN, 80),
+    ]
 }
 
 /// One routing fact per catalog row, each with a billing plane.
@@ -141,7 +145,7 @@ fn harness() -> Arc<Harness> {
             view: "key-pool-listing".into(),
             credentials: vec![
                 key("apikey:catalog:main", &[BORROWED], &[BORROWED]),
-                key("apikey:pool:main", &[POOL], &[POOL_VENDOR]),
+                key("apikey:pool-vendor:main", &[POOL], &[POOL_VENDOR]),
             ],
             ..Default::default()
         },
