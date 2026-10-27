@@ -436,6 +436,11 @@ pub(super) async fn select(
             let Some(route) = RouteRef::parse_pin(entry) else {
                 continue;
             };
+            // A ladder entry on a key-pool provider can never be answered here:
+            // say so instead of falling through to a generic refusal.
+            if key_pool::is_pool_provider(&catalog_targets, &route.provider) {
+                return Err(key_pool_route_refusal());
+            }
             let subset = available
                 .iter()
                 .filter(|key| {
