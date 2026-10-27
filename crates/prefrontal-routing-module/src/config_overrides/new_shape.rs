@@ -1,6 +1,6 @@
 use super::*;
 use crate::config_policy::{
-    consumer_matches, is_slot, resolve_consumer_policy, ConsumerPolicy, EntityPolicy,
+    consumer_matches, is_slot, resolve_consumer_policy, slot_consumer, ConsumerPolicy, EntityPolicy,
 };
 
 impl ModelFactOverride {
@@ -243,55 +243,125 @@ impl LiveConfig {
     /// Explicit pins bypass `pin_only`, but never a provider/model `only_for`
     /// or `not_for` restriction.
     pub fn route_allowed(&self, consumer: &str, route: &str, pinned: bool) -> bool {
+        self.config.route_refusal(consumer, route, pinned).is_none()
+    }
+}
+
+impl RoutingConfigFile {
+    /// Why this config refuses `route` for `consumer`, naming the config rule
+    /// that refuses it, or `None` when the route is allowed. Explicit pins
+    /// bypass `pin_only`, but never a provider/model `only_for` or `not_for`
+    /// restriction, nor a provider's `models` list. The most specific
+    /// `models` entry that sets a rule replaces the provider's rule.
+    pub(super) fn route_refusal(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+    ) -> Option<String> {
         let provider = route.split('/').next().unwrap_or(route);
-        let mut rules = self
-            .config
-            .providers
-            .get(provider)
-            .map(|provider| provider.rules.clone())
-            .unwrap_or_default();
+        let provider_rules = self.providers.get(provider).map(|policy| &policy.rules);
+        let provider_source = |field: &str| format!("providers.{provider}.{field}");
+        let mut only_for = provider_rules
+            .and_then(|rules| rules.only_for.as_ref())
+            .map(|names| (provider_source("only_for"), names));
+        let mut not_for = provider_rules
+            .and_then(|rules| rules.not_for.as_ref())
+            .map(|names| (provider_source("not_for"), names));
+        let mut pin_only = provider_rules
+            .and_then(|rules| rules.pin_only)
+            .map(|value| (provider_source("pin_only"), value));
         let mut models: Vec<_> = self
-            .config
             .model_routing
             .models
             .iter()
             .filter(|(key, _)| route == key.as_str() || route.starts_with(&format!("{key}/")))
             .collect();
         models.sort_by_key(|(key, _)| key.len());
-        for (_, model) in models {
-            if model.rules.only_for.is_some() {
-                rules.only_for = model.rules.only_for.clone();
+        for (key, model) in models {
+            let model_source = |field: &str| format!("models[{key:?}].{field}");
+            if let Some(names) = &model.rules.only_for {
+                only_for = Some((model_source("only_for"), names));
             }
-            if model.rules.not_for.is_some() {
-                rules.not_for = model.rules.not_for.clone();
+            if let Some(names) = &model.rules.not_for {
+                not_for = Some((model_source("not_for"), names));
             }
-            if model.rules.pin_only.is_some() {
-                rules.pin_only = model.rules.pin_only;
+            if let Some(value) = model.rules.pin_only {
+                pin_only = Some((model_source("pin_only"), value));
             }
         }
-        rules
-            .only_for
-            .as_ref()
-            .is_none_or(|names| names.iter().any(|name| consumer_matches(name, consumer)))
-            && !rules
-                .not_for
-                .iter()
-                .flatten()
-                .any(|name| consumer_matches(name, consumer))
-            && (pinned || rules.pin_only != Some(true))
-            && self
-                .config
-                .providers
-                .get(provider)
-                .and_then(|provider| provider.models.as_ref())
-                .is_none_or(|models| {
-                    models.iter().any(|model| {
-                        route
-                            .strip_prefix(&format!("{provider}/"))
-                            .is_some_and(|tail| {
-                                tail == model || tail.starts_with(&format!("{model}/"))
-                            })
-                    })
-                })
+        if let Some((source, names)) = only_for {
+            if !names.iter().any(|name| consumer_matches(name, consumer)) {
+                return Some(format!("{source} {names:?} does not name {consumer:?}"));
+            }
+        }
+        if let Some((source, names)) = not_for {
+            if let Some(name) = names.iter().find(|name| consumer_matches(name, consumer)) {
+                return Some(format!("{source} lists {name:?}"));
+            }
+        }
+        if let Some((source, true)) = pin_only {
+            if !pinned {
+                return Some(format!("{source} admits the route only when pinned"));
+            }
+        }
+        let listed = self.providers.get(provider)?.models.as_ref()?;
+        let served = listed.iter().any(|model| {
+            route
+                .strip_prefix(&format!("{provider}/"))
+                .is_some_and(|tail| tail == model || tail.starts_with(&format!("{model}/")))
+        });
+        (!served).then(|| format!("providers.{provider}.models {listed:?} does not list the model"))
+    }
+
+    /// Refuse a config that pins a consumer to a route its own rules refuse
+    /// for that consumer. Routing applies a model or provider `only_for` /
+    /// `not_for` and a provider's `models` list even to explicit pins, so such
+    /// a pin could never be served: every request through it would fail at
+    /// runtime with "pinned route unavailable" while the config loaded
+    /// cleanly. Checked: each `consumers.<name>.pin` (a slot pin under the
+    /// consumer its callers request it with, see [`slot_consumer`]) and each
+    /// `consumers.<name>.projects.<project>.pin`.
+    pub(super) fn validate_consumer_pins(&self) -> Result<(), String> {
+        let refuse = |path: &str, consumer: &str, routes: &[String]| -> Result<(), String> {
+            for route in routes {
+                if let Some(rule) = self.route_refusal(consumer, route, true) {
+                    return Err(format!(
+                        "{path} pins {} but this config refuses route {route} for consumer {consumer:?}: {rule}",
+                        routes[0]
+                    ));
+                }
+            }
+            Ok(())
+        };
+        for (name, policy) in &self.consumers {
+            let consumer = slot_consumer(name).unwrap_or(name);
+            if let Some(pin) = &policy.pin {
+                let mut routes = vec![pin.model.clone()];
+                if let (Some((provider, model)), Some(variant)) =
+                    (pin.model.split_once('/'), pin.variant.as_deref())
+                {
+                    routes.push(make_route_key(provider, model, Some(variant)));
+                }
+                refuse(&format!("consumers.{name}.pin"), consumer, &routes)?;
+            }
+            for (project, project_policy) in &policy.projects {
+                let Some(route) =
+                    cortexkit_role_routing::select::RouteRef::parse_pin(&project_policy.pin)
+                else {
+                    continue;
+                };
+                let mut routes = vec![route.route_key()];
+                if let Some(variant) = route.variant.as_deref() {
+                    routes.push(make_route_key(&route.provider, &route.model, Some(variant)));
+                }
+                refuse(
+                    &format!("consumers.{name}.projects.{project}.pin"),
+                    name,
+                    &routes,
+                )?;
+            }
+        }
+        Ok(())
     }
 }

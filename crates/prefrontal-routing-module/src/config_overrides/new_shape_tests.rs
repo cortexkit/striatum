@@ -225,3 +225,44 @@ fn conversion_keeps_other_consumers_provider_restrictions_on_model_exceptions() 
     assert!(!config.route_allowed("sidekick", "q/sidekick-only", false));
     assert!(config.route_allowed("mason", "q/sidekick-only", false));
 }
+
+#[test]
+fn consumer_pins_load_when_the_config_does_not_refuse_them_for_their_consumer() {
+    // The pinned model is refused for sidekick only, so the athena and lab
+    // pins stay servable and the config loads.
+    let config = config(json!({
+        "consumers": {
+            "synthesizer": {"pin": {"model": "anthropic/claude-opus-5-5", "variant": "medium"}},
+            "lab_planner": {"pin": {"model": "anthropic/claude-opus-5-5"}},
+            "spec_designer": {"pin": {"model": "anthropic/claude-opus-5-5"}},
+            "mason": {"projects": {"proj": {"pin": "anthropic/claude-opus-5-5:high"}}}
+        },
+        "models": {"anthropic/claude-opus-5-5": {"not_for": ["sidekick"], "pin_only": true}}
+    }));
+    assert_eq!(
+        config.slot_pin("synthesizer").unwrap().model,
+        "anthropic/claude-opus-5-5"
+    );
+    assert!(!config.route_allowed("sidekick", "anthropic/claude-opus-5-5", true));
+}
+
+#[test]
+fn config_convert_refuses_a_pin_the_converted_exclusions_would_refuse() {
+    // An old-shape exclusion becomes a `not_for`, which also refuses explicit
+    // pins, so the converted config must not load with the synthesizer pinned
+    // to a route the athena exclusion names.
+    let converted = crate::config_convert::convert(
+        r#"{"model_routing": {
+            "exclude": {"athena": ["anthropic/claude-opus-5-5"]},
+            "pins": {"synthesizer": {"model": "anthropic/claude-opus-5-5"}}
+        }}"#,
+    )
+    .unwrap();
+    let error = validate_document(&converted).unwrap_err();
+    assert!(
+        error.contains("consumers.synthesizer.pin")
+            && error.contains("anthropic/claude-opus-5-5")
+            && error.contains(r#"not_for lists "athena""#),
+        "{error}"
+    );
+}

@@ -487,6 +487,7 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
             return Err(format!("invalid cost/speed override for {key}"));
         }
     }
+    config.validate_consumer_pins()?;
     Ok(())
 }
 

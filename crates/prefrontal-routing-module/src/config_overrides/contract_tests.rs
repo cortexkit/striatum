@@ -150,6 +150,32 @@ refusal_case!(
     r#"{"providers":{"p":{"not_for":true}}}"#,
     "invalid type"
 );
+// A pin the config's own rules refuse for the consumer the pin serves could
+// never be served: routing applies `not_for` to explicit pins too.
+refusal_case!(
+    synthesizer_pin_refused_by_model_not_for,
+    r#"{"consumers":{"synthesizer":{"pin":{"model":"anthropic/claude-opus-5-5","variant":"medium"}}},
+        "models":{"anthropic/claude-opus-5-5":{"not_for":["athena","lab"]}}}"#,
+    r#"consumers.synthesizer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "athena": models["anthropic/claude-opus-5-5"].not_for lists "athena""#
+);
+refusal_case!(
+    lab_planner_pin_refused_by_provider_not_for,
+    r#"{"consumers":{"lab_planner":{"pin":{"model":"anthropic/claude-opus-5-5"}}},
+        "providers":{"anthropic":{"not_for":["lab"]}}}"#,
+    r#"consumers.lab_planner.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "lab": providers.anthropic.not_for lists "lab""#
+);
+refusal_case!(
+    spec_designer_pin_refused_by_provider_models_list,
+    r#"{"consumers":{"spec_designer":{"pin":{"model":"anthropic/claude-opus-5-5"}}},
+        "providers":{"anthropic":{"models":["claude-sonnet-5"]}}}"#,
+    r#"consumers.spec_designer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "athena": providers.anthropic.models ["claude-sonnet-5"] does not list the model"#
+);
+refusal_case!(
+    project_pin_refused_by_model_only_for,
+    r#"{"consumers":{"mason":{"projects":{"proj":{"pin":"p/m:high"}}}},
+        "models":{"p/m":{"only_for":["sidekick"]}}}"#,
+    r#"consumers.mason.projects.proj.pin pins p/m but this config refuses route p/m for consumer "mason": models["p/m"].only_for ["sidekick"] does not name "mason""#
+);
 refusal_case!(
     removed_aa,
     r#"{"aa":{"api_key":"never-read"},"unknown":true}"#,

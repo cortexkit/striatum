@@ -563,7 +563,19 @@ pub struct ConsumerPolicy {
 }
 
 pub fn is_slot(name: &str) -> bool {
-    matches!(name, "synthesizer" | "lab_planner" | "spec_designer")
+    slot_consumer(name).is_some()
+}
+
+/// The `route.select` consumer a pin slot is requested under, so the slot's
+/// pin is judged by that consumer's `only_for` / `not_for` rules. Core asks for
+/// the synthesizer pin and the Spec Campaigns designer's `spec_designer` slot as
+/// consumer `athena`, and for the `lab_planner` slot as consumer `lab`.
+pub fn slot_consumer(slot: &str) -> Option<&'static str> {
+    match slot {
+        "synthesizer" | "spec_designer" => Some("athena"),
+        "lab_planner" => Some("lab"),
+        _ => None,
+    }
 }
 
 /// Resolve each key independently, exhausting operator ancestors before looking
