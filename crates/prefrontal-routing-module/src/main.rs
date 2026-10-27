@@ -7858,10 +7858,9 @@ pub(crate) fn manifest(module_id: &str) -> ModuleManifest {
         //
         // It provides `flow-scopes/v1` so flows can call `diagnostics.findings`:
         // the daemon binds a flow-scoped route only to a module declaring it,
-        // and Basal refuses at install a flow manifest naming an op on any
-        // other module. The declaration is module-wide, so routing itself
-        // refuses every op outside `diagnostics_findings::FLOW_SCOPE_OPS` on
-        // a flow-scoped route (see `diagnostics_findings::flow_route_refusal`).
+        // and Basal checks the declared flow operations at install. Routing
+        // also refuses every op outside the same allowlist on a flow-scoped
+        // route (see `diagnostics_findings::flow_route_refusal`).
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
             provides: vec![
                 routing_v1::PROVIDES.to_string(),
@@ -7871,6 +7870,12 @@ pub(crate) fn manifest(module_id: &str) -> ModuleManifest {
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
+        .flow_operations(Some(
+            diagnostics_findings::FLOW_SCOPE_OPS
+                .iter()
+                .map(|operation| (*operation).to_owned())
+                .collect(),
+        ))
         .provides(vec![ProviderRole::ManagementSurface {
             // Deliberate lane, not a default: routing serves concurrent
             // selection reads; Serial would put every route decision in

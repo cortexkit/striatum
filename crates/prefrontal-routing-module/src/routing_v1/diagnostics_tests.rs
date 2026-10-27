@@ -201,6 +201,24 @@ fn the_manifest_declares_flow_scope_support() {
         "{provides:?}"
     );
     assert_eq!(crate::diagnostics_findings::FLOW_SCOPE_OPS, [OP]);
+    let flow_operations = manifest
+        .flow_operations
+        .as_ref()
+        .expect("routing must declare its flow operations");
+    assert_eq!(
+        flow_operations.as_slice(),
+        crate::diagnostics_findings::FLOW_SCOPE_OPS
+    );
+    for name in flow_operations {
+        assert!(
+            manifest.provides.iter().any(|role| matches!(
+                role,
+                subc_protocol::manifest::ProviderRole::ManagementSurface { operations, .. }
+                    if operations.iter().any(|operation| &operation.name == name)
+            )),
+            "flow operation {name} must be a manifest management operation"
+        );
+    }
     assert!(crate::served_operations().iter().any(|operation| {
         operation.name == OP
             && operation.kind == subc_protocol::manifest::ManagementOperationKind::Query
