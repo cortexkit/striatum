@@ -24,6 +24,7 @@ mod config_convert;
 mod config_overrides;
 mod config_policy;
 mod credential_fences;
+mod diagnostics_findings;
 mod engram_catalog;
 mod fusiform_catalog;
 mod key_pool;
@@ -1498,6 +1499,23 @@ async fn handle_frame(
                     route_epoch,
                     corr,
                     |reply| async move {
+                        // A flow-scoped route reaches only the ops in
+                        // diagnostics_findings::FLOW_SCOPE_OPS.
+                        if let Some(refusal) = diagnostics_findings::flow_route_refusal(
+                            &frame.body,
+                            channel,
+                            route_epoch,
+                        ) {
+                            return send_route_error_body(
+                                &reply,
+                                ver,
+                                channel,
+                                route_epoch,
+                                corr,
+                                refusal,
+                            )
+                            .await;
+                        }
                         // Both wire shapes are answered by one selection pass.
                         // claims() only chooses which request body that pass reads.
                         if routing_v1::claims(&frame.body) {
@@ -1665,6 +1683,8 @@ async fn handle_control_request(
                             scope_epoch: stamp.scope_epoch,
                             project_id: stamp.project_id.clone(),
                             owner_authorized: stamp.owner_authorized,
+                            flow_id: stamp.attributes.flow_id.clone(),
+                            run_id: stamp.attributes.run_id.clone(),
                         }),
                     ),
                 );
@@ -3838,6 +3858,9 @@ async fn handle_select_request(
     }
     if envelope.method == ROUTE_DECISIONS_LIST_OP {
         return handle_route_decisions_list(frame, writer, store).await;
+    }
+    if envelope.method == diagnostics_findings::OP {
+        return diagnostics_findings::handle(frame, writer, store).await;
     }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
         return handle_resolve_policy(frame, writer, operator_config_path).await;
@@ -7549,6 +7572,7 @@ pub(crate) fn handles(method: &str) -> bool {
             | ROUTE_COOLDOWN_STATUS_OP
             | ROUTE_EXPLAIN_OP
             | ROUTE_DECISIONS_LIST_OP
+            | diagnostics_findings::OP
             | QUOTA_STATUS_OP
             | ROUTE_ACCOUNT_QUOTA_STATUS_OP
             | account_selection::ACCOUNT_FOR_OP
@@ -7703,6 +7727,14 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
             description: None,
         },
         ManagementOperation {
+            name: diagnostics_findings::OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Routing self-diagnosis: credential fences, route and account blocks, refusal-heavy consumers and one-model candidate sets (head routes and flow scopes only)"
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
             name: QUOTA_STATUS_OP.to_string(),
             kind: ManagementOperationKind::Query,
             description: None,
@@ -7798,8 +7830,8 @@ fn print_manifest_operations() -> Result<(), ModuleError> {
 /// schema and is the sole writer for its provider and route cooldown state.
 pub(crate) fn manifest(module_id: &str) -> ModuleManifest {
     // `ModuleManifest` is `#[non_exhaustive]`, so this module constructs it
-    // with the builder. It provides the routing/v1 and scope-workdir
-    // capabilities and requires none.
+    // with the builder. It provides the routing/v1, scope-workdir and
+    // flow-scopes capabilities and requires none.
     // Build provenance comes from the module's build script.
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
         .trust_tier(Some(TrustTier::FirstParty))
@@ -7823,10 +7855,18 @@ pub(crate) fn manifest(module_id: &str) -> ModuleManifest {
         // the Entorhinal project id, recorded on every decision the route's
         // caller selects. Without the declaration the daemon strips both and a
         // scoped select records no project.
+        //
+        // It provides `flow-scopes/v1` so flows can call `diagnostics.findings`:
+        // the daemon binds a flow-scoped route only to a module declaring it,
+        // and Basal refuses at install a flow manifest naming an op on any
+        // other module. The declaration is module-wide, so routing itself
+        // refuses every op outside `diagnostics_findings::FLOW_SCOPE_OPS` on
+        // a flow-scoped route (see `diagnostics_findings::flow_route_refusal`).
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
             provides: vec![
                 routing_v1::PROVIDES.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),

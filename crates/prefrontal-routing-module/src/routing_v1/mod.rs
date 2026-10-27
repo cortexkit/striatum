@@ -40,6 +40,8 @@ mod conformance_tests;
 #[cfg(test)]
 mod consumers_tests;
 #[cfg(test)]
+mod diagnostics_tests;
+#[cfg(test)]
 mod dispatch_tests;
 #[cfg(test)]
 mod metered_tests;
@@ -124,6 +126,11 @@ pub(crate) struct ScopeAuthority {
     pub scope_epoch: u64,
     pub project_id: Option<String>,
     pub owner_authorized: bool,
+    /// The flow the scope belongs to, when the daemon stamped one: the route
+    /// carries a flow step, never its owner agent.
+    pub flow_id: Option<String>,
+    /// The agent run the scope belongs to, when the daemon stamped one.
+    pub run_id: Option<String>,
 }
 
 impl Caller {
@@ -136,7 +143,7 @@ impl Caller {
         }
     }
 
-    fn binding_is_current(&self) -> bool {
+    pub(crate) fn binding_is_current(&self) -> bool {
         self.binding.is_some_and(|(channel, epoch)| {
             // A missing route and a real unattested caller share a principal
             // label, so require a stored binding with the matching epoch.
