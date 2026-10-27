@@ -116,6 +116,7 @@ async fn start_both_modules_daemon() -> RealDaemon {
         serde_json::to_vec_pretty(&subc_jsonc).unwrap(),
     )
     .unwrap();
+    crate::real_daemon_e2e::write_operator_routing_config(&routing_module, &config_dir);
 
     let child = subc_core
         .command(&rig)

@@ -437,6 +437,48 @@ async fn the_answer_carries_route_runner_variant_limits_decision_and_expiry() {
     );
 }
 
+/// A mason's reasoning variant comes from the consumer's `variants` config on
+/// both wire shapes. Core moves unpinned masons from the older select to the
+/// v1 one, so a v1 answer that dropped the variant would launch every such
+/// mason at the route's default effort instead of the configured one.
+#[tokio::test]
+async fn a_v1_mason_runs_the_consumer_variant_the_older_select_chose() {
+    let harness = harness(&[(CHEAP, true, true, 200_000)]);
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["variants"] = json!({ CHEAP: "xhigh" });
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let v1 = route.call("route.select", &select("mason")).await;
+    assert_eq!(route_of(&v1), CHEAP);
+    let result = &v1.1["result"];
+    assert_eq!(result["route"]["variant"], "xhigh", "{result}");
+    // Core builds the Broca launch target from the runner's model.
+    assert_eq!(result["runner"]["model"]["variant"], "xhigh", "{result}");
+    assert_eq!(
+        harness
+            .store()
+            .v1_decision(result["decision_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("xhigh")
+    );
+
+    let mut legacy = select("mason");
+    legacy["targetAgent"] = json!("mason");
+    legacy["executor"] = json!("broca");
+    legacy["substrate"] = json!("broca");
+    legacy["requirements"]["eq"] = json!(0);
+    let older = route.call("route.select", &legacy).await;
+    assert_eq!(legacy_route(&older), CHEAP);
+    assert_eq!(
+        older.1["result"]["selected"]["promptParams"]["variant"], "xhigh",
+        "{}",
+        older.1
+    );
+}
+
 #[tokio::test]
 async fn legacy_provider_reset_leaves_both_select_wires_and_pins_selectable() {
     let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);

@@ -46,6 +46,38 @@ pub async fn serve_routing_fixtures(connection_file: &std::path::Path) -> Routin
     }
 }
 
+/// Write the routing config an operator runs with into `config_dir` (the
+/// rig's `$XDG_CONFIG_HOME/cortexkit`, where routing reads
+/// `prefrontal-routing.jsonc`).
+///
+/// Routing has no built-in runners or consumers: without this file it knows
+/// no runner to start a route on, so every executor selection answers
+/// `no_available_model`, and a routing/v1 select for a consumer no module
+/// declares answers `unknown_consumer`. The file is produced the way an
+/// operator produces theirs, by the module's own `config-convert` command on
+/// an empty older document, so it carries the converter's defaults: the
+/// `broca` runner through the vault and the standard consumer names.
+pub fn write_operator_routing_config(routing_bin: &std::path::Path, config_dir: &std::path::Path) {
+    std::fs::create_dir_all(config_dir).unwrap();
+    let input = config_dir.join("prefrontal-routing.legacy.json");
+    std::fs::write(&input, r#"{"model_routing": {}}"#).unwrap();
+    let output = config_dir.join("prefrontal-routing.jsonc");
+    // The converter reads and writes only the two files it is given.
+    let status = std::process::Command::new(routing_bin)
+        .env_clear()
+        .arg("config-convert")
+        .arg(&input)
+        .arg(&output)
+        .status()
+        .expect("run the routing config converter");
+    assert!(status.success(), "config-convert failed: {status}");
+    std::fs::remove_file(&input).unwrap();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+    assert_eq!(written["runners"][0]["module"], "broca", "{written}");
+    assert!(written["consumers"].get("mason").is_some(), "{written}");
+}
+
 /// Whether routing's `supervisor.health_probe` answer says both stand-ins
 /// were reached: routing is ready to select.
 pub fn routing_health_reached_fixtures(health: &serde_json::Value) -> bool {

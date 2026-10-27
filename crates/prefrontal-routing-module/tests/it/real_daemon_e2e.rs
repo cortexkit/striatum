@@ -42,7 +42,7 @@ struct RealDaemon {
 mod daemon_fixtures;
 
 use daemon_fixtures::FusiformCatalog;
-pub(crate) use daemon_fixtures::RoutingFixtures;
+pub(crate) use daemon_fixtures::{write_operator_routing_config, RoutingFixtures};
 
 #[test]
 fn fusiform_fixture_serves_pinned_first_page_and_terminal_continuation() {
@@ -132,6 +132,7 @@ async fn start_real_daemon() -> RealDaemon {
         serde_json::to_vec_pretty(&subc_jsonc).unwrap(),
     )
     .unwrap();
+    write_operator_routing_config(&module_bin, &config_dir);
 
     let child = subc_core
         .command(&rig)
