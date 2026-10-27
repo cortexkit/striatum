@@ -81,6 +81,18 @@ fn routing_facts() -> Vec<ModelFact> {
                 .collect(),
             });
             fact.auth_methods = Some(vec!["apikey".into()]);
+            // The key pool's route is the cheaper of the two, so cost alone
+            // would choose it wherever nothing stops it.
+            if fact.model_id.ends_with("model-pool") {
+                fact.cost_tier = Some(0.5);
+                fact.cost_per_m_tok_out = Some(0.5);
+                if let Some(plane) = fact.billing_plane.as_mut() {
+                    plane.rates.insert(
+                        "rate.output".to_owned(),
+                        BillingRate::Priced { rate: 0.5 },
+                    );
+                }
+            }
             fact
         })
         .collect()
