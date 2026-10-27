@@ -16788,13 +16788,9 @@ mod tests {
             "openai/fixture-dear"
         );
         params["concurrencySlots"] = json!([{"key":"openai/fixture-dear","running":1,"limit":1}]);
-        let fallback = run_select_against_rig(
-            &rig,
-            params,
-            &saturation_facts(),
-            &test_operator_config(),
-        )
-        .await;
+        let fallback =
+            run_select_against_rig(&rig, params, &saturation_facts(), &test_operator_config())
+                .await;
         let body: serde_json::Value = serde_json::from_slice(&fallback.body).unwrap();
         assert_eq!(
             body["result"]["selected"]["capacityKey"],
