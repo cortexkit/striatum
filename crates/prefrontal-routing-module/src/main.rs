@@ -1054,10 +1054,8 @@ async fn account_quota_dry_run(
         ..Default::default()
     };
     let received_at_ms = now_ms() as i64;
-    if let Some(dir) = &capture_dir {
-        std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(dir.join("usage-get-all.json"), &body))
-            .map_err(|error| ModuleError::Message(format!("capture usage: {error}")))?;
+    if let Some(dir) = capture_dir {
+        capture_account_quota_reply(dir, body.clone()).await?;
     }
     account_quota::apply_usage_reply(&mut state, &body, received_at_ms)
         .map_err(ModuleError::Message)?;
@@ -1067,6 +1065,17 @@ async fn account_quota_dry_run(
         serde_json::to_string_pretty(&status).map_err(ModuleError::Json)?
     );
     Ok(())
+}
+
+async fn capture_account_quota_reply(dir: PathBuf, body: Vec<u8>) -> Result<(), ModuleError> {
+    // Use the route-handler bridge so filesystem waits cannot stall an async
+    // worker, including when the caller uses a current-thread runtime.
+    run_route_handler_off_async_workers(async move {
+        std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(dir.join("usage-get-all.json"), &body))
+            .map_err(|error| ModuleError::Message(format!("capture usage: {error}")))
+    })
+    .await
 }
 
 struct ModuleConfig {
@@ -8132,6 +8141,61 @@ mod tests {
     use prefrontal_routing_core::{FactSource, NativeUsageFacts, UsageObservation};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn account_quota_capture_keeps_current_thread_worker_free() {
+        let scratch = prefrontal_test_support::ScratchDir::new("routing-quota-capture-blocked");
+        let path = scratch.join("usage-get-all.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        let body = b"{ \"providers\": [] }\n\0unfiltered bytes".to_vec();
+
+        // The writer is polled first and cannot open the FIFO until the sibling
+        // future runs on the same async worker and starts a blocking reader.
+        let (captured, saved) = tokio::join!(
+            biased;
+            capture_account_quota_reply(scratch.path().to_path_buf(), body.clone()),
+            async {
+                tokio::task::spawn_blocking(move || std::fs::read(path))
+                    .await.unwrap().unwrap()
+            },
+        );
+        captured.unwrap();
+        assert_eq!(saved, body);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn account_quota_capture_preserves_bytes_and_io_errors() {
+        let scratch = prefrontal_test_support::ScratchDir::new("routing-quota-capture-bytes");
+        let directory = scratch.join("capture");
+        let path = directory.join("usage-get-all.json");
+        let body = b"{ \"providers\": [] }\n\0unfiltered bytes".to_vec();
+        capture_account_quota_reply(directory.clone(), body.clone())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let expected = std::fs::write(&path, &body).unwrap_err().to_string();
+        let error = capture_account_quota_reply(directory, body.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), format!("capture usage: {expected}"));
+
+        let not_directory = scratch.join("file");
+        std::fs::write(&not_directory, b"file").unwrap();
+        let expected = std::fs::create_dir_all(&not_directory)
+            .unwrap_err()
+            .to_string();
+        let error = capture_account_quota_reply(not_directory, body)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), format!("capture usage: {expected}"));
+    }
 
     #[test]
     fn config_check_uses_startup_loader_and_refuses_renamed_or_unknown_config() {
