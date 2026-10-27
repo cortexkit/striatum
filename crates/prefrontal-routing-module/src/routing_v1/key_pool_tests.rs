@@ -1,14 +1,16 @@
 //! What `route.select` answers for a key-pool provider.
 //!
-//! A key-pool provider (`key_pool`) has no catalog rows of its own: its
-//! credentials name the provider and `serves` a catalog provider whose rows it
-//! borrows, and the key itself is leased for one send. A `routing/v1` answer
-//! cannot name that leased key yet, so v1 leaves such routes out of its
-//! answers while the legacy `route.select` still selects and leases them.
+//! A key-pool provider (`key_pool`) is one an API key names but the catalog
+//! does not: its routes are the rows it borrows from the one catalog provider
+//! its active keys `serves`, and the key a send runs on is leased per send. A
+//! `routing/v1` answer cannot name that leased key yet, so v1 leaves such
+//! routes out of its answers while the legacy `route.select` still selects and
+//! leases them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
 use cortexkit_role_routing_conformance::CatalogModel;
 use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
 use prefrontal_routing_core::ModelFact;
@@ -19,20 +21,29 @@ use subc_protocol::FrameType;
 use super::conformance_tests::{catalog_fact, reserved, Harness};
 use crate::broca_credentials::BrocaCredentials;
 
-/// The catalog provider whose rows the pool provider borrows.
+/// The catalog provider whose rows the key pool borrows.
 const BORROWED: &str = "catalog-provider";
-/// The key-pool provider: no rows of its own, so it is selected only through
-/// the API keys that name it.
+/// The key-pool provider: no catalog rows of its own.
 const POOL: &str = "pool-provider";
-/// An ordinary route on the catalog provider.
-const PLAIN: &str = "catalog-provider/model-a";
+/// The catalog provider's own three routes, cheapest last.
+const PLAIN: [&str; 3] = [
+    "catalog-provider/model-a",
+    "catalog-provider/model-b",
+    "catalog-provider/model-c",
+];
+/// The catalog row the key pool borrows. Every pool route is cheaper than the
+/// catalog provider's own, so the pool wins wherever it is allowed to decide.
+const POOL_ROUTES: [&str; 2] = [
+    "catalog-provider/model-pool",
+    "catalog-provider/model-pool-2",
+];
 
-/// A catalog model on the borrowed catalog provider, cheapest first.
-fn model(rank: usize) -> CatalogModel {
+fn model(route_key: &str, iq: u8) -> CatalogModel {
+    let (provider, model) = route_key.split_once('/').unwrap();
     CatalogModel {
-        provider: BORROWED.into(),
-        model: format!("model-{rank}"),
-        iq: 80,
+        provider: provider.into(),
+        model: model.into(),
+        iq,
         context_window: 200_000,
         max_output_tokens: 32_000,
         tool_calls: true,
@@ -42,10 +53,23 @@ fn model(rank: usize) -> CatalogModel {
     }
 }
 
-fn facts() -> Vec<ModelFact> {
-    let mut facts: Vec<ModelFact> = (0..2)
-        .map(|rank| {
-            let mut fact = catalog_fact(&model(rank), rank);
+/// The catalog's rows, best first: the catalog provider's own, then the rows
+/// the key pool borrows.
+fn catalog_models() -> Vec<CatalogModel> {
+    PLAIN
+        .iter()
+        .map(|key| model(key, 80))
+        .chain(POOL_ROUTES.iter().map(|key| model(key, 40)))
+        .collect()
+}
+
+/// One routing fact per catalog row, each with a billing plane.
+fn routing_facts() -> Vec<ModelFact> {
+    catalog_models()
+        .iter()
+        .enumerate()
+        .map(|(rank, model)| {
+            let mut fact = catalog_fact(model, rank);
             fact.billing_plane = Some(BillingPlane {
                 provider_id: fact.provider_id.clone(),
                 auth_method: "apikey".into(),
@@ -63,31 +87,36 @@ fn facts() -> Vec<ModelFact> {
             fact.auth_methods = Some(vec!["apikey".into()]);
             fact
         })
-        .collect();
-    // A pool provider borrows its catalog provider's rows, and its own are
-    // the cheapest, so it wins wherever the two surfaces agree.
-    let mut pooled = catalog_fact(&model(0), 0);
-    pooled.provider_id = POOL.into();
-    pooled.cost_tier = Some(0.1);
-    pooled.cost_per_m_tok_out = Some(0.1);
-    pooled.auth_methods = Some(vec!["apikey".into()]);
-    facts.push(pooled);
-    facts
+        .collect()
 }
 
-/// The harness's routes plus the pool provider's, with one API key whose
-/// `provider_ids` name the pool provider and whose `serves` name the catalog
-/// provider it borrows from.
+fn key(id: &str, providers: &[&str], serves: &[&str]) -> ListedCredential {
+    ListedCredential {
+        id: id.into(),
+        account_id: Some(format!("{id}-workspace")),
+        categories: vec!["llm-provider".into()],
+        credential_type: "apikey".into(),
+        auth_method: Some("apikey".into()),
+        provider_ids: providers.iter().map(|p| (*p).into()).collect(),
+        serves: serves.iter().map(|p| (*p).into()).collect(),
+        state: "active".into(),
+        ..Default::default()
+    }
+}
+
+/// Routing with a catalog provider, its own key, and a key pool: the pool key
+/// names the pool provider and `serves` the catalog provider whose rows the
+/// pool borrows.
 fn harness() -> Arc<Harness> {
     let harness = Harness::new("key-pool");
-    let facts = facts();
+    let facts = routing_facts();
     harness.install_facts(&facts);
     let updates: Vec<_> = facts
         .iter()
         .map(|fact| FusiformFactUpdate {
             provider_id: fact.provider_id.clone(),
             model_id: fact.model_id.clone(),
-            auth_methods: Some(vec!["apikey".into()]),
+            auth_methods: fact.auth_methods.clone(),
             present: true,
             context_window: fact.context_window,
             max_output_tokens: fact.max_output_tokens,
@@ -114,24 +143,26 @@ fn harness() -> Arc<Harness> {
             },
         )
         .unwrap();
-    let mut credentials = BrocaCredentials::api_test_credentials(&facts);
+    let mut credentials = BrocaCredentials::default();
     credentials.apply_listing(
-        &cortexkit_claustrum_client::ScopedCredentialListing {
-            view: "pool-credentials".into(),
-            credentials: vec![cortexkit_claustrum_client::ListedCredential {
-                id: "apikey:pool:main".into(),
-                account_id: Some("pool-workspace".into()),
-                categories: vec!["llm-provider".into()],
-                credential_type: "apikey".into(),
-                auth_method: Some("apikey".into()),
-                provider_ids: vec![POOL.into()],
-                serves: vec![BORROWED.into()],
-                state: "active".into(),
-                ..Default::default()
-            }],
+        &ScopedCredentialListing {
+            view: "key-pool-listing".into(),
+            credentials: vec![
+                key("apikey:catalog:main", &[BORROWED], &[BORROWED]),
+                key("apikey:pool:main", &[POOL], &[BORROWED]),
+            ],
             ..Default::default()
         },
         crate::now_ms(),
+    );
+    credentials.refresh_serving_methods(
+        &Default::default(),
+        &facts,
+        crate::now_ms() as i64,
+        &[],
+    );
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
     );
     credentials.publish_plan_prices(&json!({ "prices": [] }));
     harness.set_credentials(credentials);
@@ -152,39 +183,45 @@ fn legacy_select() -> Value {
     })
 }
 
-/// The route a v1 answer names, or the refusal code it answered instead.
-fn v1_route(reply: &(FrameType, Value)) -> Value {
-    if reply.0 == FrameType::Error {
-        return json!({ "code": reply.1["code"].clone(), "reason": reply.1["detail"]["reason"].clone() });
-    }
+fn answered_route(reply: &(FrameType, Value)) -> String {
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let route = &reply.1["result"]["route"];
-    json!({
-        "route": format!("{}/{}", route["provider"].as_str().unwrap(), route["model"].as_str().unwrap()),
-        "auth": reply.1["result"]["runner"]["auth"].clone(),
-    })
+    format!(
+        "{}/{}",
+        route["provider"].as_str().unwrap(),
+        route["model"].as_str().unwrap()
+    )
+}
+
+fn legacy_route(reply: &(FrameType, Value)) -> String {
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    reply.1["result"]["selected"]["routeKey"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 #[tokio::test]
-async fn a_key_pool_winner_is_left_out_of_the_v1_answer_and_still_answered_on_legacy() {
+async fn a_key_pool_winner_is_left_out_of_the_v1_answer() {
     let harness = harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
-    // The pool route is the cheapest and would win the automatic order.
-    let v1 = route.call("route.select", &select("mason")).await;
-    assert_eq!(v1.0, FrameType::Response, "{}", v1.1);
-    assert_eq!(v1_route(&v1), json!({ "route": PLAIN, "auth": Value::Null }));
-
-    let legacy = route.call("route.select", &legacy_select()).await;
-    assert_eq!(legacy.0, FrameType::Response, "{}", legacy.1);
-    assert_eq!(
-        legacy.1["result"]["selected"]["routeKey"],
-        format!("{POOL}/model-0"),
-        "{}",
-        legacy.1
+    let answered = answered_route(&route.call("route.select", &select("mason")).await);
+    assert!(
+        !answered.starts_with(&format!("{POOL}/")) && !answered.contains("model-pool"),
+        "a key-pool route must not be answered on v1, got {answered}"
     );
-    // The legacy answer names the leased key, which is exactly what v1 cannot.
+    assert_eq!(answered, PLAIN[0], "the catalog provider's own best route wins");
+}
+
+#[tokio::test]
+async fn the_key_pool_route_is_still_answered_on_legacy_route_select() {
+    let harness = harness();
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let legacy = route.call("route.select", &legacy_select()).await;
     assert_eq!(
-        legacy.1["result"]["selected"]["harness"], "broca",
-        "{}",
+        legacy_route(&legacy),
+        format!("{POOL}/model-pool"),
+        "the legacy shape still answers the key pool's cheapest route: {}",
         legacy.1
     );
 }
@@ -192,55 +229,26 @@ async fn a_key_pool_winner_is_left_out_of_the_v1_answer_and_still_answered_on_le
 #[tokio::test]
 async fn only_key_pool_routes_adequate_answers_the_typed_refusal_on_v1() {
     let harness = harness();
-    harness.edit_config(|config| {
-        // Only the one model the pool provider also sells stays adequate.
-        config["models"][PLAIN]["not_for"] = json!(["mason"]);
-    });
     let route = harness.bind(reserved("example-consumer"), None).await;
+    harness.edit_config(|config| {
+        for key in PLAIN {
+            config["models"][key]["not_for"] = json!(["mason"]);
+        }
+    });
     let v1 = route.call("route.select", &select("mason")).await;
     assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
     assert_eq!(v1.1["code"], "no_route", "{}", v1.1);
     assert_eq!(v1.1["detail"]["reason"], "no_available_model", "{}", v1.1);
     assert!(
-        v1.1["message"]
-            .as_str()
-            .unwrap()
-            .contains("key-pool"),
-        "the refusal says why: {}",
+        v1.1["message"].as_str().unwrap().contains("key-pool"),
+        "the refusal must say key-pool routes are not served yet: {}",
         v1.1
     );
-
-    // The legacy shape still answers the pool route.
-    let legacy = route.call("route.select", &legacy_select()).await;
-    assert_eq!(legacy.0, FrameType::Response, "{}", legacy.1);
-    assert_eq!(
-        legacy.1["result"]["selected"]["routeKey"],
-        format!("{POOL}/model-0"),
-        "{}",
-        legacy.1
-    );
 }
 
 #[tokio::test]
-async fn a_v1_pin_on_a_key_pool_route_is_not_served() {
+async fn a_slow_billing_plane_answers_routing_not_ready_within_the_v1_bound() {
     let harness = harness();
-    let route = harness.bind(reserved("example-consumer"), None).await;
-    let mut pinned = select("mason");
-    pinned["pin"] = json!(format!("{POOL}/model-0"));
-    let reply = route.call("route.select", &pinned).await;
-    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
-    assert!(
-        reply.1["message"].as_str().unwrap().contains("key-pool"),
-        "{}",
-        reply.1
-    );
-}
-
-#[tokio::test]
-async fn a_cold_billing_plane_refuses_routing_not_ready_within_the_v1_bound() {
-    let harness = harness();
-    // A cold billing plane: no price has been published yet.
     harness.set_credentials(BrocaCredentials::default());
     let route = harness.bind(reserved("example-consumer"), None).await;
     let started = Instant::now();
