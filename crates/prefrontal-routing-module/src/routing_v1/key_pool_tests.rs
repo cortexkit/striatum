@@ -25,18 +25,14 @@ use crate::broca_credentials::BrocaCredentials;
 const BORROWED: &str = "catalog-provider";
 /// The key-pool provider: no catalog rows of its own.
 const POOL: &str = "pool-provider";
-/// The catalog provider's own three routes, cheapest last.
-const PLAIN: [&str; 3] = [
-    "catalog-provider/model-a",
-    "catalog-provider/model-b",
-    "catalog-provider/model-c",
-];
-/// The catalog row the key pool borrows. Every pool route is cheaper than the
-/// catalog provider's own, so the pool wins wherever it is allowed to decide.
-const POOL_ROUTES: [&str; 2] = [
-    "catalog-provider/model-pool",
-    "catalog-provider/model-pool-2",
-];
+/// The catalog provider's own route.
+const PLAIN: &str = "catalog-provider/model-a";
+/// A second catalog provider that the key pool borrows from. It sells nothing
+/// of its own; every row it has comes from the pool key's `serves`.
+const POOL_VENDOR: &str = "pool-vendor";
+/// The one route `POOL_VENDOR` sells, which the key pool borrows and is the
+/// cheapest route of all.
+const POOL_ROUTE: &str = "pool-vendor/model-pool";
 
 fn model(route_key: &str, iq: u8) -> CatalogModel {
     let (provider, model) = route_key.split_once('/').unwrap();
@@ -53,14 +49,10 @@ fn model(route_key: &str, iq: u8) -> CatalogModel {
     }
 }
 
-/// The catalog's rows, best first: the catalog provider's own, then the rows
-/// the key pool borrows.
+/// The catalog's rows: the catalog provider's own, and the row the key pool
+/// borrows from `POOL_VENDOR`.
 fn catalog_models() -> Vec<CatalogModel> {
-    PLAIN
-        .iter()
-        .map(|key| model(key, 80))
-        .chain(POOL_ROUTES.iter().map(|key| model(key, 40)))
-        .collect()
+    vec![model(PLAIN, 80), model(POOL_ROUTE, 40)]
 }
 
 /// One routing fact per catalog row, each with a billing plane.
@@ -149,7 +141,7 @@ fn harness() -> Arc<Harness> {
             view: "key-pool-listing".into(),
             credentials: vec![
                 key("apikey:catalog:main", &[BORROWED], &[BORROWED]),
-                key("apikey:pool:main", &[POOL], &[BORROWED]),
+                key("apikey:pool:main", &[POOL], &[POOL_VENDOR]),
             ],
             ..Default::default()
         },
@@ -210,7 +202,7 @@ async fn a_key_pool_winner_is_left_out_of_the_v1_answer() {
         !answered.starts_with(&format!("{POOL}/")) && !answered.contains("model-pool"),
         "a key-pool route must not be answered on v1, got {answered}"
     );
-    assert_eq!(answered, PLAIN[0], "the catalog provider's own best route wins");
+    assert_eq!(answered, PLAIN, "the catalog provider's own route wins");
 }
 
 #[tokio::test]
@@ -231,9 +223,7 @@ async fn only_key_pool_routes_adequate_answers_the_typed_refusal_on_v1() {
     let harness = harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
     harness.edit_config(|config| {
-        for key in PLAIN {
-            config["models"][key]["not_for"] = json!(["mason"]);
-        }
+        config["models"][PLAIN]["not_for"] = json!(["mason"]);
     });
     let v1 = route.call("route.select", &select("mason")).await;
     assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
