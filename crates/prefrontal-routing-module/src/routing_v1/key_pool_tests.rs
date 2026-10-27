@@ -227,7 +227,11 @@ async fn only_key_pool_routes_adequate_answers_the_typed_refusal_on_v1() {
     let harness = harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
     harness.edit_config(|config| {
+        // Nothing but the key pool's borrowed route is adequate for mason any
+        // more: the catalog provider's own route and the borrowed vendor's row
+        // are both excluded.
         config["models"][PLAIN]["not_for"] = json!(["mason"]);
+        config["models"][POOL_ROUTE]["not_for"] = json!(["mason"]);
     });
     let v1 = route.call("route.select", &select("mason")).await;
     assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
