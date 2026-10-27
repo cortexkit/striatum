@@ -260,8 +260,12 @@ impl SqliteRouteStateStore {
                             CASE WHEN selected_route_key IS NOT NULL AND json_valid(score_json)
                                   AND json_type(score_json, '$.alsoAdequate') = 'array'
                                  THEN json_extract(score_json, '$.alsoAdequate') END,
+                            -- A caller that names its model (a head's work pin,
+                            -- or a seat or session admitting the exact model it
+                            -- already chose) narrows the candidates on purpose.
                             CASE WHEN selected_route_key IS NOT NULL
-                                  AND explanation_json LIKE '%model pinned by head%'
+                                  AND (explanation_json LIKE '%model pinned by head%'
+                                       OR explanation_json LIKE '%admission-only pin:%')
                                  THEN 1 ELSE 0 END,
                             CASE WHEN selected_route_key IS NULL THEN COALESCE(
                                 (SELECT json_extract(rejection.value, '$.reason') AS reason
@@ -501,5 +505,41 @@ mod tests {
         let newest = store.diagnostic_decisions(NOW - 60_000, NOW, 1).unwrap();
         assert_eq!(newest.len(), 1);
         assert_eq!(newest[0].id, only_static, "the limit keeps the newest rows");
+    }
+
+    /// Both pin spellings mark a decision pinned, so the thin-candidate check
+    /// skips them: an Athena seat admitting its chosen model is not a thin set.
+    #[test]
+    fn head_pins_and_admission_only_pins_read_as_pinned() {
+        let store = store("pins");
+        let served = |explanation: &str, at: i64| {
+            decision(
+                &store,
+                DecisionInput {
+                    consumer: Some("athena".into()),
+                    target_agent: "athena".into(),
+                    requirements_json: json!({"iq": 0}).to_string(),
+                    selected_route_key: Some("openai/gpt-6-luna".into()),
+                    selected_provider_id: Some("openai".into()),
+                    selected_model_id: Some("gpt-6-luna".into()),
+                    score_json: "null".into(),
+                    rejected_json: "[]".into(),
+                    explanation_json: Some(json!([explanation]).to_string()),
+                    ..Default::default()
+                },
+                at,
+            )
+        };
+        let admission = served("admission-only pin: openai/gpt-6-luna", NOW - 300);
+        let head = served(
+            "model pinned by head: openai/gpt-6-luna; hard admission only",
+            NOW - 200,
+        );
+        let chosen = served("route openai/gpt-6-luna for agent athena", NOW - 100);
+        let rows = store.diagnostic_decisions(NOW - 60_000, NOW, 100).unwrap();
+        let pinned = |id: &str| rows.iter().find(|row| row.id == id).unwrap().pinned;
+        assert!(pinned(&admission));
+        assert!(pinned(&head));
+        assert!(!pinned(&chosen), "a scored choice is not a pin");
     }
 }
