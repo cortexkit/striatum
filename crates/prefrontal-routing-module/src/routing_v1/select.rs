@@ -34,8 +34,8 @@ use serde_json::{json, Value};
 use super::{now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
 use crate::config_policy::RunnerPolicy;
 use crate::{
-    account_selection, config_overrides, key_pool, select_policy, work_model_pin, DecisionProvenance,
-    SelectionPolicySources,
+    account_selection, config_overrides, key_pool, select_policy, work_model_pin,
+    DecisionProvenance, SelectionPolicySources,
 };
 
 /// The members a v1 select may carry.
@@ -788,8 +788,7 @@ impl<'a> Selection<'a> {
     fn account_check(&self, selected: &SelectedModelRoute) -> Result<(), Refusal> {
         // See the key-pool filter before the candidates: a pin can name such a
         // route without the automatic order ever reaching it.
-        if key_pool::is_pool_provider(self.sources.catalog_targets, &selected.model.provider_id)
-        {
+        if key_pool::is_pool_provider(self.sources.catalog_targets, &selected.model.provider_id) {
             return Err(key_pool_route_refusal());
         }
         let policy = self

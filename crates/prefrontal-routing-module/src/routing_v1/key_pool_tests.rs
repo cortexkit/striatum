@@ -87,10 +87,9 @@ fn routing_facts() -> Vec<ModelFact> {
                 fact.cost_tier = Some(0.5);
                 fact.cost_per_m_tok_out = Some(0.5);
                 if let Some(plane) = fact.billing_plane.as_mut() {
-                    plane.rates.insert(
-                        "rate.output".to_owned(),
-                        BillingRate::Priced { rate: 0.5 },
-                    );
+                    plane
+                        .rates
+                        .insert("rate.output".to_owned(), BillingRate::Priced { rate: 0.5 });
                 }
             }
             fact
@@ -163,12 +162,7 @@ fn harness() -> Arc<Harness> {
         },
         crate::now_ms(),
     );
-    credentials.refresh_serving_methods(
-        &Default::default(),
-        &facts,
-        crate::now_ms() as i64,
-        &[],
-    );
+    credentials.refresh_serving_methods(&Default::default(), &facts, crate::now_ms() as i64, &[]);
     credentials.publish_billing_catalog(
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
     );
@@ -219,7 +213,8 @@ async fn a_ladder_entry_on_a_key_pool_route_is_not_answered_on_v1() {
     let route = harness.bind(reserved("example-consumer"), None).await;
     let v1 = route.call("route.select", &select("mason")).await;
     assert_ne!(
-        v1.0, FrameType::Response,
+        v1.0,
+        FrameType::Response,
         "a ladder entry naming a key-pool route must not be answered on v1: {}",
         v1.1
     );
