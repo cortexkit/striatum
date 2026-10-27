@@ -238,24 +238,18 @@ async fn the_key_pool_route_is_answered_because_it_is_both_adequate_and_cheap() 
 }
 
 #[tokio::test]
-async fn only_key_pool_routes_adequate_answers_the_typed_refusal_on_v1() {
+async fn a_v1_pin_on_a_key_pool_route_is_not_served() {
     let harness = harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
-    // Only the key pool's route can clear this demand: the catalog provider's
-    // own row is the only other adequate route, and it is priced above the pool.
-    let v1 = route
-        .call(
-            "route.select",
-            &json!({ "consumer": "mason", "requirements": { "iq": 95 } }),
-        )
-        .await;
-    assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
-    assert_eq!(v1.1["code"], "no_route", "{}", v1.1);
-    assert_eq!(v1.1["detail"]["reason"], "no_available_model", "{}", v1.1);
+    let mut pinned = select("mason");
+    pinned["pin"] = json!(format!("{POOL}/model-pool"));
+    let reply = route.call("route.select", &pinned).await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
     assert!(
-        v1.1["message"].as_str().unwrap().contains("key-pool"),
-        "the refusal must say key-pool routes are not served yet: {}",
-        v1.1
+        reply.1["message"].as_str().unwrap().contains("key-pool"),
+        "a pin on a key-pool route is refused by name: {}",
+        reply.1
     );
 }
 
