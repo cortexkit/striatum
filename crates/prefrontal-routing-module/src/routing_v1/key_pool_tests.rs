@@ -33,6 +33,9 @@ const POOL_VENDOR: &str = "pool-vendor";
 /// The one route `POOL_VENDOR` sells, which the key pool borrows and is the
 /// cheapest route of all.
 const POOL_ROUTE: &str = "pool-vendor/model-pool";
+/// The model the pool provider's own route carries, borrowed from `POOL_ROUTE`.
+/// A pin or a ladder entry names this route on the pool provider itself.
+const POOL_MODEL_SHORT: &str = "model-pool";
 
 fn model(route_key: &str, iq: u8) -> CatalogModel {
     let (provider, model) = route_key.split_once('/').unwrap();
@@ -203,21 +206,36 @@ fn legacy_route(reply: &(FrameType, Value)) -> String {
         .to_owned()
 }
 
+/// A ladder that names a key-pool route first, then a plain one, answers the
+/// plain entry: the key-pool entry is skipped, not allowed to refuse the whole
+/// select. Clearing `explicit_only` keeps the pool route out of the automatic
+/// order, so the only way the answer could be the pool route is the ladder.
 #[tokio::test]
-async fn a_ladder_entry_on_a_key_pool_route_is_not_answered_on_v1() {
+async fn a_ladder_skips_a_key_pool_entry_and_answers_the_next_one() {
     let harness = harness();
     harness.edit_config(|config| {
         config["consumers"]["mason"]["mode"] = json!("ladder");
-        config["consumers"]["mason"]["ladder"] = json!([format!("{POOL}/model-pool")]);
+        config["consumers"]["mason"]["ladder"] =
+            json!([format!("{POOL}/{POOL_MODEL_SHORT}"), PLAIN]);
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let v1 = route.call("route.select", &select("mason")).await;
-    assert_ne!(
-        v1.0,
-        FrameType::Response,
-        "a ladder entry naming a key-pool route must not be answered on v1: {}",
-        v1.1
-    );
+    assert_eq!(answered_route(&v1), PLAIN, "{}", v1.1);
+}
+
+/// Only a ladder with nothing else to answer refuses by naming the key-pool
+/// lease, rather than falling through to the automatic order.
+#[tokio::test]
+async fn a_ladder_of_only_key_pool_entries_refuses_by_name_on_v1() {
+    let harness = harness();
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["mode"] = json!("ladder");
+        config["consumers"]["mason"]["ladder"] = json!([format!("{POOL}/{POOL_MODEL_SHORT}")]);
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let v1 = route.call("route.select", &select("mason")).await;
+    assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
+    assert_eq!(v1.1["code"], "no_route", "{}", v1.1);
     assert!(
         v1.1["message"]
             .as_str()

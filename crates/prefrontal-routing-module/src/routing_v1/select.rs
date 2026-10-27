@@ -484,7 +484,7 @@ pub(super) async fn select(
             // rather than falling through to the automatic order.
             .or_else(|| {
                 skipped_key_pool
-                    .then(|| Err(select_policy::OrderFailure::from(key_pool_route_refusal())))
+                    .then(|| Err(select_policy::OrderFailure::Pin(key_pool_route_refusal())))
             })
     } else {
         None
