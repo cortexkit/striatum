@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use super::{now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
 use crate::config_policy::RunnerPolicy;
 use crate::{
-    account_selection, config_overrides, select_policy, work_model_pin, DecisionProvenance,
+    account_selection, config_overrides, key_pool, select_policy, work_model_pin, DecisionProvenance,
     SelectionPolicySources,
 };
 
@@ -58,9 +58,12 @@ const MEMBERS: &[&str] = &[
 /// accepted; running on the decision then is the caller's risk.
 const DECISION_TTL_MS: u64 = 10 * 60_000;
 
-/// How long a select waits for the first billing-plane load before refusing,
-/// the same bound the older select uses.
-const BILLING_WAIT: Duration = Duration::from_secs(3);
+/// How long a select waits for the first billing-plane load before refusing.
+///
+/// Callers time a select at 3 s (core's `CALL_TIMEOUT`), so the wait ends
+/// 1500 ms early and the typed `routing_not_ready` refusal reaches the caller
+/// instead of a transport timeout that drops the caller's shared connection.
+const BILLING_WAIT: Duration = Duration::from_millis(1500);
 
 /// Why the answered route was chosen, for the explanation and the detail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +261,24 @@ pub(super) async fn select(
         })
         .collect();
     if capable.is_empty() && !reachable.is_empty() {
+        return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
+    }
+
+    // A key-pool provider's keys are leased per send (`route.pool_acquire`), and
+    // a v1 answer cannot yet name the leased key the way `runner.auth` will.
+    // Answering such a route would send the work with the wrong credential or
+    // none, so it is not a v1 candidate until the answer can carry its key.
+    let key_pool_only = capable
+        .iter()
+        .all(|fact| key_pool::is_pool_provider(&catalog_targets, &fact.provider_id));
+    let capable: Vec<&ModelFact> = capable
+        .into_iter()
+        .filter(|fact| !key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))
+        .collect();
+    if capable.is_empty() {
+        if key_pool_only {
+            return Err(key_pool_route_refusal());
+        }
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
 
@@ -756,6 +777,12 @@ impl<'a> Selection<'a> {
     }
 
     fn account_check(&self, selected: &SelectedModelRoute) -> Result<(), Refusal> {
+        // See the key-pool filter before the candidates: a pin can name such a
+        // route without the automatic order ever reaching it.
+        if key_pool::is_pool_provider(self.sources.catalog_targets, &selected.model.provider_id)
+        {
+            return Err(key_pool_route_refusal());
+        }
         let policy = self
             .sources
             .operator_config
@@ -887,6 +914,19 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
     refusal
         .detail
         .insert("rejected".into(), json!(no_route.rejected));
+    refusal
+}
+
+/// The refusal for work only a key-pool route could serve. A key-pool provider
+/// is a provider Broca reaches only through an API key leased for each send
+/// (`key_pool`), and a v1 answer does not name that key yet, so nothing this
+/// answer can carry would run the work.
+fn key_pool_route_refusal() -> Refusal {
+    let mut refusal = Refusal::no_route(NoRouteReason::NoAvailableModel, None);
+    refusal.message = format!(
+        "{}: every route that meets the request is served through a routing key-pool lease, which a routing/v1 answer cannot name yet",
+        refusal.message
+    );
     refusal
 }
 

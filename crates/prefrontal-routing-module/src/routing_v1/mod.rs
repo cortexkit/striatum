@@ -46,6 +46,8 @@ mod dispatch_tests;
 #[cfg(test)]
 mod metered_tests;
 #[cfg(test)]
+mod key_pool_tests;
+#[cfg(test)]
 mod order_tests;
 #[cfg(test)]
 mod runners_tests;
