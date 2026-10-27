@@ -56,7 +56,7 @@ pub use failure_backoff::{
 pub use launch_policy::{
     resolve_launch_requirements, resolve_routing_policy, LaunchRequirementsError,
     ModelRoutingPolicyInput, RequestedCapabilities, RequestedModelRequirements,
-    ResolvedLaunchRequirements, ResolvedRoutingPolicy, CURATED_SUBSCRIPTION_PROVIDERS,
+    ResolvedLaunchRequirements, ResolvedRoutingPolicy,
 };
 pub use model_facts::{
     derive_provider_key, fact_to_route, is_valid_grand_family_id, make_capacity_key,
@@ -71,14 +71,14 @@ pub use model_resolution::{
     build_model_speed_observation, find_most_specific_fallback_entry, fuzzy_match_model,
     map_agent_to_workload_class, parse_workload_class, resolve_compatible_model_settings,
     resolve_model_capabilities, resolve_model_id_alias, resolve_model_pipeline,
-    resolve_user_model_pin, use_basket_permitted, BrocaUsageFacts, DelegatedModelConfig,
-    DesiredModelSettings, FallbackEntry, ModelAliasResolution, ModelCapabilities,
-    ModelCapabilitiesInput, ModelCapabilitiesSnapshot, ModelCapabilitiesSnapshotEntry,
-    ModelResolutionConstraints, ModelResolutionIntent, ModelResolutionPolicy,
-    ModelResolutionRequest, ModelResolutionResult, ModelSettingsCompatibilityChange,
-    ModelSettingsCompatibilityResult, NativeUsageFacts, SnapshotLimit, SnapshotModalities,
-    UserModelPinRequest, VariantFact, ACCOUNT_PRODUCER, CLASS_PRODUCER, COUNTERS_PRODUCER,
-    VALID_WORKLOAD_CLASSES,
+    resolve_user_model_pin, use_basket_permitted, BasicFamily, BrocaUsageFacts,
+    DelegatedModelConfig, DesiredModelSettings, FallbackEntry, ModelAliasResolution,
+    ModelCapabilities, ModelCapabilitiesInput, ModelCapabilitiesSnapshot,
+    ModelCapabilitiesSnapshotEntry, ModelNaming, ModelResolutionConstraints, ModelResolutionIntent,
+    ModelResolutionPolicy, ModelResolutionRequest, ModelResolutionResult, ModelRewrite,
+    ModelSettingsCompatibilityChange, ModelSettingsCompatibilityResult, NativeUsageFacts,
+    SnapshotLimit, SnapshotModalities, UserModelPinRequest, VariantFact, VendorPrefix,
+    ACCOUNT_PRODUCER, CLASS_PRODUCER, COUNTERS_PRODUCER, VALID_WORKLOAD_CLASSES,
 };
 pub use model_router::{
     admit_routes, select_model_route, select_model_route_with_config,

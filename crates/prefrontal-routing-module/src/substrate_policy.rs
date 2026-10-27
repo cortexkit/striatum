@@ -24,9 +24,9 @@ pub(crate) enum Harness {
 impl Harness {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Broca => "broca",
-            Self::Opencode => "opencode",
-            Self::Pi => "pi",
+            Self::Broca => crate::legacy_wire::BROCA,
+            Self::Opencode => crate::legacy_wire::OPENCODE,
+            Self::Pi => crate::legacy_wire::PI,
         }
     }
 }
@@ -91,7 +91,8 @@ impl SubstrateGroups {
                     ));
                 }
                 let harness = serde_json::from_value::<Harness>(value.clone()).map_err(|_| {
-                    format!("{path}: key {key:?} must name a harness: broca, opencode or pi")
+                    let [first, second, last] = crate::legacy_wire::HARNESSES;
+                    format!("{path}: key {key:?} must name a harness: {first}, {second} or {last}")
                 })?;
                 parsed.insert(key.clone(), harness);
             }

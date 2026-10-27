@@ -75,7 +75,6 @@ pub(super) async fn handle(
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
     operator_config_path: &Path,
-    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -99,12 +98,7 @@ pub(super) async fn handle(
         }
     };
     let operator_policy = config_overrides::read_operator_routing_policy(operator_config_path);
-    let text = match render_from_store(
-        &params,
-        store.as_ref(),
-        &operator_policy,
-        opencode_auth_path,
-    ) {
+    let text = match render_from_store(&params, store.as_ref(), &operator_policy) {
         Ok(text) => text,
         Err(error) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &error)
@@ -130,7 +124,6 @@ fn render_from_store(
     params: &AvailableModelsTextParams,
     store: &SqliteRouteStateStore,
     operator_policy: &ModelRoutingPolicyInput,
-    opencode_auth_path: &Path,
 ) -> Result<String, String> {
     let catalog = store
         .get_catalog_facts()
@@ -145,7 +138,7 @@ fn render_from_store(
         capacity_keys,
         operator_policy,
         &caller_policy,
-        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
+        &provider_auth_types(params.provider_auth_types.as_ref()),
     );
     let allowed_keys = resolved_policy
         .available_models
@@ -433,15 +426,6 @@ mod tests {
         }
     }
 
-    impl StoreRig {
-        /// Never read: every request here carries its own provider auth
-        /// types. It sits under the scratch root so the no-live-auth guard in
-        /// `provider_auth_types` holds even if a request stops carrying them.
-        fn opencode_auth(&self) -> std::path::PathBuf {
-            self.directory.join("opencode-auth.json")
-        }
-    }
-
     impl Drop for StoreRig {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.directory);
@@ -530,7 +514,6 @@ mod tests {
             &params(&["z/unknown", "a/cheap", "b/premium"], &["b/premium"]),
             &rig.store,
             &ModelRoutingPolicyInput::default(),
-            &rig.opencode_auth(),
         )
         .unwrap();
         assert_eq!(
@@ -542,7 +525,6 @@ mod tests {
             &params(&["x/unknown"], &[]),
             &rig.store,
             &ModelRoutingPolicyInput::default(),
-            &rig.opencode_auth(),
         )
         .unwrap();
         assert_eq!(
@@ -580,7 +562,7 @@ mod tests {
         let mut request = params(&[], &[]);
         request.available_models = models;
         let render = |request: &AvailableModelsTextParams| {
-            render_from_store(request, &rig.store, &policy, &rig.opencode_auth()).unwrap()
+            render_from_store(request, &rig.store, &policy).unwrap()
         };
         let first = render(&request);
         assert!(first.ends_with("shown 25 of 29 · next: offset=25"));
@@ -621,13 +603,8 @@ mod tests {
     fn live_store_state_gates_available_models_render() {
         let rig = StoreRig::new("state-gate");
         let request = params(&["state/model"], &[]);
-        let before = render_from_store(
-            &request,
-            &rig.store,
-            &ModelRoutingPolicyInput::default(),
-            &rig.opencode_auth(),
-        )
-        .unwrap();
+        let before =
+            render_from_store(&request, &rig.store, &ModelRoutingPolicyInput::default()).unwrap();
 
         rig.store
             .upsert_fact(
@@ -635,13 +612,8 @@ mod tests {
                 FactSource::Override,
             )
             .unwrap();
-        let after = render_from_store(
-            &request,
-            &rig.store,
-            &ModelRoutingPolicyInput::default(),
-            &rig.opencode_auth(),
-        )
-        .unwrap();
+        let after =
+            render_from_store(&request, &rig.store, &ModelRoutingPolicyInput::default()).unwrap();
 
         assert_ne!(before, after);
         assert!(before.contains("Recommended head: none"));

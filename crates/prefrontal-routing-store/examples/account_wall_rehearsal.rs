@@ -114,7 +114,7 @@ fn main() {
             &quota.windows_json,
         )
         .unwrap();
-        prefrontal_routing_core::merge_quota_overlay(&mut admitted_snapshot, &windows, &facts);
+        prefrontal_routing_core::merge_quota_overlay(&mut admitted_snapshot, &windows, &facts, &[]);
     }
     for (route, _, _, _, _) in eligible
         .into_iter()
@@ -136,6 +136,7 @@ fn main() {
                 required_capabilities: None,
                 available_models: [route.clone()].into_iter().collect(),
                 availability_substrate: prefrontal_routing_core::AvailabilitySubstrate::Broca,
+                availability_label: "served".to_string(),
                 is_subscription_route: None,
             })
             .unwrap();

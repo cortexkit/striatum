@@ -1,10 +1,9 @@
 //! The runner ops of `routing/v1`: `route.account_for` and
 //! `route.account_observe`.
 //!
-//! Only a runner module may call them: a route whose principal the daemon
-//! verified as `reserved:<module>`, for a module routing's configuration
-//! lists as a runner. The calling runner comes from that principal, never
-//! from the body. Both ops run on routing's account allocator, the one the
+//! Calls require an attested effective runner or a current session scope whose
+//! owner provides `agent-host/v1` in the daemon catalog. Neither a plugin name
+//! nor a source in the body grants authority. Both ops use the account allocator
 //! older ops serve Broca with; this module translates the v1 request into it
 //! and its answer back.
 
@@ -16,11 +15,10 @@ use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::observe::{
     parse_account_observe_request, AccountObserveAnswer, Observation,
 };
-use prefrontal_routing_core::accounts::AllocatorPolicy;
 use prefrontal_routing_store::V1Recorded;
 use serde_json::{json, Value};
 
-use super::{account_ctx, now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
+use super::{account_ctx, now_ms, provider_refusal, store_refusal, Caller, Deps};
 use crate::account_selection::{self, OpReply, ACCOUNT_FOR_OP, ACCOUNT_OBSERVE_OP};
 use crate::{account_quota, config_overrides};
 
@@ -38,6 +36,10 @@ const FOR_MEMBERS: &[&str] = &[
     "requested_account",
     "hold_wait_max_s",
     "decision_id",
+    "parent_conversation_key",
+    "pool",
+    "hold_ok",
+    "request_input_tokens",
 ];
 
 const OBSERVE_MEMBERS: &[&str] = &[
@@ -54,21 +56,73 @@ const OBSERVE_MEMBERS: &[&str] = &[
     "limit_window",
     "resets_at_ms",
     "resets_at_source",
+    "pool",
 ];
 
-/// The calling runner's module, when the caller is an attested runner.
-fn runner_module(caller: &Caller, deps: &Deps<'_>) -> Result<String, Refusal> {
-    let runners = operator_config(deps).v1_runners();
-    caller
-        .attested_module()
-        .filter(|module| runners.iter().any(|runner| runner.module == *module))
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            Refusal::new(
-                RefusalCode::AccountNotAuthorized,
-                "only a runner module routing knows, on a route the daemon attested, may call this",
-            )
-        })
+struct AccountCaller<'a> {
+    module: &'a str,
+    principal: String,
+    session: Option<&'a super::ScopeAuthority>,
+}
+
+impl AccountCaller<'_> {
+    fn admission_key(&self, id: &str) -> String {
+        self.session.map_or_else(
+            || id.to_owned(),
+            |scope| serde_json::to_string(&(&scope.reference, id)).unwrap(),
+        )
+    }
+
+    fn recorded_principal(&self) -> String {
+        self.session.map_or_else(
+            || self.principal.clone(),
+            |scope| {
+                format!(
+                    "session:{}",
+                    serde_json::to_string(&(&scope.owner, &scope.reference)).unwrap()
+                )
+            },
+        )
+    }
+}
+
+/// Session ids are scoped under their owner, not the relay's principal. The
+/// allocator hashes the stamped conversation ref within that namespace, so a
+/// child can look up its parent's reported use without sharing admission ids.
+fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCaller<'a>, Refusal> {
+    let runners = super::runners::effective(deps);
+    if caller.binding_is_current() {
+        if let Some(module) = caller
+            .attested_module()
+            .filter(|module| runners.get(module).is_some())
+        {
+            return Ok(AccountCaller {
+                module,
+                principal: caller.principal.clone(),
+                session: None,
+            });
+        }
+        if let Some(scope) = caller.scope_authority.as_ref().filter(|scope| {
+            scope.kind == subc_protocol::scope::ScopeKind::Head
+                && scope
+                    .owner
+                    .strip_prefix("reserved:")
+                    .is_some_and(super::consumers::provides_agent_host)
+        }) {
+            return Ok(AccountCaller {
+                module: scope.owner.strip_prefix("reserved:").unwrap(),
+                principal: format!(
+                    "session-owner:{}",
+                    serde_json::to_string(&scope.owner).unwrap()
+                ),
+                session: Some(scope),
+            });
+        }
+    }
+    Err(Refusal::new(
+        RefusalCode::parse("unscoped_caller"),
+        "account operations require an effective runner or a current agent-host session scope",
+    ))
 }
 
 fn same_name(left: &str, right: &str) -> bool {
@@ -80,16 +134,21 @@ pub(super) fn account_for(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
-    let module = runner_module(caller, deps)?;
+    let authority = account_caller(caller, deps)?;
     super::refuse_unknown_members(params, FOR_MEMBERS)?;
-    let request = parse_account_for_request(params)?;
+    let mut request = parse_account_for_request(params)?;
+    if let Some(scope) = authority.session {
+        request.conversation_key = scope.reference.clone();
+    }
+    let principal = authority.recorded_principal();
+    let mut hold_wait_max_s = request.hold_wait_max_s;
     // The whole body with defaults applied: two bodies that differ only in a
     // member left out versus sent with its default are the same admission.
     let body_json = serde_json::to_string(&request.normalized())
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     if let Some(first) = deps
         .store
-        .v1_admission(&caller.principal, &request.admission_id)
+        .v1_admission(&principal, &request.admission_id)
         .map_err(store_refusal)?
     {
         return standing_answer(first, &body_json);
@@ -99,11 +158,22 @@ pub(super) fn account_for(
         // named; anything else is refused as if the decision never existed.
         let decision = deps.store.v1_decision(decision_id).map_err(store_refusal)?;
         if !decision.is_some_and(|decision| {
-            decision.runner_module == module
+            caller.attested_module() == Some(decision.runner_module.as_str())
                 && same_name(&decision.provider, &request.provider)
                 && same_name(&decision.model, &request.model)
         }) {
             return Err(Refusal::unknown_decision());
+        }
+        if let Some(input) = deps
+            .store
+            .get_decision_by_id(decision_id)
+            .map_err(store_refusal)?
+        {
+            let input: Value =
+                serde_json::from_str(&input.requirements_json).map_err(store_refusal)?;
+            if let Some(cap) = input["hold_wait_max_s"].as_u64() {
+                hold_wait_max_s = Some(hold_wait_max_s.map_or(cap, |request| request.min(cap)));
+            }
         }
     }
 
@@ -111,19 +181,38 @@ pub(super) fn account_for(
         "provider": request.provider,
         "model": request.model,
         "conversation_key": request.conversation_key,
-        "admission_id": request.admission_id,
+        "admission_id": authority.admission_key(&request.admission_id),
         "mode": request.mode().as_str(),
         "initial_input_bytes": request.initial_input_bytes.unwrap_or(0),
         "initial_input_estimated": request.initial_input_estimated.unwrap_or(false),
-        "caller": { "runner": module },
+        "caller": { "runner": authority.module },
     });
     for (member, value) in [
         ("affinity_model", json!(request.affinity_model)),
         ("expected_pin", json!(request.expected_pin)),
         ("candidates", json!(request.candidates)),
         ("requested_account", json!(request.requested_account)),
-        ("hold_wait_max_s", json!(request.hold_wait_max_s)),
+        ("hold_wait_max_s", json!(hold_wait_max_s)),
         ("model_decision_id", json!(request.decision_id)),
+        (
+            "parent_conversation_key",
+            params
+                .get("parent_conversation_key")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        ("pool", params.get("pool").cloned().unwrap_or(Value::Null)),
+        (
+            "hold_ok",
+            params.get("hold_ok").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "request_input_tokens",
+            params
+                .get("request_input_tokens")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
     ] {
         if !value.is_null() {
             legacy[member] = value;
@@ -132,9 +221,11 @@ pub(super) fn account_for(
     let body = serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": legacy }))
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
-    let policy = AllocatorPolicy::default();
-    let ctx = account_ctx(deps, flags, &policy);
-    let answer = match account_selection::handle(ACCOUNT_FOR_OP, &body, &caller.principal, &ctx) {
+    let policy =
+        config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
+    let ctx = account_ctx(deps, flags, &policy)?;
+    let answer = match account_selection::handle(ACCOUNT_FOR_OP, &body, &authority.principal, &ctx)
+    {
         OpReply::Result(result) => admission_answer(&result, &request)?,
         OpReply::Error {
             code,
@@ -147,7 +238,7 @@ pub(super) fn account_for(
     let standing = deps
         .store
         .v1_record_admission(
-            &caller.principal,
+            &principal,
             &request.admission_id,
             &V1Recorded {
                 body_json: body_json.clone(),
@@ -257,12 +348,18 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
         "account_hold" => Refusal::account_hold(wait_until().unwrap_or_else(now_ms)),
         "account_pool_exhausted" => Refusal::account_pool_exhausted(wait_until()),
         "invalid_request" => Refusal::invalid_request("params", message.clone()),
-        "account_selection_disabled" | "store_error" => {
-            Refusal::new(RefusalCode::AccountSelectionUnavailable, message.clone())
-        }
+        "store_error" => Refusal::new(RefusalCode::AccountSelectionUnavailable, message.clone()),
         other => Refusal::new(RefusalCode::parse(other), message.clone()),
     };
     refusal.message = message;
+    if code == "no_eligible_account" {
+        if let Some(reset) = detail
+            .and_then(|detail| detail.get("reset_at_ms"))
+            .filter(|reset| !reset.is_null())
+        {
+            refusal.detail.insert("reset_at_ms".into(), reset.clone());
+        }
+    }
     refusal
 }
 
@@ -271,7 +368,7 @@ pub(super) fn account_observe(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
-    let module = runner_module(caller, deps)?;
+    let authority = account_caller(caller, deps)?;
     super::refuse_unknown_members(params, OBSERVE_MEMBERS)?;
     let request = parse_account_observe_request(params)?;
     // The allocator reads these two as closed sets of its own.
@@ -299,17 +396,23 @@ pub(super) fn account_observe(
     }
     let mut legacy = serde_json::to_value(&request)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
-    legacy["caller"] = json!({ "runner": module });
+    legacy["caller"] = json!({ "runner": authority.module });
+    if authority.session.is_some() {
+        legacy["event_id"] = json!(authority.admission_key(&request.event_id));
+        if let Some(id) = &request.admission_id {
+            legacy["admission_id"] = json!(authority.admission_key(id));
+        }
+    }
     let body = serde_json::to_vec(&json!({ "method": ACCOUNT_OBSERVE_OP, "params": legacy }))
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
-    let policy = AllocatorPolicy::default();
-    let ctx = account_ctx(deps, flags, &policy);
-    let reply = account_selection::handle(ACCOUNT_OBSERVE_OP, &body, &caller.principal, &ctx);
+    let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
+    let ctx = account_ctx(deps, flags, &policy)?;
+    let reply = account_selection::handle(ACCOUNT_OBSERVE_OP, &body, &authority.principal, &ctx);
     // Rate-limit headers feed routing's quota view exactly as the older op's do.
     if let (Some(shared), Some(observation)) = (
         crate::USAGE_OBSERVE.get(),
-        account_selection::usage_observation(&body, &caller.principal, &ctx),
+        account_selection::usage_observation(&body, &authority.principal, &ctx),
     ) {
         shared.record(observation);
     }

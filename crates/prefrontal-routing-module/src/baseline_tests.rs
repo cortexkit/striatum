@@ -63,7 +63,6 @@ struct World {
     dir: PathBuf,
     store: SharedStore,
     config_path: PathBuf,
-    auth_path: PathBuf,
     credentials: SharedBrocaCredentials,
     quota_cache: SharedQuotaCache,
 }
@@ -76,6 +75,10 @@ impl Drop for World {
 
 impl World {
     async fn build(baseline: &Value, label: &str) -> Self {
+        Self::build_with(baseline, label, CONFIG).await
+    }
+
+    async fn build_with(baseline: &Value, label: &str, config: &str) -> Self {
         let now = clock_ms(baseline);
         let n = NEXT_WORLD.fetch_add(1, Ordering::Relaxed);
         let dir = prefrontal_test_support::scratch_root().join(format!(
@@ -92,9 +95,17 @@ impl World {
             .expect("open the routing store"),
         );
         let config_path = dir.join("prefrontal-routing.jsonc");
-        std::fs::write(&config_path, CONFIG).unwrap();
-        let auth_path = dir.join("auth.json");
-        std::fs::write(&auth_path, baseline["auth_json"].to_string()).unwrap();
+        let mut fixture_config: Value = serde_json::from_str(
+            &crate::config_convert::convert(config).expect("the fixture config converts"),
+        )
+        .unwrap();
+        // Authorize the fixture's attested callers without changing its frozen
+        // requests, policy choices, or expected execution identities.
+        fixture_config["consumers"]["mc_dream_curate"]["owner"] = json!("magic-context");
+        fixture_config["consumers"]["mason"]["owner"] = json!("prefrontal-core");
+        fixture_config["consumers"]["codemode"]["owner"] = json!("prefrontal-core");
+        crate::test_config::write(&config_path, serde_json::to_vec(&fixture_config).unwrap())
+            .unwrap();
 
         let listing = decode_listing(baseline["credential_listing"].clone()).await;
         let mapped: HashSet<String> = listing
@@ -126,13 +137,13 @@ impl World {
 
         let facts = store.get_facts().unwrap();
         let mut credentials = BrocaCredentials::default();
-        credentials.set_score_alias(
-            crate::config_overrides::live_config(&config_path)
-                .score_aliases()
-                .clone(),
-        );
         credentials.apply_listing(&listing, now);
-        credentials.refresh_serving_methods(&accounts, &facts, now as i64);
+        credentials.refresh_serving_methods(
+            &accounts,
+            &facts,
+            now as i64,
+            &crate::config_overrides::live_config(&config_path).quota_model_pools(),
+        );
         credentials.publish_billing_catalog(PlaneCatalog::ordinary_test_catalog(&facts));
         credentials.publish_plan_prices(&baseline["plan_prices"]);
 
@@ -153,7 +164,6 @@ impl World {
             dir,
             store,
             config_path,
-            auth_path,
             credentials: Arc::new(Mutex::new(credentials)),
             quota_cache: Arc::new(Mutex::new(cache)),
         }
@@ -182,7 +192,6 @@ impl World {
             &self.config_path,
             &self.config_path,
             &self.credentials,
-            &self.auth_path,
         )
         .await
         .expect("the handler answers");
@@ -221,7 +230,6 @@ impl World {
                 routing_config_path: &self.config_path,
                 operator_config_path: &self.config_path,
                 broca_credentials: &self.credentials,
-                opencode_auth_path: &self.auth_path,
             },
         )
         .await
@@ -417,13 +425,57 @@ fn answer(
     })
 }
 
+/// For legacy route.select requests, the frozen baseline's `runner` records
+/// the reply's `selected.harness`. For host requests, that field is absent and
+/// `runner.module` matches the requested `harness`. Check both reply fields
+/// independently. Every non-host winner in the frozen fixture runs on Broca.
+fn verify_execution_identity(baseline: &Value, request: &Value, reply: &(FrameType, Value)) {
+    let name = request["name"].as_str().unwrap();
+    let wanted = listed_difference(name).unwrap_or_else(|| baseline["expected"][name].clone());
+    let v1 = request["op"] == "routing/v1 route.select";
+    let winner = wanted["route_key"].is_string();
+    let expected_harness = (!v1).then(|| wanted["runner"].as_str()).flatten();
+    let expected_runner = if !winner {
+        None
+    } else {
+        wanted["runner"].as_str().or_else(|| {
+            request["params"]["harness"]
+                .as_str()
+                .or_else(|| request["params"]["substrate"].as_str())
+                .or(Some("host"))
+        })
+    };
+    let result = &reply.1["result"];
+    assert_eq!(
+        result["runner"]["module"].as_str(),
+        expected_runner,
+        "{name}: runner module differs from frozen execution identity: {}",
+        reply.1
+    );
+    let actual_harness = if v1 {
+        &result["runner"]["harness"]
+    } else {
+        &result["selected"]["harness"]
+    };
+    assert_eq!(
+        actual_harness.as_str(),
+        expected_harness,
+        "{name}: reply harness differs from frozen execution identity: {}",
+        reply.1
+    );
+}
+
 /// Run one request on a fresh world and return its checked-in facts.
 async fn run_request(baseline: &Value, request: &Value) -> Value {
     let name = request["name"].as_str().expect("request name");
     let world = World::build(baseline, name).await;
     let params = params_of(baseline, &request["params"]);
     match request["op"].as_str().expect("request op") {
-        "route.select" => legacy_answer(&world.legacy("route.select", &params).await),
+        "route.select" => {
+            let reply = world.legacy("route.select", &params).await;
+            verify_execution_identity(baseline, request, &reply);
+            legacy_answer(&reply)
+        }
         "synthesizer" => {
             // Core reads the synthesizer pin from the panel answer's policy,
             // then admits exactly that pin with a pinned route.select.
@@ -441,13 +493,17 @@ async fn run_request(baseline: &Value, request: &Value) -> Value {
             if let Some(variant) = pin["variant"].as_str() {
                 params["pin"]["variant"] = json!(variant);
             }
-            legacy_answer(&world.legacy("route.select", &params).await)
+            let reply = world.legacy("route.select", &params).await;
+            verify_execution_identity(baseline, request, &reply);
+            legacy_answer(&reply)
         }
-        "routing/v1 route.select" => v1_answer(
-            &world
+        "routing/v1 route.select" => {
+            let reply = world
                 .v1(request["principal"].as_str().expect("principal"), &params)
-                .await,
-        ),
+                .await;
+            verify_execution_identity(baseline, request, &reply);
+            v1_answer(&reply)
+        }
         other => panic!("unknown baseline op {other}"),
     }
 }
@@ -519,20 +575,238 @@ fn baseline_lists_each_slot_pin_and_an_answer_per_request() {
     }
 }
 
-/// Today's selection on the frozen world answers every request as checked in.
-/// On a mismatch the failure prints the computed answer set in the same shape
-/// as the checked-in `expected` object, so a deliberate behaviour change can
-/// be reviewed and checked in.
+/// Requests for which the new pass differs from the frozen baseline. Each
+/// listed request names the answer the new pass must give and one allowed cause.
+const EQUIVALENCE_DIFFERENCES: &[(&str, &str, &str)] = &[(
+    "mason-excluded-model-pin",
+    r#"{"refusal_code":"pinned_route_refused","route_key":null,"runner":null,"variant":null}"#,
+    "a not_for-refused named model",
+)];
+
+fn listed_difference(name: &str) -> Option<Value> {
+    EQUIVALENCE_DIFFERENCES
+        .iter()
+        .find_map(|(request, answer, cause)| {
+            (*request == name).then(|| {
+                let mut answer: Value = serde_json::from_str(answer).expect("listed answer");
+                answer["cause"] = json!(cause);
+                answer
+            })
+        })
+}
+
+/// The new pass on the converted live file, each request from its own empty
+/// store, matches the baseline. A difference must be listed with its exact
+/// answer and one allowed cause.
 #[tokio::test]
-async fn todays_selection_matches_the_checked_in_baseline() {
+async fn the_new_pass_on_the_converted_fixture_matches_the_baseline() {
     let baseline = baseline();
     let answers = run_all(&baseline).await;
     let expected: BTreeMap<String, Value> =
         serde_json::from_value(baseline["expected"].clone()).unwrap();
+    let mut unexpected = Vec::new();
+    for (name, answer) in &answers {
+        let wanted = listed_difference(name).unwrap_or_else(|| expected[name].clone());
+        let comparable = if wanted.get("cause").is_some() {
+            let mut got = answer.clone();
+            got["cause"] = wanted["cause"].clone();
+            got
+        } else {
+            answer.clone()
+        };
+        if comparable != wanted {
+            unexpected.push((name.clone(), answer.clone(), wanted));
+        }
+    }
     assert!(
-        answers == expected,
-        "today's selection differs from the checked-in baseline.\n\
-         BEGIN ANSWERS\n{}\nEND ANSWERS",
-        serde_json::to_string_pretty(&answers).unwrap()
+        unexpected.is_empty(),
+        "new pass differs from the baseline without a listed cause.\n{}",
+        unexpected
+            .iter()
+            .map(|(name, got, wanted)| format!("{name}: got {got} wanted {wanted}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
+    for (name, _, _) in EQUIVALENCE_DIFFERENCES {
+        assert!(
+            answers.contains_key(*name),
+            "listed difference {name} is not a baseline request"
+        );
+    }
+}
+
+fn drop_at(document: &mut Value, path: &[&str]) {
+    let (last, parents) = path.split_last().expect("path");
+    let mut cursor = document;
+    for segment in parents {
+        cursor = cursor
+            .get_mut(*segment)
+            .unwrap_or_else(|| panic!("missing {segment} in {}", path.join("/")));
+    }
+    assert!(
+        cursor
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("not an object at {}", path.join("/")))
+            .remove(*last)
+            .is_some(),
+        "nothing to drop at {}",
+        path.join("/")
+    );
+}
+
+async fn one_answer(baseline: &Value, config: &str, name: &str) -> Value {
+    let request = baseline["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|request| request["name"] == name)
+        .unwrap_or_else(|| panic!("no request {name}"));
+    let world = World::build_with(baseline, name, config).await;
+    let params = params_of(baseline, &request["params"]);
+    match request["op"].as_str().unwrap() {
+        "route.select" => legacy_answer(&world.legacy("route.select", &params).await),
+        "synthesizer" => {
+            let panel_params = params_of(baseline, &request["panel_params"]);
+            let panel = world.legacy("route.select_panel", &panel_params).await;
+            assert_eq!(panel.0, FrameType::Response, "{}", panel.1);
+            let pin = &panel.1["result"]["policy"]["pins"]["synthesizer"];
+            let mut params = params;
+            params["pin"] = json!({"model": pin["model"]});
+            if let Some(variant) = pin["variant"].as_str() {
+                params["pin"]["variant"] = json!(variant);
+            }
+            legacy_answer(&world.legacy("route.select", &params).await)
+        }
+        "routing/v1 route.select" => v1_answer(
+            &world
+                .v1(request["principal"].as_str().unwrap(), &params)
+                .await,
+        ),
+        other => panic!("control does not run {other}"),
+    }
+}
+
+/// Dropping one not_for, variant, project-pin, slot-pin or subscription entry
+/// from the converted file changes an answer, so a check that recorded the
+/// undropped answer fails.
+#[tokio::test]
+async fn dropping_one_policy_entry_changes_the_converted_answer() {
+    let baseline = baseline();
+    let _clock = crate::InjectedClock::set(clock_ms(&baseline));
+    let converted = crate::config_convert::convert(CONFIG).expect("the live file converts");
+    let mut document: Value = serde_json::from_str(&converted).unwrap();
+    // The live file has no project pin. Plant one so this control has an entry
+    // to drop; a scoped mason select must answer that allowed pin.
+    document["consumers"]["mason"]["projects"] = json!({
+        "baseline-project": { "pin": "anthropic/claude-opus-5-5" }
+    });
+    let planted = serde_json::to_string(&document).unwrap();
+
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["models", "openai/gpt-6-luna", "not_for"],
+            "mason-excluded-model-pin",
+        ),
+        (&["consumers", "athena", "variants"], "athena-astra-pin"),
+        (&["consumers", "lab_planner", "pin"], "slot-lab-planner"),
+    ];
+    for (path, request) in cases {
+        let mut mutated: Value = serde_json::from_str(&planted).unwrap();
+        drop_at(&mut mutated, path);
+        let before = one_answer(&baseline, &planted, request).await;
+        let after = one_answer(
+            &baseline,
+            &serde_json::to_string(&mutated).unwrap(),
+            request,
+        )
+        .await;
+        assert_ne!(
+            before,
+            after,
+            "dropping {} did not change {request}: {before}",
+            path.join("/")
+        );
+    }
+
+    // The route remains cheapest even without its subscription, so comparing
+    // winners alone would miss this deletion. Check the resolved coverage too.
+    let subscription_keys = |reply: &Value| {
+        reply["result"]["resolvedInput"]["subscriptionKeys"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+    let world = World::build_with(&baseline, "subscription", &planted).await;
+    let params = params_of(
+        &baseline,
+        &baseline["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|request| request["name"] == "mason-broca")
+            .unwrap()["params"],
+    );
+    let covered = subscription_keys(&world.legacy("route.select", &params).await.1);
+    assert!(covered.contains(&json!("opencode-go/deepseek-v4.1-flash")));
+    let mut dropped: Value = serde_json::from_str(&planted).unwrap();
+    drop_at(&mut dropped, &["providers", "opencode-go", "subscription"]);
+    let world = World::build_with(
+        &baseline,
+        "subscription-dropped",
+        &serde_json::to_string(&dropped).unwrap(),
+    )
+    .await;
+    let uncovered = subscription_keys(&world.legacy("route.select", &params).await.1);
+    assert!(!uncovered.contains(&json!("opencode-go/deepseek-v4.1-flash")));
+
+    let pinned_config = planted.clone();
+    let world = World::build_with(&baseline, "project-pin", &pinned_config).await;
+    super::remember_route_scope(
+        9_001,
+        1,
+        Some(super::DecisionScope {
+            project_id: Some("baseline-project".into()),
+            workdir: None,
+        }),
+    );
+    let pinned = v1_answer(
+        &world
+            .v1(
+                "reserved:prefrontal-core",
+                &json!({"consumer": "mason", "requirements": {"iq": 60}}),
+            )
+            .await,
+    );
+    let mut dropped: Value = serde_json::from_str(&planted).unwrap();
+    drop_at(
+        &mut dropped,
+        &["consumers", "mason", "projects", "baseline-project"],
+    );
+    let world = World::build_with(
+        &baseline,
+        "project-pin-dropped",
+        &serde_json::to_string(&dropped).unwrap(),
+    )
+    .await;
+    super::remember_route_scope(
+        9_001,
+        1,
+        Some(super::DecisionScope {
+            project_id: Some("baseline-project".into()),
+            workdir: None,
+        }),
+    );
+    let unpinned = v1_answer(
+        &world
+            .v1(
+                "reserved:prefrontal-core",
+                &json!({"consumer": "mason", "requirements": {"iq": 60}}),
+            )
+            .await,
+    );
+    assert_ne!(
+        pinned, unpinned,
+        "dropping the project pin did not change the scoped select: {pinned}"
+    );
+    assert_eq!(pinned["route_key"], "anthropic/claude-opus-5-5", "{pinned}");
 }

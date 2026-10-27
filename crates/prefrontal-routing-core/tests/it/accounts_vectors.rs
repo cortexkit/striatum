@@ -8,14 +8,15 @@ mod accounts_support;
 
 use accounts_support::*;
 use prefrontal_routing_core::accounts::evidence::{
-    confirm_exhaustion, header_window, jitter_s, normalize_used_percent, retry_after_with_jitter,
-    short_hold_rule, Carrier, ConfirmationOutcome, Derivation, EvidenceScope, ExhaustionAction,
+    confirm_exhaustion, header_window, hold_until, jitter_s, normalize_used_percent,
+    retry_after_with_jitter, Carrier, ConfirmationOutcome, Derivation, EvidenceScope,
     ExhaustionObservation, FrameOrigin, NotConfirmedReason, ObservationKind, RateLimitEvent,
     ResetSource, WindowEvidence,
 };
 use prefrontal_routing_core::accounts::{
     decide, eligibility::scope_check, AllocatorPolicy, ConfirmationSource, FenceScope,
-    GeneralWindow, HoldBasis, ModelFamily, ObservationSource, ResetTime, ScopedList, ScopedWindow,
+    GeneralWindow, HoldBasis, ModelFamily, ObservationSource, PoolKey, PoolScope, ResetTime,
+    ScopedList, ScopedWindow,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -177,7 +178,7 @@ fn adapt_scoped(quota: &Value) -> ScopedList {
 
 #[test]
 fn scope_vectors_family_scope_and_absent_scope_predicate() {
-    let policy = AllocatorPolicy::default();
+    let policy = policy();
     let value = vectors();
     let rows = value["scopes"].as_array().unwrap();
     assert_eq!(rows.len(), 9);
@@ -202,72 +203,34 @@ fn scope_vectors_family_scope_and_absent_scope_predicate() {
     assert_ne!(missing.list_state, empty.list_state);
 }
 
+/// The reference's reset vectors against the hold rule's reset check. The
+/// reference applied them to the 5h window only; routing applies the same
+/// bounds to whichever window blocks continuation, so a vector the reference
+/// migrates is one the hold rule moves.
 #[test]
-fn reset_vectors_short_hold_exact_bounds() {
+fn reset_vectors_hold_exact_bounds() {
     let policy = AllocatorPolicy::default();
     let value = vectors();
     let rows = value["resets"].as_array().unwrap();
     assert_eq!(rows.len(), 7);
     for row in rows {
         let id = row["id"].as_str().unwrap();
-        let action = short_hold_rule(
-            false,
-            false,
-            Some(reset_from(&row["resetsAt"])),
-            NOW,
-            policy.short_hold_max_ms,
-        );
+        let held = hold_until(reset_from(&row["resetsAt"]), NOW, policy.short_hold_max_ms);
         let expected = &row["decision"];
         match expected["action"].as_str().unwrap() {
             "hold" => {
-                assert_eq!(expected["reason"], "five-hour-short-reset", "{id}");
-                let ExhaustionAction::Hold {
-                    base_retry_after_s, ..
-                } = action
-                else {
-                    panic!("{id}: expected hold, got {action:?}");
-                };
+                let (_, base_retry_after_s) =
+                    held.unwrap_or_else(|| panic!("{id}: expected hold, got a move"));
                 assert_eq!(
                     Some(base_retry_after_s),
                     expected["retryAfterSeconds"].as_u64(),
                     "{id}"
                 );
             }
-            "migrate" => {
-                let ExhaustionAction::Migrate { reason } = action else {
-                    panic!("{id}: expected migrate, got {action:?}");
-                };
-                assert_eq!(
-                    serde_json::to_value(reason).unwrap(),
-                    expected["reason"],
-                    "{id}"
-                );
-            }
+            "migrate" => assert_eq!(held, None, "{id}"),
             other => panic!("{id}: unexpected action {other}"),
         }
     }
-}
-
-#[test]
-fn short_hold_rule_migrates_model_scoped_then_seven_day_first() {
-    let short = Some(ResetTime::At(NOW + 10 * MINUTE));
-    let max = AllocatorPolicy::default().short_hold_max_ms;
-    let reason = |action| match action {
-        ExhaustionAction::Migrate { reason } => serde_json::to_value(reason).unwrap(),
-        other => panic!("expected migrate, got {other:?}"),
-    };
-    assert_eq!(
-        reason(short_hold_rule(true, true, short, NOW, max)),
-        "model-scoped"
-    );
-    assert_eq!(
-        reason(short_hold_rule(false, true, short, NOW, max)),
-        "seven-day"
-    );
-    assert_eq!(
-        short_hold_rule(false, false, None, NOW, max),
-        ExhaustionAction::Retain
-    );
 }
 
 #[test]
@@ -477,7 +440,7 @@ fn source_two_causality_uses_the_original_observation_time() {
         NotConfirmedReason::ObservedBeforeRateLimit
     );
     let fence = confirmed(confirm_exhaustion(&after_429(poll(T_AFTER))));
-    assert_eq!(fence.scope, FenceScope::General(GeneralWindow::SevenDay));
+    assert_eq!(fence.pool, Some(PoolKey::general(GeneralWindow::SevenDay)));
     assert_eq!(fence.observed_at_ms, T_AFTER);
     assert_eq!(fence.source, ConfirmationSource::PostRateLimitPoll);
     // A poll reading below 100 is not exhaustion.
@@ -536,7 +499,7 @@ fn positive_controls_raw_one_on_genuine_frames_confirm() {
             let fence = confirmed(confirm_exhaustion(&served(header_evidence(
                 1.0, carrier, frame, T_AFTER,
             ))));
-            assert_eq!(fence.scope, FenceScope::General(GeneralWindow::FiveHour));
+            assert_eq!(fence.pool, Some(PoolKey::general(GeneralWindow::FiveHour)));
             assert_eq!(fence.source, ConfirmationSource::RawHeader);
             assert_eq!(fence.reset, ResetTime::At(NOW + 15 * MINUTE));
         }
@@ -601,13 +564,13 @@ fn optimistic_unbound_and_relay_evidence_never_confirm() {
 }
 
 #[test]
-fn broca_limit_windows_map_to_scopes_and_retry_after_is_not_a_reset() {
-    let broca = |provider: &str, window: Option<&str>, source| ExhaustionObservation {
+fn broca_limit_windows_map_to_pool_keys_and_retry_after_is_not_a_reset() {
+    let broca = |window: Option<&str>, pool: Option<&str>, source| ExhaustionObservation {
         account_id: "acct-a".into(),
         bound: true,
         kind: ObservationKind::BrocaLimitExhausted {
-            provider: provider.into(),
             limit_window: window.map(str::to_string),
+            pool: pool.map(str::to_string),
             requested_family: ModelFamily::Opus,
             resets_at_ms: Some(NOW + 10 * MINUTE),
             resets_at_source: source,
@@ -615,41 +578,53 @@ fn broca_limit_windows_map_to_scopes_and_retry_after_is_not_a_reset() {
         },
     };
     let five = confirmed(confirm_exhaustion(&broca(
-        "anthropic",
         Some("five_hour"),
+        None,
         Some(ResetSource::Header),
     )));
-    assert_eq!(five.scope, FenceScope::General(GeneralWindow::FiveHour));
+    assert_eq!(five.pool, Some(PoolKey::general(GeneralWindow::FiveHour)));
     assert_eq!(five.reset, ResetTime::At(NOW + 10 * MINUTE));
-    let seven = confirmed(confirm_exhaustion(&broca(
-        "anthropic",
-        Some("seven_day"),
-        None,
-    )));
-    assert_eq!(seven.scope, FenceScope::General(GeneralWindow::SevenDay));
+    let seven = confirmed(confirm_exhaustion(&broca(Some("seven_day"), None, None)));
+    assert_eq!(seven.pool, Some(PoolKey::general(GeneralWindow::SevenDay)));
+    // An exhaustion naming no pool blocks the whole account, whatever the
+    // provider (a ChatGPT `usage_limit_reached` names none either).
     let windowless = confirmed(confirm_exhaustion(&broca(
-        "anthropic",
+        None,
         None,
         Some(ResetSource::Header),
     )));
-    assert_eq!(
-        windowless.scope,
-        FenceScope::UnknownScope(ModelFamily::Opus)
-    );
+    assert_eq!(windowless.pool, None);
     let hinted = confirmed(confirm_exhaustion(&broca(
-        "anthropic",
         Some("five_hour"),
+        None,
         Some(ResetSource::RetryAfter),
     )));
     assert_eq!(hinted.reset, ResetTime::Missing);
     assert_eq!(hinted.retry_hint_ms, Some(NOW + 10 * MINUTE));
-    let chatgpt = confirmed(confirm_exhaustion(&broca("openai", None, None)));
-    assert_eq!(chatgpt.scope, FenceScope::General(GeneralWindow::SevenDay));
+    // A window routing has no length for is a named pool of unknown length,
+    // scoped to the reported family; it is no longer left unclassified.
+    let overage = confirmed(confirm_exhaustion(&broca(Some("overage"), None, None)));
     assert_eq!(
-        confirm_exhaustion(&broca("anthropic", Some("overage"), None)),
-        ConfirmationOutcome::Unclassified {
-            limit_window: "overage".into()
-        }
+        overage.pool,
+        Some(PoolKey {
+            window_minutes: None,
+            scope: PoolScope::Family(ModelFamily::Opus),
+            name: Some("overage".into()),
+        })
+    );
+    // The report's pool member names the pool; its window gives the length.
+    let pooled = confirmed(confirm_exhaustion(&broca(
+        Some("seven_day"),
+        Some("3p"),
+        None,
+    )));
+    assert_eq!(
+        pooled.pool,
+        Some(PoolKey {
+            window_minutes: Some(10_080),
+            scope: PoolScope::Family(ModelFamily::Opus),
+            name: Some("3p".into()),
+        })
     );
 }
 

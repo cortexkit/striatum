@@ -6,7 +6,7 @@ use prefrontal_routing_core::{
     find_most_specific_fallback_entry, fuzzy_match_model, resolve_compatible_model_settings,
     resolve_model_capabilities, resolve_model_id_alias, resolve_model_pipeline,
     resolve_user_model_pin, DesiredModelSettings, FallbackEntry, ModelCapabilitiesInput,
-    ModelCapabilitiesSnapshot, ModelCapabilitiesSnapshotEntry, ModelResolutionRequest,
+    ModelCapabilitiesSnapshot, ModelCapabilitiesSnapshotEntry, ModelNaming, ModelResolutionRequest,
     NativeUsageFacts, RouteStateStore, SnapshotLimit, SnapshotModalities, UserModelPinRequest,
     VariantFact,
 };
@@ -73,11 +73,12 @@ fn agent_model_requirements() -> &'static Value {
     })
 }
 
-fn resolve(params: ResolveModelParams) -> Result<Value, String> {
+fn resolve(params: ResolveModelParams, naming: &ModelNaming) -> Result<Value, String> {
     match params.action.as_str() {
         "pipeline" => Ok(json!({
             "resolution": resolve_model_pipeline(
-                params.request.as_ref().ok_or("pipeline requires request")?
+                params.request.as_ref().ok_or("pipeline requires request")?,
+                naming,
             )
         })),
         "user-pin" => Ok(json!({
@@ -140,6 +141,7 @@ async fn send_result(
 pub(super) async fn handle_resolve_model(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
+    naming: &ModelNaming,
 ) -> Result<(), ModuleError> {
     let params = match serde_json::from_slice::<ParamsBody<ResolveModelParams>>(&frame.body) {
         Ok(body) => body.params,
@@ -156,7 +158,7 @@ pub(super) async fn handle_resolve_model(
             .await;
         }
     };
-    match resolve(params) {
+    match resolve(params, naming) {
         Ok(result) => send_result(frame, writer, result).await,
         Err(error) => {
             send_route_error(
@@ -227,6 +229,7 @@ pub(super) async fn handle_model_capabilities(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
+    naming: &ModelNaming,
 ) -> Result<(), ModuleError> {
     let params = match serde_json::from_slice::<ParamsBody<CapabilitiesParams>>(&frame.body) {
         Ok(body)
@@ -260,7 +263,7 @@ pub(super) async fn handle_model_capabilities(
             .await;
         }
     };
-    match capabilities_reply(store, params) {
+    match capabilities_reply(store, params, naming) {
         Ok(reply) => send_result(frame, writer, reply).await,
         Err(error) => {
             send_route_error(
@@ -277,17 +280,24 @@ pub(super) async fn handle_model_capabilities(
     }
 }
 
-fn capabilities_reply(store: &SharedStore, params: CapabilitiesParams) -> Result<Value, String> {
+fn capabilities_reply(
+    store: &SharedStore,
+    params: CapabilitiesParams,
+    naming: &ModelNaming,
+) -> Result<Value, String> {
     let snapshot = snapshot_from_store(store, &params.provider_id, &params.model_id)?;
-    let capabilities = resolve_model_capabilities(&ModelCapabilitiesInput {
-        provider_id: params.provider_id,
-        model_id: params.model_id.clone(),
-        runtime_model: params.runtime_model,
-        runtime_snapshot: Some(snapshot),
-        bundled_snapshot: None,
-    });
+    let capabilities = resolve_model_capabilities(
+        &ModelCapabilitiesInput {
+            provider_id: params.provider_id,
+            model_id: params.model_id.clone(),
+            runtime_model: params.runtime_model,
+            runtime_snapshot: Some(snapshot),
+            bundled_snapshot: None,
+        },
+        naming,
+    );
     let compatible_settings = params.desired.as_ref().map(|desired| {
-        resolve_compatible_model_settings(&params.model_id, desired, Some(&capabilities))
+        resolve_compatible_model_settings(&params.model_id, desired, Some(&capabilities), naming)
     });
     Ok(json!({
         "capabilities": capabilities,
@@ -350,6 +360,13 @@ pub(super) fn usage_observation_from_store(
 mod tests {
     use super::*;
 
+    /// The model naming a converted config carries: the converter's shipped
+    /// vendor prefixes, provider rewrites and capability families.
+    fn default_model_naming() -> prefrontal_routing_core::ModelNaming {
+        serde_json::from_value(crate::config_convert::defaults()["model_naming"].clone())
+            .expect("converter model naming")
+    }
+
     #[test]
     fn model_resolution_module_table_matches_the_deleted_typescript_rows() {
         let requirements = agent_model_requirements();
@@ -370,41 +387,47 @@ mod tests {
 
     #[test]
     fn model_resolution_wire_actions_keep_the_typescript_shapes() {
-        let pipeline = resolve(ResolveModelParams {
-            action: "pipeline".into(),
-            request: Some(ModelResolutionRequest {
-                intent: prefrontal_routing_core::ModelResolutionIntent {
-                    user_model: Some("openai/gpt-5.3-codex".into()),
-                    ..Default::default()
-                },
-                constraints: Default::default(),
-                policy: Default::default(),
-            }),
-            user_pin: None,
-            provider_id: None,
-            model_id: None,
-            fallback_chain: Vec::new(),
-            target: None,
-            available_models: Vec::new(),
-            providers: Vec::new(),
-            suggestion: None,
-        })
+        let pipeline = resolve(
+            ResolveModelParams {
+                action: "pipeline".into(),
+                request: Some(ModelResolutionRequest {
+                    intent: prefrontal_routing_core::ModelResolutionIntent {
+                        user_model: Some("openai/gpt-5.3-codex".into()),
+                        ..Default::default()
+                    },
+                    constraints: Default::default(),
+                    policy: Default::default(),
+                }),
+                user_pin: None,
+                provider_id: None,
+                model_id: None,
+                fallback_chain: Vec::new(),
+                target: None,
+                available_models: Vec::new(),
+                providers: Vec::new(),
+                suggestion: None,
+            },
+            &default_model_naming(),
+        )
         .unwrap();
         assert_eq!(pipeline["resolution"]["provenance"], "override");
         assert_eq!(pipeline["resolution"]["model"], "openai/gpt-5.3-codex");
 
-        let suggestion = resolve(ResolveModelParams {
-            action: "suggestion".into(),
-            request: None,
-            user_pin: None,
-            provider_id: Some("anthropic".into()),
-            model_id: Some("claude-sonet-4".into()),
-            fallback_chain: Vec::new(),
-            target: None,
-            available_models: Vec::new(),
-            providers: Vec::new(),
-            suggestion: Some("claude-sonnet-4".into()),
-        })
+        let suggestion = resolve(
+            ResolveModelParams {
+                action: "suggestion".into(),
+                request: None,
+                user_pin: None,
+                provider_id: Some("anthropic".into()),
+                model_id: Some("claude-sonet-4".into()),
+                fallback_chain: Vec::new(),
+                target: None,
+                available_models: Vec::new(),
+                providers: Vec::new(),
+                suggestion: Some("claude-sonnet-4".into()),
+            },
+            &default_model_naming(),
+        )
         .unwrap();
         assert_eq!(suggestion["model"]["modelID"], "claude-sonnet-4");
     }
@@ -441,7 +464,8 @@ mod tests {
 
         // No snapshot has been recorded yet, so the module states no validity
         // rather than a number the caller could mistake for one.
-        let unversioned = capabilities_reply(&store, request()).expect("capabilities project");
+        let unversioned = capabilities_reply(&store, request(), &default_model_naming())
+            .expect("capabilities project");
         assert_eq!(unversioned["catalogVersion"], Value::Null);
         assert!(unversioned["capabilities"]["canonicalModelId"].is_string());
 
@@ -456,8 +480,8 @@ mod tests {
                 )
                 .expect("record a catalog snapshot");
             assert_eq!(
-                capabilities_reply(&store, request()).expect("capabilities project")
-                    ["catalogVersion"],
+                capabilities_reply(&store, request(), &default_model_naming())
+                    .expect("capabilities project")["catalogVersion"],
                 json!(version),
                 "version {version} is a recorded snapshot, not an absent one"
             );

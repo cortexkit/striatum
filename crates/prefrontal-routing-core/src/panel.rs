@@ -59,19 +59,6 @@ pub enum AvailabilitySubstrate {
     BrocaServedCatalog,
 }
 
-impl AvailabilitySubstrate {
-    /// The text recorded on an availability rejection and on the panel decision,
-    /// so the next reader of a decision row does not have to reconstruct which
-    /// list was consulted, or that Broca's own reach was never known.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Host => "host",
-            Self::Broca => "broca",
-            Self::BrocaServedCatalog => "broca reachability unknown: judged against served catalog",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PanelClass {
@@ -190,10 +177,16 @@ pub struct SelectPanelInput<'a> {
     pub operator_exclude_keys: Vec<String>,
     pub required_capabilities: Option<RequiredCapabilities>,
     /// The routes the sending substrate can reach. Which substrate that is comes
-    /// from `availability_substrate`, which also labels every rejection here.
+    /// from `availability_substrate`; `availability_label` labels every
+    /// rejection here.
     pub available_models: HashSet<String>,
     /// The substrate whose availability `available_models` describes.
     pub availability_substrate: AvailabilitySubstrate,
+    /// The text every availability rejection carries, naming the list that
+    /// was consulted, so a reader of a recorded rejection can tell a route the
+    /// sender cannot reach from one merely missing from the caller's host list.
+    /// The caller names its substrate; routing core never names a runner.
+    pub availability_label: String,
     pub is_subscription_route: Option<Box<dyn Fn(&ModelRoute) -> bool + 'a>>,
 }
 
@@ -839,7 +832,7 @@ fn select_panel_admitted(
         ],
         ..Default::default()
     };
-    let availability_substrate = input.availability_substrate;
+    let availability_label = input.availability_label.clone();
     causes.extend(admission.rejected.into_iter().map(|rejected| {
         // Use the same merged route/capacity deadlines as admission. Display text
         // may change independently, and must not become a retry protocol.
@@ -873,7 +866,7 @@ fn select_panel_admitted(
             // sender genuinely cannot reach from one that is merely missing from the
             // caller's host list, and the two have different fixes.
             detail: if rejected.reason == REASON_NOT_AVAILABLE && rejected.detail.is_none() {
-                Some(availability_substrate.as_str().to_string())
+                Some(availability_label.clone())
             } else {
                 rejected.detail
             },

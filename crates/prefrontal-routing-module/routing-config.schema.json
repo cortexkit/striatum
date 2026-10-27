@@ -3,10 +3,22 @@
   "title": "RoutingConfigFile",
   "type": "object",
   "properties": {
-    "account_selection": {
-      "$ref": "#/$defs/AccountSelectionFlags",
+    "accounts": {
+      "$ref": "#/$defs/ProviderAccountsPolicy",
       "default": {
-        "enabled": false
+        "floors": null,
+        "hold_when_reset_within": null,
+        "max_hold": null,
+        "metered_fallback": false,
+        "model_families": null,
+        "order": null,
+        "ordered": null,
+        "paid_credits": null,
+        "soft_quota_remaining_percent": null,
+        "spend_budget": null,
+        "spend_budget_reset_at_ms": null,
+        "strategy": null,
+        "unknown_reset_retry": null
       }
     },
     "catalog": {
@@ -15,123 +27,221 @@
         "poll_ms": null
       }
     },
-    "model_families": {
-      "$ref": "#/$defs/ModelFamilyRules",
-      "default": {
-        "claude": [
-          "*/claude-*",
-          "anthropic/*",
-          "google/antigravity-claude-*"
-        ],
-        "deepseek": [
-          "*/deepseek-*",
-          "deepseek/*"
-        ],
-        "gemini": [
-          "*/gemini-*",
-          "google/*"
-        ],
-        "glm": [
-          "*/glm-*",
-          "zai/*"
-        ],
-        "gpt": [
-          "openai/*",
-          "*/gpt-*",
-          "*/o1*",
-          "*/o3*",
-          "*/o4*"
-        ],
-        "grok": [
-          "*/grok-*",
-          "xai/*"
-        ],
-        "kimi": [
-          "*/kimi*",
-          "moonshotai/*",
-          "kimi-for-coding/*"
-        ],
-        "llama": [
-          "*/llama-*",
-          "meta/*"
-        ],
-        "minimax": [
-          "*/minimax-*",
-          "minimax/*"
-        ],
-        "mistral": [
-          "*/mistral-*",
-          "mistral/*"
-        ],
-        "other": [
-          "*"
-        ],
-        "qwen": [
-          "*/qwen*",
-          "alibaba-*/*"
-        ]
+    "consecutive_terminal_failure_threshold": {
+      "description": "Terminal send failures required before the route-local safety backoff starts.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 1
+    },
+    "consumers": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ConsumerPolicy"
+      },
+      "default": {}
+    },
+    "demand_exponent": {
+      "description": "Power-curve exponent mapping caller IQ demand to the request frontier.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double",
+      "default": null,
+      "exclusiveMinimum": 0
+    },
+    "elo_overrides": {
+      "description": "Request-time capability overrides. Unknown keys are ignored and surfaced\nto the caller for warning logs.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "number",
+        "format": "double",
+        "exclusiveMinimum": 0
+      },
+      "default": {}
+    },
+    "head_agents": {
+      "description": "Target agents that are heads: operator-facing sessions that may spend\na subscription's kept-free reserve. Matched case-insensitively.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
       }
     },
-    "model_routing": {
-      "$ref": "#/$defs/ModelRoutingSection",
+    "min_best_effort_adequacy": {
+      "description": "Minimum adequacy for best-effort selection (sanity band). Default 0.6.\nClamped to [0, 1]; NaN is rejected loudly at parse time.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double",
+      "default": null
+    },
+    "model_families": {
+      "$ref": "#/$defs/ModelFamilyRules",
+      "default": {}
+    },
+    "model_naming": {
+      "description": "How providers spell model ids and which model families the capability\nheuristic recognizes; see `ModelNamingConfig`.",
+      "$ref": "#/$defs/ModelNamingConfig",
       "default": {
-        "consecutive_terminal_failure_threshold": null,
-        "demand_exponent": null,
-        "elo_overrides": {},
-        "exclude": {
-          "all": [],
-          "athena": [],
-          "codemode": [],
-          "core": [],
-          "flow": [],
-          "lab": [],
-          "mason": [],
-          "sidekick": []
-        },
-        "keep_free_percent": {},
-        "min_best_effort_adequacy": null,
-        "models": {},
-        "overqualification": {
-          "base": null,
-          "doubling": null,
-          "threshold": null
-        },
-        "panels": {},
-        "pins": {},
-        "project_pins": {},
-        "providers_without_prompt_cache": [
-          "ollama-cloud"
-        ],
-        "score_alias": {},
-        "subscription": [],
-        "subscription_multipliers": {},
-        "substrates": {},
-        "variants": {
-          "all": {},
-          "athena": {},
-          "codemode": {},
-          "core": {},
-          "flow": {},
-          "lab": {},
-          "mason": {},
-          "sidekick": {}
-        }
+        "basic_families": [],
+        "provider_rewrites": {},
+        "vendor_prefixes": []
       }
+    },
+    "models": {
+      "description": "Keyed by \"provider/model\" or \"provider/model/variant\".",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelFactOverride"
+      },
+      "default": {}
+    },
+    "overqualification": {
+      "description": "Over-qualification term added to selection cost for routes far above the\nrequest's iq demand. Absent fields take the routing-core defaults.",
+      "$ref": "#/$defs/OverqualificationSection",
+      "default": {
+        "base": null,
+        "doubling": null,
+        "threshold": null
+      }
+    },
+    "panels": {
+      "$ref": "#/$defs/PanelPolicies",
+      "default": {}
+    },
+    "providers": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ProviderPolicy"
+      },
+      "default": {}
+    },
+    "quota_model_pools": {
+      "description": "Quota pools that meter only some models: a routed model whose id\nstarts with `model_prefix` draws on `pool` beside its family pool.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/QuotaModelPoolConfig"
+      }
+    },
+    "runners": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/RunnerPolicy"
+      }
+    },
+    "substrates": {
+      "description": "Route-to-harness mapping. Resolve the workload group, consumer group,\nthen `all`, taking each group's longest matching route key or default.\nRoutes not covered by any group run on Broca.",
+      "$ref": "#/$defs/SubstrateGroups",
+      "default": {}
+    },
+    "variants": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
     }
   },
   "additionalProperties": false,
   "$defs": {
-    "AccountSelectionFlags": {
-      "description": "The account-selection flag (`\"account_selection\"` in the routing file).\nOff unless the file turns it on.",
+    "AccountDuration": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "AccountModelFamily": {
+      "description": "One model's quota family under `accounts.model_families`.",
       "type": "object",
       "properties": {
-        "enabled": {
-          "description": "Serve `route.account_for` and accept its reports. Off: every account\noperation refuses with `account_selection_disabled`.",
-          "type": "boolean",
-          "default": false
+        "family": {
+          "$ref": "#/$defs/AccountQuotaFamily"
+        },
+        "model": {
+          "type": "string"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "family"
+      ]
+    },
+    "AccountPoolFloor": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "window_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "remaining_percent"
+      ]
+    },
+    "AccountQuotaFamily": {
+      "description": "The model-scoped quota families account selection keeps apart.",
+      "type": "string",
+      "enum": [
+        "fable",
+        "mythos",
+        "opus",
+        "other"
+      ]
+    },
+    "BasicFamilyConfig": {
+      "type": "object",
+      "properties": {
+        "family": {
+          "type": "string"
+        },
+        "needles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "needles"
+      ]
     },
     "CatalogSection": {
       "type": "object",
@@ -148,64 +258,128 @@
       },
       "additionalProperties": false
     },
-    "ExcludeGroups": {
+    "ConsumerMode": {
+      "type": "string",
+      "enum": [
+        "demand",
+        "ladder"
+      ]
+    },
+    "ConsumerPolicy": {
       "type": "object",
       "properties": {
-        "all": {
-          "type": "array",
-          "default": [],
+        "context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "eq": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "iq": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "ladder": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
           "items": {
             "type": "string"
           }
         },
-        "athena": {
-          "type": "array",
-          "default": [],
+        "max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConsumerMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "pay_per_token": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "pin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SynthesizerPin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "projects": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ProjectPolicy"
+          },
+          "default": {}
+        },
+        "runner": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "tool_capabilities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
           "items": {
             "type": "string"
           }
         },
-        "codemode": {
-          "type": "array",
-          "default": [],
-          "items": {
+        "variants": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
             "type": "string"
-          }
-        },
-        "core": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "flow": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "lab": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "mason": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "sidekick": {
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
+          },
+          "default": null
         }
       },
       "additionalProperties": false
@@ -226,19 +400,6 @@
         "broca",
         "opencode",
         "pi"
-      ]
-    },
-    "LabPlannerPin": {
-      "type": "object",
-      "properties": {
-        "model": {
-          "type": "string",
-          "pattern": "^[^/\\s]+/[^\\s]+$"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "model"
       ]
     },
     "ModelFactOverride": {
@@ -285,6 +446,33 @@
           ],
           "default": null
         },
+        "not_for": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "only_for": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "pin_only": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "speed": {
           "type": [
             "number",
@@ -301,6 +489,13 @@
           "format": "double",
           "exclusiveMinimum": 0,
           "maximum": 2
+        },
+        "subscription": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
         },
         "subscription_multiplier": {
           "description": "Subscription subsidy multiplier: divides the route's list price to yield its\neffective price. 1.0 (or absent) means \"no subsidy known\"; larger values make\nthe route proportionally cheaper than list. Validated at load (must be finite\nand > 0); an invalid value is rejected and logged, not applied.",
@@ -321,284 +516,195 @@
       "additionalProperties": false
     },
     "ModelFamilyRules": {
-      "type": "object",
-      "properties": {
-        "claude": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "claude": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "deepseek": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "gemini": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "glm": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "gpt": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "grok": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "kimi": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "llama": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "minimax": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "mistral": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "other": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            },
+            "qwen": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "\\S"
+              }
+            }
+          },
+          "additionalProperties": false
         },
-        "deepseek": {
+        {
           "type": "array",
           "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "gemini": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "glm": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "gpt": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "grok": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "kimi": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "llama": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "minimax": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "mistral": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "other": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
-          }
-        },
-        "qwen": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "pattern": "\\S"
+            "type": "object",
+            "properties": {
+              "family": {
+                "enum": [
+                  "claude",
+                  "gpt",
+                  "gemini",
+                  "grok",
+                  "qwen",
+                  "kimi",
+                  "glm",
+                  "deepseek",
+                  "minimax",
+                  "mistral",
+                  "llama",
+                  "other"
+                ]
+              },
+              "globs": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "\\S"
+                }
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "family",
+              "globs"
+            ]
           }
         }
-      },
-      "additionalProperties": false
+      ]
     },
-    "ModelRoutingSection": {
+    "ModelNamingConfig": {
+      "description": "Operator config for `prefrontal_routing_core::ModelNaming`, the model-id\nspelling `route.resolve_model` applies per provider and the model families\n`route.model_capabilities` recognizes by name. The config converter writes\nthe shipped values from its data file.",
       "type": "object",
       "properties": {
-        "consecutive_terminal_failure_threshold": {
-          "description": "Terminal send failures required before the route-local safety backoff starts.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "default": null,
-          "minimum": 1
-        },
-        "consumers": {
-          "description": "The `routing/v1` consumer ids `route.select` answers. Absent: every\nrequest class (mason, sidekick, athena, lab, core, codemode, flow) and\nMagic Context's mc_summary, mc_dream, mc_dream_verify, mc_dream_map,\nmc_dream_curate, mc_dream_classify, mc_dream_review_user,\nmc_dream_retrospective, mc_dream_primers, mc_dream_compress_cues and\nmc_dream_docs. When present, this array replaces the defaults; only its\nlisted ids are accepted.\nCodemode and flow are answered only with routes priced per token.",
-          "type": [
-            "array",
-            "null"
-          ],
+        "basic_families": {
+          "description": "Families recognized by a substring of the normalized model id, each\nwith the basic variants. The first match wins.",
+          "type": "array",
+          "default": [],
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/BasicFamilyConfig"
           }
         },
-        "demand_exponent": {
-          "description": "Power-curve exponent mapping caller IQ demand to the request frontier.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double",
-          "default": null,
-          "exclusiveMinimum": 0
-        },
-        "elo_overrides": {
-          "description": "Request-time capability overrides. Unknown keys are ignored and surfaced\nto the caller for warning logs.",
+        "provider_rewrites": {
+          "description": "The rewrites each provider applies to a model id, in order.",
           "type": "object",
           "additionalProperties": {
-            "type": "number",
-            "format": "double",
-            "exclusiveMinimum": 0
-          },
-          "default": {}
-        },
-        "exclude": {
-          "description": "Excluded providers or routes by consumer. The `all` list applies to every\nconsumer; a negated entry in another list cannot remove its exclusions.\nExclusion keeps a route out of automatic choice only: a request that names\nthe model (a work run's `model=`, a synthesizer or planner pin) is still\nadmitted when the route is otherwise servable.",
-          "$ref": "#/$defs/ExcludeGroups",
-          "default": {
-            "all": [],
-            "athena": [],
-            "codemode": [],
-            "core": [],
-            "flow": [],
-            "lab": [],
-            "mason": [],
-            "sidekick": []
-          }
-        },
-        "keep_free_percent": {
-          "description": "Percent of each weekly account window reserved from delegated workers;\nlong-lived head agents may spend that reserved share.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "number",
-            "format": "double",
-            "maximum": 100,
-            "minimum": 0
-          },
-          "default": {},
-          "propertyNames": {
-            "pattern": "\\S"
-          }
-        },
-        "min_best_effort_adequacy": {
-          "description": "Minimum adequacy for best-effort selection (sanity band). Default 0.6.\nClamped to [0, 1]; NaN is rejected loudly at parse time.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double",
-          "default": null
-        },
-        "models": {
-          "description": "Keyed by \"provider/model\" or \"provider/model/variant\".",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/ModelFactOverride"
-          },
-          "default": {}
-        },
-        "overqualification": {
-          "description": "Over-qualification term added to selection cost for routes far above the\nrequest's iq demand. Absent fields take the routing-core defaults.",
-          "$ref": "#/$defs/OverqualificationSection",
-          "default": {
-            "base": null,
-            "doubling": null,
-            "threshold": null
-          }
-        },
-        "panels": {
-          "$ref": "#/$defs/PanelPolicies",
-          "default": {}
-        },
-        "pins": {
-          "$ref": "#/$defs/Pins",
-          "default": {}
-        },
-        "project_pins": {
-          "description": "Operator pins per project, `{<project id>: {<consumer>:\n\"provider/model[:variant]\"}}`. A `routing/v1` select on a route bound to\nthat project, for that consumer, that names no pin of its own runs on\nthe pinned model when it can be served, and is routed as usual when not.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "string"
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/ModelRewriteConfig"
             }
           },
           "default": {}
         },
-        "providers_without_prompt_cache": {
-          "description": "Providers that do not expose prompt-cache reads or writes. Gather seats\navoid these providers when a cache-capable adequate route exists.",
-          "type": "array",
-          "default": [
-            "ollama-cloud"
-          ],
-          "items": {
-            "type": "string"
-          }
-        },
-        "runners": {
-          "description": "The runner modules `routing/v1` answers with, in preference order.\nAbsent: Broca alone, on the routes its credentials serve.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/RunnerPolicy"
-          }
-        },
-        "score_alias": {
-          "description": "Providers that borrow another provider's catalog rows, keyed alias to\ntarget: `{\"anthropic-platform\": \"anthropic\"}`. Default empty.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "subscription": {
-          "description": "Providers and models priced as subscription-backed in addition to auth facts.",
+        "vendor_prefixes": {
+          "description": "For a gateway serving other vendors' models as `vendor/model`: the\nvendor of a bare model id, by the id's prefix. The first match wins.",
           "type": "array",
           "default": [],
           "items": {
-            "type": "string"
-          }
-        },
-        "subscription_multipliers": {
-          "description": "Provider-keyed subscription subsidy multipliers (\"openai\": 40). The\nsubsidy is a property of the account serving the provider, so this is\nthe primary shape; a per-model `subscription_multiplier` in `models`\noverrides its provider's value for that route only. An entry also states\nthat the provider's plan is priced at list divided by the multiplier, so\na plan whose own rates the catalog does not publish still prices.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "number",
-            "format": "double",
-            "exclusiveMinimum": 0
-          },
-          "default": {},
-          "propertyNames": {
-            "pattern": "\\S"
-          }
-        },
-        "substrates": {
-          "description": "Route-to-harness mapping. Resolve the workload group, consumer group,\nthen `all`, taking each group's longest matching route key or default.\nRoutes not covered by any group run on Broca.",
-          "$ref": "#/$defs/SubstrateGroups",
-          "default": {}
-        },
-        "variants": {
-          "description": "Reasoning-variant overrides by consumer, grouped like `exclude`. A\nselection runs at the caller's named variant, else `variants.<consumer>`,\nelse `variants.all`, else the route's curated default. Each value must\nbe an effort the catalog publishes for the matched models.",
-          "$ref": "#/$defs/VariantGroups",
-          "default": {
-            "all": {},
-            "athena": {},
-            "codemode": {},
-            "core": {},
-            "flow": {},
-            "lab": {},
-            "mason": {},
-            "sidekick": {}
+            "$ref": "#/$defs/VendorPrefixConfig"
           }
         }
       },
       "additionalProperties": false
     },
+    "ModelRewriteConfig": {
+      "description": "`vendor_prefix` serves the id as `vendor/model`; `dot_version` spells a\ndashed two-part Claude-style version with a dot; `{\"preview_alias\": a}`\nexpands the bare alias `a` to its `-preview` id.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "vendor_prefix",
+            "dot_version"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "preview_alias": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "preview_alias"
+          ]
+        }
+      ]
+    },
     "OverqualificationSection": {
-      "description": "`model_routing.overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.\n`base: 0` switches the term off.",
+      "description": "`overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.\n`base: 0` switches the term off.",
       "type": "object",
       "properties": {
         "base": {
@@ -844,20 +950,242 @@
         "floor"
       ]
     },
-    "Pins": {
+    "ProjectPolicy": {
       "type": "object",
       "properties": {
-        "lab_planner": {
-          "$ref": "#/$defs/LabPlannerPin"
-        },
-        "spec_designer": {
-          "$ref": "#/$defs/SynthesizerPin"
-        },
-        "synthesizer": {
-          "$ref": "#/$defs/SynthesizerPin"
+        "pin": {
+          "type": "string",
+          "default": ""
         }
       },
       "additionalProperties": false
+    },
+    "ProviderAccountsPolicy": {
+      "description": "Per-provider account controls. Metered fallback requires explicit opt-in.",
+      "type": "object",
+      "properties": {
+        "floors": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "$ref": "#/$defs/AccountPoolFloor"
+          }
+        },
+        "hold_when_reset_within": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_hold": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "metered_fallback": {
+          "type": "boolean",
+          "default": false
+        },
+        "model_families": {
+          "description": "The models that draw on a model-scoped quota family, by exact model\nid. A model not listed counts as `other`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "$ref": "#/$defs/AccountModelFamily"
+          }
+        },
+        "order": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "ordered": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "paid_credits": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "soft_quota_remaining_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "spend_budget": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "spend_budget_reset_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "strategy": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "unknown_reset_retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderPolicy": {
+      "type": "object",
+      "properties": {
+        "accounts": {
+          "$ref": "#/$defs/ProviderAccountsPolicy",
+          "default": {
+            "floors": null,
+            "hold_when_reset_within": null,
+            "max_hold": null,
+            "metered_fallback": false,
+            "model_families": null,
+            "order": null,
+            "ordered": null,
+            "paid_credits": null,
+            "soft_quota_remaining_percent": null,
+            "spend_budget": null,
+            "spend_budget_reset_at_ms": null,
+            "strategy": null,
+            "unknown_reset_retry": null
+          }
+        },
+        "keep_free_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "models": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "not_for": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "only_for": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "pin_only": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "prompt_cache": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "subscription": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "subscription_multiplier": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "QuotaModelPoolConfig": {
+      "type": "object",
+      "properties": {
+        "model_prefix": {
+          "type": "string"
+        },
+        "pool": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model_prefix",
+        "pool"
+      ]
     },
     "Ranking": {
       "type": "string",
@@ -868,7 +1196,7 @@
       ]
     },
     "RunnerPolicy": {
-      "description": "A runner module `routing/v1` answers with (`model_routing.runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",
+      "description": "A runner module `routing/v1` answers with (`runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",
       "type": "object",
       "properties": {
         "module": {
@@ -877,7 +1205,7 @@
           "pattern": "^\\S+$"
         },
         "routes": {
-          "description": "The routes it runs, in the exclusion grammar (`provider`,\n`provider/model`, `provider/model/variant`). Absent: every route it\nserves; for `broca`, the routes Broca's credentials serve, and for any\nother module every catalog route.",
+          "description": "The routes it runs, in the exclusion grammar (`provider`,\n`provider/model`, `provider/model/variant`). Absent: every route it\nserves. With `via_vault`, reach also requires a serving vault credential.",
           "type": [
             "array",
             "null"
@@ -893,6 +1221,11 @@
           "items": {
             "type": "string"
           }
+        },
+        "via_vault": {
+          "description": "When true, reaching this runner also requires a serving vault credential.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
@@ -1248,68 +1581,21 @@
         "variant"
       ]
     },
-    "VariantGroups": {
-      "description": "Per-consumer reasoning-variant overrides, grouped like `model_routing.exclude`.\nEach key is a route spec in the exclusion grammar without negation\n(`provider`, `provider/model`, `provider/model/variant`); each value is a\nvariant name the catalog publishes for the matched models.",
+    "VendorPrefixConfig": {
       "type": "object",
       "properties": {
-        "all": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
+        "prefix": {
+          "type": "string"
         },
-        "athena": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "codemode": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "core": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "flow": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "lab": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "mason": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
-        },
-        "sidekick": {
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {}
+        "vendor": {
+          "type": "string"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "prefix",
+        "vendor"
+      ]
     }
   }
 }

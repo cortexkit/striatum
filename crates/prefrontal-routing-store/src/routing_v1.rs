@@ -6,7 +6,7 @@
 //! The decision itself is the row `route.select` writes into the decision
 //! ledger; this module only keeps what v1 adds to it.
 
-use prefrontal_routing_core::RouteStateResult;
+use prefrontal_routing_core::{accounts::AllowedAccountClass, RouteStateResult};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{err, SqliteRouteStateStore};
@@ -18,6 +18,7 @@ pub struct V1Decision {
     /// The route principal that selected it (`reserved:<module>`, ...).
     pub principal: String,
     pub consumer: String,
+    pub allowed_account_class: AllowedAccountClass,
     pub project_id: Option<String>,
     pub provider: String,
     pub model: String,
@@ -46,8 +47,8 @@ impl SqliteRouteStateStore {
                 tx.execute(
                     "INSERT INTO routing_v1_decision
                        (decision_id, principal, consumer, project_id, provider, model, variant,
-                        runner_module, affinity, created_at_ms, expires_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         decision.decision_id,
                         decision.principal,
@@ -60,6 +61,7 @@ impl SqliteRouteStateStore {
                         decision.affinity,
                         decision.created_at_ms,
                         decision.expires_at_ms,
+                        decision.allowed_account_class.as_str(),
                     ],
                 )?;
                 if let Some(affinity) = &decision.affinity {
@@ -92,7 +94,7 @@ impl SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 c.query_row(
                     "SELECT decision_id, principal, consumer, project_id, provider, model, variant,
-                            runner_module, affinity, created_at_ms, expires_at_ms
+                            runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class
                      FROM routing_v1_decision WHERE decision_id = ?1",
                     params![decision_id],
                     |row| {
@@ -108,6 +110,9 @@ impl SqliteRouteStateStore {
                             affinity: row.get(8)?,
                             created_at_ms: row.get(9)?,
                             expires_at_ms: row.get(10)?,
+                            allowed_account_class: AllowedAccountClass::parse(&row.get::<_, String>(11)?)
+                                .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                                    11, rusqlite::types::Type::Text, error.into()))?,
                         })
                     },
                 )
@@ -116,8 +121,8 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// The previous decision for an affinity key, unless a failure report
-    /// ended the preference.
+    /// The previous decision for a live route affinity key. A failure report
+    /// ends that decision's preference, but never a newer decision's preference.
     pub fn v1_affinity_decision(
         &self,
         principal: &str,
@@ -162,16 +167,16 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Record the first report on a decision. When `ends_affinity` is set, the
-    /// affinity preference whose previous decision this is ends in the same
-    /// transaction. Returns the report that stands: this one, or one another
-    /// caller recorded first.
+    /// Record the first report on a decision. A failure ends route affinity
+    /// only while it still names this decision; account affinity is separate.
+    /// Returns the report
+    /// that stands: this one, or one another caller recorded first.
     pub fn v1_record_report(
         &self,
         decision_id: &str,
         report_id: &str,
         recorded: &V1Recorded,
-        ends_affinity: bool,
+        failed: bool,
         now_ms: i64,
     ) -> RouteStateResult<V1Recorded> {
         self.store
@@ -190,10 +195,10 @@ impl SqliteRouteStateStore {
                         now_ms
                     ],
                 )?;
-                if inserted == 1 && ends_affinity {
+                if inserted == 1 && failed {
                     tx.execute(
-                        "UPDATE routing_v1_affinity SET ended_at_ms = ?2
-                         WHERE decision_id = ?1 AND ended_at_ms IS NULL",
+                        "UPDATE routing_v1_affinity SET ended_at_ms=?2
+                         WHERE decision_id=?1 AND ended_at_ms IS NULL",
                         params![decision_id, now_ms],
                     )?;
                 }
@@ -304,6 +309,7 @@ mod tests {
             decision_id: id.into(),
             principal: "reserved:consumer".into(),
             consumer: "summary".into(),
+            allowed_account_class: AllowedAccountClass::NotPayPerToken,
             project_id: None,
             provider: "p".into(),
             model: "m".into(),
@@ -316,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn affinity_follows_the_last_decision_and_a_failure_report_ends_it() {
+    fn a_failure_ends_only_its_current_route_affinity() {
         let store = store("affinity");
         store
             .v1_record_decision(&decision("d1", Some("k")))
@@ -336,11 +342,16 @@ mod tests {
             answer_json: "{}".into(),
         };
         store.v1_record_report("d1", "r1", &body, true, 5).unwrap();
-        assert!(store
-            .v1_affinity_decision("reserved:consumer", "summary", "k")
-            .unwrap()
-            .is_some());
+        assert_eq!(
+            store
+                .v1_affinity_decision("reserved:consumer", "summary", "k")
+                .unwrap()
+                .unwrap()
+                .decision_id,
+            "d2"
+        );
 
+        // A failure report on the current decision ends route affinity.
         store.v1_record_report("d2", "r2", &body, true, 6).unwrap();
         assert!(store
             .v1_affinity_decision("reserved:consumer", "summary", "k")
@@ -351,6 +362,16 @@ mod tests {
         store
             .v1_record_decision(&decision("d3", Some("k")))
             .unwrap();
+        assert_eq!(
+            store
+                .v1_affinity_decision("reserved:consumer", "summary", "k")
+                .unwrap()
+                .unwrap()
+                .decision_id,
+            "d3"
+        );
+        store.v1_record_report("d2", "r2", &body, true, 7).unwrap();
+        store.v1_record_report("d3", "r3", &body, false, 8).unwrap();
         assert_eq!(
             store
                 .v1_affinity_decision("reserved:consumer", "summary", "k")
@@ -381,7 +402,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .v1_record_report("d1", "r2", &second, false, 2)
+                .v1_record_report("d1", "r2", &second, true, 2)
                 .unwrap(),
             first
         );

@@ -365,7 +365,7 @@ pub const MAGIC_CONTEXT_CONSUMERS: &[&str] = &[
     "mc_dream_docs",
 ];
 
-/// A runner module `routing/v1` answers with (`model_routing.runners[]`).
+/// A runner module `routing/v1` answers with (`runners[]`).
 /// Listed in preference order: the first listed runner that can serve the
 /// answered route is named.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -377,8 +377,7 @@ pub struct RunnerPolicy {
     pub module: String,
     /// The routes it runs, in the exclusion grammar (`provider`,
     /// `provider/model`, `provider/model/variant`). Absent: every route it
-    /// serves; for `broca`, the routes Broca's credentials serve, and for any
-    /// other module every catalog route.
+    /// serves. With `via_vault`, reach also requires a serving vault credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routes: Option<Vec<String>>,
     /// Tool capability tags (such as `code.read/v1`) the runner can reach a
@@ -386,14 +385,225 @@ pub struct RunnerPolicy {
     /// only on a runner reaching every one of them.
     #[serde(default)]
     pub tool_capabilities: Vec<String>,
+    /// When true, reaching this runner also requires a serving vault credential.
+    #[serde(default)]
+    pub via_vault: bool,
 }
 
-/// The runners served when the routing file names none: Broca, on the routes
-/// its credentials serve.
-pub fn default_runners() -> Vec<RunnerPolicy> {
-    vec![RunnerPolicy {
-        module: "broca".into(),
-        routes: None,
-        tool_capabilities: Vec::new(),
-    }]
+/// Match only whole dotted consumer segments, never an unrelated name that
+/// happens to start with the same characters.
+pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
+    consumer == prefix
+        || consumer
+            .strip_prefix(prefix)
+            .is_some_and(|tail| tail.starts_with('.'))
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct EntityPolicy {
+    pub only_for: Option<Vec<String>>,
+    pub not_for: Option<Vec<String>>,
+    pub pin_only: Option<bool>,
+    pub subscription: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderPolicy {
+    #[serde(flatten)]
+    pub rules: EntityPolicy,
+    pub prompt_cache: Option<bool>,
+    pub subscription_multiplier: Option<f64>,
+    pub keep_free_percent: Option<f64>,
+    pub models: Option<Vec<String>>,
+    pub accounts: ProviderAccountsPolicy,
+}
+
+/// Per-provider account controls. Metered fallback requires explicit opt-in.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderAccountsPolicy {
+    pub metered_fallback: bool,
+    pub strategy: Option<String>,
+    pub order: Option<Vec<String>>,
+    pub ordered: Option<String>,
+    pub soft_quota_remaining_percent: Option<f64>,
+    pub floors: Option<Vec<AccountPoolFloor>>,
+    pub max_hold: Option<AccountDuration>,
+    pub hold_when_reset_within: Option<AccountDuration>,
+    pub unknown_reset_retry: Option<AccountDuration>,
+    pub spend_budget: Option<f64>,
+    pub spend_budget_reset_at_ms: Option<i64>,
+    pub paid_credits: Option<bool>,
+    /// The models that draw on a model-scoped quota family, by exact model
+    /// id. A model not listed counts as `other`.
+    pub model_families: Option<Vec<AccountModelFamily>>,
+}
+
+/// One model's quota family under `accounts.model_families`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountModelFamily {
+    pub model: String,
+    pub family: AccountQuotaFamily,
+}
+
+/// The model-scoped quota families account selection keeps apart.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountQuotaFamily {
+    Fable,
+    Mythos,
+    Opus,
+    Other,
+}
+
+impl AccountQuotaFamily {
+    pub fn family(self) -> prefrontal_routing_core::accounts::ModelFamily {
+        use prefrontal_routing_core::accounts::ModelFamily;
+        match self {
+            Self::Fable => ModelFamily::Fable,
+            Self::Mythos => ModelFamily::Mythos,
+            Self::Opus => ModelFamily::Opus,
+            Self::Other => ModelFamily::Other,
+        }
+    }
+}
+
+/// The policy's model-to-family map from `accounts.model_families`.
+pub fn account_model_families(
+    families: &[AccountModelFamily],
+) -> Vec<prefrontal_routing_core::accounts::ModelFamilyMapping> {
+    families
+        .iter()
+        .map(
+            |entry| prefrontal_routing_core::accounts::ModelFamilyMapping {
+                model: entry.model.clone(),
+                family: entry.family.family(),
+            },
+        )
+        .collect()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AccountDuration {
+    Seconds(u64),
+    Text(String),
+}
+
+impl AccountDuration {
+    pub fn seconds(&self) -> Result<u64, String> {
+        match self {
+            Self::Seconds(seconds) => Ok(*seconds),
+            Self::Text(text) => {
+                let (number, factor) = if let Some(number) = text.strip_suffix('s') {
+                    (number, 1)
+                } else if let Some(number) = text.strip_suffix('m') {
+                    (number, 60)
+                } else if let Some(number) = text.strip_suffix('h') {
+                    (number, 3600)
+                } else {
+                    return Err("duration must use s, m or h".into());
+                };
+                number
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|number| number.checked_mul(factor))
+                    .ok_or_else(|| "duration must be a non-negative whole number of seconds".into())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AccountPoolFloor {
+    pub pool: Option<String>,
+    pub window_minutes: Option<u32>,
+    pub model: Option<String>,
+    pub remaining_percent: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerMode {
+    Demand,
+    Ladder,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectPolicy {
+    pub pin: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsumerPolicy {
+    pub mode: Option<ConsumerMode>,
+    pub ladder: Option<Vec<String>>,
+    pub variants: Option<BTreeMap<String, String>>,
+    pub runner: Option<String>,
+    pub owner: Option<String>,
+    pub pay_per_token: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "present_value",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pin: Option<SynthesizerPin>,
+    pub projects: BTreeMap<String, ProjectPolicy>,
+    pub iq: Option<f64>,
+    pub eq: Option<f64>,
+    pub context_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub tool_capabilities: Option<Vec<String>>,
+}
+
+pub fn is_slot(name: &str) -> bool {
+    matches!(name, "synthesizer" | "lab_planner" | "spec_designer")
+}
+
+/// Resolve each key independently, exhausting operator ancestors before looking
+/// at the request or declaration. A more specific lower-priority source cannot
+/// override an operator's parent entry.
+pub fn resolve_consumer_policy(
+    consumer: &str,
+    operator: &BTreeMap<String, ConsumerPolicy>,
+    request: &ConsumerPolicy,
+    declared: &BTreeMap<String, ConsumerPolicy>,
+) -> ConsumerPolicy {
+    let mut result = serde_json::Map::new();
+    let mut overlay = |entry: &ConsumerPolicy| {
+        for (key, value) in serde_json::to_value(entry).unwrap().as_object().unwrap() {
+            if !value.is_null() && value != &serde_json::json!({}) {
+                result.insert(key.clone(), value.clone());
+            }
+        }
+    };
+    for (source, is_operator) in [(declared, false), (operator, true)] {
+        if is_operator {
+            overlay(request);
+        }
+        let mut chain: Vec<_> = source
+            .iter()
+            .filter(|(name, _)| !is_slot(name) && consumer_matches(name, consumer))
+            .collect();
+        chain.sort_by_key(|(name, _)| name.len());
+        for (_, entry) in chain {
+            overlay(entry);
+        }
+    }
+    let mut result: ConsumerPolicy =
+        serde_json::from_value(serde_json::Value::Object(result)).unwrap();
+    if let Some(pin) = &result.pin {
+        result.mode = Some(ConsumerMode::Ladder);
+        result.ladder = Some(vec![pin.variant.as_ref().map_or_else(
+            || pin.model.clone(),
+            |variant| format!("{}:{variant}", pin.model),
+        )]);
+    }
+    result
 }

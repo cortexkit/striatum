@@ -77,10 +77,11 @@ pub fn classify_failure_attribution(
     last_error: Option<&str>,
 ) -> FailureAttribution {
     let error = last_error.unwrap_or_default().to_ascii_lowercase();
-    // Core renders Broca's typed code either as a caller error prefix or as a
+    // Core renders the runner's typed code either as a caller error prefix or as a
     // labelled field in the worker's terminal diagnostic. Do not inspect the raw
-    // provider body: it can mention request errors without classifying this run.
-    let diagnostic_fields = error.split("; broca said:").next().unwrap_or_default();
+    // provider body (after "; <runner> said:"): it can mention request errors
+    // without classifying this run.
+    let diagnostic_fields = runner_diagnostic(&error);
     if error.starts_with("request_invalid:")
         || diagnostic_fields
             .split("; ")
@@ -88,8 +89,8 @@ pub fn classify_failure_attribution(
     {
         return FailureAttribution::RequestInvalid;
     }
-    // Only inspect the runner's diagnostic, not text it attributes to Broca's
-    // provider response. These markers describe a failed session.send admission,
+    // Only inspect the runner's diagnostic, not text it attributes to the
+    // provider's response. These markers describe a failed session.send admission,
     // not an error returned by a provider after dispatch.
     if is_pre_dispatch_runner_failure(diagnostic_fields) {
         return FailureAttribution::NoDispatch;
@@ -169,13 +170,32 @@ pub fn classify_failure_attribution(
     }
 }
 
-/// Recognize the concrete Broca send and runner-unavailable diagnostics that prove
+/// The part of a lowercased terminal diagnostic before the provider body the
+/// runner quotes as "; <runner> said: …". The runner's name is a single word
+/// read from the text.
+fn runner_diagnostic(error: &str) -> &str {
+    let mut from = 0;
+    while let Some(at) = error[from..].find(" said:") {
+        let end = from + at;
+        if let Some(start) = error[..end].rfind("; ") {
+            let runner = &error[start + 2..end];
+            if !runner.is_empty() && !runner.contains(char::is_whitespace) {
+                return &error[..start];
+            }
+        }
+        from = end + " said:".len();
+    }
+    error
+}
+
+/// Recognize the concrete runner send and runner-unavailable diagnostics that prove
 /// the provider was never given a request. A provider response body is removed by the
-/// caller before these structural markers are checked.
+/// caller before these structural markers are checked. A runner whose management
+/// surface could not be opened never received the request, whichever runner it is.
 fn is_pre_dispatch_runner_failure(diagnostic: &str) -> bool {
     diagnostic.contains("llm_runner_unavailable:")
         || diagnostic.contains("session.send: request not sent:")
-        || diagnostic.contains("route.open failed for target management_surface:broca:")
+        || diagnostic.contains("route.open failed for target management_surface:")
 }
 
 /// Advance route-local failure backoff only for provider-attributable terminal evidence.

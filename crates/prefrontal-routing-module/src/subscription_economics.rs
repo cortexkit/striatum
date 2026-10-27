@@ -456,6 +456,12 @@ fn overlay_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The head agents a converted config lists (`head_agents`).
+    fn head_agents_of_converted_config() -> Vec<String> {
+        serde_json::from_value(crate::config_convert::defaults()["head_agents"].clone())
+            .expect("converter head agents")
+    }
     use crate::account_quota::{RosterIdentity, StoredReading, VaultRoster};
     use sha2::{Digest, Sha256};
     const NOW: i64 = 1791507600000;
@@ -867,7 +873,36 @@ mod tests {
         });
         fact.class_vector_is_overlay = true;
         let mut credentials = crate::broca_credentials::BrocaCredentials::default();
-        credentials.refresh_serving_methods(&state, &[fact.clone()], now);
+        credentials.apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                view: "incident".into(),
+                credentials: state
+                    .roster
+                    .as_ref()
+                    .unwrap()
+                    .identities
+                    .iter()
+                    .flat_map(|identity| {
+                        identity.credential_ids.iter().map(|id| {
+                            cortexkit_claustrum_client::ListedCredential {
+                                id: id.clone(),
+                                account_id: Some(identity.account_id.clone()),
+                                refresh_adapter: Some("anthropic".into()),
+                                provider_ids: vec!["anthropic".into()],
+                                credential_type: "oauth".into(),
+                                auth_method: Some("oauth".into()),
+                                categories: vec!["llm-provider".into()],
+                                state: "active".into(),
+                                ..Default::default()
+                            }
+                        })
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            now as u64,
+        );
+        credentials.refresh_serving_methods(&state, &[fact.clone()], now, &[]);
         assert_eq!(
             credentials.plane_keys(),
             BTreeSet::from([("anthropic".into(), "oauth".into())])
@@ -896,12 +931,7 @@ mod tests {
             params["harness"] = json!(harness);
         }
         let params: crate::SelectParams = serde_json::from_value(params).unwrap();
-        let resolved = crate::resolve_select_request(
-            &params,
-            &Default::default(),
-            Path::new("/unused/host-auth.json"),
-        )
-        .unwrap();
+        let resolved = crate::resolve_select_request(&params, &Default::default()).unwrap();
         let sub: std::collections::HashSet<String> =
             resolved.policy.subscription_keys.into_iter().collect();
         assert_eq!(sub.is_empty(), harness == Some("pi"));
@@ -916,9 +946,13 @@ mod tests {
             )]),
             ..Default::default()
         };
+        let target_is_head = head_agents_of_converted_config()
+            .iter()
+            .any(|head| head == &params.target_agent);
         (
             SelectModelRouteInput {
                 target_agent: params.target_agent,
+                target_is_head,
                 requirements: resolved.requirements,
                 available_models: resolved.policy.available_models.into_iter().collect(),
                 facts: vec![fact],
@@ -1198,6 +1232,7 @@ mod tests {
         }
         select_model_route(SelectModelRouteInput {
             target_agent: "mason".into(),
+            target_is_head: false,
             requirements: prefrontal_routing_core::model_facts::ModelRequirements {
                 iq: 70.0,
                 eq: 0.0,

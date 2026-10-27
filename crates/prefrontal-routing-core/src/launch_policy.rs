@@ -10,8 +10,6 @@ use crate::provider_model_spec::{
     filter_excluded_keys_with_policy, parse_spec_list, resolve_spec, ExclusionPolicy,
 };
 
-pub const CURATED_SUBSCRIPTION_PROVIDERS: [&str; 2] = ["opencode-go", "ollama-cloud"];
-
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestedCapabilities {
@@ -116,11 +114,10 @@ pub struct ModelRoutingPolicyInput {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub subscription: Vec<String>,
-    /// Routing providers that have no catalog rows of their own and take their
-    /// quality, capability, context and speed rows from another provider's
-    /// route with the same model id: `{"anthropic-platform": "anthropic"}`.
-    /// Pricing comes from the target provider's catalog under the alias's own
-    /// credential method. An aliased provider is never subscription-covered.
+    /// The operator file's old `score_alias` map, still parsed by the config
+    /// loader. No selection path reads it: a provider with no catalog rows now
+    /// resolves through its credentials' `serves` vendors
+    /// ([`crate::score_alias::resolve_catalog_targets`]).
     #[serde(default)]
     pub score_alias: BTreeMap<String, String>,
 }
@@ -148,6 +145,29 @@ pub fn resolve_routing_policy(
     caller: &ModelRoutingPolicyInput,
     provider_auth_types: &HashMap<String, String>,
 ) -> ResolvedRoutingPolicy {
+    resolve_routing_policy_with_catalog_targets(
+        available_models,
+        operator,
+        caller,
+        provider_auth_types,
+        &BTreeMap::new(),
+    )
+}
+
+/// [`resolve_routing_policy`] for a selection that knows which providers
+/// resolved to another provider's catalog rows (`catalog_targets`, resolved
+/// provider to catalog provider, from
+/// [`crate::score_alias::resolve_catalog_targets`]). A resolved provider is
+/// never subscription-covered: it borrows the catalog provider's rows but bills
+/// its own credential, so a subscription the catalog provider has must not
+/// price it as quota.
+pub fn resolve_routing_policy_with_catalog_targets(
+    available_models: impl IntoIterator<Item = String>,
+    operator: &ModelRoutingPolicyInput,
+    caller: &ModelRoutingPolicyInput,
+    provider_auth_types: &HashMap<String, String>,
+    catalog_targets: &BTreeMap<String, String>,
+) -> ResolvedRoutingPolicy {
     let connected: HashSet<String> = available_models.into_iter().collect();
     let connected_model_count = connected.len();
     let filtered = filter_excluded_keys_with_policy(
@@ -160,11 +180,7 @@ pub fn resolve_routing_policy(
 
     // Subscription specs are additive rather than a fence, so caller entries
     // follow the operator's and refine them for this call.
-    let mut subscription_specs = CURATED_SUBSCRIPTION_PROVIDERS
-        .iter()
-        .map(|provider| (*provider).to_string())
-        .collect::<Vec<_>>();
-    subscription_specs.extend(operator.subscription.iter().cloned());
+    let mut subscription_specs = operator.subscription.clone();
     subscription_specs.extend(caller.subscription.iter().cloned());
     let subscription_specs = parse_spec_list(&subscription_specs);
 
@@ -174,10 +190,10 @@ pub fn resolve_routing_policy(
         .iter()
         .filter(|key| {
             let provider = key.split('/').next().unwrap_or(key);
-            // A score-aliased provider borrows another provider's rows but bills
-            // its own credential (a metered API key). Treating it as covered would
-            // let a subscription spec meant for the target price it as quota.
-            if operator.score_alias.contains_key(provider) {
+            // A resolved provider borrows another provider's rows but bills its
+            // own credential (a metered API key). Treating it as covered would
+            // let a subscription meant for the target price it as quota.
+            if catalog_targets.contains_key(provider) {
                 return false;
             }
             let oauth = provider_auth_types
@@ -237,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_and_curated_providers_are_subscriptions_by_default() {
+    fn only_oauth_is_subscription_without_configuration() {
         let resolved = resolve(
             &[
                 "anthropic/claude-opus-4-8",
@@ -253,20 +269,22 @@ mod tests {
             vec![
                 "anthropic/claude-opus-4-8",
                 "google/antigravity-gemini-3.5-flash",
-                "opencode-go/qwen3.7-max",
                 "xai/grok-4.3",
             ]
         );
     }
 
     #[test]
-    fn missing_auth_data_leaves_only_curated_or_configured_subscriptions() {
+    fn missing_auth_data_leaves_only_configured_subscriptions() {
         let resolved = resolve_routing_policy(
             [
                 "anthropic/claude-opus-4-8".to_string(),
                 "opencode-go/qwen3.7-max".to_string(),
             ],
-            &ModelRoutingPolicyInput::default(),
+            &ModelRoutingPolicyInput {
+                subscription: vec!["opencode-go".into()],
+                ..Default::default()
+            },
             &ModelRoutingPolicyInput::default(),
             &HashMap::new(),
         );
@@ -274,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn user_subscription_specs_override_curated_and_oauth_defaults() {
+    fn user_subscription_specs_override_configured_and_oauth_defaults() {
         let resolved = resolve(
             &[
                 "anthropic/claude-opus-4-8",
@@ -286,6 +304,7 @@ mod tests {
                 subscription: vec![
                     "-anthropic".into(),
                     "fireworks-ai".into(),
+                    "opencode-go".into(),
                     "-opencode-go/some-metered-model".into(),
                 ],
                 ..ModelRoutingPolicyInput::default()
@@ -380,6 +399,41 @@ mod tests {
         assert!(merged
             .subscription_keys
             .contains(&"fireworks-ai/llama".to_string()));
+    }
+
+    #[test]
+    fn a_resolved_provider_is_never_subscription_covered() {
+        let keys = ["anthropic/claude-opus-4-1", "platform/claude-opus-4-1"];
+        let operator = ModelRoutingPolicyInput {
+            subscription: vec!["platform".into()],
+            ..ModelRoutingPolicyInput::default()
+        };
+        let mut auth = auth_types();
+        auth.insert("platform".into(), "oauth".into());
+        let targets = BTreeMap::from([("platform".to_string(), "anthropic".to_string())]);
+        let resolved = resolve_routing_policy_with_catalog_targets(
+            keys.iter().map(|key| (*key).to_string()),
+            &operator,
+            &ModelRoutingPolicyInput::default(),
+            &auth,
+            &targets,
+        );
+        assert_eq!(
+            resolved.subscription_keys,
+            vec!["anthropic/claude-opus-4-1"]
+        );
+        // The old operator map is no longer read: without a resolution the
+        // provider is judged on its own id like any other.
+        let unresolved = resolve_routing_policy(
+            keys.iter().map(|key| (*key).to_string()),
+            &ModelRoutingPolicyInput {
+                score_alias: targets.clone(),
+                ..operator
+            },
+            &ModelRoutingPolicyInput::default(),
+            &auth,
+        );
+        assert_eq!(unresolved.subscription_keys, keys);
     }
 
     #[test]

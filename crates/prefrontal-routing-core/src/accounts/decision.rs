@@ -4,10 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::evidence::MigrateReason;
-use super::types::{
-    CandidateRef, ConversationKeySource, EpochMs, FenceScope, GeneralWindow, ModelFamily,
-};
+use super::pools::PoolKey;
+use super::types::{CandidateRef, ConversationKeySource, EpochMs, GeneralWindow, ModelFamily};
 
 /// Reading age band (design, "Insula input and conservative degraded behavior").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +69,8 @@ pub enum ExclusionTier {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum ExclusionReason {
+    SpendBudget,
+    PolicyFloor,
     UnsupportedModel,
     NotInRunnerCandidates,
     /// Every runner-listed record is refused for this principal.
@@ -79,8 +79,10 @@ pub enum ExclusionReason {
     },
     /// Every remaining record needs re-authorization.
     ReauthRequired,
+    /// A standing block on a pool the requested model draws on; `pool` is
+    /// `None` for a block on the whole account.
     ConfirmedFence {
-        scope: FenceScope,
+        pool: Option<PoolKey>,
     },
     QuotaMissing,
     EntryErrorClass {
@@ -150,9 +152,11 @@ impl ExclusionReason {
             | InvalidPercent { .. }
             | WindowResetElapsed { .. }
             | ScopeUnmapped { .. } => ExclusionTier::QuotaUnknown,
-            ScopeExhausted { .. } | BelowReserve { .. } | BelowBrocaFloor { .. } => {
-                ExclusionTier::Reserve
-            }
+            ScopeExhausted { .. }
+            | BelowReserve { .. }
+            | BelowBrocaFloor { .. }
+            | SpendBudget
+            | PolicyFloor => ExclusionTier::Reserve,
         }
     }
 }
@@ -212,6 +216,8 @@ impl AccountNote {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum InvalidationReason {
+    PolicyFloor,
+    SpendBudget,
     UserModelChange,
     IdleExpired,
     /// The account or credential is gone from the roster.
@@ -222,11 +228,10 @@ pub enum InvalidationReason {
     NotInRunnerCandidates,
     PrincipalExcluded,
     ReauthRequired,
-    /// `account_limit_exhausted` with no window, for this family.
-    UnknownScopeFence,
-    /// Confirmed exhaustion on an applicable scope (reference reasons).
+    /// A confirmed block on an applicable pool (`None`: the whole account)
+    /// whose reset is unknown or too far away to hold for.
     ConfirmedExhaustion {
-        migrate: MigrateReason,
+        pool: Option<PoolKey>,
     },
     /// A full-band reading shows an applicable window at 100% used. This is a
     /// conversation-local move; it creates no fence.
@@ -322,6 +327,8 @@ pub struct RosterNote {
 /// The machine-readable explanation every decision carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Explanation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_fence_probe: Option<String>,
     pub policy_version: u32,
     pub provider: String,
     pub model: String,
@@ -353,6 +360,8 @@ pub struct Explanation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmitReason {
+    CredentialFenceProbe,
+    PaidCredits,
     /// Existing affinity retained.
     StickyHit,
     /// A validated `preferred_existing_account` import became the affinity.
@@ -421,9 +430,10 @@ pub struct Hold {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldBasis {
-    /// A confirmed 5h exhaustion fence on the account (shared state).
+    /// A confirmed block on the account (shared state).
     ConfirmedFence,
-    /// A full-band 5h reading at 100% used (possibly a rounded raw 0.995).
+    /// A full-band reading with a window at 100% used (possibly a rounded raw
+    /// 0.995).
     /// Soft and local to this conversation: it is not confirmation, creates
     /// no fence and grants no post-reset probe; each later admission
     /// re-evaluates it against the newest reading.

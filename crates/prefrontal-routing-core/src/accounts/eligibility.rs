@@ -188,7 +188,11 @@ pub struct QuotaEval {
 
 impl QuotaEval {
     pub fn eligible(&self) -> bool {
-        self.unknown.is_empty() && self.reserve.is_empty() && self.weight.is_some()
+        self.unknown
+            .iter()
+            .all(|reason| matches!(reason, ExclusionReason::QuotaMissing))
+            && self.reserve.is_empty()
+            && self.weight.is_some()
     }
 
     pub fn write_note(&self, note: &mut AccountNote) {
@@ -283,6 +287,9 @@ pub fn evaluate_quota(
 ) -> QuotaEval {
     let mut eval = assess_reading(reading, now, policy);
     let Some(reading) = reading else {
+        // Absence is not exhaustion. A neutral allocation weight permits cold
+        // work without inventing a measured window, headroom or timestamp.
+        eval.weight = Some(1.0);
         return eval;
     };
     let required = reading.required_windows();

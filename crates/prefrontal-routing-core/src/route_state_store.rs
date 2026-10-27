@@ -228,7 +228,10 @@ pub struct CredentialRefusal {
 /// A stored (provider, credential) pair that routing does not select
 /// automatically. `listing_fingerprint` is the credential's vault listing
 /// (provider ids, plan tier and state) when the refusal arrived; the fence ends
-/// when the listing no longer matches it, never on a timer.
+/// when the listing no longer matches it, when a recheck probe on the pair
+/// succeeds, or when an operator lifts it. A stale fence (one whose refusal is
+/// older than the recheck interval) admits a single probe request, which renews
+/// its observation clock whether it succeeds or fails again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialEntitlementFence {
     pub provider_id: String,
@@ -237,14 +240,6 @@ pub struct CredentialEntitlementFence {
     /// `None` when routing had no vault listing for the credential at the time.
     pub listing_fingerprint: Option<String>,
     pub observed_at_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderResetFence {
-    pub route_key: String,
-    pub account_ref: String,
-    pub credential_id: Option<String>,
-    pub resets_at_ms: i64,
 }
 
 /// The route-local failure-backoff fields before an operator clears them.
@@ -268,6 +263,7 @@ pub struct CooldownState {
 /// trait free of the scorer's wire shape.
 #[derive(Debug, Clone, Default)]
 pub struct DecisionInput {
+    pub allowed_account_class: crate::accounts::AllowedAccountClass,
     /// Request class supplied by the launcher, independent of the target agent.
     pub consumer: Option<String>,
     /// Allowed provider IDs for this selection; absent means no provider restriction.

@@ -42,7 +42,7 @@ pub fn reading_log_rows_for_poll(
         class: disclosure.class.clone(),
     });
 
-    extract_windows(entry, provider_id, &entry.provider, capacity_keys)
+    extract_windows(entry, &entry.provider, capacity_keys)
         .into_iter()
         .map(|window| QuotaReadingLogRow {
             account_key: account_key.clone(),

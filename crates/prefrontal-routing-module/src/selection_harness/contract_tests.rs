@@ -2,6 +2,7 @@ struct HarnessRig {
     rig: Rig,
     store: SharedStore,
     config: PathBuf,
+    credential_providers: Vec<&'static str>,
 }
 
 impl HarnessRig {
@@ -21,7 +22,7 @@ impl HarnessRig {
             store.upsert_fact(&row, FactSource::Override).unwrap();
         }
         let config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &config,
             json!({"model_routing": {"substrates": mapping, "models": {
                 "opencode/deepseek-v4.1-flash-free": {"cost_per_mtok_out": 0},
@@ -30,7 +31,7 @@ impl HarnessRig {
             .to_string(),
         )
         .unwrap();
-        Self { rig, store, config }
+        Self { rig, store, config, credential_providers: vec!["anthropic", "opencode"] }
     }
 
     async fn call(
@@ -59,7 +60,6 @@ impl HarnessRig {
             &self.config,
             &self.config,
             credentials,
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -79,11 +79,20 @@ impl HarnessRig {
                 credentials: vec![cortexkit_claustrum_client::ListedCredential {
                     id: "apikey:anthropic:fixture".into(),
                     credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
                     categories: vec!["llm-provider".into()],
                     state: "active".into(),
                     provider_ids: vec!["anthropic".into()],
                     ..Default::default()
-                }],
+                }, cortexkit_claustrum_client::ListedCredential {
+                    id: "apikey:opencode:fixture".into(),
+                    credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
+                    categories: vec!["llm-provider".into()],
+                    state: "active".into(),
+                    provider_ids: vec!["opencode".into()],
+                    ..Default::default()
+                }].into_iter().filter(|row| row.provider_ids.iter().any(|provider| self.credential_providers.contains(&provider.as_str()))).collect(),
                 view: "fixture".into(),
                 ..Default::default()
             },
@@ -133,7 +142,8 @@ async fn launch_availability_is_per_mapped_harness() {
             "harness opencode does not serve this route for this request"
         );
     }
-    let unmapped = HarnessRig::new(json!({}));
+    let mut unmapped = HarnessRig::new(json!({}));
+    unmapped.credential_providers = vec!["anthropic"];
     let result = unmapped
         .select(json!({"workload": "mason", "harness": "opencode", "availableModels": [CHEAP], "substrate": "opencode"}))
         .await;
@@ -142,7 +152,7 @@ async fn launch_availability_is_per_mapped_harness() {
         .call(
             ROUTE_SELECT_OP,
             json!({"targetAgent": "mason", "workload": "mason", "requirements": {"iq": 30, "eq": 0}}),
-            &empty_broca_credentials(),
+            &mapped_broca_credentials("anthropic"),
         )
         .await;
     assert_eq!(fallback["result"]["selected"]["harness"], "broca");
@@ -212,11 +222,12 @@ async fn executor_and_required_harness_refuse_mismatched_routes() {
         rejection(&body, PAID)["detail"],
         "harness_mismatch: task runs on opencode"
     );
-    let plain = HarnessRig::new(json!({}));
+    let mut plain = HarnessRig::new(json!({}));
     let body = plain
         .select(json!({"executor": "broca", "availableModels": [CHEAP, PAID]}))
         .await;
     assert_eq!(body["result"]["selected"]["routeKey"], CHEAP, "{body}");
+    plain.credential_providers = vec!["anthropic"];
     let body = plain
         .select(json!({"executor": "broca", "substrate": "broca"}))
         .await;
@@ -243,7 +254,7 @@ async fn panel_seats_resolve_under_athena_and_only_use_broca() {
     let mut config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rig.config).unwrap()).unwrap();
     config["model_routing"]["panels"] = json!({"audit": {"topK": 1, "extra": 0, "by": "iq"}});
-    std::fs::write(&rig.config, config.to_string()).unwrap();
+    crate::test_config::write(&rig.config, config.to_string()).unwrap();
     let body = rig
         .call(
             ROUTE_SELECT_PANEL_OP,
@@ -329,7 +340,7 @@ async fn runner_auth_pin_mapped_off_broca_refuses_even_with_broca_substrate() {
     let mut config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rig.config).unwrap()).unwrap();
     config["model_routing"]["score_alias"] = json!({"anthropic-platform": "anthropic"});
-    std::fs::write(&rig.config, config.to_string()).unwrap();
+    crate::test_config::write(&rig.config, config.to_string()).unwrap();
     let body = rig.call(ROUTE_SELECT_OP, json!({
         "consumer": "mason", "targetAgent": "mason", "workload": "mason", "requirements": {"iq": 30, "eq": 0},
         "modelPin": "anthropic-platform/claude-opus-5-5", "substrate": "broca", "harness": "opencode",
@@ -393,8 +404,11 @@ async fn route_explain_reads_selected_execution_identity_for_fresh_and_pinned_la
         let selected = rig.select(params).await;
         let id = selected["result"]["decisionID"].as_str().unwrap_or_else(|| panic!("{selected}"));
         assert_eq!(selected["result"]["selected"]["harness"], harness, "{selected}");
+        // The reply's selected.harness retains the legacy substrate value;
+        // the decision ledger names the configured runner that executes it.
+        assert_eq!(selected["result"]["runner"]["module"], "broca", "{selected}");
         let explained = rig.explain(json!({"decisionID": id})).await;
-        assert_eq!(explained["selectedRoute"]["harness"], harness, "{explained}");
+        assert_eq!(explained["selectedRoute"]["harness"], "broca", "{explained}");
         assert_eq!(explained["selectedRoute"]["workload"], json!(workload), "{explained}");
         assert_eq!(explained["selectedRoute"]["routeKey"], selected["result"]["selected"]["routeKey"]);
         assert_eq!(explained["provenance"]["harness"], "opencode");
@@ -440,18 +454,14 @@ async fn route_explain_legacy_row_does_not_infer_execution_identity_from_caller(
     assert_eq!(explained["provenance"]["harness"], "pi");
 }
 
-/// A selection that names no executor, workload or required harness comes from
-/// a host's own route resolver (an OpenCode or Pi head picking the model for a
-/// mason or explore subagent) or from core repeating such a selection. Core
-/// still decides where that worker runs, so routing judges the routes against
-/// the caller's own model list and leaves the harness unrecorded. When the
-/// caller names substrate broca, the routes are those Broca reaches, still
-/// within the caller's list: a route outside the list is never chosen, even
-/// when Broca reaches no route the list names. The route-to-harness mapping
-/// applies only once a caller names its workload.
+/// Hosts choose from their own model list without vault admission. A legacy
+/// re-selection explicitly sent to Broca instead needs a vault credential and
+/// remains confined to the caller's list. A workload request uses the harness
+/// mapping rather than the host's local execution context.
 #[tokio::test]
 async fn host_run_selection_is_judged_on_the_callers_list_not_the_mapping() {
-    let rig = HarnessRig::new(json!({}));
+    let mut rig = HarnessRig::new(json!({}));
+    rig.credential_providers = vec!["anthropic"];
     for extra in [
         json!({"consumer": "sidekick", "targetAgent": "explore", "harness": "opencode", "availableModels": [CHEAP]}),
         json!({"harness": "pi", "availableModels": [CHEAP]}),

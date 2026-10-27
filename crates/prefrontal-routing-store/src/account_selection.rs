@@ -12,7 +12,10 @@
 //! Old account history and runner observations are removed only by the
 //! bounded retention batches in `retention.rs`.
 
-use prefrontal_routing_core::RouteStateResult;
+use prefrontal_routing_core::{
+    accounts::{FenceScope, PoolKey},
+    RouteStateResult,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use super::{err, SqliteRouteStateStore};
@@ -21,6 +24,422 @@ use super::{err, SqliteRouteStateStore};
 /// the only mode routing writes. (The schema also allows `shadow`, from the
 /// retired shadow mode; retention purges those rows.)
 pub const DECISION_MODE_SERVE: &str = "serve";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialProbeClaim {
+    Claimed,
+    Unfenced,
+    Blocked,
+}
+
+#[cfg(test)]
+mod account_fact_tests {
+    use super::*;
+
+    #[test]
+    fn stale_credential_probe_is_claimed_once_with_a_strict_cutoff() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-credential-probe");
+        let store = std::sync::Arc::new(
+            SqliteRouteStateStore::open(&crate::dev_descriptor(
+                "account-credential-probe",
+                scratch.path().join("store.db").to_string_lossy(),
+            ))
+            .unwrap(),
+        );
+        store
+            .record_credential_entitlement_fence(
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "c".into(),
+                    code: "billing_exhausted".into(),
+                },
+                Some("listing"),
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .account_transaction(|tx| tx.claim_credential_probe("p", "c", 100, 200))
+                .unwrap(),
+            CredentialProbeClaim::Blocked
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let attempts: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, 200))
+                        .unwrap()
+                })
+            })
+            .collect();
+        let claims: Vec<_> = attempts
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| **claim == CredentialProbeClaim::Claimed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| **claim == CredentialProbeClaim::Blocked)
+                .count(),
+            7
+        );
+        store
+            .record_credential_entitlement_fence(
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "c".into(),
+                    code: "ENTITLEMENT_ERROR".into(),
+                },
+                Some("listing"),
+                150,
+            )
+            .unwrap();
+        assert_eq!(
+            store.credential_entitlement_fences().unwrap()[0].observed_at_ms,
+            200,
+            "a late refusal cannot rewind a reserved probe"
+        );
+        assert_eq!(
+            store
+                .account_transaction(|tx| tx.claim_credential_probe("p", "c", 151, 201))
+                .unwrap(),
+            CredentialProbeClaim::Blocked
+        );
+        store.clear_credential_entitlement_fence("p", "c").unwrap();
+        assert_eq!(
+            store
+                .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, 200))
+                .unwrap(),
+            CredentialProbeClaim::Unfenced
+        );
+    }
+
+    #[test]
+    fn eligibility_survives_restart_and_clears_only_on_listing_change() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-eligibility-clear");
+        let descriptor = crate::dev_descriptor(
+            "account-eligibility-clear",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        store
+            .record_account_eligibility(&AccountEligibilityFact {
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: "m".into(),
+                listing_fingerprint: Some("v1".into()),
+                code: "404".into(),
+                observed_at: 1,
+            })
+            .unwrap();
+        drop(store);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v1".into())])
+            .unwrap();
+        assert_eq!(store.account_eligibility().unwrap().len(), 1);
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            .unwrap();
+        assert!(store.account_eligibility().unwrap().is_empty());
+        store
+            .record_account_eligibility(&AccountEligibilityFact {
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: String::new(),
+                listing_fingerprint: None,
+                code: "ineligible".into(),
+                observed_at: 2,
+            })
+            .unwrap();
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            .unwrap();
+        assert_eq!(
+            store.account_eligibility().unwrap()[0]
+                .listing_fingerprint
+                .as_deref(),
+            Some("v2")
+        );
+        store.reconcile_account_eligibility(&[]).unwrap();
+        assert!(store.account_eligibility().unwrap().is_empty());
+    }
+
+    #[test]
+    fn size_refusals_expire_or_clear_on_later_success_in_the_same_band() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-size-clear");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "account-size-clear",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let fact = AccountSizeRefusal {
+            provider: "p".into(),
+            credential_id: "c".into(),
+            model: "m".into(),
+            size_class: 17,
+            expires_at: 100,
+            observed_at: 10,
+        };
+        store.record_account_size_refusal(&fact).unwrap();
+        store
+            .clear_account_size_refusal("p", "c", "m", 17, 10)
+            .unwrap();
+        store
+            .clear_account_size_refusal("p", "c", "m", 12, 11)
+            .unwrap();
+        assert_eq!(store.account_size_refusals(11).unwrap().len(), 1);
+        store
+            .clear_account_size_refusal("p", "c", "m", 17, 12)
+            .unwrap();
+        assert!(store.account_size_refusals(12).unwrap().is_empty());
+        store.record_account_size_refusal(&fact).unwrap();
+        assert!(store.account_size_refusals(100).unwrap().is_empty());
+        assert!(
+            store.account_size_refusals(0).unwrap().is_empty(),
+            "expiry deletes the row"
+        );
+    }
+}
+
+/// An account/model fact, valid only for the credential listing it was read on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountEligibilityFact {
+    pub provider: String,
+    pub credential_id: String,
+    /// Empty means every model on the provider.
+    pub model: String,
+    pub listing_fingerprint: Option<String>,
+    pub code: String,
+    pub observed_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSizeRefusal {
+    pub provider: String,
+    pub credential_id: String,
+    pub model: String,
+    pub size_class: u32,
+    pub expires_at: i64,
+    pub observed_at: i64,
+}
+
+impl SqliteRouteStateStore {
+    /// A run outcome is an audit fact, not quota or model-health evidence.
+    pub fn record_routing_outcome(
+        &self,
+        decision: &str,
+        outcome: &prefrontal_routing_core::RouteOutcome,
+        error: Option<&str>,
+        at: i64,
+    ) -> RouteStateResult<()> {
+        self.store.with_conn(|conn: &Connection| {
+            conn.execute("UPDATE model_route_decisions SET outcome=?1,outcome_at=?2,outcome_error=?3 WHERE id=?4",
+                params![outcome.as_str(),at,error,decision]).map(|_| ())
+        }).map_err(err)
+    }
+
+    pub fn record_account_eligibility(
+        &self,
+        fact: &AccountEligibilityFact,
+    ) -> RouteStateResult<()> {
+        self.account_transaction(|tx| tx.record_eligibility(fact))
+    }
+}
+
+impl AccountTx<'_> {
+    /// Reserve one stale credential probe in the same write transaction as
+    /// its admission. The strict cutoff also rejects a concurrently renewed
+    /// refusal or a probe already reserved from an older roster snapshot.
+    pub fn claim_credential_probe(
+        &self,
+        provider: &str,
+        credential: &str,
+        before: i64,
+        at: i64,
+    ) -> RouteStateResult<CredentialProbeClaim> {
+        let changed=self.conn.execute("UPDATE credential_entitlement_fences SET observed_at_ms=?4 WHERE provider_id=?1 AND credential_id=?2 AND observed_at_ms<?3",params![provider,credential,before,at]).map_err(err)?;
+        if changed > 0 {
+            return Ok(CredentialProbeClaim::Claimed);
+        }
+        let exists: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2)",params![provider,credential],|row|row.get(0)).map_err(err)?;
+        Ok(if exists {
+            CredentialProbeClaim::Blocked
+        } else {
+            CredentialProbeClaim::Unfenced
+        })
+    }
+
+    /// Freeze the admitted serving identity on the model decision so a later
+    /// completion report heals only the credential that actually ran.
+    pub fn bind_model_account(
+        &self,
+        decision: &str,
+        provider: &str,
+        model: &str,
+        account: &str,
+        credential: &str,
+    ) -> RouteStateResult<()> {
+        let identity = serde_json::to_string(
+            &prefrontal_routing_core::route_state_store::ProviderOutcome {
+                account_ref: account.into(),
+                credential_id: Some(credential.into()),
+                resets_at_ms: None,
+                credential_refusal: None,
+            },
+        )
+        .map_err(err)?;
+        self.conn.execute("UPDATE model_route_decisions SET provider_identity_json=?1 WHERE id=?2 AND selected_provider_id=?3 AND selected_model_id=?4",params![identity,decision,provider,model]).map(|_|()).map_err(err)
+    }
+
+    pub fn record_eligibility(&self, fact: &AccountEligibilityFact) -> RouteStateResult<()> {
+        self.conn.execute(
+                "INSERT INTO account_eligibility VALUES (?1,?2,?3,?4,?5,?6) \
+                 ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
+                 listing_fingerprint=excluded.listing_fingerprint,code=excluded.code,observed_at=excluded.observed_at \
+                 WHERE excluded.observed_at >= account_eligibility.observed_at",
+                params![fact.provider, fact.credential_id, fact.model, fact.listing_fingerprint, fact.code, fact.observed_at],
+            ).map(|_| ()).map_err(err)
+    }
+
+    /// A parent's latest admission holds its current account until its pin
+    /// lapses: the admission deadline before start, the lease deadline after.
+    pub fn parent_used_account(
+        &self,
+        principal: &str,
+        hash: &str,
+        provider: &str,
+        now_ms: i64,
+    ) -> RouteStateResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT a.account_id FROM (
+                SELECT * FROM account_admission
+                 WHERE principal=?1 AND conversation_hash=?2 AND provider=?3
+                 ORDER BY committed_at DESC, rowid DESC LIMIT 1
+             ) a JOIN account_affinity f
+               ON f.principal=a.principal AND f.conversation_hash=a.conversation_hash
+              AND f.provider=a.provider AND f.pin_id=a.pin_id AND f.pin_generation=a.pin_generation
+             WHERE (a.state='reserved' AND a.admission_valid_until>?4)
+                OR (a.state='started' AND a.lease_valid_until>?4)",
+                params![principal, hash, provider, now_ms],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)
+    }
+}
+
+impl SqliteRouteStateStore {
+    /// Reconcile facts only after a successful vault listing. Unknown listing
+    /// state must not erase a previously established eligibility restriction.
+    pub fn reconcile_account_eligibility(
+        &self,
+        listings: &[(String, String)],
+    ) -> RouteStateResult<()> {
+        self.store.with_conn(|conn: &Connection| {
+            if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(()); }
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let credentials = {
+                let mut statement = tx.prepare("SELECT DISTINCT credential_id FROM account_eligibility")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for credential in credentials {
+                match listings.iter().find(|(id, _)| id == &credential) {
+                    Some((_, fingerprint)) => {
+                        tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1 AND listing_fingerprint IS NOT NULL AND listing_fingerprint<>?2", params![credential, fingerprint])?;
+                        tx.execute("UPDATE account_eligibility SET listing_fingerprint=?2 WHERE credential_id=?1 AND listing_fingerprint IS NULL", params![credential, fingerprint])?;
+                    }
+                    None => { tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1", [&credential])?; }
+                }
+            }
+            tx.commit()
+        }).map_err(err)
+    }
+
+    pub fn account_eligibility(&self) -> RouteStateResult<Vec<AccountEligibilityFact>> {
+        self.store.with_conn(|conn: &Connection| {
+            if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(Vec::new()); }
+            let mut statement = conn.prepare("SELECT provider,credential_id,model,listing_fingerprint,code,observed_at FROM account_eligibility ORDER BY provider,credential_id,model")?;
+            let rows = statement.query_map([], |row| Ok(AccountEligibilityFact {
+                provider: row.get(0)?, credential_id: row.get(1)?, model: row.get(2)?,
+                listing_fingerprint: row.get(3)?, code: row.get(4)?, observed_at: row.get(5)?,
+            }))?;
+            rows.collect()
+        }).map_err(err)
+    }
+
+    pub fn record_account_size_refusal(&self, fact: &AccountSizeRefusal) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.execute(
+                    "INSERT INTO account_size_refusal VALUES (?1,?2,?3,?4,?5,?6) \
+                ON CONFLICT (provider,credential_id,model,size_class) DO UPDATE SET \
+                expires_at=excluded.expires_at,observed_at=excluded.observed_at \
+                WHERE excluded.observed_at >= account_size_refusal.observed_at",
+                    params![
+                        fact.provider,
+                        fact.credential_id,
+                        fact.model,
+                        fact.size_class,
+                        fact.expires_at,
+                        fact.observed_at
+                    ],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
+    /// Expired refusals are removed on reads, not just ignored in memory.
+    pub fn account_size_refusals(&self, now: i64) -> RouteStateResult<Vec<AccountSizeRefusal>> {
+        self.store.with_conn(|conn: &Connection| {
+            if !account_fact_table_exists(conn, "account_size_refusal")? { return Ok(Vec::new()); }
+            conn.execute("DELETE FROM account_size_refusal WHERE expires_at<=?1", [now])?;
+            let mut statement = conn.prepare("SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_size_refusal")?;
+            let rows = statement.query_map([], |row| Ok(AccountSizeRefusal {
+                provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,size_class: row.get(3)?,expires_at: row.get(4)?,observed_at: row.get(5)?,
+            }))?;
+            rows.collect()
+        }).map_err(err)
+    }
+
+    pub fn clear_account_size_refusal(
+        &self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        size_class: u32,
+        observed_at: i64,
+    ) -> RouteStateResult<()> {
+        self.store.with_conn(|conn: &Connection| {
+            conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",
+                params![provider,credential,model,size_class,observed_at]).map(|_| ())
+        }).map_err(err)
+    }
+}
+
+// Upgrade fixtures issue admissions on the old schema before reopening it with
+// migrations enabled. Absence of the new fact tables means no such facts exist.
+fn account_fact_table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
 
 /// One recorded account decision. `decision_json` is the allocator's whole
 /// decision (outcome and explanation); `context_json` is what the caller of
@@ -179,6 +598,15 @@ pub struct AccountFenceRow {
     pub created_at: i64,
     pub cleared_at: Option<i64>,
     pub cleared_reason: Option<String>,
+}
+
+/// Pool identity and whole-account recovery requirements alongside the original
+/// exhaustion evidence. A missing key blocks the entire account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountPoolFenceRow {
+    pub evidence: AccountFenceRow,
+    pub pool_key: Option<PoolKey>,
+    pub recovery_set: Vec<PoolKey>,
 }
 
 /// A runner's scoped not-found for one credential in one admission.
@@ -774,11 +1202,31 @@ impl AccountTx<'_> {
     }
 
     pub fn insert_fence(&self, row: &AccountFenceRow) -> RouteStateResult<()> {
+        let pool_key = serde_json::from_str::<FenceScope>(&row.scope_json)
+            .ok()
+            .map(PoolKey::from);
+        self.insert_pool_fence(&AccountPoolFenceRow {
+            evidence: row.clone(),
+            pool_key,
+            recovery_set: Vec::new(),
+        })
+    }
+
+    /// Store the recovery set in the same transaction as the confirming evidence.
+    pub fn insert_pool_fence(&self, block: &AccountPoolFenceRow) -> RouteStateResult<()> {
+        let row = &block.evidence;
+        let pool_key = block
+            .pool_key
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(err)?;
+        let recovery_set = serde_json::to_string(&block.recovery_set).map_err(err)?;
         self.conn
             .execute(
                 &format!(
-                    "INSERT INTO account_fence ({FENCE_COLUMNS}) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                    "INSERT INTO account_fence ({FENCE_COLUMNS}, pool_key_json, recovery_set_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
                 ),
                 params![
                     row.fence_id,
@@ -794,10 +1242,89 @@ impl AccountTx<'_> {
                     row.created_at,
                     row.cleared_at,
                     row.cleared_reason,
+                    pool_key,
+                    recovery_set,
                 ],
             )
             .map(|_| ())
             .map_err(err)
+    }
+
+    pub fn active_pool_fences(&self, provider: &str) -> RouteStateResult<Vec<AccountPoolFenceRow>> {
+        let mut statement = self
+            .conn
+            .prepare(&format!(
+                "SELECT {FENCE_COLUMNS}, pool_key_json, recovery_set_json FROM account_fence
+             WHERE provider=?1 AND cleared_at IS NULL ORDER BY created_at, fence_id"
+            ))
+            .map_err(err)?;
+        let rows = statement
+            .query_map([provider], |row| {
+                Ok((
+                    fence_from_row(row)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, String>(14)?,
+                ))
+            })
+            .map_err(err)?;
+        rows.map(|row| {
+            let (evidence, key, recovery) = row.map_err(err)?;
+            Ok(AccountPoolFenceRow {
+                evidence,
+                pool_key: key
+                    .map(|key| serde_json::from_str(&key))
+                    .transpose()
+                    .map_err(err)?,
+                recovery_set: serde_json::from_str(&recovery).map_err(err)?,
+            })
+        })
+        .collect()
+    }
+
+    /// Mark a standing block ended, recording when and why. Returns whether
+    /// the block was still standing.
+    pub fn clear_fence(&self, fence_id: &str, at: i64, reason: &str) -> RouteStateResult<bool> {
+        self.conn
+            .execute(
+                "UPDATE account_fence SET cleared_at = ?2, cleared_reason = ?3 \
+                 WHERE fence_id = ?1 AND cleared_at IS NULL",
+                params![fence_id, at, reason],
+            )
+            .map(|changed| changed > 0)
+            .map_err(err)
+    }
+
+    /// Replace a standing whole-account block's recovery set, which only
+    /// grows as later readings report more pools.
+    pub fn set_fence_recovery_set(
+        &self,
+        fence_id: &str,
+        recovery_set: &[PoolKey],
+    ) -> RouteStateResult<()> {
+        let recovery_set = serde_json::to_string(recovery_set).map_err(err)?;
+        self.conn
+            .execute(
+                "UPDATE account_fence SET recovery_set_json = ?2 \
+                 WHERE fence_id = ?1 AND cleared_at IS NULL",
+                params![fence_id, recovery_set],
+            )
+            .map(|_| ())
+            .map_err(err)
+    }
+
+    /// Every provider with at least one standing block.
+    pub fn active_fence_providers(&self) -> RouteStateResult<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT provider FROM account_fence WHERE cleared_at IS NULL \
+                 ORDER BY provider",
+            )
+            .map_err(err)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(err)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(err)
     }
 
     /// The scoped not-found exclusions reported against this one admission.

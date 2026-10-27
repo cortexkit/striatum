@@ -2,7 +2,7 @@
 use crate::RouteWallClass;
 use serde_json::Value;
 
-/// Recognize typed account exhaustion and the exact legacy Broca summary core
+/// Recognize typed account exhaustion and the exact legacy runner summary core
 /// persisted before account scope was retained through terminalization. Do not
 /// infer scope from a provider's free-form message or from a generic HTTP 429.
 pub fn account_scoped_error(error: &str) -> bool {
@@ -26,12 +26,23 @@ pub fn account_scoped_error(error: &str) -> bool {
         }
         return false;
     }
-    if !error.starts_with("provider quota exhausted on ") || !error.contains(" in Broca run ") {
+    if !error.starts_with("provider quota exhausted on ") {
         return false;
     }
-    let Some((_, description)) = error.split_once(" (Broca error class ") else {
+    // The summary names its runner twice, "… in <runner> run … (<runner> error
+    // class …"; the runner's name is read from the text, never assumed.
+    let Some((head, description)) = error.split_once(" error class ") else {
         return false;
     };
+    let Some((before, runner)) = head.rsplit_once(" (") else {
+        return false;
+    };
+    if runner.is_empty()
+        || runner.contains(char::is_whitespace)
+        || !before.contains(&format!(" in {runner} run "))
+    {
+        return false;
+    }
     let Some((metadata, _)) = description.split_once("; the provider said: ") else {
         return false;
     };

@@ -1,11 +1,11 @@
 //! `route.select` for `routing/v1`.
 //!
 //! The selection itself is routing's existing core: the same facts, quota
-//! overlay, configuration overlays, billing-plane prices, provider resets,
-//! credential entitlement fences and operator exclusions every route
+//! overlay, configuration overlays, billing-plane prices, credential
+//! entitlement fences and operator exclusions every route
 //! selection reads ([`crate::prepare_selection_inputs`],
 //! [`crate::price_selection_inputs`]), the scorer
-//! ([`select_model_route_with_availability`]) and the pin admission
+//! ([`select_policy::select_candidates`]) and the pin admission
 //! ([`crate::work_model_pin::select_with_availability`]). What this module
 //! adds is the v1 request: which runners can serve, the requirements the
 //! scorer has no input for, the consumer's policy, the project's pin and the
@@ -23,23 +23,19 @@ use cortexkit_role_routing::select::{
     EXPLANATION_MAX_CHARS,
 };
 use prefrontal_routing_core::model_router::{
-    select_model_route_with_availability, ModelRouteStateSnapshot, NoRouteError,
-    RequiredCapabilities, RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
+    ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
+    SelectedModelRoute,
 };
-use prefrontal_routing_core::provider_model_spec::{parse_spec_list, resolve_spec};
 use prefrontal_routing_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
-use prefrontal_routing_core::{
-    fact_to_route, resolve_routing_policy, ModelFact, ModelRequirements, ModelRoute,
-    ModelRoutingPolicyInput, RoutingConfig,
-};
+use prefrontal_routing_core::{fact_to_route, ModelFact, ModelRequirements, RoutingConfig};
 use prefrontal_routing_store::V1Decision;
 use serde_json::{json, Value};
 
 use super::{now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
 use crate::config_policy::RunnerPolicy;
 use crate::{
-    account_selection, config_overrides, credential_fences, select_policy, work_model_pin,
-    DecisionProvenance, SelectionPolicySources,
+    account_selection, config_overrides, select_policy, work_model_pin, DecisionProvenance,
+    SelectionPolicySources,
 };
 
 /// The members a v1 select may carry.
@@ -53,6 +49,9 @@ const MEMBERS: &[&str] = &[
     "correlation_id",
     "concurrency_slots",
     "detail",
+    "harness",
+    "hold_ok",
+    "hold_wait_max_s",
 ];
 
 /// How long an answer stays current routing. A report after this is still
@@ -93,9 +92,10 @@ pub(super) async fn select(
     let live_config = config_overrides::live_config(deps.routing_config_path);
     let operator_config = operator_config(deps);
     let consumer = request.consumer.clone();
-    if !operator_config.v1_consumers().contains(&consumer) {
-        return Err(Refusal::unknown_consumer(consumer));
-    }
+    let consumers = super::consumers::effective(&operator_config);
+    consumers.admit(&consumer, caller)?;
+    let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
+    let request = parse_select_request_serving(&effective_params, super::describe::CAPABILITIES)?;
     if !crate::broca_credentials::wait_for_billing_catalog(deps.broca_credentials, BILLING_WAIT)
         .await
     {
@@ -106,34 +106,53 @@ pub(super) async fn select(
     }
 
     let operator_policy = operator_config.operator_policy();
-    // A consumer id that names a request class (mason, ..., codemode, flow)
-    // takes that class's policy: its variants, provider resets and, for
-    // codemode and flow, the priced-per-token rule. Any other consumer reads
-    // only the `all` groups.
+    // Legacy classes still identify variant/reset groups. Payment class comes
+    // only from the resolved consumer policy, not from the consumer's name.
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
+    let consumer_policy = operator_config.consumer_policy(
+        &consumer,
+        &crate::config_policy::ConsumerPolicy {
+            iq: Some(f64::from(request.requirements.iq)),
+            eq: request.requirements.eq.map(f64::from),
+            ..Default::default()
+        },
+        &consumers.policies,
+    );
+    let priced_per_token = select_policy::priced_per_token(&consumer_policy, legacy_consumer);
     let crate::PreparedSelectionInputs {
         now,
         mut facts,
         mut snapshot,
         quota_signal_json,
         quota_note: _,
-    } = crate::prepare_selection_inputs(deps.quota_cache, deps.store, live_config.pricing())
-        .map_err(store_refusal)?;
+    } = crate::prepare_selection_inputs(
+        deps.quota_cache,
+        deps.store,
+        live_config.pricing(),
+        &live_config.quota_model_pools(),
+    )
+    .map_err(store_refusal)?;
+    // Providers with no catalog rows of their own, each resolved to the
+    // catalog provider whose rows it borrows, read once for this selection.
+    let catalog_targets = deps
+        .broca_credentials
+        .lock()
+        .map(|credentials| credentials.catalog_targets(&facts))
+        .unwrap_or_default();
     let sources = SelectionPolicySources {
         live_config: &live_config,
         operator_config: &operator_config,
         operator_config_path: deps.operator_config_path,
-        operator_policy: &operator_policy,
+        catalog_targets: &catalog_targets,
     };
     let priced = crate::price_selection_inputs(
         &mut facts,
-        &mut snapshot,
         quota_signal_json,
         &sources,
         deps.store,
         deps.broca_credentials,
-        Some(&consumer),
-        legacy_consumer,
+        true,
+        priced_per_token,
     )
     .map_err(|error| store_refusal(error.to_string()))?;
 
@@ -144,9 +163,27 @@ pub(super) async fn select(
         .tool_capabilities
         .clone()
         .unwrap_or_default();
-    let runners: Vec<RunnerPolicy> = operator_config
-        .v1_runners()
+    let registry = deps
+        .broca_credentials
+        .lock()
+        .map(|credentials| {
+            super::runners::Registry::build(
+                operator_config.v1_runners(),
+                &credentials,
+                &facts,
+                now as u64,
+            )
+        })
+        .unwrap_or_default();
+    let runners: Vec<RunnerPolicy> = registry
+        .policies()
         .into_iter()
+        .filter(|runner| {
+            consumer_policy
+                .runner
+                .as_ref()
+                .is_none_or(|module| module == &runner.module)
+        })
         .filter(|runner| {
             request
                 .runners
@@ -154,8 +191,24 @@ pub(super) async fn select(
                 .is_none_or(|listed| listed.contains(&runner.module))
         })
         .collect();
+    let runners: Vec<RunnerPolicy> = runners
+        .into_iter()
+        .filter(|runner| {
+            request.harness.as_deref().is_none_or(|harness| {
+                registry
+                    .get(&runner.module)
+                    .is_some_and(|runner| runner.harnesses.iter().any(|hosted| hosted == harness))
+            })
+        })
+        .collect();
     if runners.is_empty() {
-        return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
+        return Err(if let Some(harness) = &request.harness {
+            let mut refusal = Refusal::no_route(NoRouteReason::HarnessUnavailable, None);
+            refusal.message = format!("no session-starting runner declares harness {harness}");
+            refusal
+        } else {
+            Refusal::no_route(NoRouteReason::NoAvailableModel, None)
+        });
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -167,18 +220,8 @@ pub(super) async fn select(
     if runners.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
-    let broca_served: HashSet<String> = crate::broca_served_routes(&facts, deps.broca_credentials)
-        .0
-        .into_iter()
-        .collect();
     let runs = |runner: &RunnerPolicy, route_key: &str, capacity_key: &str| -> bool {
-        match &runner.routes {
-            Some(specs) => resolve_spec(&parse_spec_list(specs), route_key, false),
-            None if runner.module == "broca" => {
-                broca_served.contains(route_key) || broca_served.contains(capacity_key)
-            }
-            None => true,
-        }
+        registry.runs(&runner.module, route_key, capacity_key)
     };
 
     // The routes some eligible runner runs, then the requirements the scorer
@@ -211,42 +254,83 @@ pub(super) async fn select(
         .filter(|fact| {
             requirements
                 .max_output_tokens
-                .is_none_or(|floor| fact.max_output_tokens.is_none_or(|limit| limit >= floor))
+                .is_none_or(|floor| fact.max_output_tokens.is_some_and(|limit| limit >= floor))
         })
         .collect();
     if capable.is_empty() && !reachable.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
 
-    // Subscription coverage, read the way every selection reads it: the
-    // operator's `subscription` list and the provider auth facts.
-    let subscription_keys: HashSet<String> = resolve_routing_policy(
-        capable.iter().map(|fact| fact_to_route(fact).route_key),
-        &operator_policy,
-        &ModelRoutingPolicyInput::default(),
-        &crate::provider_auth_types(None, deps.opencode_auth_path),
-    )
-    .subscription_keys
-    .into_iter()
-    .collect();
     let available: HashSet<String> = capable
         .iter()
         .map(|fact| fact_to_route(fact).route_key)
         .collect();
-    // The route-local refusals every selection applies before scoring, pins
-    // included: codemode and flow run only on routes priced per token, never
-    // on a provider that publishes a subscription plan. A v1 request names no
-    // provider allow-list, so that filter admits every provider here.
-    let rejections = select_policy::candidate_rejections(
+    if let Some(classes) = &priced.classes {
+        classes.apply_eligibility(&mut snapshot, &facts, priced_per_token, false);
+    }
+    let candidates = select_policy::prepare_candidates(
         &facts,
+        &mut snapshot,
+        available,
+        HashMap::new(),
+        select_policy::CandidateSource::Vault {
+            credentials: deps.broca_credentials,
+            fences: &priced.entitlement_fences,
+            stale: &[],
+            defer_pool_pin: false,
+        },
         legacy_consumer,
+        priced_per_token,
         None,
         priced.subscription_plan_providers.as_ref(),
+        &operator_policy,
+        &catalog_targets,
+        priced.classes.as_ref(),
     );
+    let available = candidates.available;
+    let mut usable = available.clone();
+    let mut account_blocks = HashMap::new();
+    if let Some(classes) = &priced.classes {
+        for fact in &facts {
+            if !matches!(
+                classes
+                    .probe(
+                        &fact.provider_id,
+                        &fact.model_id,
+                        priced_per_token,
+                        false,
+                        None,
+                        "demand-preflight"
+                    )
+                    .outcome,
+                prefrontal_routing_core::accounts::Outcome::Admit(_)
+            ) {
+                usable.remove(&prefrontal_routing_core::fact_to_route(fact).route_key);
+                if let Some(reset) =
+                    classes.blocked_reset(&fact.provider_id, &fact.model_id, priced_per_token)
+                {
+                    account_blocks.insert(
+                        prefrontal_routing_core::fact_to_route(fact).route_key,
+                        reset,
+                    );
+                }
+            }
+        }
+    }
+    let subscription_keys = candidates.subscription_keys;
+    let rejections = candidates.rejected;
 
+    // Operator score targets allow fractions; keep them in the internal demand
+    // rather than sending them through the integer-only request validator.
+    let operator_demand =
+        operator_config.consumer_policy(&consumer, &Default::default(), &Default::default());
     let demand = ModelRequirements {
-        iq: f64::from(requirements.iq),
-        eq: f64::from(requirements.eq.unwrap_or(0)),
+        iq: operator_demand
+            .iq
+            .unwrap_or_else(|| f64::from(requirements.iq)),
+        eq: operator_demand
+            .eq
+            .unwrap_or_else(|| f64::from(requirements.eq.unwrap_or(0))),
     };
     let vision = modalities.contains(&Modality::Image);
     let required_capabilities = match (vision, requirements.context_window) {
@@ -270,7 +354,7 @@ pub(super) async fn select(
     });
     let selection = Selection {
         consumer: &consumer,
-        legacy_consumer,
+        priced_per_token,
         demand,
         required_capabilities,
         facts: &facts,
@@ -289,6 +373,12 @@ pub(super) async fn select(
         account_flags: live_config.account_flags(),
         scope: caller.scope.clone(),
         now,
+        hold_ok: params
+            .get("hold_ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        hold_wait_max_s: params.get("hold_wait_max_s").and_then(Value::as_u64),
+        conversation_key: request.affinity.as_deref().unwrap_or("select"),
     };
 
     let project_pin = caller
@@ -304,62 +394,148 @@ pub(super) async fn select(
             .map_err(store_refusal)?,
         None => None,
     };
-    let (mut selected, basis, explicit_variant) = if let Some(pin) = &request.pin {
-        let selected = selection.pin(pin, &available)?;
-        (
-            selected,
-            Basis::RequestPin,
-            RouteRef::parse_pin(pin).and_then(|pin| pin.variant),
-        )
-    } else if let Some(selected) = project_pin
-        .as_deref()
-        .and_then(|pin| selection.pin(pin, &available).ok())
+    let continuing = previous
+        .as_ref()
+        .map(|previous| format!("{}/{}", previous.provider, previous.model));
+    // Request pin, then project pin, then the continuing model, then the mode.
+    // A pin does not fall through. The continuing model does, once it is no
+    // longer allowed. Legacy targetAgent bodies never reach this surface.
+    let ladder_choice = if request.pin.is_none()
+        && project_pin.is_none()
+        && continuing.is_none()
+        && consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
     {
-        let variant = project_pin
-            .as_deref()
-            .and_then(RouteRef::parse_pin)
-            .and_then(|pin| pin.variant);
-        (selected, Basis::ProjectPin, variant)
-    } else if let Some(selected) = previous.as_ref().and_then(|previous| {
-        // The previous route again, under the full requirements: affinity
-        // keeps a route only while it still meets the request.
-        let key = prefrontal_routing_core::make_route_key(
-            &previous.provider,
-            &previous.model,
-            previous.variant.as_deref(),
-        );
-        let base = format!("{}/{}", previous.provider, previous.model);
-        let only: HashSet<String> = available
-            .iter()
-            .filter(|candidate| **candidate == key || **candidate == base)
-            .cloned()
-            .collect();
-        (!only.is_empty())
-            .then(|| selection.automatic(&only).ok())
-            .flatten()
-    }) {
-        (selected, Basis::Affinity, None)
-    } else {
-        match selection.automatic(&available) {
-            Ok(selected) => (selected, Basis::Automatic, None),
-            Err(no_route) => {
-                selection.record_refusal(&no_route, &priced.provenance);
-                return Err(no_route_refusal(&no_route, now));
+        let mut result = None;
+        let mut fallback_hold = None;
+        for entry in consumer_policy.ladder.iter().flatten() {
+            let Some(route) = RouteRef::parse_pin(entry) else {
+                continue;
+            };
+            let subset = available
+                .iter()
+                .filter(|key| {
+                    *key == &route.route_key()
+                        || key.starts_with(&format!("{}/", route.route_key()))
+                })
+                .cloned()
+                .collect();
+            if let Ok(selected) = selection.pass().score(&subset) {
+                match selection.account_check(&selected) {
+                    Ok(()) => {
+                        result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
+                        break;
+                    }
+                    Err(refusal) if refusal.code.as_str() == "account_hold" => {
+                        if selection.hold_ok {
+                            result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
+                            break;
+                        }
+                        if fallback_hold.as_ref().is_none_or(
+                            |(_, previous): &(SelectedModelRoute, Refusal)| {
+                                previous.detail.get("reset_at_ms").and_then(Value::as_i64)
+                                    > refusal.detail.get("reset_at_ms").and_then(Value::as_i64)
+                            },
+                        ) {
+                            fallback_hold = Some((selected, refusal));
+                        }
+                    }
+                    Err(_) => {}
+                }
             }
+        }
+        result.or_else(|| {
+            fallback_hold.map(|(selected, _)| Ok((selected, select_policy::OrderBasis::Mode)))
+        })
+    } else {
+        None
+    };
+    let ordered = ladder_choice.unwrap_or_else(|| {
+        selection.pass().select(
+            &usable,
+            request.pin.as_deref(),
+            project_pin.as_deref(),
+            continuing.as_deref(),
+            |pin| selection.pin(pin, &available),
+        )
+    });
+    let (mut selected, basis, explicit_variant) = match ordered {
+        Ok((selected, order)) => {
+            let explicit = match order {
+                select_policy::OrderBasis::RequestPin => request
+                    .pin
+                    .as_deref()
+                    .and_then(RouteRef::parse_pin)
+                    .and_then(|pin| pin.variant),
+                select_policy::OrderBasis::ProjectPin => project_pin
+                    .as_deref()
+                    .and_then(RouteRef::parse_pin)
+                    .and_then(|pin| pin.variant),
+                select_policy::OrderBasis::Continuing | select_policy::OrderBasis::Mode => None,
+            };
+            let basis = match order {
+                select_policy::OrderBasis::RequestPin => Basis::RequestPin,
+                select_policy::OrderBasis::ProjectPin => Basis::ProjectPin,
+                select_policy::OrderBasis::Continuing => Basis::Affinity,
+                select_policy::OrderBasis::Mode => Basis::Automatic,
+            };
+            (selected, basis, explicit)
+        }
+        Err(select_policy::OrderFailure::Pin(refusal)) => return Err(refusal),
+        Err(select_policy::OrderFailure::Score(no_route)) => {
+            selection.record_refusal(&no_route, &priced.provenance);
+            // Account preflight is separate from model scoring. Only name an
+            // account block when an otherwise adequate, policy-allowed model
+            // would have been selected without that block.
+            let mut resets = Vec::new();
+            let blocked: HashSet<_> = account_blocks
+                .iter()
+                .filter_map(|(key, reset)| {
+                    if consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
+                        && !consumer_policy.ladder.iter().flatten().any(|entry| {
+                            RouteRef::parse_pin(entry)
+                                .is_some_and(|route| route.route_key() == *key)
+                        })
+                    {
+                        return None;
+                    }
+                    if !available.contains(key)
+                        || selection
+                            .pass()
+                            .score(&HashSet::from([key.clone()]))
+                            .is_err()
+                    {
+                        return None;
+                    }
+                    resets.extend(*reset);
+                    Some(key.clone())
+                })
+                .collect();
+            if !blocked.is_empty() {
+                return Err(Refusal::no_route(
+                    NoRouteReason::parse("accounts_blocked"),
+                    resets.into_iter().min().map(|reset| reset.max(0) as u64),
+                ));
+            }
+            return Err(no_route_refusal(&no_route, now));
         }
     };
     let variant_choice = crate::apply_variant_policy(
         &mut selected,
         &operator_config,
         deps.operator_config_path,
+        &catalog_targets,
         legacy_consumer,
         explicit_variant.as_deref(),
     );
 
-    let runner = runners
-        .iter()
-        .find(|runner| runs(runner, &selected.route_key, &selected.capacity_key))
-        .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
+    let runner = select_policy::choose_runner(
+        &runners,
+        consumer_policy.runner.as_deref(),
+        &selected.route_key,
+        &selected.capacity_key,
+        &runs,
+    )
+    .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
 
     // Record the decision in the ledger every selection writes, then bind it.
     let mut decision = crate::decision_input_for(
@@ -375,11 +551,30 @@ pub(super) async fn select(
         Some(&crate::policy_sources_line(&operator_policy)),
     );
     decision.consumer = Some(consumer.clone());
+    // Selection chooses the route; account_for enforces its hold. Preserve the
+    // effective wait cap so later policy edits cannot widen this decision.
+    let max_hold_s = operator_config
+        .allocator_policy(&selected.model.provider_id)
+        .max_hold_s;
+    let hold_cap = request
+        .hold_wait_max_s
+        .map_or(max_hold_s, |cap| cap.min(max_hold_s));
+    let mut input: Value =
+        serde_json::from_str(&decision.requirements_json).map_err(store_refusal)?;
+    input["hold_wait_max_s"] = json!(hold_cap);
+    decision.requirements_json = input.to_string();
+    decision.allowed_account_class =
+        prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
+            priced_per_token,
+        );
     let decision_id = deps
         .store
         .record_decision_with_selection(&decision, Some(&runner.module), None)
         .map_err(store_refusal)?;
-    if runner.module == "broca" {
+    if registry
+        .get(&runner.module)
+        .is_some_and(|runner| runner.follows_account_choice)
+    {
         // The decision stands without the serving identity: an outcome for
         // it is then recorded as for a route with several credentials.
         if let Err(error) = crate::remember_provider_identity(
@@ -406,6 +601,7 @@ pub(super) async fn select(
             decision_id: decision_id.clone(),
             principal: caller.principal.clone(),
             consumer: consumer.clone(),
+            allowed_account_class: decision.allowed_account_class,
             project_id: caller
                 .scope
                 .as_ref()
@@ -430,10 +626,17 @@ pub(super) async fn select(
         runner.module,
         basis.as_str()
     ));
+    let mut runner_ref = RunnerRef::new(runner.module.clone(), route.clone());
+    if let Some(harness) = registry
+        .get(&runner.module)
+        .and_then(|runner| runner.selection_harness(request.harness.as_deref()))
+    {
+        runner_ref = runner_ref.with_harness(harness);
+    }
     let answer = SelectAnswer {
         decision_id,
         route: route.clone(),
-        runner: RunnerRef::new(runner.module.clone(), route),
+        runner: runner_ref,
         context_window: fact
             .and_then(|fact| fact.context_window)
             .map_or(0, |window| window as u64),
@@ -456,8 +659,11 @@ pub(super) async fn select(
 
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
+    hold_ok: bool,
+    hold_wait_max_s: Option<u64>,
+    conversation_key: &'a str,
     consumer: &'a str,
-    legacy_consumer: Option<select_policy::Consumer>,
+    priced_per_token: bool,
     demand: ModelRequirements,
     required_capabilities: Option<RequiredCapabilities>,
     facts: &'a [ModelFact],
@@ -482,47 +688,27 @@ struct Selection<'a> {
 }
 
 impl<'a> Selection<'a> {
-    fn input(
-        &self,
-        available: &HashSet<String>,
-        snapshot: ModelRouteStateSnapshot,
-    ) -> SelectModelRouteInput<'a> {
-        let subscription_keys = self.subscription_keys.clone();
-        let consumer = self.legacy_consumer;
-        SelectModelRouteInput {
-            target_agent: self.consumer.to_owned(),
+    fn pass(&self) -> select_policy::SelectionPass<'_> {
+        select_policy::SelectionPass {
+            consumer: self.consumer,
+            target_agent: self.consumer,
             requirements: self.demand,
-            available_models: available.clone(),
-            facts: self.facts.to_vec(),
-            runtime_snapshot: Some(snapshot),
-            exclude_route_keys: self.exclude.to_vec(),
-            operator_exclude_keys: self.operator_exclude.to_vec(),
+            facts: self.facts,
+            snapshot: self.snapshot,
+            exclude: self.exclude,
+            operator_exclude: self.operator_exclude,
             required_capabilities: self.required_capabilities,
-            is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                select_policy::subscription_covered(consumer, &subscription_keys, route)
-            })),
-            min_best_effort_adequacy: self.min_band,
+            subscription_keys: self.subscription_keys,
+            priced_per_token: self.priced_per_token,
+            min_band: self.min_band,
             prefer_prompt_cache: false,
-            providers_without_prompt_cache: self
-                .providers_without_prompt_cache
-                .iter()
-                .cloned()
-                .collect(),
+            providers_without_prompt_cache: &self.providers_without_prompt_cache,
+            consumer_exclude: self.consumer_exclude,
+            rejections: self.rejections,
+            config: self.routing_config,
+            slots: self.slots,
+            operator_config: self.sources.operator_config,
         }
-    }
-
-    /// The scorer's choice among `available`. Unlike the older select there
-    /// is no break-glass retry: a route that is cooling down or out of quota
-    /// is fenced, and the refusal says when the earliest one returns.
-    fn automatic(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
-        select_model_route_with_availability(
-            self.input(available, self.snapshot.clone()),
-            self.routing_config,
-            self.slots,
-            self.consumer_exclude,
-            self.rejections,
-        )
-        .map_err(select_policy::describe_filter_refusal)
     }
 
     /// A named model, through the same pin admission a work run's `model=`
@@ -530,7 +716,12 @@ impl<'a> Selection<'a> {
     fn pin(&self, pin: &str, available: &HashSet<String>) -> Result<SelectedModelRoute, Refusal> {
         let parsed = RouteRef::parse_pin(pin)
             .ok_or_else(|| Refusal::pin_unavailable(pin, PinUnavailableReason::Invalid, None))?;
-        if self.exclude.contains(&parsed.route_key()) {
+        if self.exclude.contains(&parsed.route_key())
+            || !self
+                .sources
+                .operator_config
+                .route_allowed(self.consumer, &parsed.route_key(), true)
+        {
             return Err(Refusal::pin_unavailable(
                 pin,
                 PinUnavailableReason::Excluded,
@@ -540,32 +731,7 @@ impl<'a> Selection<'a> {
         let variant = work_model_pin::named_variant(pin, self.facts);
         let (pin_key, pin_capacity) =
             work_model_pin::route_keys(pin, variant.as_deref(), self.facts);
-        // The pin's own snapshot: provider resets are read again at the
-        // variant the pin names, and credential entitlement fences, which
-        // only steer automatic choice, do not apply to an explicit pin.
-        let mut snapshot = self.snapshot.clone();
-        for state in snapshot.by_route.values_mut() {
-            state.provider_reset_until = None;
-        }
-        credential_fences::clear(&mut snapshot);
-        let pin_facts: Vec<ModelFact> = self
-            .facts
-            .iter()
-            .filter(|fact| fact_to_route(fact).capacity_key == pin_capacity)
-            .cloned()
-            .collect();
-        crate::apply_provider_resets_for_group(
-            &mut snapshot,
-            &pin_facts,
-            self.deps.store,
-            self.deps.broca_credentials,
-            self.sources.operator_config,
-            self.sources.operator_config_path,
-            self.consumer,
-            self.legacy_consumer,
-            variant.as_deref(),
-        )
-        .map_err(|error| store_refusal(error.to_string()))?;
+        let snapshot = self.snapshot.clone();
         let refused = |reason: &str| {
             let (reason, reset) = pin_reason(reason, &snapshot, &pin_key, &pin_capacity, self.now);
             Refusal::pin_unavailable(pin, reason, reset)
@@ -573,22 +739,61 @@ impl<'a> Selection<'a> {
         let catalog = config_overrides::reasoning_catalog_for(self.sources.operator_config_path);
         let selected = work_model_pin::select_with_availability(
             pin,
-            self.input(available, snapshot.clone()),
+            self.pass().input(available, snapshot.clone()),
             self.routing_config,
             self.slots,
             catalog.as_ref(),
-            self.sources.operator_config.score_aliases(),
+            self.sources.catalog_targets,
             self.rejections,
         )
         .map_err(|refusal| refused(&refusal.code))?;
-        let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
-        account_selection::preflight_model(
-            &super::account_ctx(self.deps, self.account_flags, &policy),
+        if let Err(refusal) = self.account_check(&selected) {
+            if refusal.code.as_str() != "account_hold" {
+                return Err(refusal);
+            }
+        }
+        Ok(selected)
+    }
+
+    fn account_check(&self, selected: &SelectedModelRoute) -> Result<(), Refusal> {
+        let policy = self
+            .sources
+            .operator_config
+            .allocator_policy(&selected.model.provider_id);
+        let ctx = super::account_ctx(self.deps, self.account_flags, &policy)?;
+        if let Some(classes) = &ctx.classes {
+            match classes
+                .probe(
+                    &selected.model.provider_id,
+                    &selected.model.model_id,
+                    self.priced_per_token,
+                    true,
+                    self.hold_wait_max_s,
+                    self.conversation_key,
+                )
+                .outcome
+            {
+                prefrontal_routing_core::accounts::Outcome::Admit(_) => return Ok(()),
+                prefrontal_routing_core::accounts::Outcome::Hold(hold) => {
+                    let mut refusal = Refusal::account_hold(hold.reset_at_ms.max(0) as u64);
+                    refusal
+                        .detail
+                        .insert("retry_after_s".into(), json!(hold.retry_after_s));
+                    refusal
+                        .detail
+                        .insert("reset_at_ms".into(), json!(hold.reset_at_ms));
+                    return Err(refusal);
+                }
+                _ => {}
+            }
+        }
+        account_selection::preflight_model_for_class(
+            &ctx,
             &selected.model.provider_id,
             &selected.model.model_id,
+            self.priced_per_token,
         )
-        .map_err(|(code, _)| refused(&code))?;
-        Ok(selected)
+        .map_err(|(code, message)| provider_refusal(&code, message))
     }
 
     /// Record a refused selection in the ledger, as every selection does.
@@ -624,12 +829,11 @@ fn pin_reason(
         snapshot.by_route.get(route_key),
         snapshot.by_capacity.get(capacity_key),
     ];
-    let deadline = |pick: fn(&prefrontal_routing_core::RouteRuntimeState) -> [Option<f64>; 2]| {
+    let deadline = |pick: fn(&prefrontal_routing_core::RouteRuntimeState) -> Option<f64>| {
         states
             .iter()
             .flatten()
-            .flat_map(|state| pick(state))
-            .flatten()
+            .filter_map(|state| pick(state))
             .filter(|until| *until > now)
             .max_by(f64::total_cmp)
             .map(|until| until as u64)
@@ -646,15 +850,15 @@ fn pin_reason(
         "credential_billing_exhausted" => (PinUnavailableReason::CredentialBillingExhausted, None),
         "cooldown_active" => (
             PinUnavailableReason::Cooldown,
-            deadline(|state| [state.cooldown_until, None]),
+            deadline(|state| state.cooldown_until),
         ),
         "backoff_active" => (
             PinUnavailableReason::Backoff,
-            deadline(|state| [state.failure_backoff_until, None]),
+            deadline(|state| state.failure_backoff_until),
         ),
         "quota_exhausted" | "account_pool_exhausted" => (
             PinUnavailableReason::QuotaExhausted,
-            deadline(|state| [state.quota_exhausted_until, state.provider_reset_until]),
+            deadline(|state| state.quota_exhausted_until),
         ),
         _ => (PinUnavailableReason::NotAvailable, None),
     }
@@ -680,6 +884,9 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
         .map(|reset| reset as u64);
     let mut refusal = Refusal::no_route(reason, reset);
     refusal.message = format!("{}: {}", refusal.message, no_route.refusal_message());
+    refusal
+        .detail
+        .insert("rejected".into(), json!(no_route.rejected));
     refusal
 }
 

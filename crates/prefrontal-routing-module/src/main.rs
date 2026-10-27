@@ -20,15 +20,19 @@ mod available_models_text;
 #[cfg(test)]
 mod baseline_tests;
 mod broca_credentials;
+mod config_convert;
 mod config_overrides;
 mod config_policy;
 mod credential_fences;
+mod diagnostics_findings;
 mod engram_catalog;
 mod fusiform_catalog;
 mod key_pool;
+mod legacy_wire;
+#[cfg(test)]
+mod literal_census_tests;
 mod model_resolution;
 mod panel_policy;
-mod provider_resets;
 mod quota_bus;
 mod quota_consumer;
 mod quota_events;
@@ -39,6 +43,8 @@ mod select_policy;
 mod selection_harness;
 mod subscription_economics;
 mod substrate_policy;
+#[cfg(test)]
+mod test_config;
 mod usage_observe;
 mod variant_policy;
 mod winner_ladder;
@@ -57,13 +63,14 @@ use std::{
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
 use cortexkit_store_types::StorageDescriptor;
 use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
+use prefrontal_routing_core::launch_policy::resolve_routing_policy_with_catalog_targets;
 use prefrontal_routing_core::model_facts::make_capacity_key;
 use prefrontal_routing_core::model_facts::{
     Confidence, ModelScores, RoutePricing, ScoreProvenance,
 };
 use prefrontal_routing_core::model_router::{
-    select_model_route_with_availability, ModelRouteStateSnapshot, NoRouteError,
-    RequiredCapabilities, RouteFailureReason, SelectModelRouteInput, SelectedModelRoute,
+    ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
+    SelectModelRouteInput, SelectedModelRoute,
 };
 use prefrontal_routing_core::quota::quota_poll::record_reading_log_poll;
 use prefrontal_routing_core::quota::{merge_quota_overlay, ProviderUsage};
@@ -137,6 +144,10 @@ const ROUTE_COOLDOWN_STATUS_OP: &str = "route.cooldown_status";
 const ROUTE_CLEAR_FAILURE_BACKOFF_OP: &str = "route.clear_failure_backoff";
 /// Lift a route-local cooldown and quota wall without resetting failure backoff.
 const ROUTE_CLEAR_COOLDOWN_OP: &str = "route.clear_cooldown";
+/// Lift every credential entitlement fence on one named vault credential at
+/// once, for use right after topping it up. Operator-only: only the `direct`
+/// and `reserved:callosum` principals may call it.
+const ROUTE_CLEAR_CREDENTIAL_FENCES_OP: &str = "route.clear_credential_fences";
 /// Observability op: reports whether the outbound quota-consumer connection is
 /// live and how fresh its windows are. Lets a consumer (and the e2e) confirm the
 /// module->module quota path actually round-tripped, not just that it didn't hang.
@@ -269,7 +280,7 @@ type RouteEpochs = HashMap<u16, u32>;
 /// example `reserved:broca` for the supervised Broca module), by channel, with
 /// the epoch it was bound under. The account-selection operations namespace
 /// admissions and affinity by it and accept a report only for an admission
-/// they issued to the same identity; no other operation reads it. It is a
+/// they issued to the same identity; consumer admission also reads it. It is a
 /// process global so the shared request handler keeps its signature.
 static ROUTE_PRINCIPALS: OnceLock<Mutex<HashMap<u16, (u32, String)>>> = OnceLock::new();
 
@@ -297,6 +308,24 @@ fn route_principal(channel: u16, epoch: u32) -> String {
 /// scope. The daemon sends both only to a target that provides
 /// `scope-workdir/v1`, so a scope it stamped without them records nothing.
 static ROUTE_SCOPES: OnceLock<Mutex<HashMap<u16, (u32, Option<DecisionScope>)>>> = OnceLock::new();
+
+/// Authorization is kept separately from decision-ledger metadata so a scope
+/// without a project id still carries its daemon-attested owner and permission.
+static ROUTE_SCOPE_AUTHORITY: OnceLock<
+    Mutex<HashMap<u16, (u32, Option<routing_v1::ScopeAuthority>)>>,
+> = OnceLock::new();
+
+fn route_scope_authority(channel: u16, epoch: u32) -> Option<routing_v1::ScopeAuthority> {
+    ROUTE_SCOPE_AUTHORITY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|map| {
+            map.get(&channel)
+                .filter(|(bound, _)| *bound == epoch)
+                .and_then(|(_, scope)| scope.clone())
+        })
+}
 
 fn route_scopes() -> &'static Mutex<HashMap<u16, (u32, Option<DecisionScope>)>> {
     ROUTE_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -334,6 +363,14 @@ fn clear_route_scope(channel: u16, epoch: u32) {
             map.remove(&channel);
         }
     }
+    if let Ok(mut map) = ROUTE_SCOPE_AUTHORITY
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        if map.get(&channel).is_some_and(|(bound, _)| *bound == epoch) {
+            map.remove(&channel);
+        }
+    }
 }
 
 /// The scope the request on `channel` was bound under, when it still holds
@@ -350,6 +387,14 @@ fn clear_route_epoch(route_epochs: &mut RouteEpochs, channel: u16, epoch: u32) {
     if route_epochs.get(&channel) == Some(&epoch) {
         route_epochs.remove(&channel);
         clear_route_scope(channel, epoch);
+        if let Ok(mut principals) = route_principals().lock() {
+            if principals
+                .get(&channel)
+                .is_some_and(|(bound, _)| *bound == epoch)
+            {
+                principals.remove(&channel);
+            }
+        }
     }
 }
 
@@ -567,7 +612,7 @@ fn write_quota_readings(
     let facts = store.get_facts().map_err(|e| e.to_string())?;
     let observed_at = i64::try_from(observed_at_ms).map_err(|e| e.to_string())?;
     for entry in fresh {
-        let Some(join) = prefrontal_routing_core::quota::quota_route_join(entry) else {
+        let Some(join) = prefrontal_routing_core::quota::quota_route_join(entry, &facts) else {
             continue;
         };
         let capacity_keys = prefrontal_routing_core::quota::quota_capacity_keys(entry, &facts);
@@ -861,6 +906,22 @@ fn check_config_at(path: &Path) -> Result<(), ModuleError> {
 
 #[tokio::main]
 async fn main() -> Result<(), ModuleError> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "config-convert") {
+        if args.len() != 3 {
+            return Err(ModuleError::Message(format!(
+                "usage: {} <input> <output>",
+                config_convert::COMMAND
+            )));
+        }
+        let input = std::fs::read_to_string(&args[1])
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
+        let output = config_convert::convert(&input).map_err(ModuleError::Message)?;
+        config_overrides::validate_document(&output).map_err(ModuleError::Message)?;
+        std::fs::write(&args[2], output)
+            .map_err(|error| ModuleError::Message(error.to_string()))?;
+        return Ok(());
+    }
     // Read the launch nonce before anything else can spawn a process: until
     // this first read, the pipe the daemon handed it over on is inheritable,
     // so a child spawned earlier would receive it. The result is cached for
@@ -1172,6 +1233,13 @@ where
     let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
     broca_credentials.lock().unwrap().connection_file_path =
         Some(config.connection_file_path.clone());
+    loops.spawn(
+        "runner declarations",
+        routing_v1::runners::refresh_loop(
+            config.connection_file_path.clone(),
+            Arc::clone(&broca_credentials),
+        ),
+    );
     // Restored login identities identify their serving plane before the first
     // catalog poll; API-only providers wait for the non-secret listing poll.
     if let (Ok(accounts), Ok(facts), Ok(mut credentials)) = (
@@ -1179,11 +1247,12 @@ where
         store.get_facts(),
         broca_credentials.lock(),
     ) {
-        credentials.set_score_alias(
-            config_overrides::read_operator_routing_policy(&config_overrides::config_path())
-                .score_alias,
+        credentials.refresh_serving_methods(
+            &accounts,
+            &facts,
+            now_ms() as i64,
+            &config_overrides::live_config(&config_overrides::config_path()).quota_model_pools(),
         );
-        credentials.refresh_serving_methods(&accounts, &facts, now_ms() as i64);
     }
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
         let roster_resolver: Arc<dyn cortexkit_claustrum_client::CredentialResolver> = Arc::new(
@@ -1203,6 +1272,7 @@ where
                 Arc::clone(&store),
                 roster_resolver,
                 Arc::clone(&broca_credentials),
+                config_overrides::config_path(),
             ),
         );
     }
@@ -1220,8 +1290,6 @@ where
     let override_path = config_overrides::config_path();
     // Selection policy and model-fact overrides share the routing-owned file.
     let operator_config_path = override_path.clone();
-    // OpenCode owns this file; routing reads only each provider's auth kind.
-    let opencode_auth_path = config_overrides::auth_json_path();
     config_overrides::live_config(&override_path);
     loops.spawn(
         "config refresh",
@@ -1275,7 +1343,6 @@ where
             &override_path,
             &operator_config_path,
             &broca_credentials,
-            &opencode_auth_path,
             &catalog_health,
         )
         .await?
@@ -1373,7 +1440,6 @@ async fn handle_frame(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
-    opencode_auth_path: &Path,
     catalog_health: &SharedCatalogHealth,
 ) -> Result<bool, ModuleError> {
     match frame.header.ty {
@@ -1424,7 +1490,6 @@ async fn handle_frame(
             let routing_config_path = routing_config_path.to_path_buf();
             let operator_config_path = operator_config_path.to_path_buf();
             let broca_credentials = Arc::clone(broca_credentials);
-            let opencode_auth_path = opencode_auth_path.to_path_buf();
             let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
             tokio::spawn(async move {
                 answer_route_request(
@@ -1434,8 +1499,25 @@ async fn handle_frame(
                     route_epoch,
                     corr,
                     |reply| async move {
-                        // The routing/v1 surface answers the requests it claims;
-                        // every other request reaches the older ops unchanged.
+                        // A flow-scoped route reaches only the ops in
+                        // diagnostics_findings::FLOW_SCOPE_OPS.
+                        if let Some(refusal) = diagnostics_findings::flow_route_refusal(
+                            &frame.body,
+                            channel,
+                            route_epoch,
+                        ) {
+                            return send_route_error_body(
+                                &reply,
+                                ver,
+                                channel,
+                                route_epoch,
+                                corr,
+                                refusal,
+                            )
+                            .await;
+                        }
+                        // Both wire shapes are answered by one selection pass.
+                        // claims() only chooses which request body that pass reads.
                         if routing_v1::claims(&frame.body) {
                             return routing_v1::serve(
                                 frame,
@@ -1447,7 +1529,6 @@ async fn handle_frame(
                                     routing_config_path: &routing_config_path,
                                     operator_config_path: &operator_config_path,
                                     broca_credentials: &broca_credentials,
-                                    opencode_auth_path: &opencode_auth_path,
                                 },
                             )
                             .await;
@@ -1462,7 +1543,6 @@ async fn handle_frame(
                             &routing_config_path,
                             &operator_config_path,
                             &broca_credentials,
-                            &opencode_auth_path,
                         )
                         .await
                     },
@@ -1588,6 +1668,27 @@ async fn handle_control_request(
                 epoch,
                 DecisionScope::from_stamp(scope.as_ref()),
             );
+            if let Ok(mut map) = ROUTE_SCOPE_AUTHORITY
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+            {
+                map.insert(
+                    route_channel,
+                    (
+                        epoch,
+                        scope.as_ref().map(|stamp| routing_v1::ScopeAuthority {
+                            owner: account_selection::principal_label(Some(&stamp.owner)),
+                            reference: stamp.scope_ref.clone(),
+                            kind: stamp.kind.clone(),
+                            scope_epoch: stamp.scope_epoch,
+                            project_id: stamp.project_id.clone(),
+                            owner_authorized: stamp.owner_authorized,
+                            flow_id: stamp.attributes.flow_id.clone(),
+                            run_id: stamp.attributes.run_id.clone(),
+                        }),
+                    ),
+                );
+            }
             // The catalog is machine-global, but the wire identity is binding-specific.
             // Install it only after the accepted bind ACK is queued.
             let body = serde_json::to_vec(&ModuleControlResponse::RouteBindAck {})
@@ -1649,6 +1750,7 @@ async fn handle_control_request(
                     .map(|health| health.snapshot(now_ms()))
                     .unwrap_or_else(|_| json!({ "reach": "never-reached", "lastError": "health lock poisoned" })),
                 "quota": quota_metrics,
+                "consumerDeclarations": routing_v1::consumers::health(),
             }));
             let body = serde_json::to_vec(&ModuleControlResponse::from(report))
                 .map_err(ModuleError::Json)?;
@@ -1778,17 +1880,13 @@ impl SelectParams {
         serde_json::from_value(json!({})).expect("every select param has a default")
     }
 
-    /// A selection that names no executor, no workload and no required harness
-    /// comes from a host's own route resolver (an OpenCode or Pi head choosing
-    /// the model for a mason or explore subagent it launches) or from core
-    /// re-running such a selection after a failed attempt. Core still decides
-    /// where those workers run, from its own substrate settings, so the host's
-    /// model list (or Broca's, when the caller names substrate `broca`) stays
-    /// authoritative and the route-to-harness mapping is not consulted. Only
-    /// callers that name a workload, an executor or a required harness are
-    /// judged by the mapped harness.
+    /// A host chooses from its own model list. A request explicitly sent to the
+    /// vault substrate instead needs credential and account admission.
     fn is_host_run(&self) -> bool {
-        self.executor.is_none() && self.workload.is_none() && self.required_harness.is_none()
+        self.executor.is_none()
+            && self.workload.is_none()
+            && self.required_harness.is_none()
+            && !is_broca_substrate(self.substrate.as_deref())
     }
 
     fn resolved_workload(&self) -> Option<selection_harness::Workload> {
@@ -1942,35 +2040,10 @@ struct ResolvedSelectRequest {
     policy: ResolvedRoutingPolicy,
 }
 
-/// Provider auth kinds from the request, else read from OpenCode's `auth.json`
-/// at `opencode_auth_path`. The path is passed in rather than resolved here so
-/// unit tests hand in a scratch file; resolving it from HOME would read the
-/// operator's live credentials file.
-fn provider_auth_types(
-    raw: Option<&HashMap<String, String>>,
-    opencode_auth_path: &Path,
-) -> HashMap<String, String> {
-    if let Some(raw) = raw {
-        return raw.clone();
-    }
-    // A unit test must never read the operator's real auth.json (it holds API
-    // keys and OAuth tokens, and the test would then depend on which providers
-    // the operator has configured).
-    #[cfg(test)]
-    assert!(
-        opencode_auth_path.starts_with(prefrontal_test_support::scratch_root()),
-        "routing unit test read OpenCode auth from {} instead of a scratch file",
-        opencode_auth_path.display()
-    );
-    match config_overrides::read_provider_auth_types(opencode_auth_path) {
-        Ok(types) => types,
-        Err(error) => {
-            eprintln!(
-                "[prefrontal-routing] provider auth read failed (treating non-curated providers as metered): {error}"
-            );
-            HashMap::new()
-        }
-    }
+/// Host auth facts come only from the request. Non-host selection classifies
+/// each serving credential directly from the vault in the shared candidate pass.
+fn provider_auth_types(raw: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+    raw.cloned().unwrap_or_default()
 }
 
 /// Record the sole policy source with each decision so explanations remain tied
@@ -2127,10 +2200,27 @@ fn no_route_error(
     }
 }
 
+/// [`resolve_select_request_with_catalog_targets`] with no provider resolved
+/// through the vault, for tests that resolve a request without a listing.
+#[cfg(test)]
 fn resolve_select_request(
     params: &SelectParams,
     operator_policy: &ModelRoutingPolicyInput,
-    opencode_auth_path: &Path,
+) -> Result<ResolvedSelectRequest, NoRouteError> {
+    resolve_select_request_with_catalog_targets(
+        params,
+        operator_policy,
+        &std::collections::BTreeMap::new(),
+    )
+}
+
+/// Resolve a legacy select's requirements and available-model policy.
+/// `catalog_targets` names the providers with no catalog rows that resolved
+/// through the vault; they are never subscription-covered.
+fn resolve_select_request_with_catalog_targets(
+    params: &SelectParams,
+    operator_policy: &ModelRoutingPolicyInput,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
 ) -> Result<ResolvedSelectRequest, NoRouteError> {
     let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
         (requirements, params.required_capabilities)
@@ -2174,11 +2264,12 @@ fn resolve_select_request(
     if params.pin.is_some() || params.model_pin.is_some() {
         availability_policy.exclude.clear();
     }
-    let policy = resolve_routing_policy(
+    let policy = resolve_routing_policy_with_catalog_targets(
         params.available_models.iter().cloned(),
         &availability_policy,
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
+        &provider_auth_types(params.provider_auth_types.as_ref()),
+        catalog_targets,
     );
     let uses_host_availability = (params.executor.is_some() || params.is_host_run())
         && !is_broca_substrate(params.substrate.as_deref());
@@ -2728,12 +2819,13 @@ async fn handle_list_canonical_gaps(
 }
 
 /// The canonical model id of each panel candidate, so a panel never seats two
-/// routes of one model. A score-alias row serves its target provider's model,
-/// so it takes the target row's id.
+/// routes of one model. A row borrowed by a provider with no catalog rows
+/// (`catalog_targets`) serves its catalog provider's model, so it takes that
+/// row's id.
 fn panel_canonical_ids(
     store: &SqliteRouteStateStore,
     facts: &[ModelFact],
-    aliases: &std::collections::BTreeMap<String, String>,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
 ) -> Result<HashMap<String, String>, prefrontal_routing_core::RouteStateStoreError> {
     let stored = store.canonical_ids_by_route_key()?;
     Ok(facts
@@ -2741,7 +2833,7 @@ fn panel_canonical_ids(
         .filter_map(|fact| {
             let route_key = fact_to_route(fact).route_key;
             let catalog_key =
-                prefrontal_routing_core::score_alias::catalog_key(aliases, &route_key);
+                prefrontal_routing_core::score_alias::catalog_key(catalog_targets, &route_key);
             stored
                 .get(&catalog_key)
                 .map(|canonical_id| (route_key, canonical_id.clone()))
@@ -3055,7 +3147,6 @@ async fn handle_resolve_policy(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     operator_config_path: &Path,
-    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -3083,7 +3174,7 @@ async fn handle_resolve_policy(
         params.available_models,
         &operator_policy,
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
+        &provider_auth_types(params.provider_auth_types.as_ref()),
     );
     let body = serde_json::to_vec(&json!({ "result": resolved })).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
@@ -3223,6 +3314,7 @@ fn prepare_selection_inputs(
     quota_cache: &SharedQuotaCache,
     store: &SharedStore,
     pricing: &RoutePricing,
+    model_pools: &[prefrontal_routing_core::quota_extract::ModelPool],
 ) -> Result<PreparedSelectionInputs, String> {
     let now = now_ms() as f64;
     let facts = store
@@ -3261,7 +3353,7 @@ fn prepare_selection_inputs(
         .as_ref()
         .and_then(|_| stale_quota_age_ms(quota_refreshed_at_ms, now as u64));
     if let Some(windows) = quota_windows.as_ref().filter(|_| stale_age_ms.is_none()) {
-        merge_quota_overlay(&mut snapshot, windows, &facts);
+        merge_quota_overlay(&mut snapshot, windows, &facts, model_pools);
     }
     subscription_economics::overlay(&mut snapshot, &facts, now as i64, pricing);
     let quota_signal_json = quota_signal_json(
@@ -3292,7 +3384,10 @@ struct SelectionPolicySources<'a> {
     live_config: &'a config_overrides::LiveConfig,
     operator_config: &'a config_overrides::LiveConfig,
     operator_config_path: &'a Path,
-    operator_policy: &'a ModelRoutingPolicyInput,
+    /// Each provider with no catalog rows that resolved to a catalog provider
+    /// through its credentials' `serves` vendor
+    /// ([`BrocaCredentials::catalog_targets`]), read once for the selection.
+    catalog_targets: &'a std::collections::BTreeMap<String, String>,
 }
 
 /// What pricing a selection's inputs yields besides the priced facts and the
@@ -3300,30 +3395,46 @@ struct SelectionPolicySources<'a> {
 struct PricedSelection {
     routing_config: prefrontal_routing_core::RoutingConfig,
     provenance: DecisionProvenance,
+    /// Empty input for legacy candidate selection: account choice supplies
+    /// all credential eligibility decisions.
     entitlement_fences: Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>,
-    /// The providers known to publish a subscription plan, which a consumer
-    /// that must run priced per token never runs on
-    /// ([`select_policy::candidate_rejections`]); `None` until it is known.
+    /// Providers known to publish a subscription plan. Host-only payment
+    /// admission uses this list when it has no vault account class.
+    /// `None` means the plan listing is not known yet.
     subscription_plan_providers: Option<HashSet<String>>,
+    classes: Option<account_selection::ClassContext>,
 }
 
 /// Apply one selection's configuration to the facts and snapshot that
-/// [`prepare_selection_inputs`] read: the live overlays, borrowed score-alias
-/// rows, Broca's billing-plane prices, the provider-confirmed resets recorded
-/// for `reset_group`, and the credential entitlement fences. Every route
-/// selection runs this same sequence, so a route fenced for one caller's
-/// selection is fenced for every other.
+/// [`prepare_selection_inputs`] read: the live overlays, the rows borrowed by
+/// providers with no catalog rows, Broca's billing-plane prices, the
+/// credential entitlement fences. Every route selection runs this same sequence, so a
+/// route fenced for one caller's selection is fenced for every other.
 #[allow(clippy::too_many_arguments)]
 fn price_selection_inputs(
     facts: &mut Vec<ModelFact>,
-    snapshot: &mut ModelRouteStateSnapshot,
     quota_signal_json: String,
     sources: &SelectionPolicySources<'_>,
     store: &SharedStore,
     broca_credentials: &SharedBrocaCredentials,
-    reset_group: Option<&str>,
-    consumer: Option<select_policy::Consumer>,
+    credentialed: bool,
+    priced_per_token: bool,
 ) -> Result<PricedSelection, ModuleError> {
+    let classes = if credentialed {
+        Some(
+            account_selection::ClassContext::read(
+                store,
+                broca_credentials,
+                Arc::new(sources.operator_config.clone()),
+                ACCOUNT_QUOTA.get(),
+                facts.clone(),
+                now_ms() as i64,
+            )
+            .map_err(ModuleError::Message)?,
+        )
+    } else {
+        None
+    };
     let outcome = sources.live_config.apply(facts);
     let provenance = DecisionProvenance {
         quota_signal_json,
@@ -3331,47 +3442,44 @@ fn price_selection_inputs(
     };
     // Borrowed rows are added after the live overlays so they carry the target's
     // current quality data, and before pricing so they get their own plane.
-    prefrontal_routing_core::score_alias::append_alias_rows(
-        facts,
-        &sources.operator_policy.score_alias,
-    );
+    prefrontal_routing_core::score_alias::append_alias_rows(facts, sources.catalog_targets);
     let subscription_plan_providers = if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(facts, sources.live_config.pricing());
         credentials.subscription_plan_providers()
     } else {
         None
     };
+    if let Some(classes) = &classes {
+        for fact in facts.iter_mut() {
+            let class = classes.class(fact, priced_per_token);
+            if let Some(method) = class
+                .rows
+                .first()
+                .and_then(|row| row.auth_method.as_deref())
+            {
+                classes
+                    .credentials
+                    .price_for_method(fact, method, sources.live_config.pricing());
+            }
+        }
+    }
     sources.live_config.apply(facts);
-    // A consumer that must run priced per token is never priced as if a
-    // subscription subsidised it.
-    if select_policy::requires_metered(consumer) {
+    // A consumer priced per token is never priced as if a subscription
+    // subsidised it. Only the consumer flag authorizes that payment class.
+    if priced_per_token {
         for fact in facts.iter_mut() {
             fact.subscription_multiplier = None;
         }
     }
-    if let Some(group) = reset_group {
-        apply_provider_resets_for_group(
-            snapshot,
-            facts,
-            store,
-            broca_credentials,
-            sources.operator_config,
-            sources.operator_config_path,
-            group,
-            consumer,
-            None,
-        )?;
-    }
-    // Credentials a provider refused permanently: automatic selection skips a
-    // route no other credential serves, and launches the rest on another one.
-    let entitlement_fences =
-        credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?;
-    credential_fences::apply(snapshot, facts, &entitlement_fences, broca_credentials);
+    // Eligibility is resolved by account choice; selection never reads the
+    // credential-refusal table as an independent route-level restriction.
+    let entitlement_fences = Vec::new();
     Ok(PricedSelection {
         routing_config: outcome.routing_config,
         provenance,
         entitlement_fences,
         subscription_plan_providers,
+        classes,
     })
 }
 
@@ -3581,7 +3689,6 @@ async fn handle_select_request(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
-    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let timing = RouteSelectTimingGuard::new();
     let live_config_started = Instant::now();
@@ -3688,13 +3795,27 @@ async fn handle_select_request(
 
     if account_selection::handles(&envelope.method) {
         let principal = route_principal(channel, epoch);
-        let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+        let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
+            model_families: live_config.account_model_families(),
+            model_pools: live_config.quota_model_pools(),
+            ..Default::default()
+        };
         let ctx = account_selection::Ctx {
             store: store.as_ref(),
             accounts: ACCOUNT_QUOTA.get(),
             flags: live_config.account_flags(),
             policy: &policy,
             now_ms: account_selection::now_ms(),
+            classes: Some(
+                account_selection::ClassContext::load(
+                    store,
+                    broca_credentials,
+                    config_overrides::live_config(operator_config_path),
+                    ACCOUNT_QUOTA.get(),
+                    account_selection::now_ms(),
+                )
+                .map_err(ModuleError::Message)?,
+            ),
         };
         let reply = account_selection::handle(&envelope.method, &frame.body, &principal, &ctx);
         if envelope.method == account_selection::ACCOUNT_OBSERVE_OP {
@@ -3730,6 +3851,9 @@ async fn handle_select_request(
     if envelope.method == ROUTE_CLEAR_COOLDOWN_OP {
         return handle_clear_cooldown(frame, writer, store).await;
     }
+    if envelope.method == ROUTE_CLEAR_CREDENTIAL_FENCES_OP {
+        return handle_clear_credential_fences(frame, writer, store).await;
+    }
     if envelope.method == ROUTE_COOLDOWN_STATUS_OP {
         return handle_cooldown_status(frame, writer, store).await;
     }
@@ -3739,9 +3863,11 @@ async fn handle_select_request(
     if envelope.method == ROUTE_DECISIONS_LIST_OP {
         return handle_route_decisions_list(frame, writer, store).await;
     }
+    if envelope.method == diagnostics_findings::OP {
+        return diagnostics_findings::handle(frame, writer, store).await;
+    }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
-        return handle_resolve_policy(frame, writer, operator_config_path, opencode_auth_path)
-            .await;
+        return handle_resolve_policy(frame, writer, operator_config_path).await;
     }
     if envelope.method == ROUTE_MODEL_FACT_OP {
         return handle_model_fact(frame, writer, store).await;
@@ -3750,23 +3876,23 @@ async fn handle_select_request(
         return handle_model_facts(frame, writer, store, operator_config_path).await;
     }
     if envelope.method == model_resolution::RESOLVE_MODEL_OP {
-        return model_resolution::handle_resolve_model(frame, writer).await;
+        return model_resolution::handle_resolve_model(frame, writer, &live_config.model_naming())
+            .await;
     }
     if envelope.method == model_resolution::MODEL_CAPABILITIES_OP {
-        return model_resolution::handle_model_capabilities(frame, writer, store).await;
+        return model_resolution::handle_model_capabilities(
+            frame,
+            writer,
+            store,
+            &live_config.model_naming(),
+        )
+        .await;
     }
     if envelope.method == model_resolution::AGENT_MODEL_REQUIREMENTS_OP {
         return model_resolution::handle_agent_model_requirements(frame, writer).await;
     }
     if envelope.method == available_models_text::OP {
-        return available_models_text::handle(
-            frame,
-            writer,
-            store,
-            operator_config_path,
-            opencode_auth_path,
-        )
-        .await;
+        return available_models_text::handle(frame, writer, store, operator_config_path).await;
     }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         let ladder_sources =
@@ -3783,23 +3909,75 @@ async fn handle_select_request(
         return handle_list_canonical_gaps(frame, writer, store).await;
     }
     if key_pool::handles(&envelope.method) {
-        let policy = config_overrides::read_operator_routing_policy(operator_config_path);
+        // The pool's providers resolve from the stored catalog rows and the
+        // vault listing.
+        let facts = match store.get_facts() {
+            Ok(facts) => facts,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &format!("key pool: {error}"),
+                )
+                .await;
+            }
+        };
+        let catalog_targets = broca_credentials
+            .lock()
+            .map(|credentials| credentials.catalog_targets(&facts))
+            .unwrap_or_default();
         let reply = key_pool::handle(
             &envelope.method,
             &frame.body,
             &key_pool::PoolCtx {
                 store: store.as_ref(),
                 credentials: broca_credentials,
-                policy: &policy,
+                catalog_targets: &catalog_targets,
                 now_ms: now_ms() as i64,
             },
         );
         return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
     }
-    let billing_ready = if matches!(
-        envelope.method.as_str(),
-        ROUTE_SELECT_OP | ROUTE_SELECT_PANEL_OP
-    ) {
+    if envelope.method == ROUTE_SELECT_OP {
+        if let Ok(request) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
+            let params = &request["params"];
+            let consumer = routing_v1::consumers::legacy_consumer(params);
+            if !routing_v1::consumers::legacy_core_consumer(consumer) {
+                let operator = config_overrides::live_config(operator_config_path);
+                let consumers = routing_v1::consumers::effective(&operator);
+                // Preserve the legacy decoder's invalid_request for malformed
+                // enum values. A known non-core name still faces ownership first.
+                let invalid_legacy_consumer = params.get("consumer").is_some_and(|value| {
+                    serde_json::from_value::<Option<select_policy::Consumer>>(value.clone())
+                        .is_err()
+                }) && !consumers.knows(consumer);
+                if let Err(refusal) = if invalid_legacy_consumer {
+                    Ok(())
+                } else {
+                    consumers.admit(consumer, &routing_v1::Caller::for_route(channel, epoch))
+                } {
+                    let body = ErrorBody {
+                        code: refusal.code.as_str().to_owned(),
+                        message: refusal.message,
+                        detail: Some(serde_json::Value::Object(refusal.detail)),
+                    };
+                    return send_route_error_body(writer, ver, channel, epoch, corr, body).await;
+                }
+            }
+        }
+    }
+    let host_request = envelope.method == ROUTE_SELECT_OP
+        && serde_json::from_slice::<SelectBody>(&frame.body)
+            .is_ok_and(|body| body.params.is_host_run());
+    let billing_ready = if !host_request
+        && matches!(
+            envelope.method.as_str(),
+            ROUTE_SELECT_OP | ROUTE_SELECT_PANEL_OP
+        ) {
         let billing_started = Instant::now();
         let ready =
             broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
@@ -3841,7 +4019,6 @@ async fn handle_select_request(
             routing_config_path,
             operator_config_path,
             broca_credentials,
-            opencode_auth_path,
         )
         .await;
     }
@@ -3915,35 +4092,9 @@ async fn handle_select_request(
     };
     let operator_policy = operator_config.operator_policy();
     timing.add_live_config_check(live_config_started.elapsed());
-    // A host does not choose the substrate of the mason it launches. A host's
-    // mason pin on a provider that needs a per-send credential pin is admitted
-    // provisionally against Broca's routes, without leasing a key; core selects
-    // the pin again with substrate broca before it records the launch.
-    let deferred_runner_pin = host_run
-        && params.substrate.is_none()
-        && params.target_agent == "mason"
-        && params.model_pin.as_deref().is_some_and(|pin| {
-            pin.split_once('/')
-                .is_some_and(|(provider, _)| needs_runner_pin(&operator_policy, provider))
-        });
-    // The harness a host-run selection is judged on: Broca's served routes when
-    // the caller names substrate broca (or for a deferred runner pin), otherwise
-    // the caller's own list, which has no harness of routing's choosing.
-    let host_run_harness = (host_run
-        && (deferred_runner_pin || is_broca_substrate(params.substrate.as_deref())))
-    .then_some(substrate_policy::Harness::Broca);
     let snapshot_started = Instant::now();
-    let mut availability = match store.get_facts() {
-        Ok(mut facts) => {
-            live_config.apply(&mut facts);
-            // Aliased providers are reachable through their own credentials,
-            // so their borrowed rows join the served-route join.
-            prefrontal_routing_core::score_alias::append_alias_rows(
-                &mut facts,
-                &operator_policy.score_alias,
-            );
-            select_availability(Some("broca"), Vec::new(), &facts, broca_credentials)
-        }
+    let stored_facts = match store.get_facts() {
+        Ok(facts) => facts,
         Err(e) => {
             return send_route_error(
                 writer,
@@ -3957,6 +4108,46 @@ async fn handle_select_request(
             .await;
         }
     };
+    // Providers with no catalog rows of their own, each resolved to the catalog
+    // provider whose rows it borrows, read once for this selection.
+    let catalog_targets = broca_credentials
+        .lock()
+        .map(|credentials| credentials.catalog_targets(&stored_facts))
+        .unwrap_or_default();
+    timing.add_snapshot_closure(snapshot_started.elapsed());
+    // A host does not choose the substrate of the mason it launches. A host's
+    // mason pin on a provider that needs a per-send credential pin is admitted
+    // provisionally against Broca's routes, without leasing a key; core selects
+    // the pin again with substrate broca before it records the launch.
+    let deferred_runner_pin = host_run
+        && params.substrate.is_none()
+        && params.target_agent == "mason"
+        && params.model_pin.as_deref().is_some_and(|pin| {
+            pin.split_once('/')
+                .is_some_and(|(provider, _)| needs_runner_pin(&catalog_targets, provider))
+        });
+    // The harness a host-run selection is judged on: Broca's served routes when
+    // the caller names substrate broca (or for a deferred runner pin), otherwise
+    // the caller's own list, which has no harness of routing's choosing.
+    let host_run_harness = (host_run
+        && (deferred_runner_pin || is_broca_substrate(params.substrate.as_deref())))
+    .then_some(substrate_policy::Harness::Broca);
+    let snapshot_started = Instant::now();
+    let mut availability = if host_run && !deferred_runner_pin {
+        SelectAvailability::host(params.available_models.clone())
+    } else {
+        let mut facts = stored_facts;
+        live_config.apply(&mut facts);
+        // Resolved providers are reachable through their own credentials, so
+        // their borrowed rows join the served-route join.
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &catalog_targets);
+        select_availability(
+            Some(legacy_wire::BROCA),
+            Vec::new(),
+            &facts,
+            broca_credentials,
+        )
+    };
     timing.add_snapshot_closure(snapshot_started.elapsed());
     // A host-run selection judged on the caller's own list never consulted
     // Broca's routes, so its explanation must not describe them.
@@ -3964,47 +4155,55 @@ async fn handle_select_request(
         availability.note = None;
     }
     let resolve_started = Instant::now();
-    let resolved_request =
-        match resolve_select_request(&params, &operator_policy, opencode_auth_path) {
-            Ok(resolved) => {
-                add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
-                resolved
+    let mut resolved_request = match resolve_select_request_with_catalog_targets(
+        &params,
+        &operator_policy,
+        &catalog_targets,
+    ) {
+        Ok(resolved) => {
+            add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
+            resolved
+        }
+        Err(mut no_route) => {
+            add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
+            let write_started = Instant::now();
+            if let Some(note) = &availability.note {
+                no_route.message = format!("{} ({note})", no_route.message);
             }
-            Err(mut no_route) => {
-                add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
-                let write_started = Instant::now();
-                if let Some(note) = &availability.note {
-                    no_route.message = format!("{} ({note})", no_route.message);
-                }
-                let requirements = no_route
-                    .requirements
-                    .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
-                let decision = decision_input_for(
-                    &params.target_agent,
-                    &requirements,
-                    None,
-                    Some(&no_route),
-                    &params,
-                    None,
-                    Some(&policy_sources_line(&operator_policy)),
-                );
-                record_failed_selection_decision(store.as_ref(), &decision);
-                add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
-                return send_no_route(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    &no_route,
-                    params.pin.as_ref().map(|_| "invalid_requirements"),
-                )
-                .await;
-            }
-        };
+            let requirements = no_route
+                .requirements
+                .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
+            let decision = decision_input_for(
+                &params.target_agent,
+                &requirements,
+                None,
+                Some(&no_route),
+                &params,
+                None,
+                Some(&policy_sources_line(&operator_policy)),
+            );
+            record_failed_selection_decision(store.as_ref(), &decision);
+            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
+            return send_no_route(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                &no_route,
+                params.pin.as_ref().map(|_| "invalid_requirements"),
+            )
+            .await;
+        }
+    };
     let providers_without_prompt_cache = live_config.providers_without_prompt_cache();
     let snapshot_started = Instant::now();
-    let prepared = prepare_selection_inputs(quota_cache, store, live_config.pricing());
+    let prepared = prepare_selection_inputs(
+        quota_cache,
+        store,
+        live_config.pricing(),
+        &live_config.quota_model_pools(),
+    );
     timing.add_snapshot_closure(snapshot_started.elapsed());
     let PreparedSelectionInputs {
         now,
@@ -4019,28 +4218,44 @@ async fn handle_select_request(
         }
     };
     let pricing_started = Instant::now();
+    let consumer_id = variant_policy::consumer_group(params.consumer).unwrap_or("");
+    let consumer_policy = operator_config.consumer_policy(
+        consumer_id,
+        &config_policy::ConsumerPolicy::default(),
+        &std::collections::BTreeMap::new(),
+    );
+    // Consumer-less legacy requests keep their old routing policy, but codemode
+    // privacy must not depend on the caller spelling out a consumer member.
+    let payment_consumer = params
+        .consumer
+        .or_else(|| select_policy::Consumer::from_id(&params.target_agent));
+    let payment_policy = operator_config.consumer_policy(
+        variant_policy::consumer_group(payment_consumer).unwrap_or(""),
+        &config_policy::ConsumerPolicy::default(),
+        &std::collections::BTreeMap::new(),
+    );
+    let priced_per_token = select_policy::priced_per_token(&payment_policy, payment_consumer);
     let PricedSelection {
         routing_config,
         provenance,
         entitlement_fences,
         subscription_plan_providers,
+        classes,
     } = price_selection_inputs(
         &mut facts,
-        &mut snapshot,
         quota_signal_json,
         &SelectionPolicySources {
             live_config: &live_config,
             operator_config: &operator_config,
             operator_config_path,
-            operator_policy: &operator_policy,
+            catalog_targets: &catalog_targets,
         },
         store,
         broca_credentials,
-        variant_policy::consumer_group(params.consumer),
-        params.consumer,
+        !host_run,
+        priced_per_token,
     )?;
     add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
-
     let policy_started = Instant::now();
     let host_models: HashSet<String> = resolved_request
         .policy
@@ -4071,8 +4286,11 @@ async fn handle_select_request(
     // inside the list: Broca's reach decides which of those models can run,
     // never which other models may. A pin names its own model and is not
     // confined.
-    let confined_broca_models = (host_run
-        && host_run_harness.is_some()
+    let confined_broca_models = ((host_run_harness.is_some()
+        || (is_broca_substrate(params.substrate.as_deref())
+            && params.executor.is_none()
+            && params.workload.is_none()
+            && params.required_harness.is_none()))
         && params.pin.is_none()
         && params.model_pin.is_none()
         && !params.available_models.is_empty())
@@ -4087,9 +4305,9 @@ async fn handle_select_request(
         }
         confined
     });
-    let mut mapped_availability = if host_run {
+    let mut mapped_availability = if host_run || confined_broca_models.is_some() {
         selection_harness::MappedAvailability {
-            models: if host_run_harness.is_some() {
+            models: if host_run_harness.is_some() || !host_run {
                 confined_broca_models.unwrap_or_else(|| broca_models.clone())
             } else {
                 host_models.clone()
@@ -4099,19 +4317,107 @@ async fn handle_select_request(
     } else {
         harness_context.availability(&facts)
     };
-    let admission_facts = broca_credentials.lock().map_or_else(
-        |_| facts.clone(),
-        |credentials| credentials.admission_facts(&facts, params.consumer, now_ms()),
+    let host_auth = params.provider_auth_types.clone().unwrap_or_default();
+    if let Some(classes) = &classes {
+        classes.apply_eligibility(
+            &mut snapshot,
+            &facts,
+            priced_per_token,
+            params.pin.is_some() || params.model_pin.is_some(),
+        );
+    }
+    let candidates = select_policy::prepare_candidates(
+        &facts,
+        &mut snapshot,
+        mapped_availability.models,
+        mapped_availability.rejected,
+        if host_run {
+            select_policy::CandidateSource::Host {
+                auth_types: &host_auth,
+            }
+        } else {
+            select_policy::CandidateSource::Vault {
+                credentials: broca_credentials,
+                fences: &entitlement_fences,
+                stale: &[],
+                defer_pool_pin: params.pin.is_some() || params.model_pin.is_some(),
+            }
+        },
+        params.consumer,
+        priced_per_token,
+        params.allowed_providers.as_deref(),
+        subscription_plan_providers.as_ref(),
+        &operator_policy,
+        &catalog_targets,
+        classes.as_ref(),
     );
-    mapped_availability
-        .rejected
-        .extend(select_policy::candidate_rejections(
-            &admission_facts,
-            params.consumer,
-            params.allowed_providers.as_deref(),
-            subscription_plan_providers.as_ref(),
-        ));
+    let subscription_keys = candidates.subscription_keys;
+    let candidate_filters = candidates.filters;
+    resolved_request.policy.subscription_keys = subscription_keys.iter().cloned().collect();
+    resolved_request.policy.subscription_keys.sort();
+    mapped_availability = selection_harness::MappedAvailability {
+        models: candidates.available,
+        rejected: candidates.rejected,
+    };
+    let runner_registry = broca_credentials
+        .lock()
+        .map(|credentials| {
+            routing_v1::runners::Registry::build(
+                operator_config.v1_runners(),
+                &credentials,
+                &facts,
+                snapshot.now as u64,
+            )
+        })
+        .unwrap_or_default();
+    let configured_runners = runner_registry.policies();
+    let runner_runs = |runner: &config_policy::RunnerPolicy, key: &str, capacity: &str| {
+        runner_registry.runs(&runner.module, key, capacity)
+    };
+    if !host_run {
+        mapped_availability.models.retain(|key| {
+            let capacity = facts
+                .iter()
+                .map(fact_to_route)
+                .find(|route| route.route_key == *key)
+                .map(|route| route.capacity_key)
+                .unwrap_or_else(|| key.clone());
+            select_policy::choose_runner(
+                &configured_runners,
+                consumer_policy.runner.as_deref(),
+                key,
+                &capacity,
+                &runner_runs,
+            )
+            .is_some()
+        });
+    }
     let available = mapped_availability.models.clone();
+    let runner_module = |selected: &SelectedModelRoute| -> Option<String> {
+        if host_run {
+            Some(
+                if deferred_runner_pin {
+                    legacy_wire::BROCA
+                } else {
+                    params
+                        .harness
+                        .as_deref()
+                        .or(params.substrate.as_deref())
+                        .unwrap_or("host")
+                }
+                .to_owned(),
+            )
+        } else {
+            select_policy::choose_runner(
+                &configured_runners,
+                consumer_policy.runner.as_deref(),
+                &selected.route_key,
+                &selected.capacity_key,
+                &runner_runs,
+            )
+            .map(|runner| runner.module.clone())
+        }
+    };
     // The harness a route selected here runs on, as far as routing knows: the
     // mapped harness, or for a host-run selection Broca when it was judged on
     // Broca's routes and unknown otherwise.
@@ -4122,18 +4428,6 @@ async fn handle_select_request(
             Some(harness_context.mapped(route_key))
         }
     };
-    let mut execution_operator_policy = operator_policy.clone();
-    if params.pin.is_some() || params.model_pin.is_some() {
-        execution_operator_policy.exclude.clear();
-    }
-    let execution_policy = resolve_routing_policy(
-        available.iter().cloned(),
-        &execution_operator_policy,
-        &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(params.provider_auth_types.as_ref(), opencode_auth_path),
-    );
-    let subscription_keys: HashSet<String> =
-        execution_policy.subscription_keys.into_iter().collect();
     // Record on the winner's harness ladder, keeping other harnesses' routes
     // out of its availability history. Target agents retain separate histories.
     //
@@ -4199,10 +4493,31 @@ async fn handle_select_request(
             None
         };
 
+    let pass = select_policy::SelectionPass {
+        consumer: consumer_id,
+        target_agent: &target_agent,
+        requirements,
+        required_capabilities,
+        facts: &facts,
+        snapshot: &snapshot,
+        exclude: &exclude,
+        operator_exclude: &operator_exclude,
+        consumer_exclude,
+        subscription_keys: &subscription_keys,
+        priced_per_token,
+        rejections: &mapped_availability.rejected,
+        config: &routing_config,
+        slots: concurrency_slots.as_ref(),
+        min_band: min_best_effort_adequacy,
+        prefer_prompt_cache,
+        providers_without_prompt_cache: &providers_without_prompt_cache,
+        operator_config: &operator_config,
+    };
+
     let admission_pin = params
         .pin
         .as_ref()
-        .and_then(|pin| pin.resolve(operator_config.pins()));
+        .and_then(|pin| pin.resolve(|slot| operator_config.slot_pin(slot).cloned()));
     let mut pin_rejected = None;
     if let Some(pin) = params
         .model_pin
@@ -4214,27 +4529,7 @@ async fn handle_select_request(
             .and_then(|pin| pin.variant.clone())
             .or_else(|| work_model_pin::named_variant(pin, &facts));
         let (pin_key, pin_capacity) = work_model_pin::route_keys(pin, variant.as_deref(), &facts);
-        let mut pin_snapshot = snapshot.clone();
-        for state in pin_snapshot.by_route.values_mut() {
-            state.provider_reset_until = None;
-        }
-        // An explicit pin is not subject to credential entitlement fences.
-        credential_fences::clear(&mut pin_snapshot);
-        let pin_facts: Vec<_> = facts
-            .iter()
-            .filter(|f| format!("{}/{}", f.provider_id, f.model_id) == pin_capacity)
-            .cloned()
-            .collect();
-        apply_provider_resets(
-            &mut pin_snapshot,
-            &pin_facts,
-            store,
-            broca_credentials,
-            &operator_config,
-            operator_config_path,
-            params.consumer,
-            variant.as_deref(),
-        )?;
+        let pin_snapshot = snapshot.clone();
         let mut pin_availability = mapped_availability.rejected.clone();
         // When a pin refused for a timed wall can be admitted again, so a caller
         // that may not fall back can wait for that time instead of failing.
@@ -4244,37 +4539,32 @@ async fn handle_select_request(
             &pin_capacity,
         );
         let mut pin_available = available.clone();
+        let allowed = operator_config.route_allowed(consumer_id, &pin_key, true)
+            && operator_config.route_allowed(consumer_id, &pin_capacity, true);
+        if !allowed {
+            pin_availability.insert(pin_key.clone(), format!("not_for excludes {consumer_id}"));
+        }
         // A host-run pin is judged on the same list as the host's automatic
         // selections; it is not added to that list.
-        if !host_run {
+        if !host_run && allowed {
             if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
                 pin_availability.insert(pin_key.clone(), detail);
             } else {
                 pin_available.insert(pin_key.clone());
             }
         }
-        let pin_admission_facts: Vec<_> = admission_facts
-            .iter()
-            .filter(|f| format!("{}/{}", f.provider_id, f.model_id) == pin_capacity)
-            .cloned()
-            .collect();
-        if let Some(detail) = select_policy::candidate_rejections(
-            &pin_admission_facts,
-            params.consumer,
-            params.allowed_providers.as_deref(),
-            subscription_plan_providers.as_ref(),
-        )
-        .values()
-        .next()
+        if let Some(detail) = candidate_filters
+            .get(&pin_key)
+            .or_else(|| candidate_filters.get(&pin_capacity))
         {
             pin_availability.insert(pin_key.clone(), detail.clone());
         }
         let pin_harness = run_harness(&pin_key);
         let runner_pin_refusal = if host_run {
             host_runner_pin_refusal(
-                &operator_policy,
+                &catalog_targets,
                 if deferred_runner_pin {
-                    Some("broca")
+                    Some(legacy_wire::BROCA)
                 } else {
                     params.substrate.as_deref()
                 },
@@ -4284,7 +4574,7 @@ async fn handle_select_request(
         } else {
             let mapped = harness_context.mapped(&pin_key);
             host_runner_pin_refusal(
-                &operator_policy,
+                &catalog_targets,
                 Some(mapped.as_str()),
                 "this route maps to harness",
                 [pin],
@@ -4308,49 +4598,50 @@ async fn handle_select_request(
             )
             .await;
         }
-        let sub = subscription_keys.clone();
         add_stage_ms(&timing.policy_ms, policy_started.elapsed());
         let selection_started = Instant::now();
+        let pin_credential_refusal = pin_snapshot
+            .by_capacity
+            .get(&pin_capacity)
+            .and_then(|state| state.credential_refusal.clone());
         let selection = {
-            let input = SelectModelRouteInput {
-                target_agent: target_agent.clone(),
-                requirements,
-                available_models: pin_available,
-                facts: facts.clone(),
-                runtime_snapshot: Some(pin_snapshot),
-                exclude_route_keys: exclude.clone(),
-                operator_exclude_keys: operator_exclude.clone(),
-                required_capabilities,
-                is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                    select_policy::subscription_covered(params.consumer, &sub, route)
-                })),
-                min_best_effort_adequacy,
+            let input = select_policy::SelectionPass {
                 prefer_prompt_cache: false,
-                providers_without_prompt_cache: HashSet::new(),
-            };
-            if let Some(pin) = &admission_pin {
-                select_policy::select_pin_with_availability(
-                    pin,
-                    input,
-                    &routing_config,
-                    concurrency_slots.as_ref(),
-                    &pin_availability,
-                )
-                .map_err(|code| work_model_pin::Refusal {
-                    message: code.clone(),
-                    code,
-                })
-            } else {
-                work_model_pin::select_with_availability(
-                    pin,
-                    input,
-                    &routing_config,
-                    concurrency_slots.as_ref(),
-                    config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
-                    operator_config.score_aliases(),
-                    &pin_availability,
-                )
+                ..pass
             }
+            .input(&pin_available, pin_snapshot);
+            let mut input = Some(input);
+            pass.select(&pin_available, Some(pin), None, None, |_| {
+                let input = input.take().expect("a terminal pin is admitted once");
+                if let Some(pin) = &admission_pin {
+                    select_policy::select_pin_with_availability(
+                        pin,
+                        input,
+                        &routing_config,
+                        concurrency_slots.as_ref(),
+                        &pin_availability,
+                    )
+                    .map_err(|code| work_model_pin::Refusal {
+                        message: code.clone(),
+                        code,
+                    })
+                } else {
+                    work_model_pin::select_with_availability(
+                        pin,
+                        input,
+                        &routing_config,
+                        concurrency_slots.as_ref(),
+                        config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
+                        &catalog_targets,
+                        &pin_availability,
+                    )
+                }
+            })
+            .map(|(selected, _)| selected)
+            .map_err(|error| match error {
+                select_policy::OrderFailure::Pin(refusal) => refusal,
+                select_policy::OrderFailure::Score(_) => unreachable!("a request pin is terminal"),
+            })
         };
         let selection = selection.map(|mut selected| {
             let explicit = admission_pin.as_ref().map_or_else(
@@ -4361,26 +4652,37 @@ async fn handle_select_request(
                 &mut selected,
                 &operator_config,
                 operator_config_path,
+                &catalog_targets,
                 params.consumer,
                 explicit.as_deref(),
             );
             (selected, choice)
         });
         let selection = selection.and_then(|(selected, variant_choice)| {
-            let policy = prefrontal_routing_core::accounts::AllocatorPolicy::default();
+            let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
+                model_families: live_config.account_model_families(),
+                model_pools: live_config.quota_model_pools(),
+                ..Default::default()
+            };
             let ctx = account_selection::Ctx {
                 store: store.as_ref(),
                 accounts: ACCOUNT_QUOTA.get(),
                 flags: live_config.account_flags(),
                 policy: &policy,
                 now_ms: now as i64,
+                classes: classes.clone(),
             };
-            account_selection::preflight_model(
-                &ctx,
-                &selected.model.provider_id,
-                &selected.model.model_id,
-            )
-            .map_err(|(code, message)| work_model_pin::Refusal { code, message })?;
+            // Explicit catalog-less providers lease API keys through key_pool;
+            // its own admission must preserve the pool's typed refusal.
+            if !host_run && !catalog_targets.contains_key(&selected.model.provider_id) {
+                account_selection::preflight_model_for_class(
+                    &ctx,
+                    &selected.model.provider_id,
+                    &selected.model.model_id,
+                    priced_per_token,
+                )
+                .map_err(|(code, message)| work_model_pin::Refusal { code, message })?;
+            }
             // Resolve the Broca launch target and its credential mapping
             // before recording a decision; an unusable mapping rejects the pin.
             // A deferred runner pin leases nothing until core completes it.
@@ -4393,15 +4695,15 @@ async fn handle_select_request(
                     );
                     Some(
                         runner_for_route(
-                            &operator_policy,
+                            &catalog_targets,
                             broca_credentials,
                             store.as_ref(),
                             &session,
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
-                            variant_policy::consumer_group(params.consumer),
-                            &[],
+                            classes.as_ref(),
+                            priced_per_token,
                         )
                         .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
                     )
@@ -4414,6 +4716,18 @@ async fn handle_select_request(
         policy_started = Instant::now();
         match selection {
             Ok((mut selected, runner, variant_choice)) => {
+                let Some(module) = runner_module(&selected) else {
+                    return send_route_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "no_route",
+                        "no configured runner can run the pinned route",
+                    )
+                    .await;
+                };
                 let ladder_started = Instant::now();
                 record_ladder(pin_harness);
                 add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
@@ -4421,7 +4735,7 @@ async fn handle_select_request(
                     selected.explanation.push(line.clone());
                 }
                 let write_started = Instant::now();
-                let decision = decision_input_for(
+                let mut decision = decision_input_for(
                     &target_agent,
                     &requirements,
                     Some(&selected),
@@ -4430,10 +4744,18 @@ async fn handle_select_request(
                     Some(&provenance),
                     Some(&policy_sources_line(&operator_policy)),
                 );
+                decision.allowed_account_class =
+                    prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
+                        priced_per_token,
+                    );
                 let decision_id = store
                     .record_decision_with_selection(
                         &decision,
-                        pin_harness.map(substrate_policy::Harness::as_str),
+                        if host_run {
+                            pin_harness.map(substrate_policy::Harness::as_str)
+                        } else {
+                            Some(&module)
+                        },
                         selected_workload,
                     )
                     .map_err(|error| ModuleError::Message(error.to_string()))?;
@@ -4454,13 +4776,19 @@ async fn handle_select_request(
                     result["pin_rejected"] = serde_json::Value::Null;
                 }
                 if deferred_runner_pin {
-                    result["requiredSubstrate"] = json!("broca");
+                    result["requiredSubstrate"] = json!(legacy_wire::BROCA);
                 }
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
                     if let Some(grant) = grant {
                         result["poolLease"] = grant.lease_json();
                     }
+                }
+                if host_run && !deferred_runner_pin {
+                    result["runner"] = host_runner(&params, &selected);
+                }
+                if !deferred_runner_pin {
+                    complete_legacy_selection(&mut result, &selected, &facts, &module);
                 }
                 let body =
                     serde_json::to_vec(&json!({"result": result})).map_err(ModuleError::Json)?;
@@ -4514,17 +4842,28 @@ async fn handle_select_request(
                         return send(writer, response).await;
                     }
                 } else {
-                    if refusal.code == "not_available" && !host_run {
+                    let detail = pin_credential_refusal.as_ref()
+                        .filter(|mark| mark.reason == refusal.code)
+                        .map(|mark| json!({"reason": mark.reason, "credentialIds": mark.credential_ids}));
+                    if !host_run
+                        && matches!(
+                            refusal.code.as_str(),
+                            "not_available" | "no_eligible_account"
+                        )
+                    {
                         refusal.code = "pinned_route_refused".into();
                     }
-                    return send_route_error(
+                    return send_route_error_body(
                         writer,
                         ver,
                         channel,
                         epoch,
                         corr,
-                        &refusal.code,
-                        &refusal.message,
+                        ErrorBody {
+                            code: refusal.code,
+                            message: refusal.message,
+                            detail,
+                        },
                     )
                     .await;
                 }
@@ -4532,34 +4871,48 @@ async fn handle_select_request(
         }
     }
 
+    // A project pin is a one-entry ladder and beats the consumer mode. Legacy
+    // bodies carry no affinity, so each one is fresh. A request pin was already
+    // admitted above.
+    let project_pin = route_scope(channel, epoch).and_then(|scope| {
+        scope
+            .project_id
+            .as_deref()
+            .and_then(|project| operator_config.project_pin(project, consumer_id))
+            .map(str::to_owned)
+    });
     let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
-        let sub = subscription_keys.clone();
-        select_model_route_with_availability(
-            SelectModelRouteInput {
-                target_agent: target_agent.clone(),
-                requirements,
-                available_models: available.clone(),
-                facts: facts.clone(),
-                runtime_snapshot: Some(snap),
-                exclude_route_keys: exclude.clone(),
-                operator_exclude_keys: operator_exclude.clone(),
-                required_capabilities,
-                is_subscription_route: Some(Box::new(move |route: &ModelRoute| {
-                    select_policy::subscription_covered(params.consumer, &sub, route)
-                })),
-                min_best_effort_adequacy,
-                prefer_prompt_cache,
-                providers_without_prompt_cache: providers_without_prompt_cache
-                    .iter()
-                    .cloned()
-                    .collect(),
-            },
-            &routing_config,
-            concurrency_slots.as_ref(),
-            consumer_exclude,
-            &mapped_availability.rejected,
-        )
-        .map_err(select_policy::describe_filter_refusal)
+        let pass = select_policy::SelectionPass {
+            snapshot: &snap,
+            ..pass
+        };
+        pass.select(&available, None, project_pin.as_deref(), None, |pin| {
+            let allowed = available
+                .iter()
+                .filter(|key| operator_config.route_allowed(consumer_id, key, true))
+                .cloned()
+                .collect();
+            work_model_pin::select_with_availability(
+                pin,
+                pass.input(&allowed, snap.clone()),
+                &routing_config,
+                concurrency_slots.as_ref(),
+                config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
+                &catalog_targets,
+                &mapped_availability.rejected,
+            )
+            .map_err(|refusal| {
+                let mut error = pass.score(&HashSet::new()).unwrap_err();
+                error.message = refusal.message;
+                error
+            })
+        })
+        .map(|(selected, _)| selected)
+        .map_err(|error| match error {
+            select_policy::OrderFailure::Pin(error) | select_policy::OrderFailure::Score(error) => {
+                error
+            }
+        })
     };
 
     // First attempt against the live snapshot.
@@ -4632,6 +4985,18 @@ async fn handle_select_request(
     let policy_sources = policy_sources_line(&operator_policy);
     match selection {
         Ok(mut selected) => {
+            let Some(module) = runner_module(&selected) else {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "no_route",
+                    "no configured runner can run the selected route",
+                )
+                .await;
+            };
             let selected_harness = run_harness(&selected.route_key);
             add_stage_ms(&timing.finish_ms, finish_started.elapsed());
             let ladder_started = Instant::now();
@@ -4642,8 +5007,13 @@ async fn handle_select_request(
                 &mut selected,
                 &operator_config,
                 operator_config_path,
+                &catalog_targets,
                 params.consumer,
-                None,
+                project_pin
+                    .as_deref()
+                    .and_then(|pin| cortexkit_role_routing::select::RouteRef::parse_pin(pin))
+                    .and_then(|pin| pin.variant)
+                    .as_deref(),
             );
             selected.explanation.push(policy_sources.clone());
             if let Some(line) = &executor_workload {
@@ -4664,7 +5034,7 @@ async fn handle_select_request(
                 .extend(head_refusals.notes.iter().cloned());
             add_stage_ms(&timing.finish_ms, finish_started.elapsed());
             let write_started = Instant::now();
-            let decision = decision_input_for(
+            let mut decision = decision_input_for(
                 &target_agent,
                 &requirements,
                 Some(&selected),
@@ -4673,9 +5043,17 @@ async fn handle_select_request(
                 Some(&provenance),
                 Some(&policy_sources),
             );
+            decision.allowed_account_class =
+                prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
+                    priced_per_token,
+                );
             let recorded = store.record_decision_with_selection(
                 &decision,
-                selected_harness.map(substrate_policy::Harness::as_str),
+                if host_run {
+                    selected_harness.map(substrate_policy::Harness::as_str)
+                } else {
+                    Some(&module)
+                },
                 selected_workload,
             );
             add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
@@ -4734,6 +5112,9 @@ async fn handle_select_request(
                     if params.pin.is_some() {
                         result["pin_rejected"] = json!(pin_rejected);
                     }
+                    if host_run {
+                        result["runner"] = host_runner(&params, &selected);
+                    }
                     add_stage_ms(&timing.finish_ms, finish_started.elapsed());
                     let runner_started = Instant::now();
                     if selected_harness == Some(substrate_policy::Harness::Broca) {
@@ -4747,15 +5128,15 @@ async fn handle_select_request(
                             &decision_id,
                         );
                         match runner_for_route(
-                            &operator_policy,
+                            &catalog_targets,
                             broca_credentials,
                             store.as_ref(),
                             &session,
                             &selected.model.provider_id,
                             &selected.model.model_id,
                             selected.prompt_params.variant.as_deref(),
-                            variant_policy::consumer_group(params.consumer),
-                            &entitlement_fences,
+                            classes.as_ref(),
+                            priced_per_token,
                         ) {
                             Ok((runner, _)) => result["runner"] = json!(runner),
                             Err((code, message)) => {
@@ -4767,6 +5148,7 @@ async fn handle_select_request(
                         }
                     }
                     add_stage_ms(&timing.runner_ms, runner_started.elapsed());
+                    complete_legacy_selection(&mut result, &selected, &facts, &module);
                     let finish_started = Instant::now();
                     let body = serde_json::to_vec(&json!({ "result": result }))
                         .map_err(ModuleError::Json)?;
@@ -4875,6 +5257,53 @@ async fn handle_select_request(
     }
 }
 
+fn host_runner(params: &SelectParams, selected: &SelectedModelRoute) -> serde_json::Value {
+    let module = params
+        .harness
+        .as_deref()
+        .or(params.substrate.as_deref())
+        .unwrap_or("host");
+    json!(cortexkit_role_routing::select::RunnerRef::new(
+        module,
+        cortexkit_role_routing::select::RouteRef {
+            provider: selected.model.provider_id.clone(),
+            model: selected.model.model_id.clone(),
+            variant: selected.prompt_params.variant.clone(),
+        },
+    ))
+}
+
+/// Add the common decision envelope without removing legacy launch fields
+/// (notably credential pins and pool leases) that existing callers consume.
+fn complete_legacy_selection(
+    result: &mut serde_json::Value,
+    selected: &SelectedModelRoute,
+    facts: &[ModelFact],
+    module: &str,
+) {
+    let route = cortexkit_role_routing::select::RouteRef {
+        provider: selected.model.provider_id.clone(),
+        model: selected.model.model_id.clone(),
+        variant: selected.prompt_params.variant.clone(),
+    };
+    let fact = facts
+        .iter()
+        .filter(|fact| fact.provider_id == route.provider && fact.model_id == route.model)
+        .min_by_key(|fact| u8::from(fact.variant != route.variant));
+    if !result["runner"].is_object() {
+        result["runner"] = json!({});
+    }
+    result["runner"]["module"] = json!(module);
+    result["runner"]["route"] = json!(route);
+    result["route"] = json!(route);
+    result["decision_id"] = result["decisionID"].clone();
+    result["context_window"] = json!(fact
+        .and_then(|fact| fact.context_window)
+        .map_or(0, |window| window as u64));
+    result["max_output_tokens"] = json!(fact.and_then(|fact| fact.max_output_tokens).unwrap_or(0));
+    result["expires_at_ms"] = json!(now_ms() + 10 * 60_000);
+}
+
 /// Panel legs use the substrate that sends. Claustrum's complete mappings
 /// restrict Broca to credentialed providers; incomplete/stale listings fall
 /// back to the served catalog, just like single-route Broca selection.
@@ -4900,24 +5329,28 @@ fn panel_availability(
 /// per-send credential pin, requested for a substrate that cannot carry one.
 const PROVIDER_REQUIRES_RUNNER_PIN: &str = "provider_requires_runner_pin";
 
-fn needs_runner_pin(policy: &ModelRoutingPolicyInput, provider: &str) -> bool {
-    key_pool::is_pool_provider(policy, provider)
+pub(crate) fn needs_runner_pin(
+    catalog_targets: &std::collections::BTreeMap<String, String>,
+    provider: &str,
+) -> bool {
+    key_pool::is_pool_provider(catalog_targets, provider)
 }
 
 /// The Broca launch target for a selected route: the plain translation for an
-/// ordinary provider. For a score-aliased key-pool provider it leases a key for
+/// ordinary provider. For a key-pool provider (one with no catalog rows that
+/// resolved through its credentials' `serves` vendor) it leases a key for
 /// `session` from the pool and returns the target that pins it, with the grant;
 /// a pool that cannot be resolved or has no admissible key refuses by name.
 fn runner_for_route(
-    policy: &ModelRoutingPolicyInput,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     credentials: &SharedBrocaCredentials,
     store: &SqliteRouteStateStore,
     session: &str,
     provider: &str,
     model: &str,
     variant: Option<&str>,
-    consumer: Option<&str>,
-    entitlement_fences: &[prefrontal_routing_core::route_state_store::CredentialEntitlementFence],
+    classes: Option<&account_selection::ClassContext>,
+    priced_per_token: bool,
 ) -> Result<
     (
         prefrontal_routing_core::runner::RunnerModel,
@@ -4925,67 +5358,16 @@ fn runner_for_route(
     ),
     (String, String),
 > {
-    if !needs_runner_pin(policy, provider) {
-        let refused_here = entitlement_fences
-            .iter()
-            .any(|fence| fence.provider_id == provider);
-        let reset_fences = match consumer {
-            Some(consumer) => {
-                let key = prefrontal_routing_core::make_route_key(provider, model, variant);
-                store
-                    .provider_reset_fences(consumer, now_ms() as i64)
-                    .map_err(|e| ("store_error".into(), e.to_string()))?
-                    .into_iter()
-                    .filter(|f| f.route_key == key)
-                    .collect::<Vec<_>>()
-            }
-            None => Vec::new(),
-        };
-        if !reset_fences.is_empty() || refused_here {
-            let facts = store
-                .get_facts()
-                .map_err(|e| ("store_error".into(), e.to_string()))?;
-            let identities = facts
-                .iter()
-                .find(|f| f.provider_id == provider && f.model_id == model)
-                .and_then(|fact| credentials.lock().ok().map(|c| c.serving_identities(fact)))
-                .unwrap_or_default();
-            // A credential the provider refused permanently is never launched
-            // on automatically; the others are checked for provider resets.
-            let entitled: Vec<(String, Option<String>)> =
-                credential_fences::entitled(entitlement_fences, provider, &identities)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-            if !reset_fences.is_empty() {
-                if let Some(id) = provider_resets::healthy_credential(&reset_fences, &entitled) {
-                    if let Some(runner) =
-                        prefrontal_routing_core::runner::RunnerModel::pinned(&id, model, variant)
-                    {
-                        return Ok((runner, None));
-                    }
-                }
-                return Err((
-                    "quota_exhausted".into(),
-                    format!(
-                        "provider reset for {} on {}",
-                        consumer.unwrap_or_default(),
-                        prefrontal_routing_core::make_route_key(provider, model, variant)
-                    ),
-                ));
-            }
-            // Pin the launch to a credential the provider has not refused, so
-            // Broca cannot fall back to the refused one.
-            if let Some(runner) = entitled.first().and_then(|(id, _)| {
-                prefrontal_routing_core::runner::RunnerModel::pinned(id, model, variant)
-            }) {
+    if !needs_runner_pin(catalog_targets, provider) {
+        if let Some(classes) =
+            classes.filter(|classes| classes.needs_credential_pin(provider, model))
+        {
+            let id = classes.launch_credential(provider, model, priced_per_token)?;
+            if let Some(runner) =
+                prefrontal_routing_core::runner::RunnerModel::pinned(&id, model, variant)
+            {
                 return Ok((runner, None));
             }
-            let refused = credential_fences::unentitled(entitlement_fences, provider, &identities);
-            return Err((
-                credential_fences::rejection_reason(entitlement_fences, provider, &refused).into(),
-                refused.join(","),
-            ));
         }
         return Ok((
             prefrontal_routing_core::runner::RunnerModel::broca(provider, model, variant),
@@ -4996,7 +5378,7 @@ fn runner_for_route(
         &key_pool::PoolCtx {
             store,
             credentials,
-            policy,
+            catalog_targets,
             now_ms: now_ms() as i64,
         },
         provider,
@@ -5024,7 +5406,7 @@ fn pool_session(task_id: Option<&str>, send_id: Option<&str>, fallback: &str) ->
 /// send would silently land on the provider's default logins. Refuse such pins
 /// by name for every other mapped harness.
 fn host_runner_pin_refusal<'a>(
-    policy: &ModelRoutingPolicyInput,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     requested_substrate: Option<&str>,
     substrate_source: &str,
     pinned_routes: impl IntoIterator<Item = &'a str>,
@@ -5034,17 +5416,27 @@ fn host_runner_pin_refusal<'a>(
     }
     pinned_routes.into_iter().find_map(|route| {
         let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
-        needs_runner_pin(policy, provider).then(|| {
+        needs_runner_pin(catalog_targets, provider).then(|| {
             format!(
-                "{route}: provider {provider} needs a per-send credential pin that only the Broca runner carries, but {substrate_source} {}",
+                "{route}: provider {provider} needs a per-send credential pin that only the {} runner carries, but {substrate_source} {}",
+                runner_title(legacy_wire::BROCA),
                 requested_substrate.unwrap_or("none")
             )
         })
     })
 }
 
+/// A runner's name as prose capitalizes it: `broca` reads as `Broca`.
+fn runner_title(runner: &str) -> String {
+    let mut chars = runner.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
-    requested_substrate.map(str::trim) == Some("broca")
+    requested_substrate.map(str::trim) == Some(legacy_wire::BROCA)
 }
 
 /// The Broca routes a caller's model list admits: a route stays when the list
@@ -5118,7 +5510,12 @@ fn select_availability(
     let (models, fallback) = broca_served_routes(facts, broca_credentials);
     let note = match fallback {
         Some(reason) => format!("availability unknown: {reason}; routed over all {} served catalog routes", models.len()),
-        None => format!("availability: broca ({} served catalog routes on providers Broca holds a credential for)", models.len()),
+        None => format!(
+            "availability: {runner} ({} served catalog routes on providers {} holds a credential for)",
+            models.len(),
+            runner_title(legacy_wire::BROCA),
+            runner = legacy_wire::BROCA,
+        ),
     };
     SelectAvailability {
         models,
@@ -5134,7 +5531,6 @@ async fn handle_select_panel(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
-    opencode_auth_path: &Path,
 ) -> Result<(), ModuleError> {
     let channel = frame.header.channel;
     let epoch = frame.header.epoch;
@@ -5174,7 +5570,12 @@ async fn handle_select_panel(
         )
         .await;
     }
-    let mut prepared = match prepare_selection_inputs(quota_cache, store, live_config.pricing()) {
+    let mut prepared = match prepare_selection_inputs(
+        quota_cache,
+        store,
+        live_config.pricing(),
+        &live_config.quota_model_pools(),
+    ) {
         Ok(prepared) => prepared,
         Err(e) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
@@ -5186,56 +5587,44 @@ async fn handle_select_panel(
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
     };
-    // Use the operator's score aliases and subscription coverage, never the
-    // caller's subscriptionKeys, to price and admit panel candidates.
-    prefrontal_routing_core::score_alias::append_alias_rows(
-        &mut prepared.facts,
-        &operator_policy.score_alias,
-    );
+    // Providers with no catalog rows borrow their catalog provider's rows;
+    // the operator's subscription coverage, never the caller's
+    // subscriptionKeys, prices and admits panel candidates.
+    let catalog_targets = broca_credentials
+        .lock()
+        .map(|credentials| credentials.catalog_targets(&prepared.facts))
+        .unwrap_or_default();
+    prefrontal_routing_core::score_alias::append_alias_rows(&mut prepared.facts, &catalog_targets);
     if let Ok(credentials) = broca_credentials.lock() {
         credentials.price_facts(&mut prepared.facts, live_config.pricing());
     }
     live_config.apply(&mut prepared.facts);
-    // Seats are automatic choices for the class's consumer (see the variant
-    // policy below), and every seat's provider reset is fenced under the panel
-    // decision's consumer. Admission must see those fences, or a model whose
-    // account is out until a known reset keeps being seated and failing.
     let panel_consumer =
         if params.panel_spec.class == prefrontal_routing_core::panel::PanelClass::Lab {
             select_policy::Consumer::Lab
         } else {
             select_policy::Consumer::Athena
         };
-    apply_provider_resets_for_group(
-        &mut prepared.snapshot,
-        &prepared.facts,
+    let classes = account_selection::ClassContext::read(
         store,
         broca_credentials,
-        &live_config,
-        routing_config_path,
-        PANEL_DECISION_CONSUMER,
-        Some(panel_consumer),
-        None,
-    )?;
-    // Seats are automatic choices: a model no entitled credential serves is not seated.
-    let entitlement_fences =
-        credential_fences::live(store, broca_credentials).map_err(ModuleError::Message)?;
-    credential_fences::apply(
-        &mut prepared.snapshot,
-        &prepared.facts,
-        &entitlement_fences,
-        broca_credentials,
-    );
+        live_config.clone(),
+        ACCOUNT_QUOTA.get(),
+        prepared.facts.clone(),
+        now_ms() as i64,
+    )
+    .map_err(ModuleError::Message)?;
+    classes.apply_eligibility(&mut prepared.snapshot, &prepared.facts, false, false);
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
-    let resolved_policy = resolve_routing_policy(
+    let resolved_policy = resolve_routing_policy_with_catalog_targets(
         params.available_models.iter().cloned(),
         &ModelRoutingPolicyInput {
             subscription: operator_policy.subscription.clone(),
-            score_alias: operator_policy.score_alias.clone(),
             ..ModelRoutingPolicyInput::default()
         },
         &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(None, opencode_auth_path),
+        &provider_auth_types(None),
+        &catalog_targets,
     );
     let subscription_keys: HashSet<String> =
         resolved_policy.subscription_keys.into_iter().collect();
@@ -5283,22 +5672,21 @@ async fn handle_select_panel(
     let operator_exclude_keys =
         panel_policy::operator_exclusions(&prepared.facts, &operator_policy.exclude, group);
     let policy = panel_policy::class_policy(live_config.panels(), class);
-    let canonical_ids =
-        match panel_canonical_ids(store, &prepared.facts, &operator_policy.score_alias) {
-            Ok(canonical_ids) => canonical_ids,
-            Err(e) => {
-                return send_route_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "store_error",
-                    &format!("reading canonical model ids: {e}"),
-                )
-                .await;
-            }
-        };
+    let canonical_ids = match panel_canonical_ids(store, &prepared.facts, &catalog_targets) {
+        Ok(canonical_ids) => canonical_ids,
+        Err(e) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("reading canonical model ids: {e}"),
+            )
+            .await;
+        }
+    };
     let context = prefrontal_routing_core::panel::PanelSelectionContext {
         seed: params
             .seed
@@ -5307,7 +5695,7 @@ async fn handle_select_panel(
             .cloned()
             .unwrap_or_default(),
         pins: prefrontal_routing_core::panel::PanelPins {
-            synthesizer: live_config.pins().synthesizer.as_ref().map(|pin| {
+            synthesizer: live_config.slot_pin("synthesizer").map(|pin| {
                 prefrontal_routing_core::panel::PanelSynthesizerPin {
                     model: pin.model.clone(),
                     variant: pin.variant.clone(),
@@ -5353,6 +5741,8 @@ async fn handle_select_panel(
                 required_capabilities: params.required_capabilities,
                 available_models: mapped_availability.models.clone(),
                 availability_substrate,
+                availability_label: legacy_wire::availability_label(availability_substrate)
+                    .to_string(),
                 is_subscription_route: Some(Box::new(|route: &ModelRoute| {
                     subscription_keys.contains(&route.route_key)
                         || subscription_keys.contains(&route.capacity_key)
@@ -5384,6 +5774,7 @@ async fn handle_select_panel(
             &mut panel,
             &live_config,
             routing_config_path,
+            &catalog_targets,
             panel_consumer,
             &seat_models,
         );
@@ -5396,7 +5787,7 @@ async fn handle_select_panel(
                 let Some((provider, model)) = member.route_key.split_once('/') else {
                     continue;
                 };
-                if !needs_runner_pin(&operator_policy, provider) {
+                if !needs_runner_pin(&catalog_targets, provider) {
                     continue;
                 }
                 let variant = member
@@ -5411,7 +5802,7 @@ async fn handle_select_panel(
                     &key_pool::PoolCtx {
                         store: store.as_ref(),
                         credentials: broca_credentials,
-                        policy: &operator_policy,
+                        catalog_targets: &catalog_targets,
                         now_ms: now_ms() as i64,
                     },
                     provider,
@@ -5495,21 +5886,22 @@ async fn handle_select_panel(
         &provenance,
         &policy_sources_line(&operator_policy),
     );
-    let decision_id = match store.record_decision_with_selection(&decision, Some("broca"), None) {
-        Ok(id) => id,
-        Err(e) => {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "store_error",
-                &format!("recording panel decision: {e}"),
-            )
-            .await;
-        }
-    };
+    let decision_id =
+        match store.record_decision_with_selection(&decision, Some(legacy_wire::BROCA), None) {
+            Ok(id) => id,
+            Err(e) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &format!("recording panel decision: {e}"),
+                )
+                .await;
+            }
+        };
     let mut result = json!({
         "members": &panel.members,
         "runnerUp": &panel.runner_up,
@@ -5519,7 +5911,7 @@ async fn handle_select_panel(
         .as_array_mut()
         .expect("panel members are an array")
     {
-        member["harness"] = json!("broca");
+        member["harness"] = json!(legacy_wire::BROCA);
     }
     if let Some(shortfall) = &panel.shortfall {
         result
@@ -5554,6 +5946,7 @@ fn apply_variant_policy(
     selected: &mut SelectedModelRoute,
     config: &config_overrides::LiveConfig,
     config_path: &Path,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     consumer: Option<select_policy::Consumer>,
     explicit: Option<&str>,
 ) -> variant_policy::VariantChoice {
@@ -5566,7 +5959,7 @@ fn apply_variant_policy(
     let curated = selected.prompt_params.variant.clone();
     let choice = variant_policy::resolve(
         groups,
-        config.score_aliases(),
+        catalog_targets,
         catalog.as_ref(),
         &variant_policy::VariantRequest {
             route_key: &selected.route_key,
@@ -5593,110 +5986,6 @@ fn apply_variant_policy(
             .extend(choice.explanation_lines(&selected.route_key));
     }
     choice
-}
-
-fn apply_provider_resets(
-    snapshot: &mut ModelRouteStateSnapshot,
-    facts: &[ModelFact],
-    store: &SharedStore,
-    credentials: &SharedBrocaCredentials,
-    config: &config_overrides::LiveConfig,
-    path: &Path,
-    consumer: Option<select_policy::Consumer>,
-    explicit: Option<&str>,
-) -> Result<(), ModuleError> {
-    let Some(group) = variant_policy::consumer_group(consumer) else {
-        return Ok(());
-    };
-    apply_provider_resets_for_group(
-        snapshot,
-        facts,
-        store,
-        credentials,
-        config,
-        path,
-        group,
-        consumer,
-        explicit,
-    )
-}
-
-/// Install the live provider-reset fences recorded under `group` into the
-/// selection snapshot. `consumer` chooses the variant each route runs at, which
-/// is part of the fenced route key; it is separate from `group` because panel
-/// decisions record one consumer for every class while lab seats run at the lab
-/// consumer's variants.
-#[allow(clippy::too_many_arguments)]
-fn apply_provider_resets_for_group(
-    snapshot: &mut ModelRouteStateSnapshot,
-    facts: &[ModelFact],
-    store: &SharedStore,
-    credentials: &SharedBrocaCredentials,
-    config: &config_overrides::LiveConfig,
-    path: &Path,
-    group: &str,
-    consumer: Option<select_policy::Consumer>,
-    explicit: Option<&str>,
-) -> Result<(), ModuleError> {
-    let fences = store
-        .provider_reset_fences(group, snapshot.now as i64)
-        .map_err(|e| ModuleError::Message(e.to_string()))?;
-    if fences.is_empty() {
-        return Ok(());
-    }
-    let catalog = config_overrides::reasoning_catalog_for(path);
-    for fact in facts {
-        let route = prefrontal_routing_core::fact_to_route(fact);
-        let curated = fact
-            .prompt_defaults
-            .as_ref()
-            .and_then(|d| d.variant.as_deref())
-            .or(fact.variant.as_deref());
-        let variant = variant_policy::resolve(
-            config.variant_groups(),
-            config.score_aliases(),
-            catalog.as_ref(),
-            &variant_policy::VariantRequest {
-                route_key: &route.route_key,
-                provider_id: &fact.provider_id,
-                model_id: &fact.model_id,
-                explicit,
-                curated,
-                consumer,
-            },
-        )
-        .variant;
-        let key = prefrontal_routing_core::make_route_key(
-            &fact.provider_id,
-            &fact.model_id,
-            variant.as_deref(),
-        );
-        let matching: Vec<_> = fences
-            .iter()
-            .filter(|f| f.route_key == key)
-            .cloned()
-            .collect();
-        let identities = credentials
-            .lock()
-            .ok()
-            .map(|c| c.serving_identities(fact))
-            .unwrap_or_default();
-        if let Some(until) = provider_resets::blocked_until(&matching, &identities) {
-            snapshot
-                .by_route
-                .entry(route.route_key)
-                .or_default()
-                .provider_reset_until = Some(until as f64);
-            // Explicit pins can synthesize a variant route from a base catalog
-            // fact. Admission must see the fence under that executed key too.
-            snapshot
-                .by_route
-                .entry(key)
-                .or_default()
-                .provider_reset_until = Some(until as f64);
-        }
-    }
-    Ok(())
 }
 
 fn remember_provider_identity(
@@ -5740,6 +6029,7 @@ fn apply_panel_variant_policy(
     panel: &mut SelectedPanel,
     config: &config_overrides::LiveConfig,
     config_path: &Path,
+    catalog_targets: &std::collections::BTreeMap<String, String>,
     consumer: select_policy::Consumer,
     seat_models: &HashMap<String, (String, String)>,
 ) {
@@ -5760,7 +6050,7 @@ fn apply_panel_variant_policy(
             .map(str::to_string);
         let choice = variant_policy::resolve(
             groups,
-            config.score_aliases(),
+            catalog_targets,
             catalog.as_ref(),
             &variant_policy::VariantRequest {
                 route_key,
@@ -5836,21 +6126,18 @@ fn panel_decision_input(
         "selection": "class_policy",
         "policy": panel.policy,
         "policySources": policy_sources,
-        "availability": availability.as_str(),
+        "availability": legacy_wire::availability_label(availability),
         "workload": "workload: athena",
     });
     DecisionInput {
         consumer: Some(PANEL_DECISION_CONSUMER.into()),
+        allowed_account_class: Default::default(),
         allowed_providers_json: None,
         decision_id: None,
         decision_kind: "panel".into(),
         task_id: params.task_id.clone(),
         parent_session_id: params.parent_session_id.clone(),
-        harness: params
-            .harness
-            .as_deref()
-            .filter(|value| matches!(*value, "opencode" | "broca" | "pi"))
-            .map(str::to_owned),
+        harness: params.harness.as_deref().map(str::to_owned),
         project_root: params
             .project_root
             .as_deref()
@@ -5890,22 +6177,25 @@ fn decision_input_for(
     let requirements_json = serde_json::to_string(requirements).unwrap_or_else(|_| "null".into());
     let quota_signal_json = provenance.map(|value| value.quota_signal_json.clone());
     let policy_revision = provenance.map(|value| value.policy_revision.clone());
+    let consumer = variant_policy::consumer_group(
+        params
+            .consumer
+            .or_else(|| select_policy::Consumer::from_id(target_agent)),
+    )
+    .map(str::to_string);
     match selected {
         Some(sel) => DecisionInput {
+            allowed_account_class: Default::default(),
             allowed_providers_json: params
                 .allowed_providers
                 .as_ref()
                 .map(|ids| serde_json::to_string(ids).unwrap()),
-            consumer: variant_policy::consumer_group(params.consumer).map(str::to_string),
+            consumer,
             decision_id: None,
             decision_kind: "single".into(),
             task_id: params.task_id.clone(),
             parent_session_id: params.parent_session_id.clone(),
-            harness: params
-                .harness
-                .as_deref()
-                .filter(|value| matches!(*value, "opencode" | "broca" | "pi"))
-                .map(str::to_owned),
+            harness: params.harness.as_deref().map(str::to_owned),
             project_root: params
                 .project_root
                 .as_deref()
@@ -5938,20 +6228,17 @@ fn decision_input_for(
         None => {
             let failure = no_route.expect("a refusal decision must preserve its routing failure");
             DecisionInput {
+                allowed_account_class: Default::default(),
                 allowed_providers_json: params
                     .allowed_providers
                     .as_ref()
                     .map(|ids| serde_json::to_string(ids).unwrap()),
-                consumer: variant_policy::consumer_group(params.consumer).map(str::to_string),
+                consumer,
                 decision_id: None,
                 decision_kind: "single".into(),
                 task_id: params.task_id.clone(),
                 parent_session_id: params.parent_session_id.clone(),
-                harness: params
-                    .harness
-                    .as_deref()
-                    .filter(|value| matches!(*value, "opencode" | "broca" | "pi"))
-                    .map(str::to_owned),
+                harness: params.harness.as_deref().map(str::to_owned),
                 project_root: params
                     .project_root
                     .as_deref()
@@ -6019,22 +6306,6 @@ struct SetDecisionOutcomeParams {
     /// Exact terminal send error surfaced by the harness, when one was available.
     #[serde(default)]
     last_error: Option<String>,
-    /// The route one seat of a panel decision ran on. A panel decision covers
-    /// several seats and names no route of its own, so a seat's provider reset
-    /// can only be fenced on the right model when the caller names the seat.
-    /// Ignored for a decision that names its own route.
-    #[serde(default)]
-    seat_route: Option<SeatRouteParams>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SeatRouteParams {
-    /// The seat's route key as `route.select_panel` returned it.
-    route_key: String,
-    /// The reasoning variant the seat ran at, when it ran at one.
-    #[serde(default)]
-    variant: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6163,7 +6434,7 @@ async fn handle_set_decision_outcome(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
-    routing_config_path: &Path,
+    _routing_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
@@ -6200,7 +6471,6 @@ async fn handle_set_decision_outcome(
         )
         .await;
     };
-    let failure_backoff = config_overrides::live_config(routing_config_path).failure_backoff();
     let mut provider_outcome = params.provider_outcome;
     if let Some(provider) = provider_outcome
         .as_mut()
@@ -6225,7 +6495,9 @@ async fn handle_set_decision_outcome(
     let observed_at_ms = now_ms() as i64;
     // A credential the provider refused permanently is fenced whatever the
     // decision ledger still holds: the report names the provider and the
-    // credential itself, and a replayed report changes nothing.
+    // credential itself. Recording renews a repeated refusal, so a fence that
+    // keeps failing stays fresh and its next recheck probe waits another
+    // interval.
     if let Some(refusal) = provider_outcome
         .as_ref()
         .and_then(|provider| provider.credential_refusal.as_ref())
@@ -6244,35 +6516,53 @@ async fn handle_set_decision_outcome(
             .await;
         }
     }
-    if let (Some(seat), Some(provider)) = (params.seat_route.as_ref(), provider_outcome.as_ref()) {
-        if let Err(e) = store.record_panel_seat_provider_outcome(
-            &params.decision_id,
-            &seat.route_key,
-            seat.variant.as_deref(),
-            outcome == RouteOutcome::Completed,
-            provider,
-            observed_at_ms,
-        ) {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "store_error",
-                &format!("set_decision_outcome: panel seat provider outcome: {e}"),
-            )
-            .await;
+    // Only the credential that actually served the completed run is healed.
+    if outcome == RouteOutcome::Completed {
+        if let Some(credential) = provider_outcome
+            .as_ref()
+            .and_then(|provider| provider.credential_id.as_deref())
+        {
+            match store.get_decision_by_id(&params.decision_id) {
+                Ok(Some(decision)) => {
+                    if let Some(provider) = decision.selected_provider_id.as_deref() {
+                        if let Err(e) =
+                            credential_fences::lift_after_success(store, provider, credential)
+                        {
+                            return send_route_error(
+                                writer,
+                                ver,
+                                channel,
+                                epoch,
+                                corr,
+                                "store_error",
+                                &format!("set_decision_outcome: lifting credential fence: {e}"),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return send_route_error(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        "store_error",
+                        &format!("set_decision_outcome: reading decision: {e}"),
+                    )
+                    .await
+                }
+            }
         }
     }
-    let update = DecisionOutcomeUpdate {
-        provider_outcome,
-        outcome,
-        last_error: params.last_error,
+    match store.record_routing_outcome(
+        &params.decision_id,
+        &outcome,
+        params.last_error.as_deref(),
         observed_at_ms,
-        failure_backoff,
-    };
-    match store.set_decision_outcome(&params.decision_id, &update) {
+    ) {
         Ok(()) => send_ok(writer, ver, channel, epoch, corr).await,
         Err(e) => {
             send_route_error(
@@ -6881,6 +7171,115 @@ async fn handle_clear_cooldown(
     send(writer, response).await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearCredentialFencesParams {
+    credential_id: String,
+}
+
+/// Whether the route's daemon-attested principal may lift credential fences:
+/// the operator on a shell on this machine (`direct`) or on the phone
+/// (`reserved:callosum`). Every other module principal, and unverified and
+/// unattested routes, are refused: lifting a fence sends the next request back
+/// to a credential the provider refused, which only the operator may order
+/// after topping it up.
+fn is_fence_lift_operator(principal: &str) -> bool {
+    principal == "direct" || principal == "reserved:callosum"
+}
+
+/// Lift every credential entitlement fence on one named vault credential at
+/// once, for use right after topping it up. Operator-only (see
+/// [`is_fence_lift_operator`]); the reply names what was lifted.
+async fn handle_clear_credential_fences(
+    frame: Frame,
+    writer: &mpsc::Sender<Frame>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let (ver, channel, epoch, corr) = (
+        frame.header.ver,
+        frame.header.channel,
+        frame.header.epoch,
+        frame.header.corr,
+    );
+    let principal = route_principal(channel, epoch);
+    if !is_fence_lift_operator(&principal) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "not_permitted",
+            &format!(
+                "route.clear_credential_fences is operator-only: principal '{principal}' may not lift credential fences",
+            ),
+        )
+        .await;
+    }
+    let params: ClearCredentialFencesParams =
+        match serde_json::from_slice::<MethodParamsBody<_>>(&frame.body) {
+            Ok(body) => body.params,
+            Err(error) => {
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "invalid_request",
+                    &format!("route.clear_credential_fences params not decodable: {error}"),
+                )
+                .await;
+            }
+        };
+    if params.credential_id.trim().is_empty() {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "invalid_request",
+            "route.clear_credential_fences credentialId must not be empty",
+        )
+        .await;
+    }
+    let lifted = match credential_fences::lift_for_operator(store, &params.credential_id) {
+        Ok(lifted) => lifted,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("route.clear_credential_fences: {error}"),
+            )
+            .await;
+        }
+    };
+    let body = serde_json::to_vec(&json!({ "result": {
+        "credentialId": params.credential_id,
+        "lifted": lifted.iter().map(|fence| json!({
+            "providerId": fence.provider_id,
+            "code": fence.code,
+        })).collect::<Vec<_>>(),
+    } }))
+    .map_err(ModuleError::Json)?;
+    let response = Frame::build_with_version(
+        ver,
+        FrameType::Response,
+        Flags::new(false, Priority::Interactive, false),
+        channel,
+        epoch,
+        corr,
+        body,
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    send(writer, response).await
+}
+
 async fn handle_record_cooldown(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
@@ -7006,6 +7405,7 @@ async fn send_no_route(
     if let Some(reason) = pin_rejected {
         body_value["pin_rejected"] = json!(reason);
     }
+    body_value["rejected"] = json!(err.rejected);
     let body = serde_json::to_vec(&body_value).map_err(ModuleError::Json)?;
     let frame = Frame::build_with_version(
         ver,
@@ -7068,12 +7468,30 @@ async fn send_route_error(
     code: &str,
     message: &str,
 ) -> Result<(), ModuleError> {
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_string(),
-        message: message.to_string(),
-        detail: None,
-    })
-    .map_err(ModuleError::Json)?;
+    send_route_error_body(
+        writer,
+        ver,
+        channel,
+        epoch,
+        corr,
+        ErrorBody {
+            code: code.to_string(),
+            message: message.to_string(),
+            detail: None,
+        },
+    )
+    .await
+}
+
+async fn send_route_error_body(
+    writer: &mpsc::Sender<Frame>,
+    ver: u8,
+    channel: u16,
+    epoch: u32,
+    corr: u64,
+    error: ErrorBody,
+) -> Result<(), ModuleError> {
+    let body = serde_json::to_vec(&error).map_err(ModuleError::Json)?;
     let frame = Frame::build_with_version(
         ver,
         FrameType::Error,
@@ -7141,7 +7559,7 @@ fn control_flags() -> Flags {
     Flags::new(false, Priority::Passive, false)
 }
 
-fn handles(method: &str) -> bool {
+pub(crate) fn handles(method: &str) -> bool {
     matches!(
         method,
         ROUTE_SELECT_OP
@@ -7162,9 +7580,11 @@ fn handles(method: &str) -> bool {
             | ROUTE_RECORD_COOLDOWN_OP
             | ROUTE_CLEAR_FAILURE_BACKOFF_OP
             | ROUTE_CLEAR_COOLDOWN_OP
+            | ROUTE_CLEAR_CREDENTIAL_FENCES_OP
             | ROUTE_COOLDOWN_STATUS_OP
             | ROUTE_EXPLAIN_OP
             | ROUTE_DECISIONS_LIST_OP
+            | diagnostics_findings::OP
             | QUOTA_STATUS_OP
             | ROUTE_ACCOUNT_QUOTA_STATUS_OP
             | account_selection::ACCOUNT_FOR_OP
@@ -7176,7 +7596,7 @@ fn handles(method: &str) -> bool {
 }
 
 /// Operations registered in HELLO and exposed by `--print-manifest`.
-fn served_operations() -> Vec<ManagementOperation> {
+pub(crate) fn served_operations() -> Vec<ManagementOperation> {
     let pool_operations = [
         key_pool::POOL_ACQUIRE_OP,
         key_pool::POOL_RENEW_OP,
@@ -7190,11 +7610,16 @@ fn served_operations() -> Vec<ManagementOperation> {
         description: None,
     });
     let mut operations = vec![
-        // route.select is a mutation because it records the decision it returns.
+        // route.select is one selection pass for both wire shapes. The older
+        // body is recognised by targetAgent; every other body is routing/v1.
+        // The pass records the decision it returns, so the op is a mutation.
         ManagementOperation {
             name: ROUTE_SELECT_OP.to_string(),
             kind: ManagementOperationKind::Mutate,
-            description: None,
+            description: Some(
+                "One selection pass for the older route.select body and routing/v1 select: route, runner, variant, limits, decision id and expiry"
+                    .to_string(),
+            ),
         },
         ManagementOperation {
             name: ROUTE_RESOLVE_POLICY_OP.to_string(),
@@ -7291,6 +7716,14 @@ fn served_operations() -> Vec<ManagementOperation> {
             description: Some("Clear one route's cooldown and quota wall without changing failure backoff".to_string()),
         },
         ManagementOperation {
+            name: ROUTE_CLEAR_CREDENTIAL_FENCES_OP.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some(
+                "Lift every credential entitlement fence on one vault credential, for use right after topping it up (operator-only: direct and reserved:callosum routes)"
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
             name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
             kind: ManagementOperationKind::Query,
             description: None,
@@ -7306,6 +7739,14 @@ fn served_operations() -> Vec<ManagementOperation> {
             description: None,
         },
         ManagementOperation {
+            name: diagnostics_findings::OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some(
+                "Routing self-diagnosis: credential fences, route and account blocks, refusal-heavy consumers and one-model candidate sets (head routes and flow scopes only)"
+                    .to_string(),
+            ),
+        },
+        ManagementOperation {
             name: QUOTA_STATUS_OP.to_string(),
             kind: ManagementOperationKind::Query,
             description: None,
@@ -7318,8 +7759,7 @@ fn served_operations() -> Vec<ManagementOperation> {
                     .to_string(),
             ),
         },
-        // The account-selection operations. Each refuses with
-        // `account_selection_disabled` until routing policy enables serving.
+        // Account-selection operations serve even before quota readings arrive.
         ManagementOperation {
             name: account_selection::ACCOUNT_FOR_OP.to_string(),
             kind: ManagementOperationKind::Mutate,
@@ -7402,8 +7842,8 @@ fn print_manifest_operations() -> Result<(), ModuleError> {
 /// schema and is the sole writer for its provider and route cooldown state.
 pub(crate) fn manifest(module_id: &str) -> ModuleManifest {
     // `ModuleManifest` is `#[non_exhaustive]`, so this module constructs it
-    // with the builder. It provides the routing/v1 and scope-workdir
-    // capabilities and requires none.
+    // with the builder. It provides the routing/v1, scope-workdir and
+    // flow-scopes capabilities and requires none.
     // Build provenance comes from the module's build script.
     ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
         .trust_tier(Some(TrustTier::FirstParty))
@@ -7427,14 +7867,27 @@ pub(crate) fn manifest(module_id: &str) -> ModuleManifest {
         // the Entorhinal project id, recorded on every decision the route's
         // caller selects. Without the declaration the daemon strips both and a
         // scoped select records no project.
+        //
+        // It provides `flow-scopes/v1` so flows can call `diagnostics.findings`:
+        // the daemon binds a flow-scoped route only to a module declaring it,
+        // and Basal checks the declared flow operations at install. Routing
+        // also refuses every op outside the same allowlist on a flow-scoped
+        // route (see `diagnostics_findings::flow_route_refusal`).
         .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
             provides: vec![
                 routing_v1::PROVIDES.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+                subc_protocol::scope::FLOW_SCOPES_CAPABILITY.to_string(),
             ],
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))
+        .flow_operations(Some(
+            diagnostics_findings::FLOW_SCOPE_OPS
+                .iter()
+                .map(|operation| (*operation).to_owned())
+                .collect(),
+        ))
         .provides(vec![ProviderRole::ManagementSurface {
             // Deliberate lane, not a default: routing serves concurrent
             // selection reads; Serial would put every route decision in
@@ -7597,31 +8050,29 @@ mod tests {
         let path = scratch.join("prefrontal-routing.jsonc");
         check_config_at(&path).unwrap();
         let renamed = prefrontal_test_support::ScratchDir::new("routing-config-check-renamed");
-        std::fs::write(renamed.join("alfonso-routing.jsonc"), "{}").unwrap();
+        crate::test_config::write(renamed.join("alfonso-routing.jsonc"), "{}").unwrap();
         assert!(check_config_at(&renamed.join("prefrontal-routing.jsonc"))
             .unwrap_err()
             .to_string()
             .contains("config_renamed"));
         let invalid = prefrontal_test_support::ScratchDir::new("routing-config-check-invalid");
         let invalid_path = invalid.join("prefrontal-routing.jsonc");
-        std::fs::write(&invalid_path, "{\"not_a_routing_setting\":true}").unwrap();
+        crate::test_config::write(&invalid_path, "{\"not_a_routing_setting\":true}").unwrap();
         assert!(check_config_at(&invalid_path).is_err());
     }
 
     #[test]
-    fn config_check_refuses_explicit_only_providers_and_names_the_exclude_remedy() {
+    fn config_check_refuses_old_shape_and_names_converter() {
         let scratch = prefrontal_test_support::ScratchDir::new("routing-config-check-explicit");
         let path = scratch.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write_raw(
             &path,
             r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,
         )
         .unwrap();
         let error = check_config_at(&path).unwrap_err().to_string();
         assert!(
-            error.contains("config_key_removed: model_routing.explicit_only_providers")
-                && error
-                    .contains("list the provider in model_routing.exclude.all; pins still work"),
+            error.contains("model_routing") && error.contains("prefrontal-routing config-convert"),
             "{error}"
         );
     }
@@ -7833,189 +8284,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_reset_75h_skips_only_the_failed_consumer_then_expires() {
+    async fn legacy_provider_reset_does_not_block_automatic_or_pinned_selection() {
         use prefrontal_routing_core::route_state_store::ProviderOutcome;
-        let now = now_ms() as i64;
-        for (age_hours, has_reset) in [(0, true), (76, true), (0, false)] {
-            let rig = Rig::new("provider-reset-75h");
-            let mut primary = fact("google", "antigravity-gemini-3.8-flash");
-            primary.prompt_defaults =
-                Some(prefrontal_routing_core::model_facts::ModelPromptDefaults {
-                    variant: Some("high".into()),
-                    ..Default::default()
-                });
-            let fallback = fact("z-provider", "adequate-fallback");
-            let facts = [primary, fallback];
-            let params = |consumer: &str| {
-                json!({"consumer":consumer,"targetAgent":"mason",
-                "requirements":{"iq":30,"eq":0},"availableModels":["google/antigravity-gemini-3.8-flash","google/antigravity-gemini-3.8-flash/high","z-provider/adequate-fallback"]})
-            };
-            let path = Path::new("/nonexistent/provider-reset-routing.jsonc");
-            let selected: serde_json::Value = serde_json::from_slice(
-                &run_select_against_rig(&rig, params("mason"), &facts, path)
-                    .await
-                    .body,
-            )
-            .unwrap();
-            assert_eq!(
-                selected["result"]["selected"]["model"]["providerID"], "google",
-                "{selected}"
-            );
-            let decision = selected["result"]["decisionID"].as_str().unwrap();
-            let observed = now - age_hours * 3_600_000;
-            let reset = observed + 75 * 3_600_000;
-            let store = rig.open_store();
-            store
-                .set_decision_outcome(
-                    decision,
-                    &DecisionOutcomeUpdate {
-                        outcome: RouteOutcome::Interrupted,
-                        last_error: Some(
-                            "account_limit_exhausted: class transient; HTTP 429".into(),
-                        ),
-                        observed_at_ms: observed,
-                        failure_backoff: Default::default(),
-                        provider_outcome: Some(ProviderOutcome {
-                            account_ref: "quota-account".into(),
-                            credential_id: Some("antigravity:google".into()),
-                            resets_at_ms: has_reset.then_some(reset),
-                            credential_refusal: None,
-                        }),
-                    },
-                )
-                .unwrap();
-            drop(store);
-            let optimistic_quota = QuotaCache {
-                windows: vec![antigravity_reading(
-                    "quota-account",
-                    &[
-                        ("gemini-weekly", 0.0, now as u64 + 7 * 24 * 3_600_000),
-                        ("gemini-5h", 0.0, now as u64 + 5 * 3_600_000),
-                    ],
-                )],
-                refreshed_at_ms: now_ms(),
-                available: true,
-                ..Default::default()
-            };
-            let next: serde_json::Value = serde_json::from_slice(
-                &run_select_against_rig_with_quota(
-                    &rig,
-                    params("mason"),
-                    &facts,
-                    path,
-                    optimistic_quota,
-                )
+        let rig = Rig::new("provider-reset-is-not-exhaustion");
+        let primary = fact("google", "antigravity-gemini-3.8-flash");
+        let fallback = fact("z-provider", "adequate-fallback");
+        let facts = [primary, fallback];
+        let params = json!({"consumer":"mason","targetAgent":"mason",
+            "requirements":{"iq":30,"eq":0},
+            "availableModels":["google/antigravity-gemini-3.8-flash","z-provider/adequate-fallback"]});
+        let config = test_operator_config();
+        let selected: serde_json::Value = serde_json::from_slice(
+            &run_select_against_rig(&rig, params.clone(), &facts, config.as_path())
                 .await
                 .body,
+        )
+        .unwrap();
+        assert_eq!(
+            selected["result"]["selected"]["model"]["providerID"], "google",
+            "{selected}"
+        );
+        let store = rig.open_store();
+        store
+            .set_decision_outcome(
+                selected["result"]["decisionID"].as_str().unwrap(),
+                &DecisionOutcomeUpdate {
+                    outcome: RouteOutcome::Interrupted,
+                    last_error: Some("account_limit_exhausted: transient HTTP 429".into()),
+                    observed_at_ms: 1_000,
+                    failure_backoff: Default::default(),
+                    provider_outcome: Some(ProviderOutcome {
+                        account_ref: "catalog-account-google-apikey".into(),
+                        credential_id: Some("catalog-credential-google-apikey".into()),
+                        resets_at_ms: Some(i64::MAX),
+                        credential_refusal: None,
+                    }),
+                },
             )
             .unwrap();
-            assert_eq!(
-                next["result"]["selected"]["model"]["providerID"],
-                if age_hours == 0 && has_reset {
-                    "z-provider"
-                } else {
-                    "google"
-                },
-                "{next}"
-            );
-            let smaller: serde_json::Value = serde_json::from_slice(
-                &run_select_against_rig(&rig, params("sidekick"), &facts, path)
+        drop(store);
+        for pinned in [false, true] {
+            let mut request = params.clone();
+            if pinned {
+                request["pin"] = json!({"model":"google/antigravity-gemini-3.8-flash"});
+                request["pin_fallback"] = json!("none");
+            }
+            let next: serde_json::Value = serde_json::from_slice(
+                &run_select_against_rig(&rig, request, &facts, config.as_path())
                     .await
                     .body,
             )
             .unwrap();
             assert_eq!(
-                smaller["result"]["selected"]["model"]["providerID"], "google",
-                "{smaller}"
+                next["result"]["selected"]["model"]["providerID"], "google",
+                "{next}"
             );
-            if age_hours == 0 && has_reset {
-                let mut pin = params("mason");
-                pin["pin"] =
-                    json!({"model":"google/antigravity-gemini-3.8-flash","variant":"high"});
-                pin["pin_fallback"] = json!("none");
-                let refused: serde_json::Value = serde_json::from_slice(
-                    &run_select_against_rig(&rig, pin.clone(), &facts, path)
-                        .await
-                        .body,
-                )
-                .unwrap();
-                assert!(refused["result"]["selected"].is_null(), "{refused}");
-                pin["pin"]["variant"] = json!("low");
-                let mut low = facts[0].clone();
-                low.variant = Some("low".into());
-                let pin_facts = [facts[0].clone(), facts[1].clone(), low];
-                pin["availableModels"] = json!([
-                    "google/antigravity-gemini-3.8-flash/high",
-                    "google/antigravity-gemini-3.8-flash/low",
-                    "z-provider/adequate-fallback"
-                ]);
-                let other_variant: serde_json::Value = serde_json::from_slice(
-                    &run_select_against_rig(&rig, pin, &pin_facts, path)
-                        .await
-                        .body,
-                )
-                .unwrap();
-                assert_eq!(
-                    other_variant["result"]["selected"]["promptParams"]["variant"], "low",
-                    "{other_variant}"
-                );
-                let store = rig.open_store();
-                assert_eq!(
-                    store.provider_reset_fences("mason", now).unwrap()[0].resets_at_ms,
-                    reset
-                );
-                let success = |consumer: &str, account: &str| {
-                    let id = store
-                        .record_decision(&DecisionInput {
-                            consumer: Some(consumer.into()),
-                            selected_provider_id: Some("google".into()),
-                            selected_model_id: Some("antigravity-gemini-3.8-flash".into()),
-                            selected_route_key: Some(
-                                "google/antigravity-gemini-3.8-flash/high".into(),
-                            ),
-                            selected_variant: Some("high".into()),
-                            ..Default::default()
-                        })
-                        .unwrap();
-                    store
-                        .set_decision_outcome(
-                            &id,
-                            &DecisionOutcomeUpdate {
-                                outcome: RouteOutcome::Completed,
-                                last_error: None,
-                                observed_at_ms: now + 1,
-                                failure_backoff: Default::default(),
-                                provider_outcome: Some(ProviderOutcome {
-                                    account_ref: account.into(),
-                                    credential_id: None,
-                                    resets_at_ms: None,
-                                    credential_refusal: None,
-                                }),
-                            },
-                        )
-                        .unwrap();
-                };
-                success("sidekick", "quota-account");
-                success("mason", "other-account");
-                assert_eq!(store.provider_reset_fences("mason", now).unwrap().len(), 1);
-                success("mason", "quota-account");
-                drop(store);
-                let recovered: serde_json::Value = serde_json::from_slice(
-                    &run_select_against_rig(&rig, params("mason"), &facts, path)
-                        .await
-                        .body,
-                )
-                .unwrap();
-                assert_eq!(
-                    recovered["result"]["selected"]["model"]["providerID"], "google",
-                    "{recovered}"
-                );
-            }
         }
     }
 
     #[tokio::test]
-    async fn provider_outcome_wire_uses_the_reset_and_frozen_success_identity() {
+    async fn provider_outcome_wire_records_terminal_outcomes_without_reset_fences() {
         use prefrontal_routing_core::route_state_store::ProviderOutcome;
         let rig = Rig::new("provider-reset-wire");
         let store = Arc::new(rig.open_store());
@@ -8087,14 +8415,20 @@ mod tests {
             let ack: serde_json::Value =
                 serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
             assert_eq!(ack["result"]["ok"], true, "{ack}");
-            let fences = store
-                .provider_reset_fences("mason", now_ms() as i64)
-                .unwrap();
-            if completing {
-                assert!(fences.is_empty());
-            } else {
-                assert_eq!(fences[0].resets_at_ms, reset);
-            }
+            let id = if completing { &recovery } else { &failed };
+            assert_eq!(
+                store
+                    .get_decision_by_id(id)
+                    .unwrap()
+                    .unwrap()
+                    .outcome
+                    .as_deref(),
+                Some(if completing {
+                    "completed"
+                } else {
+                    "interrupted"
+                }),
+            );
         }
     }
 
@@ -8104,17 +8438,19 @@ mod tests {
     /// The retry went to another cline-pass model and got the same 403, because the
     /// refusal is about the account, not the model. The first refusal must now fence
     /// (cline-pass, apikey:cline-pass): the retry avoids every cline-pass route and the
-    /// decision log names the fence; the fence survives a store reopen and any amount
-    /// of time; an explicit pin is not fenced; and the fence ends when the
+    /// decision log names the fence; the fence survives a store reopen; a fence
+    /// older than the recheck interval admits exactly one probe, then holds
+    /// again; an explicit pin is not fenced; and the fence ends when the
     /// credential's vault listing changes.
     ///
     /// The same replay covers an empty balance: Broca ends the run as permanent
     /// `billing_exhausted` naming the credential (xAI's spending limit, Anthropic's
     /// "credit balance too low", OpenAI's insufficient_quota, OpenCode's HTTP 402
-    /// "Insufficient account funds"); topping up does not show on a timer either.
-    /// And a balance too small for the request: permanent `credit_insufficient`
-    /// (OpenRouter's 402 "This request requires more credits"), the same
-    /// account-level refusal as an empty balance.
+    /// "Insufficient account funds"). Topping up does not change the vault listing,
+    /// so the fence holds until the recheck admits one probe. And a balance too
+    /// small for the request: permanent `credit_insufficient` (OpenRouter's 402
+    /// "This request requires more credits"), the same account-level refusal as
+    /// an empty balance.
     #[tokio::test]
     async fn an_account_level_refusal_fences_the_providers_routes_through_that_credential() {
         for (code, reason) in [
@@ -8184,7 +8520,10 @@ mod tests {
                 credentials,
             )
             .await;
-            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone()
+            let mut result =
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone();
+            admit_selected_account(store, credentials, &mut result);
+            result
         }
         let first = select(&store, &credentials, &request).await;
         assert_eq!(
@@ -8262,8 +8601,12 @@ mod tests {
             logged.rejected_json
         );
 
-        // The fence is routing state, not memory: it survives a store reopen. It
-        // has no expiry either: a fence recorded long ago still holds.
+        // The fence is routing state, not memory: it survives a store reopen. A
+        // fence recorded long ago admits one recheck probe, then holds again:
+        // model selection picks the fenced provider; the following account
+        // admission reserves and records its probe. The next selection is
+        // fenced until another interval passes or an outcome
+        // lifts or renews it.
         drop(store);
         rusqlite::Connection::open(rig.dir.join("store.db"))
             .unwrap()
@@ -8273,19 +8616,41 @@ mod tests {
             )
             .unwrap();
         store = Arc::new(rig.open_store());
+        let probe = select(&store, &credentials, &request).await;
+        assert_eq!(
+            probe["selected"]["model"]["providerID"], "cline-pass",
+            "a fence past the recheck interval admits exactly one probe: {probe}"
+        );
+        assert!(
+            probe["account_admission"]["reason"]["fence_probe"]
+                .as_str()
+                .is_some_and(|line| line.contains("fence probe")),
+            "the pick records its probe: {probe}"
+        );
         assert_fenced(&select(&store, &credentials, &request).await);
 
-        // An explicit pin keeps its behaviour: it is not fenced.
+        // Naming a model cannot authorize a credential the provider refused.
         let mut pinned = request.clone();
         pinned["params"]["modelPin"] = json!("cline-pass/deepseek-v4.1-flash");
-        let pinned = select(&store, &credentials, &pinned).await;
+        let pinned = run_route_wire_request_with_paths(
+            &store,
+            pinned,
+            Path::new("/nonexistent/credential-refusal-fence.jsonc"),
+            &credentials,
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_slice(&pinned.body).unwrap();
+        assert_eq!(pinned.header.ty, FrameType::Error, "{body}");
+        assert_eq!(body["code"], reason);
+        assert_eq!(body["detail"]["reason"], reason, "{body}");
         assert_eq!(
-            pinned["selected"]["model"]["modelID"], "deepseek-v4.1-flash",
-            "{pinned}"
+            body["detail"]["credentialIds"],
+            json!(["apikey:cline-pass"]),
+            "{body}"
         );
 
         // A change to the credential's vault listing (here its plan tier) is what can
-        // fix the refusal, so it ends the fence. No timer does.
+        // fix the refusal, so it ends the fence; a successful recheck probe does too.
         let changed = listing(Some("contributor"));
         let healed = select(&store, &changed, &request).await;
         assert_eq!(
@@ -8350,6 +8715,423 @@ mod tests {
         }
     }
 
+    // Model selection does not spend a probe. The runner's subsequent account
+    // admission reserves it and records the actual serving identity.
+    fn admit_selected_account(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        selected: &mut serde_json::Value,
+    ) {
+        let provider = selected["selected"]["model"]["providerID"]
+            .as_str()
+            .unwrap();
+        let model = selected["selected"]["model"]["modelID"].as_str().unwrap();
+        let decision = selected["decisionID"].as_str().unwrap();
+        let config =
+            config_overrides::live_config(Path::new("/nonexistent/credential-fence-probe.jsonc"));
+        let policy = config.allocator_policy(provider);
+        let ctx = account_selection::Ctx {
+            store,
+            accounts: ACCOUNT_QUOTA.get(),
+            flags: config.account_flags(),
+            policy: &policy,
+            now_ms: now_ms() as i64,
+            classes: Some(
+                account_selection::ClassContext::load(
+                    store,
+                    credentials,
+                    config,
+                    ACCOUNT_QUOTA.get(),
+                    now_ms() as i64,
+                )
+                .unwrap(),
+            ),
+        };
+        let body=serde_json::to_vec(&json!({"method":account_selection::ACCOUNT_FOR_OP,"params":{
+            "provider":provider,"model":model,"model_decision_id":decision,"conversation_key":format!("probe-fixture:{decision}"),"admission_id":format!("probe-fixture:{decision}"),"caller":{"runner":"broca"}
+        }})).unwrap();
+        let reply = account_selection::handle(
+            account_selection::ACCOUNT_FOR_OP,
+            &body,
+            "reserved:broca",
+            &ctx,
+        );
+        let account_selection::OpReply::Result(admission) = reply else {
+            panic!("account admission failed: {reply:?}");
+        };
+        let logged = store
+            .account_decision(admission["reason"]["decision_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let logged: serde_json::Value = serde_json::from_str(&logged.decision_json).unwrap();
+        assert_eq!(
+            logged["explanation"]["credential_fence_probe"], admission["reason"]["fence_probe"],
+            "the admitted probe is durable"
+        );
+        selected["account_admission"] = admission;
+    }
+
+    async fn select_result(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        request: &serde_json::Value,
+    ) -> serde_json::Value {
+        let frame = run_route_wire_request_with_paths(
+            store,
+            request.clone(),
+            Path::new("/nonexistent/credential-fence-probe.jsonc"),
+            credentials,
+        )
+        .await;
+        let mut result =
+            serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()["result"].clone();
+        admit_selected_account(store, credentials, &mut result);
+        result
+    }
+
+    async fn report_refusal(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        decision: &str,
+        code: &str,
+    ) {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": {
+                "decisionID": decision, "outcome": "error",
+                "lastError": format!("{code}: provider cline-pass refused credential apikey:cline-pass"),
+                "providerOutcome": {
+                    "accountRef": "apikey:cline-pass", "credentialId": "apikey:cline-pass", "resetsAtMs": null,
+                    "credentialRefusal": {"providerId": "cline-pass", "credentialId": "apikey:cline-pass", "code": code}
+                }}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_set_decision_outcome(
+            frame,
+            &tx,
+            store,
+            Path::new("/nonexistent/credential-fence-probe.jsonc"),
+            credentials,
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(ack["result"]["ok"], true, "{ack}");
+    }
+
+    async fn report_completed(
+        store: &SharedStore,
+        credentials: &SharedBrocaCredentials,
+        decision: &str,
+    ) {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method": ROUTE_SET_DECISION_OUTCOME_OP, "params": {
+                "decisionID": decision, "outcome": "completed",
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_set_decision_outcome(
+            frame,
+            &tx,
+            store,
+            Path::new("/nonexistent/credential-fence-probe.jsonc"),
+            credentials,
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(ack["result"]["ok"], true, "{ack}");
+    }
+
+    /// Fence (cline-pass, apikey:cline-pass) with `code` through a real select
+    /// plus an outcome report, returning the rig, store, credentials, the
+    /// automatic request that preferred cline-pass, and the fencing decision.
+    async fn billing_fenced_rig(
+        code: &str,
+    ) -> (
+        Rig,
+        SharedStore,
+        SharedBrocaCredentials,
+        serde_json::Value,
+        String,
+    ) {
+        let rig = Rig::new(&format!("credential-fence-probe-{code}"));
+        let store: SharedStore = Arc::new(rig.open_store());
+        let mut cheap = fact("cline-pass", "muse-spark-1.3-contributor");
+        cheap.cost_per_m_tok_out = Some(0.5);
+        let mut flash = fact("cline-pass", "deepseek-v4.1-flash");
+        flash.cost_per_m_tok_out = Some(0.6);
+        let mut fallback = fact("other", "fallback-model");
+        fallback.cost_per_m_tok_out = Some(40.0);
+        for fact in [&cheap, &flash, &fallback] {
+            store.upsert_fact(fact, FactSource::Override).unwrap();
+        }
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                credentials: [
+                    ("apikey:cline-pass", "cline-pass"),
+                    ("apikey:other", "other"),
+                ]
+                .into_iter()
+                .map(
+                    |(id, provider)| cortexkit_claustrum_client::ListedCredential {
+                        id: id.into(),
+                        categories: vec!["llm-provider".into()],
+                        credential_type: "apikey".into(),
+                        state: "active".into(),
+                        provider_ids: vec![provider.into()],
+                        plan_tier: None,
+                        ..Default::default()
+                    },
+                )
+                .collect(),
+                view: format!("cline-pass-view-probe-{code}"),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        let request = json!({"method": ROUTE_SELECT_OP, "params": {
+            "consumer": "mason", "targetAgent": "mason", "requirements": {"iq": 30, "eq": 0},
+            "availableModels": ["cline-pass/muse-spark-1.3-contributor", "cline-pass/deepseek-v4.1-flash", "other/fallback-model"]}});
+        let first = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            first["selected"]["model"]["providerID"], "cline-pass",
+            "precondition: cline-pass wins before any refusal: {first}"
+        );
+        let decision = first["decisionID"].as_str().unwrap().to_string();
+        report_refusal(&store, &credentials, &decision, code).await;
+        let retry = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            retry["selected"]["model"]["providerID"], "other",
+            "precondition: the fence holds: {retry}"
+        );
+        (rig, store, credentials, request, decision)
+    }
+
+    fn age_fence_to_stale(store: &SharedStore) {
+        store
+            .touch_credential_entitlement_fence(
+                "cline-pass",
+                "apikey:cline-pass",
+                now_ms() as i64 - 7 * 60 * 60 * 1000,
+            )
+            .unwrap();
+    }
+
+    fn explanation_lines(result: &serde_json::Value) -> Vec<String> {
+        result["account_admission"]["reason"]["fence_probe"]
+            .as_str()
+            .map(str::to_string)
+            .into_iter()
+            .collect()
+    }
+
+    /// A probe that succeeds ends the fence: the next selection picks the
+    /// provider without recording another probe.
+    #[tokio::test]
+    async fn a_successful_probe_lifts_the_fence() {
+        let (_rig, store, credentials, request, _decision) =
+            billing_fenced_rig("billing_exhausted").await;
+        age_fence_to_stale(&store);
+        let probe = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            probe["selected"]["model"]["providerID"], "cline-pass",
+            "precondition: the probe is admitted: {probe}"
+        );
+        report_completed(&store, &credentials, probe["decisionID"].as_str().unwrap()).await;
+        assert!(
+            store.credential_entitlement_fences().unwrap().is_empty(),
+            "a successful probe lifts the fence"
+        );
+        let healed = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            healed["selected"]["model"]["providerID"], "cline-pass",
+            "{healed}"
+        );
+        assert!(
+            !explanation_lines(&healed)
+                .iter()
+                .any(|line| line.contains("fence probe")),
+            "no probe is recorded once the fence is gone: {healed}"
+        );
+    }
+
+    /// A probe that fails with a billing refusal renews the fence with a fresh
+    /// observation: it still holds, and the next probe waits another interval.
+    #[tokio::test]
+    async fn a_billing_failure_renews_the_fence() {
+        let (_rig, store, credentials, request, _decision) =
+            billing_fenced_rig("billing_exhausted").await;
+        age_fence_to_stale(&store);
+        let stale = store.credential_entitlement_fences().unwrap()[0].observed_at_ms;
+        let probe = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            probe["selected"]["model"]["providerID"], "cline-pass",
+            "precondition: the probe is admitted: {probe}"
+        );
+        let at_probe = store.credential_entitlement_fences().unwrap()[0].observed_at_ms;
+        assert!(
+            at_probe > stale,
+            "admitting the probe stamps the fence fresh"
+        );
+        report_refusal(
+            &store,
+            &credentials,
+            probe["decisionID"].as_str().unwrap(),
+            "billing_exhausted",
+        )
+        .await;
+        let fences = store.credential_entitlement_fences().unwrap();
+        assert_eq!(fences.len(), 1, "the failure keeps the fence");
+        assert!(
+            fences[0].observed_at_ms >= at_probe,
+            "the failure renews the fence with a fresh observation"
+        );
+        let retry = select_result(&store, &credentials, &request).await;
+        assert_eq!(
+            retry["selected"]["model"]["providerID"], "other",
+            "the renewed fence holds: {retry}"
+        );
+    }
+
+    async fn clear_fences_as(
+        store: &SharedStore,
+        channel: u16,
+        principal: &str,
+        credential: &str,
+    ) -> Frame {
+        route_principals()
+            .lock()
+            .unwrap()
+            .insert(channel, (1, principal.to_string()));
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method": ROUTE_CLEAR_CREDENTIAL_FENCES_OP,
+                "params": {"credentialId": credential}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_clear_credential_fences(frame, &tx, store)
+            .await
+            .unwrap();
+        rx.recv().await.unwrap()
+    }
+
+    /// The operator op lifts every fence on the named credential at once, for
+    /// use right after a top-up. Only the operator's own routes may call it:
+    /// any other module principal, and unverified routes, are refused.
+    #[tokio::test]
+    async fn the_operator_op_lifts_fences_and_refuses_non_operators() {
+        let rig = Rig::new("credential-fence-operator-lift");
+        let store: SharedStore = Arc::new(rig.open_store());
+        let refusal =
+            |provider: &str| prefrontal_routing_core::route_state_store::CredentialRefusal {
+                provider_id: provider.into(),
+                credential_id: "apikey:inception".into(),
+                code: "billing_exhausted".into(),
+            };
+        let credentials = empty_broca_credentials();
+        for provider in ["inception", "other"] {
+            credential_fences::record(&store, &credentials, &refusal(provider), now_ms() as i64)
+                .unwrap();
+        }
+        assert_eq!(store.credential_entitlement_fences().unwrap().len(), 2);
+        // The operator on a shell on this machine.
+        let reply = clear_fences_as(&store, 501, "direct", "apikey:inception").await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{reply:?}");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body["result"]["lifted"],
+            json!([
+                {"providerId": "inception", "code": "billing_exhausted"},
+                {"providerId": "other", "code": "billing_exhausted"},
+            ]),
+            "the reply names what was lifted: {body}"
+        );
+        assert!(store.credential_entitlement_fences().unwrap().is_empty());
+        // The operator on the phone.
+        credential_fences::record(&store, &credentials, &refusal("inception"), now_ms() as i64)
+            .unwrap();
+        let reply = clear_fences_as(&store, 502, "reserved:callosum", "apikey:inception").await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{reply:?}");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body["result"]["lifted"].as_array().unwrap().len(),
+            1,
+            "{body}"
+        );
+        assert!(store.credential_entitlement_fences().unwrap().is_empty());
+        // Any other module principal is refused, naming its principal.
+        credential_fences::record(&store, &credentials, &refusal("inception"), now_ms() as i64)
+            .unwrap();
+        let reply = clear_fences_as(&store, 503, "reserved:broca", "apikey:inception").await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{reply:?}");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "not_permitted", "{body}");
+        assert!(
+            body["message"].as_str().unwrap().contains("reserved:broca"),
+            "the refusal names the principal: {body}"
+        );
+        assert_eq!(store.credential_entitlement_fences().unwrap().len(), 1);
+        // So is an unverified route.
+        let reply = clear_fences_as(&store, 504, "unverified", "apikey:inception").await;
+        assert_eq!(reply.header.ty, FrameType::Error, "{reply:?}");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["code"], "not_permitted", "{body}");
+        assert_eq!(store.credential_entitlement_fences().unwrap().len(), 1);
+    }
+
+    /// A strict pin on a stale-fenced model probes that same model: the pick
+    /// is the pinned route, never a different model the caller did not name.
+    #[tokio::test]
+    async fn a_strict_pin_probes_its_own_fenced_model() {
+        let (_rig, store, credentials, mut request, _decision) =
+            billing_fenced_rig("billing_exhausted").await;
+        age_fence_to_stale(&store);
+        request["params"]["modelPin"] = json!("cline-pass/deepseek-v4.1-flash");
+        let frame = run_route_wire_request_with_paths(
+            &store,
+            request,
+            Path::new("/nonexistent/credential-fence-pin-probe.jsonc"),
+            &credentials,
+        )
+        .await;
+        let mut body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+        assert_eq!(frame.header.ty, FrameType::Response, "{body}");
+        admit_selected_account(&store, &credentials, &mut body["result"]);
+        assert_eq!(
+            body["result"]["selected"]["routeKey"], "cline-pass/deepseek-v4.1-flash",
+            "a strict pin probes its own model, not another one: {body}"
+        );
+        assert!(
+            body["result"]["account_admission"]["reason"]["fence_probe"]
+                .as_str()
+                .is_some_and(|line| line.contains("fence probe")),
+            "the pick records its probe: {body}"
+        );
+    }
+
     /// Routing deploys before core, and core may run against an older routing, so
     /// neither side may reject the other's report: unknown members of
     /// `providerOutcome` and of `credentialRefusal` are ignored.
@@ -8374,15 +9156,10 @@ mod tests {
         assert_eq!(old.provider_outcome.unwrap().credential_refusal, None);
     }
 
-    /// Replay of a live panel defect: an audit panel kept seating Meta's Muse as its
-    /// random extra seat while Muse's subscription was out until a dated provider
-    /// reset. The seat's failure was reported against the shared panel decision,
-    /// which names no route, so no fence was written, and panel admission never read
-    /// the fences anyway. One seat's reset must now fence that seat's model for
-    /// later panels, leave every other seat and consumer alone, and lift at the
-    /// reset.
+    /// A panel seat's provider reset is outcome metadata, not confirmed quota
+    /// exhaustion. It must not remove that model from later panels.
     #[tokio::test]
-    async fn a_panel_seat_provider_reset_fences_that_model_from_later_panels_until_the_reset() {
+    async fn a_panel_seat_provider_reset_leaves_the_model_selectable() {
         let rig = Rig::new("panel-seat-provider-reset");
         let store = Arc::new(rig.open_store());
         let request = json!({
@@ -8441,8 +9218,8 @@ mod tests {
         let seat_variant = seat["promptParams"]["variant"].as_str().map(str::to_string);
         let decision = first["decisionID"].as_str().unwrap().to_string();
         let reset = now_ms() as i64 + 3 * 24 * 3_600_000;
-        // Another seat of the same panel settles first; the shared decision keeps
-        // that first outcome, and the failing seat's reset must not be lost behind it.
+        // The shared decision keeps its first terminal outcome even when another
+        // seat later reports a failure with a provider reset.
         report(
             &store,
             json!({"decisionID": decision, "outcome": "completed"}),
@@ -8454,57 +9231,14 @@ mod tests {
                 "decisionID": decision,
                 "outcome": "interrupted",
                 "lastError": "account_limit_exhausted",
-                "providerOutcome": {"accountRef": "seat-account", "resetsAtMs": reset},
+                "providerOutcome": {"accountRef": "catalog-account-openai-apikey", "resetsAtMs": reset},
                 "seatRoute": {"routeKey": seat_route, "variant": seat_variant},
             }),
         )
         .await;
 
-        let fences = store
-            .provider_reset_fences(PANEL_DECISION_CONSUMER, now_ms() as i64)
-            .unwrap();
-        assert_eq!(fences.len(), 1, "{fences:?}");
-        assert_eq!(
-            fences[0].route_key,
-            prefrontal_routing_core::make_route_key(
-                "openai",
-                seat_route.strip_prefix("openai/").unwrap(),
-                seat_variant.as_deref()
-            ),
-            "only the failing seat's own route is fenced"
-        );
-        assert_eq!(fences[0].resets_at_ms, reset);
-        assert!(
-            store
-                .provider_reset_fences("mason", now_ms() as i64)
-                .unwrap()
-                .is_empty(),
-            "other consumers are not fenced"
-        );
-
-        let fenced = select(&store, &request).await;
-        assert!(!seated(&fenced).contains(&seat_route), "{fenced}");
-        assert!(
-            fenced["shortfall"]["causes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|cause| cause["model"] == seat_route.as_str()
-                    && cause["reason"] == "quota_exhausted"),
-            "the fenced seat is named as a quota wall: {fenced}"
-        );
-
-        // The provider's reset passes, so the fence expires and the model is
-        // seated again.
-        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
-        connection
-            .execute(
-                "UPDATE provider_reset_fences SET resets_at_ms=?1",
-                [now_ms() as i64 - 1],
-            )
-            .unwrap();
-        let lifted = select(&store, &request).await;
-        assert!(seated(&lifted).contains(&seat_route), "{lifted}");
+        let next = select(&store, &request).await;
+        assert!(seated(&next).contains(&seat_route), "{next}");
     }
 
     #[test]
@@ -8551,6 +9285,92 @@ mod tests {
 
     struct Rig {
         dir: PathBuf,
+    }
+
+    #[tokio::test]
+    async fn legacy_hosts_route_with_an_empty_vault_without_account_selection() {
+        let _clock = InjectedClock::set(1_800_000_000_000);
+        let rig = Rig::new("host-candidate-isolation");
+        let config = rig.dir.join("routing.jsonc");
+        crate::test_config::write(&config, r#"{}"#).unwrap();
+        assert!(
+            config_overrides::live_config(&config)
+                .account_flags()
+                .enabled
+        );
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .upsert_fact(&fact("host-provider", "host-model"), FactSource::Override)
+            .unwrap();
+        let credentials = Arc::new(Mutex::new(broca_credentials::BrocaCredentials::default()));
+        assert!(ACCOUNT_QUOTA.get().is_none());
+        for host in ["opencode", "pi"] {
+            for pinned in [false, true] {
+                let mut params = json!({
+                    "targetAgent": "mason", "consumer": "mason", "harness": host,
+                    "requirements": {"iq": 30, "eq": 0},
+                    "availableModels": ["host-provider/host-model"],
+                    "providerAuthTypes": {"host-provider": "oauth"},
+                });
+                if pinned {
+                    params["modelPin"] = json!("host-provider/host-model");
+                }
+                let request = Frame::build(
+                    FrameType::Request,
+                    Flags::new(false, Priority::Interactive, false),
+                    7,
+                    1,
+                    99,
+                    serde_json::to_vec(&json!({"method": ROUTE_SELECT_OP, "params": params}))
+                        .unwrap(),
+                )
+                .unwrap();
+                let (tx, mut rx) = mpsc::channel(1);
+                handle_select_request(
+                    request,
+                    1,
+                    &tx,
+                    &Arc::new(Mutex::new(QuotaCache::default())),
+                    &store,
+                    &Arc::new(Mutex::new(None)),
+                    &config,
+                    &config,
+                    &credentials,
+                )
+                .await
+                .unwrap();
+                let frame = rx.recv().await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+                assert_eq!(frame.header.ty, FrameType::Response, "{body}");
+                assert_eq!(
+                    body["result"]["selected"]["routeKey"],
+                    "host-provider/host-model"
+                );
+                assert_eq!(body["result"]["runner"]["module"], host, "{body}");
+                assert!(ACCOUNT_QUOTA.get().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_broca_substrate_is_not_a_host_request() {
+        let params: SelectParams = serde_json::from_value(json!({"substrate": "broca"})).unwrap();
+        assert!(!params.is_host_run());
+        let params: SelectParams =
+            serde_json::from_value(json!({"harness": "custom-host"})).unwrap();
+        assert!(params.is_host_run());
+    }
+
+    #[test]
+    fn an_auth_json_oauth_claim_is_not_a_non_host_auth_fact() {
+        // Routing takes no auth file path at all: host auth kinds come only
+        // from the request.
+        assert!(provider_auth_types(None).is_empty());
+        assert_eq!(
+            provider_auth_types(Some(&HashMap::from([("example".into(), "apikey".into())])))
+                ["example"],
+            "apikey"
+        );
     }
 
     impl Rig {
@@ -8821,13 +9641,13 @@ mod tests {
             .upsert_fact(&fact("held-b", "model"), FactSource::Override)
             .unwrap();
         let path = rig.dir.join("routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"models":{"held-a/model":{"speed_multiplier":0.5}},"keep_free_percent":{"held-b":20}}}"#,
         )
         .unwrap();
         let held = config_overrides::settle_live_config(&path);
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"models":{"held-a/model":{"speed_multiplier":2.0}},"keep_free_percent":{"held-b":0}}}"#,
         )
@@ -8837,7 +9657,7 @@ mod tests {
 
         let quota = Arc::new(Mutex::new(QuotaCache::default()));
         let judged = |pricing: &RoutePricing| {
-            let prepared = prepare_selection_inputs(&quota, &store, pricing).unwrap();
+            let prepared = prepare_selection_inputs(&quota, &store, pricing, &[]).unwrap();
             let a = prepared
                 .facts
                 .iter()
@@ -8900,6 +9720,7 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &RoutePricing::default(),
+            &[],
         )
         .unwrap();
         let actual = prepared
@@ -8970,7 +9791,6 @@ mod tests {
                     &rig.dir.join("routing.jsonc"),
                     &rig.dir.join("operator.jsonc"),
                     &broca_credentials,
-                    &rig.dir.join("auth.json"),
                     &catalog_health,
                 )
                 .await
@@ -9061,18 +9881,19 @@ mod tests {
     }
 
     async fn run_route_wire_request(store: &SharedStore, request: serde_json::Value) -> Frame {
-        run_route_wire_request_with_operator_config(
-            store,
-            request,
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-        )
-        .await
+        run_route_wire_request_with_operator_config(store, request, &test_operator_config()).await
     }
 
     fn empty_broca_credentials() -> SharedBrocaCredentials {
         // These wire fixtures represent a completed catalog load with no supplied
         // planes. Cold-start tests construct the uninitialized cache explicitly.
         Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(&[])))
+    }
+
+    fn catalog_broca_credentials(store: &SharedStore) -> SharedBrocaCredentials {
+        Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
+            &store.get_facts().unwrap(),
+        )))
     }
 
     fn mapped_broca_credentials(provider: &str) -> SharedBrocaCredentials {
@@ -9082,6 +9903,8 @@ mod tests {
                 credentials: vec![cortexkit_claustrum_client::ListedCredential {
                     id: "fixture".into(),
                     categories: vec!["llm-provider".into()],
+                    credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
                     state: "active".into(),
                     provider_ids: vec![provider.into()],
                     ..Default::default()
@@ -9094,16 +9917,14 @@ mod tests {
         credentials
     }
 
-    /// An OpenCode `auth.json` with no providers, under the scratch root, for
-    /// requests that carry no provider auth types (see `provider_auth_types`).
-    fn empty_opencode_auth() -> PathBuf {
+    fn test_operator_config() -> PathBuf {
         static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         PATH.get_or_init(|| {
             let path = prefrontal_test_support::scratch_root().join(format!(
-                "prefrontal-routing-empty-opencode-auth-{}.json",
+                "prefrontal-routing-test-operator-{}.json",
                 std::process::id()
             ));
-            std::fs::write(&path, "{}").unwrap();
+            crate::test_config::write(&path, "{}").unwrap();
             path
         })
         .clone()
@@ -9158,7 +9979,9 @@ mod tests {
             store,
             request,
             operator_config_path,
-            &empty_broca_credentials(),
+            &Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
+                &store.get_facts().unwrap(),
+            ))),
         )
         .await
     }
@@ -9169,9 +9992,16 @@ mod tests {
         operator_config_path: &Path,
         broca_credentials: &SharedBrocaCredentials,
     ) -> Frame {
+        let fixture_config = test_operator_config();
+        let operator_config_path = if operator_config_path.exists() {
+            operator_config_path
+        } else {
+            &fixture_config
+        };
         // Legacy wire fixtures exercise executor availability from an explicit
         // list or Broca substrate. Launch-mapping tests use their own fixture.
         if request["method"] == ROUTE_SELECT_OP {
+            authorize_legacy_policy_fixture(&request["params"], operator_config_path);
             request["params"]
                 .as_object_mut()
                 .unwrap()
@@ -9196,14 +10026,34 @@ mod tests {
             &quota_cache,
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             operator_config_path,
             broca_credentials,
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
         rx.recv().await.unwrap()
+    }
+
+    /// Policy fixtures own their legacy target labels. Admission itself is
+    /// exercised by the route-bound routing/v1 harness, not these policy helpers.
+    pub(super) fn authorize_legacy_policy_fixture(params: &serde_json::Value, config_path: &Path) {
+        if let Some(target) = params["targetAgent"].as_str() {
+            let operator = config_overrides::live_config(config_path);
+            let owner = operator
+                .consumer_owners()
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| "prefrontal-core".into());
+            routing_v1::consumers::replace_catalog(&json!([{
+                "module_id": owner, "nonce_verified": true,
+                "role_declarations": {"routing/v1": {"consumers": [{"name": target}]}}
+            }]));
+            route_principals()
+                .lock()
+                .unwrap()
+                .insert(7, (1, format!("reserved:{owner}")));
+        }
     }
 
     /// Explicitly ignored: reads live Fusiform metadata, but all route.select
@@ -9240,9 +10090,6 @@ mod tests {
         );
         let credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
         let routing_config = config_overrides::config_path();
-        // The roster is non-secret metadata; never read the operator's secret
-        // OpenCode auth file in a replay. Subscription policy remains live.
-        let auth_path = empty_opencode_auth();
         let mut report = Vec::new();
         for (phase, cache) in [
             ("before_ordinary_catalog", &before_credentials),
@@ -9255,6 +10102,7 @@ mod tests {
                         &state,
                         &store.get_facts().unwrap(),
                         now_ms() as i64,
+                        &[],
                     );
                     guard.mark_copy_listing_gap();
                 }
@@ -9267,7 +10115,12 @@ mod tests {
                     .await
                     .unwrap();
                 let mut guard = credentials.lock().unwrap();
-                guard.refresh_serving_methods(&state, &store.get_facts().unwrap(), now_ms() as i64);
+                guard.refresh_serving_methods(
+                    &state,
+                    &store.get_facts().unwrap(),
+                    now_ms() as i64,
+                    &[],
+                );
                 guard.mark_copy_listing_gap();
             }
             for iq in [70, 85] {
@@ -9295,7 +10148,6 @@ mod tests {
                     &routing_config,
                     &routing_config,
                     cache,
-                    &auth_path,
                 )
                 .await
                 .unwrap();
@@ -10245,7 +11097,7 @@ mod tests {
             )
             .expect("stamp the stale exclusion column");
         let operator_config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": {"all": ["fixture/wire-only"]} } }"#,
         )
@@ -10734,13 +11586,7 @@ mod tests {
         facts: &[ModelFact],
     ) -> (Frame, Rig) {
         let rig = Rig::new(label);
-        let response = run_select_against_rig(
-            &rig,
-            params,
-            facts,
-            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
-        )
-        .await;
+        let response = run_select_against_rig(&rig, params, facts, &test_operator_config()).await;
         (response, rig)
     }
 
@@ -10797,10 +11643,9 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             operator_config_path,
-            &empty_broca_credentials(),
-            &empty_opencode_auth(),
+            &catalog_broca_credentials(&store),
         )
         .await
         .unwrap();
@@ -10842,10 +11687,9 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            &empty_broca_credentials(),
-            &empty_opencode_auth(),
+            &test_operator_config(),
+            &test_operator_config(),
+            &catalog_broca_credentials(&store),
         )
         .await
         .unwrap();
@@ -10939,10 +11783,9 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            &empty_broca_credentials(),
-            &empty_opencode_auth(),
+            &test_operator_config(),
+            &test_operator_config(),
+            &catalog_broca_credentials(&store),
         )
         .await
         .unwrap();
@@ -11597,10 +12440,9 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            &empty_broca_credentials(),
-            &empty_opencode_auth(),
+            &test_operator_config(),
+            &test_operator_config(),
+            &catalog_broca_credentials(store),
         )
         .await
         .unwrap();
@@ -11682,10 +12524,9 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            &empty_broca_credentials(),
-            &empty_opencode_auth(),
+            &test_operator_config(),
+            &test_operator_config(),
+            &catalog_broca_credentials(&store),
         )
         .await
         .unwrap();
@@ -11788,12 +12629,11 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
                 &quota_decides_facts(),
             ))),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -11868,10 +12708,9 @@ mod tests {
             &Arc::new(Mutex::new(quota_cache)),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            &empty_broca_credentials(),
-            &empty_opencode_auth(),
+            &test_operator_config(),
+            &test_operator_config(),
+            &catalog_broca_credentials(store),
         )
         .await
         .unwrap();
@@ -12415,7 +13254,7 @@ mod tests {
             ))
             .unwrap();
         let operator_config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": { "all": ["google/antigravity-gemini-4-argon"] } } }"#,
         )
@@ -12472,7 +13311,7 @@ mod tests {
             fact("openai", "gpt-5.5"),
         ];
         let operator_config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": {"all": ["anthropic"]} } }"#,
         )
@@ -12563,7 +13402,7 @@ mod tests {
         );
 
         // Live edit: a new exclude list takes effect on the next selection, no restart.
-        std::fs::write(
+        crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": {"all": ["openai"]} } }"#,
         )
@@ -12617,6 +13456,8 @@ mod tests {
 
         assert_eq!(response.header.ty, FrameType::Response);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        // This executor fixture has API-key credentials and no subscription
+        // config. The request's OAuth claim cannot change vault account coverage.
         assert_eq!(
             body["result"]["resolvedInput"],
             json!({
@@ -12627,11 +13468,7 @@ mod tests {
                     "opencode-go/deepseek-v4-flash",
                     "opencode-go/minimax-m2.5"
                 ],
-                "subscriptionKeys": [
-                    "openai/gpt-5.5",
-                    "opencode-go/deepseek-v4-flash",
-                    "opencode-go/minimax-m2.5"
-                ]
+                "subscriptionKeys": []
             })
         );
     }
@@ -12714,7 +13551,7 @@ mod tests {
                 "providerAuthTypes": { "openai": "oauth" }
             }),
             &[luna, sol],
-            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
         )
         .await;
 
@@ -13090,10 +13927,9 @@ mod tests {
                 &quota_cache,
                 &store,
                 &min_band,
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                &empty_broca_credentials(),
-                &empty_opencode_auth(),
+                &test_operator_config(),
+                &test_operator_config(),
+                &catalog_broca_credentials(&store),
             )
             .await
             .unwrap();
@@ -13172,7 +14008,7 @@ mod tests {
                 let response = run_route_wire_request_with_paths(
                     &store,
                     request(substrate),
-                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                    &test_operator_config(),
                     &broca_credentials,
                 )
                 .await;
@@ -13240,7 +14076,7 @@ mod tests {
                     "taskId": "panel-substrate-unknown-reach",
                 }
             }),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             &broca_credentials,
         )
         .await;
@@ -13311,7 +14147,7 @@ mod tests {
                     "taskId": "panel-substrate-uncredentialed"
                 }
             }),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             &mapped_broca_credentials("kimi-code-plan-global"),
         )
         .await;
@@ -13362,7 +14198,7 @@ mod tests {
             let response = run_route_wire_request_with_paths(
                 &store,
                 request,
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                &test_operator_config(),
                 &broca_credentials,
             )
             .await;
@@ -13380,14 +14216,14 @@ mod tests {
         assert_eq!(results[1]["resolvedInput"]["availableModels"], json!([]));
         assert_eq!(
             results[1]["runner"],
-            json!({"provider":"opencode-go", "model":"m-native-fast"})
+            json!({"provider":"opencode-go", "model":"m-native-fast", "module":"broca", "route":{"provider":"opencode-go", "model":"m-native-fast"}})
         );
     }
 
     /// The two selections a routed Broca mason gets. The launching OpenCode head
     /// selects on its own model list and names no substrate, so routing records
-    /// no selected harness and returns no runner: that answer cannot be sent to
-    /// Broca. Core then selects the same launch for substrate broca, which
+    /// no selected harness and returns the requesting host as runner. Core then
+    /// selects the same launch for substrate broca, which
     /// routing records under harness broca and answers with the Go plan's own
     /// provider id as the runner.
     #[tokio::test]
@@ -13433,10 +14269,9 @@ mod tests {
                 &Arc::new(Mutex::new(QuotaCache::default())),
                 &store,
                 &Arc::new(Mutex::new(None)),
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                &test_operator_config(),
+                &test_operator_config(),
                 &broca_credentials,
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -13456,14 +14291,14 @@ mod tests {
             host["selected"]["routeKey"],
             "opencode-go/deepseek-v4.1-flash"
         );
-        assert!(host.get("runner").is_none(), "{host}");
+        assert_eq!(host["runner"]["module"], "opencode", "{host}");
         assert_eq!(host_harness.as_deref(), None);
         let (broca, broca_harness) = &answers[1];
         assert_eq!(broca["selected"]["harness"], "broca");
         assert_eq!(broca_harness.as_deref(), Some("broca"));
         assert_eq!(
             broca["runner"],
-            json!({"provider":"opencode-go", "model":"deepseek-v4.1-flash"})
+            json!({"provider":"opencode-go", "model":"deepseek-v4.1-flash", "module":"broca", "route":{"provider":"opencode-go", "model":"deepseek-v4.1-flash"}})
         );
     }
 
@@ -13494,10 +14329,9 @@ mod tests {
             &Arc::new(Mutex::new(QuotaCache::default())),
             store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             credentials,
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -13561,8 +14395,7 @@ mod tests {
         credentials
     }
 
-    /// Live replay (task bg_cb31294f57a0fb19, decision dec_b558f7480125,
-    /// 2026-10-23). A provider reset fence held one ChatGPT login
+    /// A live incident on 2026-10-23 held one ChatGPT login
     /// (`chatgpt:openai:live`) for masons on openai/gpt-6.1-sol/xhigh. Routing
     /// pinned the launch to the first serving credential the fence did not
     /// cover, which in vault order was the metered key `apikey:openai`: the
@@ -13570,12 +14403,10 @@ mod tests {
     /// selection, and the runs failed `credit_balance_exhausted` while routing
     /// had priced them on the ChatGPT plan.
     ///
-    /// The launch must stay on a ChatGPT login: here the first unfenced one.
-    /// Requirements are lowered to this fixture's score scale; the vault rows
-    /// and the fence row are the live ones (the reset is moved forward only if
-    /// the clock has passed it, so the fence is always in force).
+    /// The launch must stay on a ChatGPT login. A provider reset is not quota
+    /// evidence and must not trigger a credential pin or a metered fallback.
     #[tokio::test]
-    async fn a_reset_fence_on_one_chatgpt_login_never_pins_an_openai_launch_to_an_api_key() {
+    async fn a_provider_reset_does_not_override_runner_credential_choice() {
         let rig = Rig::new("openai-reset-fence-no-apikey-pin");
         let store = Arc::new(rig.open_store());
         let mut sol = fact("openai", "gpt-6.1-sol");
@@ -13584,30 +14415,35 @@ mod tests {
             ..Default::default()
         });
         store.upsert_fact(&sol, FactSource::Override).unwrap();
-        let resets_at_ms = 1_793_293_884_000_i64.max(now_ms() as i64 + 7 * 86_400_000);
-        rusqlite::Connection::open(rig.dir.join("store.db"))
-            .unwrap()
-            .execute(
-                "INSERT INTO provider_reset_fences \
-                 (route_key, consumer, account_ref, credential_id, resets_at_ms, observed_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    "openai/gpt-6.1-sol/xhigh",
-                    "mason",
-                    "00000000-0000-4000-8000-0000000000a4",
-                    "chatgpt:openai:live",
-                    resets_at_ms,
-                    1_792_761_620_444_i64
-                ],
+        let previous = store
+            .record_decision(&DecisionInput {
+                consumer: Some("mason".into()),
+                selected_provider_id: Some("openai".into()),
+                selected_model_id: Some("gpt-6.1-sol".into()),
+                selected_route_key: Some("openai/gpt-6.1-sol/xhigh".into()),
+                selected_variant: Some("xhigh".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .set_decision_outcome(
+                &previous,
+                &DecisionOutcomeUpdate {
+                    outcome: RouteOutcome::Interrupted,
+                    last_error: None,
+                    observed_at_ms: 1_000,
+                    failure_backoff: Default::default(),
+                    provider_outcome: Some(
+                        prefrontal_routing_core::route_state_store::ProviderOutcome {
+                            account_ref: "00000000-0000-4000-8000-0000000000a4".into(),
+                            credential_id: Some("chatgpt:openai:live".into()),
+                            resets_at_ms: Some(i64::MAX),
+                            credential_refusal: None,
+                        },
+                    ),
+                },
             )
             .unwrap();
-        assert_eq!(
-            store
-                .provider_reset_fences("mason", now_ms() as i64)
-                .unwrap()
-                .len(),
-            1
-        );
         let (result, _) = host_run_broca_select(
             &store,
             &live_openai_vault(),
@@ -13627,8 +14463,8 @@ mod tests {
         assert_eq!(result["runner"]["variant"], "xhigh", "{result}");
         assert_eq!(
             result["runner"]["auth"],
-            json!({"method": "chatgpt"}),
-            "the fence moves the launch to another ChatGPT login, never to an API key: {result}"
+            serde_json::Value::Null,
+            "a provider reset must not inject a credential pin: {result}"
         );
     }
 
@@ -13694,7 +14530,7 @@ mod tests {
         );
         assert_eq!(
             confined["runner"],
-            json!({"provider": "anthropic", "model": "claude-opus-5-5"})
+            json!({"provider": "anthropic", "model": "claude-opus-5-5", "module":"broca", "route":{"provider":"anthropic", "model":"claude-opus-5-5"}})
         );
         assert!(
             explanation.contains("confined to the caller's 4 listed models: 1 reachable"),
@@ -13732,10 +14568,14 @@ mod tests {
             let store = Arc::clone(&store);
             let broca_credentials = Arc::clone(&broca_credentials);
             async move {
+                let mut request = broca_select_request(&["hostonly/m-old"], substrate);
+                if substrate.is_none() {
+                    request["params"]["executor"] = serde_json::Value::Null;
+                }
                 let response = run_route_wire_request_with_paths(
                     &store,
-                    broca_select_request(&["hostonly/m-old"], substrate),
-                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                    request,
+                    &test_operator_config(),
                     &broca_credentials,
                 )
                 .await;
@@ -13768,11 +14608,10 @@ mod tests {
         );
     }
 
-    /// With Broca's reach unknown the selection still routes, over every route the catalog serves, and the
-    /// recorded decision says the availability was unknown; a route the catalog
-    /// has withdrawn stays out, because nothing serves it.
+    /// A catalog row alone cannot authorize a vault-backed run. Unknown runner
+    /// reach does not supply a credential, and withdrawn rows stay unavailable.
     #[tokio::test]
-    async fn a_broca_route_select_with_unknown_reach_routes_over_served_rows_and_says_so() {
+    async fn a_broca_route_select_with_unknown_reach_refuses_routes_without_credentials() {
         let rig = Rig::new("select-substrate-unknown");
         let store = Arc::new(rig.open_store());
         rusqlite::Connection::open(rig.dir.join("store.db"))
@@ -13796,26 +14635,22 @@ mod tests {
         let response = run_route_wire_request_with_paths(
             &store,
             broca_select_request(&[], Some("broca")),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
             &empty_broca_credentials(),
         )
         .await;
-        assert_eq!(response.header.ty, FrameType::Response);
-        let result =
-            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"].clone();
-        let available: Vec<&str> = result["resolvedInput"]["availableModels"]
-            .as_array()
-            .expect("an unknown reach still routes")
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect();
-        assert!(
-            available.is_empty(),
-            "Broca-served routes never enter the caller's resolved list: {available:?}"
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response.header.ty, FrameType::Error, "{body}");
+        assert_eq!(body["code"], "no_available_model");
+        let rejected = body["rejected"].as_array().unwrap();
+        assert_eq!(
+            rejected
+                .iter()
+                .find(|row| row["routeKey"] == "livebroca/m-new")
+                .unwrap()["reason"],
+            "no_eligible_account"
         );
-        assert_eq!(result["selected"]["routeKey"], "livebroca/m-new");
-        assert!(decision_explanation(&store, &result)
-            .contains("broca reachability unknown: credential listing unavailable"));
+        assert!(body.get("result").is_none());
     }
 
     #[tokio::test]
@@ -14054,10 +14889,9 @@ mod tests {
             &quota_cache,
             &store,
             &Arc::new(Mutex::new(None)),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
+            &test_operator_config(),
             &empty_broca_credentials(),
-            &empty_opencode_auth(),
         )
         .await
         .unwrap();
@@ -14304,6 +15138,7 @@ mod tests {
             )
             .unwrap();
         let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        crate::test_config::write(&operator_config, "{}").unwrap();
         let catalog_store = Arc::clone(&store);
         config_overrides::attach_reasoning_catalog(
             &operator_config,
@@ -14397,16 +15232,20 @@ mod tests {
         store
             .upsert_fact(&fact("openai", "gpt-5.5"), FactSource::Override)
             .unwrap();
-        let frame = run_route_wire_request(
+        let frame = run_route_wire_request_with_paths(
             &store,
             json!({"method":"route.select","params":{
                 "targetAgent":"mason", "requestedRequirements":{"iq":72,"eq":0},
                 "availableModels":[], "modelPin":"openai/gpt-5.5:high"
             }}),
+            &test_operator_config(),
+            &empty_broca_credentials(),
         )
         .await;
         let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["code"], "pinned_route_refused", "{body}");
+        assert_eq!(body["detail"]["reason"], "no_eligible_account", "{body}");
+        assert_eq!(body["detail"]["credentialIds"], json!([]), "{body}");
         assert!(body["message"]
             .as_str()
             .unwrap()
@@ -14414,24 +15253,26 @@ mod tests {
         assert!(body.get("result").is_none());
     }
 
-    /// The routing file for the paid Anthropic API key: a provider whose rows are
-    /// borrowed from `anthropic` and which `exclude.all` keeps out of automatic
-    /// choice. Naming one of its models still admits it.
+    /// The routing file for the paid Anthropic API key: a provider with no
+    /// catalog rows, which borrows `anthropic`'s rows through its keys' `serves`
+    /// vendor and which `exclude.all` keeps out of automatic choice. Naming one
+    /// of its models still admits it.
     fn platform_operator_config(rig: &Rig) -> PathBuf {
         let path = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{ "model_routing": {
-                "exclude": { "all": ["anthropic-platform"] },
-                "score_alias": { "anthropic-platform": "anthropic" }
+                "exclude": { "all": ["anthropic-platform"] }
             } }"#,
         )
         .unwrap();
         path
     }
 
-    /// A vault listing whose rows map `provider_ids` as given. `account_id` is
-    /// the key's workspace, deliberately different from the id's label.
+    /// A vault listing whose rows map `provider_ids` as given. Each row serves
+    /// the vendor its id names (`apikey:anthropic:work` serves `anthropic`), as
+    /// the vault lists them. `account_id` is the key's workspace, deliberately
+    /// different from the id's label.
     fn platform_listing(rows: &[(&str, &[&str])]) -> SharedBrocaCredentials {
         let credentials = empty_broca_credentials();
         credentials.lock().unwrap().apply_listing(
@@ -14442,6 +15283,16 @@ mod tests {
                         |(id, providers)| cortexkit_claustrum_client::ListedCredential {
                             id: (*id).into(),
                             categories: vec!["llm-provider".into()],
+                            auth_method: Some(
+                                if id.starts_with("apikey:") {
+                                    "apikey"
+                                } else if id.starts_with("chatgpt:") {
+                                    "chatgpt"
+                                } else {
+                                    "oauth"
+                                }
+                                .into(),
+                            ),
                             credential_type: if id.starts_with("apikey:") {
                                 "apikey"
                             } else {
@@ -14450,6 +15301,12 @@ mod tests {
                             .into(),
                             state: "active".into(),
                             provider_ids: providers.iter().map(|p| (*p).into()).collect(),
+                            serves: id
+                                .split(':')
+                                .nth(1)
+                                .map(str::to_string)
+                                .into_iter()
+                                .collect(),
                             account_id: Some("workspace-7".into()),
                             ..Default::default()
                         },
@@ -14629,7 +15486,8 @@ mod tests {
             body["result"]["runner"],
             json!({"provider": "anthropic", "model": "claude-opus-4-1",
                    "auth": {"method": "apikey", "account": "work"},
-                   "pool": "anthropic-platform", "pool_session": session}),
+                   "pool": "anthropic-platform", "pool_session": session,
+                   "module":"broca", "route":{"provider":"anthropic-platform", "model":"claude-opus-4-1"}}),
             "{body}"
         );
         assert_eq!(
@@ -14767,8 +15625,7 @@ mod tests {
             store.upsert_fact(&row, FactSource::Override).unwrap();
         }
         let config = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(&config, json!({"model_routing": {
-            "score_alias": {"anthropic-platform": "anthropic"},
+        crate::test_config::write(&config, json!({"model_routing": {
             "exclude": {"all": ["anthropic/claude-opus-5-5", "anthropic-platform/claude-sonnet-fallback"]},
             "panels": {"audit": {"topK": 2, "extra": 0, "by": "iq"}}
         }}).to_string()).unwrap();
@@ -14803,7 +15660,6 @@ mod tests {
                     &config,
                     &config,
                     &credentials,
-                    &empty_opencode_auth(),
                 )
                 .await
                 .unwrap();
@@ -14881,6 +15737,160 @@ mod tests {
                 .is_some(),
             "{unfilled}"
         );
+    }
+
+    /// A provider with no catalog rows of its own, shaped like the paid
+    /// Anthropic keys, resolves through its keys' `serves` vendor: it gets
+    /// that catalog provider's scores and prices, a pin on it is admitted and
+    /// its keys are leased. A provider whose keys serve two catalog vendors
+    /// resolves to neither: it has no rows, so no scores, no prices, no
+    /// selection and no lease. No routing config names either mapping.
+    #[tokio::test]
+    async fn a_provider_without_catalog_rows_borrows_through_its_keys_serves_vendor() {
+        let row = |id: &str, provider: &str, serves: &[&str]| {
+            cortexkit_claustrum_client::ListedCredential {
+                id: id.into(),
+                categories: vec!["llm-provider".into()],
+                credential_type: "apikey".into(),
+                auth_method: Some("apikey".into()),
+                state: "active".into(),
+                provider_ids: vec![provider.into()],
+                serves: serves.iter().map(|vendor| (*vendor).into()).collect(),
+                account_id: Some("workspace-7".into()),
+                ..Default::default()
+            }
+        };
+        let credentials = empty_broca_credentials();
+        credentials.lock().unwrap().apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                credentials: vec![
+                    row(
+                        "apikey:anthropic:work",
+                        "anthropic-platform",
+                        &["anthropic"],
+                    ),
+                    row(
+                        "apikey:anthropic:mixed",
+                        "mixed-keys",
+                        &["anthropic", "openai"],
+                    ),
+                ],
+                view: "catalogless-view".into(),
+                ..Default::default()
+            },
+            now_ms(),
+        );
+        let rig = Rig::new("catalogless-provider");
+        let store: SharedStore = Arc::new(rig.open_store());
+        for (provider, model) in [("anthropic", "claude-opus-4-1"), ("openai", "gpt-5.5")] {
+            store
+                .upsert_fact(&fact(provider, model), FactSource::Override)
+                .unwrap();
+        }
+        let facts = store.get_facts().unwrap();
+        assert!(
+            !facts
+                .iter()
+                .any(|fact| fact.provider_id == "anthropic-platform"
+                    || fact.provider_id == "mixed-keys"),
+            "neither provider has catalog rows of its own"
+        );
+
+        let resolution = credentials.lock().unwrap().catalog_resolution(&facts);
+        assert_eq!(
+            resolution.targets,
+            std::collections::BTreeMap::from([(
+                "anthropic-platform".to_string(),
+                "anthropic".to_string()
+            )])
+        );
+        assert_eq!(resolution.unresolved["mixed-keys"], ["anthropic", "openai"]);
+
+        // Scores: the borrowed row carries the catalog row's; the ambiguous
+        // provider gets no row at all.
+        let mut rows = facts.clone();
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut rows, &resolution.targets);
+        let find = |rows: &[ModelFact], provider: &str| {
+            rows.iter()
+                .find(|fact| fact.provider_id == provider && fact.model_id == "claude-opus-4-1")
+                .cloned()
+        };
+        let source = find(&rows, "anthropic").unwrap();
+        let borrowed = find(&rows, "anthropic-platform").expect("a borrowed row");
+        assert_eq!(borrowed.scores, source.scores);
+        assert!(!rows.iter().any(|fact| fact.provider_id == "mixed-keys"));
+
+        // Prices: the catalog provider's rates, under the key's own method.
+        {
+            let mut guard = credentials.lock().unwrap();
+            guard.refresh_serving_methods(
+                &account_quota::AccountQuotaState::default(),
+                &facts,
+                now_ms() as i64,
+                &[],
+            );
+            guard.publish_billing_catalog(
+                crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
+            );
+            guard.price_facts(&mut rows, &prefrontal_routing_core::RoutePricing::default());
+        }
+        let plane = find(&rows, "anthropic-platform")
+            .unwrap()
+            .billing_plane
+            .expect("the borrowed row is priced");
+        assert_eq!(
+            (plane.provider_id.as_str(), plane.auth_method.as_str()),
+            ("anthropic", "apikey")
+        );
+        assert!(!plane.rates.is_empty(), "{plane:?}");
+
+        let config = platform_operator_config(&rig);
+        let call = |method: &'static str, params: serde_json::Value| {
+            let store = Arc::clone(&store);
+            let credentials = credentials.clone();
+            let config = config.clone();
+            async move {
+                let frame = run_route_wire_request_with_paths(
+                    &store,
+                    json!({"method": method, "params": params}),
+                    &config,
+                    &credentials,
+                )
+                .await;
+                serde_json::from_slice::<serde_json::Value>(&frame.body).unwrap()
+            }
+        };
+        let pin = |route: &str| {
+            json!({"targetAgent": "mason", "requestedRequirements": {"iq": 30, "eq": 0},
+                   "substrate": "broca", "modelPin": route, "taskId": "catalogless"})
+        };
+        let resolved = call(ROUTE_SELECT_OP, pin("anthropic-platform/claude-opus-4-1")).await;
+        assert_eq!(
+            resolved["result"]["selected"]["routeKey"], "anthropic-platform/claude-opus-4-1",
+            "{resolved}"
+        );
+        assert_eq!(
+            resolved["result"]["poolLease"]["credentialId"], "apikey:anthropic:work",
+            "{resolved}"
+        );
+        let ambiguous = call(ROUTE_SELECT_OP, pin("mixed-keys/claude-opus-4-1")).await;
+        assert!(ambiguous.get("result").is_none(), "{ambiguous}");
+
+        let lease = call(
+            "route.pool_acquire",
+            json!({"provider": "anthropic-platform", "model": "claude-opus-4-1", "session": "ses-a"}),
+        )
+        .await;
+        assert_eq!(
+            lease["result"]["credentialId"], "apikey:anthropic:work",
+            "{lease}"
+        );
+        let refused = call(
+            "route.pool_acquire",
+            json!({"provider": "mixed-keys", "model": "claude-opus-4-1", "session": "ses-b"}),
+        )
+        .await;
+        assert_eq!(refused["code"], key_pool::NOT_A_POOL_PROVIDER, "{refused}");
     }
 
     #[tokio::test]
@@ -15467,6 +16477,7 @@ mod tests {
                     credential_type: "apikey".into(),
                     state: "active".into(),
                     provider_ids: vec!["anthropic-platform".into()],
+                    serves: vec!["anthropic".into()],
                     account_id: None,
                     ..Default::default()
                 }],
@@ -15511,6 +16522,16 @@ mod tests {
                         |(id, providers, account)| cortexkit_claustrum_client::ListedCredential {
                             id: (*id).into(),
                             categories: vec!["llm-provider".into()],
+                            auth_method: Some(
+                                if id.starts_with("apikey:") {
+                                    "apikey"
+                                } else if id.starts_with("chatgpt:") {
+                                    "chatgpt"
+                                } else {
+                                    "oauth"
+                                }
+                                .into(),
+                            ),
                             credential_type: if id.starts_with("apikey:") {
                                 "apikey"
                             } else {
@@ -15519,6 +16540,12 @@ mod tests {
                             .into(),
                             state: "active".into(),
                             provider_ids: providers.iter().map(|p| (*p).into()).collect(),
+                            serves: id
+                                .split(':')
+                                .nth(1)
+                                .map(str::to_string)
+                                .into_iter()
+                                .collect(),
                             account_id: account.map(str::to_string),
                             ..Default::default()
                         },
@@ -15829,7 +16856,7 @@ mod tests {
             &rig,
             saturation_select_params(None),
             &saturation_facts(),
-            &PathBuf::from("/nonexistent/prefrontal-routing.jsonc"),
+            &test_operator_config(),
         )
         .await;
         let next: serde_json::Value = serde_json::from_slice(&next.body).unwrap();
@@ -15889,7 +16916,7 @@ mod tests {
         for variant in [None, Some("thinking")] {
             let response = run_route_wire_request_with_paths(&store, json!({"method": ROUTE_MODEL_UPSERT_OP,
                 "params":{"providerID":"meta","modelID":"muse-wonder-1.0","variant":variant,"elo":1808,"eq":1600}
-            }), Path::new("/nonexistent/prefrontal-routing.jsonc"), &credentials).await;
+            }), &test_operator_config(), &credentials).await;
             assert_eq!(
                 response.header.ty,
                 FrameType::Response,
@@ -16220,7 +17247,7 @@ mod tests {
         }
         let credentials = Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(&[a, b])));
         let path = rig.dir.join("routing.jsonc");
-        std::fs::write(&path, "{}").unwrap();
+        crate::test_config::write(&path, "{}").unwrap();
         async fn select(
             store: &SharedStore,
             credentials: &SharedBrocaCredentials,
@@ -16252,7 +17279,6 @@ mod tests {
                 path,
                 path,
                 credentials,
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -16262,7 +17288,7 @@ mod tests {
         }
         let first = select(&store, &credentials, &path).await;
         assert_eq!(first["result"]["selected"]["routeKey"], "a/reader");
-        std::fs::write(
+        crate::test_config::write(
             &path,
             r#"{"model_routing":{"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#,
         )
@@ -16270,7 +17296,7 @@ mod tests {
         config_overrides::settle_live_config(&path);
         let cost_edit = select(&store, &credentials, &path).await;
         assert_eq!(cost_edit["result"]["selected"]["routeKey"], "b/reader");
-        std::fs::write(&path, r#"{"model_routing":{"exclude":{"all":["b"]},"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
+        crate::test_config::write(&path, r#"{"model_routing":{"exclude":{"all":["b"]},"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
         config_overrides::settle_live_config(&path);
         let fenced = select(&store, &credentials, &path).await;
         assert_eq!(fenced["result"]["selected"]["routeKey"], "a/reader");
@@ -16286,7 +17312,7 @@ mod tests {
             // The removed key is refused whole, so its exclusion is never applied.
             r#"{"model_routing":{"explicit_only_providers":["a"]}}"#,
         ] {
-            std::fs::write(&path, invalid).unwrap();
+            crate::test_config::write(&path, invalid).unwrap();
             let retained = config_overrides::settle_live_config(&path);
             assert!(
                 Arc::ptr_eq(&good, &retained),
@@ -16295,7 +17321,7 @@ mod tests {
             let selected = select(&store, &credentials, &path).await;
             assert_eq!(selected["result"]["selected"], fenced["result"]["selected"]);
         }
-        std::fs::write(&path, "{}").unwrap();
+        crate::test_config::write(&path, "{}").unwrap();
         config_overrides::settle_live_config(&path);
         let removed = select(&store, &credentials, &path).await;
         assert_eq!(removed["result"]["selected"]["routeKey"], "a/reader");
@@ -16345,9 +17371,8 @@ mod tests {
                 store,
                 &Arc::new(Mutex::new(None)),
                 config_path,
-                Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                &empty_broca_credentials(),
-                &empty_opencode_auth(),
+                &test_operator_config(),
+                &catalog_broca_credentials(store),
             )
             .await
             .unwrap();
@@ -16371,11 +17396,11 @@ mod tests {
         store.upsert_fact(&weak, FactSource::Override).unwrap();
         store.upsert_fact(&strong, FactSource::Override).unwrap();
         let config_path = rig.dir.join("prefrontal-routing.jsonc");
-        std::fs::write(&config_path, r#"{"model_routing":{}}"#).unwrap();
+        crate::test_config::write(&config_path, r#"{"model_routing":{}}"#).unwrap();
         let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
 
         assert_eq!(select(&store, &quota_cache, &config_path).await, "p/strong");
-        std::fs::write(
+        crate::test_config::write(
             &config_path,
             r#"{"model_routing":{"elo_overrides":{"p/weak":1900}}}"#,
         )
@@ -16807,6 +17832,7 @@ mod tests {
         select_model_route_with_config(
             SelectModelRouteInput {
                 target_agent: "mason".to_string(),
+                target_is_head: false,
                 requirements: resolved.requirements,
                 available_models: observation.available.iter().cloned().collect(),
                 facts: rig
@@ -17067,7 +18093,7 @@ mod tests {
         let mut watch = winner_ladder::ConfigReloadWatch::new(&rig.sources);
         assert_eq!(watch.check(rig.store.as_ref(), &rig.sources), None);
 
-        std::fs::write(
+        crate::test_config::write(
             &rig.sources.routing_config,
             serde_json::to_vec(&json!({
                 "model_routing": { "exclude": {"all": [rig.route("incumbent")]} }
@@ -17241,7 +18267,7 @@ mod tests {
             rig.route("incumbent"),
             json!({ "subscription_multiplier": 100 }),
         );
-        std::fs::write(
+        crate::test_config::write(
             &rig.sources.routing_config,
             serde_json::to_vec(&json!({ "model_routing": { "models": models } })).unwrap(),
         )
@@ -17355,7 +18381,6 @@ mod tests {
                 &rig.dir.join("routing.jsonc"),
                 &rig.dir.join("operator.jsonc"),
                 &empty_broca_credentials(),
-                &rig.dir.join("auth.json"),
                 &Arc::new(Mutex::new(CatalogReachHealth::new(600_000))),
             )
             .await
@@ -17583,13 +18608,8 @@ mod tests {
                 ),
             ] {
                 take_operator_warnings();
-                let reply = run_select_against_rig(
-                    &rig,
-                    params,
-                    &[],
-                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
-                )
-                .await;
+                let reply =
+                    run_select_against_rig(&rig, params, &[], &test_operator_config()).await;
                 let error = error_body(&reply);
                 if label == "unresolved requirements" {
                     assert_eq!(error.code, "invalid_requirements", "{}", error.message);
@@ -17621,11 +18641,12 @@ mod tests {
                 .upsert_fact(&fact("opencode-go", "m-native-fast"), FactSource::Override)
                 .unwrap();
             let broca_credentials = mapped_broca_credentials("opencode-go");
+            let operator_config = test_operator_config();
             let select = || {
                 run_route_wire_request_with_paths(
                     &store,
                     broca_select_request(&["opencode-go/m-native-fast"], Some("broca")),
-                    Path::new("/nonexistent/prefrontal-routing.jsonc"),
+                    &operator_config,
                     &broca_credentials,
                 )
             };

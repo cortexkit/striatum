@@ -922,7 +922,7 @@ fn general_windows(usage: Option<&Usage>) -> Vec<WindowView> {
     let Some(usage) = usage else {
         return Vec::new();
     };
-    prefrontal_routing_core::quota_extract::account_rate_windows(usage, None)
+    prefrontal_routing_core::quota_extract::account_rate_windows(usage, None, &[])
         .into_iter()
         .map(|(slot, window)| window_view(slot, &window))
         .collect()
@@ -1772,6 +1772,7 @@ pub async fn account_quota_loop(
     store: Arc<SqliteRouteStateStore>,
     resolver: Arc<dyn CredentialResolver>,
     broca_credentials: crate::broca_credentials::SharedBrocaCredentials,
+    routing_config_path: PathBuf,
 ) {
     use prefrontal_routing_core::RouteStateStore as _;
     let project_root =
@@ -1810,18 +1811,31 @@ pub async fn account_quota_loop(
             }
         }
 
+        // Readings that arrived since the last admission still end blocks and
+        // grow whole-account recovery sets.
+        // The state is copied first so no account lock is held while the
+        // store transaction is open.
+        let snapshot = state.lock().ok().map(|guard| guard.clone());
+        if let Some(snapshot) = snapshot {
+            if let Err(error) = crate::account_selection::refresh_all_blocks(
+                &store,
+                &snapshot,
+                &crate::config_overrides::live_config(&crate::config_overrides::config_path()),
+                now_ms(),
+            ) {
+                tracing::warn!(error = %error, "account blocks not refreshed");
+            }
+        }
+
         // Account selection and pricing must agree on the serving login. Build
         // the method map after both roster and readings have been refreshed.
         if let (Ok(guard), Ok(facts)) = (state.lock(), store.get_facts()) {
-            // Score aliases come from the same operator file selection reads; a
-            // config edit reaches serving methods on this loop's next pass.
-            let score_alias = crate::config_overrides::read_operator_routing_policy(
-                &crate::config_overrides::config_path(),
-            )
-            .score_alias;
+            // Providers with no catalog rows resolve from this listing and these
+            // rows inside the refresh, so pricing follows the vault.
+            let model_pools =
+                crate::config_overrides::live_config(&routing_config_path).quota_model_pools();
             if let Ok(mut credentials) = broca_credentials.lock() {
-                credentials.set_score_alias(score_alias);
-                credentials.refresh_serving_methods(&guard, &facts, now_ms());
+                credentials.refresh_serving_methods(&guard, &facts, now_ms(), &model_pools);
             }
         }
         crate::subscription_economics::refresh(

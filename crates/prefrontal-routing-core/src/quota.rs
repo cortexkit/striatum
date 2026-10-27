@@ -296,7 +296,9 @@ use std::collections::HashMap;
 
 use crate::model_facts::{make_capacity_key, ModelFact};
 use crate::model_router::ModelRouteStateSnapshot;
-use crate::quota_extract::{antigravity_pool_capacities, extract_windows, WindowScopeKind};
+use crate::quota_extract::{
+    antigravity_pool_capacities, extract_windows, ModelPool, WindowScopeKind,
+};
 use crate::quota_pace::{
     project_quota_abundance, project_quota_pressure, PaceConfig, PaceError, PaceInput,
     PaceWindowModel, DEFAULT_PACE_CONFIG,
@@ -450,6 +452,7 @@ pub fn merge_quota_overlay(
     snapshot: &mut ModelRouteStateSnapshot,
     windows: &[ProviderUsage],
     facts: &[ModelFact],
+    model_pools: &[ModelPool],
 ) {
     merge_quota_overlay_with(
         snapshot,
@@ -458,6 +461,7 @@ pub fn merge_quota_overlay(
         now_default(snapshot),
         &DEFAULT_PACE_CONFIG,
         DEFAULT_HARD_BLOCK_THRESHOLD,
+        model_pools,
     );
 }
 
@@ -476,25 +480,41 @@ pub struct QuotaRouteJoin<'a> {
 #[derive(Debug, Clone, Copy)]
 struct ExceptionalQuotaJoin {
     insula_provider: &'static str,
-    route_provider: &'static str,
     route_model_prefix: &'static str,
 }
 
-/// Insula deliberately omits `apiProvider` for Antigravity: its pools are Google
-/// Code Assist, not models.dev `google`. The consumer contract keys those pools
-/// by window `id`, never title: `gemini-*` serves `antigravity-gemini-*`, while
-/// `3p-*` serves Antigravity's Claude/GPT family. Extraction and pool routing keep
-/// those windows separate; this join is restricted to the Antigravity route family.
+/// Insula deliberately omits `apiProvider` for Antigravity: its pools are Code
+/// Assist pools, not the catalog vendor's own API. The consumer contract keys
+/// those pools by window `id`, never title: `gemini-*` serves
+/// `antigravity-gemini-*`, while `3p-*` serves Antigravity's Claude/GPT family.
+/// Extraction and pool routing keep those windows separate; this join is
+/// restricted to the Antigravity route family. Its route provider is read from
+/// the catalog: the one provider that serves models under the Antigravity
+/// prefix.
 const ANTIGRAVITY_QUOTA_JOIN: ExceptionalQuotaJoin = ExceptionalQuotaJoin {
     insula_provider: "antigravity",
-    route_provider: "google",
     route_model_prefix: "antigravity-",
 };
 
+/// The one catalog provider serving models whose ids start with `prefix`, or
+/// `None` when no provider or more than one does.
+fn sole_provider_serving_prefix<'a>(facts: &'a [ModelFact], prefix: &str) -> Option<&'a str> {
+    let mut providers = facts
+        .iter()
+        .filter(|fact| fact.model_id.starts_with(prefix))
+        .map(|fact| fact.provider_id.as_str());
+    let first = providers.next()?;
+    providers.all(|provider| provider == first).then_some(first)
+}
+
 /// Resolve one Insula entry to its route-provider namespace. Published slugs are
 /// authoritative; an absent slug is not guessed, except for Antigravity's
-/// separately identified Code Assist pools.
-pub fn quota_route_join(entry: &ProviderUsage) -> Option<QuotaRouteJoin<'_>> {
+/// separately identified Code Assist pools, joined to the catalog provider
+/// that serves the Antigravity route family.
+pub fn quota_route_join<'a>(
+    entry: &'a ProviderUsage,
+    facts: &'a [ModelFact],
+) -> Option<QuotaRouteJoin<'a>> {
     let antigravity = entry.provider == ANTIGRAVITY_QUOTA_JOIN.insula_provider;
     if let Some(provider_id) = entry
         .api_provider
@@ -506,8 +526,14 @@ pub fn quota_route_join(entry: &ProviderUsage) -> Option<QuotaRouteJoin<'_>> {
             antigravity_family_only: antigravity,
         });
     }
-    antigravity.then_some(QuotaRouteJoin {
-        provider_id: ANTIGRAVITY_QUOTA_JOIN.route_provider,
+    if !antigravity {
+        return None;
+    }
+    Some(QuotaRouteJoin {
+        provider_id: sole_provider_serving_prefix(
+            facts,
+            ANTIGRAVITY_QUOTA_JOIN.route_model_prefix,
+        )?,
         antigravity_family_only: true,
     })
 }
@@ -524,7 +550,7 @@ fn quota_join_matches_capacity(join: QuotaRouteJoin<'_>, capacity_key: &str) -> 
 /// The route capacities an entry can inform, including Antigravity's family-only
 /// restriction. Event persistence and live quota overlays use the same join.
 pub fn quota_capacity_keys(entry: &ProviderUsage, facts: &[ModelFact]) -> Vec<String> {
-    let Some(join) = quota_route_join(entry) else {
+    let Some(join) = quota_route_join(entry, facts) else {
         return Vec::new();
     };
     facts
@@ -544,6 +570,7 @@ pub fn merge_quota_overlay_with(
     now_ms: f64,
     pace_config: &PaceConfig,
     hard_block_threshold: f64,
+    model_pools: &[ModelPool],
 ) {
     // provider_id -> its capacity keys present in the catalog (for window scoping +
     // the antigravity per-model title match).
@@ -568,7 +595,7 @@ pub fn merge_quota_overlay_with(
         if !entry.is_healthy() {
             continue;
         }
-        let Some(join) = quota_route_join(entry) else {
+        let Some(join) = quota_route_join(entry, facts) else {
             continue;
         };
         let empty: Vec<String> = Vec::new();
@@ -585,7 +612,7 @@ pub fn merge_quota_overlay_with(
             Some(caps) => caps,
             None => &empty,
         };
-        let extracted = extract_windows(entry, join.provider_id, &entry.provider, provider_caps);
+        let extracted = extract_windows(entry, &entry.provider, provider_caps);
 
         let account_key = (
             join.provider_id.to_string(),
@@ -624,7 +651,7 @@ pub fn merge_quota_overlay_with(
                 WindowScopeKind::AntigravityPool => win
                     .applies_key
                     .as_deref()
-                    .map(|pool| antigravity_pool_capacities(pool, provider_caps))
+                    .map(|pool| antigravity_pool_capacities(pool, provider_caps, model_pools))
                     .unwrap_or_default(),
                 // ModelFamily/RouteKey are not emitted by the live extractors.
                 WindowScopeKind::ModelFamily | WindowScopeKind::RouteKey => {
@@ -787,6 +814,15 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::*;
+
+    /// The model-specific quota pools the config converter writes.
+    fn model_pools() -> Vec<ModelPool> {
+        let defaults: serde_json::Value = serde_json::from_str(include_str!(
+            "../../prefrontal-routing-module/data/config_convert_defaults.json"
+        ))
+        .unwrap();
+        serde_json::from_value(defaults["quota_model_pools"].clone()).unwrap()
+    }
     use crate::model_facts::{Confidence, ModelRequirements, ModelScores, ScoreProvenance};
     use crate::model_resolution::ACCOUNT_PRODUCER;
     use crate::model_router::{RouteRuntimeState, SelectModelRouteInput};
@@ -849,6 +885,7 @@ mod tests {
             NOW_MS,
             &DEFAULT_PACE_CONFIG,
             DEFAULT_HARD_BLOCK_THRESHOLD,
+            &model_pools(),
         );
         snapshot
     }
@@ -864,6 +901,7 @@ mod tests {
         crate::model_router::select_model_route_with_config(
             SelectModelRouteInput {
                 target_agent: "mason".into(),
+                target_is_head: false,
                 requirements: ModelRequirements { iq: 20.0, eq: 20.0 },
                 available_models,
                 facts,
@@ -1039,6 +1077,7 @@ mod tests {
             NOW_MS,
             &DEFAULT_PACE_CONFIG,
             DEFAULT_HARD_BLOCK_THRESHOLD,
+            &model_pools(),
         );
         snapshot
     }
@@ -1236,6 +1275,67 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_exhausted_argon_weekly_walls_argon_but_not_other_gemini() {
+        // A paid Pro account: Gemini pool free, separate Argon weekly limit spent.
+        let facts = vec![
+            fact("google", "antigravity-gemini-4-argon", 50.0),
+            fact("google", "antigravity-gemini-3.8-flash", 50.0),
+        ];
+        let argon_reset = "2030-01-06T00:00:00Z";
+        let pro = antigravity_account(
+            "pro",
+            &[
+                ("gemini-5h", 10.0, "2030-01-01T04:00:00Z"),
+                ("gemini-weekly", 20.0, "2030-01-05T00:00:00Z"),
+                ("gemini-argon-wtu-weekly", 100.0, argon_reset),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[pro.clone()], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_ARGON].quota_exhausted_until,
+            Some(ms(argon_reset)),
+            "the spent Argon weekly limit walls Argon"
+        );
+        assert_eq!(
+            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until, None,
+            "the Argon limit never walls another Gemini route"
+        );
+
+        // Argon still counts against the Gemini pool: a spent Gemini 5h window
+        // walls it even though its own Argon window is free.
+        let gemini_spent = antigravity_account(
+            "pro",
+            &[
+                ("gemini-5h", 100.0, "2030-01-01T01:00:00Z"),
+                ("gemini-argon-wtu-weekly", 5.0, argon_reset),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[gemini_spent], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_ARGON].quota_exhausted_until,
+            Some(ms("2030-01-01T01:00:00Z"))
+        );
+
+        // An Ultra account publishes no Argon window: the Gemini windows alone
+        // gate Argon there, and with them free the route stays open.
+        let ultra = antigravity_account(
+            "ultra",
+            &[
+                ("gemini-5h", 10.0, "2030-01-01T04:00:00Z"),
+                ("gemini-weekly", 20.0, "2030-01-05T00:00:00Z"),
+            ],
+        );
+        let snapshot = antigravity_overlay(&[ultra.clone()], &facts);
+        assert_eq!(snapshot.by_capacity[AG_ARGON].quota_exhausted_until, None);
+        assert!(snapshot.by_capacity[AG_ARGON].quota_pressure.is_some());
+        let snapshot = antigravity_overlay(&[pro, ultra], &facts);
+        assert_eq!(
+            snapshot.by_capacity[AG_ARGON].quota_exhausted_until, None,
+            "the Ultra account keeps Argon open beside a Pro account whose Argon limit is spent"
+        );
+    }
+
+    #[test]
     fn antigravity_pool_walls_only_when_every_account_is_walled() {
         let facts = antigravity_facts();
         // Live 2026-10-02: one account's 5h pool spent, the other's weekly spent.
@@ -1273,25 +1373,35 @@ mod tests {
         );
     }
 
+    // Replaces `antigravity_entry_without_extra_rate_windows_keeps_todays_behaviour`.
+    // Extraction used to dispatch on the `google` provider id, which extracted
+    // nothing from an Antigravity entry without extra windows. Windows are now
+    // read by the reading's shape: without extra windows, the entry is an
+    // aggregate reading, and its aggregate walls the routes the join reaches.
     #[test]
-    fn antigravity_entry_without_extra_rate_windows_keeps_todays_behaviour() {
+    fn an_antigravity_entry_without_extra_rate_windows_is_read_as_its_aggregate() {
         let facts = antigravity_facts();
-        // The misleading aggregate alone, as before pools were read.
+        let reset = "2030-01-01T01:00:00Z";
         let entry = usage(serde_json::json!({
             "provider": "antigravity",
             "account": "only",
             "usage": { "primary": {
                 "usedPercent": 100.0,
-                "resetsAt": "2030-01-01T01:00:00Z",
+                "resetsAt": reset,
                 "windowMinutes": 300
             }}
         }));
         let snapshot = antigravity_overlay(&[entry], &facts);
-        assert!(
-            snapshot.by_capacity.is_empty(),
-            "no extraRateWindows: no Antigravity signal at all, as before"
+        assert_eq!(
+            snapshot.by_capacity[AG_GEMINI].quota_exhausted_until,
+            Some(ms(reset)),
+            "the aggregate walls the Antigravity routes"
         );
-        assert_eq!(select(facts, snapshot), AG_GEMINI);
+        assert!(
+            !snapshot.by_capacity.contains_key(API_GEMINI),
+            "the join still reaches only the Antigravity route family"
+        );
+        assert_ne!(select(facts, snapshot), AG_GEMINI);
     }
 
     #[test]
@@ -1395,6 +1505,7 @@ mod tests {
             NOW_MS,
             &DEFAULT_PACE_CONFIG,
             DEFAULT_HARD_BLOCK_THRESHOLD,
+            &model_pools(),
         );
 
         let state = &snapshot.by_capacity["anthropic/claude"];

@@ -1,8 +1,10 @@
 //! Broca reachability from Claustrum's non-secret credential metadata.
 //!
-//! `serves` names model vendors; only the operator's `provider_ids` mapping
-//! names Fusiform providers. Older vaults omit the mapping and upgraded vaults
-//! initially emit empty mappings, so either shape requires a catalog fallback.
+//! `provider_ids` supplies explicit provider membership. When that mapping is
+//! empty, exactly one catalog provider named in `serves` supplies membership.
+//! A mapped provider with no catalog rows (`anthropic-platform`) borrows the
+//! rows of the one catalog provider its credentials' `serves` names; see
+//! [`BrocaCredentials::catalog_resolution`].
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -32,6 +34,9 @@ pub struct BrocaCredentials {
     unreadable: usize,
     last_error: Option<String>,
     listed: Vec<ListedCredential>,
+    catalog_providers: BTreeSet<String>,
+    pub(crate) runner_declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
+    pub(crate) wire_apis: BTreeMap<String, String>,
     serving: BTreeMap<String, ServingMethod>,
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
     subscription_plan_providers: Option<HashSet<String>>,
@@ -39,11 +44,12 @@ pub struct BrocaCredentials {
     pub(crate) catalog_snapshot: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
     pub(crate) catalog_wake: Arc<tokio::sync::Notify>,
     pub(crate) connection_file_path: Option<std::path::PathBuf>,
-    /// The operator's `model_routing.score_alias` as of the last refresh. An
-    /// aliased provider has no Fusiform plane of its own: its serving method is
-    /// read from the credentials mapped to the alias, and its rates from the
-    /// target provider's catalog under that method.
-    score_alias: std::collections::BTreeMap<String, String>,
+    /// The providers with no catalog rows that resolved to a catalog provider
+    /// at the last [`Self::refresh_serving_methods`], each with its catalog
+    /// provider. Such a provider has no Fusiform plane of its own: its serving
+    /// method is read from the credentials mapped to it, and its rates from the
+    /// catalog provider's plane under that method.
+    priced_targets: BTreeMap<String, String>,
     #[cfg(test)]
     pub(crate) legacy_pricing_baseline: bool,
 }
@@ -54,33 +60,43 @@ pub(crate) struct ServingMethod {
     pub reason: String,
 }
 
-pub(crate) fn credential_method(adapter: Option<&str>, credential_type: &str) -> String {
-    match adapter {
-        Some("openai" | "chatgpt") => "chatgpt",
-        Some("antigravity") => "antigravity",
-        Some("anthropic") => "oauth",
-        _ => credential_type,
+/// Explicit provider mappings win. Without them, infer membership only when
+/// exactly one provider named in `serves` is present in the catalog.
+pub(crate) fn credential_providers(
+    row: &ListedCredential,
+    catalog: &BTreeSet<String>,
+) -> Vec<String> {
+    if !row.provider_ids.is_empty() {
+        return row.provider_ids.clone();
     }
-    .to_string()
+    let vendors: BTreeSet<_> = row
+        .serves
+        .iter()
+        .filter(|vendor| catalog.contains(*vendor))
+        .collect();
+    if vendors.len() == 1 {
+        vendors.into_iter().cloned().collect()
+    } else {
+        Vec::new()
+    }
 }
 
-fn listed_method(row: &ListedCredential) -> String {
-    row.auth_method
-        .clone()
-        .unwrap_or_else(|| credential_method(row.refresh_adapter.as_deref(), &row.credential_type))
-}
-
-fn credential_serves_fact(row: &ListedCredential, fact: &ModelFact) -> bool {
+pub(crate) fn credential_serves_fact(
+    row: &ListedCredential,
+    fact: &ModelFact,
+    catalog: &BTreeSet<String>,
+) -> bool {
     row.state == "active"
         && row
             .categories
             .iter()
             .any(|category| category == "llm-provider")
-        && row.provider_ids.contains(&fact.provider_id)
-        && fact
-            .auth_methods
-            .as_ref()
-            .is_none_or(|allowed| allowed.contains(&listed_method(row)))
+        && credential_providers(row, catalog).contains(&fact.provider_id)
+        && fact.auth_methods.as_ref().is_none_or(|allowed| {
+            row.auth_method
+                .as_ref()
+                .is_some_and(|method| allowed.contains(method))
+        })
 }
 
 fn choose_method(roster: BTreeSet<String>, listed: BTreeSet<String>) -> ServingMethod {
@@ -162,6 +178,55 @@ pub(crate) async fn wait_for_billing_catalog(
 }
 
 impl BrocaCredentials {
+    pub(crate) fn listing_is_fresh(&self, now_ms: u64) -> bool {
+        self.view.is_some()
+            && self
+                .reached_at_ms
+                .is_some_and(|at| now_ms.saturating_sub(at) <= MAX_AGE_MS)
+    }
+
+    pub(crate) fn wire_api(&self, fact: &ModelFact) -> Option<&str> {
+        let provider = self
+            .priced_targets
+            .get(&fact.provider_id)
+            .unwrap_or(&fact.provider_id);
+        self.wire_apis
+            .get(&format!("{provider}/{}", fact.model_id))
+            .map(String::as_str)
+    }
+    /// The vault's listed facts, without deriving a credential kind from its id
+    /// or refresh adapter. Selection uses these facts to classify account coverage.
+    pub(crate) fn listed_credentials(&self) -> &[ListedCredential] {
+        &self.listed
+    }
+
+    pub(crate) fn listing_version(&self) -> Option<(&str, u64)> {
+        Some((self.view.as_deref()?, self.reached_at_ms?))
+    }
+
+    /// Reprices `fact` on the selected account class's method. `pricing` is the
+    /// selection's configuration, read as in [`Self::price_facts`]: a configured
+    /// subscription multiplier keeps list rates on an uncovered plan.
+    pub(crate) fn price_for_method(
+        &self,
+        fact: &mut ModelFact,
+        auth_method: &str,
+        pricing: &prefrontal_routing_core::RoutePricing,
+    ) {
+        let key = format!("{}/{}", fact.provider_id, fact.model_id);
+        let catalog_key =
+            prefrontal_routing_core::score_alias::catalog_key(&self.priced_targets, &key);
+        let multiplier_configured = pricing.subscription_multiplier(&key).is_some();
+        fact.billing_plane = Some(self.billing_catalog.for_route(
+            &catalog_key,
+            &ServingMethod {
+                auth_method: Some(auth_method.into()),
+                reason: "selected account class".into(),
+            },
+            multiplier_configured,
+        ));
+    }
+
     /// The vault listing of one credential, reduced to the fields that could
     /// change whether a provider entitles it: the provider ids it is mapped to,
     /// its plan tier and its state. `Unknown` until routing has read a listing.
@@ -199,18 +264,10 @@ impl BrocaCredentials {
         let serving = self.serving_method(fact).auth_method;
         self.listed
             .iter()
-            .filter(|row| credential_serves_fact(row, fact))
-            .filter(|row| {
-                // The listed method and the adapter-derived one can differ on
-                // older rows; either naming the serving method counts.
-                let methods = [
-                    listed_method(row),
-                    credential_method(row.refresh_adapter.as_deref(), &row.credential_type),
-                ];
-                match serving.as_deref() {
-                    Some(serving) => methods.iter().any(|method| method == serving),
-                    None => methods.iter().all(|method| method != "apikey"),
-                }
+            .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers))
+            .filter(|row| match serving.as_deref() {
+                Some(serving) => row.auth_method.as_deref() == Some(serving),
+                None => row.auth_method.as_deref() != Some("apikey"),
             })
             .map(|row| (row.id.clone(), row.account_id.clone()))
             .collect()
@@ -226,8 +283,8 @@ impl BrocaCredentials {
                 BTreeSet::new(),
                 self.listed
                     .iter()
-                    .filter(|row| credential_serves_fact(row, fact))
-                    .map(listed_method)
+                    .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers))
+                    .filter_map(|row| row.auth_method.clone())
                     .collect(),
             )
         })
@@ -267,6 +324,53 @@ impl BrocaCredentials {
     #[cfg(test)]
     pub(crate) fn api_test_credentials(facts: &[ModelFact]) -> Self {
         let mut credentials = Self::default();
+        if !facts.is_empty() {
+            credentials.apply_listing(
+                &ScopedCredentialListing {
+                    view: "test-catalog-credentials".into(),
+                    credentials: facts
+                        .iter()
+                        .map(|fact| {
+                            let method = fact
+                                .billing_plane
+                                .as_ref()
+                                .map(|plane| plane.auth_method.clone())
+                                .or_else(|| {
+                                    fact.auth_methods
+                                        .as_ref()
+                                        .and_then(|methods| methods.first().cloned())
+                                })
+                                .unwrap_or_else(|| "apikey".into());
+                            (
+                                (fact.provider_id.clone(), method.clone()),
+                                ListedCredential {
+                                    id: format!("catalog-credential-{}-{method}", fact.provider_id),
+                                    account_id: Some(format!(
+                                        "catalog-account-{}-{method}",
+                                        fact.provider_id
+                                    )),
+                                    state: "active".into(),
+                                    categories: vec!["llm-provider".into()],
+                                    provider_ids: vec![fact.provider_id.clone()],
+                                    credential_type: if method == "apikey" {
+                                        "apikey"
+                                    } else {
+                                        "oauth"
+                                    }
+                                    .into(),
+                                    auth_method: Some(method),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                        .into_values()
+                        .collect(),
+                    ..Default::default()
+                },
+                crate::now_ms(),
+            );
+        }
         credentials.serving = facts
             .iter()
             .map(|fact| {
@@ -316,12 +420,12 @@ impl BrocaCredentials {
                 continue;
             }
             self.active += 1;
-            if credential.provider_ids.is_empty() {
+            let providers = credential_providers(credential, &self.catalog_providers);
+            if providers.is_empty() {
                 self.unmapped += 1;
                 self.unmapped_ids.push(credential.id.clone());
             }
-            self.providers
-                .extend(credential.provider_ids.iter().cloned());
+            self.providers.extend(providers);
         }
         self.catalog_wake.notify_one();
         true
@@ -351,10 +455,9 @@ impl BrocaCredentials {
             {
                 continue;
             }
-            let method = credential_method(row.refresh_adapter.as_deref(), &row.credential_type);
-            if method.is_empty() {
+            let Some(method) = row.auth_method.as_ref().filter(|method| !method.is_empty()) else {
                 continue;
-            }
+            };
             for provider in &row.provider_ids {
                 methods_by_provider
                     .entry(provider)
@@ -379,10 +482,41 @@ impl BrocaCredentials {
             .collect()
     }
 
-    /// Replace the score aliases used for serving methods, Fusiform plane keys
-    /// and pricing. Takes effect for serving methods on the next refresh.
-    pub(crate) fn set_score_alias(&mut self, aliases: std::collections::BTreeMap<String, String>) {
-        self.score_alias = aliases;
+    /// Resolve every provider the listing maps credentials to but that has no
+    /// rows in `facts` (the stored catalog rows, before any borrowed rows are
+    /// appended): it borrows the rows of the one catalog provider that a
+    /// `serves` vendor of its active credentials names. With no such vendor,
+    /// or more than one, the provider stays unresolved and gets no rows, so it
+    /// has no scores and no prices and is never selected.
+    pub(crate) fn catalog_resolution(
+        &self,
+        facts: &[ModelFact],
+    ) -> prefrontal_routing_core::score_alias::CatalogResolution {
+        let catalog: BTreeSet<String> = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        prefrontal_routing_core::score_alias::resolve_catalog_targets(
+            &catalog,
+            self.listed
+                .iter()
+                .filter(|row| {
+                    row.state == "active"
+                        && row
+                            .categories
+                            .iter()
+                            .any(|category| category == "llm-provider")
+                })
+                .map(
+                    |row| prefrontal_routing_core::score_alias::CredentialVendors {
+                        provider_ids: &row.provider_ids,
+                        serves: &row.serves,
+                    },
+                ),
+        )
+    }
+
+    /// [`Self::catalog_resolution`]'s map from each resolved provider to the
+    /// catalog provider whose rows it borrows.
+    pub(crate) fn catalog_targets(&self, facts: &[ModelFact]) -> BTreeMap<String, String> {
+        self.catalog_resolution(facts).targets
     }
 
     pub(crate) fn refresh_serving_methods(
@@ -390,11 +524,30 @@ impl BrocaCredentials {
         state: &crate::account_quota::AccountQuotaState,
         facts: &[ModelFact],
         at_ms: i64,
+        model_pools: &[prefrontal_routing_core::quota_extract::ModelPool],
     ) {
-        // Aliased providers have no stored rows; serve them the borrowed rows
+        self.catalog_providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        self.providers.clear();
+        self.unmapped_ids.clear();
+        for row in self.listed.iter().filter(|row| {
+            row.state == "active"
+                && row
+                    .categories
+                    .iter()
+                    .any(|category| category == "llm-provider")
+        }) {
+            let providers = credential_providers(row, &self.catalog_providers);
+            if providers.is_empty() {
+                self.unmapped_ids.push(row.id.clone());
+            }
+            self.providers.extend(providers);
+        }
+        self.unmapped = self.unmapped_ids.len();
+        // Resolved providers have no stored rows; serve them the borrowed rows
         // selection will see so their credential method is known.
+        self.priced_targets = self.catalog_targets(facts);
         let mut facts = facts.to_vec();
-        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &self.score_alias);
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &self.priced_targets);
         self.serving = facts
             .iter()
             .map(|fact| {
@@ -403,6 +556,7 @@ impl BrocaCredentials {
                     &fact.provider_id,
                     &fact.model_id,
                     at_ms,
+                    model_pools,
                 );
                 let methods = roster
                     .iter()
@@ -412,31 +566,20 @@ impl BrocaCredentials {
                                 .listed
                                 .iter()
                                 .find(|row| row.id == record.credential_id);
-                            if fact.auth_methods.is_some() {
-                                // A quota identity match cannot make a credential eligible
-                                // if its provider mapping or the model's login policy excludes it.
-                                return listed
-                                    .filter(|row| credential_serves_fact(row, fact))
-                                    .map(listed_method);
-                            }
-                            Some(credential_method(
-                                Some(&account.refresh_adapter),
-                                listed.map_or("oauth", |row| row.credential_type.as_str()),
-                            ))
+                            // A quota identity cannot supply an absent vault auth method.
+                            listed
+                                .filter(|row| {
+                                    credential_serves_fact(row, fact, &self.catalog_providers)
+                                })
+                                .and_then(|row| row.auth_method.clone())
                         })
                     })
                     .collect();
                 let listed = self
                     .listed
                     .iter()
-                    .filter(|row| credential_serves_fact(row, fact))
-                    .map(|row| {
-                        if fact.auth_methods.is_some() {
-                            listed_method(row)
-                        } else {
-                            credential_method(row.refresh_adapter.as_deref(), &row.credential_type)
-                        }
-                    })
+                    .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers))
+                    .filter_map(|row| row.auth_method.clone())
                     .collect();
                 (
                     format!("{}/{}", fact.provider_id, fact.model_id),
@@ -451,12 +594,14 @@ impl BrocaCredentials {
             .serving
             .iter()
             .filter_map(|(key, method)| {
-                // An aliased provider is priced on its target's plane, the only
-                // one Fusiform knows, under the alias's own credential method.
+                // A resolved provider is priced on its catalog provider's plane,
+                // the only one Fusiform knows, under its own credential method.
                 let provider = key.split_once('/')?.0;
-                let provider =
-                    prefrontal_routing_core::score_alias::alias_target(&self.score_alias, provider)
-                        .unwrap_or(provider);
+                let provider = prefrontal_routing_core::score_alias::alias_target(
+                    &self.priced_targets,
+                    provider,
+                )
+                .unwrap_or(provider);
                 Some((provider.to_string(), method.auth_method.clone()?))
             })
             .collect();
@@ -478,11 +623,13 @@ impl BrocaCredentials {
                         continue;
                     }
                     let provider = prefrontal_routing_core::score_alias::alias_target(
-                        &self.score_alias,
+                        &self.priced_targets,
                         provider,
                     )
                     .unwrap_or(provider);
-                    keys.insert((provider.to_string(), listed_method(row)));
+                    if let Some(method) = &row.auth_method {
+                        keys.insert((provider.to_string(), method.clone()));
+                    }
                 }
             }
         }
@@ -509,7 +656,7 @@ impl BrocaCredentials {
             let key = format!("{}/{}", fact.provider_id, fact.model_id);
             let method = self.serving_method(fact);
             let catalog_key =
-                prefrontal_routing_core::score_alias::catalog_key(&self.score_alias, &key);
+                prefrontal_routing_core::score_alias::catalog_key(&self.priced_targets, &key);
             let multiplier_configured = pricing.subscription_multiplier(&key).is_some();
             fact.billing_plane = Some(self.billing_catalog.for_route(
                 &catalog_key,
@@ -585,18 +732,22 @@ impl BrocaCredentials {
     }
 
     fn fallback_reason(&self, now_ms: u64) -> Option<String> {
+        // The legacy shapes judge reach for the Broca runner from this listing.
+        let runner = crate::legacy_wire::BROCA;
         let Some(reached_at_ms) = self.reached_at_ms else {
-            return Some("broca reachability unknown: credential listing unavailable".into());
+            return Some(format!(
+                "{runner} reachability unknown: credential listing unavailable"
+            ));
         };
         if now_ms.saturating_sub(reached_at_ms) > MAX_AGE_MS {
-            return Some(
-                "broca reachability unknown: credential listing stale (over 15 minutes)".into(),
-            );
+            return Some(format!(
+                "{runner} reachability unknown: credential listing stale (over 15 minutes)"
+            ));
         }
         if self.providers.is_empty() {
-            return Some(
-                "broca reachability unknown: no credentials map to catalog providers".into(),
-            );
+            return Some(format!(
+                "{runner} reachability unknown: no credentials map to catalog providers"
+            ));
         }
         None
     }
@@ -606,7 +757,8 @@ impl BrocaCredentials {
         report.detail = self.fallback_reason(now_ms).or_else(|| {
             (self.unreadable > 0).then(|| {
                 format!(
-                    "broca reachability: {} unreadable credential rows skipped",
+                    "{} reachability: {} unreadable credential rows skipped",
+                    crate::legacy_wire::BROCA,
                     self.unreadable
                 )
             })
@@ -629,21 +781,21 @@ impl BrocaCredentials {
     /// Rows arrive already filtered for catalog withdrawals. When the vault
     /// listing is unknown, stale, or has no mapped providers, unrestricted models
     /// fall back to that served catalog, never the caller's host list. A fresh
-    /// listing with mapped providers instead uses the exact provider-id join.
+    /// listing also resolves membership through uniquely matching `serves` vendors.
     /// Restricted models cannot use the catalog fallback: an active credential
-    /// in a fresh listing must map the provider and satisfy the login allowlist.
+    /// in a fresh listing must join the provider and satisfy the login allowlist.
     pub fn served_routes(&self, facts: &[ModelFact], now_ms: u64) -> (Vec<String>, Option<String>) {
         let fallback = self.fallback_reason(now_ms);
+        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
         let routes = facts
             .iter()
-            .filter(|fact| fallback.is_some() || self.providers.contains(&fact.provider_id))
             .filter(|fact| {
-                fact.auth_methods.is_none()
-                    || (fallback.is_none()
+                (fallback.is_some() && fact.auth_methods.is_none())
+                    || (self.listing_is_fresh(now_ms)
                         && self
                             .listed
                             .iter()
-                            .any(|row| credential_serves_fact(row, fact)))
+                            .any(|row| credential_serves_fact(row, fact, &catalog)))
             })
             .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
             .collect();
@@ -653,6 +805,29 @@ impl BrocaCredentials {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn listed_credentials_preserve_the_vault_type_without_adapter_inference() {
+        let mut credentials = super::BrocaCredentials::default();
+        credentials.apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                view: "type-facts".into(),
+                credentials: vec![cortexkit_claustrum_client::ListedCredential {
+                    id: "opaque-id".into(),
+                    credential_type: "apikey".into(),
+                    refresh_adapter: Some("chatgpt".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            1,
+        );
+        assert_eq!(
+            credentials.listed_credentials()[0].credential_type,
+            "apikey"
+        );
+        assert_eq!(credentials.listed_credentials()[0].id, "opaque-id");
+    }
+
     use super::*;
     use cortexkit_claustrum_client::{
         ClaustrumCredentialResolver, CredentialGetTarget, CredentialResolver,
@@ -689,21 +864,17 @@ mod tests {
 
     #[test]
     fn methods_come_from_metadata_never_credential_ids() {
-        assert_eq!(credential_method(Some("openai"), "oauth"), "chatgpt");
-        assert_eq!(credential_method(Some("anthropic"), "oauth"), "oauth");
-        assert_eq!(
-            credential_method(Some("antigravity"), "oauth"),
-            "antigravity"
-        );
-        assert_eq!(credential_method(None, "apikey"), "apikey");
         let mut row = credential("chatgpt:openai:misleading", &["openai"]);
         row.credential_type = "apikey".into();
+        row.auth_method = Some("apikey".into());
+        row.refresh_adapter = Some("chatgpt".into());
         let mut credentials = BrocaCredentials::default();
         credentials.apply_listing(&listing(vec![row]), 1);
         credentials.refresh_serving_methods(
             &crate::account_quota::AccountQuotaState::default(),
             &[crate::tests::fact("openai", "example")],
             1,
+            &[],
         );
         assert_eq!(
             credentials.serving["openai/example"].auth_method.as_deref(),
@@ -744,6 +915,7 @@ mod tests {
         let consumer = Some(crate::select_policy::Consumer::Codemode);
         let mut row = credential("oauth:misleading", &["mapped"]);
         row.credential_type = "apikey".into();
+        row.auth_method = Some("apikey".into());
         let mut cache = BrocaCredentials::default();
         cache.apply_listing(&listing(vec![row]), 1);
         cache.publish_plan_prices(&json!({"prices": []}));
@@ -785,15 +957,15 @@ mod tests {
 
     #[test]
     fn oauth_and_chatgpt_credentials_do_not_admit_metered_consumers() {
-        for (kind, adapter) in [
-            ("oauth", None),
-            ("chatgpt", None),
-            ("apikey", Some("openai")),
-            ("apikey", Some("anthropic")),
+        for (kind, method) in [
+            ("oauth", "oauth"),
+            ("chatgpt", "chatgpt"),
+            ("apikey", "chatgpt"),
+            ("apikey", "oauth"),
         ] {
             let mut row = credential("apikey:misleading", &["mapped"]);
             row.credential_type = kind.into();
-            row.refresh_adapter = adapter.map(str::to_owned);
+            row.auth_method = Some(method.into());
             let mut cache = BrocaCredentials::default();
             cache.apply_listing(&listing(vec![row]), 1);
             cache.publish_plan_prices(&json!({"prices": []}));
@@ -804,7 +976,7 @@ mod tests {
                 assert!(
                     admission_refusals(&cache, &[metered_fact()], consumer)
                         .contains_key("mapped/metered"),
-                    "{kind} / {adapter:?}"
+                    "{kind} / {method}"
                 );
             }
         }
@@ -896,6 +1068,7 @@ mod tests {
     fn vault_apikey_does_not_bypass_plan_membership_or_output_price_requirements() {
         let mut row = credential("opaque", &["mapped"]);
         row.credential_type = "apikey".into();
+        row.auth_method = Some("apikey".into());
         let mut cache = BrocaCredentials::default();
         cache.apply_listing(&listing(vec![row]), 1);
         let fact = metered_fact();
@@ -1200,8 +1373,11 @@ mod tests {
         let mut credentials = (0..19)
             .map(|index| credential(&format!("mapped-{index}"), &["anthropic"]))
             .collect::<Vec<_>>();
-        credentials.push(credential("apikey:typesafe", &[]));
-        credentials.push(credential("oauth:cursor", &[]));
+        for id in ["apikey:typesafe", "oauth:cursor"] {
+            let mut row = credential(id, &[]);
+            row.serves.clear();
+            credentials.push(row);
+        }
 
         let mut cache = BrocaCredentials::default();
         cache.apply_listing(&listing(credentials), crate::now_ms());

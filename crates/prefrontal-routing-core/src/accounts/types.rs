@@ -150,6 +150,11 @@ pub struct QuotaReading {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub general_windows: Option<Vec<QuotaWindow>>,
     pub scoped: ScopedList,
+    /// Every aggregate and named pool window of the account's whole reading,
+    /// before it was narrowed to the windows one model draws on. Blocks lift
+    /// from these. `None` means the reading's general windows are all there is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_windows: Option<Vec<super::pools::PoolWindowReading>>,
 }
 
 impl QuotaReading {
@@ -250,7 +255,8 @@ pub struct ConversationAffinity {
     pub lease_active: bool,
 }
 
-/// What a fence covers on its account.
+/// What a fence covered on its account before fences were keyed by pool.
+/// Stored rows still carry it; [`super::PoolKey::from`] gives its pool key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum FenceScope {
@@ -287,12 +293,20 @@ pub enum ConfirmationSource {
     RawHeader,
 }
 
-/// Confirmed exhaustion on one scope of one account. Only bound, confirmed
-/// evidence creates one (see `evidence::confirm_exhaustion`).
+/// A block: confirmed exhaustion of one quota pool of one account, or of the
+/// whole account. Only bound, confirmed evidence creates one (see
+/// `evidence::confirm_exhaustion`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fence {
     pub account_id: String,
-    pub scope: FenceScope,
+    /// The blocked pool; `None` when the exhaustion named no pool, which
+    /// blocks the whole account.
+    pub pool: Option<super::PoolKey>,
+    /// For a whole-account block: the pool keys a reading must report above
+    /// reserve before it lifts the block. Fixed at confirmation from the
+    /// account's latest fresh reading and stored with the block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_set: Vec<super::PoolKey>,
     /// Original observation time of the confirming evidence.
     pub observed_at_ms: EpochMs,
     /// A header reset. A Retry-After-derived time is never a reset: it is kept
@@ -300,6 +314,16 @@ pub struct Fence {
     pub reset: ResetTime,
     pub retry_hint_ms: Option<EpochMs>,
     pub source: ConfirmationSource,
+}
+
+impl Fence {
+    /// Whether this block restricts a request for `model` of `family` that
+    /// draws on `request_pool`. A whole-account block restricts every model.
+    pub fn applies_to(&self, model: &str, family: ModelFamily, request_pool: Option<&str>) -> bool {
+        self.pool
+            .as_ref()
+            .is_none_or(|key| key.applies_to(model, family, request_pool))
+    }
 }
 
 /// A per-principal refusal exclusion of one credential, recorded when a
@@ -408,6 +432,11 @@ pub struct AccountRequest {
     /// when an import is still permitted for this conversation.
     pub preferred_existing_account: Option<AccountRef>,
     pub hold_wait_max_s: u64,
+    /// The quota pool the requested model draws on, as the runner or the
+    /// reading names it. `None` means no pool is supplied or known for the
+    /// requested model, so every pool block in its scope applies.
+    #[serde(default)]
+    pub pool: Option<String>,
 }
 
 /// Maps a producer scope id plus window length to a model family.
@@ -429,6 +458,22 @@ pub struct ModelFamilyMapping {
 /// initial values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AllocatorPolicy {
+    #[serde(default)]
+    pub strategy: super::policy::AccountStrategy,
+    #[serde(default)]
+    pub fallback_first: bool,
+    #[serde(default)]
+    pub soft_quota_remaining_percent: Option<f64>,
+    #[serde(default)]
+    pub pool_floors: Vec<super::policy::PoolFloor>,
+    #[serde(default)]
+    pub spend_budget: Option<f64>,
+    #[serde(default)]
+    pub spend_budget_reset_at_ms: Option<EpochMs>,
+    #[serde(default = "default_paid_credits")]
+    pub paid_credits: bool,
+    #[serde(default = "default_max_hold_s")]
+    pub max_hold_s: u64,
     pub policy_version: u32,
     /// Reserve on the general 5h window, in percentage points (live sidecar value 1).
     pub reserve_five_hour: f64,
@@ -451,8 +496,13 @@ pub struct AllocatorPolicy {
     pub account_request_principals: Vec<String>,
     /// Tie-break order, before account UUID byte order.
     pub account_order: Vec<String>,
-    /// Longest confirmed-5h reset distance that still holds.
+    /// Longest distance to the blocking window's reset that still holds,
+    /// whatever kind of window blocks.
     pub short_hold_max_ms: i64,
+    /// When a block has no known reset and no Retry-After hint, the next
+    /// admission may try the account this long after confirmation.
+    #[serde(default = "default_unknown_reset_retry_ms")]
+    pub unknown_reset_retry_ms: i64,
     /// Readings younger than this are in the full band.
     pub full_band_ms: i64,
     /// Readings at least this old are in the excluded band.
@@ -473,15 +523,37 @@ pub struct AllocatorPolicy {
     pub pool_retry_fallback_s: u64,
     pub model_families: Vec<ModelFamilyMapping>,
     pub scope_ids: Vec<ScopeIdMapping>,
+    /// Pools that meter only some models (operator config
+    /// `quota_model_pools`). Not part of the published policy.
+    #[serde(skip)]
+    pub model_pools: Vec<crate::quota_extract::ModelPool>,
+}
+
+/// Six hours, the quota overlay's own re-probe horizon for a window with no
+/// reported reset.
+fn default_unknown_reset_retry_ms() -> i64 {
+    crate::quota::NO_RESET_REPROBE_HORIZON_MS as i64
+}
+
+fn default_max_hold_s() -> u64 {
+    900
+}
+
+fn default_paid_credits() -> bool {
+    true
 }
 
 impl Default for AllocatorPolicy {
     fn default() -> Self {
-        let family = |model: &str, family| ModelFamilyMapping {
-            model: model.to_string(),
-            family,
-        };
         Self {
+            strategy: super::policy::AccountStrategy::Sticky,
+            fallback_first: false,
+            soft_quota_remaining_percent: None,
+            pool_floors: Vec::new(),
+            spend_budget: None,
+            spend_budget_reset_at_ms: None,
+            paid_credits: default_paid_credits(),
+            max_hold_s: default_max_hold_s(),
             policy_version: 2,
             reserve_five_hour: 1.0,
             reserve_seven_day: 1.0,
@@ -494,6 +566,7 @@ impl Default for AllocatorPolicy {
             account_request_principals: Vec::new(),
             account_order: Vec::new(),
             short_hold_max_ms: 15 * 60_000,
+            unknown_reset_retry_ms: default_unknown_reset_retry_ms(),
             full_band_ms: 5 * 60_000,
             excluded_band_ms: 20 * 60_000,
             discounted_floor_factor: 0.25,
@@ -503,16 +576,10 @@ impl Default for AllocatorPolicy {
             quota_unknown_retry_s: 60,
             pool_retry_margin_s: 60,
             pool_retry_fallback_s: 300,
-            model_families: vec![
-                family("claude-fable-5", ModelFamily::Fable),
-                family("claude-fable-5[1m]", ModelFamily::Fable),
-                family("claude-fable-5-1", ModelFamily::Fable),
-                family("claude-fable-5-1[1m]", ModelFamily::Fable),
-                family("claude-mythos-5-1", ModelFamily::Mythos),
-                family("claude-mythos-5-1[1m]", ModelFamily::Mythos),
-                family("claude-opus-5-5", ModelFamily::Opus),
-                family("claude-opus-5-5[1m]", ModelFamily::Opus),
-            ],
+            // Which models draw on a model-scoped quota family is operator
+            // config (`accounts.model_families`); routing core names no model.
+            model_families: Vec::new(),
+            model_pools: Vec::new(),
             // Insula publishes the Fable window's id as upstream
             // `limits[].scope.model.id` when available, else the display name,
             // which today is `Fable`.

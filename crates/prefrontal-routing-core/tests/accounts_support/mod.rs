@@ -6,8 +6,9 @@
 use prefrontal_routing_core::accounts::{
     AccountRequest, AccountView, AdmissionDemand, AdmissionState, AllocatorPolicy, AllocatorState,
     CallerKind, CandidateRef, ConversationAffinity, ConversationKeySource, CredentialRecord,
-    EpochMs, Fence, FenceScope, GeneralWindow, ModelReach, ObservationSource, QuotaReading,
-    QuotaWindow, ResetTime, Roster, RunnerCandidates, ScopedList, ScopedWindow,
+    EpochMs, Fence, FenceScope, GeneralWindow, ModelFamily, ModelFamilyMapping, ModelReach,
+    ObservationSource, QuotaReading, QuotaWindow, ResetTime, Roster, RunnerCandidates, ScopedList,
+    ScopedWindow,
 };
 
 /// The golden fixtures' clock: 2026-09-29T12:00:00Z.
@@ -41,6 +42,7 @@ pub fn reading(five_used: f64, seven_used: f64) -> QuotaReading {
         seven_day: Some(window(seven_used, ResetTime::At(NOW + 72 * HOUR), 10_080)),
         general_windows: None,
         scoped: ScopedList::Missing,
+        pool_windows: None,
     }
 }
 
@@ -80,7 +82,29 @@ pub fn state(accounts: Vec<AccountView>) -> AllocatorState {
         principal_exclusions: Vec::new(),
         admissions: Vec::new(),
         operator_override: None,
-        policy: AllocatorPolicy::default(),
+        policy: policy(),
+    }
+}
+
+/// The default policy with the model-scoped quota families operator config
+/// carries (`accounts.model_families`, written by the config converter).
+pub fn policy() -> AllocatorPolicy {
+    let family = |model: &str, family| ModelFamilyMapping {
+        model: model.to_string(),
+        family,
+    };
+    AllocatorPolicy {
+        model_families: vec![
+            family("claude-fable-5", ModelFamily::Fable),
+            family("claude-fable-5[1m]", ModelFamily::Fable),
+            family("claude-fable-5-1", ModelFamily::Fable),
+            family("claude-fable-5-1[1m]", ModelFamily::Fable),
+            family("claude-mythos-5-1", ModelFamily::Mythos),
+            family("claude-mythos-5-1[1m]", ModelFamily::Mythos),
+            family("claude-opus-5-5", ModelFamily::Opus),
+            family("claude-opus-5-5[1m]", ModelFamily::Opus),
+        ],
+        ..AllocatorPolicy::default()
     }
 }
 
@@ -100,6 +124,7 @@ pub fn request() -> AccountRequest {
         requested_account: None,
         preferred_existing_account: None,
         hold_wait_max_s: 900,
+        pool: None,
     }
 }
 
@@ -121,11 +146,15 @@ pub fn affinity(account: &str, model: &str, generation: u64) -> ConversationAffi
     }
 }
 
+/// A block keyed by the pool a pre-pool fence scope migrates to, confirmed at
+/// `NOW`. A reading observed at the same instant never lifts it, so the
+/// builders' readings (observed at `NOW` or earlier) leave it standing.
 pub fn fence(account: &str, scope: FenceScope, reset: ResetTime) -> Fence {
     Fence {
         account_id: account.into(),
-        scope,
-        observed_at_ms: NOW - MINUTE,
+        pool: Some(scope.into()),
+        recovery_set: Vec::new(),
+        observed_at_ms: NOW,
         reset,
         retry_hint_ms: None,
         source: prefrontal_routing_core::accounts::ConfirmationSource::BrocaAccountLimit,

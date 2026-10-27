@@ -96,10 +96,6 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "unexpired provider walls new routes inherit",
     ),
     (
-        "provider_reset_fences",
-        "provider-confirmed resets scoped to request class and serving identity",
-    ),
-    (
         "credential_entitlement_fences",
         "credentials a provider refused permanently (no entitlement, empty balance); \
          empty, routing selects them again and the next run repeats the refusal",
@@ -119,6 +115,16 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "client-visible retry answers within their window",
     ),
     ("account_fence", "confirmed account exhaustion fences"),
+    (
+        "account_eligibility",
+        "model/account eligibility facts retained until the credential listing changes; \
+         restoring them empty would repeat refusals already learned",
+    ),
+    (
+        "account_size_refusal",
+        "request-size restrictions retained until expiry or a later successful request; \
+         restoring them empty would repeat oversized requests already refused",
+    ),
     (
         "account_principal_exclusion",
         "scoped credential exclusions",

@@ -38,7 +38,7 @@ mod consumer_and_pin {
             let rig = Rig::new("consumer-and-pin");
             let store = Arc::new(rig.open_store());
             let path = rig.dir.join("routing.jsonc");
-            std::fs::write(&path, config.to_string()).unwrap();
+            crate::test_config::write(&path, config.to_string()).unwrap();
             for (provider, model, cost) in [("openai", "pin", 0.1), ("fallback", "safe", 10.0)] {
                 let mut fact = fact(provider, model);
                 fact.cost_per_m_tok_out = Some(cost);
@@ -92,6 +92,7 @@ mod consumer_and_pin {
         }
 
         async fn select_with_listing(&self, params: serde_json::Value, planes: &[prefrontal_routing_core::billing::BillingPlane], plan_prices: serde_json::Value, listing: Option<cortexkit_claustrum_client::ScopedCredentialListing>) -> serde_json::Value {
+            crate::tests::authorize_legacy_policy_fixture(&params, &self.path);
             let frame = Frame::build(
                 FrameType::Request,
                 Flags::new(false, Priority::Interactive, false),
@@ -110,6 +111,7 @@ mod consumer_and_pin {
             credentials.publish_plan_prices(&plan_prices);
             if let Some(listing) = listing {
                 credentials.apply_listing(&listing, now_ms());
+                credentials.refresh_serving_methods(&crate::account_quota::AccountQuotaState::default(), &facts, now_ms() as i64, &[]);
             }
             let credentials = Arc::new(Mutex::new(credentials));
             handle_select_request(
@@ -122,7 +124,6 @@ mod consumer_and_pin {
                 &self.path,
                 &self.path,
                 &credentials,
-                &empty_opencode_auth(),
             )
             .await
             .unwrap();
@@ -165,12 +166,14 @@ mod consumer_and_pin {
     async fn vault_apikey_admits_catalog_unknown_routes_for_automatic_and_pinned_metered_selection() {
         use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let rig = PolicyRig::new(json!({}));
+        crate::test_config::write(&rig.path, json!({"model_routing": {"substrates": {"all": {"default": "broca"}}}}).to_string()).unwrap();
         rig.set_auth_methods("openai", "pin", None);
         let listing = ScopedCredentialListing {
             view: "api-view".into(),
             credentials: vec![ListedCredential {
                 id: "opaque".into(),
                 credential_type: "apikey".into(),
+                auth_method: Some("apikey".into()),
                 state: "active".into(),
                 categories: vec!["llm-provider".into()],
                 provider_ids: vec!["openai".into()],
@@ -181,6 +184,7 @@ mod consumer_and_pin {
         for consumer in ["codemode", "flow"] {
             for pinned in [false, true] {
                 let mut params = rig.params();
+                params["executor"] = json!("broca");
                 params["consumer"] = json!(consumer);
                 params["availableModels"] = json!(["openai/pin"]);
                 if pinned {
@@ -194,7 +198,7 @@ mod consumer_and_pin {
     }
 
     #[tokio::test]
-    async fn codemode_prefers_metered_over_higher_scoring_subscription_but_mason_does_not() {
+    async fn codemode_is_metered_with_either_legacy_consumer_spelling_but_mason_uses_subscription() {
         let rig = PolicyRig::new(json!({}));
         let mut subscription = fact("openai", "pin");
         subscription.scores.elo = 90.0;
@@ -210,7 +214,7 @@ mod consumer_and_pin {
         params.as_object_mut().unwrap().remove("consumer");
         params["targetAgent"] = json!("codemode");
         let reply = rig.select_with_planes(params, &planes).await;
-        assert_eq!(reply["result"]["selected"]["capacityKey"], "openai/pin", "{reply}");
+        assert_eq!(reply["result"]["selected"]["capacityKey"], "fallback/safe", "{reply}");
     }
 
     #[tokio::test]
@@ -433,9 +437,9 @@ mod consumer_and_pin {
     }
 
     #[tokio::test]
-    async fn admitted_pin_bypasses_every_exclude_group_with_variant() {
+    async fn admitted_pin_bypasses_global_pin_only_policy_with_variant() {
         let rig = PolicyRig::new(json!({"model_routing": {
-            "exclude": {"all": ["openai"], "lab": ["openai/pin"]},
+            "exclude": {"all": ["openai"]},
         }}));
         let mut params = rig.params();
         params["pin"] = json!({"model": "openai/pin", "variant": "high"});
@@ -578,7 +582,7 @@ mod consumer_and_pin {
             first["result"]["selected"]["capacityKey"], "openai/pin",
             "{first}"
         );
-        std::fs::write(
+        crate::test_config::write(
             &rig.path,
             json!({"model_routing": {"pins": {
                 "lab_planner": {"model": "fallback/safe"}
@@ -689,11 +693,10 @@ mod consumer_and_pin {
         assert_eq!(rig.decisions(), 0);
     }
 
-    /// `exclude` keeps a route out of automatic choice only. For every group, an
-    /// unpinned request from the fenced consumer never gets the route, while a
-    /// launch that names it with `model=` is admitted.
+    /// Global exclusions convert to pin-only rules, while consumer restrictions
+    /// remain binding even when a launch names its model.
     #[tokio::test]
-    async fn launch_model_pin_admits_a_route_every_exclude_group_fences_from_automatic_choice() {
+    async fn launch_pin_bypasses_global_pin_only_but_not_consumer_restrictions() {
         for group in ["all", "mason", "sidekick", "athena", "lab", "core"] {
             let rig = PolicyRig::new(json!({"model_routing": {
                 "exclude": {group: ["openai"]},
@@ -718,12 +721,13 @@ mod consumer_and_pin {
                 );
                 params["modelPin"] = json!("openai/pin");
                 let pinned = rig.select(params).await;
-                assert_eq!(
-                    pinned["result"]["selected"]["capacityKey"], "openai/pin",
-                    "group={group} consumer={consumer}: {pinned}"
-                );
-                assert!(pinned.get("pin_rejected").is_none(), "{pinned}");
-                assert!(pinned["result"].get("pin_rejected").is_none(), "{pinned}");
+                if group == "all" {
+                    assert_eq!(pinned["result"]["selected"]["capacityKey"], "openai/pin", "{pinned}");
+                    assert!(pinned["result"].get("pin_rejected").is_none(), "{pinned}");
+                } else {
+                    assert_eq!(pinned["code"], "not_available", "{pinned}");
+                    assert!(pinned["result"]["selected"].is_null(), "{pinned}");
+                }
             }
         }
     }
@@ -1006,7 +1010,7 @@ mod consumer_and_pin {
     fn consumer_and_pin_shapes_refuse_unknown_values_and_mixed_pins() {
         for params in [
             json!({"consumer": "explore"}),
-            json!({"pin": {"slot": "synthesizer"}}),
+            json!({"pin": {"slot": "unknown-slot"}}),
             json!({"pin": {"slot": "lab_planner", "model": "openai/pin"}}),
             json!({"pin": {"model": "openai/pin", "extra": true}}),
             json!({"pin_fallback": "maybe"}),
@@ -1016,5 +1020,10 @@ mod consumer_and_pin {
                 "{params}"
             );
         }
+    }
+
+    #[test]
+    fn synthesizer_is_a_supported_request_slot() {
+        assert!(serde_json::from_value::<SelectParams>(json!({"pin": {"slot": "synthesizer"}})).is_ok());
     }
 }
