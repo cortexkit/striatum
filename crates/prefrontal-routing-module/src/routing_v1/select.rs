@@ -263,23 +263,27 @@ pub(super) async fn select(
     if capable.is_empty() && !reachable.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
-
-    // A key-pool provider's keys are leased per send (`route.pool_acquire`), and
-    // a v1 answer cannot yet name the leased key the way `runner.auth` will.
-    // Answering such a route would send the work with the wrong credential or
-    // none, so it is not a v1 candidate until the answer can carry its key.
-    let key_pool_only = capable
+    // A key-pool provider's keys are leased per send (`route.pool_acquire`),
+    // and a v1 answer cannot yet name the leased key the way `runner.auth`
+    // will. Answering such a route would send the work with the wrong
+    // credential or none, so it is not a v1 candidate until the answer can
+    // carry its key.
+    let key_pool_routes: Vec<&ModelFact> = capable
         .iter()
-        .all(|fact| key_pool::is_pool_provider(&catalog_targets, &fact.provider_id));
+        .copied()
+        .filter(|fact| key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))
+        .collect();
+    let key_pool_only = key_pool_routes.len() == capable.len();
     let capable: Vec<&ModelFact> = capable
         .into_iter()
         .filter(|fact| !key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))
         .collect();
     if capable.is_empty() {
-        if key_pool_only {
-            return Err(key_pool_route_refusal());
-        }
-        return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
+        return Err(if key_pool_only {
+            key_pool_route_refusal()
+        } else {
+            Refusal::no_route(NoRouteReason::MissingCapability, None)
+        });
     }
 
     let available: HashSet<String> = capable
