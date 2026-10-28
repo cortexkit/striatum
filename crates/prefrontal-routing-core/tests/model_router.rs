@@ -155,6 +155,7 @@ fn input<'a>(
         min_best_effort_adequacy: extra.min_best_effort_adequacy,
         prefer_prompt_cache: extra.prefer_prompt_cache,
         providers_without_prompt_cache: extra.providers_without_prompt_cache,
+        providers_without_cache_write_reports: HashSet::new(),
     }
 }
 

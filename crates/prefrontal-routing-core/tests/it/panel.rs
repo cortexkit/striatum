@@ -443,6 +443,7 @@ fn admission_is_shared_not_reimplemented() {
         min_best_effort_adequacy: None,
         prefer_prompt_cache: false,
         providers_without_prompt_cache: HashSet::new(),
+        providers_without_cache_write_reports: HashSet::new(),
     })
     .unwrap();
     assert_eq!(singular.route_key, "p/winner");

@@ -913,6 +913,7 @@ mod tests {
                 min_best_effort_adequacy: None,
                 prefer_prompt_cache: false,
                 providers_without_prompt_cache: HashSet::new(),
+                providers_without_cache_write_reports: HashSet::new(),
             },
             &crate::routing_config::ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION,
         )

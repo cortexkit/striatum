@@ -184,6 +184,8 @@ pub struct SelectModelRouteInput<'a> {
     /// Provider IDs that do not offer prompt caching, loaded by the routing
     /// module from its live configuration.
     pub providers_without_prompt_cache: HashSet<String>,
+    /// Empty by default; the usage-window profile refresh adds providers whose rows never report a cache-write counter.
+    pub providers_without_cache_write_reports: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -958,7 +960,10 @@ pub(crate) enum CostBasis<'v> {
         vector: &'v ClassVector,
         source: BasketVectorSource,
     },
-    TaskProfile(&'v TaskProfile),
+    TaskProfile {
+        profile: &'v TaskProfile,
+        omit_cache_write: bool,
+    },
 }
 
 /// The output-only ladder: effective output price, then tier, then the
@@ -1040,8 +1045,19 @@ pub(crate) fn compute_objective(
     basis: CostBasis<'_>,
     head: bool,
 ) -> (ObjectiveBreakdown, Vec<String>) {
-    if let CostBasis::TaskProfile(profile) = basis {
-        return compute_profile_objective(route, runtime, is_subscription, profile, head);
+    if let CostBasis::TaskProfile {
+        profile,
+        omit_cache_write,
+    } = basis
+    {
+        return compute_profile_objective(
+            route,
+            runtime,
+            is_subscription,
+            profile,
+            omit_cache_write,
+            head,
+        );
     }
     let mut notes: Vec<String> = Vec::new();
 
@@ -1128,7 +1144,7 @@ pub(crate) fn compute_objective(
     objective.price_unknown = match basis {
         CostBasis::Basket { vector, .. } => route.fact.basket_price(vector).cost.is_none(),
         CostBasis::OutputOnly => output_price_unknown(&route.fact),
-        CostBasis::TaskProfile(_) => unreachable!("task profiles were priced above"),
+        CostBasis::TaskProfile { .. } => unreachable!("task profiles were priced above"),
     };
     if is_subscription {
         if let Some(pool) = &runtime.subscription_pool {
@@ -1163,7 +1179,7 @@ pub(crate) fn compute_objective(
                         .basket_rate(crate::model_facts::BasketDimension::OutputExcludingReasoning),
                     crate::routing_config::COST_REFERENCE_PER_MTOK,
                 ),
-                CostBasis::TaskProfile(_) => unreachable!("task profiles were priced above"),
+                CostBasis::TaskProfile { .. } => unreachable!("task profiles were priced above"),
             };
             if let Some(list_usd) = list_usd {
                 if let Some(mut pricing) = pool.price(
@@ -1200,16 +1216,15 @@ pub(crate) fn compute_objective(
 fn profile_list_price(
     fact: &ModelFact,
     tokens: TokenVector,
+    omit_cache_write: bool,
 ) -> (Option<f64>, Vec<String>, Vec<String>) {
     let mut dollars = 0.0;
     let mut omitted = Vec::new();
     let mut unpriced = Vec::new();
     for dimension in BasketDimension::ALL {
-        // These providers never report cache writes. A transferred profile may
-        // contain them, but cannot establish consumption of an unreported counter.
-        if dimension == BasketDimension::CacheWrite
-            && matches!(fact.provider_id.as_str(), "meta" | "muse" | "opencode-go")
-        {
+        // A transferred profile may contain cache writes, but cannot establish
+        // consumption when the provider's usage window never reports that counter.
+        if dimension == BasketDimension::CacheWrite && omit_cache_write {
             omitted.push(dimension.as_str().to_string());
             continue;
         }
@@ -1239,10 +1254,11 @@ fn compute_profile_objective(
     runtime: &RouteRuntimeState,
     is_subscription: bool,
     profile: &TaskProfile,
+    omit_cache_write: bool,
     head: bool,
 ) -> (ObjectiveBreakdown, Vec<String>) {
     let (list_cost_usd, omitted_dimensions, unpriced_dimensions) =
-        profile_list_price(&route.fact, profile.tokens);
+        profile_list_price(&route.fact, profile.tokens, omit_cache_write);
     // The empty pool uses the same multiplier resolver and pressure=1 path as an account
     // snapshot with no economics, rather than restoring the legacy free bucket.
     let empty_pool = crate::subscription::SubscriptionPool::default();
@@ -1334,7 +1350,7 @@ fn record_cold_start_pricing(
             reasoning: vector.reasoning,
         }),
         CostBasis::OutputOnly => None,
-        CostBasis::TaskProfile(_) => unreachable!("only cold-start bases are recorded here"),
+        CostBasis::TaskProfile { .. } => unreachable!("only cold-start bases are recorded here"),
     };
     let list_cost_usd = if let Some(tokens) = tokens {
         tokens.list_cost(fact)
@@ -1860,7 +1876,12 @@ fn admit_and_price_shortlist(
             let is_sub =
                 subscription_route_covered(&a.route, input.is_subscription_route.as_deref());
             let basis = if use_profiles {
-                CostBasis::TaskProfile(&profiles[&a.route.route_key])
+                CostBasis::TaskProfile {
+                    profile: &profiles[&a.route.route_key],
+                    omit_cache_write: input
+                        .providers_without_cache_write_reports
+                        .contains(&a.route.provider_id),
+                }
             } else if use_basket {
                 let (vector, source) = route_basket_vector(&a.route.fact, fleet_vector)
                     .expect("the basket gate admitted only routes with a usable vector");
@@ -1873,10 +1894,10 @@ fn admit_and_price_shortlist(
                 match basis {
                     CostBasis::Basket { vector, .. } => Some(vector),
                     CostBasis::OutputOnly => a.route.fact.ephemeral_vector(),
-                    CostBasis::TaskProfile(_) => None,
+                    CostBasis::TaskProfile { .. } => None,
                 },
             );
-            let cached_read_term = if let CostBasis::TaskProfile(profile) = basis {
+            let cached_read_term = if let CostBasis::TaskProfile { profile, .. } = basis {
                 a.route
                     .fact
                     .basket_rate(BasketDimension::CachedRead)
@@ -2620,6 +2641,7 @@ mod task_profile_pricing_tests {
             min_best_effort_adequacy: None,
             prefer_prompt_cache: false,
             providers_without_prompt_cache: HashSet::new(),
+            providers_without_cache_write_reports: HashSet::new(),
         }
     }
 
@@ -2741,7 +2763,11 @@ mod task_profile_pricing_tests {
         muse_profile.own_weight = 0.0;
         muse_profile.tokens.cache_write = 1000000.0;
         let profiles = profiles(&facts, vec![muse_profile, profile(840000.0)]);
-        let selected = select(input(facts, true), &profiles);
+        let mut request = input(facts, true);
+        request
+            .providers_without_cache_write_reports
+            .insert(request.facts[0].provider_id.clone());
+        let selected = select(request, &profiles);
         let records: Vec<serde_json::Value> = selected
             .explanation
             .iter()
@@ -2795,7 +2821,10 @@ mod task_profile_pricing_tests {
             &route,
             &runtime,
             false,
-            CostBasis::TaskProfile(&profile(1000000.0)),
+            CostBasis::TaskProfile {
+                profile: &profile(1000000.0),
+                omit_cache_write: false,
+            },
             false,
         );
         let pricing = objective.task_pricing.unwrap();
@@ -2819,12 +2848,12 @@ mod task_profile_pricing_tests {
         let mut profile = profile(1000.0);
         profile.tokens.reasoning = 2000.0;
         profile.tokens.cache_write = 3000.0;
-        let (list, omitted, unpriced) = profile_list_price(&fact, profile.tokens);
+        let (list, omitted, unpriced) = profile_list_price(&fact, profile.tokens, false);
         close(list.unwrap(), 0.009);
         assert!(omitted.is_empty() && unpriced.is_empty());
         fact.cache_read_rate = None;
         profile.tokens.cached_read = 4000.0;
-        let (list, _, unpriced) = profile_list_price(&fact, profile.tokens);
+        let (list, _, unpriced) = profile_list_price(&fact, profile.tokens, false);
         assert!(list.is_none());
         assert_eq!(unpriced, vec!["cached_read"]);
     }
@@ -2893,7 +2922,10 @@ mod task_profile_pricing_tests {
                 &route,
                 &runtime,
                 true,
-                CostBasis::TaskProfile(&profile(840000.0)),
+                CostBasis::TaskProfile {
+                    profile: &profile(840000.0),
+                    omit_cache_write: false,
+                },
                 head,
             );
             let pricing = objective.task_pricing.as_ref().unwrap();
@@ -2981,18 +3013,37 @@ mod task_profile_pricing_tests {
     }
 
     #[test]
-    fn provider_unreported_dimensions_are_named_even_with_a_rate() {
-        for provider in ["meta", "opencode-go"] {
-            let fact = model(provider, "model");
-            let tokens = TokenVector {
+    fn cache_write_omission_is_driven_by_the_reporting_set() {
+        for unreported in [false, true] {
+            let fact = model("provider", "model");
+            let mut profile = profile(0.0);
+            profile.tokens = TokenVector {
                 cache_write: 1000000.0,
                 fresh_input: 1000.0,
                 ..Default::default()
             };
-            let (list, omitted, unpriced) = profile_list_price(&fact, tokens);
-            close(list.unwrap(), 0.001);
-            assert_eq!(omitted, vec!["cache_write"]);
-            assert!(unpriced.is_empty());
+            let profiles = profiles(std::slice::from_ref(&fact), vec![profile]);
+            let mut request = input(vec![fact], false);
+            if unreported {
+                request
+                    .providers_without_cache_write_reports
+                    .insert("provider".into());
+            }
+            let selected = select(request, &profiles);
+            let pricing = selected.score.objective.task_pricing.unwrap();
+            close(
+                pricing.list_cost_usd.unwrap(),
+                if unreported { 0.001 } else { 1.001 },
+            );
+            assert_eq!(
+                pricing.omitted_dimensions,
+                if unreported {
+                    vec!["cache_write"]
+                } else {
+                    vec![]
+                }
+            );
+            assert!(pricing.unpriced_dimensions.is_empty());
         }
     }
 }
@@ -3108,6 +3159,7 @@ mod abundance_tests {
                 min_best_effort_adequacy: None,
                 prefer_prompt_cache: options.prefer_prompt_cache,
                 providers_without_prompt_cache: options.providers_without_prompt_cache,
+                providers_without_cache_write_reports: HashSet::new(),
             },
             &crate::routing_config::ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION,
             options.slots.as_ref(),
@@ -3645,6 +3697,7 @@ mod availability_credential_tests {
             min_best_effort_adequacy: None,
             prefer_prompt_cache: false,
             providers_without_prompt_cache: HashSet::new(),
+            providers_without_cache_write_reports: HashSet::new(),
         })
         .unwrap_err();
         let accountless = result

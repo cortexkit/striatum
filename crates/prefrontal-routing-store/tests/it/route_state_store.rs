@@ -1659,6 +1659,7 @@ fn persisted_double_mirror_break_glass_clears_only_the_rejected_candidate() {
         min_best_effort_adequacy: None,
         prefer_prompt_cache: false,
         providers_without_prompt_cache: std::collections::HashSet::new(),
+        providers_without_cache_write_reports: std::collections::HashSet::new(),
     });
     assert_eq!(
         blocked.unwrap_err().reason,
@@ -1702,6 +1703,7 @@ fn persisted_double_mirror_break_glass_clears_only_the_rejected_candidate() {
         min_best_effort_adequacy: None,
         prefer_prompt_cache: false,
         providers_without_prompt_cache: std::collections::HashSet::new(),
+        providers_without_cache_write_reports: std::collections::HashSet::new(),
     })
     .expect("clearing both mirrors admits the candidate");
     assert_eq!(selected.route_key, route_key);
@@ -3942,6 +3944,7 @@ fn route_input<'a>(facts: Vec<ModelFact>) -> SelectModelRouteInput<'a> {
         min_best_effort_adequacy: None,
         prefer_prompt_cache: false,
         providers_without_prompt_cache: std::collections::HashSet::new(),
+        providers_without_cache_write_reports: std::collections::HashSet::new(),
     }
 }
 

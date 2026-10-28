@@ -3369,6 +3369,7 @@ mod multiplier_fallback_tests {
                 min_best_effort_adequacy: None,
                 prefer_prompt_cache: false,
                 providers_without_prompt_cache: Default::default(),
+                providers_without_cache_write_reports: Default::default(),
             },
         )
         .expect("a route is selected");
@@ -3410,6 +3411,7 @@ mod multiplier_fallback_tests {
                 min_best_effort_adequacy: None,
                 prefer_prompt_cache: false,
                 providers_without_prompt_cache: Default::default(),
+                providers_without_cache_write_reports: Default::default(),
             },
         )
         .expect("the sole adequate route stays selectable");

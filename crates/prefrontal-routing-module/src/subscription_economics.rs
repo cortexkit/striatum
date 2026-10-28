@@ -935,6 +935,7 @@ mod tests {
                 min_best_effort_adequacy: None,
                 prefer_prompt_cache: false,
                 providers_without_prompt_cache: Default::default(),
+                providers_without_cache_write_reports: Default::default(),
             },
             fixture,
         )
@@ -1221,6 +1222,7 @@ mod tests {
             min_best_effort_adequacy: None,
             prefer_prompt_cache: false,
             providers_without_prompt_cache: Default::default(),
+            providers_without_cache_write_reports: Default::default(),
         })
     }
 
