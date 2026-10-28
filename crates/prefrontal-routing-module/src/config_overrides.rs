@@ -704,6 +704,27 @@ impl LiveConfig {
         &self.pricing
     }
 
+    pub(crate) fn shadowed_operator_grades(
+        &self,
+        grades: &BTreeMap<String, prefrontal_routing_store::OperatorQuality>,
+    ) -> Vec<String> {
+        self.config
+            .model_routing
+            .elo_overrides
+            .keys()
+            .filter(|key| {
+                let (provider, model, _) = parse_model_key(key).expect("validated model key");
+                let provider = if provider == "anthropic-platform" {
+                    "anthropic"
+                } else {
+                    &provider
+                };
+                grades.contains_key(&format!("{provider}/{model}"))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn apply(&self, facts: &mut Vec<ModelFact>) -> SelectionOverrideOutcome {
         let section = &self.config.model_routing;
         for (key, model) in &section.models {
@@ -752,9 +773,20 @@ impl LiveConfig {
             let key = make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
             if let Some(model) = section.models.get(&key) {
                 let observed_speed = fact.scores.speed;
+                let quality = (fact.scores.elo, fact.scores.eq, fact.score_provenance);
+                let operator_grade = fact.eq_source.as_deref() == Some("operator_grade");
                 *fact = merge_override(fact, model);
-                if model.elo.is_some() && model.eq.is_some() {
-                    fact.score_provenance = ScoreProvenance::Override;
+                if operator_grade {
+                    (fact.scores.elo, fact.scores.eq, fact.score_provenance) = quality;
+                } else {
+                    if model.elo.is_some()
+                        && (quality.2 != ScoreProvenance::Unscored || model.eq.is_some())
+                    {
+                        fact.score_provenance = ScoreProvenance::EloOverride;
+                    }
+                    if model.eq.is_some() {
+                        fact.eq_source = Some("override".into());
+                    }
                 }
                 if let (Some(cost), Some(plane)) =
                     (model.cost_per_mtok_out, fact.billing_plane.as_mut())
@@ -772,6 +804,9 @@ impl LiveConfig {
             }
             if let Some(elo) = section.elo_overrides.get(&key) {
                 fact.scores.elo = *elo;
+                if fact.score_provenance != ScoreProvenance::Unscored {
+                    fact.score_provenance = ScoreProvenance::EloOverride;
+                }
             }
             fact.subscription_multiplier = section
                 .models

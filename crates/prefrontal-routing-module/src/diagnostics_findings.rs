@@ -77,6 +77,7 @@ const CHECK_CREDENTIAL_FENCES: &str = "credential_fences";
 const CHECK_ROUTE_BLOCKS: &str = "route_blocks";
 const CHECK_REFUSAL_RATE: &str = "refusal_rate";
 const CHECK_EMPTY_CANDIDATE_SETS: &str = "empty_candidate_sets";
+const CHECK_UNSCORED_ADMISSIBLE_MODEL: &str = "unscored_admissible_model";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +88,7 @@ struct Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Severity {
+    Info,
     Warning,
     Error,
 }
@@ -109,6 +111,7 @@ pub(crate) struct Finding {
 
 /// Everything the checks read, gathered from the store in one pass.
 pub(crate) struct Evidence {
+    pub unscored_admissible_models: Vec<prefrontal_routing_store::UnscoredAdmissibleModel>,
     pub fences: Vec<CredentialEntitlementFence>,
     pub route_walls: Vec<DiagnosticRouteWall>,
     pub holds: Vec<DiagnosticAccountHold>,
@@ -144,6 +147,9 @@ impl Evidence {
             decisions
         };
         Ok(Self {
+            unscored_admissible_models: store
+                .unscored_admissible_models(now_ms.saturating_sub(window_ms), now_ms)
+                .map_err(text)?,
             fences: store.credential_entitlement_fences().map_err(text)?,
             route_walls: store.diagnostic_route_walls(now_ms).map_err(text)?,
             holds: store.diagnostic_account_holds(now_ms).map_err(text)?,
@@ -171,12 +177,35 @@ pub(crate) fn report(evidence: &Evidence, now_ms: i64, window_ms: i64) -> Value 
     findings.extend(route_blocks(evidence, now_ms));
     findings.extend(refusal_rate(evidence));
     findings.extend(empty_candidate_sets(evidence));
+    findings.extend(
+        evidence
+            .unscored_admissible_models
+            .iter()
+            .map(|row| Finding {
+                check: CHECK_UNSCORED_ADMISSIBLE_MODEL,
+                key: row.model.clone(),
+                severity: Severity::Info,
+                count: 1,
+                first_seen_ms: row.first_seen_ms,
+                last_seen_ms: row.last_seen_ms,
+                summary: clip(
+                    &format!(
+                        "{} was admissible without a Fusiform operator grade",
+                        row.model
+                    ),
+                    MAX_SUMMARY_CHARS,
+                ),
+                samples: vec![json!({"model": row.model, "first_seen_ms": row.first_seen_ms})],
+                hint: format!("ask the operator to grade {} in Fusiform", row.model),
+            }),
+    );
     let check_rank = |check: &str| {
         [
             CHECK_CREDENTIAL_FENCES,
             CHECK_ROUTE_BLOCKS,
             CHECK_REFUSAL_RATE,
             CHECK_EMPTY_CANDIDATE_SETS,
+            CHECK_UNSCORED_ADMISSIBLE_MODEL,
         ]
         .iter()
         .position(|known| *known == check)
@@ -201,9 +230,12 @@ pub(crate) fn report(evidence: &Evidence, now_ms: i64, window_ms: i64) -> Value 
     let mut used = serde_json::to_vec(&envelope).map_or(0, |body| body.len());
     let mut kept = Vec::with_capacity(findings.len());
     for finding in findings {
-        let Ok(value) = serde_json::to_value(&finding) else {
+        let Ok(mut value) = serde_json::to_value(&finding) else {
             continue;
         };
+        if finding.check == CHECK_UNSCORED_ADMISSIBLE_MODEL {
+            value["model"] = json!(finding.key);
+        }
         let size = serde_json::to_vec(&value).map_or(usize::MAX, |body| body.len()) + 1;
         if used.saturating_add(size) >= MAX_REPLY_BYTES {
             break;
@@ -1013,6 +1045,21 @@ fn answer(body: &[u8], channel: u16, epoch: u32, store: &SharedStore) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unscored_admissible_model_vector_matches_bytes() {
+        let mut evidence = empty();
+        evidence.unscored_admissible_models.push(
+            prefrontal_routing_store::UnscoredAdmissibleModel {
+                model: "synthetic-lab/ungraded-model".into(),
+                first_seen_ms: 1_799_999_990_000,
+                last_seen_ms: 1_799_999_999_000,
+            },
+        );
+        let reply = json!({"result": report(&evidence, 1_800_000_000_000, 60_000)});
+        let mut bytes = serde_json::to_vec_pretty(&reply).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(bytes, include_bytes!("../../../test-vectors/diagnostics-findings-v1/reply-routing-unscored-admissible-model.json"));
+    }
     use super::*;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -1020,6 +1067,7 @@ mod tests {
 
     fn empty() -> Evidence {
         Evidence {
+            unscored_admissible_models: Vec::new(),
             fences: Vec::new(),
             route_walls: Vec::new(),
             holds: Vec::new(),

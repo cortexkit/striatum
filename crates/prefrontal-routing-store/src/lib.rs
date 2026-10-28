@@ -44,6 +44,8 @@ mod account_selection;
 #[cfg(feature = "test-support")]
 pub mod backup;
 mod diagnostics;
+mod operator_quality;
+pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod key_pool;
 mod reasoning_catalog;
 mod retention;
@@ -275,7 +277,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 67] {
+fn route_state_migrations() -> [Migration; 68] {
     [
         Migration {
             version: 1,
@@ -545,6 +547,10 @@ fn route_state_migrations() -> [Migration; 67] {
             version: 68,
             statements: MIGRATION_068,
         },
+        Migration {
+            version: 70,
+            statements: include_str!("../migrations/070_operator_quality.sql"),
+        },
     ]
 }
 
@@ -703,7 +709,8 @@ struct CatalogFingerprintRow {
 /// data, vision/tool capability flags, allowed login methods, published
 /// reasoning efforts, canonical model identity (it decides which score a route
 /// borrows), upstream status (a deprecated route is refused), prompt defaults,
-/// confidence, speed multiplier, and exclusion. Adding a routing-read column
+/// confidence, speed multiplier, and exclusion, plus Fusiform operator grades.
+/// Adding a routing-read column
 /// without extending this row is the defect this hash exists to catch. Query ordering—not insertion ordering—is the
 /// generation contract, so a no-op reseed or shuffled input cannot mint a different
 /// fingerprint for the same catalog.
@@ -760,13 +767,14 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    let bytes = serde_json::to_vec(&rows)
+    let grades = operator_quality::fingerprint_rows(connection)?;
+    let bytes = serde_json::to_vec(&(rows, grades))
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let hex = blake3::hash(&bytes).to_hex().to_string();
     Ok(hex[..16].to_string())
 }
 
-/// Count every `model_facts` write made through this connection, so a cached
+/// Count every `model_facts` or operator-grade write through this connection, so a cached
 /// catalog fingerprint can tell whether the catalog changed since it was
 /// computed. Returns `false` (and installs nothing) when the store has no
 /// `model_facts` table.
@@ -811,6 +819,19 @@ fn install_catalog_change_tracking(connection: &Connection) -> rusqlite::Result<
            UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1;
          END;",
     )?;
+    if operator_quality::has_quality_table(connection)? {
+        connection.execute_batch(
+            "CREATE TEMP TRIGGER IF NOT EXISTS catalog_quality_writes_on_insert
+             AFTER INSERT ON routing_operator_quality
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;
+             CREATE TEMP TRIGGER IF NOT EXISTS catalog_quality_writes_on_update
+             AFTER UPDATE ON routing_operator_quality
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;
+             CREATE TEMP TRIGGER IF NOT EXISTS catalog_quality_writes_on_delete
+             AFTER DELETE ON routing_operator_quality
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;",
+        )?;
+    }
     Ok(true)
 }
 
@@ -1455,6 +1476,7 @@ impl SqliteRouteStateStore {
             present.push(present_now);
         }
         self.share_canonical_scores(&mut facts, &canonical_ids);
+        self.overlay_operator_quality(&mut facts, &canonical_ids)?;
         Ok(facts.into_iter().zip(present).collect())
     }
 
@@ -2411,6 +2433,7 @@ impl SqliteRouteStateStore {
             .clone()
             .unwrap_or_else(|| format!("dec_{}", short_id()));
         let id_ret = id.clone();
+        let created_at = now_ms();
         let rejected_json = bound_rejected_json(&input.rejected_json);
         self.store
             .with_conn(|c: &Connection| {
@@ -2445,7 +2468,7 @@ impl SqliteRouteStateStore {
                         input.policy_revision,
                         input.anchor_version,
                         catalog_fingerprint,
-                        now_ms(),
+                        created_at,
                         selected_harness,
                         selected_workload,
                         input.consumer,
@@ -2455,6 +2478,7 @@ impl SqliteRouteStateStore {
                         input.allowed_account_class.as_str(),
                     ],
                 )?;
+                operator_quality::observe_decision(c, &input.score_json, created_at)?;
                 Ok(())
             })
             .map_err(err)?;
