@@ -51,7 +51,7 @@ WITH usage_totals AS (
                END) AS output_excluding_reasoning,
            SUM(CAST(reasoning_tokens AS REAL)) AS reasoning,
            MAX(observed_at) AS closed_at
-    FROM model_route_usage
+    FROM model_route_usage INDEXED BY model_route_usage_task_idx
     WHERE task_id IS NOT NULL AND task_workload IS NOT NULL
     GROUP BY task_workload, task_id
     HAVING MAX(observed_at) > ?1 AND MAX(observed_at) <= ?2
@@ -62,8 +62,8 @@ WITH usage_totals AS (
                PARTITION BY COALESCE(consumer, selected_workload, target_agent), task_id
                ORDER BY created_at, id
            ) AS ordinal
-    FROM model_route_decisions
-    WHERE task_id IS NOT NULL
+    FROM model_route_decisions INDEXED BY model_route_decisions_task_idx
+    WHERE task_id IN (SELECT task_id FROM usage_totals)
 ), model_counts AS (
     SELECT workload, task_id,
            MIN(selected_model_id) AS selected_model_id,
@@ -209,6 +209,52 @@ mod tests {
         store
             .record_usage_delivery_for_decision(&observation(id, at), decision)
             .unwrap();
+    }
+
+    #[test]
+    fn closed_task_usage_query_plan_reads_tagged_usage_and_probes_task_decisions() {
+        let store = store("task-query-plan");
+        decision(
+            &store,
+            "d",
+            Some("task"),
+            "mason",
+            ("sol", None),
+            45.0,
+            NOW - 3 * DAY_MS,
+        );
+        usage(&store, "u", "d", NOW - 2 * DAY_MS);
+        let details: Vec<String> = store
+            .store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {CLOSED_TASK_USAGE_SQL}"))?;
+                let rows =
+                    stmt.query_map(params![NOW - 30 * DAY_MS, NOW - DAY_MS], |row| row.get(3))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        let usage_accesses: Vec<_> = details
+            .iter()
+            .filter(|detail| detail.contains("model_route_usage"))
+            .collect();
+        assert!(
+            !usage_accesses.is_empty(),
+            "missing usage access: {details:?}"
+        );
+        assert!(
+            usage_accesses
+                .iter()
+                .all(|detail| detail.contains("USING INDEX model_route_usage_task_idx")),
+            "usage must read the partial task index, not scan the full table: {details:?}"
+        );
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains(
+                    "SEARCH model_route_decisions USING INDEX model_route_decisions_task_idx",
+                ) && detail.contains("task_id=?")
+            }),
+            "decisions must be probed by the closed cohort's task ids: {details:?}"
+        );
     }
 
     #[test]
