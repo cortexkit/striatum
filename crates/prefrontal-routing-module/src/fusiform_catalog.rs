@@ -280,11 +280,7 @@ enum CatalogRate {
     BilledAs {
         key: String,
     },
-    Unpriced {
-        #[serde(default)]
-        #[allow(dead_code)]
-        reason: Value,
-    },
+    Unpriced,
     #[serde(other)]
     Unknown,
 }
@@ -654,7 +650,7 @@ fn rate_cost(rate: Option<&CatalogRate>) -> OutputPrice {
         // A stated zero is a real price of zero; whether zero is "free" is
         // routing policy downstream, and it must not read as absent.
         CatalogRate::StatedZero | CatalogRate::NotBilled => OutputPrice::Known(0.0),
-        CatalogRate::Unpriced { .. } | CatalogRate::BilledAs { .. } | CatalogRate::Unknown => {
+        CatalogRate::Unpriced | CatalogRate::BilledAs { .. } | CatalogRate::Unknown => {
             OutputPrice::NotPublished
         }
     }
