@@ -185,7 +185,9 @@ async fn unscoped_caller_is_not_authorized() {
 }
 
 #[tokio::test]
-async fn fenced_class_is_not_authorized_without_a_reset_on_both_entrypoints() {
+async fn fenced_class_is_exhausted_without_a_reset_on_both_entrypoints() {
+    // A billing/entitlement fence is an account limit, not an auth problem:
+    // `account_pool_exhausted` without a reset when none is known.
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, credentials) = setup("synthetic", false);
     let shared = Arc::new(std::sync::Mutex::new(credentials));
@@ -205,8 +207,16 @@ async fn fenced_class_is_not_authorized_without_a_reset_on_both_entrypoints() {
         .call("route.account_for", &v1_request("synthetic", "fenced"))
         .await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
-    assert_eq!(refused.1["code"], "account_not_authorized", "{}", refused.1);
-    assert_eq!(refused.1["detail"], json!({}), "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+    assert_eq!(
+        refused.1["detail"]["reset_at_ms"],
+        json!(null),
+        "{}",
+        refused.1
+    );
+    let refusal: cortexkit_role_routing::errors::Refusal =
+        serde_json::from_value(refused.1.clone()).unwrap();
+    assert_eq!(refusal.wait_until_ms(), None);
 }
 
 #[tokio::test]
@@ -366,7 +376,7 @@ fn undeclared_legacy_codes_become_unavailable() {
 #[tokio::test]
 async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
     let _clock = crate::InjectedClock::set(NOW);
-    // Fenced without a reset: both entrypoints refuse `account_not_authorized`.
+    // Fenced without a reset: an account limit on both entrypoints.
     {
         let (harness, credentials) = setup("synthetic", false);
         let shared = Arc::new(std::sync::Mutex::new(credentials));
@@ -388,7 +398,13 @@ async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
                 &v1_request("synthetic", "legacy-fenced"),
             )
             .await;
-        assert_eq!(refused.1["code"], "account_not_authorized", "{}", refused.1);
+        assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+        assert_eq!(
+            refused.1["detail"]["reset_at_ms"],
+            json!(null),
+            "{}",
+            refused.1
+        );
         let policy = harness.operator_config().allocator_policy("synthetic");
         let config = harness.operator_config();
         let classes = account_selection::ClassContext::load(
@@ -411,7 +427,7 @@ async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
         assert_eq!(
             account_selection::handle(ACCOUNT_FOR_OP, &body, &format!("reserved:{RUNNER}"), &ctx)
                 .code(),
-            Some("account_not_authorized"),
+            Some("account_pool_exhausted"),
             "legacy class-aware fenced"
         );
     }
@@ -457,4 +473,137 @@ async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
             "legacy class-aware unknown provider"
         );
     }
+}
+
+#[tokio::test]
+async fn policy_excluded_is_not_authorized_on_both_entrypoints() {
+    // Operator policy for this request (size band) filters the class, so both
+    // entrypoints refuse `account_not_authorized`.
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let select = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30},"pin":"synthetic/model"}),
+        )
+        .await;
+    assert_eq!(select.0, FrameType::Response, "{}", select.1);
+    let report = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":select.1["result"]["decision_id"],"outcome":"refused","credential_id":"oauth:test","runner_code":"size_shaped_429","request_input_tokens":169_000,"reset_at_ms":NOW+600_000}),
+        )
+        .await;
+    assert_eq!(report.0, FrameType::Response, "{}", report.1);
+    let mut large = v1_request("synthetic", "policy-large");
+    large["initial_input_bytes"] = json!(169_000 * 4);
+    let refused = runner.call("route.account_for", &large).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_not_authorized", "{}", refused.1);
+    assert_eq!(refused.1["detail"], json!({}), "{}", refused.1);
+    let policy = harness.operator_config().allocator_policy("synthetic");
+    let config = harness.operator_config();
+    let classes = account_selection::ClassContext::load(
+        harness.store(),
+        &shared,
+        config,
+        crate::ACCOUNT_QUOTA.get(),
+        NOW as i64,
+    )
+    .unwrap();
+    let ctx = account_selection::Ctx {
+        store: harness.store(),
+        accounts: crate::ACCOUNT_QUOTA.get(),
+        flags: crate::config_overrides::AccountSelectionFlags { enabled: true },
+        policy: &policy,
+        now_ms: NOW as i64,
+        classes: Some(classes),
+    };
+    let mut legacy = legacy_request("synthetic", "policy-legacy", "policy-key");
+    legacy["initial_input_bytes"] = json!(169_000 * 4);
+    let body = serde_json::to_vec(&json!({"method": ACCOUNT_FOR_OP, "params": legacy})).unwrap();
+    assert_eq!(
+        account_selection::handle(ACCOUNT_FOR_OP, &body, &format!("reserved:{RUNNER}"), &ctx)
+            .code(),
+        Some("account_not_authorized"),
+        "legacy class-aware size policy"
+    );
+}
+
+#[tokio::test]
+async fn mixed_fence_and_policy_is_exhausted_on_both_entrypoints() {
+    // When causes mix, the most recoverable wins: a fence anywhere in the
+    // class makes the empty roster an account limit, even when other
+    // credentials are policy-filtered.
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let select = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30},"pin":"synthetic/model"}),
+        )
+        .await;
+    assert_eq!(select.0, FrameType::Response, "{}", select.1);
+    let report = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":select.1["result"]["decision_id"],"outcome":"refused","credential_id":"oauth:test","runner_code":"size_shaped_429","request_input_tokens":169_000,"reset_at_ms":NOW+600_000}),
+        )
+        .await;
+    assert_eq!(report.0, FrameType::Response, "{}", report.1);
+    crate::credential_fences::record(
+        harness.store(),
+        &shared,
+        &prefrontal_routing_core::route_state_store::CredentialRefusal {
+            provider_id: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            code: "ENTITLEMENT_ERROR".into(),
+        },
+        NOW as i64,
+    )
+    .unwrap();
+    let mut large = v1_request("synthetic", "mixed-large");
+    large["initial_input_bytes"] = json!(169_000 * 4);
+    let refused = runner.call("route.account_for", &large).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+    assert_eq!(
+        refused.1["detail"]["reset_at_ms"],
+        json!(null),
+        "{}",
+        refused.1
+    );
+    let policy = harness.operator_config().allocator_policy("synthetic");
+    let config = harness.operator_config();
+    let classes = account_selection::ClassContext::load(
+        harness.store(),
+        &shared,
+        config,
+        crate::ACCOUNT_QUOTA.get(),
+        NOW as i64,
+    )
+    .unwrap();
+    let ctx = account_selection::Ctx {
+        store: harness.store(),
+        accounts: crate::ACCOUNT_QUOTA.get(),
+        flags: crate::config_overrides::AccountSelectionFlags { enabled: true },
+        policy: &policy,
+        now_ms: NOW as i64,
+        classes: Some(classes),
+    };
+    let mut legacy = legacy_request("synthetic", "mixed-legacy", "mixed-key");
+    legacy["initial_input_bytes"] = json!(169_000 * 4);
+    let body = serde_json::to_vec(&json!({"method": ACCOUNT_FOR_OP, "params": legacy})).unwrap();
+    assert_eq!(
+        account_selection::handle(ACCOUNT_FOR_OP, &body, &format!("reserved:{RUNNER}"), &ctx)
+            .code(),
+        Some("account_pool_exhausted"),
+        "legacy class-aware mixed fence wins"
+    );
 }

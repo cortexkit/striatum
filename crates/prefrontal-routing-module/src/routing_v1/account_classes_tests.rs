@@ -39,9 +39,14 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
         )
         .await;
     // Every serving credential for the subscription class is fenced and no
-    // reset is known, so the contract code is `account_not_authorized`.
-    assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
-    assert_eq!(blocked.1["detail"], json!({}), "{}", blocked.1);
+    // reset is known: an account limit, not an auth problem.
+    assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+    assert_eq!(
+        blocked.1["detail"]["reset_at_ms"],
+        json!(null),
+        "{}",
+        blocked.1
+    );
     let _later = crate::InjectedClock::set(NOW + 1);
     let config = harness.operator_config();
     let policy = config.allocator_policy("synthetic");
@@ -224,8 +229,13 @@ async fn a_credential_probe_is_a_fallback_and_an_entitlement_failure_renews_it()
             &account_request("synthetic", "after-entitlement-probe"),
         )
         .await;
-    assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
-    assert_eq!(blocked.1["detail"], json!({}), "{}", blocked.1);
+    assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+    assert_eq!(
+        blocked.1["detail"]["reset_at_ms"],
+        json!(null),
+        "{}",
+        blocked.1
+    );
 }
 
 fn catalog_fact(harness: &Harness, fact: &prefrontal_routing_core::ModelFact) {
@@ -1296,10 +1306,15 @@ async fn paid_credit_readings_are_explicit_fresh_inputs_and_refusals_cannot_rewr
             &account_request("synthetic", "credits-refused"),
         )
         .await;
-    // Credential fences filtered the subscription class with no reset, so the
-    // caller may not use it.
-    assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
-    assert_eq!(blocked.1["detail"], json!({}), "{}", blocked.1);
+    // Credential fences filtered the subscription class with no reset: an
+    // account limit without a known reset.
+    assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+    assert_eq!(
+        blocked.1["detail"]["reset_at_ms"],
+        json!(null),
+        "{}",
+        blocked.1
+    );
 }
 
 /// Contract 0.5.0: a failed report with a future reset fences the decision's

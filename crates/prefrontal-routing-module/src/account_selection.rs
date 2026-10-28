@@ -2465,6 +2465,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 priced,
                 &route_fenced,
                 ctx.now_ms,
+                &parsed,
             );
         }
         return OpReply::typed(
@@ -2550,13 +2551,20 @@ fn route_fence_refusal(
 
 /// The contract code for an empty eligible roster with class-aware routing.
 /// A route fence that closed every usable account is already answered as
-/// `account_pool_exhausted` by `route_fence_refusal`; what remains is a
-/// missing or unusable payment class. When a route fence still names a reset
-/// (for example a candidates restriction kept the fence out of that refusal),
-/// the pool is exhausted until then. Otherwise a payment class with no
-/// serving credential needs a login (`auth_required`), while a class whose
-/// credentials exist but are all filtered (credential fences, eligibility or
-/// size refusals) is one the caller may not use (`account_not_authorized`).
+/// `account_pool_exhausted` by `route_fence_refusal`. What remains is split
+/// by cause, because Broca classes `account_not_authorized` as an auth
+/// failure and pauses the worker: an account limit must never use it.
+/// - No serving credential for the payment class at all needs a login
+///   (`auth_required`).
+/// - Every remaining credential excluded by a fence (a billing or
+///   entitlement credential fence, a route fence, or quota exhaustion) is an
+///   account limit (`account_pool_exhausted`), with `reset_at_ms` when any
+///   fence or window names a known reset and without it otherwise.
+/// - Every remaining credential excluded by operator policy for this request
+///   (model or account eligibility, or the size band) is one the caller may
+///   not use (`account_not_authorized`).
+/// When causes mix, the most recoverable wins: `account_pool_exhausted`
+/// beats `account_not_authorized`.
 fn empty_roster_refusal(
     classes: &ClassContext,
     provider: &str,
@@ -2564,30 +2572,8 @@ fn empty_roster_refusal(
     priced: bool,
     fenced: &BTreeMap<String, i64>,
     now: i64,
+    params: &AccountForParams,
 ) -> OpReply {
-    if let Some(until) = fenced.values().min().copied().filter(|until| *until > now) {
-        let retry_after_s = u64::try_from(until.saturating_sub(now))
-            .unwrap_or(0)
-            .div_ceil(1000);
-        return OpReply::typed(
-            "account_pool_exhausted",
-            format!(
-                "routing selects no accounts for provider `{provider}` until {}",
-                rfc3339(until)
-            ),
-            json!({
-                "code": "account_pool_exhausted",
-                "retry_after_s": retry_after_s,
-                "decision_id": null,
-                "exclusions": [],
-                "reset_at_ms": until,
-            }),
-        );
-    }
-    let fact = classes
-        .facts
-        .iter()
-        .find(|fact| fact.provider_id == provider && fact.model_id == model);
     let untimed = |code: &str, message: String| {
         OpReply::typed(
             code,
@@ -2600,17 +2586,90 @@ fn empty_roster_refusal(
             }),
         )
     };
+    let exhausted = |until: Option<i64>| {
+        let (retry_after_s, reset_at_ms, suffix) = match until.filter(|until| *until > now) {
+            Some(until) => (
+                Some(
+                    u64::try_from(until.saturating_sub(now))
+                        .unwrap_or(0)
+                        .div_ceil(1000),
+                ),
+                Some(until),
+                format!(" until {}", rfc3339(until)),
+            ),
+            None => (None, None, String::new()),
+        };
+        OpReply::typed(
+            "account_pool_exhausted",
+            format!("routing selects no accounts for provider `{provider}`{suffix}"),
+            json!({
+                "code": "account_pool_exhausted",
+                "retry_after_s": retry_after_s,
+                "decision_id": null,
+                "exclusions": [],
+                "reset_at_ms": reset_at_ms,
+            }),
+        )
+    };
+    let fact = classes
+        .facts
+        .iter()
+        .find(|fact| fact.provider_id == provider && fact.model_id == model);
     let Some(fact) = fact else {
         return untimed(
             "auth_required",
             format!("routing selects no accounts for provider `{provider}`"),
         );
     };
-    if classes.class(fact, priced).rows.is_empty() {
+    let rows = classes.class(fact, priced).rows;
+    if rows.is_empty() {
         return untimed(
             "auth_required",
             format!("routing selects no accounts for provider `{provider}`"),
         );
+    }
+    let tokens = params
+        .request_input_tokens
+        .unwrap_or_else(|| params.initial_input_bytes.div_ceil(4));
+    let size_class = prefrontal_routing_core::accounts::input_size_class(tokens);
+    let mut fenced_cause = false;
+    for row in &rows {
+        let account = row.account_id.clone().unwrap_or_else(|| row.id.clone());
+        if fenced.contains_key(&account) {
+            fenced_cause = true;
+            continue;
+        }
+        if classes.refusals.iter().any(|fence| {
+            fence.provider_id == provider
+                && fence.credential_id == row.id
+                && (classes.targets.contains_key(provider)
+                    || now.saturating_sub(fence.observed_at_ms)
+                        <= crate::credential_fences::FENCE_PROBE_RECHECK_MS)
+        }) {
+            fenced_cause = true;
+            continue;
+        }
+        if classes.eligibility.iter().any(|fact_| {
+            fact_.provider == provider
+                && fact_.credential_id == row.id
+                && (fact_.model.is_empty() || fact_.model == model)
+        }) {
+            continue;
+        }
+        if classes.size_refusals.iter().any(|fact_| {
+            fact_.provider == provider
+                && fact_.model == model
+                && fact_.credential_id == row.id
+                && fact_.size_class == size_class
+        }) {
+            continue;
+        }
+        // A row none of the filters excludes would have left the roster
+        // non-empty; treat an unclassified row as policy-filtered so a new
+        // filter cannot silently become a timed pool refusal.
+    }
+    if fenced_cause {
+        return exhausted(fenced.values().min().copied());
     }
     untimed(
         "account_not_authorized",
