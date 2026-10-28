@@ -3480,6 +3480,15 @@ pub(crate) fn usage_observation(
         .store
         .account_transaction(|tx| tx.admission(principal, admission_id))
         .ok()??;
+    if parsed
+        .served_account_id
+        .as_deref()
+        .is_some_and(|served| served != admission.account_id)
+    {
+        // Both callers record the observation first, which logs the mismatch.
+        // Its headers cannot describe the account that the admission assigned.
+        return None;
+    }
     let is_anthropic_subscription = ctx.accounts.is_some_and(|accounts| {
         accounts.lock().is_ok_and(|state| {
             state.roster.as_ref().is_some_and(|roster| {
@@ -5639,6 +5648,79 @@ mod tests {
         ));
         assert_eq!(after_start["release"]["released"], false);
         assert_eq!(after_start["release"]["state"], "started");
+    }
+
+    #[test]
+    fn usage_observation_forwards_only_the_admitted_accounts_headers() {
+        for kind in ["attempt", "run_finished"] {
+            let fixture = fixture("usage-observation-account");
+            let ctx = fixture.ctx(true, NOW);
+            let admitted = result(fixture.call(
+                &ctx,
+                ACCOUNT_FOR_OP,
+                BROCA,
+                admit_params("adm-usage", "broca:usage", "broca"),
+            ));
+            let account = admitted["account"]["account_id"].as_str().unwrap();
+            let other = if account == ACCOUNT_A {
+                ACCOUNT_B
+            } else {
+                ACCOUNT_A
+            };
+            for (event, served, forwardable) in [
+                ("mismatch", Some(other), false),
+                ("matching", Some(account), true),
+                ("unreported", None, true),
+            ] {
+                let headers = BTreeMap::from([
+                    (
+                        "anthropic-ratelimit-unified-5h-status".to_string(),
+                        "limited".to_string(),
+                    ),
+                    (
+                        "anthropic-ratelimit-unified-fallback-percentage".to_string(),
+                        "0.12345".to_string(),
+                    ),
+                ]);
+                let mut params = json!({
+                    "event_id": event,
+                    "caller": { "runner": "broca" },
+                    "kind": kind,
+                    "admission_id": "adm-usage",
+                    "observed_at_ms": NOW - 1_000,
+                    "headers": headers,
+                });
+                if let Some(served) = served {
+                    params["served_account_id"] = json!(served);
+                }
+                let body = serde_json::to_vec(&json!({
+                    "method": ACCOUNT_OBSERVE_OP,
+                    "params": params,
+                }))
+                .unwrap();
+                let recorded = result(handle(ACCOUNT_OBSERVE_OP, &body, BROCA, &ctx));
+                assert_eq!(recorded["observation"]["bound"], forwardable);
+                let forwarded = usage_observation(&body, BROCA, &ctx);
+                if forwardable {
+                    assert_eq!(
+                        forwarded,
+                        Some(crate::usage_observe::UsageObservation {
+                            provider: "claude",
+                            account: account.to_string(),
+                            observed_at_ms: NOW - 1_000,
+                            headers,
+                        }),
+                        "{kind}: {event}"
+                    );
+                } else {
+                    assert_eq!(
+                        recorded["observation"]["effects"][0]["effect"],
+                        "served_account_mismatch"
+                    );
+                    assert_eq!(forwarded, None, "{kind}: {event}");
+                }
+            }
+        }
     }
 
     #[test]
