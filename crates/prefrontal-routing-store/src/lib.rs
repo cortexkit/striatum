@@ -58,7 +58,7 @@ pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
 pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
 pub use retention::AffinityRetentionBatch;
 pub use routing_v1::{V1Decision, V1Recorded};
-pub use task_usage::{ClosedTaskUsage, TaskTokenTotals};
+pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use account_selection::AccountServingCounts;

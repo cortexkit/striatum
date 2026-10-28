@@ -24,6 +24,8 @@ pub struct TaskTokenTotals {
 pub struct ClosedTaskUsage {
     pub workload: String,
     pub task_ref: String,
+    /// Serving provider from usage, absent when several providers served the task.
+    pub provider_id: Option<String>,
     /// The task's model pair, not its serving route/provider. Both fields are
     /// absent for multi-model tasks; unselected decisions do not name a model.
     pub selected_model_id: Option<String>,
@@ -32,9 +34,24 @@ pub struct ClosedTaskUsage {
     pub iq_bucket: Option<i64>,
     /// Exclude these tasks from every profile population, including fleet donors.
     pub multi_model: bool,
+    pub multi_provider: bool,
     pub totals: TaskTokenTotals,
     pub closed_at_ms: i64,
 }
+
+/// Reporting presence across all usage rows in the profile window, including
+/// untagged and still-open tasks. A reported zero counts as a report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderTokenReporting {
+    pub provider_id: String,
+    pub reports_cache_write: bool,
+}
+
+const PROVIDER_TOKEN_REPORTING_SQL: &str = "
+SELECT provider_id, MAX(cache_write_tokens IS NOT NULL)
+FROM model_route_usage INDEXED BY model_route_usage_observed_idx
+WHERE observed_at > ?1 AND observed_at <= ?2
+GROUP BY provider_id";
 
 // Aggregate usage before joining decisions so multiple executions cannot multiply
 // the token sums. Do not apply the time window to individual usage rows: old rows
@@ -50,7 +67,9 @@ WITH usage_totals AS (
                     THEN MAX(CAST(output_tokens AS REAL) - COALESCE(reasoning_tokens, 0), 0)
                END) AS output_excluding_reasoning,
            SUM(CAST(reasoning_tokens AS REAL)) AS reasoning,
-           MAX(observed_at) AS closed_at
+           MAX(observed_at) AS closed_at,
+           MIN(provider_id) AS provider_id,
+           COUNT(DISTINCT provider_id) > 1 AS multi_provider
     FROM model_route_usage INDEXED BY model_route_usage_task_idx
     WHERE task_id IS NOT NULL AND task_workload IS NOT NULL
     GROUP BY task_workload, task_id
@@ -78,13 +97,35 @@ SELECT u.workload, u.task_id,
        CASE WHEN NOT m.multi_model THEN m.selected_variant END,
        d.requirements_json,
        m.multi_model, u.fresh_input, u.cached_read, u.cache_write,
-       u.output_excluding_reasoning, u.reasoning, u.closed_at
+       u.output_excluding_reasoning, u.reasoning, u.closed_at,
+       CASE WHEN NOT u.multi_provider THEN u.provider_id END, u.multi_provider
 FROM usage_totals u
 JOIN decisions d ON d.task_id = u.task_id AND d.workload = u.workload AND d.ordinal = 1
 JOIN model_counts m ON m.task_id = u.task_id AND m.workload = u.workload
 ORDER BY u.workload, u.task_id";
 
 impl SqliteRouteStateStore {
+    /// Background-only reporting scan, bounded by the existing observed-time index.
+    /// Providers with no rows in `(now - 30 days, now]` are not returned.
+    pub fn provider_token_reporting(
+        &self,
+        now_ms: i64,
+    ) -> RouteStateResult<Vec<ProviderTokenReporting>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(PROVIDER_TOKEN_REPORTING_SQL)?;
+                let rows =
+                    stmt.query_map(params![now_ms.saturating_sub(30 * DAY_MS), now_ms], |row| {
+                        Ok(ProviderTokenReporting {
+                            provider_id: row.get(0)?,
+                            reports_cache_write: row.get(1)?,
+                        })
+                    })?;
+                rows.collect()
+            })
+            .map_err(err)
+    }
+
     /// Recompute samples from retained rows. A task closes 24 hours after its last
     /// usage and is returned when that usage is in `(now - 30 days, now - 24h]`.
     /// Later usage reopens it; later decisions can change its multi-model marker.
@@ -102,6 +143,7 @@ impl SqliteRouteStateStore {
                         Ok(ClosedTaskUsage {
                             workload: row.get(0)?,
                             task_ref: row.get(1)?,
+                            provider_id: row.get(12)?,
                             selected_model_id: row.get(2)?,
                             selected_variant: row.get(3)?,
                             iq_bucket: serde_json::from_str::<serde_json::Value>(
@@ -111,6 +153,7 @@ impl SqliteRouteStateStore {
                             .and_then(|value| value.get("iq").and_then(|iq| iq.as_f64()))
                             .map(|iq| (iq / 10.0).floor() as i64),
                             multi_model: row.get(5)?,
+                            multi_provider: row.get(13)?,
                             totals: TaskTokenTotals {
                                 fresh_input: row.get(6)?,
                                 cached_read: row.get(7)?,
@@ -209,6 +252,92 @@ mod tests {
         store
             .record_usage_delivery_for_decision(&observation(id, at), decision)
             .unwrap();
+    }
+
+    #[test]
+    fn closed_task_provider_comes_from_usage_and_multiple_providers_are_marked() {
+        let store = store("task-provider");
+        decision(
+            &store,
+            "d",
+            Some("task"),
+            "mason",
+            ("sol", None),
+            75.0,
+            NOW - 3 * DAY_MS,
+        );
+        usage(&store, "u1", "d", NOW - 2 * DAY_MS);
+        let rows = store.closed_task_usage(NOW).unwrap();
+        assert_eq!(rows[0].provider_id.as_deref(), Some("provider"));
+        assert!(!rows[0].multi_provider);
+        let mut second = observation("u2", NOW - 2 * DAY_MS);
+        second.provider_id = "other-provider".into();
+        store
+            .record_usage_delivery_for_decision(&second, "d")
+            .unwrap();
+        let rows = store.closed_task_usage(NOW).unwrap();
+        assert_eq!(rows[0].provider_id, None);
+        assert!(rows[0].multi_provider);
+        assert!(!rows[0].multi_model);
+    }
+
+    #[test]
+    fn provider_reporting_uses_all_window_rows_and_distinguishes_absence_from_zero() {
+        let store = store("provider-reporting");
+        for (id, provider, at, cache_write) in [
+            ("absent", "old-only", NOW - 30 * DAY_MS, Some(5.0)),
+            ("future", "future-only", NOW + 1, Some(5.0)),
+            ("none", "no-counter", NOW, None),
+            ("old-counter", "no-counter", NOW - 31 * DAY_MS, Some(5.0)),
+            ("zero", "zero-counter", NOW - DAY_MS, Some(0.0)),
+            ("mixed-none", "mixed", NOW - DAY_MS, None),
+            ("mixed-some", "mixed", NOW, Some(7.0)),
+        ] {
+            let mut row = observation(id, at);
+            row.provider_id = provider.into();
+            row.cache_write_tokens = cache_write;
+            store.record_usage_delivery(&row).unwrap();
+        }
+        let rows = store.provider_token_reporting(NOW).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ProviderTokenReporting {
+                    provider_id: "mixed".into(),
+                    reports_cache_write: true
+                },
+                ProviderTokenReporting {
+                    provider_id: "no-counter".into(),
+                    reports_cache_write: false
+                },
+                ProviderTokenReporting {
+                    provider_id: "zero-counter".into(),
+                    reports_cache_write: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_reporting_query_plan_searches_the_existing_time_index() {
+        let store = store("provider-reporting-plan");
+        let details: Vec<String> = store
+            .store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(&format!(
+                    "EXPLAIN QUERY PLAN {PROVIDER_TOKEN_REPORTING_SQL}"
+                ))?;
+                let rows = stmt.query_map(params![NOW - 30 * DAY_MS, NOW], |row| row.get(3))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        assert!(details.iter().any(|line| line.contains("SEARCH model_route_usage USING INDEX model_route_usage_observed_idx (observed_at>? AND observed_at<?)")), "{details:?}");
+        assert!(
+            !details
+                .iter()
+                .any(|line| line.starts_with("SCAN model_route_usage")),
+            "{details:?}"
+        );
     }
 
     #[test]

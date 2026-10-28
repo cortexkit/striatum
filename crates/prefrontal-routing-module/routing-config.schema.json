@@ -137,6 +137,15 @@
         "$ref": "#/$defs/RunnerPolicy"
       }
     },
+    "subscription_multipliers": {
+      "description": "Provider-wide subscription multipliers. Legacy route keys are accepted\nonly to warn and discard them; model-level values never override these.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "number",
+        "format": "double"
+      },
+      "writeOnly": true
+    },
     "substrates": {
       "description": "Route-to-harness mapping. Resolve the workload group, consumer group,\nthen `all`, taking each group's longest matching route key or default.\nRoutes not covered by any group run on Broca.",
       "$ref": "#/$defs/SubstrateGroups",
@@ -498,13 +507,12 @@
           "default": null
         },
         "subscription_multiplier": {
-          "description": "Subscription subsidy multiplier: divides the route's list price to yield its\neffective price. 1.0 (or absent) means \"no subsidy known\"; larger values make\nthe route proportionally cheaper than list. Validated at load (must be finite\nand > 0); an invalid value is rejected and logged, not applied.",
+          "description": "Retained for old operator files. Ignored with a warning at load because\nsubscription value belongs to the provider, not an individual model.",
           "type": [
             "number",
             "null"
           ],
-          "format": "double",
-          "exclusiveMinimum": 0
+          "format": "double"
         },
         "vision": {
           "type": [

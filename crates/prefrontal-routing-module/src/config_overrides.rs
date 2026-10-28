@@ -68,16 +68,18 @@ impl LiveConfig {
 /// Collect a validated section's pricing and reserve settings into one value.
 fn route_pricing(section: &ModelRoutingSection) -> RoutePricing {
     let mut pricing = RoutePricing {
-        subscription_multipliers: section.subscription_multipliers.clone(),
+        subscription_multipliers: section
+            .subscription_multipliers
+            .iter()
+            .filter(|(key, _)| !key.contains('/'))
+            .map(|(key, value)| (key.clone(), *value))
+            .collect(),
         keep_free_percent: section.keep_free_percent.clone(),
         ..Default::default()
     };
     for (key, model) in &section.models {
         if let Some(value) = model.speed_multiplier {
             pricing.speed_multipliers.insert(key.clone(), value);
-        }
-        if let Some(value) = model.subscription_multiplier {
-            pricing.subscription_multipliers.insert(key.clone(), value);
         }
     }
     pricing
@@ -284,6 +286,15 @@ fn reject_old_config(path: &Path, stamp: ConfigStamp) -> Result<(), String> {
 }
 
 fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
+    parse_config_with_reporter(document, |warning| {
+        crate::warn_operator(format!("[prefrontal-routing] {warning}"));
+    })
+}
+
+fn parse_config_with_reporter(
+    document: &str,
+    mut report: impl FnMut(&str),
+) -> Result<RoutingConfigFile, String> {
     let json = jsonc_to_json(document)?;
     let value: serde_json::Value =
         serde_json::from_str(&json).map_err(|error| error.to_string())?;
@@ -313,6 +324,27 @@ fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
     // Parse the original text so ordered model_families rules retain their order.
     let mut config: RoutingConfigFile =
         serde_json::from_str(&json).map_err(|error| format!("invalid routing config: {error}"))?;
+    let section = &mut config.model_routing;
+    let mut ignored = Vec::new();
+    section.subscription_multipliers.retain(|key, _| {
+        if key.contains('/') {
+            ignored.push(format!("subscription_multipliers.{key}"));
+            false
+        } else {
+            true
+        }
+    });
+    for (key, model) in &mut section.models {
+        if model.subscription_multiplier.take().is_some() {
+            ignored.push(format!("models.{key}.subscription_multiplier"));
+        }
+    }
+    ignored.sort();
+    for key in ignored {
+        report(&format!(
+            "ignored per-route multiplier `{key}`; subscription multipliers are provider-wide"
+        ));
+    }
     config.prepare()?;
     validate_live_config(&config)?;
     Ok(config)
@@ -773,16 +805,11 @@ impl LiveConfig {
             if let Some(elo) = section.elo_overrides.get(&key) {
                 fact.scores.elo = *elo;
             }
-            fact.subscription_multiplier = section
-                .models
-                .get(&key)
-                .and_then(|model| model.subscription_multiplier)
-                .or_else(|| {
-                    section
-                        .subscription_multipliers
-                        .get(&fact.provider_id)
-                        .copied()
-                });
+            fact.subscription_multiplier = self
+                .pricing
+                .subscription_multipliers
+                .get(&fact.provider_id)
+                .copied();
         }
         SelectionOverrideOutcome {
             routing_config: RoutingConfig {
@@ -1416,13 +1443,9 @@ struct ModelRoutingSection {
     /// avoid these providers when a cache-capable adequate route exists.
     #[serde(skip)]
     providers_without_prompt_cache: Vec<String>,
-    /// Provider-keyed subscription subsidy multipliers ("openai": 40). The
-    /// subsidy is a property of the account serving the provider, so this is
-    /// the primary shape; a per-model `subscription_multiplier` in `models`
-    /// overrides its provider's value for that route only. An entry also states
-    /// that the provider's plan is priced at list divided by the multiplier, so
-    /// a plan whose own rates the catalog does not publish still prices.
-    #[serde(skip)]
+    /// Provider-wide subscription multipliers. Legacy route keys are accepted
+    /// only to warn and discard them; model-level values never override these.
+    #[serde(default, skip_serializing)]
     subscription_multipliers: HashMap<String, f64>,
     /// Percent of each weekly account window reserved from delegated workers;
     /// long-lived head agents may spend that reserved share.
@@ -1525,11 +1548,8 @@ struct ModelFactOverride {
     vision: Option<bool>,
     #[schemars(range(max = 2), transform = positive_number)]
     speed_multiplier: Option<f64>,
-    /// Subscription subsidy multiplier: divides the route's list price to yield its
-    /// effective price. 1.0 (or absent) means "no subsidy known"; larger values make
-    /// the route proportionally cheaper than list. Validated at load (must be finite
-    /// and > 0); an invalid value is rejected and logged, not applied.
-    #[schemars(transform = positive_number)]
+    /// Retained for old operator files. Ignored with a warning at load because
+    /// subscription value belongs to the provider, not an individual model.
     subscription_multiplier: Option<f64>,
     #[serde(flatten)]
     rules: crate::config_policy::EntityPolicy,
@@ -3408,6 +3428,62 @@ mod catalog_poll_tests {
 #[cfg(test)]
 mod route_pricing_tests {
     use super::*;
+
+    #[test]
+    fn conflicting_route_multipliers_warn_and_cannot_reappear_in_overlays() {
+        let mut warnings = Vec::new();
+        let config = parse_config_with_reporter(
+            r#"{
+                "providers":{"openai":{"subscription_multiplier":40}},
+                "subscription_multipliers":{"openai/sol":9,"openai/luna/high":0},
+                "models":{
+                    "openai/sol":{"subscription_multiplier":5},
+                    "openai/luna":{"subscription_multiplier":80}
+                }
+            }"#,
+            |warning| warnings.push(warning.to_owned()),
+        )
+        .unwrap();
+        assert_eq!(warnings.len(), 4);
+        for key in [
+            "models.openai/sol.subscription_multiplier",
+            "models.openai/luna.subscription_multiplier",
+            "subscription_multipliers.openai/sol",
+            "subscription_multipliers.openai/luna/high",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| warning.contains(key)),
+                "{key}"
+            );
+        }
+        let live = LiveConfig::new(config, None);
+        assert_eq!(live.pricing().subscription_multipliers.len(), 1);
+        let mut facts = vec![
+            crate::tests::fact("openai", "sol"),
+            crate::tests::fact("openai", "luna"),
+        ];
+        for fact in &mut facts {
+            fact.subscription_multiplier = Some(999.0);
+        }
+        live.apply(&mut facts);
+        live.apply(&mut facts);
+        for fact in &facts {
+            assert_eq!(fact.subscription_multiplier, Some(40.0));
+            assert_eq!(
+                live.pricing().subscription_multiplier(&make_route_key(
+                    &fact.provider_id,
+                    &fact.model_id,
+                    fact.variant.as_deref()
+                )),
+                Some(40.0)
+            );
+        }
+        let withdrawn = LiveConfig::new(RoutingConfigFile::default(), None);
+        withdrawn.apply(&mut facts);
+        assert!(facts
+            .iter()
+            .all(|fact| fact.subscription_multiplier.is_none()));
+    }
 
     /// Pricing and reserve settings travel with the published document: a
     /// selection that holds one snapshot keeps its prices and reserves while

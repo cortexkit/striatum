@@ -45,6 +45,7 @@ mod select_policy;
 mod selection_harness;
 mod subscription_economics;
 mod substrate_policy;
+mod task_profile_refresh;
 #[cfg(test)]
 mod test_config;
 mod usage_observe;
@@ -1224,6 +1225,7 @@ where
     ));
 
     let mut route_epochs = RouteEpochs::new();
+    let mut profiles_started = false;
     loop {
         let Some(frame) = next_frame_or_loop_stop(read_half, &mut loops).await? else {
             return Ok(()); // clean EOF: subc closed the connection.
@@ -1243,6 +1245,18 @@ where
         .await?
         {
             return Ok(());
+        }
+        if !profiles_started && !route_epochs.is_empty() {
+            // Start only after the first bind ACK is queued, never during store open.
+            loops.spawn(
+                "task profile refresh",
+                task_profile_refresh::refresh_loop(
+                    Arc::clone(&store),
+                    override_path.clone(),
+                    Arc::clone(&broca_credentials),
+                ),
+            );
+            profiles_started = true;
         }
     }
 }
