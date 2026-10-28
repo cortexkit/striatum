@@ -52,6 +52,8 @@ mod metered_tests;
 #[cfg(test)]
 mod order_tests;
 #[cfg(test)]
+mod profile_tests;
+#[cfg(test)]
 mod report_fence_tests;
 #[cfg(test)]
 mod runners_tests;
@@ -59,6 +61,8 @@ mod runners_tests;
 mod scope_attribution_tests;
 #[cfg(test)]
 mod select_options_tests;
+#[cfg(test)]
+mod task_ref_tests;
 
 /// The `routing/v1` capability a routing provider lists in its manifest.
 pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;

@@ -113,6 +113,61 @@ fn select(consumer: &str) -> Value {
     json!({ "consumer": consumer, "requirements": { "iq": 30 } })
 }
 
+#[tokio::test]
+async fn task_profiles_use_the_recorded_workload_and_effective_iq_without_store_reads() {
+    let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["iq"] = json!(75);
+        config["models"][CHEAP] = json!({"subscription_multiplier": 10_000.0});
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let cold = route.call("route.select", &select("mason")).await;
+    assert_eq!(route_of(&cold), CHEAP);
+
+    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
+    connection
+        .execute_batch("DROP INDEX model_route_usage_task_idx")
+        .unwrap();
+    assert!(harness
+        .store()
+        .closed_task_usage(super::now_ms() as i64)
+        .is_err());
+    let profiles =
+        super::profile_tests::lookup("mason", 75.0, &[(CHEAP, 10_000_000.0), (DEAR, 100_000.0)]);
+    let answer = route
+        .select_with_profiles(&select("mason"), &profiles)
+        .await
+        .unwrap();
+    assert_eq!(
+        format!(
+            "{}/{}",
+            answer["route"]["provider"].as_str().unwrap(),
+            answer["route"]["model"].as_str().unwrap()
+        ),
+        DEAR
+    );
+    let pricing =
+        super::profile_tests::task_pricing(&harness, answer["decision_id"].as_str().unwrap());
+    assert_eq!(pricing["tokens"]["outputExcludingReasoning"], 100_000.0);
+    assert_eq!(pricing["profile"]["taskCount"], 20);
+    assert_eq!(pricing["valueMultiplier"], 1.0);
+
+    let mut pinned = select("mason");
+    pinned["pin"] = json!(CHEAP);
+    let answer = route
+        .select_with_profiles(&pinned, &profiles)
+        .await
+        .unwrap();
+    assert_eq!(answer["route"]["provider"], "cheap-provider");
+    let pricing =
+        super::profile_tests::task_pricing(&harness, answer["decision_id"].as_str().unwrap());
+    assert_eq!(pricing["tokens"]["outputExcludingReasoning"], 10_000_000.0);
+    assert_eq!(
+        pricing["valueMultiplier"], 1.0,
+        "per-route multipliers never affect task prices"
+    );
+}
+
 fn route_of(reply: &(FrameType, Value)) -> String {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let route = &reply.1["result"]["route"];
@@ -464,6 +519,20 @@ async fn a_v1_mason_runs_the_consumer_variant_the_older_select_chose() {
             .as_deref(),
         Some("xhigh")
     );
+
+    let profiles = super::profile_tests::lookup(
+        "mason",
+        30.0,
+        &[(CHEAP, 1_000.0), ("cheap-provider/model-a/xhigh", 2_000.0)],
+    );
+    let profiled = route
+        .select_with_profiles(&select("mason"), &profiles)
+        .await
+        .unwrap();
+    assert_eq!(profiled["route"]["variant"], "xhigh");
+    let pricing =
+        super::profile_tests::task_pricing(&harness, profiled["decision_id"].as_str().unwrap());
+    assert_eq!(pricing["tokens"]["outputExcludingReasoning"], 2_000.0);
 
     let mut legacy = select("mason");
     legacy["targetAgent"] = json!("mason");

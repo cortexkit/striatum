@@ -16,6 +16,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "select_hold_control",
     cortexkit_role_routing::capabilities::SELECT_PREFER,
     cortexkit_role_routing::capabilities::SELECT_EXCLUDE_PROVIDERS,
+    cortexkit_role_routing::capabilities::SELECT_TASK_REF,
 ];
 
 /// Params are ignored: the role defines `{}` and no refusal for this op.

@@ -317,3 +317,36 @@ async fn codemode_ranks_routes_at_list_price_never_at_a_subscription_subsidy() {
         assert_eq!(route_key(&reply), CHEAP, "{consumer}");
     }
 }
+
+#[tokio::test]
+async fn profile_metered_routes_pay_list_price_even_with_provider_multiplier_overrides() {
+    const CHEAP: &str = "metered-a/model-a";
+    const DEAR: &str = "metered-b/model-b";
+    let harness = harness_of(&[CHEAP, DEAR], json!({"prices": []}));
+    harness.edit_config(|config| {
+        config["providers"]["metered-b"] = json!({"subscription_multiplier": 40.0});
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    for consumer in ["mason", "codemode", "flow"] {
+        let profiles = super::profile_tests::lookup(
+            consumer,
+            30.0,
+            &[(CHEAP, 1_000_000.0), (DEAR, 1_000_000.0)],
+        );
+        let answer = route
+            .select_with_profiles(&select(consumer), &profiles)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer["route"]["provider"], "metered-a",
+            "{consumer}: {answer}"
+        );
+        let pricing =
+            super::profile_tests::task_pricing(&harness, answer["decision_id"].as_str().unwrap());
+        assert_eq!(pricing["valueMultiplier"], 1.0, "{consumer}: {pricing}");
+        assert_eq!(
+            pricing["listCostUsd"], pricing["finalCostUsd"],
+            "{consumer}: {pricing}"
+        );
+    }
+}
