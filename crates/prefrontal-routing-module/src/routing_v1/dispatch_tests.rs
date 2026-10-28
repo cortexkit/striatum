@@ -301,7 +301,7 @@ async fn runner_ops_refuse_a_caller_that_is_not_a_known_runner() {
         ] {
             let reply = route.call(method, &params).await;
             assert_eq!(reply.0, FrameType::Error, "{method}: {}", reply.1);
-            assert_eq!(reply.1["code"], "unscoped_caller", "{method}");
+            assert_eq!(reply.1["code"], "account_not_authorized", "{method}");
             assert_eq!(reply.1["detail"], json!({}), "{method}");
         }
     }

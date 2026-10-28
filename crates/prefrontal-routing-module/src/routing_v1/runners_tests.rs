@@ -396,7 +396,7 @@ async fn consumer_ownership_never_grants_unscoped_account_operations() {
                 }
                 let reply = caller.call(method, &params).await;
                 assert_eq!(reply.0, FrameType::Error);
-                assert_eq!(reply.1["code"], "unscoped_caller", "{reply:?}");
+                assert_eq!(reply.1["code"], "account_not_authorized", "{reply:?}");
             }
         }
     }

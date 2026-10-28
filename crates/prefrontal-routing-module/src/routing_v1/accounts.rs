@@ -18,9 +18,25 @@ use cortexkit_role_routing::observe::{
 use prefrontal_routing_store::V1Recorded;
 use serde_json::{json, Value};
 
-use super::{account_ctx, now_ms, provider_refusal, store_refusal, Caller, Deps};
+use super::{account_ctx, now_ms, provider_refusal, Caller, Deps};
 use crate::account_selection::{self, OpReply, ACCOUNT_FOR_OP, ACCOUNT_OBSERVE_OP};
 use crate::{account_quota, config_overrides};
+
+/// A store or serialization failure inside `route.account_for`. The contract
+/// has no `store_error` or `internal_error` for this op; a router that cannot
+/// read or render its state cannot choose right now, which is the transient
+/// `account_selection_unavailable`.
+fn account_unavailable(message: impl Into<String>) -> Refusal {
+    Refusal::new(RefusalCode::AccountSelectionUnavailable, message.into())
+}
+
+fn store_unavailable(error: impl std::fmt::Display) -> Refusal {
+    account_unavailable(format!("route-state store: {error}"))
+}
+
+fn internal_unavailable(error: impl std::fmt::Display) -> Refusal {
+    account_unavailable(error.to_string())
+}
 
 const FOR_MEMBERS: &[&str] = &[
     "provider",
@@ -120,7 +136,9 @@ fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCall
         }
     }
     Err(Refusal::new(
-        RefusalCode::parse("unscoped_caller"),
+        // The contract answers any caller that is not an attested runner
+        // module as `account_not_authorized`; it has no unscoped-caller code.
+        RefusalCode::AccountNotAuthorized,
         "account operations require an effective runner or a current agent-host session scope",
     ))
 }
@@ -144,19 +162,21 @@ pub(super) fn account_for(
     let mut hold_wait_max_s = request.hold_wait_max_s;
     // The whole body with defaults applied: two bodies that differ only in a
     // member left out versus sent with its default are the same admission.
-    let body_json = serde_json::to_string(&request.normalized())
-        .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
+    let body_json = serde_json::to_string(&request.normalized()).map_err(internal_unavailable)?;
     if let Some(first) = deps
         .store
         .v1_admission(&principal, &request.admission_id)
-        .map_err(store_refusal)?
+        .map_err(store_unavailable)?
     {
         return standing_answer(first, &body_json);
     }
     if let Some(decision_id) = &request.decision_id {
         // Honoured only from the runner the decision named, for the model it
         // named; anything else is refused as if the decision never existed.
-        let decision = deps.store.v1_decision(decision_id).map_err(store_refusal)?;
+        let decision = deps
+            .store
+            .v1_decision(decision_id)
+            .map_err(store_unavailable)?;
         if !decision.is_some_and(|decision| {
             caller.attested_module() == Some(decision.runner_module.as_str())
                 && same_name(&decision.provider, &request.provider)
@@ -167,10 +187,10 @@ pub(super) fn account_for(
         if let Some(input) = deps
             .store
             .get_decision_by_id(decision_id)
-            .map_err(store_refusal)?
+            .map_err(store_unavailable)?
         {
             let input: Value =
-                serde_json::from_str(&input.requirements_json).map_err(store_refusal)?;
+                serde_json::from_str(&input.requirements_json).map_err(store_unavailable)?;
             if let Some(cap) = input["hold_wait_max_s"].as_u64() {
                 hold_wait_max_s = Some(hold_wait_max_s.map_or(cap, |request| request.min(cap)));
             }
@@ -219,11 +239,14 @@ pub(super) fn account_for(
         }
     }
     let body = serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": legacy }))
-        .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
+        .map_err(internal_unavailable)?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
     let policy =
         config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
-    let ctx = account_ctx(deps, flags, &policy)?;
+    // The shared context reports a store failure; for `account_for` that is
+    // transient unavailability, not the open `store_error` code.
+    let ctx = account_ctx(deps, flags, &policy)
+        .map_err(|refusal| account_unavailable(refusal.message))?;
     let answer = match account_selection::handle(ACCOUNT_FOR_OP, &body, &authority.principal, &ctx)
     {
         OpReply::Result(result) => admission_answer(&result, &request)?,
@@ -233,8 +256,7 @@ pub(super) fn account_for(
             detail,
         } => return Err(account_refusal(&code, message, detail.as_ref())),
     };
-    let answer_json = serde_json::to_string(&answer)
-        .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
+    let answer_json = serde_json::to_string(&answer).map_err(internal_unavailable)?;
     let standing = deps
         .store
         .v1_record_admission(
@@ -246,7 +268,7 @@ pub(super) fn account_for(
             },
             now_ms() as i64,
         )
-        .map_err(store_refusal)?;
+        .map_err(store_unavailable)?;
     standing_answer(standing, &body_json)
 }
 
@@ -260,7 +282,7 @@ fn standing_answer(first: V1Recorded, body_json: &str) -> Result<Value, Refusal>
         ));
     }
     serde_json::from_str(&first.answer_json)
-        .map_err(|error| store_refusal(format!("stored admission answer undecodable: {error}")))
+        .map_err(|error| store_unavailable(format!("stored admission answer undecodable: {error}")))
 }
 
 /// The allocator's answer in v1 shape: times in Unix milliseconds, the pin's
@@ -330,13 +352,17 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
             quota_age_band: text(&reason["quota_age_band"]).unwrap_or_else(|| "unknown".into()),
         },
     };
-    serde_json::to_value(answer)
-        .map_err(|error| provider_refusal("internal_error", error.to_string()))
+    serde_json::to_value(answer).map_err(internal_unavailable)
 }
 
 /// The allocator's refusal in v1 shape. A hold and an exhausted pool are
 /// timed by the wait the allocator states; every other refusal carries no
-/// detail.
+/// detail. Legacy codes the contract does not declare (`store_error`,
+/// `internal_error`, `no_eligible_account`, `account_selection_unsupported`,
+/// `unscoped_caller`) become the transient `account_selection_unavailable`.
+/// `account_selection_disabled` is preserved verbatim so it stays
+/// distinguishable from quota or authentication refusals; the contract still
+/// needs to declare it. This arm is the backstop.
 fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refusal {
     let wait_until = || {
         detail
@@ -355,18 +381,14 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                 .or_else(wait_until),
         ),
         "invalid_request" => Refusal::invalid_request("params", message.clone()),
-        "store_error" => Refusal::new(RefusalCode::AccountSelectionUnavailable, message.clone()),
+        "store_error"
+        | "internal_error"
+        | "no_eligible_account"
+        | "account_selection_unsupported"
+        | "unscoped_caller" => account_unavailable(message.clone()),
         other => Refusal::new(RefusalCode::parse(other), message.clone()),
     };
     refusal.message = message;
-    if code == "no_eligible_account" {
-        if let Some(reset) = detail
-            .and_then(|detail| detail.get("reset_at_ms"))
-            .filter(|reset| !reset.is_null())
-        {
-            refusal.detail.insert("reset_at_ms".into(), reset.clone());
-        }
-    }
     refusal
 }
 
@@ -466,6 +488,21 @@ fn observation_answer(result: &Value) -> Result<Value, Refusal> {
     };
     serde_json::to_value(answer)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))
+}
+
+/// The contract mapping for a legacy code, for the per-code tests.
+#[cfg(test)]
+pub(crate) fn account_refusal_for_test(code: &str) -> Refusal {
+    account_refusal(code, format!("test {code}"), None)
+}
+
+/// The contract mapping with a legacy detail, for timing tests.
+#[cfg(test)]
+pub(crate) fn account_refusal_for_test_detail(
+    code: &str,
+    detail: Option<&serde_json::Value>,
+) -> Refusal {
+    account_refusal(code, format!("test {code}"), detail)
 }
 
 #[cfg(test)]

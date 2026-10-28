@@ -56,14 +56,20 @@ async fn nonrunners_cannot_admit_or_observe_even_with_a_decision_or_body_identit
                 if let Some(extra) = extra {
                     body[extra] = json!("agent-host/v1");
                 }
+                // A caller that is not an attested runner is refused as
+                // `account_not_authorized`; the contract has no
+                // `unscoped_caller` code.
                 let reply = route.call("route.account_for", &body).await;
-                assert_eq!(reply.1["code"], "unscoped_caller", "{}", reply.1);
+                assert_eq!(reply.1["code"], "account_not_authorized", "{}", reply.1);
+                assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
                 let mut observed = json!({"event_id":"refused","kind":"account_limit_exhausted","admission_id":"refused"});
                 if let Some(extra) = extra {
                     observed[extra] = json!("agent-host/v1");
                 }
+                // `route.account_observe` is also a runner op: a non-runner is
+                // `account_not_authorized` (§9).
                 let reply = route.call("route.account_observe", &observed).await;
-                assert_eq!(reply.1["code"], "unscoped_caller", "{}", reply.1);
+                assert_eq!(reply.1["code"], "account_not_authorized", "{}", reply.1);
             }
         }
         assert!(harness
@@ -97,8 +103,9 @@ async fn session_authority_requires_a_current_head_scope_and_verified_host_capab
                 json!({"event_id":"refused","kind":"attempt"}),
             ),
         ] {
+            // Both runner ops refuse a non-runner as `account_not_authorized`.
             let reply = route.call(op, &body).await;
-            assert_eq!(reply.1["code"], "unscoped_caller", "{}", reply.1);
+            assert_eq!(reply.1["code"], "account_not_authorized", "{}", reply.1);
         }
     }
     let route = session(&harness, "replaceable-host", "stale", "head").await;
@@ -125,7 +132,7 @@ async fn session_authority_requires_a_current_head_scope_and_verified_host_capab
             .unwrap_err()
             .code
             .as_str(),
-        "unscoped_caller"
+        "account_not_authorized"
     );
     assert_eq!(
         super::accounts::account_observe(
@@ -136,7 +143,7 @@ async fn session_authority_requires_a_current_head_scope_and_verified_host_capab
         .unwrap_err()
         .code
         .as_str(),
-        "unscoped_caller"
+        "account_not_authorized"
     );
     assert_eq!(harness.store().account_serving_counts().unwrap().total(), 0);
 }
@@ -253,8 +260,10 @@ async fn v1_members_are_validated_on_the_live_handler_and_token_size_reaches_the
     })).await);
     let mut large = request("large");
     large["request_input_tokens"] = json!(169_000);
+    // The size refusal filtered every account in the class for this input.
     let refused = runner.call("route.account_for", &large).await;
-    assert_eq!(refused.1["code"], "no_eligible_account", "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_not_authorized", "{}", refused.1);
+    assert_eq!(refused.1["detail"], json!({}), "{}", refused.1);
     let mut small = request("small");
     small["request_input_tokens"] = json!(1_000);
     response(&runner.call("route.account_for", &small).await);

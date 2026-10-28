@@ -38,7 +38,10 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
             &account_request("synthetic", "exactly-six-hours"),
         )
         .await;
-    assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
+    // Every serving credential for the subscription class is fenced and no
+    // reset is known, so the contract code is `account_not_authorized`.
+    assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
+    assert_eq!(blocked.1["detail"], json!({}), "{}", blocked.1);
     let _later = crate::InjectedClock::set(NOW + 1);
     let config = harness.operator_config();
     let policy = config.allocator_policy("synthetic");
@@ -113,6 +116,8 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
         now_ms: NOW as i64 + 1,
         classes: Some(cached),
     };
+    // The probe is already claimed: the allocator has no account left and the
+    // stale roster cannot serve, which is transient unavailability.
     assert_eq!(
         crate::account_selection::handle(
             crate::account_selection::ACCOUNT_FOR_OP,
@@ -121,7 +126,7 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
             &ctx
         )
         .code(),
-        Some("no_eligible_account"),
+        Some("account_selection_unavailable"),
         "a stale cached roster cannot reserve a second probe"
     );
     let completed = caller
@@ -219,7 +224,8 @@ async fn a_credential_probe_is_a_fallback_and_an_entitlement_failure_renews_it()
             &account_request("synthetic", "after-entitlement-probe"),
         )
         .await;
-    assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
+    assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
+    assert_eq!(blocked.1["detail"], json!({}), "{}", blocked.1);
 }
 
 fn catalog_fact(harness: &Harness, fact: &prefrontal_routing_core::ModelFact) {
@@ -499,21 +505,27 @@ async fn ten_default_admissions_never_spend_after_subscription_exhaustion_or_ent
                     )
                     .await;
                 assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+                // Quota exhaustion is `account_pool_exhausted` timed by its
+                // reset; fenced credentials without a reset are
+                // `account_not_authorized`. A short hold stays a hold.
                 assert!(
                     matches!(
                         reply.1["code"].as_str(),
-                        Some("account_hold" | "no_eligible_account")
+                        Some("account_hold" | "account_pool_exhausted" | "account_not_authorized")
                     ),
                     "{}",
                     reply.1
                 );
-                if !entitlement && reply.1["code"] == "no_eligible_account" {
+                if !entitlement && reply.1["code"] == "account_pool_exhausted" {
                     assert_eq!(
                         reply.1["detail"]["reset_at_ms"],
                         NOW + 600_000,
                         "{}",
                         reply.1
                     );
+                }
+                if reply.1["code"] == "account_not_authorized" {
+                    assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
                 }
             }
             harness.edit_config(|config| {
@@ -817,8 +829,11 @@ async fn the_frozen_empty_mapping_joins_only_its_single_catalog_vendor() {
             &account_request("openai", "ambiguous-vendor"),
         )
         .await;
+    // No credential serves the payment class, so the provider needs a login
+    // the runner does not have.
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert_eq!(reply.1["code"], "no_eligible_account");
+    assert_eq!(reply.1["code"], "auth_required");
+    assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
 }
 
 fn oauth_reading(used_percent: f64) {
@@ -866,7 +881,7 @@ async fn provider_strategies_never_escape_the_subscription_class() {
         assert!(
             matches!(
                 blocked.1["code"].as_str(),
-                Some("account_hold" | "no_eligible_account")
+                Some("account_hold" | "account_pool_exhausted")
             ),
             "{}",
             blocked.1
@@ -948,7 +963,10 @@ async fn model_eligibility_applies_to_pins_and_clears_with_the_vault_listing() {
             &account_request("synthetic", "not-found-next"),
         )
         .await;
-    assert_eq!(next.1["code"], "no_eligible_account", "{}", next.1);
+    // The eligibility refusal filtered the subscription class, so the caller
+    // may not use it.
+    assert_eq!(next.1["code"], "account_not_authorized", "{}", next.1);
+    assert_eq!(next.1["detail"], json!({}), "{}", next.1);
     let mut unaffected = account_request("synthetic", "404-other-model");
     unaffected["model"] = json!("other");
     assert_credential(
@@ -1019,12 +1037,14 @@ async fn report_eligibility_is_model_or_account_scoped_and_never_a_hold() {
             );
         } else {
             let answer = runner.call("route.account_for", &request).await;
-            assert_eq!(answer.1["code"], "no_eligible_account", "{}", answer.1);
+            assert_eq!(answer.1["code"], "account_not_authorized", "{}", answer.1);
+            assert_eq!(answer.1["detail"], json!({}), "{}", answer.1);
         }
         request["model"] = json!("other");
         request["admission_id"] = json!(format!("other-{index}"));
         let answer = runner.call("route.account_for", &request).await;
-        assert_eq!(answer.1["code"], "no_eligible_account", "{}", answer.1);
+        assert_eq!(answer.1["code"], "account_not_authorized", "{}", answer.1);
+        assert_eq!(answer.1["detail"], json!({}), "{}", answer.1);
     }
 }
 
@@ -1041,8 +1061,11 @@ async fn size_shaped_429_restricts_only_its_input_band_and_success_clears_it() {
     assert_eq!(report.0, FrameType::Response, "{}", report.1);
     let mut large = account_request("synthetic", "large");
     large["initial_input_bytes"] = json!(169_000 * 4);
+    // The size refusal filtered every account in the class for this input
+    // size, so the caller may not use it.
     let blocked = runner.call("route.account_for", &large).await;
-    assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
+    assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
+    assert_eq!(blocked.1["detail"], json!({}), "{}", blocked.1);
     let mut small = account_request("synthetic", "small");
     small["initial_input_bytes"] = json!(4096 * 4);
     assert_credential(
@@ -1273,7 +1296,10 @@ async fn paid_credit_readings_are_explicit_fresh_inputs_and_refusals_cannot_rewr
             &account_request("synthetic", "credits-refused"),
         )
         .await;
-    assert_eq!(blocked.1["code"], "no_eligible_account", "{}", blocked.1);
+    // Credential fences filtered the subscription class with no reset, so the
+    // caller may not use it.
+    assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
+    assert_eq!(blocked.1["detail"], json!({}), "{}", blocked.1);
 }
 
 /// Contract 0.5.0: a failed report with a future reset fences the decision's
@@ -1409,8 +1435,15 @@ async fn absent_readings_admit_without_fabricated_quota_and_known_headroom_order
             &account_request("synthetic", "only-known-exhausted"),
         )
         .await;
+    // The only subscription account sits within its reserve, so the allocator
+    // answers `account_pool_reserve_limited` (untimed).
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert_eq!(reply.1["code"], "no_eligible_account");
+    assert_eq!(
+        reply.1["code"], "account_pool_reserve_limited",
+        "{}",
+        reply.1
+    );
+    assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
 }
 
 #[tokio::test]
@@ -1478,9 +1511,12 @@ async fn pay_per_token_never_uses_subscription_when_the_api_key_disappears() {
                     &format!("removed-{consumer}-{coverage_override}"),
                 );
                 request["decision_id"] = json!(id);
+                // The metered class lost its only credential, so the provider
+                // needs a login the runner does not have.
                 let reply = runner.call("route.account_for", &request).await;
                 assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-                assert_eq!(reply.1["code"], "no_eligible_account");
+                assert_eq!(reply.1["code"], "auth_required", "{}", reply.1);
+                assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
             }
         }
     }

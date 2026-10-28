@@ -54,7 +54,12 @@ pub const ACCOUNT_OBSERVE_OP: &str = "route.account_observe";
 /// Release an admission that never started, or end a conversation's lease.
 pub const ACCOUNT_RELEASE_OP: &str = "route.account_release";
 
-/// The refusal every account operation answers while serving is off.
+/// The refusal every account operation answers while serving is off. This
+/// code is intentionally preserved verbatim: it means the operator switched
+/// account selection off for the whole module (the serving flag), and Broca
+/// falls back to its static credential on it, so it must stay
+/// distinguishable from quota or auth refusals. The contract still needs to
+/// declare this code.
 pub const DISABLED_CODE: &str = "account_selection_disabled";
 
 /// A reservation that has not started within this long expires.
@@ -2450,16 +2455,23 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         .as_ref()
         .is_some_and(|roster| !roster.accounts.is_empty())
     {
-        let code = if ctx.classes.is_some() {
-            "no_eligible_account"
-        } else {
-            "account_selection_unsupported"
-        };
+        if let Some(classes) = ctx.classes.as_ref() {
+            let priced =
+                class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly;
+            return empty_roster_refusal(
+                classes,
+                &provider,
+                &normalize(&parsed.model),
+                priced,
+                &route_fenced,
+                ctx.now_ms,
+            );
+        }
         return OpReply::typed(
-            code,
+            "account_selection_unsupported",
             format!("routing selects no accounts for provider `{provider}`"),
             json!({
-                "code": code,
+                "code": "account_selection_unsupported",
                 "retry_after_s": null,
                 "decision_id": null,
                 "exclusions": [],
@@ -2534,6 +2546,76 @@ fn route_fence_refusal(
             "reset_at_ms": until,
         }),
     ))
+}
+
+/// The contract code for an empty eligible roster with class-aware routing.
+/// A route fence that closed every usable account is already answered as
+/// `account_pool_exhausted` by `route_fence_refusal`; what remains is a
+/// missing or unusable payment class. When a route fence still names a reset
+/// (for example a candidates restriction kept the fence out of that refusal),
+/// the pool is exhausted until then. Otherwise a payment class with no
+/// serving credential needs a login (`auth_required`), while a class whose
+/// credentials exist but are all filtered (credential fences, eligibility or
+/// size refusals) is one the caller may not use (`account_not_authorized`).
+fn empty_roster_refusal(
+    classes: &ClassContext,
+    provider: &str,
+    model: &str,
+    priced: bool,
+    fenced: &BTreeMap<String, i64>,
+    now: i64,
+) -> OpReply {
+    if let Some(until) = fenced.values().min().copied().filter(|until| *until > now) {
+        let retry_after_s = u64::try_from(until.saturating_sub(now))
+            .unwrap_or(0)
+            .div_ceil(1000);
+        return OpReply::typed(
+            "account_pool_exhausted",
+            format!(
+                "routing selects no accounts for provider `{provider}` until {}",
+                rfc3339(until)
+            ),
+            json!({
+                "code": "account_pool_exhausted",
+                "retry_after_s": retry_after_s,
+                "decision_id": null,
+                "exclusions": [],
+                "reset_at_ms": until,
+            }),
+        );
+    }
+    let fact = classes
+        .facts
+        .iter()
+        .find(|fact| fact.provider_id == provider && fact.model_id == model);
+    let untimed = |code: &str, message: String| {
+        OpReply::typed(
+            code,
+            message,
+            json!({
+                "code": code,
+                "retry_after_s": null,
+                "decision_id": null,
+                "exclusions": [],
+            }),
+        )
+    };
+    let Some(fact) = fact else {
+        return untimed(
+            "auth_required",
+            format!("routing selects no accounts for provider `{provider}`"),
+        );
+    };
+    if classes.class(fact, priced).rows.is_empty() {
+        return untimed(
+            "auth_required",
+            format!("routing selects no accounts for provider `{provider}`"),
+        );
+    }
+    untimed(
+        "account_not_authorized",
+        format!("routing selects no accounts for provider `{provider}`"),
+    )
 }
 
 /// Check a cold worker launch without reserving an account or creating affinity.
@@ -2839,11 +2921,16 @@ fn serve(
             ))
         }
         Outcome::Refuse(refusal) => {
-            let code = if ctx.classes.is_some() {
-                "no_eligible_account"
-            } else {
-                refusal_code(refusal.code)
-            };
+            // The caller sees the allocator's own contract code. The store
+            // keeps that code too (`outcome_columns`), so this mapping must
+            // not change the recorded decision, only the reply. The contract
+            // has no `account_selection_unsupported`: a class-aware roster
+            // never reaches it, and a stale roster is transient
+            // unavailability.
+            let mut code = refusal_code(refusal.code);
+            if code == "account_selection_unsupported" {
+                code = "account_selection_unavailable";
+            }
             let family = ctx.policy.family_for_model(&params.model);
             let reset = state
                 .fences
@@ -2889,15 +2976,18 @@ fn serve(
                 )
                 .filter(|reset| *reset > now)
                 .min();
+            // Only an exhausted pool is timed by the contract. Every other
+            // allocator refusal is untimed, so it carries no wait or reset.
+            let timed = code == "account_pool_exhausted";
             Ok(OpReply::typed(
                 code,
                 format!("no account admitted: {code}"),
                 json!({
                     "code": code,
-                    "retry_after_s": refusal.retry_after_s,
+                    "retry_after_s": timed.then_some(refusal.retry_after_s).flatten(),
                     "decision_id": decision_id,
                     "exclusions": wire_exclusions(&decision),
-                    "reset_at_ms": reset,
+                    "reset_at_ms": timed.then_some(reset).flatten(),
                 }),
             ))
         }

@@ -36,6 +36,8 @@ mod account_classes_tests;
 #[cfg(test)]
 mod account_ops_tests;
 #[cfg(test)]
+mod account_refusal_codes_tests;
+#[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
 mod consumers_tests;

@@ -3906,22 +3906,38 @@ async fn handle_select_request(
             model_pools: live_config.quota_model_pools(),
             ..Default::default()
         };
+        // The contract has no `store_error` or `internal_error` for
+        // `route.account_for`; a context that cannot load is transient
+        // unavailability, not a transport failure.
+        let classes = match account_selection::ClassContext::load(
+            store,
+            broca_credentials,
+            config_overrides::live_config(operator_config_path),
+            ACCOUNT_QUOTA.get(),
+            account_selection::now_ms(),
+        ) {
+            Ok(classes) => classes,
+            Err(error) => {
+                let reply = account_selection::OpReply::Error {
+                    code: "account_selection_unavailable".to_string(),
+                    message: format!("routing could not load account context: {error}"),
+                    detail: Some(json!({
+                        "code": "account_selection_unavailable",
+                        "retry_after_s": null,
+                        "decision_id": null,
+                        "exclusions": [],
+                    })),
+                };
+                return send_account_reply(writer, ver, channel, epoch, corr, reply).await;
+            }
+        };
         let ctx = account_selection::Ctx {
             store: store.as_ref(),
             accounts: ACCOUNT_QUOTA.get(),
             flags: live_config.account_flags(),
             policy: &policy,
             now_ms: account_selection::now_ms(),
-            classes: Some(
-                account_selection::ClassContext::load(
-                    store,
-                    broca_credentials,
-                    config_overrides::live_config(operator_config_path),
-                    ACCOUNT_QUOTA.get(),
-                    account_selection::now_ms(),
-                )
-                .map_err(ModuleError::Message)?,
-            ),
+            classes: Some(classes),
         };
         let reply = account_selection::handle(&envelope.method, &frame.body, &principal, &ctx);
         if envelope.method == account_selection::ACCOUNT_OBSERVE_OP {
