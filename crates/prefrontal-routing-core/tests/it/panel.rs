@@ -675,7 +675,6 @@ fn reserved_headroom_panel_cause_publishes_structured_reset_without_prose_timest
                     plans: vec![SubscriptionPlan {
                         tier: None,
                         fee_usd: 0.0,
-                        fusiform_multiplier: None,
                         accounts: vec![account(2.0), account(1.0)],
                     }],
                     ..Default::default()

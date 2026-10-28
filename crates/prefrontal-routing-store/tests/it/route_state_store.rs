@@ -1428,7 +1428,6 @@ fn decision_rejections_retain_subscription_reserve_numbers_ahead_of_catalog_tail
         plans: vec![SubscriptionPlan {
             tier: Some("pro_100".into()),
             fee_usd: 100.0,
-            fusiform_multiplier: None,
             accounts: vec![QuotaAccount {
                 weekly_used: 81.0,
                 weekly_remaining_fraction: 0.99,

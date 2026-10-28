@@ -1,16 +1,14 @@
-//! Subscription economics in pooled percentage points (one account-window percent).
+//! Subscription costs use provider value multipliers and pooled quota pressure.
 //! This module consumes snapshots only; selection never calls a quota service.
 
 use serde::Serialize;
 
 pub const ASTRO_MAX_AGE_MS: i64 = 48 * 60 * 60 * 1000;
 pub const DEFAULT_PLAN_FEE_USD: f64 = 200.0;
-/// No measured subsidy is assumed when all value sources are unknown.
-pub const DEFAULT_VALUE_MULTIPLIER: f64 = 1.0;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeasuredValue {
-    pub usd_per_point: f64,
+    /// API list value divided by the subscription cost of the quota used.
+    pub multiplier: f64,
     pub interval_end_ms: i64,
     pub row_date: String,
 }
@@ -30,7 +28,6 @@ pub struct SubscriptionPool {
 pub struct SubscriptionPlan {
     pub tier: Option<String>,
     pub fee_usd: f64,
-    pub fusiform_multiplier: Option<f64>,
     pub accounts: Vec<QuotaAccount>,
 }
 
@@ -56,12 +53,11 @@ pub struct QuotaConstraint {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionPricing {
-    pub value_per_point_usd: f64,
+    pub value_multiplier: f64,
     pub value_source: String,
-    pub message_points: f64,
+    pub list_cost_usd: f64,
     /// The basket's message, or the common output-only reference unit.
     pub price_unit: &'static str,
-    pub fee_per_point_usd: f64,
     pub plan_pressure: f64,
     pub keep_free_percent: f64,
     pub available_points: Option<f64>,
@@ -72,31 +68,20 @@ pub struct SubscriptionPricing {
 pub fn resolve_value(
     operator_multiplier: Option<f64>,
     measured: Option<&MeasuredValue>,
-    fusiform_multiplier: Option<f64>,
-    fee_per_point: f64,
     now_ms: i64,
 ) -> (f64, String) {
     let valid = |v: &f64| v.is_finite() && *v > 0.0;
-    if let Some(multiplier) = operator_multiplier.filter(valid) {
-        return (multiplier * fee_per_point, "operator override".into());
-    }
     if let Some(row) = measured.filter(|row| {
-        valid(&row.usd_per_point)
+        valid(&row.multiplier)
             && now_ms >= row.interval_end_ms
             && now_ms - row.interval_end_ms < ASTRO_MAX_AGE_MS
     }) {
-        return (row.usd_per_point, format!("astrocyte {}", row.row_date));
+        return (row.multiplier, format!("astrocyte {}", row.row_date));
     }
-    if let Some(multiplier) = fusiform_multiplier.filter(valid) {
-        return (
-            multiplier * fee_per_point,
-            "fusiform (conservative low)".into(),
-        );
+    if let Some(multiplier) = operator_multiplier.filter(valid) {
+        return (multiplier, "operator override".into());
     }
-    (
-        DEFAULT_VALUE_MULTIPLIER * fee_per_point,
-        "default (unmeasured)".into(),
-    )
+    (1.0, "unmeasured".into())
 }
 
 /// Remaining time / squared remaining share. For fixed time this is monotone
@@ -248,6 +233,21 @@ impl SubscriptionPool {
         keep_free: f64,
         head: bool,
     ) -> Option<SubscriptionPricing> {
+        let (value, source) = resolve_value(operator, self.measured.as_ref(), self.now_ms);
+        let pricing = |points, pressure, banked, tier| SubscriptionPricing {
+            value_multiplier: value,
+            value_source: source.clone(),
+            list_cost_usd: list_usd,
+            price_unit: "message",
+            plan_pressure: pressure,
+            keep_free_percent: if head { 0.0 } else { keep_free },
+            available_points: points,
+            banked_resets_applied: banked,
+            plan_tier: tier,
+        };
+        if self.plans.is_empty() {
+            return (head || keep_free == 0.0).then(|| pricing(None, 1.0, 0, None));
+        }
         self.plans
             .iter()
             .enumerate()
@@ -262,26 +262,7 @@ impl SubscriptionPool {
                 {
                     return None;
                 }
-                let fee = plan.fee_usd / 100.0;
-                let (value, source) = resolve_value(
-                    operator,
-                    self.measured.as_ref(),
-                    plan.fusiform_multiplier,
-                    fee,
-                    self.now_ms,
-                );
-                Some(SubscriptionPricing {
-                    value_per_point_usd: value,
-                    value_source: source,
-                    message_points: list_usd / value,
-                    price_unit: "message",
-                    fee_per_point_usd: fee,
-                    plan_pressure: pressure,
-                    keep_free_percent: if head { 0.0 } else { keep_free },
-                    available_points: points,
-                    banked_resets_applied: banked,
-                    plan_tier: plan.tier.clone(),
-                })
+                Some(pricing(points, pressure, banked, plan.tier.clone()))
             })
             .min_by(|a, b| a.dollars().total_cmp(&b.dollars()))
     }
@@ -289,13 +270,13 @@ impl SubscriptionPool {
 
 impl SubscriptionPricing {
     pub fn dollars(&self) -> f64 {
-        self.message_points * self.fee_per_point_usd * self.plan_pressure
+        self.list_cost_usd / self.value_multiplier * self.plan_pressure
     }
 
     pub fn explanation(&self) -> String {
-        format!("subscription value ${:.4}/point ({}); {} {:.6} pooled points; plan pressure {:.4}; keep-free margin {:.1}%; banked resets applied {}",
-            self.value_per_point_usd, self.value_source, self.price_unit, self.message_points, self.plan_pressure,
-            self.keep_free_percent, self.banked_resets_applied)
+        format!("subscription value multiplier M {:.4} ({}); {} list ${:.6}; plan pressure {:.4}; cost ${:.6}; keep-free margin {:.1}%; banked resets applied {}",
+            self.value_multiplier, self.value_source, self.price_unit, self.list_cost_usd, self.plan_pressure,
+            self.dollars(), self.keep_free_percent, self.banked_resets_applied)
     }
 }
 
@@ -304,36 +285,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn value_precedence_override_fresh_stale_and_absent() {
+    fn fresh_measurement_beats_operator_and_stale_falls_back() {
         let row = MeasuredValue {
-            usd_per_point: 28.4,
+            multiplier: 18.7,
             interval_end_ms: 1_000,
             row_date: "2026-10-09".into(),
         };
         assert_eq!(
-            resolve_value(Some(18.0), Some(&row), Some(27.5), 2.0, 1_001),
-            (36.0, "operator override".into())
+            resolve_value(Some(6.0), Some(&row), 1_001),
+            (18.7, "astrocyte 2026-10-09".into())
         );
         assert_eq!(
-            resolve_value(None, Some(&row), Some(27.5), 2.0, 1_001),
-            (28.4, "astrocyte 2026-10-09".into())
+            resolve_value(Some(6.0), Some(&row), 1_000 + ASTRO_MAX_AGE_MS - 1),
+            (18.7, "astrocyte 2026-10-09".into())
         );
         assert_eq!(
-            resolve_value(None, Some(&row), None, 2.0, 1_000 + ASTRO_MAX_AGE_MS),
-            (2.0, "default (unmeasured)".into())
+            resolve_value(Some(6.0), Some(&row), 1_000 + ASTRO_MAX_AGE_MS),
+            (6.0, "operator override".into())
         );
         assert_eq!(
-            resolve_value(None, None, None, 2.0, 1_001),
-            (2.0, "default (unmeasured)".into())
+            resolve_value(None, Some(&row), 1_000 + ASTRO_MAX_AGE_MS),
+            (1.0, "unmeasured".into())
         );
+        assert_eq!(resolve_value(None, None, 1_001), (1.0, "unmeasured".into()));
         assert_eq!(
-            resolve_value(None, Some(&row), Some(27.5), 2.0, 1_000 + ASTRO_MAX_AGE_MS),
-            (55.0, "fusiform (conservative low)".into())
+            resolve_value(Some(6.0), Some(&row), 999),
+            (6.0, "operator override".into())
         );
-        assert_eq!(
-            resolve_value(None, Some(&row), None, 2.0, 999).1,
-            "default (unmeasured)"
-        );
+    }
+
+    #[test]
+    fn invalid_multipliers_never_supply_value() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let row = MeasuredValue {
+                multiplier: invalid,
+                interval_end_ms: 1_000,
+                row_date: "2026-10-09".into(),
+            };
+            assert_eq!(resolve_value(Some(6.0), Some(&row), 1_001).0, 6.0);
+            assert_eq!(resolve_value(Some(invalid), Some(&row), 1_001).0, 1.0);
+            assert_eq!(resolve_value(Some(invalid), None, 1_001).0, 1.0);
+        }
+    }
+
+    #[test]
+    fn list_divided_by_multiplier_is_cost_before_pressure_for_workers_and_heads() {
+        for head in [false, true] {
+            for (provider, list, multiplier, expected) in [
+                ("codex", 0.84, 18.7, 0.044_919_786_096_256_68),
+                ("muse", 0.063, 6.0, 0.0105),
+            ] {
+                let mut pool = SubscriptionPool {
+                    provider: provider.into(),
+                    ..Default::default()
+                };
+                for no_accounts in [false, true] {
+                    if no_accounts {
+                        pool.plans.push(SubscriptionPlan {
+                            tier: None,
+                            fee_usd: 999.0,
+                            accounts: Vec::new(),
+                        });
+                    }
+                    let price = pool.price(list, Some(multiplier), 0.0, head).unwrap();
+                    assert_eq!(price.plan_pressure, 1.0);
+                    assert!((price.dollars() - expected).abs() < 1e-12);
+                    assert_eq!(price.list_cost_usd, list);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn account_pressure_multiplies_list_divided_by_value_not_plan_fee() {
+        let mut pool = SubscriptionPool {
+            plans: vec![plan(50.0)],
+            ..Default::default()
+        };
+        for fee in [20.0, 200.0, 999.0] {
+            pool.plans[0].fee_usd = fee;
+            let price = pool.price(0.063, Some(6.0), 0.0, false).unwrap();
+            assert_eq!(price.plan_pressure, 2.0);
+            assert!((price.dollars() - 0.021).abs() < 1e-12);
+        }
     }
 
     #[test]
@@ -352,7 +386,6 @@ mod tests {
         SubscriptionPlan {
             tier: Some("pro_200".into()),
             fee_usd: 200.0,
-            fusiform_multiplier: None,
             accounts: vec![QuotaAccount {
                 weekly_used: used,
                 weekly_remaining_fraction: 0.5,

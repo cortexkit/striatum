@@ -3429,15 +3429,15 @@ mod route_pricing_tests {
         .unwrap();
         let held = settle_live_config(&path);
         let pricing = held.pricing();
-        // Every model on a provider inherits the provider's subsidy, including
-        // one the config never names; a per-route entry overrides it.
+        // Every model on a provider inherits the provider's quota value, including
+        // one the config never names; a per-route entry cannot change that value.
         assert_eq!(
             pricing.subscription_multiplier("openai/brand-new-model"),
             Some(40.0)
         );
         assert_eq!(
             pricing.subscription_multiplier("openai/special-route"),
-            Some(5.0)
+            Some(40.0)
         );
         assert_eq!(pricing.subscription_multiplier("xai/grok-5"), None);
         assert_eq!(pricing.speed_multiplier("openai/special-route"), Some(0.5));

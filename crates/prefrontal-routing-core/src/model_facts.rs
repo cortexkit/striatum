@@ -35,11 +35,9 @@ pub const FAST_SUFFIX: &str = "-fast";
 pub struct RoutePricing {
     /// Speed multipliers keyed by full route key ("provider/model[/variant]").
     pub speed_multipliers: HashMap<String, f64>,
-    /// Subscription subsidy multipliers. Keyed by bare provider ("openai") or by
-    /// full route key ("openai/gpt-5.6-sol"); a route-key entry overrides its
-    /// provider's. Provider keying is the primary shape: the subsidy is a
-    /// property of the ACCOUNT serving the provider, not of any one model -
-    /// per-model repetition was the drift that let a new model ship unpriced. A
+    /// Subscription value multipliers, keyed only by bare provider ("openai").
+    /// Quota value belongs to the provider's accounts, not to an individual model;
+    /// full route keys are ignored even if a later configuration overlay adds one. A
     /// multiplier divides the route's list price to yield its effective
     /// (subscription-adjusted) price: 1.0 means "no subsidy known", larger values
     /// make the route proportionally cheaper than list.
@@ -55,9 +53,6 @@ impl RoutePricing {
     }
 
     pub fn subscription_multiplier(&self, route_key: &str) -> Option<f64> {
-        if let Some(value) = self.subscription_multipliers.get(route_key) {
-            return Some(*value);
-        }
         let provider = route_key
             .split_once('/')
             .map_or(route_key, |(provider, _)| provider);
@@ -716,5 +711,36 @@ pub fn fact_to_route(fact: &ModelFact) -> ModelRoute {
         route_key: make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()),
         capacity_key: make_capacity_key(&fact.provider_id, &fact.model_id),
         fact: fact.clone(),
+    }
+}
+
+#[cfg(test)]
+mod pricing_tests {
+    use super::*;
+
+    #[test]
+    fn subscription_multiplier_uses_only_the_provider_key() {
+        let pricing = RoutePricing {
+            subscription_multipliers: HashMap::from([
+                ("openai".into(), 18.7),
+                ("openai/gpt-6.1-sol".into(), 2.0),
+                ("openai/gpt-6-astra/high".into(), 3.0),
+                ("meta/muse-spark-1.3-contributor".into(), 6.0),
+            ]),
+            ..RoutePricing::default()
+        };
+        assert_eq!(pricing.subscription_multiplier("openai"), Some(18.7));
+        assert_eq!(
+            pricing.subscription_multiplier("openai/gpt-6.1-sol"),
+            Some(18.7)
+        );
+        assert_eq!(
+            pricing.subscription_multiplier("openai/gpt-6-astra/high"),
+            Some(18.7)
+        );
+        assert_eq!(
+            pricing.subscription_multiplier("meta/muse-spark-1.3-contributor"),
+            None
+        );
     }
 }
