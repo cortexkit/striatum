@@ -11,15 +11,15 @@ name = "ck-prefrontal-routing"
 path = "src/main.rs"
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = { workspace = true }
 
 [dependencies]
-async-nats = { version = "0.50", default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
-async-trait = "0.1"
-base64 = "0.22"
-cortexkit-bus-naming = "=0.2.7"
-cortexkit-bus-nats = "0.3.0"
-cortexkit-bus-trait = "0.3.0"
+async-nats = { workspace = true, default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+cortexkit-bus-naming = { workspace = true }
+cortexkit-bus-nats = { workspace = true }
+cortexkit-bus-trait = { workspace = true }
 # The routing/v1 role contract: wire shapes and validators for the v1 ops.
 cortexkit-role-routing = { workspace = true }
 subc-client-rs = { workspace = true }
@@ -34,19 +34,19 @@ subc-os = { workspace = true }
 subc-jsonc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
-schemars = "1"
-sha2 = "0.10"
+schemars = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
-cortexkit-bus-inmemory = "0.3.0"
+cortexkit-bus-inmemory = { workspace = true }
 # Drives this module through every routing/v1 contract rule.
 cortexkit-role-routing-conformance = { workspace = true }
 prefrontal-routing-store = { path = "../prefrontal-routing-store", features = ["test-support"] }
 prefrontal-test-support = { path = "../prefrontal-test-support" }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled"] }
 # The real-daemon e2e tests spawn the daemon and module binaries; nothing else in
 # this package's graph turns on tokio's process feature any more.
 tokio = { workspace = true, features = ["process"] }
