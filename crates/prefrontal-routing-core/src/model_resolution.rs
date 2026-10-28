@@ -1457,7 +1457,8 @@ pub struct BrocaUsageFacts {
     pub cached_input_tokens: u64,
     pub cache_write_tokens: u64,
     pub output_tokens: u64,
-    pub reasoning_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     #[serde(default)]
     pub retries_used: u64,
 }
@@ -1469,7 +1470,7 @@ impl NativeUsageFacts {
     /// - reasoning = reasoning_tokens
     /// - fresh_input = input_tokens (Broca already reports fresh, non-cached input)
     /// - output_tokens = output_tokens - reasoning_tokens
-    /// - absence of Broca usage is whole-object: None clears all five counters
+    /// - absent reasoning stays unknown; absent usage clears all five counters
     ///
     /// The output conversion is the load-bearing line. Broca's canonical
     /// `output_tokens` INCLUDES reasoning (broca-protocol `Usage::reasoning_tokens`:
@@ -1483,9 +1484,13 @@ impl NativeUsageFacts {
         if let Some(u) = usage {
             self.cached_read_tokens = Some(u.cached_input_tokens as f64);
             self.cache_write_tokens = Some(u.cache_write_tokens as f64);
-            self.reasoning_tokens = Some(u.reasoning_tokens as f64);
+            self.reasoning_tokens = u.reasoning_tokens.map(|tokens| tokens as f64);
             self.input_tokens = Some(u.input_tokens as f64);
-            self.output_tokens = u.output_tokens.saturating_sub(u.reasoning_tokens) as f64;
+            // With no breakdown, retain the combined output total without claiming
+            // that the provider measured zero reasoning tokens.
+            self.output_tokens =
+                u.output_tokens
+                    .saturating_sub(u.reasoning_tokens.unwrap_or(0)) as f64;
         } else {
             self.cached_read_tokens = None;
             self.cache_write_tokens = None;
@@ -2070,7 +2075,7 @@ mod tests {
             cached_input_tokens: 250,
             cache_write_tokens: 15,
             output_tokens: 120,
-            reasoning_tokens: 45,
+            reasoning_tokens: Some(45),
             retries_used: 0,
         };
         facts.apply_broca_usage(Some(&live_usage));
@@ -2084,7 +2089,7 @@ mod tests {
             cached_input_tokens: 40,
             cache_write_tokens: 20,
             output_tokens: 100,
-            reasoning_tokens: 80,
+            reasoning_tokens: Some(80),
             retries_used: 0,
         };
         fixture_facts.apply_broca_usage(Some(&fixture_usage));
@@ -2179,7 +2184,7 @@ mod tests {
             cached_input_tokens: 0,
             cache_write_tokens: 5,
             output_tokens: 50,
-            reasoning_tokens: 10,
+            reasoning_tokens: Some(10),
             retries_used: 0,
         };
         let mut facts_zero = usage_facts("zero-cached");
