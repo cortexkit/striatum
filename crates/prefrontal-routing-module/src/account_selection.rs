@@ -1952,9 +1952,6 @@ impl RequestMode {
 #[derive(Debug, Clone, Deserialize)]
 struct CallerParams {
     runner: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    harness: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
