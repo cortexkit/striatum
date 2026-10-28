@@ -4152,6 +4152,8 @@ fn subscription_plan(
 ) -> prefrontal_routing_core::subscription::SubscriptionPlan {
     prefrontal_routing_core::subscription::SubscriptionPlan {
         tier: Some(tier.into()),
+        plan: None,
+        measured: None,
         fee_usd: fee,
         accounts: used
             .iter()
@@ -4214,7 +4216,7 @@ fn subscription_scenario(
     };
     for f in &facts {
         let claude = f.provider_id == "anthropic";
-        let plans = if claude {
+        let mut plans = if claude {
             vec![subscription_plan("max_20x", 200.0, claude_use)]
         } else {
             vec![
@@ -4222,17 +4224,19 @@ fn subscription_scenario(
                 subscription_plan("pro_100", 100.0, &[100.0]),
             ]
         };
+        for plan in &mut plans {
+            plan.measured = Some(MeasuredValue {
+                multiplier: if claude { 38.1 } else { 18.7 },
+                interval_end_ms: 999_999,
+                row_date: "2026-10-09".into(),
+            });
+        }
         snapshot.by_capacity.insert(
             make_capacity_key(&f.provider_id, &f.model_id),
             RouteRuntimeState {
                 subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
                     provider: f.provider_id.clone(),
                     keep_free_percent: if claude { margin } else { 0.0 },
-                    measured: Some(MeasuredValue {
-                        multiplier: if claude { 38.1 } else { 18.7 },
-                        interval_end_ms: 999_999,
-                        row_date: "2026-10-09".into(),
-                    }),
                     plans,
                     allow_banked: false,
                     now_ms: 1_000_000,
@@ -4506,9 +4510,10 @@ fn subscription_stale_or_absent_measurement_uses_operator_then_one() {
                 .unwrap();
             let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
             if stale {
-                pool.measured.as_mut().unwrap().interval_end_ms = pool.now_ms - ASTRO_MAX_AGE_MS;
+                pool.plans[0].measured.as_mut().unwrap().interval_end_ms =
+                    pool.now_ms - ASTRO_MAX_AGE_MS;
             } else {
-                pool.measured = None;
+                pool.plans[0].measured = None;
             }
             let selected = select_model_route(input).unwrap();
             let pricing = selected.score.objective.subscription_pricing.unwrap();
@@ -4578,12 +4583,15 @@ fn subscription_task_cost_examples_and_api_list_cost() {
                 RouteRuntimeState {
                     subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
                         provider: provider.into(),
-                        measured: Some(MeasuredValue {
-                            multiplier: multiplier.unwrap_or(99.0),
-                            interval_end_ms: 999_999,
-                            row_date: "2026-10-09".into(),
-                        }),
-                        plans: vec![subscription_plan("plan", 200.0, &[])],
+                        plans: vec![{
+                            let mut plan = subscription_plan("plan", 200.0, &[]);
+                            plan.measured = Some(MeasuredValue {
+                                multiplier: multiplier.unwrap_or(99.0),
+                                interval_end_ms: 999_999,
+                                row_date: "2026-10-09".into(),
+                            });
+                            plan
+                        }],
                         now_ms: 1_000_000,
                         ..Default::default()
                     })),
@@ -4630,7 +4638,11 @@ fn unpriced_subscription_cannot_win_basket_or_plan_value_pricing() {
                 .by_capacity
                 .values_mut()
             {
-                std::sync::Arc::make_mut(state.subscription_pool.as_mut().unwrap()).measured = None;
+                for plan in
+                    &mut std::sync::Arc::make_mut(state.subscription_pool.as_mut().unwrap()).plans
+                {
+                    plan.measured = None;
+                }
             }
         }
         let selected = select_model_route(input).unwrap();
@@ -4651,8 +4663,10 @@ fn subscription_close_economic_prices_preserve_quality_tiebreak() {
         .get_mut("openai/gpt-6.1-sol")
         .unwrap();
     let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
-    pool.measured.as_mut().unwrap().multiplier = 30.2;
+    let mut measured = pool.plans[0].measured.clone().unwrap();
+    measured.multiplier = 30.2;
     pool.plans = vec![subscription_plan("pro_200", 200.0, &[3.0])];
+    pool.plans[0].measured = Some(measured);
     let selected = select_model_route(input).unwrap();
     assert_eq!(selected.route_key, "openai/gpt-6.1-sol");
 }

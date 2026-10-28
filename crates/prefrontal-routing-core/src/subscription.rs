@@ -1,4 +1,4 @@
-//! Subscription costs use provider value multipliers and pooled quota pressure.
+//! Subscription costs use plan value multipliers and pooled quota pressure.
 //! This module consumes snapshots only; selection never calls a quota service.
 
 use serde::Serialize;
@@ -17,7 +17,6 @@ pub struct MeasuredValue {
 pub struct SubscriptionPool {
     pub provider: String,
     pub keep_free_percent: f64,
-    pub measured: Option<MeasuredValue>,
     pub plans: Vec<SubscriptionPlan>,
     /// False while another available subscription plan has live, unreserved quota.
     pub allow_banked: bool,
@@ -27,6 +26,9 @@ pub struct SubscriptionPool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubscriptionPlan {
     pub tier: Option<String>,
+    /// Exact plan name joined from Astrocyte's per-account plan prices.
+    pub plan: Option<String>,
+    pub measured: Option<MeasuredValue>,
     pub fee_usd: f64,
     pub accounts: Vec<QuotaAccount>,
 }
@@ -55,6 +57,7 @@ pub struct QuotaConstraint {
 pub struct SubscriptionPricing {
     pub value_multiplier: f64,
     pub value_source: String,
+    pub plan_values: Vec<SubscriptionPlanValue>,
     pub list_cost_usd: f64,
     /// The basket's message, or the common output-only reference unit.
     pub price_unit: &'static str,
@@ -65,17 +68,33 @@ pub struct SubscriptionPricing {
     pub plan_tier: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionPlanValue {
+    pub plan_tier: Option<String>,
+    pub plan: Option<String>,
+    pub value_multiplier: f64,
+    /// One of measured, operator, or default.
+    pub source: &'static str,
+    pub weight: f64,
+}
+
+impl MeasuredValue {
+    fn usable(&self, now_ms: i64) -> bool {
+        self.multiplier.is_finite()
+            && self.multiplier > 0.0
+            && now_ms >= self.interval_end_ms
+            && now_ms - self.interval_end_ms < ASTRO_MAX_AGE_MS
+    }
+}
+
 pub fn resolve_value(
     operator_multiplier: Option<f64>,
     measured: Option<&MeasuredValue>,
     now_ms: i64,
 ) -> (f64, String) {
     let valid = |v: &f64| v.is_finite() && *v > 0.0;
-    if let Some(row) = measured.filter(|row| {
-        valid(&row.multiplier)
-            && now_ms >= row.interval_end_ms
-            && now_ms - row.interval_end_ms < ASTRO_MAX_AGE_MS
-    }) {
+    if let Some(row) = measured.filter(|row| row.usable(now_ms)) {
         return (row.multiplier, format!("astrocyte {}", row.row_date));
     }
     if let Some(multiplier) = operator_multiplier.filter(valid) {
@@ -233,10 +252,73 @@ impl SubscriptionPool {
         keep_free: f64,
         head: bool,
     ) -> Option<SubscriptionPricing> {
-        let (value, source) = resolve_value(operator, self.measured.as_ref(), self.now_ms);
+        let budgets: Vec<_> = self
+            .plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                plan.budget(
+                    keep_free,
+                    head,
+                    self.banked_for(index, keep_free, head),
+                    self.now_ms,
+                )
+            })
+            .collect();
+        let total_points: f64 = budgets.iter().filter_map(|b| b.0).sum();
+        let plan_values: Vec<_> = self
+            .plans
+            .iter()
+            .zip(&budgets)
+            .map(|(plan, budget)| {
+                let (value, _) = resolve_value(operator, plan.measured.as_ref(), self.now_ms);
+                SubscriptionPlanValue {
+                    plan_tier: plan.tier.clone(),
+                    plan: plan.plan.clone(),
+                    value_multiplier: value,
+                    source: if plan
+                        .measured
+                        .as_ref()
+                        .is_some_and(|row| row.usable(self.now_ms))
+                    {
+                        "measured"
+                    } else if operator.is_some_and(|v| v.is_finite() && v > 0.0) {
+                        "operator"
+                    } else {
+                        "default"
+                    },
+                    weight: if total_points > 0.0 {
+                        budget.0.unwrap_or(0.0) / total_points
+                    } else if self.plans.len() == 1 && budget.0.is_none() {
+                        // A lone unknown-capacity plan retains the no-quota-snapshot fallback.
+                        1.0
+                    } else {
+                        0.0
+                    },
+                }
+            })
+            .collect();
+        let weighted: Vec<_> = plan_values.iter().filter(|p| p.weight > 0.0).collect();
+        let (value, source) = if weighted.len() == 1 {
+            let index = plan_values.iter().position(|p| p.weight > 0.0).unwrap();
+            resolve_value(operator, self.plans[index].measured.as_ref(), self.now_ms)
+        } else if !weighted.is_empty() {
+            // Capacity-proportional usage pays list/M for each plan, so costs
+            // combine arithmetically and the list-to-quota multiplier harmonically.
+            (
+                1.0 / weighted
+                    .iter()
+                    .map(|p| p.weight / p.value_multiplier)
+                    .sum::<f64>(),
+                "spendable-points weighted harmonic mean".into(),
+            )
+        } else {
+            resolve_value(operator, None, self.now_ms)
+        };
         let pricing = |points, pressure, banked, tier| SubscriptionPricing {
             value_multiplier: value,
             value_source: source.clone(),
+            plan_values: plan_values.clone(),
             list_cost_usd: list_usd,
             price_unit: "message",
             plan_pressure: pressure,
@@ -250,14 +332,8 @@ impl SubscriptionPool {
         }
         self.plans
             .iter()
-            .enumerate()
-            .filter_map(|(index, plan)| {
-                let (points, pressure, banked) = plan.budget(
-                    keep_free,
-                    head,
-                    self.banked_for(index, keep_free, head),
-                    self.now_ms,
-                );
+            .zip(budgets)
+            .filter_map(|(plan, (points, pressure, banked))| {
                 if points.is_some_and(|p| p <= 0.0) || points.is_none() && !head && keep_free > 0.0
                 {
                     return None;
@@ -343,6 +419,8 @@ mod tests {
                     if no_accounts {
                         pool.plans.push(SubscriptionPlan {
                             tier: None,
+                            plan: None,
+                            measured: None,
                             fee_usd: 999.0,
                             accounts: Vec::new(),
                         });
@@ -371,6 +449,70 @@ mod tests {
     }
 
     #[test]
+    fn subscription_plan_values_use_spendable_points_weighted_harmonic_mean() {
+        let mut measured = plan(10.0);
+        measured.measured = Some(MeasuredValue {
+            multiplier: 4.0,
+            interval_end_ms: 999,
+            row_date: "fresh".into(),
+        });
+        let mut fallback = plan(70.0);
+        fallback.tier = Some("pro_100".into());
+        fallback.plan = Some("openai/pro_100".into());
+        let mut blocked = plan(0.0);
+        blocked.tier = Some("blocked".into());
+        blocked.plan = Some("blocked".into());
+        blocked.accounts[0].short_walled = true;
+        let mut pool = SubscriptionPool {
+            plans: vec![measured, fallback, blocked],
+            now_ms: 1000,
+            ..Default::default()
+        };
+        let price = pool.price(1.0, Some(2.0), 10.0, false).unwrap();
+        // Workers have 80 and 20 points after the reserve; the blocked plan has none.
+        assert!((price.value_multiplier - 10.0 / 3.0).abs() < 1e-12);
+        assert_eq!(
+            price
+                .plan_values
+                .iter()
+                .map(|p| (p.source, p.weight))
+                .collect::<Vec<_>>(),
+            vec![("measured", 0.8), ("operator", 0.2), ("operator", 0.0)]
+        );
+        assert_eq!(price.plan_values[0].value_multiplier, 4.0);
+        assert_eq!(price.plan_values[1].value_multiplier, 2.0);
+        let wire = serde_json::to_value(&price).unwrap();
+        assert_eq!(wire["planValues"][0]["planTier"], "pro_200");
+        assert_eq!(wire["planValues"][0]["plan"], "openai/pro_200");
+        assert_eq!(wire["planValues"][0]["source"], "measured");
+        assert_eq!(wire["planValues"][0]["weight"], 0.8);
+        // Heads spend 90 and 30 points, without the worker reserve.
+        assert!(
+            (pool
+                .price(1.0, Some(2.0), 10.0, true)
+                .unwrap()
+                .value_multiplier
+                - 3.2)
+                .abs()
+                < 1e-12
+        );
+        let default = pool.price(1.0, None, 10.0, false).unwrap();
+        assert!((default.value_multiplier - 2.5).abs() < 1e-12);
+        assert_eq!(default.plan_values[1].source, "default");
+        pool.plans.reverse();
+        assert_eq!(
+            pool.price(1.0, Some(2.0), 10.0, false)
+                .unwrap()
+                .value_multiplier,
+            price.value_multiplier
+        );
+        pool.plans[1].accounts[0].weekly_used = 100.0;
+        let single = pool.price(1.0, Some(2.0), 10.0, false).unwrap();
+        assert_eq!(single.value_multiplier, 4.0);
+        assert_eq!(single.plan_values[2].weight, 1.0);
+    }
+
+    #[test]
     fn pressure_monotone_and_steep_near_wall_and_expiring_headroom_cheap() {
         let mut previous = 0.0;
         for used in 0..100 {
@@ -385,6 +527,8 @@ mod tests {
     fn plan(used: f64) -> SubscriptionPlan {
         SubscriptionPlan {
             tier: Some("pro_200".into()),
+            plan: Some("openai/pro_200".into()),
+            measured: None,
             fee_usd: 200.0,
             accounts: vec![QuotaAccount {
                 weekly_used: used,

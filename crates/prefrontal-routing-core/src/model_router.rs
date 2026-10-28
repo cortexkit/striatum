@@ -1296,11 +1296,21 @@ fn compute_profile_objective(
         .map(|p| (p.value_multiplier, p.value_source.clone(), p.plan_pressure))
         .unwrap_or_else(|| {
             if is_subscription {
-                let (value, source) = crate::subscription::resolve_value(
-                    route.fact.subscription_multiplier,
-                    pool.measured.as_ref(),
-                    pool.now_ms,
-                );
+                let (value, source) = pool
+                    .price(
+                        0.0,
+                        route.fact.subscription_multiplier,
+                        pool.keep_free_percent,
+                        head,
+                    )
+                    .map(|p| (p.value_multiplier, p.value_source))
+                    .unwrap_or_else(|| {
+                        crate::subscription::resolve_value(
+                            route.fact.subscription_multiplier,
+                            None,
+                            pool.now_ms,
+                        )
+                    });
                 (value, source, 1.0)
             } else {
                 (1.0, "pay-per-token".to_string(), 1.0)
@@ -2895,13 +2905,14 @@ mod task_profile_pricing_tests {
             subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
                 provider: "codex".into(),
                 now_ms: 1000,
-                measured: Some(MeasuredValue {
-                    multiplier: 18.7,
-                    interval_end_ms: 999,
-                    row_date: "fresh".into(),
-                }),
                 plans: vec![SubscriptionPlan {
                     tier: Some("pro".into()),
+                    plan: Some("openai/pro_200".into()),
+                    measured: Some(MeasuredValue {
+                        multiplier: 18.7,
+                        interval_end_ms: 999,
+                        row_date: "fresh".into(),
+                    }),
                     fee_usd: 200.0,
                     accounts: vec![QuotaAccount {
                         weekly_used: 50.0,

@@ -1427,6 +1427,8 @@ fn decision_rejections_retain_subscription_reserve_numbers_ahead_of_catalog_tail
         keep_free_percent: 20.0,
         plans: vec![SubscriptionPlan {
             tier: Some("pro_100".into()),
+            plan: None,
+            measured: None,
             fee_usd: 100.0,
             accounts: vec![QuotaAccount {
                 weekly_used: 81.0,

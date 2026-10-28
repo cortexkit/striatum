@@ -675,6 +675,8 @@ fn reserved_headroom_panel_cause_publishes_structured_reset_without_prose_timest
                     now_ms: 1791682778812,
                     plans: vec![SubscriptionPlan {
                         tier: None,
+                        plan: None,
+                        measured: None,
                         fee_usd: 0.0,
                         accounts: vec![account(2.0), account(1.0)],
                     }],
