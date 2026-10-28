@@ -6599,6 +6599,25 @@ async fn handle_set_decision_outcome(
             .map_err(|e| ModuleError::Message(e.to_string()))?;
     }
     let observed_at_ms = now_ms() as i64;
+    if let Err(error) = record_provider_reset_fence(
+        store,
+        broca_credentials,
+        &params.decision_id,
+        &outcome,
+        provider_outcome.as_ref(),
+        observed_at_ms,
+    ) {
+        return send_route_error(
+            writer,
+            ver,
+            channel,
+            epoch,
+            corr,
+            "store_error",
+            &format!("set_decision_outcome: provider reset fence: {error}"),
+        )
+        .await;
+    }
     // A credential the provider refused permanently is fenced whatever the
     // decision ledger still holds: the report names the provider and the
     // credential itself. Recording renews a repeated refusal, so a fence that
@@ -6683,6 +6702,83 @@ async fn handle_set_decision_outcome(
             .await
         }
     }
+}
+
+/// Provider reset evidence accompanies episode outcomes, including interruptions
+/// on v1-selected workers. Keep it separate from model health and fence only the
+/// route on the credential that served it, never the provider's other accounts.
+fn record_provider_reset_fence(
+    store: &SharedStore,
+    credentials: &SharedBrocaCredentials,
+    decision_id: &str,
+    outcome: &RouteOutcome,
+    provider: Option<&prefrontal_routing_core::route_state_store::ProviderOutcome>,
+    now: i64,
+) -> Result<(), String> {
+    if *outcome == RouteOutcome::Completed {
+        return Ok(());
+    }
+    let Some(provider) = provider.filter(|p| p.credential_refusal.is_none()) else {
+        return Ok(());
+    };
+    let Some(reset) = provider.resets_at_ms.filter(|reset| *reset > now) else {
+        return Ok(());
+    };
+    let Some(decision) = store
+        .get_decision_by_id(decision_id)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+    let (Some(provider_id), Some(model)) =
+        (decision.selected_provider_id, decision.selected_model_id)
+    else {
+        return Ok(());
+    };
+    let frozen = store
+        .decision_provider_identity(decision_id)
+        .map_err(|e| e.to_string())?
+        .and_then(|identity| identity.credential_id);
+    let credential = if let Some(frozen) = frozen {
+        frozen
+    } else if let Some(reported) = provider.credential_id.as_deref() {
+        // Without a frozen identity, accept only a listed credential that serves
+        // the decision's model. Provider account aliases are not credential ids.
+        let facts = store.get_facts().map_err(|e| e.to_string())?;
+        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        let Some(fact) = facts
+            .iter()
+            .find(|fact| fact.provider_id == provider_id && fact.model_id == model)
+        else {
+            return Ok(());
+        };
+        let credentials = credentials.lock().map_err(|e| e.to_string())?;
+        if !credentials.listed_credentials().iter().any(|row| {
+            row.id == reported && broca_credentials::credential_serves_fact(row, fact, &catalog)
+        }) {
+            return Ok(());
+        }
+        reported.to_owned()
+    } else {
+        return Ok(());
+    };
+    // Weekly provider windows can exceed the generic v1 report's one-day cap.
+    // Eight days bounds malformed timestamps without shortening a weekly reset.
+    const MAX_PROVIDER_RESET_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
+    let until = reset.min(now.saturating_add(MAX_PROVIDER_RESET_MS));
+    if until != reset {
+        eprintln!("[prefrontal-routing] provider reset clamped decision={decision_id} provider={provider_id} credential={credential} reset_at_ms={reset} until_ms={until}");
+    }
+    store
+        .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+            provider: provider_id,
+            credential_id: credential,
+            model,
+            until_ms: until,
+            decision_id: decision_id.into(),
+            recorded_at: now,
+        })
+        .map_err(|e| e.to_string())
 }
 
 async fn handle_record_usage(
@@ -8535,7 +8631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_outcome_wire_records_terminal_outcomes_without_reset_fences() {
+    async fn provider_outcome_wire_records_terminal_outcomes_and_frozen_reset_fence() {
         use prefrontal_routing_core::route_state_store::ProviderOutcome;
         let rig = Rig::new("provider-reset-wire");
         let store = Arc::new(rig.open_store());
@@ -8622,6 +8718,11 @@ mod tests {
                 }),
             );
         }
+        let fences = store.account_route_fences(now_ms() as i64).unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].decision_id, failed);
+        assert_eq!(fences[0].credential_id, "antigravity:google");
+        assert_eq!(fences[0].until_ms, reset);
     }
 
     /// Replay of a live incident: vault credential `apikey:cline-pass` was mapped to
@@ -9249,6 +9350,23 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(store.credential_entitlement_fences().unwrap().len(), 2);
+        let now = now_ms() as i64;
+        for (provider, credential, model) in [
+            ("inception", "apikey:inception", "model-a"),
+            ("other", "apikey:inception", "model-b"),
+            ("other", "apikey:other", "model-b"),
+        ] {
+            store
+                .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                    provider: provider.into(),
+                    credential_id: credential.into(),
+                    model: model.into(),
+                    until_ms: now + 600_000,
+                    decision_id: "reset-decision".into(),
+                    recorded_at: now,
+                })
+                .unwrap();
+        }
         // The operator on a shell on this machine.
         let reply = clear_fences_as(&store, 501, "direct", "apikey:inception").await;
         assert_eq!(reply.header.ty, FrameType::Response, "{reply:?}");
@@ -9262,6 +9380,9 @@ mod tests {
             "the reply names what was lifted: {body}"
         );
         assert!(store.credential_entitlement_fences().unwrap().is_empty());
+        let remaining = store.account_route_fences(now).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].credential_id, "apikey:other");
         // The operator on the phone.
         credential_fences::record(&store, &credentials, &refusal("inception"), now_ms() as i64)
             .unwrap();

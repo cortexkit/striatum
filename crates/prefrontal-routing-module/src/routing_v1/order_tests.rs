@@ -480,42 +480,150 @@ async fn a_v1_mason_runs_the_consumer_variant_the_older_select_chose() {
 }
 
 #[tokio::test]
-async fn legacy_provider_reset_leaves_both_select_wires_and_pins_selectable() {
-    let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
-    harness.edit_config(|config| {
-        config.as_object_mut().unwrap().remove("accounts");
-    });
-    let route = harness.bind(reserved("example-consumer"), None).await;
-    let mut legacy = select("mason");
-    legacy["targetAgent"] = json!("mason");
-    legacy["executor"] = json!("broca");
-    legacy["substrate"] = json!("broca");
-    legacy["requirements"]["eq"] = json!(0);
-    let first = route.call("route.select", &legacy).await;
-    assert_eq!(legacy_route(&first), CHEAP);
-    let outcome = route
-        .call(
-            "route.set_decision_outcome",
-            &json!({
-                "decisionID": first.1["result"]["decisionID"],
-                "outcome": "interrupted",
-                "providerOutcome": {"accountRef": "account-a", "resetsAtMs": i64::MAX},
-            }),
-        )
-        .await;
-    assert_eq!(outcome.0, FrameType::Response, "{}", outcome.1);
-    assert_eq!(outcome.1["result"]["ok"], true, "{}", outcome.1);
-    assert_eq!(
-        route_of(&route.call("route.select", &select("mason")).await),
-        CHEAP
-    );
-    assert_eq!(
-        legacy_route(&route.call("route.select", &legacy).await),
-        CHEAP
-    );
-    let mut pinned = select("mason");
-    pinned["pin"] = json!(CHEAP);
-    assert_eq!(route_of(&route.call("route.select", &pinned).await), CHEAP);
+async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select_wires() {
+    use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+    let now = 1_793_149_650_000;
+    let _clock = crate::InjectedClock::set(now as u64);
+    for v1 in [true, false] {
+        for (reset, sibling) in [
+            (now + 5 * 86_400_000, false),
+            (now - 6_000, false),
+            (i64::MAX, false),
+            (now + 5 * 86_400_000, true),
+        ] {
+            let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
+            harness.edit_config(|config| {
+                config.as_object_mut().unwrap().remove("accounts");
+            });
+            let mut credentials = BrocaCredentials::api_test_credentials(&facts(&[
+                (CHEAP, true, true, 200_000),
+                (DEAR, true, true, 200_000),
+            ]));
+            credentials.apply_listing(
+                &ScopedCredentialListing {
+                    view: "worker-keys".into(),
+                    credentials: ["cheap-provider", "dear-provider"]
+                        .into_iter()
+                        .map(|provider| (provider, format!("apikey:{provider}")))
+                        .chain(sibling.then(|| ("cheap-provider", "apikey:cheap-sibling".into())))
+                        .map(|(provider, id)| ListedCredential {
+                            id,
+                            state: "active".into(),
+                            categories: vec!["llm-provider".into()],
+                            provider_ids: vec![provider.into()],
+                            credential_type: "apikey".into(),
+                            auth_method: Some("apikey".into()),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                now as u64,
+            );
+            harness.set_credentials(credentials);
+            let route = harness.bind(reserved("example-consumer"), None).await;
+            let mut legacy = select("mason");
+            legacy["targetAgent"] = json!("mason");
+            legacy["executor"] = json!("broca");
+            legacy["substrate"] = json!("broca");
+            legacy["requirements"]["eq"] = json!(0);
+            let v1_select = select("mason");
+            let first = route
+                .call("route.select", if v1 { &v1_select } else { &legacy })
+                .await;
+            let decision = if v1 {
+                assert_eq!(route_of(&first), CHEAP);
+                &first.1["result"]["decision_id"]
+            } else {
+                assert_eq!(legacy_route(&first), CHEAP);
+                &first.1["result"]["decisionID"]
+            };
+            if v1 {
+                // Multiple serving keys leave no single frozen identity. The
+                // worker's reported key must still be checked against the listing.
+                harness
+                    .store()
+                    .set_decision_provider_identity(
+                        decision.as_str().unwrap(),
+                        &prefrontal_routing_core::route_state_store::ProviderOutcome {
+                            account_ref: "provider-alias".into(),
+                            credential_id: None,
+                            resets_at_ms: None,
+                            credential_refusal: None,
+                        },
+                    )
+                    .unwrap();
+                assert!(harness
+                    .store()
+                    .decision_provider_identity(decision.as_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .credential_id
+                    .is_none());
+            }
+            let outcome = route
+                .call(
+                    "route.set_decision_outcome",
+                    &json!({
+                        "decisionID": decision,
+                        "outcome": "interrupted",
+                        "lastError": "account_limit_exhausted: Go usage limit exceeded",
+                        "providerOutcome": {"accountRef": "apikey:cheap-provider",
+                            "credentialId": "apikey:cheap-provider", "resetsAtMs": reset},
+                    }),
+                )
+                .await;
+            assert_eq!(outcome.0, FrameType::Response, "{}", outcome.1);
+            assert_eq!(outcome.1["result"]["ok"], true, "{}", outcome.1);
+            let blocked = reset > now && !sibling;
+            let expected = if blocked { DEAR } else { CHEAP };
+            assert_eq!(
+                route_of(&route.call("route.select", &select("mason")).await),
+                expected
+            );
+            assert_eq!(
+                legacy_route(&route.call("route.select", &legacy).await),
+                expected
+            );
+            let mut pinned = select("mason");
+            pinned["pin"] = json!(CHEAP);
+            let pinned = route.call("route.select", &pinned).await;
+            let mut legacy_pin = legacy.clone();
+            legacy_pin["modelPin"] = json!(CHEAP);
+            let legacy_pin = route.call("route.select", &legacy_pin).await;
+            if blocked {
+                assert_eq!(pinned.0, FrameType::Error, "{}", pinned.1);
+                assert_eq!(legacy_pin.0, FrameType::Error, "{}", legacy_pin.1);
+            } else {
+                assert_eq!(route_of(&pinned), CHEAP);
+                assert_eq!(legacy_route(&legacy_pin), CHEAP);
+            }
+            let fences = harness.store().account_route_fences(now).unwrap();
+            if reset > now {
+                assert_eq!(fences.len(), 1);
+                assert_eq!(fences[0].credential_id, "apikey:cheap-provider");
+                assert_eq!(fences[0].model, "model-a");
+                assert_eq!(fences[0].until_ms, reset.min(now + 8 * 86_400_000));
+                assert!(harness
+                    .store()
+                    .account_route_fences(fences[0].until_ms)
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    route_of(&route.call("route.select", &select("mason")).await),
+                    CHEAP
+                );
+            } else {
+                assert!(fences.is_empty());
+            }
+            let row = harness
+                .store()
+                .get_decision_by_id(decision.as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.outcome.as_deref(), Some("interrupted"));
+        }
+    }
 }
 
 #[tokio::test]

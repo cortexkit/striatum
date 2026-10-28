@@ -196,11 +196,19 @@ pub(crate) fn lift_after_success(
 }
 
 /// End every fence naming `credential_id`, as an operator does right after
-/// topping it up. Returns the fences that were lifted, ordered by provider.
+/// topping it up. Returns the entitlement fences that were lifted, ordered by provider.
 pub(crate) fn lift_for_operator(
     store: &SqliteRouteStateStore,
     credential_id: &str,
 ) -> Result<Vec<CredentialEntitlementFence>, String> {
+    let route_fences = store
+        .clear_account_route_fences_for_credential(credential_id)
+        .map_err(|e| e.to_string())?;
+    if route_fences > 0 {
+        eprintln!(
+            "[prefrontal-routing] account route fences lifted credential={credential_id} count={route_fences}: operator lift after top-up"
+        );
+    }
     let lifted = store
         .clear_credential_entitlement_fences_for_credential(credential_id)
         .map_err(|e| e.to_string())?;
