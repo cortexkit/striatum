@@ -12,6 +12,57 @@ use super::conformance_tests::{reserved, Harness, Route};
 const NOW: u64 = 1_800_000_000_000;
 const OP: &str = crate::diagnostics_findings::OP;
 
+fn assert_vector(name: &str, value: &Value) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test-vectors/diagnostics-findings-v1")
+        .join(name);
+    let mut bytes = serde_json::to_vec_pretty(value).unwrap();
+    bytes.push(b'\n');
+    if std::env::var_os("UPDATE_DIAGNOSTICS_FINDINGS_VECTORS").is_some() {
+        std::fs::write(&path, &bytes).unwrap();
+    }
+    assert_eq!(bytes, std::fs::read(path).unwrap(), "vector {name}");
+}
+
+#[tokio::test]
+async fn diagnostics_findings_v1_vectors_match_serving_replies() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = Harness::new("diagnostics-v1-vectors");
+    hosts(&[("prefrontal-core", true)]);
+    let head = scoped(&harness, "bridge-relay", head_scope("prefrontal-core")).await;
+    for (name, params, window) in [
+        ("request-empty.json", json!({}), 21_600_000),
+        ("request-window.json", json!({"window_ms": 60_000}), 60_000),
+        (
+            "request-max-window.json",
+            json!({"window_ms": 604_800_000}),
+            604_800_000,
+        ),
+    ] {
+        assert_vector(name, &json!({"method": OP, "params": params}));
+        let (ty, reply) = head.call(OP, &params).await;
+        assert_eq!(ty, FrameType::Response, "{reply}");
+        assert_eq!(reply["result"]["window_ms"], window);
+        assert_eq!(reply["result"]["findings"], json!([]));
+    }
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &CredentialRefusal {
+                provider_id: "inception".into(),
+                credential_id: "apikey:inception:main".into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            NOW as i64 - 10 * 60_000,
+        )
+        .unwrap();
+    let (ty, reply) = head.call(OP, &json!({})).await;
+    assert_eq!(ty, FrameType::Response, "{reply}");
+    assert_eq!(reply["result"]["findings"].as_array().unwrap().len(), 1);
+    assert_vector("reply-routing-findings.json", &reply);
+}
+
 fn hosts(entries: &[(&str, bool)]) {
     super::consumers::replace_catalog(&Value::Array(
         entries
