@@ -361,8 +361,8 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
 /// `internal_error`, `no_eligible_account`, `account_selection_unsupported`,
 /// `unscoped_caller`) become the transient `account_selection_unavailable`.
 /// `account_selection_disabled` is preserved verbatim so it stays
-/// distinguishable from quota or authentication refusals; the contract still
-/// needs to declare it. This arm is the backstop.
+/// distinguishable from quota or authentication refusals; the contract
+/// declares it (0.5.2) as untimed with empty detail. This arm is the backstop.
 fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refusal {
     let wait_until = || {
         detail
@@ -381,6 +381,10 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                 .or_else(wait_until),
         ),
         "invalid_request" => Refusal::invalid_request("params", message.clone()),
+        // Declared (0.5.2) and untimed: module-wide, use your own credential.
+        "account_selection_disabled" => {
+            Refusal::new(RefusalCode::AccountSelectionDisabled, message.clone())
+        }
         "store_error"
         | "internal_error"
         | "no_eligible_account"

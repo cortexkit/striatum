@@ -58,8 +58,8 @@ pub const ACCOUNT_RELEASE_OP: &str = "route.account_release";
 /// code is intentionally preserved verbatim: it means the operator switched
 /// account selection off for the whole module (the serving flag), and Broca
 /// falls back to its static credential on it, so it must stay
-/// distinguishable from quota or auth refusals. The contract still needs to
-/// declare this code.
+/// distinguishable from quota or auth refusals. The contract declares it
+/// (0.5.2) as untimed with empty detail, module-wide.
 pub const DISABLED_CODE: &str = "account_selection_disabled";
 
 /// A reservation that has not started within this long expires.

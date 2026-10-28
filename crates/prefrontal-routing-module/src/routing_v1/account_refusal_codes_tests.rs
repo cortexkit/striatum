@@ -143,12 +143,12 @@ async fn pin_generation_conflict_is_untimed_on_both_entrypoints() {
 }
 
 #[tokio::test]
-async fn disabled_stays_disabled_per_chair_ruling() {
+async fn disabled_is_declared_untimed_and_module_wide() {
     // Keep the exact `account_selection_disabled` code. It means the operator
     // switched account selection off for the whole module (the global serving
     // flag), and Broca falls back to its static credential on it, so it must
-    // stay distinguishable from quota or auth refusals. The contract still
-    // needs to declare this code.
+    // stay distinguishable from quota or auth refusals. The contract declares
+    // it (0.5.2) as untimed with empty detail.
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     let policy = harness.operator_config().allocator_policy("synthetic");
@@ -164,10 +164,32 @@ async fn disabled_stays_disabled_per_chair_ruling() {
     let reply =
         account_selection::handle(ACCOUNT_FOR_OP, &body, &format!("reserved:{RUNNER}"), &ctx);
     assert_eq!(reply.code(), Some("account_selection_disabled"));
-    // The v1 adapter preserves it verbatim (as `Other`) so Broca still sees
-    // the distinct code.
+    // The v1 adapter preserves it as the declared code with empty detail.
     let refusal = super::accounts::account_refusal_for_test("account_selection_disabled");
-    assert_eq!(refusal.code.as_str(), "account_selection_disabled");
+    assert_eq!(refusal.code, RefusalCode::AccountSelectionDisabled);
+    assert!(refusal.code.is_known());
+    assert!(refusal.detail.is_empty());
+    assert_eq!(refusal.wait_until_ms(), None);
+}
+
+#[test]
+fn disabled_sample_from_contract_052_is_declared_and_never_timed() {
+    // Pins the exact `account_selection_disabled` sample body shipped in the
+    // 0.5.2 `test-vectors/routing-v1/refusals.json`: it decodes to the known
+    // code with empty detail and is never timed, even if a peer attaches
+    // timing fields.
+    let mut refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_str(
+        r#"{"code":"account_selection_disabled","message":"account selection is off on this router; use your own credential","detail":{}}"#,
+    )
+    .unwrap();
+    assert!(refusal.code.is_known());
+    assert_eq!(refusal.code, RefusalCode::AccountSelectionDisabled);
+    assert!(refusal.detail.is_empty());
+    assert_eq!(refusal.wait_until_ms(), None);
+    for key in ["reset_at_ms", "until_ms"] {
+        refusal.detail.insert(key.into(), json!(99));
+    }
+    assert_eq!(refusal.wait_until_ms(), None);
 }
 
 #[tokio::test]
@@ -341,6 +363,7 @@ fn contract_codes_map_with_contract_detail() {
         "auth_required",
         "account_quota_unknown",
         "account_pool_reserve_limited",
+        "account_selection_disabled",
         "account_selection_unavailable",
         "admission_conflict",
         "pin_generation_conflict",
@@ -353,9 +376,8 @@ fn contract_codes_map_with_contract_detail() {
 
 #[test]
 fn undeclared_legacy_codes_become_unavailable() {
-    // `account_selection_disabled` is intentionally excluded: it is preserved
-    // verbatim so it stays distinguishable from quota or authentication
-    // refusals, and the contract still needs to declare it.
+    // `account_selection_disabled` is intentionally excluded: the contract
+    // declares it (0.5.2), so it keeps its own code instead of mapping here.
     for code in [
         "store_error",
         "internal_error",
