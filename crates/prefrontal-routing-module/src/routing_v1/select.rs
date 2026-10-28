@@ -1254,6 +1254,7 @@ mod tests {
     #[test]
     fn only_quota_and_cooldown_refusals_carry_a_reset() {
         let refusal = |reason, reset| NoRouteError {
+            candidates: Vec::new(),
             reason,
             message: "m".into(),
             rejected: Vec::new(),

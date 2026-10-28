@@ -131,6 +131,14 @@ struct CatalogGetReply {
     resolved_at_ms: i64,
     #[serde(default)]
     curated: Vec<CatalogCuratedModel>,
+    #[serde(default)]
+    quality_scores: Option<QualityScores>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+struct QualityScores {
+    graded_by: String,
+    graded_at_ms: i64,
 }
 
 /// Keep disclosures with their model pages until the entire read is assembled.
@@ -151,6 +159,8 @@ struct CatalogPage {
     curated: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     aliased: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality_scores: Option<QualityScores>,
 }
 
 impl CatalogPage {
@@ -158,6 +168,7 @@ impl CatalogPage {
         if self.source != page.source
             || self.catalog_version != page.catalog_version
             || self.resolved_at_ms != page.resolved_at_ms
+            || self.quality_scores != page.quality_scores
         {
             return Err(error("Fusiform catalog page identity changed during read"));
         }
@@ -291,6 +302,8 @@ pub(crate) struct CatalogSnapshot {
     facts: Vec<FusiformFactUpdate>,
     rates: BTreeMap<String, ModelRates>,
     pub(crate) wire_apis: BTreeMap<String, String>,
+    quality_scores: Option<QualityScores>,
+    grades: BTreeMap<String, prefrontal_routing_store::OperatorQuality>,
     /// `(provider_id, model_id)` of entries served under a well-formed
     /// `provider/model` key whose facts could not be decoded. Applying the
     /// snapshot leaves their stored rows and cached base rates as they were:
@@ -736,9 +749,31 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut rates = BTreeMap::new();
     let mut retained = BTreeSet::new();
     let mut wire_apis = BTreeMap::new();
+    let mut grades = BTreeMap::new();
     // (served key, reason) for every entry left out of this snapshot.
     let mut unreadable: Vec<(String, String)> = Vec::new();
     for (served_key, entry) in reply.models {
+        if reply
+            .quality_scores
+            .as_ref()
+            .is_some_and(|scores| scores.graded_by == "operator")
+        {
+            if let (Some(elo), Some(eq)) = (
+                entry.get("quality.elo").and_then(Value::as_f64),
+                entry.get("quality.eq").and_then(Value::as_f64),
+            ) {
+                let model = entry
+                    .get("model.canonical_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or(&served_key)
+                    .to_owned();
+                grades.insert(
+                    served_key.clone(),
+                    prefrontal_routing_store::OperatorQuality { model, elo, eq },
+                );
+            }
+        }
         let entry_auth_methods = auth_methods.remove(&served_key);
         // A key that does not split into provider/model names no stored row,
         // so skipping it leaves nothing behind to protect.
@@ -779,6 +814,8 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         rates,
         retained,
         wire_apis,
+        quality_scores: reply.quality_scores,
+        grades,
     })
 }
 
@@ -1315,6 +1352,13 @@ fn apply_catalog_snapshot(
     if let Some(path) = family_config_path {
         crate::config_overrides::apply_family_rules_from_config(store, path)
             .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
+        let shadowed =
+            crate::config_overrides::live_config(path).shadowed_operator_grades(&snapshot.grades);
+        if !shadowed.is_empty() {
+            eprintln!(
+                "[prefrontal-routing] elo_overrides shadow Fusiform operator grades: {shadowed:?}"
+            );
+        }
     }
     if let Some(sources) = ladder {
         winner_ladder::announce(
@@ -1366,6 +1410,15 @@ pub(crate) fn apply_mapped_catalog(
             &retained,
         )
         .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
+    store
+        .replace_operator_quality(
+            snapshot
+                .quality_scores
+                .as_ref()
+                .is_some_and(|scores| scores.graded_by == "operator"),
+            &snapshot.grades,
+        )
+        .map_err(|reason| error(format!("apply operator quality: {reason}")))?;
     if let Some(credentials) = credentials {
         let mut credentials = credentials
             .lock()
@@ -1627,6 +1680,7 @@ pub async fn catalog_refresh_loop(
 
 #[cfg(test)]
 mod tests {
+    include!("operator_quality_tests.rs");
     include!("fusiform_catalog_paging_tests.rs");
     include!("billing_readiness_tests.rs");
     use super::*;

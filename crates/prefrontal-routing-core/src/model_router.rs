@@ -344,6 +344,7 @@ pub struct PromptParams {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectedRouteScore {
+    pub candidates: Vec<CandidateQualityScore>,
     pub adequacy: f64,
     pub raw_adequacy: f64,
     pub selection_cost: f64,
@@ -357,6 +358,60 @@ pub struct SelectedRouteScore {
     /// Why the selection priced output-only, when it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pricing_fallback: Option<String>,
+}
+
+/// Effective quality and its source for every candidate, including routes
+/// rejected before ranking. Eligibility records the decision's admission gate.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateQualityScore {
+    pub route_key: String,
+    pub model: String,
+    pub elo: f64,
+    pub eq: f64,
+    pub elo_source: &'static str,
+    pub eq_source: &'static str,
+    pub eligible: bool,
+}
+
+impl CandidateQualityScore {
+    pub fn from_fact(fact: &ModelFact, eligible: bool) -> Self {
+        Self {
+            model: format!("{}/{}", fact.provider_id, fact.model_id),
+            eligible,
+            route_key: fact_to_route(fact).route_key,
+            elo: fact.scores.elo,
+            eq: fact.scores.eq,
+            elo_source: match fact.score_provenance {
+                ScoreProvenance::OperatorGrade => "operator_grade",
+                ScoreProvenance::EloOverride => "override",
+                _ => "curated",
+            },
+            eq_source: match fact.eq_source.as_deref() {
+                Some("operator_grade") => "operator_grade",
+                Some("override") => "override",
+                _ => "curated",
+            },
+        }
+    }
+}
+
+fn candidate_quality_scores(
+    facts: &[ModelFact],
+    admitted: &[AdmittedRoute],
+) -> Vec<CandidateQualityScore> {
+    let mut candidates = facts
+        .iter()
+        .map(|fact| {
+            let route_key = fact_to_route(fact).route_key;
+            CandidateQualityScore::from_fact(
+                fact,
+                admitted.iter().any(|a| a.route.route_key == route_key),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| a.route_key.cmp(&b.route_key));
+    candidates
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -461,6 +516,7 @@ impl RouteFailureReason {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NoRouteError {
+    pub candidates: Vec<CandidateQualityScore>,
     pub reason: RouteFailureReason,
     pub message: String,
     pub rejected: Vec<RejectedRoute>,
@@ -1698,6 +1754,7 @@ fn admit_and_price_shortlist(
         || config.demand_exponent <= 0.0
     {
         return Err(NoRouteError {
+            candidates: candidate_quality_scores(&input.facts, &[]),
             reason: RouteFailureReason::InvalidRequirements,
             message: "model_requirements must be numbers in 0..100".to_string(),
             rejected: Vec::new(),
@@ -1714,6 +1771,7 @@ fn admit_and_price_shortlist(
         .unwrap_or(false);
     if capability_only && !has_required_cap {
         return Err(NoRouteError {
+            candidates: candidate_quality_scores(&input.facts, &[]),
             reason: RouteFailureReason::InvalidRequirements,
             message: "all-zero model_requirements require a required capability (e.g. vision)"
                 .to_string(),
@@ -1766,6 +1824,7 @@ fn admit_and_price_shortlist(
         let (earliest_reset, earliest_reset_route) =
             earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
         return Err(NoRouteError {
+            candidates: candidate_quality_scores(&input.facts, &admissible),
             reason: classify_empty_admission(&rejected),
             message: "no admissible model route for requirements".to_string(),
             rejected,
@@ -1811,6 +1870,7 @@ fn admit_and_price_shortlist(
             earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
 
         return Err(NoRouteError {
+            candidates: candidate_quality_scores(&input.facts, &admissible),
             reason: RouteFailureReason::AllRoutesInadequate,
             message: format!(
                 "no route clears the adequacy floor ({:.2}); best effort adequacy {:.2} is below the sanity band ({:.2})",
@@ -2295,6 +2355,7 @@ pub fn select_model_route_with_profiles(
         route_key: winner_admissible.route.route_key.clone(),
         capacity_key: winner_admissible.route.capacity_key.clone(),
         score: SelectedRouteScore {
+            candidates: candidate_quality_scores(&input.facts, &admissible),
             adequacy: winner_admissible.adequacy.adequacy,
             raw_adequacy: winner_admissible.adequacy.raw_adequacy,
             selection_cost: winner.objective.selection_cost,

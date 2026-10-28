@@ -412,6 +412,7 @@ pub struct PackageSeatReplacement {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectedPanel {
+    pub candidates: Vec<crate::model_router::CandidateQualityScore>,
     pub members: Vec<PanelMember>,
     pub runner_up: Vec<PanelRunnerUp>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1304,7 +1305,19 @@ fn select_panel_admitted(
         sibling_collapses,
     });
 
+    let mut quality_candidates = considered_facts
+        .iter()
+        .map(|fact| {
+            let route_key = crate::model_facts::fact_to_route(fact).route_key;
+            crate::model_router::CandidateQualityScore::from_fact(
+                fact,
+                eligible.iter().any(|c| c.route.route_key == route_key),
+            )
+        })
+        .collect::<Vec<_>>();
+    quality_candidates.sort_by(|a, b| a.route_key.cmp(&b.route_key));
     Ok(SelectedPanel {
+        candidates: quality_candidates,
         availability_rejections: availability_causes,
         members,
         runner_up,

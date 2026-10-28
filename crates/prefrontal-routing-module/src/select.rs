@@ -362,6 +362,7 @@ fn no_route_error(
     requirements: ModelRequirements,
 ) -> NoRouteError {
     NoRouteError {
+        candidates: Vec::new(),
         reason,
         message,
         rejected: Vec::new(),
@@ -3474,7 +3475,7 @@ pub(super) fn panel_decision_input(
         selected_provider_id: None,
         selected_model_id: None,
         selected_variant: None,
-        score_json: "null".into(),
+        score_json: serde_json::to_string(&json!({"candidates": panel.candidates})).unwrap(),
         rejected_json: serde_json::to_string(&causes).unwrap_or_else(|_| "[]".into()),
         explanation_json: Some(serde_json::to_string(&explanation).unwrap_or_else(|_| "{}".into())),
         quota_signal_json: Some(provenance.quota_signal_json.clone()),
@@ -3578,7 +3579,8 @@ pub(super) fn decision_input_for(
                 selected_provider_id: None,
                 selected_model_id: None,
                 selected_variant: None,
-                score_json: "null".into(),
+                score_json: serde_json::to_string(&json!({"candidates": failure.candidates}))
+                    .unwrap(),
                 rejected_json: serde_json::to_string(&failure.rejected)
                     .unwrap_or_else(|_| "[]".into()),
                 explanation_json: Some(

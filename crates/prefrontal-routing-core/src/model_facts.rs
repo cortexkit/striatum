@@ -168,12 +168,16 @@ pub enum Confidence {
 /// `override` is `route.model_upsert` or config. `aa_inferred` is the provisional
 /// AA-index interpolation. `unscored` is a model known to the catalog with no
 /// score yet (the Fusiform consumer's target) and is not routable.
+/// `operator_grade` and `elo_override` are read-time overlays from Fusiform and
+/// live configuration, respectively; they never replace stored curated scores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScoreProvenance {
     #[default]
     Curated,
     Override,
+    OperatorGrade,
+    EloOverride,
     AaInferred,
     Unscored,
 }
@@ -183,6 +187,8 @@ impl ScoreProvenance {
         match self {
             ScoreProvenance::Curated => "curated",
             ScoreProvenance::Override => "override",
+            ScoreProvenance::OperatorGrade => "operator_grade",
+            ScoreProvenance::EloOverride => "override",
             ScoreProvenance::AaInferred => "aa_inferred",
             ScoreProvenance::Unscored => "unscored",
         }
@@ -375,7 +381,8 @@ pub struct ModelFact {
     /// Unix milliseconds after which an `aa_inferred` row is past due for hand review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_by_ms: Option<i64>,
-    /// How EQ was chosen for an `aa_inferred` row (`aa_index` or `neighbor:<route>`).
+    /// How EQ was chosen for an `aa_inferred` row (`aa_index` or `neighbor:<route>`),
+    /// or the read-time quality overlay (`operator_grade` or `override`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eq_source: Option<String>,
     /// Optional class vector computed at read time by `get_facts_with_observed_speed`.

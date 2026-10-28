@@ -11412,6 +11412,7 @@ mod tests {
             ..Default::default()
         };
         let panel = SelectedPanel {
+            candidates: Vec::new(),
             availability_rejections: Vec::new(),
             members: Vec::new(),
             runner_up: Vec::new(),
@@ -11452,6 +11453,7 @@ mod tests {
         body["params"]["packageTokens"] = json!("227000");
         assert!(serde_json::from_value::<SelectPanelBody>(body).is_err());
         let panel = SelectedPanel {
+            candidates: Vec::new(),
             availability_rejections: Vec::new(),
             members: Vec::new(),
             runner_up: Vec::new(),
