@@ -70,12 +70,14 @@ pub struct PaceConfig {
     scarcity_gain_exponent: f64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaceConfigError {
     AbundanceGainExponentOutOfRange,
     ScarcityGainExponentOutOfRange,
 }
 
+#[cfg(test)]
 impl PaceConfig {
     pub fn with_exponents(
         abundance_gain_exponent: f64,
