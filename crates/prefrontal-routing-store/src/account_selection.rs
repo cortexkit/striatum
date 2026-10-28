@@ -514,6 +514,24 @@ impl SqliteRouteStateStore {
             rows.collect()
         }).map_err(err)
     }
+
+    /// Lift all route-reset fences for a credential after an operator top-up.
+    pub fn clear_account_route_fences_for_credential(
+        &self,
+        credential_id: &str,
+    ) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                if !account_fact_table_exists(conn, "account_route_fence")? {
+                    return Ok(0);
+                }
+                conn.execute(
+                    "DELETE FROM account_route_fence WHERE credential_id=?1",
+                    [credential_id],
+                )
+            })
+            .map_err(err)
+    }
 }
 
 // Upgrade fixtures issue admissions on the old schema before reopening it with

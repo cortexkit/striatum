@@ -599,6 +599,19 @@ impl ClassContext {
         fenced
     }
 
+    fn route_fence_reset(&self, provider: &str, model: &str, priced: bool) -> Option<i64> {
+        let (roster, fenced) = self.roster_and_fences_for(provider, model, priced);
+        if roster
+            .roster
+            .as_ref()
+            .is_none_or(|roster| roster.accounts.is_empty())
+        {
+            fenced.values().min().copied()
+        } else {
+            None
+        }
+    }
+
     fn method(&self, credential: &str) -> &str {
         self.credentials
             .listed_credentials()
@@ -778,6 +791,20 @@ impl ClassContext {
                     .or_default()
                     .credential_refusal = Some(mark);
             }
+            // Legacy selection does not run the allocator's preflight. Project
+            // a temporary route wall into this request's snapshot only when no
+            // eligible account in its payment class is left unfenced.
+            if let Some(reset) = self.route_fence_reset(&fact.provider_id, &fact.model_id, priced) {
+                let state = snapshot
+                    .by_capacity
+                    .entry(prefrontal_routing_core::make_capacity_key(
+                        &fact.provider_id,
+                        &fact.model_id,
+                    ))
+                    .or_default();
+                state.quota_exhausted_until =
+                    Some(state.quota_exhausted_until.unwrap_or(0.0).max(reset as f64));
+            }
         }
     }
 
@@ -810,6 +837,9 @@ impl ClassContext {
                 .size_refusals
                 .iter()
                 .any(|fact| fact.provider == provider && fact.model == model)
+            || self.route_fences.iter().any(|fence| {
+                fence.provider == provider && fence.model == model && fence.until_ms > self.now_ms
+            })
     }
 
     fn allocation_context(
