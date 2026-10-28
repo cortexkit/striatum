@@ -69,6 +69,7 @@ fn operator_quality_precedence_and_anthropic_platform_mapping() {
             operator_exclude_keys: Vec::new(), required_capabilities: None,
             is_subscription_route: None, min_best_effort_adequacy: None,
             prefer_prompt_cache: false, providers_without_prompt_cache: Default::default(),
+            providers_without_cache_write_reports: Default::default(),
         },
     ).unwrap();
     let candidates = serde_json::to_value(&selected.score).unwrap()["candidates"].clone();
