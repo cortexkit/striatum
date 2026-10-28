@@ -378,11 +378,14 @@ fn contract_codes_map_with_contract_detail() {
 fn undeclared_legacy_codes_become_unavailable() {
     // `account_selection_disabled` is intentionally excluded: the contract
     // declares it (0.5.2), so it keeps its own code instead of mapping here.
+    // `account_selection_unsupported` is excluded too: with no cause
+    // attached it means no credential of the right kind served the request,
+    // so the backstop maps it to the untimed `auth_required`, never a
+    // transient retry.
     for code in [
         "store_error",
         "internal_error",
         "no_eligible_account",
-        "account_selection_unsupported",
         "unscoped_caller",
     ] {
         let refusal = super::accounts::account_refusal_for_test(code);
@@ -393,6 +396,10 @@ fn undeclared_legacy_codes_become_unavailable() {
         );
         assert!(refusal.detail.is_empty(), "{code}");
     }
+    let unsupported = super::accounts::account_refusal_for_test("account_selection_unsupported");
+    assert_eq!(unsupported.code, RefusalCode::AuthRequired);
+    assert!(unsupported.detail.is_empty());
+    assert_eq!(unsupported.wait_until_ms(), None);
 }
 
 #[tokio::test]

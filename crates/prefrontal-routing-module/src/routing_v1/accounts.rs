@@ -358,11 +358,14 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
 /// The allocator's refusal in v1 shape. A hold and an exhausted pool are
 /// timed by the wait the allocator states; every other refusal carries no
 /// detail. Legacy codes the contract does not declare (`store_error`,
-/// `internal_error`, `no_eligible_account`, `account_selection_unsupported`,
-/// `unscoped_caller`) become the transient `account_selection_unavailable`.
-/// `account_selection_disabled` is preserved verbatim so it stays
-/// distinguishable from quota or authentication refusals; the contract
-/// declares it (0.5.2) as untimed with empty detail. This arm is the backstop.
+/// `internal_error`, `no_eligible_account`, `unscoped_caller`) become the
+/// transient `account_selection_unavailable`. `account_selection_disabled`
+/// is preserved verbatim so it stays distinguishable from quota or
+/// authentication refusals; the contract declares it (0.5.2) as untimed
+/// with empty detail. A legacy `account_selection_unsupported` that reaches
+/// this adapter means no credential of the right kind served the request,
+/// so it becomes the untimed `auth_required`, never a transient retry.
+/// This arm is the backstop.
 fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refusal {
     let wait_until = || {
         detail
@@ -385,11 +388,10 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
         "account_selection_disabled" => {
             Refusal::new(RefusalCode::AccountSelectionDisabled, message.clone())
         }
-        "store_error"
-        | "internal_error"
-        | "no_eligible_account"
-        | "account_selection_unsupported"
-        | "unscoped_caller" => account_unavailable(message.clone()),
+        "account_selection_unsupported" => Refusal::new(RefusalCode::AuthRequired, message.clone()),
+        "store_error" | "internal_error" | "no_eligible_account" | "unscoped_caller" => {
+            account_unavailable(message.clone())
+        }
         other => Refusal::new(RefusalCode::parse(other), message.clone()),
     };
     refusal.message = message;

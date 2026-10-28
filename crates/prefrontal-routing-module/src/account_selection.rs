@@ -2468,11 +2468,16 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 &parsed,
             );
         }
+        // Without class context the vault/quota roster names nothing usable
+        // for this provider/model: no filtering by eligibility, size or
+        // candidates happens here, so an empty roster means no credential
+        // of the right kind serves it. That is `auth_required`, untimed:
+        // the runner needs a login it does not have.
         return OpReply::typed(
-            "account_selection_unsupported",
+            "auth_required",
             format!("routing selects no accounts for provider `{provider}`"),
             json!({
-                "code": "account_selection_unsupported",
+                "code": "auth_required",
                 "retry_after_s": null,
                 "decision_id": null,
                 "exclusions": [],
@@ -2983,12 +2988,33 @@ fn serve(
             // The caller sees the allocator's own contract code. The store
             // keeps that code too (`outcome_columns`), so this mapping must
             // not change the recorded decision, only the reply. The contract
-            // has no `account_selection_unsupported`: a class-aware roster
-            // never reaches it, and a stale roster is transient
-            // unavailability.
+            // has no `account_selection_unsupported`, so map it by cause.
+            // The allocator emits it in three places: an empty provider
+            // slice of a present roster, a cold roster whose accounts all
+            // fail model reach, and a hard-filtered operator override that
+            // fails reach (the override never runs here). The first two
+            // both mean no credential of the right kind serves this
+            // provider/model, which is `auth_required`: the runner needs a
+            // login it does not have. It is untimed and must never read as
+            // a transient retry. The one temporary case is probe
+            // contention: the probe loop below removed every credential
+            // after another admission claimed the probe, and a re-read may
+            // admit, so that stays `account_selection_unavailable`.
             let mut code = refusal_code(refusal.code);
             if code == "account_selection_unsupported" {
-                code = "account_selection_unavailable";
+                let probe_emptied = roster
+                    .roster
+                    .as_ref()
+                    .is_some_and(|roster| !roster.accounts.is_empty())
+                    && state
+                        .roster
+                        .as_ref()
+                        .is_none_or(|roster| roster.accounts.is_empty());
+                code = if probe_emptied {
+                    "account_selection_unavailable"
+                } else {
+                    "auth_required"
+                };
             }
             let family = ctx.policy.family_for_model(&params.model);
             let reset = state
@@ -4618,10 +4644,13 @@ mod tests {
             Some("admission_conflict")
         );
         params["admission_id"] = json!("unknown-provider-admit");
+        // No credential in the vault serves an untracked provider: the
+        // runner needs a login it does not have (`auth_required`, untimed),
+        // not a transient retry.
         assert_eq!(
             rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params)
                 .code(),
-            Some("account_selection_unsupported")
+            Some("auth_required")
         );
     }
 
@@ -4715,10 +4744,13 @@ mod tests {
         params["provider"] = json!("google");
         params["model"] = json!("antigravity-gemini-3.8-flash");
         params["affinity_model"] = params["model"].clone();
+        // The only google credential is absent and the vendorless lanes are
+        // unmapped: no credential of the right kind serves this model, so
+        // `auth_required` (untimed), not a transient retry.
         assert_eq!(
             rig.call(&rig.ctx(true, NOW), "route.account_for", BROCA, params)
                 .code(),
-            Some("account_selection_unsupported")
+            Some("auth_required")
         );
     }
 
@@ -4760,24 +4792,28 @@ mod tests {
         );
         params["admission_id"] = json!("antigravity-sticky");
         params["model"] = params["affinity_model"].clone();
+        // The gemini-cli account cannot serve antigravity models: its pool
+        // reach covers only gemini-2.5-flash, so no credential of the right
+        // kind exists (`auth_required`, untimed), even with sticky affinity.
         assert_eq!(
             rig.call(&ctx, "route.account_for", BROCA, params.clone())
                 .code(),
-            Some("account_selection_unsupported")
+            Some("auth_required")
         );
         params["admission_id"] = json!("antigravity-cold");
         params["conversation_key"] = json!("antigravity-cold");
         assert_eq!(
             rig.call(&ctx, "route.account_for", BROCA, params).code(),
-            Some("account_selection_unsupported")
+            Some("auth_required")
         );
         let mut unknown = admit_params("unknown-pool", "unknown-pool", "broca");
         unknown["provider"] = json!("google");
         unknown["model"] = json!("antigravity-new-family-model");
         unknown["affinity_model"] = unknown["model"].clone();
+        // Same kind mismatch for a model no account's pools name.
         assert_eq!(
             rig.call(&ctx, "route.account_for", BROCA, unknown).code(),
-            Some("account_selection_unsupported")
+            Some("auth_required")
         );
     }
 
