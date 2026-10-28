@@ -594,6 +594,16 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
             if blocked {
                 assert_eq!(pinned.0, FrameType::Error, "{}", pinned.1);
                 assert_eq!(legacy_pin.0, FrameType::Error, "{}", legacy_pin.1);
+                let mut only_blocked = select("mason");
+                only_blocked["exclude"] = json!([DEAR]);
+                let no_alternative = route.call("route.select", &only_blocked).await;
+                assert_eq!(no_alternative.0, FrameType::Error, "{}", no_alternative.1);
+                assert_eq!(no_alternative.1["code"], "no_route");
+                assert_eq!(no_alternative.1["detail"]["reason"], "accounts_blocked");
+                assert_eq!(
+                    no_alternative.1["detail"]["reset_at_ms"],
+                    reset.min(now + 8 * 86_400_000),
+                );
             } else {
                 assert_eq!(route_of(&pinned), CHEAP);
                 assert_eq!(legacy_route(&legacy_pin), CHEAP);

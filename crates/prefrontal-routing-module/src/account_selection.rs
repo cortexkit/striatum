@@ -791,9 +791,24 @@ impl ClassContext {
                     .or_default()
                     .credential_refusal = Some(mark);
             }
-            // Legacy selection does not run the allocator's preflight. Project
-            // a temporary route wall into this request's snapshot only when no
-            // eligible account in its payment class is left unfenced.
+        }
+    }
+
+    /// Legacy selection needs request-local route walls because it does not run
+    /// allocator preflight. V1 must keep these fences at account preflight: a
+    /// capacity wall would hide an adequate route and lose `accounts_blocked`
+    /// and the reset that lets the caller wait.
+    pub(crate) fn apply_legacy_route_fences(
+        &self,
+        snapshot: &mut prefrontal_routing_core::ModelRouteStateSnapshot,
+        facts: &[prefrontal_routing_core::ModelFact],
+        priced: bool,
+        defer_pool_pin: bool,
+    ) {
+        for fact in facts {
+            if defer_pool_pin && self.targets.contains_key(&fact.provider_id) {
+                continue;
+            }
             if let Some(reset) = self.route_fence_reset(&fact.provider_id, &fact.model_id, priced) {
                 let state = snapshot
                     .by_capacity

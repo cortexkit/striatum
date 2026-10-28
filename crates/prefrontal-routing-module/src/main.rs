@@ -4431,6 +4431,12 @@ async fn handle_select_request(
             priced_per_token,
             params.pin.is_some() || params.model_pin.is_some(),
         );
+        classes.apply_legacy_route_fences(
+            &mut snapshot,
+            &facts,
+            priced_per_token,
+            params.pin.is_some() || params.model_pin.is_some(),
+        );
     }
     let candidates = select_policy::prepare_candidates(
         &facts,
@@ -5721,6 +5727,7 @@ async fn handle_select_panel(
     )
     .map_err(ModuleError::Message)?;
     classes.apply_eligibility(&mut prepared.snapshot, &prepared.facts, false, false);
+    classes.apply_legacy_route_fences(&mut prepared.snapshot, &prepared.facts, false, false);
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     let resolved_policy = resolve_routing_policy_with_catalog_targets(
         params.available_models.iter().cloned(),
