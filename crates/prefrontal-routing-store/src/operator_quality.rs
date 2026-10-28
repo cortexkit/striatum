@@ -20,15 +20,6 @@ pub struct UnscoredAdmissibleModel {
     pub last_seen_ms: i64,
 }
 
-fn catalog_key(provider: &str, model: &str) -> String {
-    let provider = if provider == "anthropic-platform" {
-        "anthropic"
-    } else {
-        provider
-    };
-    format!("{provider}/{model}")
-}
-
 pub(super) fn has_quality_table(c: &Connection) -> rusqlite::Result<bool> {
     c.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = 'routing_operator_quality')",
@@ -77,16 +68,14 @@ impl SqliteRouteStateStore {
                     )?;
                 }
                 tx.execute(
-                    "UPDATE routing_operator_quality_state SET active = ?1",
+                    "INSERT INTO routing_operator_quality_state VALUES (1, ?1)
+                     ON CONFLICT(singleton) DO UPDATE SET active = excluded.active",
                     [active],
                 )?;
                 tx.execute(
                     "DELETE FROM routing_unscored_admissible_models
                  WHERE model IN (SELECT model FROM routing_operator_quality)
-                    OR model IN (SELECT route_key FROM routing_operator_quality)
-                    OR (model LIKE 'anthropic-platform/%' AND
-                        'anthropic/' || substr(model, 20) IN
-                            (SELECT route_key FROM routing_operator_quality))",
+                    OR model IN (SELECT route_key FROM routing_operator_quality)",
                     [],
                 )?;
                 tx.commit()
@@ -105,7 +94,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<()> {
         let grades = self.operator_quality()?;
         for (fact, canonical_id) in facts.iter_mut().zip(canonical_ids) {
-            let key = catalog_key(&fact.provider_id, &fact.model_id);
+            let key = format!("{}/{}", fact.provider_id, fact.model_id);
             let grade = grades.get(&key).or_else(|| {
                 canonical_id
                     .as_ref()
@@ -132,6 +121,7 @@ impl SqliteRouteStateStore {
                 "SELECT model, first_seen_ms, last_seen_ms FROM routing_unscored_admissible_models
                  WHERE last_seen_ms BETWEEN ?1 AND ?2
                    AND (SELECT active FROM routing_operator_quality_state) = 1
+                   AND EXISTS (SELECT 1 FROM routing_operator_quality)
                  ORDER BY model",
             )?;
                 let rows = stmt.query_map(params![since_ms, now_ms], |row| {
@@ -172,7 +162,7 @@ pub(super) fn observe_decision(c: &Connection, score: &str, now_ms: i64) -> rusq
         let Some((provider, model, canonical)) = identity else {
             continue;
         };
-        let route = catalog_key(&provider, &model);
+        let route = format!("{provider}/{model}");
         let model = canonical
             .filter(|id| !id.trim().is_empty())
             .unwrap_or_else(|| format!("{provider}/{model}"));
@@ -302,6 +292,26 @@ mod tests {
             store.unscored_admissible_models(0, 1000).unwrap()[0].first_seen_ms,
             500
         );
+        for cleared_tables in [
+            "DELETE FROM routing_operator_quality",
+            "DELETE FROM routing_operator_quality_state",
+            "DELETE FROM routing_operator_quality; DELETE FROM routing_operator_quality_state",
+        ] {
+            store
+                .store
+                .with_conn(|c: &Connection| c.execute_batch(cleared_tables))
+                .unwrap();
+            assert!(store
+                .unscored_admissible_models(0, 1000)
+                .unwrap()
+                .is_empty());
+            store.replace_operator_quality(true, &grades).unwrap();
+            assert_eq!(
+                store.unscored_admissible_models(0, 1000).unwrap()[0].first_seen_ms,
+                500,
+                "a catalog refresh rebuilds omitted caches without resetting admission history"
+            );
+        }
         store
             .replace_operator_quality(false, &BTreeMap::new())
             .unwrap();

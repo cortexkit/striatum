@@ -1,7 +1,7 @@
 //! until this consumer is live, a model swap in opencode.jsonc silently strips phone attachments for that session until someone upserts a model_facts row (script/upsert-model-fact.ts); the next occurrence is NOT a phone bug.
 //!
-//! Fusiform is authoritative only for existence, rates, limits, and capabilities.
-//! Routing scores and policy remain operator-owned. The merge boundary is fenced by
+//! Fusiform supplies existence, rates, limits, capabilities, and operator-graded
+//! Elo/EQ. Routing policy and stored placements remain operator-owned. The fact merge boundary is fenced by
 //! [`FusiformFactUpdate`], which cannot represent scores, variants, exclusions,
 //! speed multipliers, prompt defaults, AA indices, aliases, or lifecycle dates.
 //!
@@ -9,7 +9,8 @@
 //! | --- | --- | --- |
 //! | vision, tool use, context/output limits, rates/output tier | Fusiform | an explicit override of that same field wins |
 //! | published reasoning efforts (`capability.reasoning_options`) | Fusiform | none; the operator's `model_routing.variants` must name one of them |
-//! | Elo, EQ, speed, variants, exclusions, multipliers, prompt defaults | operator | always retained; Fusiform cannot represent them |
+//! | Elo, EQ | operator | live Elo overrides win, then Fusiform operator grades, then stored placements |
+//! | speed, variants, exclusions, multipliers, prompt defaults | operator | always retained; Fusiform cannot represent them |
 //!
 //! Wire decoding is isolated here and pinned to the producer-real fixture copied
 //! from `fusiform/crates/fusiform-module/fixtures/served-payloads.json` at Fusiform
@@ -25,7 +26,7 @@ use std::{
     time::Duration,
 };
 
-use prefrontal_routing_core::{BillingPlane, BillingRate};
+use prefrontal_routing_core::{BillingPlane, BillingRate, RouteStateStore as _};
 use prefrontal_routing_store::{FusiformCatalogCursor, FusiformFactUpdate, SqliteRouteStateStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1352,8 +1353,11 @@ fn apply_catalog_snapshot(
     if let Some(path) = family_config_path {
         crate::config_overrides::apply_family_rules_from_config(store, path)
             .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
-        let shadowed =
-            crate::config_overrides::live_config(path).shadowed_operator_grades(&snapshot.grades);
+        let shadowed = crate::config_overrides::live_config(path).shadowed_operator_grades(
+            &store
+                .operator_quality()
+                .map_err(|reason| error(format!("read operator quality: {reason}")))?,
+        );
         if !shadowed.is_empty() {
             eprintln!(
                 "[prefrontal-routing] elo_overrides shadow Fusiform operator grades: {shadowed:?}"
@@ -1410,13 +1414,33 @@ pub(crate) fn apply_mapped_catalog(
             &retained,
         )
         .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
+    let mut grades = snapshot.grades.clone();
+    // Cache grades for provider aliases resolved from credential metadata,
+    // using the same catalog targets as pricing for coverage and shadow notices.
+    if let Some(credentials) = credentials {
+        let mut facts = store
+            .get_facts()
+            .map_err(|reason| error(format!("read catalog targets: {reason}")))?;
+        let targets = credentials
+            .lock()
+            .map_err(|_| error("credential cache poisoned"))?
+            .catalog_targets(&facts);
+        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
+        for fact in facts {
+            let route = format!("{}/{}", fact.provider_id, fact.model_id);
+            let catalog_key = prefrontal_routing_core::score_alias::catalog_key(&targets, &route);
+            if let Some(grade) = snapshot.grades.get(&catalog_key) {
+                grades.entry(route).or_insert_with(|| grade.clone());
+            }
+        }
+    }
     store
         .replace_operator_quality(
             snapshot
                 .quality_scores
                 .as_ref()
                 .is_some_and(|scores| scores.graded_by == "operator"),
-            &snapshot.grades,
+            &grades,
         )
         .map_err(|reason| error(format!("apply operator quality: {reason}")))?;
     if let Some(credentials) = credentials {
