@@ -1812,10 +1812,19 @@ mod tests {
             "existence": "present", "rate.input": {"state":"priced","currency":"USD","exponent":0,"units":4},
             "rate.output": {"state":"priced","currency":"USD","exponent":0,"units":20}
         });
+        reply["models"]["meta/muse-spark-1.3-contributor"] = json!({
+            "existence": "present", "rate.input": {"state":"priced","currency":"USD","exponent":3,"units":100},
+            "rate.output": {"state":"priced","currency":"USD","exponent":3,"units":200},
+            "rate.cache_read": {"state":"priced","currency":"USD","exponent":3,"units":2}
+        });
         reply["curated"]
             .as_array_mut()
             .unwrap()
             .push(json!({"model":"meta/muse-wonder-1.0","auth_methods":["oauth"]}));
+        reply["curated"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"model":"meta/muse-spark-1.3-contributor","auth_methods":["oauth"]}));
         let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
         let credentials = Arc::new(Mutex::new(
             crate::broca_credentials::BrocaCredentials::default(),
@@ -1850,6 +1859,13 @@ mod tests {
         assert_eq!(fact.cost_per_m_tok_out, Some(20.0));
         assert_eq!(fact.input_rate, Some(4.0));
         assert_eq!(fact.auth_methods, Some(vec!["oauth".into()]));
+        let contributor = store
+            .get_fact_by_route_key("meta/muse-spark-1.3-contributor")
+            .unwrap()
+            .unwrap();
+        assert_eq!(contributor.input_rate, Some(0.10));
+        assert_eq!(contributor.cost_per_m_tok_out, Some(0.20));
+        assert_eq!(contributor.cache_read_rate, Some(0.002));
         assert_eq!(
             fact.score_provenance,
             prefrontal_routing_core::ScoreProvenance::Unscored

@@ -1352,7 +1352,6 @@ mod reset_tests {
                 plans: vec![SubscriptionPlan {
                     tier: None,
                     fee_usd: 0.0,
-                    fusiform_multiplier: None,
                     accounts: vec![account(2.0), account(1.0), account(f64::NAN)],
                 }],
                 ..Default::default()

@@ -34,7 +34,8 @@ fn cache() -> &'static Mutex<EconomicsCache> {
 }
 
 /// Read each provider's latest observation from the report's `latest` array:
-/// API list-price nanos divided by pooled percentage-point use yields USD/point.
+/// `multiplier` is API list value divided by the subscription cost of quota used.
+/// `fee_multiplier` instead compares value with fees paid and is not quota value.
 /// Schema source: astrocyte/crates/astrocyte-core/src/multiplier.rs
 /// (observation_rows/multiplier_report), commit
 /// 4a89d881101c9a666d8acf9cc3aeae7b4532b0c8. Age uses interval_end_ms,
@@ -45,13 +46,12 @@ fn measured(report: &Value, quota_provider: &str) -> Option<MeasuredValue> {
         .as_array()?
         .iter()
         .find(|r| r["quota_provider"] == quota_provider)?;
-    let delta = row["delta_percent"].as_f64()?;
-    let api = row["api_nanos"].as_f64()?;
-    if delta <= 0.0 || api <= 0.0 || !delta.is_finite() || !api.is_finite() {
+    let multiplier = row["multiplier"].as_f64()?;
+    if multiplier <= 0.0 || !multiplier.is_finite() {
         return None;
     }
     Some(MeasuredValue {
-        usd_per_point: api / 1e9 / delta,
+        multiplier,
         interval_end_ms: row["interval_end_ms"].as_i64()?,
         row_date: row["observation_day"].as_str()?.to_string(),
     })
@@ -91,35 +91,6 @@ fn astro_fee(report: &Value, provider: &str, account_id: &str, now: i64) -> Opti
     }
     let fee = plan["monthly_nanos"].as_f64()? / 1e9;
     (fee.is_finite() && fee > 0.0).then_some(fee)
-}
-
-/// Read the conservative measured quota value from the subscription-plan price
-/// rows served by Fusiform, the service that supplies these prices. Missing or
-/// refused measurements, and observations outside their date limits, stay unknown.
-fn fusiform_value(row: &Value, now: i64) -> Option<f64> {
-    if row.get("retired").and_then(Value::as_bool) == Some(true) {
-        return None;
-    }
-    let value = row.get("quota_value")?.as_object()?;
-    if value.get("review_by_ms")?.as_i64()? < now {
-        return None;
-    }
-    match value.get("state")?.as_str()? {
-        "measured" => {
-            if value.get("as_of_ms")?.as_i64()? > now {
-                return None;
-            }
-            for field in ["basis", "token_mix", "established_by", "source_ref"] {
-                if value.get(field)?.as_str()?.trim().is_empty() {
-                    return None;
-                }
-            }
-            let low = decimal(value.get("low")?, "units")?;
-            let high = decimal(value.get("high")?, "units")?;
-            (low <= high).then_some(low)
-        }
-        _ => None,
-    }
 }
 
 fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
@@ -276,7 +247,6 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
             .or_insert_with(|| SubscriptionPlan {
                 tier,
                 fee_usd: fee,
-                fusiform_multiplier: row.and_then(|r| fusiform_value(r, now)),
                 accounts: Vec::new(),
             });
         plan.accounts.push(account);
@@ -291,7 +261,6 @@ fn fallback_plan() -> SubscriptionPlan {
     SubscriptionPlan {
         tier: None,
         fee_usd: DEFAULT_PLAN_FEE_USD,
-        fusiform_multiplier: None,
         accounts: Vec::new(),
     }
 }
@@ -333,7 +302,7 @@ pub(crate) async fn refresh(
     };
     let mut next = build(&snapshot, &report, &prices, now);
     if let Some(listing) = listing {
-        next.unpriced_tiers = unpriced_tiers(listing, &prices, now);
+        next.unpriced_tiers = unpriced_tiers(listing, &prices);
     }
     if let Ok(mut guard) = cache().lock() {
         *guard = next;
@@ -343,14 +312,17 @@ pub(crate) async fn refresh(
 fn unpriced_tiers(
     listing: &cortexkit_claustrum_client::ScopedCredentialListing,
     prices: &Value,
-    now: i64,
 ) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for credential in &listing.credentials {
         if let Some(tier) = &credential.plan_tier {
             for provider in &credential.provider_ids {
                 if price_row(prices, provider, tier)
-                    .and_then(|r| fusiform_value(r, now))
+                    .and_then(|r| {
+                        (r["price"]["currency"] == "USD")
+                            .then(|| decimal(&r["price"], "minor_units"))
+                            .flatten()
+                    })
                     .is_none()
                 {
                     out.insert(format!("unpriced plan tier: {provider}/{tier}"));
@@ -479,8 +451,8 @@ mod tests {
             .clone()
     }
     fn prices() -> Value {
-        // Adapter tests use this saved upstream response to confirm the decoder
-        // reads Fusiform's served quota_value rows, not a test-only schema.
+        // Adapter tests use the saved upstream plan response, including prices
+        // and the quota_value fields that routing must ignore.
         // Source: crates/fusiform-module/fixtures/served-payloads.json at commit 2e689aab.
         // Fixture SHA-256: 95a576e57ab51182853ce52aff0240c4026f6fcf6d4104c997d9ee68cf410a45.
         serde_json::from_str(include_str!("../fixtures/fusiform-plan-prices.json")).unwrap()
@@ -581,13 +553,30 @@ mod tests {
     fn report_fixture_absence_and_real_column_units() {
         assert!(measured(&json!({"latest":[],"series":[]}), "claude").is_none());
         let captured = measured(&report(), "claude").unwrap();
-        assert!((captured.usd_per_point - 28.4).abs() < 0.1);
+        assert!((captured.multiplier - 60.8491090065368).abs() < 1e-12);
         assert_eq!(captured.row_date, "2026-10-09");
-        let report = json!({"latest":[{"quota_provider":"claude","observation_day":"2026-10-09","snapshot_at_ms":NOW,"interval_end_ms":NOW-1,"api_nanos":284000000000i64,"delta_percent":10.0,"subscription_nanos":4666666667i64,"multiplier":60.8,"error_deflating":"unpriced tokens","error_inflating":"excluded accounts"}],"series":[]});
+        let report = json!({"latest":[{"quota_provider":"claude","observation_day":"2026-10-09","snapshot_at_ms":NOW,"interval_end_ms":NOW-1,"api_nanos":284000000000i64,"delta_percent":10.0,"subscription_nanos":4666666667i64,"multiplier":60.8,"fee_multiplier":123.0,"error_deflating":"unpriced tokens","error_inflating":"excluded accounts"}],"series":[]});
         let row = measured(&report, "claude").unwrap();
-        assert!((row.usd_per_point - 28.4).abs() < 1e-12);
+        assert_eq!(row.multiplier, 60.8);
         assert_eq!(row.interval_end_ms, NOW - 1);
         assert_eq!(row.row_date, "2026-10-09");
+    }
+
+    #[test]
+    fn missing_or_invalid_quota_multiplier_never_uses_fees_or_point_value() {
+        for multiplier in [Value::Null, json!(0.0), json!(-1.0), json!("60.8")] {
+            let report = json!({"latest":[{
+                "quota_provider":"claude", "observation_day":"2026-10-09",
+                "interval_end_ms":NOW-1, "api_nanos":284000000000i64,
+                "delta_percent":10.0, "fee_multiplier":123.0, "multiplier":multiplier
+            }]});
+            assert!(measured(&report, "claude").is_none());
+        }
+        let report = json!({"latest":[{
+            "quota_provider":"claude", "observation_day":"2026-10-09",
+            "interval_end_ms":NOW-1, "multiplier":60.8
+        }]});
+        assert_eq!(measured(&report, "claude").unwrap().multiplier, 60.8);
     }
 
     #[test]
@@ -627,50 +616,21 @@ mod tests {
     }
 
     #[test]
-    fn fusiform_conservative_low_requires_live_value_and_operator_tier() {
+    fn fusiform_quota_values_never_supply_subscription_multipliers() {
         let p = prices();
         let row = price_row(&p, "anthropic", "max_20x").unwrap();
-        assert_eq!(fusiform_value(row, NOW), Some(57.4));
-        assert_eq!(
-            fusiform_value(price_row(&p, "openai", "pro_200").unwrap(), NOW),
-            Some(29.0)
-        );
-        assert_eq!(fusiform_value(row, 1794182400001), None);
-        assert_eq!(
-            fusiform_value(price_row(&p, "anthropic", "max_5x").unwrap(), NOW),
-            None
-        );
-        assert_eq!(
-            fusiform_value(price_row(&p, "openai", "plus").unwrap(), NOW),
-            None
-        );
-        let without_value = json!({"provider_id":"anthropic", "tier":"max_20x"});
-        assert_eq!(fusiform_value(&without_value, NOW), None);
-        let explicitly_retired = json!({"retired":true, "quota_value":row["quota_value"]});
-        assert_eq!(fusiform_value(&explicitly_retired, NOW), None);
-        let mut stale_retired_prices = p.clone();
-        for tier in ["pro_5x", "pro_20x"] {
-            stale_retired_prices["prices"]
-                .as_array_mut()
-                .unwrap()
-                .push(json!({"provider_id":"anthropic", "tier":tier}));
-            let retired_row = price_row(&stale_retired_prices, "anthropic", tier).unwrap();
-            assert_eq!(fusiform_value(retired_row, NOW), None);
+        assert_eq!(row["quota_value"]["state"], "measured");
+        for tier in [None, Some("max_20x")] {
+            let built = build(&state(3.0, tier), &Value::Null, &p, NOW);
+            let pool = &built.pools["anthropic"];
+            let price = pool.price(1.0, None, 0.0, false).unwrap();
+            assert_eq!(price.value_multiplier, 1.0);
+            assert_eq!(price.value_source, "unmeasured");
+            let price = pool.price(1.0, Some(6.0), 0.0, false).unwrap();
+            assert_eq!(price.value_multiplier, 6.0);
+            assert_eq!(price.value_source, "operator override");
+            assert_eq!(pool.plans[0].fee_usd, 200.0);
         }
-        let refused_row = price_row(&p, "openai", "pro").unwrap();
-        assert!(refused_row.get("refusal_reason").is_some());
-        assert_eq!(fusiform_value(refused_row, NOW), None);
-        let without_tier = build(&state(3.0, None), &report(), &p, NOW);
-        assert_eq!(
-            without_tier.pools["anthropic"].plans[0].fusiform_multiplier,
-            None
-        );
-        let with_tier = build(&state(3.0, Some("max_20x")), &report(), &p, NOW);
-        assert_eq!(
-            with_tier.pools["anthropic"].plans[0].fusiform_multiplier,
-            Some(57.4)
-        );
-        assert_eq!(with_tier.pools["anthropic"].plans[0].fee_usd, 200.0);
     }
 
     #[test]
@@ -701,7 +661,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            unpriced_tiers(&listing, &prices(), NOW),
+            unpriced_tiers(&listing, &prices()),
+            BTreeSet::from([
+                "unpriced plan tier: anthropic/pro_5x".into(),
+                "unpriced plan tier: openai/pro".into()
+            ])
+        );
+        let mut without_quota_values = prices();
+        for row in without_quota_values["prices"].as_array_mut().unwrap() {
+            row.as_object_mut().unwrap().remove("quota_value");
+        }
+        assert_eq!(
+            unpriced_tiers(&listing, &without_quota_values),
             BTreeSet::from([
                 "unpriced plan tier: anthropic/pro_5x".into(),
                 "unpriced plan tier: openai/pro".into()
@@ -1256,16 +1227,36 @@ mod tests {
     #[test]
     fn realistic_outage_snapshot_leaves_iq70_worker_route_without_spending_saved_resets() {
         let selected = outage_selection().expect("pooled quota can serve a worker");
-        assert_eq!(selected.route_key, "anthropic/claude-opus-5-5");
+        assert_eq!(selected.route_key, "openai/gpt-6.1-sol");
         assert!(selected
             .rejected
             .iter()
             .any(|r| r.route_key == "xai/grok-4.7" && r.reason == "quota_exhausted"));
         let pricing = selected.score.objective.subscription_pricing.unwrap();
-        // Claude has 285 live points minus a 100-point fixed margin. Without
-        // forecast withholding it wins on price; the saved resets stay unused.
-        assert_eq!(pricing.plan_tier.as_deref(), Some("max_20x"));
+        // Neither provider has a measured or operator value, so both use M = 1.
+        // Sol wins without the old Fusiform subsidy; saved resets remain unused.
+        assert_eq!(pricing.value_multiplier, 1.0);
+        assert_eq!(pricing.value_source, "unmeasured");
+        assert_eq!(pricing.plan_tier.as_deref(), Some("pro_100"));
         assert_eq!(pricing.banked_resets_applied, 0);
-        assert_eq!(pricing.available_points, Some(185.0));
+        assert_eq!(pricing.available_points, Some(90.0));
+        assert!(!selected
+            .rejected
+            .iter()
+            .any(|r| r.route_key == "anthropic/claude-opus-5-5"));
+
+        // Claude remains admitted with 285 live points minus the fixed 100-point
+        // margin, even though it no longer wins the price comparison.
+        let (state, fixture) = outage_fixture();
+        let pools = build(
+            &state,
+            &Value::Null,
+            &prices(),
+            fixture["now_ms"].as_i64().unwrap(),
+        )
+        .pools;
+        let claude = pools["anthropic"].price(20.0, None, 20.0, false).unwrap();
+        assert_eq!(claude.available_points, Some(185.0));
+        assert_eq!(claude.banked_resets_applied, 0);
     }
 }
