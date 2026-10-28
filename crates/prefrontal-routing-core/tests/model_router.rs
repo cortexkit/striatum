@@ -155,6 +155,7 @@ fn input<'a>(
         min_best_effort_adequacy: extra.min_best_effort_adequacy,
         prefer_prompt_cache: extra.prefer_prompt_cache,
         providers_without_prompt_cache: extra.providers_without_prompt_cache,
+        providers_without_cache_write_reports: HashSet::new(),
     }
 }
 
@@ -4151,8 +4152,9 @@ fn subscription_plan(
 ) -> prefrontal_routing_core::subscription::SubscriptionPlan {
     prefrontal_routing_core::subscription::SubscriptionPlan {
         tier: Some(tier.into()),
+        plan: None,
+        measured: None,
         fee_usd: fee,
-        fusiform_multiplier: None,
         accounts: used
             .iter()
             .map(|u| {
@@ -4214,7 +4216,7 @@ fn subscription_scenario(
     };
     for f in &facts {
         let claude = f.provider_id == "anthropic";
-        let plans = if claude {
+        let mut plans = if claude {
             vec![subscription_plan("max_20x", 200.0, claude_use)]
         } else {
             vec![
@@ -4222,17 +4224,19 @@ fn subscription_scenario(
                 subscription_plan("pro_100", 100.0, &[100.0]),
             ]
         };
+        for plan in &mut plans {
+            plan.measured = Some(MeasuredValue {
+                multiplier: if claude { 38.1 } else { 18.7 },
+                interval_end_ms: 999_999,
+                row_date: "2026-10-09".into(),
+            });
+        }
         snapshot.by_capacity.insert(
             make_capacity_key(&f.provider_id, &f.model_id),
             RouteRuntimeState {
                 subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
                     provider: f.provider_id.clone(),
                     keep_free_percent: if claude { margin } else { 0.0 },
-                    measured: Some(MeasuredValue {
-                        usd_per_point: if claude { 28.4 } else { 9.42 },
-                        interval_end_ms: 999_999,
-                        row_date: "2026-10-09".into(),
-                    }),
                     plans,
                     allow_banked: false,
                     now_ms: 1_000_000,
@@ -4444,7 +4448,9 @@ fn subscription_today_iq70_claude_wins_then_reserve_pressure_flips_to_sol() {
     let pricing = selected.score.objective.subscription_pricing.unwrap();
     assert_eq!(pricing.available_points, Some(210.0));
     assert_eq!(pricing.banked_resets_applied, 0);
-    assert!((pricing.message_points - 0.03 / 28.4).abs() < 1e-12);
+    assert_eq!(pricing.value_multiplier, 38.1);
+    assert!((pricing.list_cost_usd - 0.03).abs() < 1e-12);
+    assert!((pricing.dollars() - 0.002_232).abs() < 0.000_000_5);
     assert!(selected.explanation.iter().any(
         |line| line.contains("astrocyte 2026-10-09") && line.contains("keep-free margin 20.0%")
     ));
@@ -4474,17 +4480,145 @@ fn subscription_pressure_is_monotone_and_expiring_headroom_is_cheaper() {
 }
 
 #[test]
-fn subscription_operator_value_overrides_fresh_astro_in_decision() {
-    let mut input = subscription_scenario(&[3.0], 20.0, "mason");
-    input.facts[0].subscription_multiplier = Some(18.0);
-    let selected = select_model_route(input).unwrap();
-    let pricing = selected.score.objective.subscription_pricing.unwrap();
-    assert_eq!(pricing.value_source, "operator override");
-    assert_eq!(pricing.value_per_point_usd, 36.0);
-    assert!(selected
-        .explanation
-        .iter()
-        .any(|line| line.contains("operator override")));
+fn subscription_fresh_astro_overrides_operator_for_workers_and_heads() {
+    for agent in ["mason", "alfonso"] {
+        let mut input = subscription_scenario(&[3.0], 20.0, agent);
+        input.facts[0].subscription_multiplier = Some(18.0);
+        let selected = select_model_route(input).unwrap();
+        let pricing = selected.score.objective.subscription_pricing.unwrap();
+        assert_eq!(pricing.value_source, "astrocyte 2026-10-09");
+        assert_eq!(pricing.value_multiplier, 38.1);
+        assert!(selected
+            .explanation
+            .iter()
+            .any(|line| line.contains("astrocyte 2026-10-09")));
+    }
+}
+
+#[test]
+fn subscription_stale_or_absent_measurement_uses_operator_then_one() {
+    use prefrontal_routing_core::subscription::ASTRO_MAX_AGE_MS;
+    for stale in [false, true] {
+        for operator in [None, Some(18.7)] {
+            let mut input = subscription_scenario(&[], 0.0, "mason");
+            input.facts.truncate(1);
+            input.facts[0].subscription_multiplier = operator;
+            let snapshot = input.runtime_snapshot.as_mut().unwrap();
+            let runtime = snapshot
+                .by_capacity
+                .get_mut("anthropic/claude-opus")
+                .unwrap();
+            let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
+            if stale {
+                pool.plans[0].measured.as_mut().unwrap().interval_end_ms =
+                    pool.now_ms - ASTRO_MAX_AGE_MS;
+            } else {
+                pool.plans[0].measured = None;
+            }
+            let selected = select_model_route(input).unwrap();
+            let pricing = selected.score.objective.subscription_pricing.unwrap();
+            assert_eq!(pricing.plan_pressure, 1.0);
+            assert_eq!(pricing.value_multiplier, operator.unwrap_or(1.0));
+            assert_eq!(
+                pricing.value_source,
+                if operator.is_some() {
+                    "operator override"
+                } else {
+                    "unmeasured"
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn subscription_task_cost_examples_and_api_list_cost() {
+    use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
+    use prefrontal_routing_core::routing_config::COST_REFERENCE_PER_MTOK;
+    use prefrontal_routing_core::subscription::{MeasuredValue, SubscriptionPool};
+    for (provider, model, list, multiplier, expected) in [
+        (
+            "openai",
+            "gpt-6.1-sol",
+            0.84,
+            Some(18.7),
+            0.044_919_786_096_256_68,
+        ),
+        (
+            "meta",
+            "muse-spark-1.3-contributor",
+            0.063,
+            Some(6.0),
+            0.0105,
+        ),
+        ("api", "metered", 1.0, None, 1.0),
+    ] {
+        for head in [false, true] {
+            let mut input = subscription_scenario(&[], 0.0, "mason");
+            input.target_is_head = head;
+            input.facts.truncate(1);
+            let fact = &mut input.facts[0];
+            fact.provider_id = provider.into();
+            fact.model_id = model.into();
+            fact.input_rate = Some(0.0);
+            fact.cost_per_m_tok_out = Some(list * 1000.0);
+            if multiplier.is_none() {
+                fact.class_vector = None;
+                fact.class_vector_is_overlay = false;
+                fact.cost_per_m_tok_out = Some(1.0);
+                fact.billing_plane = Some(BillingPlane {
+                    provider_id: provider.into(),
+                    auth_method: "apikey".into(),
+                    kind: "upstream".into(),
+                    selection_reason: "fixture API credential".into(),
+                    rates: [("rate.output".into(), BillingRate::Priced { rate: 1.0 })].into(),
+                });
+            }
+            input.available_models = [make_capacity_key(provider, model)].into();
+            input.is_subscription_route = Some(Box::new(move |_| multiplier.is_some()));
+            let snapshot = input.runtime_snapshot.as_mut().unwrap();
+            snapshot.by_capacity.clear();
+            snapshot.by_capacity.insert(
+                make_capacity_key(provider, model),
+                RouteRuntimeState {
+                    subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
+                        provider: provider.into(),
+                        plans: vec![{
+                            let mut plan = subscription_plan("plan", 200.0, &[]);
+                            plan.measured = Some(MeasuredValue {
+                                multiplier: multiplier.unwrap_or(99.0),
+                                interval_end_ms: 999_999,
+                                row_date: "2026-10-09".into(),
+                            });
+                            plan
+                        }],
+                        now_ms: 1_000_000,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            );
+            let selected = select_model_route(input).unwrap();
+            if let Some(multiplier) = multiplier {
+                let price = selected
+                    .score
+                    .objective
+                    .subscription_pricing
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(price.value_multiplier, multiplier);
+                assert_eq!(price.plan_pressure, 1.0);
+                assert!((price.list_cost_usd - list).abs() < 1e-12);
+                assert!((price.dollars() - expected).abs() < 1e-12);
+            } else {
+                assert!(selected.score.objective.subscription_pricing.is_none());
+                assert!(
+                    (selected.score.objective.cost * COST_REFERENCE_PER_MTOK - expected).abs()
+                        < 1e-12
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -4504,7 +4638,11 @@ fn unpriced_subscription_cannot_win_basket_or_plan_value_pricing() {
                 .by_capacity
                 .values_mut()
             {
-                std::sync::Arc::make_mut(state.subscription_pool.as_mut().unwrap()).measured = None;
+                for plan in
+                    &mut std::sync::Arc::make_mut(state.subscription_pool.as_mut().unwrap()).plans
+                {
+                    plan.measured = None;
+                }
             }
         }
         let selected = select_model_route(input).unwrap();
@@ -4525,8 +4663,10 @@ fn subscription_close_economic_prices_preserve_quality_tiebreak() {
         .get_mut("openai/gpt-6.1-sol")
         .unwrap();
     let pool = std::sync::Arc::make_mut(runtime.subscription_pool.as_mut().unwrap());
-    pool.measured.as_mut().unwrap().usd_per_point = 22.5;
+    let mut measured = pool.plans[0].measured.clone().unwrap();
+    measured.multiplier = 30.2;
     pool.plans = vec![subscription_plan("pro_200", 200.0, &[3.0])];
+    pool.plans[0].measured = Some(measured);
     let selected = select_model_route(input).unwrap();
     assert_eq!(selected.route_key, "openai/gpt-6.1-sol");
 }

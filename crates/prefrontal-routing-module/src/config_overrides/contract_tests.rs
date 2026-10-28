@@ -430,11 +430,21 @@ refusal_case!(
     r#"{"model_routing":{"models":{"openai/gpt-6":{"speed_multiplier":0}}}}"#,
     "invalid cost/speed override for openai/gpt-6"
 );
-refusal_case!(
-    route_subscription_multiplier_zero,
-    r#"{"model_routing":{"models":{"openai/gpt-6":{"subscription_multiplier":0}}}}"#,
-    "invalid positive model override for openai/gpt-6"
-);
+#[test]
+fn route_subscription_multiplier_zero_loads_with_a_named_warning() {
+    let mut rig = Rig::new();
+    rig.write(r#"{"models":{"openai/gpt-6":{"subscription_multiplier":0}}}"#);
+    crate::take_operator_warnings();
+    initialize_config(&rig.path).unwrap();
+    let config = live_config(&rig.path);
+    let warnings = crate::take_operator_warnings();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("models.openai/gpt-6.subscription_multiplier"));
+    assert_eq!(
+        config.config.model_routing.models["openai/gpt-6"].subscription_multiplier,
+        None
+    );
+}
 refusal_case!(
     provider_subscription_multiplier_negative,
     r#"{"model_routing":{"subscription_multipliers":{"openai":-1}}}"#,
@@ -638,7 +648,7 @@ fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
                 model.speed_multiplier,
                 model.subscription_multiplier
             ),
-            (Some(true), Some(1.5), Some(20.0))
+            (Some(true), Some(1.5), None)
         );
         assert_eq!(section.elo_overrides["openai/gpt-6/high"], 1900.0);
         assert_eq!(section.demand_exponent, Some(1.5));

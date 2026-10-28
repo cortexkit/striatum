@@ -48,6 +48,7 @@ mod key_pool;
 mod reasoning_catalog;
 mod retention;
 mod routing_v1;
+mod task_usage;
 
 pub use diagnostics::{
     DiagnosticAccountBlock, DiagnosticAccountHold, DiagnosticDecision, DiagnosticKeyWall,
@@ -57,6 +58,7 @@ pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
 pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
 pub use retention::AffinityRetentionBatch;
 pub use routing_v1::{V1Decision, V1Recorded};
+pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use account_selection::AccountServingCounts;
@@ -220,6 +222,7 @@ const MIGRATION_065: &str = include_str!("../migrations/065_routing_policy_end_s
 const MIGRATION_066: &str = include_str!("../migrations/066_account_eligibility.sql");
 const MIGRATION_067: &str = include_str!("../migrations/067_account_route_fence.sql");
 const MIGRATION_068: &str = include_str!("../migrations/068_account_demand_by_account.sql");
+const MIGRATION_069: &str = include_str!("../migrations/069_task_workload.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -275,7 +278,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 67] {
+fn route_state_migrations() -> [Migration; 68] {
     [
         Migration {
             version: 1,
@@ -544,6 +547,10 @@ fn route_state_migrations() -> [Migration; 67] {
         Migration {
             version: 68,
             statements: MIGRATION_068,
+        },
+        Migration {
+            version: 69,
+            statements: MIGRATION_069,
         },
     ]
 }
@@ -2406,6 +2413,23 @@ impl SqliteRouteStateStore {
         selected_harness: Option<&str>,
         selected_workload: Option<&str>,
     ) -> RouteStateResult<String> {
+        self.record_decision_with_task_ref(
+            input,
+            selected_harness,
+            selected_workload,
+            input.task_id.as_deref(),
+        )
+    }
+
+    /// Record an optional opaque task key alongside the selection, in `task_id`.
+    /// The wire's `task_ref` is attribution only; it does not affect selection.
+    pub fn record_decision_with_task_ref(
+        &self,
+        input: &DecisionInput,
+        selected_harness: Option<&str>,
+        selected_workload: Option<&str>,
+        task_ref: Option<&str>,
+    ) -> RouteStateResult<String> {
         let id = input
             .decision_id
             .clone()
@@ -2427,7 +2451,7 @@ impl SqliteRouteStateStore {
                     params![
                         id,
                         if input.decision_kind.is_empty() { "single" } else { &input.decision_kind },
-                        input.task_id,
+                        task_ref,
                         input.parent_session_id,
                         input.harness,
                         input.project_root,
@@ -2931,6 +2955,157 @@ impl SqliteRouteStateStore {
                 }))
             })
             .map_err(err)
+    }
+}
+
+impl SqliteRouteStateStore {
+    /// Copy task and workload attribution from the decision, never from the report.
+    pub fn record_usage_delivery_for_decision(
+        &self,
+        obs: &UsageObservation,
+        decision_id: &str,
+    ) -> RouteStateResult<UsageRecordResult> {
+        self.record_usage_delivery_with_decision(obs, Some(decision_id))
+    }
+
+    fn record_usage_delivery_with_decision(
+        &self,
+        obs: &UsageObservation,
+        decision_id: Option<&str>,
+    ) -> RouteStateResult<UsageRecordResult> {
+        if obs.id.trim().is_empty()
+            || obs.route_key.trim().is_empty()
+            || obs.capacity_key.trim().is_empty()
+            || obs.provider_id.trim().is_empty()
+        {
+            return Ok(UsageRecordResult::default());
+        }
+        let Some(observed_at) = floored_i64(obs.observed_at) else {
+            return Ok(UsageRecordResult::default());
+        };
+
+        let input_tokens = obs.input_tokens.and_then(stored_token_count);
+        let output_tokens = stored_output_tokens(obs.output_tokens);
+        let reasoning_tokens = obs.reasoning_tokens.and_then(stored_token_count);
+        let cached_read_tokens = obs.cached_read_tokens.and_then(stored_token_count);
+        let cache_write_tokens = obs.cache_write_tokens.and_then(stored_token_count);
+        let duration_ms = (obs.duration_ms >= 0.0)
+            .then(|| floored_i64(obs.duration_ms))
+            .flatten();
+        let workload_class = stored_workload_class(obs.workload_class.as_deref());
+
+        self.store
+            .with_conn(|c: &Connection| {
+                let (task_id, decision_workload): (Option<String>, Option<String>) =
+                    match decision_id {
+                        Some(id) => c.query_row(
+                            "SELECT task_id, COALESCE(consumer, selected_workload, target_agent)
+                             FROM model_route_decisions WHERE id = ?1",
+                            params![id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?,
+                        None => (None, None),
+                    };
+                let task_workload = task_id.as_ref().and(decision_workload);
+                let held_speed_observation = c
+                    .query_row(
+                        "SELECT COALESCE(output_tokens >= ?2 AND duration_ms >= ?3, FALSE)
+                         FROM model_route_usage
+                         WHERE id = ?1",
+                        params![
+                            obs.id,
+                            USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
+                            USAGE_MIN_DURATION_MS.floor() as i64,
+                        ],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()?;
+
+                let stored_speed_values = c
+                    .query_row(
+                        "INSERT INTO model_route_usage
+                           (id, task_id, route_key, capacity_key, provider_id,
+                            input_tokens, output_tokens, duration_ms, observed_at,
+                            reasoning_tokens, cached_read_tokens, cache_write_tokens,
+                            workload_class, account_key, task_workload)
+                         VALUES (?1, ?14, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                                 ?9, ?10, ?11, ?12, ?13, ?15)
+                         ON CONFLICT(id) DO UPDATE SET
+                           task_id = COALESCE(model_route_usage.task_id, excluded.task_id),
+                           input_tokens = COALESCE(model_route_usage.input_tokens,
+                                                   excluded.input_tokens),
+                           output_tokens = COALESCE(model_route_usage.output_tokens,
+                                                    excluded.output_tokens),
+                           duration_ms = COALESCE(model_route_usage.duration_ms,
+                                                 excluded.duration_ms),
+                           reasoning_tokens = COALESCE(model_route_usage.reasoning_tokens,
+                                                       excluded.reasoning_tokens),
+                           cached_read_tokens = COALESCE(model_route_usage.cached_read_tokens,
+                                                         excluded.cached_read_tokens),
+                           cache_write_tokens = COALESCE(model_route_usage.cache_write_tokens,
+                                                         excluded.cache_write_tokens),
+                           workload_class = COALESCE(model_route_usage.workload_class,
+                                                     excluded.workload_class),
+                           task_workload = CASE
+                             WHEN model_route_usage.task_id IS NULL OR model_route_usage.task_id = excluded.task_id
+                               THEN COALESCE(model_route_usage.task_workload, excluded.task_workload)
+                             ELSE model_route_usage.task_workload
+                           END,
+                            account_key = COALESCE(model_route_usage.account_key,
+                                                   excluded.account_key)
+                         WHERE (model_route_usage.input_tokens IS NULL AND excluded.input_tokens IS NOT NULL)
+                            OR (model_route_usage.output_tokens IS NULL AND excluded.output_tokens IS NOT NULL)
+                            OR (model_route_usage.duration_ms IS NULL AND excluded.duration_ms IS NOT NULL)
+                            OR (model_route_usage.reasoning_tokens IS NULL AND excluded.reasoning_tokens IS NOT NULL)
+                            OR (model_route_usage.cached_read_tokens IS NULL AND excluded.cached_read_tokens IS NOT NULL)
+                            OR (model_route_usage.cache_write_tokens IS NULL AND excluded.cache_write_tokens IS NOT NULL)
+                            OR (model_route_usage.workload_class IS NULL AND excluded.workload_class IS NOT NULL)
+                             OR (model_route_usage.account_key IS NULL AND excluded.account_key IS NOT NULL)
+                              OR (model_route_usage.task_id IS NULL AND excluded.task_id IS NOT NULL)
+                              OR (model_route_usage.task_workload IS NULL AND excluded.task_workload IS NOT NULL
+                                  AND (model_route_usage.task_id IS NULL OR model_route_usage.task_id = excluded.task_id))
+                         RETURNING output_tokens, duration_ms",
+                        params![
+                            obs.id,
+                            obs.route_key,
+                            obs.capacity_key,
+                            obs.provider_id,
+                            input_tokens,
+                            output_tokens,
+                            duration_ms,
+                            observed_at,
+                            reasoning_tokens,
+                            cached_read_tokens,
+                            cache_write_tokens,
+                            workload_class,
+                            obs.account_key.as_deref(),
+                            task_id,
+                            task_workload,
+                        ],
+                        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                    )
+                    .optional()?;
+
+                let holds_speed_observation =
+                    stored_speed_values.is_some_and(|(output, duration)| {
+                        output
+                            .is_some_and(|tokens| tokens >= USAGE_MIN_OUTPUT_TOKENS.floor() as i64)
+                            && duration.is_some_and(|ms| ms >= USAGE_MIN_DURATION_MS.floor() as i64)
+                    });
+                Ok((UsageRecordResult {
+                    recorded: !held_speed_observation.unwrap_or(false) && holds_speed_observation,
+                    usage_recorded: held_speed_observation.is_none(),
+                }, stored_speed_values.is_some()))
+            })
+            .map_err(err)
+            .map(|(result, changed)| {
+                // Retries that supply no new measurements must not invalidate the
+                // seven-day population mean. Only inserts/enrichment can move it.
+                if changed {
+                    self.usage_generation.fetch_add(1, Ordering::AcqRel);
+                }
+                result
+            })
     }
 }
 
@@ -4024,119 +4199,8 @@ impl RouteStateStore for SqliteRouteStateStore {
     }
 
     fn record_usage_delivery(&self, obs: &UsageObservation) -> RouteStateResult<UsageRecordResult> {
-        if obs.id.trim().is_empty()
-            || obs.route_key.trim().is_empty()
-            || obs.capacity_key.trim().is_empty()
-            || obs.provider_id.trim().is_empty()
-        {
-            return Ok(UsageRecordResult::default());
-        }
-        let Some(observed_at) = floored_i64(obs.observed_at) else {
-            return Ok(UsageRecordResult::default());
-        };
-
-        let input_tokens = obs.input_tokens.and_then(stored_token_count);
-        let output_tokens = stored_output_tokens(obs.output_tokens);
-        let reasoning_tokens = obs.reasoning_tokens.and_then(stored_token_count);
-        let cached_read_tokens = obs.cached_read_tokens.and_then(stored_token_count);
-        let cache_write_tokens = obs.cache_write_tokens.and_then(stored_token_count);
-        let duration_ms = (obs.duration_ms >= 0.0)
-            .then(|| floored_i64(obs.duration_ms))
-            .flatten();
-        let workload_class = stored_workload_class(obs.workload_class.as_deref());
-
-        self.store
-            .with_conn(|c: &Connection| {
-                let held_speed_observation = c
-                    .query_row(
-                        "SELECT COALESCE(output_tokens >= ?2 AND duration_ms >= ?3, FALSE)
-                         FROM model_route_usage
-                         WHERE id = ?1",
-                        params![
-                            obs.id,
-                            USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
-                            USAGE_MIN_DURATION_MS.floor() as i64,
-                        ],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .optional()?;
-
-                let stored_speed_values = c
-                    .query_row(
-                        "INSERT INTO model_route_usage
-                           (id, task_id, route_key, capacity_key, provider_id,
-                            input_tokens, output_tokens, duration_ms, observed_at,
-                            reasoning_tokens, cached_read_tokens, cache_write_tokens,
-                            workload_class, account_key)
-                         VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                                 ?9, ?10, ?11, ?12, ?13)
-                         ON CONFLICT(id) DO UPDATE SET
-                           input_tokens = COALESCE(model_route_usage.input_tokens,
-                                                   excluded.input_tokens),
-                           output_tokens = COALESCE(model_route_usage.output_tokens,
-                                                    excluded.output_tokens),
-                           duration_ms = COALESCE(model_route_usage.duration_ms,
-                                                 excluded.duration_ms),
-                           reasoning_tokens = COALESCE(model_route_usage.reasoning_tokens,
-                                                       excluded.reasoning_tokens),
-                           cached_read_tokens = COALESCE(model_route_usage.cached_read_tokens,
-                                                         excluded.cached_read_tokens),
-                           cache_write_tokens = COALESCE(model_route_usage.cache_write_tokens,
-                                                         excluded.cache_write_tokens),
-                           workload_class = COALESCE(model_route_usage.workload_class,
-                                                     excluded.workload_class),
-                            account_key = COALESCE(model_route_usage.account_key,
-                                                   excluded.account_key)
-                         WHERE (model_route_usage.input_tokens IS NULL AND excluded.input_tokens IS NOT NULL)
-                            OR (model_route_usage.output_tokens IS NULL AND excluded.output_tokens IS NOT NULL)
-                            OR (model_route_usage.duration_ms IS NULL AND excluded.duration_ms IS NOT NULL)
-                            OR (model_route_usage.reasoning_tokens IS NULL AND excluded.reasoning_tokens IS NOT NULL)
-                            OR (model_route_usage.cached_read_tokens IS NULL AND excluded.cached_read_tokens IS NOT NULL)
-                            OR (model_route_usage.cache_write_tokens IS NULL AND excluded.cache_write_tokens IS NOT NULL)
-                            OR (model_route_usage.workload_class IS NULL AND excluded.workload_class IS NOT NULL)
-                            OR (model_route_usage.account_key IS NULL AND excluded.account_key IS NOT NULL)
-                         RETURNING output_tokens, duration_ms",
-                        params![
-                            obs.id,
-                            obs.route_key,
-                            obs.capacity_key,
-                            obs.provider_id,
-                            input_tokens,
-                            output_tokens,
-                            duration_ms,
-                            observed_at,
-                            reasoning_tokens,
-                            cached_read_tokens,
-                            cache_write_tokens,
-                            workload_class,
-                            obs.account_key.as_deref(),
-                        ],
-                        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
-                    )
-                    .optional()?;
-
-                let holds_speed_observation =
-                    stored_speed_values.is_some_and(|(output, duration)| {
-                        output
-                            .is_some_and(|tokens| tokens >= USAGE_MIN_OUTPUT_TOKENS.floor() as i64)
-                            && duration.is_some_and(|ms| ms >= USAGE_MIN_DURATION_MS.floor() as i64)
-                    });
-                Ok((UsageRecordResult {
-                    recorded: !held_speed_observation.unwrap_or(false) && holds_speed_observation,
-                    usage_recorded: held_speed_observation.is_none(),
-                }, stored_speed_values.is_some()))
-            })
-            .map_err(err)
-            .map(|(result, changed)| {
-                // Retries that supply no new measurements must not invalidate the
-                // seven-day population mean. Only inserts/enrichment can move it.
-                if changed {
-                    self.usage_generation.fetch_add(1, Ordering::AcqRel);
-                }
-                result
-            })
+        self.record_usage_delivery_with_decision(obs, None)
     }
-
     fn append_quota_readings(&self, rows: &[QuotaReadingLogRow]) -> RouteStateResult<usize> {
         self.store
             .with_conn(|connection: &Connection| {

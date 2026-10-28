@@ -45,6 +45,7 @@ mod select_policy;
 mod selection_harness;
 mod subscription_economics;
 mod substrate_policy;
+mod task_profile_refresh;
 #[cfg(test)]
 mod test_config;
 mod usage_observe;
@@ -1224,6 +1225,7 @@ where
     ));
 
     let mut route_epochs = RouteEpochs::new();
+    let mut profiles_started = false;
     loop {
         let Some(frame) = next_frame_or_loop_stop(read_half, &mut loops).await? else {
             return Ok(()); // clean EOF: subc closed the connection.
@@ -1243,6 +1245,18 @@ where
         .await?
         {
             return Ok(());
+        }
+        if !profiles_started && !route_epochs.is_empty() {
+            // Start only after the first bind ACK is queued, never during store open.
+            loops.spawn(
+                "task profile refresh",
+                task_profile_refresh::refresh_loop(
+                    Arc::clone(&store),
+                    override_path.clone(),
+                    Arc::clone(&broca_credentials),
+                ),
+            );
+            profiles_started = true;
         }
     }
 }
@@ -14500,6 +14514,7 @@ mod tests {
                 min_best_effort_adequacy: None,
                 prefer_prompt_cache: false,
                 providers_without_prompt_cache: HashSet::new(),
+                providers_without_cache_write_reports: HashSet::new(),
             },
             &DEFAULT_ROUTING_CONFIG,
         )
@@ -14903,26 +14918,33 @@ mod tests {
     #[test]
     fn the_first_ladder_after_boot_prices_routes_with_the_configured_multipliers() {
         let rig = LadderRig::new("multiplier");
-        let mut listed = fact(&rig.provider, "listed");
+        let listed_provider = format!("{}-listed", rig.provider);
+        let listed_route = make_route_key(&listed_provider, "listed", None);
+        let mut listed = fact(&listed_provider, "listed");
         listed.scores.elo = 1_500.0;
         listed.scores.eq = 1_500.0;
         listed.cost_per_m_tok_out = Some(8.0);
         rig.store
             .upsert_fact(&listed, FactSource::Override)
             .unwrap();
-        // At list price `listed` (8) undercuts `incumbent` (10); with the
-        // incumbent's configured multiplier it costs a tenth as much.
-        let mut models = serde_json::Map::new();
-        models.insert(
-            rig.route("incumbent"),
+        // At list price `listed` (8) undercuts `incumbent` (10). A provider-wide
+        // multiplier makes the incumbent cheaper without subsidizing its rival.
+        let mut providers = serde_json::Map::new();
+        providers.insert(
+            rig.provider.clone(),
             json!({ "subscription_multiplier": 100 }),
         );
         crate::test_config::write(
             &rig.sources.routing_config,
-            serde_json::to_vec(&json!({ "model_routing": { "models": models } })).unwrap(),
+            serde_json::to_vec(&json!({ "providers": providers })).unwrap(),
         )
         .unwrap();
-        rig.observe(&["incumbent", "listed"]);
+        rig.sources.observed.record(
+            host_mason(),
+            [rig.route("incumbent"), listed_route.clone()],
+            Vec::new(),
+            rig.store.build_snapshot(now_ms() as f64).unwrap(),
+        );
 
         let first = rig.ladder();
         assert_eq!(
@@ -14934,6 +14956,13 @@ mod tests {
             first,
             rig.ladder(),
             "identical inputs give identical ladders"
+        );
+        crate::test_config::write(&rig.sources.routing_config, "{}").unwrap();
+        config_overrides::settle_live_config(&rig.sources.routing_config);
+        assert_eq!(
+            host_tier(&rig.ladder(), 30).neutral,
+            Some(listed_route),
+            "without the provider multiplier the lower list price must win"
         );
     }
     #[tokio::test]

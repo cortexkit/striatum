@@ -48,6 +48,7 @@ const MEMBERS: &[&str] = &[
     "runners",
     "affinity",
     "correlation_id",
+    "task_ref",
     "concurrency_slots",
     "detail",
     "harness",
@@ -95,7 +96,53 @@ pub(super) async fn select(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
+    let lookup = |workload: &str, iq: f64, facts: &[ModelFact]| {
+        let complete = crate::select::task_profiles_for(workload, iq, facts);
+        if !complete.profiles.is_empty() || facts.len() <= 1 {
+            return complete;
+        }
+        // Resolve each route from one refresh snapshot. The core scorer, which
+        // knows the final adequate shortlist, enforces all-or-nothing pricing;
+        // an excluded or inadequate route must not prevent the remaining routes
+        // from using profile pricing.
+        let snapshot = crate::task_profile_refresh::cache().snapshot();
+        crate::select::TaskProfileLookup {
+            profiles: facts
+                .iter()
+                .flat_map(|fact| snapshot.lookup(workload, iq, std::slice::from_ref(fact)))
+                .collect(),
+            providers_without_cache_write_reports: snapshot
+                .providers_without_cache_write_reports
+                .clone(),
+        }
+    };
+    select_with_profile_lookup(params, caller, deps, &lookup).await
+}
+
+pub(super) type ProfileLookup =
+    dyn Fn(&str, f64, &[ModelFact]) -> crate::select::TaskProfileLookup + Sync;
+
+pub(super) async fn select_with_profile_lookup(
+    params: &serde_json::Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    profile_lookup: &ProfileLookup,
+) -> Result<Value, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
+    // An omitted task_ref is valid, but a present value must be a string.
+    // Reject null rather than letting the optional-string parser treat it as omitted.
+    if params.get("task_ref").is_some_and(|value| {
+        value.as_str().is_none_or(|key| {
+            key.is_empty()
+                || key.len() > 128
+                || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        })
+    }) {
+        return Err(Refusal::invalid_request(
+            "task_ref",
+            "task_ref must be 1-128 bytes of printable ASCII (0x21-0x7E)",
+        ));
+    }
     let request = parse_select_request_serving(params, super::describe::CAPABILITIES)?;
     let live_config = config_overrides::live_config(deps.routing_config_path);
     let operator_config = operator_config(deps);
@@ -392,6 +439,8 @@ pub(super) async fn select(
         consumer: &consumer,
         priced_per_token,
         demand,
+        profile_lookup,
+        task_ref: request.task_ref.as_deref(),
         required_capabilities,
         facts: &facts,
         snapshot: &snapshot,
@@ -477,7 +526,7 @@ pub(super) async fn select(
                 })
                 .cloned()
                 .collect();
-            if let Ok(selected) = selection.pass().score(&subset) {
+            if let Ok(selected) = selection.score(&subset) {
                 match selection.account_check(&selected) {
                     Ok(()) => {
                         result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
@@ -515,12 +564,18 @@ pub(super) async fn select(
         None
     };
     let mut ordered = ladder_choice.unwrap_or_else(|| {
-        selection.pass().select(
+        select_policy::select_ordered(
             &usable,
             request_pin.as_deref(),
             project_pin.as_deref(),
             continuing.as_deref(),
             |pin| selection.pin(pin, &available),
+            |only| selection.score(only),
+            || {
+                select_policy::select_in_order(&usable, &consumer_policy, |only| {
+                    selection.score(only)
+                })
+            },
         )
     });
     // `pin_outcome` is answered exactly when the request pinned: `fell_back`
@@ -589,10 +644,7 @@ pub(super) async fn select(
                         return None;
                     }
                     if !available.contains(key)
-                        || selection
-                            .pass()
-                            .score(&HashSet::from([key.clone()]))
-                            .is_err()
+                        || selection.score(&HashSet::from([key.clone()])).is_err()
                     {
                         return None;
                     }
@@ -659,7 +711,12 @@ pub(super) async fn select(
         );
     let decision_id = deps
         .store
-        .record_decision_with_selection(&decision, Some(&runner.module), None)
+        .record_decision_with_task_ref(
+            &decision,
+            Some(&runner.module),
+            None,
+            request.task_ref.as_deref(),
+        )
         .map_err(store_refusal)?;
     if registry
         .get(&runner.module)
@@ -764,6 +821,8 @@ struct Selection<'a> {
     consumer: &'a str,
     priced_per_token: bool,
     demand: ModelRequirements,
+    profile_lookup: &'a ProfileLookup,
+    task_ref: Option<&'a str>,
     required_capabilities: Option<RequiredCapabilities>,
     facts: &'a [ModelFact],
     snapshot: &'a ModelRouteStateSnapshot,
@@ -787,6 +846,84 @@ struct Selection<'a> {
 }
 
 impl<'a> Selection<'a> {
+    fn score(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
+        let allowed = available
+            .iter()
+            .filter(|route| {
+                self.sources
+                    .operator_config
+                    .route_allowed(self.consumer, route, false)
+            })
+            .cloned()
+            .collect();
+        let input = self.pass().input(&allowed, self.snapshot.clone());
+        self.score_input(input, self.consumer_exclude, None)
+            .map_err(select_policy::describe_filter_refusal)
+    }
+
+    fn score_input(
+        &self,
+        mut input: prefrontal_routing_core::SelectModelRouteInput<'_>,
+        consumer_exclude: &[String],
+        explicit_variant: Option<&str>,
+    ) -> Result<SelectedModelRoute, NoRouteError> {
+        let catalog = config_overrides::reasoning_catalog_for(self.sources.operator_config_path);
+        let groups = self.sources.operator_config.variant_groups();
+        let mut identities = Vec::new();
+        let mut shortlist = Vec::new();
+        for fact in &input.facts {
+            let route = fact_to_route(fact);
+            if !input.available_models.contains(&route.route_key)
+                && !input.available_models.contains(&route.capacity_key)
+            {
+                continue;
+            }
+            let choice = crate::variant_policy::resolve(
+                groups,
+                self.sources.catalog_targets,
+                catalog.as_ref(),
+                &crate::variant_policy::VariantRequest {
+                    route_key: &route.route_key,
+                    provider_id: &fact.provider_id,
+                    model_id: &fact.model_id,
+                    explicit: explicit_variant,
+                    curated: fact
+                        .prompt_defaults
+                        .as_ref()
+                        .and_then(|p| p.variant.as_deref())
+                        .or(fact.variant.as_deref()),
+                    consumer: select_policy::Consumer::from_id(self.consumer),
+                },
+            );
+            let mut served = fact.clone();
+            served.variant = choice.variant;
+            // Profiles follow the variant that will run, while routing keeps
+            // the original keys for exclusions, availability and reservations.
+            identities.push((route.route_key, fact_to_route(&served).route_key));
+            shortlist.push(served);
+        }
+        // The lookup reads a refresh snapshot, never task history on the select path.
+        let lookup = (self.profile_lookup)(self.consumer, self.demand.iq, &shortlist);
+        let profiles = identities
+            .into_iter()
+            .filter_map(|(route, served)| {
+                lookup
+                    .profiles
+                    .get(&served)
+                    .map(|profile| (route, profile.clone()))
+            })
+            .collect();
+        input.providers_without_cache_write_reports = lookup.providers_without_cache_write_reports;
+        prefrontal_routing_core::model_router::select_model_route_with_profiles(
+            input,
+            self.routing_config,
+            self.slots,
+            consumer_exclude,
+            self.rejections,
+            &profiles,
+        )
+    }
+
     fn pass(&self) -> select_policy::SelectionPass<'_> {
         select_policy::SelectionPass {
             consumer: self.consumer,
@@ -837,7 +974,7 @@ impl<'a> Selection<'a> {
             Refusal::pin_unavailable(pin, reason, reset)
         };
         let catalog = config_overrides::reasoning_catalog_for(self.sources.operator_config_path);
-        let selected = work_model_pin::select_with_availability(
+        let mut selected = work_model_pin::select_with_availability(
             pin,
             self.pass().input(available, snapshot.clone()),
             self.routing_config,
@@ -847,6 +984,49 @@ impl<'a> Selection<'a> {
             self.rejections,
         )
         .map_err(|refusal| refused(&refusal.code))?;
+        // Hard pin admission remains shared with legacy selection. Reprice only
+        // the admitted route, retaining its real demand's profile bucket.
+        let mut input = self.pass().input(available, snapshot.clone());
+        let mut fact = input
+            .facts
+            .iter()
+            .find(|fact| {
+                fact.provider_id == selected.model.provider_id
+                    && fact.model_id == selected.model.model_id
+                    && fact.variant == selected.prompt_params.variant
+            })
+            .or_else(|| {
+                input.facts.iter().find(|fact| {
+                    fact.provider_id == selected.model.provider_id
+                        && fact.model_id == selected.model.model_id
+                        && fact.variant.is_none()
+                })
+            })
+            .or_else(|| {
+                input.facts.iter().find(|fact| {
+                    fact.provider_id == selected.model.provider_id
+                        && fact.model_id == selected.model.model_id
+                })
+            })
+            .expect("pin admission selected a catalog fact")
+            .clone();
+        fact.variant = selected.prompt_params.variant.clone();
+        input.facts = vec![fact];
+        input.operator_exclude_keys.clear();
+        input.requirements = ModelRequirements { iq: 0.0, eq: 0.0 };
+        input
+            .required_capabilities
+            .get_or_insert_with(Default::default)
+            .min_context = Some(0.0);
+        let mut priced = self
+            .score_input(input, &[], variant.as_deref())
+            .map_err(|error| refused(error.reason.as_str()))?;
+        priced.score.adequacy = selected.score.adequacy;
+        priced.score.raw_adequacy = selected.score.raw_adequacy;
+        priced.score.metrics = selected.score.metrics;
+        selected.score = priced.score;
+        selected.priced_with_basket = priced.priced_with_basket;
+        selected.explanation.extend(priced.explanation);
         if let Err(refusal) = self.account_check(&selected) {
             if refusal.code.as_str() != "account_hold" {
                 return Err(refusal);
@@ -874,7 +1054,7 @@ impl<'a> Selection<'a> {
             if only.is_empty() {
                 return None;
             }
-            let listed = self.pass().score(&only).ok()?;
+            let listed = self.score(&only).ok()?;
             let queues = listed
                 .slot_saturation
                 .as_ref()
@@ -938,6 +1118,7 @@ impl<'a> Selection<'a> {
             Some(no_route),
             &crate::SelectParams {
                 scope: self.scope.clone(),
+                task_id: self.task_ref.map(str::to_owned),
                 ..crate::SelectParams::for_record()
             },
             Some(provenance),

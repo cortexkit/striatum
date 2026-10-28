@@ -62,6 +62,7 @@ impl<'a> SelectionPass<'a> {
                 .iter()
                 .cloned()
                 .collect(),
+            providers_without_cache_write_reports: Default::default(),
         }
     }
 

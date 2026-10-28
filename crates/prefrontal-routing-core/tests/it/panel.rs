@@ -443,6 +443,7 @@ fn admission_is_shared_not_reimplemented() {
         min_best_effort_adequacy: None,
         prefer_prompt_cache: false,
         providers_without_prompt_cache: HashSet::new(),
+        providers_without_cache_write_reports: HashSet::new(),
     })
     .unwrap();
     assert_eq!(singular.route_key, "p/winner");
@@ -674,8 +675,9 @@ fn reserved_headroom_panel_cause_publishes_structured_reset_without_prose_timest
                     now_ms: 1791682778812,
                     plans: vec![SubscriptionPlan {
                         tier: None,
+                        plan: None,
+                        measured: None,
                         fee_usd: 0.0,
-                        fusiform_multiplier: None,
                         accounts: vec![account(2.0), account(1.0)],
                     }],
                     ..Default::default()

@@ -472,6 +472,7 @@ pub(crate) fn compute_ladder(
                             min_best_effort_adequacy,
                             prefer_prompt_cache: false,
                             providers_without_prompt_cache: HashSet::new(),
+                            providers_without_cache_write_reports: HashSet::new(),
                         },
                         &routing_config,
                     )

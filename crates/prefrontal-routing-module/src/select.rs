@@ -2,6 +2,27 @@
 
 use super::*;
 
+/// One refresh snapshot supplies both profiles and provider reporting metadata.
+pub(crate) struct TaskProfileLookup {
+    pub(crate) profiles: prefrontal_routing_core::model_router::RouteTaskProfiles,
+    pub(crate) providers_without_cache_write_reports: HashSet<String>,
+}
+
+/// Resolve only from memory; routing/v1 can call this after forming its shortlist.
+pub(crate) fn task_profiles_for(
+    workload: &str,
+    iq: f64,
+    shortlist: &[ModelFact],
+) -> TaskProfileLookup {
+    let snapshot = task_profile_refresh::cache().snapshot();
+    TaskProfileLookup {
+        profiles: snapshot.lookup(workload, iq, shortlist),
+        providers_without_cache_write_reports: snapshot
+            .providers_without_cache_write_reports
+            .clone(),
+    }
+}
+
 /// The full `route.select` body, decoded only after the method is confirmed.
 #[derive(Debug, Deserialize)]
 pub(super) struct SelectBody {

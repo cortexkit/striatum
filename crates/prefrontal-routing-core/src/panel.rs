@@ -1351,8 +1351,9 @@ mod reset_tests {
                 now_ms: 1791682778812,
                 plans: vec![SubscriptionPlan {
                     tier: None,
+                    plan: None,
+                    measured: None,
                     fee_usd: 0.0,
-                    fusiform_multiplier: None,
                     accounts: vec![account(2.0), account(1.0), account(f64::NAN)],
                 }],
                 ..Default::default()

@@ -433,6 +433,7 @@ fn exhausted_provider_loses_selection_to_unpressured_peer_end_to_end() {
         min_best_effort_adequacy: None,
         prefer_prompt_cache: false,
         providers_without_prompt_cache: std::collections::HashSet::new(),
+        providers_without_cache_write_reports: std::collections::HashSet::new(),
     })
     .unwrap();
     assert_eq!(
@@ -710,6 +711,7 @@ fn balance_only_positive_pool_keeps_provider_servable() {
         min_best_effort_adequacy: None,
         prefer_prompt_cache: false,
         providers_without_prompt_cache: std::collections::HashSet::new(),
+        providers_without_cache_write_reports: std::collections::HashSet::new(),
     })
     .expect("a positive balance-only provider remains selectable");
     assert_eq!(selected.model.provider_id, "balance-provider");
@@ -865,6 +867,7 @@ fn an_idle_account_keeps_its_provider_off_the_all_accounts_wall() {
             min_best_effort_adequacy: None,
             prefer_prompt_cache: false,
             providers_without_prompt_cache: Default::default(),
+            providers_without_cache_write_reports: Default::default(),
         })
         .unwrap();
         (result.model.provider_id, wall)
@@ -947,6 +950,7 @@ fn an_exhausted_rolling_window_still_walls_its_route() {
             min_best_effort_adequacy: None,
             prefer_prompt_cache: false,
             providers_without_prompt_cache: Default::default(),
+            providers_without_cache_write_reports: Default::default(),
         })
         .unwrap();
         (result.model.model_id, wall)

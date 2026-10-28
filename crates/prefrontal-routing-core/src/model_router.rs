@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model_facts::{
-    fact_to_route, BasketPrice, ClassVector, ModelFact, ModelMetric, ModelRequirements, ModelRoute,
-    ScoreProvenance, CLASS_VECTOR_SAMPLE_FLOOR,
+    fact_to_route, BasketDimension, BasketPrice, ClassVector, ModelFact, ModelMetric,
+    ModelRequirements, ModelRoute, ScoreProvenance, CLASS_VECTOR_SAMPLE_FLOOR,
 };
 use crate::model_resolution::{use_basket_permitted, CLASS_PRODUCER, COUNTERS_PRODUCER};
 use crate::provider_model_spec::{ExclusionPolicy, ExclusionSource, ExclusionSpecs};
@@ -34,6 +34,12 @@ use crate::routing_config::{
 use crate::slot_saturation::{
     pick_unsaturated, ConcurrencySlots, SlotSaturation, REASON_PROVIDER_SATURATED,
 };
+use crate::task_profile::{TaskProfile, TokenVector};
+
+/// Profiles resolved for one select's workload and intelligence-demand bucket,
+/// keyed by exact route key. The caller supplies a single in-memory refresh snapshot; selection
+/// never loads or recomputes task statistics.
+pub type RouteTaskProfiles = HashMap<String, TaskProfile>;
 
 /// A route the operator's standing policy fences off. Distinct from [`REASON_EXCLUDED`]
 /// so a reader of a rejection can tell "the machine owner said never" from "this
@@ -178,6 +184,8 @@ pub struct SelectModelRouteInput<'a> {
     /// Provider IDs that do not offer prompt caching, loaded by the routing
     /// module from its live configuration.
     pub providers_without_prompt_cache: HashSet<String>,
+    /// Empty by default; the usage-window profile refresh adds providers whose rows never report a cache-write counter.
+    pub providers_without_cache_write_reports: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -217,9 +225,32 @@ pub struct ObjectiveBreakdown {
     pub quota_abundance_window: Option<String>,
     /// How the route's cost was computed when its selection priced by the token
     /// basket: which ephemeral vector it used and which dimensions, if any, had
-    /// tokens but no rate. Absent when the selection priced output-only.
+    /// tokens but no rate. Absent for task-profile and output-only pricing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basket_pricing: Option<BasketRoutePricing>,
+    /// Task economics, including the cold-start basis when no profile serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_pricing: Option<TaskRoutePricing>,
+}
+
+/// Per-candidate evidence for the economic cost, before over-qualification.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskRoutePricing {
+    /// None means cold start, with zero supporting tasks. A served profile
+    /// includes its level, task count, transfer and blending metadata.
+    pub profile: Option<TaskProfile>,
+    /// None only for the cold-start million-output-token comparison unit.
+    pub tokens: Option<TokenVector>,
+    pub price_unit: &'static str,
+    pub list_cost_usd: Option<f64>,
+    pub value_multiplier: f64,
+    pub value_source: String,
+    pub pressure: f64,
+    pub final_cost_usd: Option<f64>,
+    pub normalized_cost: f64,
+    pub omitted_dimensions: Vec<String>,
+    pub unpriced_dimensions: Vec<String>,
 }
 
 /// Where the token profile a route was basket-priced on came from.
@@ -369,9 +400,10 @@ pub struct PricedShortlistEntry {
     pub overqualification: f64,
     /// Cached-read term in list dollars: `cached_read * cache_read_rate / 1e6`.
     pub cached_read_term_usd: Option<f64>,
-    /// How the route was basket-priced; None when the selection priced
-    /// output-only.
+    /// How the route was cold-start basket-priced; None for task profiles and
+    /// output-only pricing.
     pub basket_pricing: Option<BasketRoutePricing>,
+    pub task_pricing: Option<TaskRoutePricing>,
 }
 
 /// The shortlist `select_model_route` would price, with the whole-selection
@@ -918,7 +950,7 @@ fn cached_read_term_usd(fact: &ModelFact, vector: Option<&ClassVector>) -> Optio
     Some((vector.cached_read * rate) / 1_000_000.0)
 }
 
-/// The unit one route is priced in, decided for the whole selection.
+/// The comparison unit for one route, decided for the whole selection.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CostBasis<'v> {
     /// The output $/Mtok ladder (effective price, tier, unpriced rule).
@@ -927,6 +959,10 @@ pub(crate) enum CostBasis<'v> {
     Basket {
         vector: &'v ClassVector,
         source: BasketVectorSource,
+    },
+    TaskProfile {
+        profile: &'v TaskProfile,
+        omit_cache_write: bool,
     },
 }
 
@@ -1009,6 +1045,20 @@ pub(crate) fn compute_objective(
     basis: CostBasis<'_>,
     head: bool,
 ) -> (ObjectiveBreakdown, Vec<String>) {
+    if let CostBasis::TaskProfile {
+        profile,
+        omit_cache_write,
+    } = basis
+    {
+        return compute_profile_objective(
+            route,
+            runtime,
+            is_subscription,
+            profile,
+            omit_cache_write,
+            head,
+        );
+    }
     let mut notes: Vec<String> = Vec::new();
 
     let multiplier = subscription_multiplier(&route.fact);
@@ -1094,6 +1144,7 @@ pub(crate) fn compute_objective(
     objective.price_unknown = match basis {
         CostBasis::Basket { vector, .. } => route.fact.basket_price(vector).cost.is_none(),
         CostBasis::OutputOnly => output_price_unknown(&route.fact),
+        CostBasis::TaskProfile { .. } => unreachable!("task profiles were priced above"),
     };
     if is_subscription {
         if let Some(pool) = &runtime.subscription_pool {
@@ -1128,6 +1179,7 @@ pub(crate) fn compute_objective(
                         .basket_rate(crate::model_facts::BasketDimension::OutputExcludingReasoning),
                     crate::routing_config::COST_REFERENCE_PER_MTOK,
                 ),
+                CostBasis::TaskProfile { .. } => unreachable!("task profiles were priced above"),
             };
             if let Some(list_usd) = list_usd {
                 if let Some(mut pricing) = pool.price(
@@ -1159,6 +1211,202 @@ pub(crate) fn compute_objective(
         notes.push(price_unknown_note(route));
     }
     (objective, notes)
+}
+
+fn profile_list_price(
+    fact: &ModelFact,
+    tokens: TokenVector,
+    omit_cache_write: bool,
+) -> (Option<f64>, Vec<String>, Vec<String>) {
+    let mut dollars = 0.0;
+    let mut omitted = Vec::new();
+    let mut unpriced = Vec::new();
+    for dimension in BasketDimension::ALL {
+        // A transferred profile may contain cache writes, but cannot establish
+        // consumption when the provider's usage window never reports that counter.
+        if dimension == BasketDimension::CacheWrite && omit_cache_write {
+            omitted.push(dimension.as_str().to_string());
+            continue;
+        }
+        let quantity = tokens.dimension(dimension);
+        if !quantity.is_finite() || quantity < 0.0 {
+            unpriced.push(dimension.as_str().to_string());
+        } else if quantity > 0.0 {
+            if let Some(rate) = fact
+                .basket_rate(dimension)
+                .filter(|r| r.is_finite() && *r >= 0.0)
+            {
+                dollars += quantity * rate / 1_000_000.0;
+            } else {
+                unpriced.push(dimension.as_str().to_string());
+            }
+        }
+    }
+    (
+        (unpriced.is_empty() && dollars.is_finite()).then_some(dollars),
+        omitted,
+        unpriced,
+    )
+}
+
+fn compute_profile_objective(
+    route: &ModelRoute,
+    runtime: &RouteRuntimeState,
+    is_subscription: bool,
+    profile: &TaskProfile,
+    omit_cache_write: bool,
+    head: bool,
+) -> (ObjectiveBreakdown, Vec<String>) {
+    let (list_cost_usd, omitted_dimensions, unpriced_dimensions) =
+        profile_list_price(&route.fact, profile.tokens, omit_cache_write);
+    // The empty pool uses the same multiplier resolver and pressure=1 path as an account
+    // snapshot with no economics, rather than restoring the legacy free bucket.
+    let empty_pool = crate::subscription::SubscriptionPool::default();
+    let pool = runtime.subscription_pool.as_deref().unwrap_or(&empty_pool);
+    let pricing = if is_subscription {
+        list_cost_usd.and_then(|list| {
+            pool.price(
+                list,
+                route.fact.subscription_multiplier,
+                pool.keep_free_percent,
+                head,
+            )
+        })
+    } else {
+        None
+    };
+    let final_cost_usd = if is_subscription {
+        pricing.as_ref().map(|p| p.dollars())
+    } else {
+        list_cost_usd
+    };
+    let cost = final_cost_usd
+        .map(|dollars| dollars / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE)
+        .unwrap_or(1.0);
+    let (mut objective, mut notes) =
+        objective_tail(route, runtime, is_subscription, cost, None, Vec::new());
+    // Plan pressure is already in the dollar price. No independent legacy quota
+    // surcharge applies to a task estimate, including one with no account pool.
+    objective.quota = 0.0;
+    objective.selection_cost = cost;
+    objective.price_unknown = final_cost_usd.is_none();
+    notes.retain(|note| !note.starts_with("quota +") && !note.starts_with("quota signal:"));
+    let (value_multiplier, value_source, pressure) = pricing
+        .as_ref()
+        .map(|p| (p.value_multiplier, p.value_source.clone(), p.plan_pressure))
+        .unwrap_or_else(|| {
+            if is_subscription {
+                let (value, source) = pool
+                    .price(
+                        0.0,
+                        route.fact.subscription_multiplier,
+                        pool.keep_free_percent,
+                        head,
+                    )
+                    .map(|p| (p.value_multiplier, p.value_source))
+                    .unwrap_or_else(|| {
+                        crate::subscription::resolve_value(
+                            route.fact.subscription_multiplier,
+                            None,
+                            pool.now_ms,
+                        )
+                    });
+                (value, source, 1.0)
+            } else {
+                (1.0, "pay-per-token".to_string(), 1.0)
+            }
+        });
+    objective.subscription_pricing = pricing.map(|mut p| {
+        p.price_unit = "task";
+        p
+    });
+    objective.task_pricing = Some(TaskRoutePricing {
+        profile: Some(profile.clone()),
+        tokens: Some(profile.tokens),
+        price_unit: "task",
+        list_cost_usd,
+        value_multiplier,
+        value_source,
+        pressure,
+        final_cost_usd,
+        normalized_cost: cost,
+        omitted_dimensions,
+        unpriced_dimensions,
+    });
+    if let Some(plane) = &route.fact.billing_plane {
+        notes.push(format!(
+            "billing plane: {}/{} ({}, serving method: {})",
+            plane.provider_id, plane.auth_method, plane.kind, plane.selection_reason
+        ));
+    }
+    if objective.price_unknown {
+        notes.push(price_unknown_note(route));
+    }
+    (objective, notes)
+}
+
+fn record_cold_start_pricing(
+    objective: &mut ObjectiveBreakdown,
+    fact: &ModelFact,
+    basis: CostBasis<'_>,
+    is_subscription: bool,
+) {
+    let tokens = match basis {
+        CostBasis::Basket { vector, .. } => Some(TokenVector {
+            fresh_input: vector.fresh_input,
+            cached_read: vector.cached_read,
+            cache_write: vector.cache_write,
+            output_excluding_reasoning: vector.output_excluding_reasoning,
+            reasoning: vector.reasoning,
+        }),
+        CostBasis::OutputOnly => None,
+        CostBasis::TaskProfile { .. } => unreachable!("only cold-start bases are recorded here"),
+    };
+    let list_cost_usd = if let Some(tokens) = tokens {
+        tokens.list_cost(fact)
+    } else {
+        fact.basket_rate(BasketDimension::OutputExcludingReasoning)
+    };
+    let reference = if tokens.is_some() {
+        crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE
+    } else {
+        COST_REFERENCE_PER_MTOK
+    };
+    let (value_multiplier, value_source, pressure) =
+        if let Some(p) = &objective.subscription_pricing {
+            (p.value_multiplier, p.value_source.clone(), p.plan_pressure)
+        } else {
+            (
+                subscription_multiplier(fact),
+                "cold-start effective rate".to_string(),
+                1.0,
+            )
+        };
+    objective.task_pricing = Some(TaskRoutePricing {
+        profile: None,
+        tokens,
+        price_unit: if tokens.is_some() {
+            "message"
+        } else {
+            "million output tokens"
+        },
+        list_cost_usd,
+        value_multiplier,
+        value_source: if is_subscription {
+            value_source
+        } else {
+            "cold-start effective rate".to_string()
+        },
+        pressure,
+        final_cost_usd: (!objective.price_unknown).then_some(objective.cost * reference),
+        normalized_cost: objective.cost,
+        omitted_dimensions: Vec::new(),
+        unpriced_dimensions: objective
+            .basket_pricing
+            .as_ref()
+            .map(|p| p.unpriced_dimensions.clone())
+            .unwrap_or_default(),
+    });
 }
 
 /// Why a route has no known price, in the words a decision reader needs.
@@ -1309,6 +1557,7 @@ fn objective_tail(
             quota_abundance,
             quota_abundance_window,
             basket_pricing,
+            task_pricing: None,
         },
         notes,
     )
@@ -1440,6 +1689,7 @@ fn admit_and_price_shortlist(
     class_producer: bool,
     operator_group: &[String],
     availability_rejections: &HashMap<String, String>,
+    profiles: &RouteTaskProfiles,
 ) -> Result<PricedAdmission, NoRouteError> {
     let requirements = input.requirements;
 
@@ -1588,7 +1838,15 @@ fn admit_and_price_shortlist(
         .map(|(i, _)| i)
         .collect();
 
-    // Basket gate. Basket pricing is decided per route and per dimension: a
+    // Fleet fallback makes profile support selection-wide: either all candidates
+    // have a resolved task estimate, or all retain the cold-start comparison unit.
+    // Never mix dollars per task and dollars per legacy message in one select.
+    let use_profiles = !shortlist.is_empty()
+        && shortlist
+            .iter()
+            .all(|&idx| profiles.contains_key(&admissible[idx].route.route_key));
+
+    // Cold-start basket gate. Basket pricing is decided per route and per dimension: a
     // missing rate only affects the route that lacks it (see
     // `basket_route_cost`), so no catalog gap anywhere in the shortlist can
     // switch the whole selection's unit. The one whole-selection fallback left
@@ -1597,14 +1855,15 @@ fn admit_and_price_shortlist(
     // can be basket-priced on equal terms. The producer flags are the other
     // precondition; account_producer is not in this predicate.
     let fleet_vector = fleet_ephemeral_vector(&input.facts);
-    let degraded_by = shortlist.iter().find_map(|&idx| {
+    let degraded_by = shortlist.iter().filter(|_| !use_profiles).find_map(|&idx| {
         let route = &admissible[idx].route;
         route_basket_vector(&route.fact, fleet_vector)
             .is_none()
             .then(|| route.route_key.clone())
     });
     let producers_permit = use_basket_permitted(counters_producer, class_producer);
-    let use_basket = producers_permit && !shortlist.is_empty() && degraded_by.is_none();
+    let use_basket =
+        use_profiles || (producers_permit && !shortlist.is_empty() && degraded_by.is_none());
     let pricing_fallback = if use_basket {
         None
     } else if !producers_permit {
@@ -1626,7 +1885,14 @@ fn admit_and_price_shortlist(
             let a = &admissible[idx];
             let is_sub =
                 subscription_route_covered(&a.route, input.is_subscription_route.as_deref());
-            let basis = if use_basket {
+            let basis = if use_profiles {
+                CostBasis::TaskProfile {
+                    profile: &profiles[&a.route.route_key],
+                    omit_cache_write: input
+                        .providers_without_cache_write_reports
+                        .contains(&a.route.provider_id),
+                }
+            } else if use_basket {
                 let (vector, source) = route_basket_vector(&a.route.fact, fleet_vector)
                     .expect("the basket gate admitted only routes with a usable vector");
                 CostBasis::Basket { vector, source }
@@ -1638,10 +1904,22 @@ fn admit_and_price_shortlist(
                 match basis {
                     CostBasis::Basket { vector, .. } => Some(vector),
                     CostBasis::OutputOnly => a.route.fact.ephemeral_vector(),
+                    CostBasis::TaskProfile { .. } => None,
                 },
             );
+            let cached_read_term = if let CostBasis::TaskProfile { profile, .. } = basis {
+                a.route
+                    .fact
+                    .basket_rate(BasketDimension::CachedRead)
+                    .map(|rate| profile.tokens.cached_read * rate / 1_000_000.0)
+            } else {
+                cached_read_term
+            };
             let (mut breakdown, mut notes) =
                 compute_objective(&a.route, &a.runtime, is_sub, basis, input.target_is_head);
+            if !use_profiles {
+                record_cold_start_pricing(&mut breakdown, &a.route.fact, basis, is_sub);
+            }
             apply_overqualification(
                 &mut breakdown,
                 &mut notes,
@@ -1691,6 +1969,23 @@ pub fn price_selection_shortlist(
     counters_producer: bool,
     class_producer: bool,
 ) -> Result<PricedShortlist, NoRouteError> {
+    price_selection_shortlist_with_profiles(
+        input,
+        config,
+        counters_producer,
+        class_producer,
+        &RouteTaskProfiles::new(),
+    )
+}
+
+/// Shortlist replay with the same pre-resolved profile snapshot as selection.
+pub fn price_selection_shortlist_with_profiles(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    counters_producer: bool,
+    class_producer: bool,
+    profiles: &RouteTaskProfiles,
+) -> Result<PricedShortlist, NoRouteError> {
     let priced = admit_and_price_shortlist(
         &input,
         config,
@@ -1698,6 +1993,7 @@ pub fn price_selection_shortlist(
         class_producer,
         &[],
         &HashMap::new(),
+        profiles,
     )?;
     Ok(PricedShortlist {
         use_basket: priced.use_basket,
@@ -1715,6 +2011,7 @@ pub fn price_selection_shortlist(
                     overqualification: s.objective.overqualification,
                     cached_read_term_usd: s.cached_read_term_usd,
                     basket_pricing: s.objective.basket_pricing.clone(),
+                    task_pricing: s.objective.task_pricing.clone(),
                 }
             })
             .collect(),
@@ -1761,6 +2058,29 @@ pub fn select_model_route_with_availability(
     operator_group: &[String],
     availability_rejections: &HashMap<String, String>,
 ) -> Result<SelectedModelRoute, NoRouteError> {
+    select_model_route_with_profiles(
+        input,
+        config,
+        slots,
+        operator_group,
+        availability_rejections,
+        &RouteTaskProfiles::new(),
+    )
+}
+
+/// Select using task profiles already resolved for the request's workload and iq
+/// bucket. An empty map is cold start. A partial map also falls back selection-wide
+/// so task prices are never compared with legacy per-message or output-only prices.
+/// The caller obtains these profiles from its refresh snapshot, not from the store
+/// on the select path.
+pub fn select_model_route_with_profiles(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    slots: Option<&ConcurrencySlots>,
+    operator_group: &[String],
+    availability_rejections: &HashMap<String, String>,
+    profiles: &RouteTaskProfiles,
+) -> Result<SelectedModelRoute, NoRouteError> {
     let PricedAdmission {
         admissible,
         mut rejected,
@@ -1777,6 +2097,7 @@ pub fn select_model_route_with_availability(
         CLASS_PRODUCER,
         operator_group,
         availability_rejections,
+        profiles,
     )?;
 
     // Deterministic ordering. COST-PRIMARY lexicographic among adequate models.
@@ -1794,6 +2115,11 @@ pub fn select_model_route_with_availability(
                     route_key: &a.route.route_key,
                     subscription_covered: s.objective.subscription_covered,
                     quota_priced: s.objective.subscription_pricing.is_some(),
+                    profile_priced: s
+                        .objective
+                        .task_pricing
+                        .as_ref()
+                        .is_some_and(|p| p.profile.is_some()),
                     price_unknown: s.objective.price_unknown,
                     selection_cost: if with_term {
                         s.objective.selection_cost
@@ -1882,6 +2208,22 @@ pub fn select_model_route_with_availability(
     ));
     explanation.extend(winner.objective_notes.iter().cloned());
     for candidate in &scored {
+        if let Some(pricing) = &candidate.objective.task_pricing {
+            let level = pricing
+                .profile
+                .as_ref()
+                .map(|profile| format!("{:?}", profile.level))
+                .unwrap_or_else(|| "cold_start".to_string());
+            let tasks = pricing
+                .profile
+                .as_ref()
+                .map_or(0, |profile| profile.task_count);
+            explanation.push(format!(
+                "route {}: task pricing (level={level}, tasks={tasks}): {}",
+                admissible[candidate.idx].route.route_key,
+                serde_json::to_string(pricing).expect("task pricing contains finite numbers"),
+            ));
+        }
         if candidate.idx != winner.idx && candidate.objective.price_unknown {
             let route_key = &admissible[candidate.idx].route.route_key;
             explanation.push(format!(
@@ -1893,6 +2235,14 @@ pub fn select_model_route_with_availability(
     // basket: per-route lines above say how each route was priced, this one
     // says which comparison they were all part of.
     explanation.push(match &pricing_fallback {
+        None if winner
+            .objective
+            .task_pricing
+            .as_ref()
+            .is_some_and(|p| p.profile.is_some()) =>
+        {
+            "pricing: task profiles for the whole shortlist".to_string()
+        }
         None if use_basket => "pricing: basket for the whole shortlist".to_string(),
         Some(reason) => format!("pricing: output-only for the whole shortlist ({reason})"),
         None => "pricing: output-only for the whole shortlist".to_string(),
@@ -2069,6 +2419,7 @@ pub(crate) struct RouteOrderFacts<'r> {
     pub route_key: &'r str,
     pub subscription_covered: bool,
     pub quota_priced: bool,
+    pub profile_priced: bool,
     pub selection_cost: f64,
     /// True only when the caller prefers prompt caching and this route's
     /// provider does not cache prompts.
@@ -2107,7 +2458,7 @@ pub(crate) struct RouteOrderKey<'r> {
 ///
 /// Quota-priced routes keep their own economic cost because different token
 /// baskets consume different amounts of the same subscription pool. Legacy
-/// snapshots without account economics retain a free bucket and price each
+/// cold-start snapshots without account economics retain a free bucket and price each
 /// provider's covered routes at that provider's cheapest covered cost. Quality
 /// then decides within a shared pool or free bucket.
 ///
@@ -2118,10 +2469,9 @@ pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteO
     // Per provider: the cheapest covered route's cost and how many covered
     // routes share the pool.
     let mut pools: HashMap<&str, (f64, usize)> = HashMap::new();
-    for route in routes
-        .iter()
-        .filter(|r| r.subscription_covered && !r.quota_priced && !r.price_unknown)
-    {
+    for route in routes.iter().filter(|r| {
+        r.subscription_covered && !r.quota_priced && !r.profile_priced && !r.price_unknown
+    }) {
         pools
             .entry(route.provider_id)
             .and_modify(|(min, members)| {
@@ -2133,14 +2483,19 @@ pub(crate) fn route_order_keys<'r>(routes: &[RouteOrderFacts<'r>]) -> Vec<RouteO
     routes
         .iter()
         .map(|route| {
-            let (pool_cost, shared_pool) =
-                if route.subscription_covered && !route.quota_priced && !route.price_unknown {
-                    let (min, members) = pools[route.provider_id];
-                    (min, members >= 2)
-                } else {
-                    (route.selection_cost, false)
-                };
-            let free = !route.quota_priced && pool_cost <= EFFECTIVELY_FREE_SELECTION_COST;
+            let (pool_cost, shared_pool) = if route.subscription_covered
+                && !route.quota_priced
+                && !route.profile_priced
+                && !route.price_unknown
+            {
+                let (min, members) = pools[route.provider_id];
+                (min, members >= 2)
+            } else {
+                (route.selection_cost, false)
+            };
+            let free = !route.quota_priced
+                && !route.profile_priced
+                && pool_cost <= EFFECTIVELY_FREE_SELECTION_COST;
             // An absent or non-finite abundance sample is neutral rather than
             // favourable or fatal; quantizing keeps tiny float noise from
             // outranking the speed tie-break.
@@ -2240,6 +2595,467 @@ fn fmt_num(n: f64) -> String {
         format!("{}", n as i64)
     } else {
         format!("{}", n)
+    }
+}
+
+#[cfg(test)]
+mod task_profile_pricing_tests {
+    use super::*;
+    use crate::task_profile::{compute_profile, ClosedTask, ProfileLevel};
+
+    fn model(provider: &str, id: &str) -> ModelFact {
+        serde_json::from_value(serde_json::json!({
+            "providerID": provider, "modelID": id, "family": "test",
+            "scores": { "elo": 1800.0, "eq": 1800.0, "speed": 50.0 },
+            "confidence": "curated", "costPerMTokOut": 1.0,
+            "inputRate": 1.0, "cacheReadRate": 1.0, "cacheWriteRate": 1.0,
+            "reasoningRate": 1.0
+        }))
+        .unwrap()
+    }
+
+    fn profile(tokens: f64) -> TaskProfile {
+        TaskProfile {
+            tokens: TokenVector {
+                output_excluding_reasoning: tokens,
+                ..Default::default()
+            },
+            level: ProfileLevel::OwnCell,
+            task_count: 20,
+            own_task_count: 20,
+            own_weight: 1.0,
+            keeps_tokenizer: true,
+        }
+    }
+
+    fn profiles(facts: &[ModelFact], profiles: Vec<TaskProfile>) -> RouteTaskProfiles {
+        facts
+            .iter()
+            .zip(profiles)
+            .map(|(fact, profile)| (fact_to_route(fact).route_key, profile))
+            .collect()
+    }
+
+    fn input(facts: Vec<ModelFact>, subscription: bool) -> SelectModelRouteInput<'static> {
+        SelectModelRouteInput {
+            target_agent: "mason".into(),
+            target_is_head: false,
+            requirements: ModelRequirements { iq: 75.0, eq: 20.0 },
+            available_models: facts.iter().map(|f| fact_to_route(f).route_key).collect(),
+            facts,
+            runtime_snapshot: None,
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            required_capabilities: None,
+            is_subscription_route: Some(Box::new(move |_| subscription)),
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: HashSet::new(),
+            providers_without_cache_write_reports: HashSet::new(),
+        }
+    }
+
+    fn select(
+        input: SelectModelRouteInput<'_>,
+        profiles: &RouteTaskProfiles,
+    ) -> SelectedModelRoute {
+        select_model_route_with_profiles(
+            input,
+            &crate::routing_config::ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION,
+            None,
+            &[],
+            &HashMap::new(),
+            profiles,
+        )
+        .unwrap()
+    }
+
+    fn close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-10, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn sonnet_three_times_opus_tokens_has_three_times_the_list_cost() {
+        let facts = vec![model("claude", "opus"), model("claude", "sonnet")];
+        let tasks: Vec<_> = facts
+            .iter()
+            .enumerate()
+            .flat_map(|(i, model)| {
+                (0..20).map(move |_| ClosedTask {
+                    workload: "mason",
+                    model,
+                    iq_bucket: 7,
+                    tokens: TokenVector {
+                        fresh_input: 1000.0 * (1 + i * 2) as f64,
+                        cached_read: 2000.0 * (1 + i * 2) as f64,
+                        cache_write: 3000.0 * (1 + i * 2) as f64,
+                        output_excluding_reasoning: 4000.0 * (1 + i * 2) as f64,
+                        reasoning: 5000.0 * (1 + i * 2) as f64,
+                    },
+                })
+            })
+            .collect();
+        let resolved = facts
+            .iter()
+            .map(|fact| compute_profile(&tasks, fact, "mason", 7).unwrap())
+            .collect();
+        let profiles = profiles(&facts, resolved);
+        let priced = price_selection_shortlist_with_profiles(
+            input(facts, false),
+            &crate::routing_config::ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION,
+            false,
+            false,
+            &profiles,
+        )
+        .unwrap();
+        assert!(
+            priced.use_basket,
+            "profiles do not depend on legacy producer flags"
+        );
+        let opus = priced
+            .routes
+            .iter()
+            .find(|r| r.route_key.contains("opus"))
+            .unwrap()
+            .task_pricing
+            .as_ref()
+            .unwrap();
+        let sonnet = priced
+            .routes
+            .iter()
+            .find(|r| r.route_key.contains("sonnet"))
+            .unwrap()
+            .task_pricing
+            .as_ref()
+            .unwrap();
+        close(opus.list_cost_usd.unwrap(), 0.015);
+        close(sonnet.list_cost_usd.unwrap(), 0.045);
+        close(
+            sonnet.list_cost_usd.unwrap() / opus.list_cost_usd.unwrap(),
+            3.0,
+        );
+        assert_eq!(
+            sonnet.profile.as_ref().unwrap().level,
+            ProfileLevel::OwnCell
+        );
+    }
+
+    #[test]
+    fn no_pool_subscription_routes_rank_on_their_own_profile_costs() {
+        let mut cheap = model("codex", "sol");
+        cheap.subscription_multiplier = Some(18.7);
+        let mut expensive = model("codex", "luna");
+        expensive.subscription_multiplier = Some(18.7);
+        expensive.scores.speed = 1000.0;
+        let facts = vec![expensive, cheap];
+        let profiles = profiles(&facts, vec![profile(3000.0), profile(1000.0)]);
+        let selected = select(input(facts, true), &profiles);
+        assert_eq!(selected.model.model_id, "sol");
+        let pricing = selected.score.objective.task_pricing.as_ref().unwrap();
+        close(pricing.list_cost_usd.unwrap(), 0.001);
+        close(pricing.value_multiplier, 18.7);
+        close(pricing.pressure, 1.0);
+        close(pricing.final_cost_usd.unwrap(), 0.001 / 18.7);
+        assert!(selected.score.objective.subscription_pricing.is_some());
+    }
+
+    #[test]
+    fn muse_sol_decision_explains_both_profiles_and_full_economics() {
+        let mut muse = model("meta", "muse-spark-1.3-contributor");
+        muse.subscription_multiplier = Some(6.0);
+        let mut sol = model("codex", "sol");
+        sol.subscription_multiplier = Some(18.7);
+        let facts = vec![muse, sol];
+        let mut muse_profile = profile(63000.0);
+        muse_profile.level = ProfileLevel::FleetBucket;
+        muse_profile.keeps_tokenizer = false;
+        muse_profile.own_task_count = 0;
+        muse_profile.own_weight = 0.0;
+        muse_profile.tokens.cache_write = 1000000.0;
+        let profiles = profiles(&facts, vec![muse_profile, profile(840000.0)]);
+        let mut request = input(facts, true);
+        request
+            .providers_without_cache_write_reports
+            .insert(request.facts[0].provider_id.clone());
+        let selected = select(request, &profiles);
+        let records: Vec<serde_json::Value> = selected
+            .explanation
+            .iter()
+            .filter_map(|line| {
+                line.split_once("): ")
+                    .filter(|_| line.contains(": task pricing ("))
+                    .map(|(_, json)| serde_json::from_str(json).unwrap())
+            })
+            .collect();
+        assert_eq!(records.len(), 2);
+        let muse = records
+            .iter()
+            .find(|r| r["valueMultiplier"] == 6.0)
+            .unwrap();
+        let sol = records
+            .iter()
+            .find(|r| r["valueMultiplier"] == 18.7)
+            .unwrap();
+        assert_eq!(muse["profile"]["level"], "fleet_bucket");
+        assert_eq!(muse["profile"]["taskCount"], 20);
+        assert_eq!(muse["profile"]["keepsTokenizer"], false);
+        assert_eq!(muse["tokens"]["outputExcludingReasoning"], 63000.0);
+        assert_eq!(
+            muse["omittedDimensions"],
+            serde_json::json!(["cache_write"])
+        );
+        for (record, list, multiplier) in [(muse, 0.063, 6.0), (sol, 0.84, 18.7)] {
+            close(record["listCostUsd"].as_f64().unwrap(), list);
+            assert_eq!(record["valueSource"], "operator override");
+            close(record["pressure"].as_f64().unwrap(), 1.0);
+            close(record["finalCostUsd"].as_f64().unwrap(), list / multiplier);
+            close(
+                record["normalizedCost"].as_f64().unwrap(),
+                list / multiplier / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE,
+            );
+        }
+        assert_eq!(sol["profile"]["level"], "own_cell");
+        assert_eq!(sol["tokens"]["outputExcludingReasoning"], 840000.0);
+    }
+
+    #[test]
+    fn profile_metered_cost_ignores_subsidy_and_legacy_quota_surcharge() {
+        let mut fact = model("api", "sol");
+        fact.subscription_multiplier = Some(100.0);
+        let route = fact_to_route(&fact);
+        let runtime = RouteRuntimeState {
+            quota_pressure: Some(0.8),
+            ..Default::default()
+        };
+        let (objective, _) = compute_objective(
+            &route,
+            &runtime,
+            false,
+            CostBasis::TaskProfile {
+                profile: &profile(1000000.0),
+                omit_cache_write: false,
+            },
+            false,
+        );
+        let pricing = objective.task_pricing.unwrap();
+        close(pricing.list_cost_usd.unwrap(), 1.0);
+        close(pricing.final_cost_usd.unwrap(), 1.0);
+        close(pricing.value_multiplier, 1.0);
+        close(
+            objective.cost,
+            1.0 / crate::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE,
+        );
+        close(objective.quota, 0.0);
+        close(objective.selection_cost, objective.cost);
+    }
+
+    #[test]
+    fn profile_prices_fallback_rates_but_not_unknown_positive_dimensions() {
+        let mut fact = model("api", "sol");
+        fact.reasoning_rate = None;
+        fact.cache_write_rate = None;
+        fact.input_rate = Some(2.0);
+        let mut profile = profile(1000.0);
+        profile.tokens.reasoning = 2000.0;
+        profile.tokens.cache_write = 3000.0;
+        let (list, omitted, unpriced) = profile_list_price(&fact, profile.tokens, false);
+        close(list.unwrap(), 0.009);
+        assert!(omitted.is_empty() && unpriced.is_empty());
+        fact.cache_read_rate = None;
+        profile.tokens.cached_read = 4000.0;
+        let (list, _, unpriced) = profile_list_price(&fact, profile.tokens, false);
+        assert!(list.is_none());
+        assert_eq!(unpriced, vec!["cached_read"]);
+    }
+
+    #[test]
+    fn incomplete_profile_snapshot_keeps_the_whole_select_in_cold_start() {
+        let facts = vec![model("api", "sol"), model("api", "spark")];
+        let profiles = profiles(&facts[..1], vec![profile(1000000.0)]);
+        let selected = select(input(facts, false), &profiles);
+        assert!(!selected.priced_with_basket);
+        assert!(selected
+            .score
+            .objective
+            .task_pricing
+            .as_ref()
+            .unwrap()
+            .profile
+            .is_none());
+        assert_eq!(
+            selected
+                .explanation
+                .iter()
+                .filter(|line| line.contains("level=cold_start, tasks=0"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn profile_uses_pool_measurement_and_pressure_for_workers_and_heads() {
+        use crate::subscription::{
+            MeasuredValue, QuotaAccount, SubscriptionPlan, SubscriptionPool,
+        };
+        let mut fact = model("codex", "sol");
+        fact.subscription_multiplier = Some(2.0);
+        let route = fact_to_route(&fact);
+        let runtime = RouteRuntimeState {
+            quota_pressure: Some(0.9),
+            subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {
+                provider: "codex".into(),
+                now_ms: 1000,
+                plans: vec![SubscriptionPlan {
+                    tier: Some("pro".into()),
+                    plan: Some("openai/pro_200".into()),
+                    measured: Some(MeasuredValue {
+                        multiplier: 18.7,
+                        interval_end_ms: 999,
+                        row_date: "fresh".into(),
+                    }),
+                    fee_usd: 200.0,
+                    accounts: vec![QuotaAccount {
+                        weekly_used: 50.0,
+                        weekly_remaining_fraction: 0.5,
+                        hours_to_reset: 84.0,
+                        short_walled: false,
+                        short_windows: Vec::new(),
+                        banked_resets: 0,
+                        banked_expires_at_ms: None,
+                    }],
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for head in [false, true] {
+            let (objective, _) = compute_objective(
+                &route,
+                &runtime,
+                true,
+                CostBasis::TaskProfile {
+                    profile: &profile(840000.0),
+                    omit_cache_write: false,
+                },
+                head,
+            );
+            let pricing = objective.task_pricing.as_ref().unwrap();
+            close(pricing.list_cost_usd.unwrap(), 0.84);
+            close(pricing.value_multiplier, 18.7);
+            assert_eq!(pricing.value_source, "astrocyte fresh");
+            close(pricing.pressure, 2.0);
+            close(pricing.final_cost_usd.unwrap(), 0.84 / 18.7 * 2.0);
+            close(objective.quota, 0.0);
+        }
+    }
+
+    #[test]
+    fn task_profiles_supersede_class_vectors_and_thin_fleets_stay_cold() {
+        let mut fact = model("api", "sol");
+        fact.class_vector = Some(ClassVector {
+            workload_class: "ephemeral".into(),
+            fresh_input: 9000000.0,
+            output_excluding_reasoning: 9000000.0,
+            reasoning: 0.0,
+            cached_read: 0.0,
+            cache_write: 0.0,
+            sample_count: 50,
+            trailing_window_days: 7.0,
+            statistic: "mean".into(),
+            is_overlay: false,
+        });
+        let facts = vec![fact];
+        let profiles = profiles(&facts, vec![profile(1000.0)]);
+        let selected = select(input(facts.clone(), false), &profiles);
+        close(
+            selected
+                .score
+                .objective
+                .task_pricing
+                .unwrap()
+                .list_cost_usd
+                .unwrap(),
+            0.001,
+        );
+        let tasks: Vec<_> = (0..19)
+            .map(|_| ClosedTask {
+                workload: "mason",
+                model: &facts[0],
+                iq_bucket: 7,
+                tokens: TokenVector {
+                    output_excluding_reasoning: 1000.0,
+                    ..Default::default()
+                },
+            })
+            .collect();
+        assert!(compute_profile(&tasks, &facts[0], "mason", 7).is_none());
+        let selected = select(input(facts, false), &RouteTaskProfiles::new());
+        let pricing = selected.score.objective.task_pricing.unwrap();
+        assert!(pricing.profile.is_none());
+        close(pricing.list_cost_usd.unwrap(), 18.0);
+        assert!(selected.priced_with_basket);
+    }
+
+    #[test]
+    fn profile_ordering_has_neither_legacy_pool_minimum_nor_free_bucket() {
+        let routes: Vec<_> = [("plan/expensive", 0.002, 1.0), ("plan/cheap", 0.001, 0.99)]
+            .into_iter()
+            .map(|(route_key, selection_cost, adequacy)| RouteOrderFacts {
+                price_unknown: false,
+                provider_id: "plan",
+                route_key,
+                subscription_covered: true,
+                quota_priced: false,
+                profile_priced: true,
+                selection_cost,
+                uncached: false,
+                adequacy,
+                raw_adequacy: adequacy,
+                quota_abundance: None,
+                speed_score: 1.0,
+                metered_cost: 1.0,
+            })
+            .collect();
+        let keys = route_order_keys(&routes);
+        close(keys[0].cost_key, 0.002);
+        close(keys[1].cost_key, 0.001);
+        assert!(!keys[0].in_bucket && !keys[1].in_bucket);
+        assert!(compare_route_order_keys(&keys[1], &keys[0], false).is_lt());
+    }
+
+    #[test]
+    fn cache_write_omission_is_driven_by_the_reporting_set() {
+        for unreported in [false, true] {
+            let fact = model("provider", "model");
+            let mut profile = profile(0.0);
+            profile.tokens = TokenVector {
+                cache_write: 1000000.0,
+                fresh_input: 1000.0,
+                ..Default::default()
+            };
+            let profiles = profiles(std::slice::from_ref(&fact), vec![profile]);
+            let mut request = input(vec![fact], false);
+            if unreported {
+                request
+                    .providers_without_cache_write_reports
+                    .insert("provider".into());
+            }
+            let selected = select(request, &profiles);
+            let pricing = selected.score.objective.task_pricing.unwrap();
+            close(
+                pricing.list_cost_usd.unwrap(),
+                if unreported { 0.001 } else { 1.001 },
+            );
+            assert_eq!(
+                pricing.omitted_dimensions,
+                if unreported {
+                    vec!["cache_write"]
+                } else {
+                    vec![]
+                }
+            );
+            assert!(pricing.unpriced_dimensions.is_empty());
+        }
     }
 }
 
@@ -2354,6 +3170,7 @@ mod abundance_tests {
                 min_best_effort_adequacy: None,
                 prefer_prompt_cache: options.prefer_prompt_cache,
                 providers_without_prompt_cache: options.providers_without_prompt_cache,
+                providers_without_cache_write_reports: HashSet::new(),
             },
             &crate::routing_config::ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION,
             options.slots.as_ref(),
@@ -2433,6 +3250,7 @@ mod abundance_tests {
             quota_abundance: None,
             quota_abundance_window: None,
             basket_pricing: None,
+            task_pricing: None,
         };
 
         assert_eq!(
@@ -2710,6 +3528,7 @@ mod route_order_tests {
         RouteOrderFacts {
             price_unknown: false,
             quota_priced: false,
+            profile_priced: false,
             provider_id,
             route_key,
             subscription_covered,
@@ -2889,6 +3708,7 @@ mod availability_credential_tests {
             min_best_effort_adequacy: None,
             prefer_prompt_cache: false,
             providers_without_prompt_cache: HashSet::new(),
+            providers_without_cache_write_reports: HashSet::new(),
         })
         .unwrap_err();
         let accountless = result

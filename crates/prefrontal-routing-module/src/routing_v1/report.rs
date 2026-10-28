@@ -15,7 +15,7 @@ use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::report::{
     parse_report_request, Outcome, ReportAnswer, ReportRequest, RESET_FENCE_CAP_MS,
 };
-use prefrontal_routing_core::{RouteOutcome, RouteStateStore};
+use prefrontal_routing_core::RouteOutcome;
 use prefrontal_routing_store::V1Recorded;
 use serde_json::Value;
 
@@ -347,7 +347,7 @@ fn record_usage(
         return Ok(());
     };
     deps.store
-        .record_usage_delivery(&observation)
+        .record_usage_delivery_for_decision(&observation, &decision.decision_id)
         .map(|_| ())
         .map_err(store_refusal)
 }
