@@ -42,10 +42,25 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
         "which catalog snapshot was applied; a missing cursor makes the next refresh fetch \
          the whole catalog",
     ),
+    (
+        "routing_operator_quality_state",
+        "Fusiform grade-cache presence; empty suppresses grade-coverage findings until \
+         the next catalog refresh recreates the singleton",
+    ),
+    (
+        "routing_operator_quality",
+        "Fusiform operator-grade cache; empty falls back to stored scores and suppresses \
+         grade-coverage findings until the next catalog refresh repopulates the grades",
+    ),
 ];
 
 /// Tables every backup must carry, each with the reason.
 pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
+    (
+        "routing_unscored_admissible_models",
+        "routing-owned first-admission timestamp history; restoring it empty would make \
+         previously observed ungraded models appear newly discovered",
+    ),
     (
         "model_route_usage",
         "per-message usage is the scoring input itself: observed speed per route and the \

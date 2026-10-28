@@ -746,11 +746,6 @@ impl LiveConfig {
             .keys()
             .filter(|key| {
                 let (provider, model, _) = parse_model_key(key).expect("validated model key");
-                let provider = if provider == "anthropic-platform" {
-                    "anthropic"
-                } else {
-                    &provider
-                };
                 grades.contains_key(&format!("{provider}/{model}"))
             })
             .cloned()

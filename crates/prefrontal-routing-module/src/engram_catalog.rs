@@ -98,7 +98,9 @@ mod tests {
         "account_decision",
         "quota_reading_log",
         "route_winner_baseline",
-        "fusiform_catalog_cursor"
+        "fusiform_catalog_cursor",
+        "routing_operator_quality_state",
+        "routing_operator_quality"
       ]
     },
     {
