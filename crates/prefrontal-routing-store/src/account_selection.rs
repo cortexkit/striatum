@@ -126,6 +126,76 @@ mod account_fact_tests {
     }
 
     #[test]
+    fn reconciliation_writes_once_and_rechecks_new_facts_with_the_same_listing() {
+        let scratch = prefrontal_test_support::ScratchDir::new("account-eligibility-single-flight");
+        let store = std::sync::Arc::new(
+            SqliteRouteStateStore::open(&crate::dev_descriptor(
+                "account-eligibility-single-flight",
+                scratch.path().join("store.db").to_string_lossy(),
+            ))
+            .unwrap(),
+        );
+        let fact = AccountEligibilityFact {
+            provider: "p".into(),
+            credential_id: "c".into(),
+            model: "m".into(),
+            listing_fingerprint: None,
+            code: "ineligible".into(),
+            observed_at: 1,
+        };
+        store.record_account_eligibility(&fact).unwrap();
+        let writes = store.account_write_transaction_count_for_test();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .reconcile_account_eligibility(&[("c".into(), "v1".into())])
+                        .unwrap();
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(store.account_write_transaction_count_for_test() - writes, 1);
+        assert_eq!(
+            store.account_eligibility().unwrap()[0]
+                .listing_fingerprint
+                .as_deref(),
+            Some("v1")
+        );
+
+        store
+            .record_account_eligibility(&AccountEligibilityFact {
+                observed_at: 2,
+                ..fact
+            })
+            .unwrap();
+        let writes = store.account_write_transaction_count_for_test();
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v1".into())])
+            .unwrap();
+        assert_eq!(
+            store.account_write_transaction_count_for_test() - writes,
+            1,
+            "a new fact without a fingerprint must adopt even an unchanged listing"
+        );
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v1".into())])
+            .unwrap();
+        assert_eq!(store.account_write_transaction_count_for_test() - writes, 1);
+        store
+            .reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            .unwrap();
+        assert_eq!(store.account_write_transaction_count_for_test() - writes, 2);
+        assert!(store.account_eligibility().unwrap().is_empty());
+    }
+
+    #[test]
     fn eligibility_survives_restart_and_clears_only_on_listing_change() {
         let scratch = prefrontal_test_support::ScratchDir::new("account-eligibility-clear");
         let descriptor = crate::dev_descriptor(
@@ -394,17 +464,37 @@ impl SqliteRouteStateStore {
         &self,
         listings: &[(String, String)],
     ) -> RouteStateResult<()> {
+        let mut fingerprints = std::collections::HashMap::with_capacity(listings.len());
+        for (credential, fingerprint) in listings {
+            fingerprints
+                .entry(credential.as_str())
+                .or_insert(fingerprint.as_str());
+        }
         self.store.with_conn(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(()); }
-            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let read = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
             let credentials = {
-                let mut statement = tx.prepare("SELECT DISTINCT credential_id FROM account_eligibility")?;
-                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
+                let mut statement = read.prepare("SELECT DISTINCT credential_id,listing_fingerprint FROM account_eligibility")?;
+                let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?;
+                let mut changed = std::collections::BTreeSet::new();
+                for row in rows {
+                    let (credential, recorded) = row?;
+                    if recorded.as_deref().is_none() || recorded.as_deref() != fingerprints.get(credential.as_str()).copied() {
+                        changed.insert(credential);
+                    }
+                }
+                changed
             };
+            read.commit()?;
+            if credentials.is_empty() { return Ok(()); }
+            // Keep the connection gate across the read and write: a later
+            // reconciliation sees the committed facts and skips unchanged rows.
+            // Inspect facts each time, so a newly recorded restriction is not
+            // hidden by a cache of previously seen listing fingerprints.
+            let tx = self.begin_account_write(conn)?;
             for credential in credentials {
-                match listings.iter().find(|(id, _)| id == &credential) {
-                    Some((_, fingerprint)) => {
+                match fingerprints.get(credential.as_str()) {
+                    Some(fingerprint) => {
                         tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1 AND listing_fingerprint IS NOT NULL AND listing_fingerprint<>?2", params![credential, fingerprint])?;
                         tx.execute("UPDATE account_eligibility SET listing_fingerprint=?2 WHERE credential_id=?1 AND listing_fingerprint IS NULL", params![credential, fingerprint])?;
                     }
@@ -453,7 +543,9 @@ impl SqliteRouteStateStore {
     pub fn account_size_refusals(&self, now: i64) -> RouteStateResult<Vec<AccountSizeRefusal>> {
         self.store.with_conn(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_size_refusal")? { return Ok(Vec::new()); }
-            conn.execute("DELETE FROM account_size_refusal WHERE expires_at<=?1", [now])?;
+            if conn.query_row("SELECT EXISTS(SELECT 1 FROM account_size_refusal WHERE expires_at<=?1)", [now], |row| row.get::<_, bool>(0))? {
+                conn.execute("DELETE FROM account_size_refusal WHERE expires_at<=?1", [now])?;
+            }
             let mut statement = conn.prepare("SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_size_refusal")?;
             let rows = statement.query_map([], |row| Ok(AccountSizeRefusal {
                 provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,size_class: row.get(3)?,expires_at: row.get(4)?,observed_at: row.get(5)?,
@@ -506,7 +598,9 @@ impl SqliteRouteStateStore {
     pub fn account_route_fences(&self, now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
         self.store.with_conn(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(Vec::new()); }
-            conn.execute("DELETE FROM account_route_fence WHERE until_ms<=?1", [now])?;
+            if conn.query_row("SELECT EXISTS(SELECT 1 FROM account_route_fence WHERE until_ms<=?1)", [now], |row| row.get::<_, bool>(0))? {
+                conn.execute("DELETE FROM account_route_fence WHERE until_ms<=?1", [now])?;
+            }
             let mut statement = conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence ORDER BY provider,credential_id,model")?;
             let rows = statement.query_map([], |row| Ok(AccountRouteFence {
                 provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,until_ms: row.get(3)?,decision_id: row.get(4)?,recorded_at: row.get(5)?,
@@ -1624,6 +1718,39 @@ impl AccountTx<'_> {
 }
 
 impl SqliteRouteStateStore {
+    fn begin_account_write<'a>(&self, conn: &'a Connection) -> rusqlite::Result<Transaction<'a>> {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.account_write_transactions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(tx)
+    }
+
+    /// Number of explicit account write transactions begun by this store.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn account_write_transaction_count_for_test(&self) -> u64 {
+        self.account_write_transactions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Read account state in a deferred transaction without reserving the writer.
+    /// The callback must not write; admissions must use `account_transaction`.
+    pub fn account_read<T>(
+        &self,
+        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
+    ) -> RouteStateResult<T> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+                let result = f(&AccountTx { conn: &tx });
+                if result.is_ok() {
+                    tx.commit()?;
+                }
+                Ok(result)
+            })
+            .map_err(err)?
+    }
+
     /// Run `f` inside one IMMEDIATE write transaction over the account
     /// tables. `Ok` commits before this returns, so a reply built from the
     /// result is sent only once the decision is durable; `Err` rolls every
@@ -1634,7 +1761,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<T> {
         self.store
             .with_conn(|conn: &Connection| {
-                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx { conn: &tx });
                 if result.is_ok() {
                     tx.commit()?;

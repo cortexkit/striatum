@@ -1193,6 +1193,112 @@ async fn entitlement_is_credential_wide_and_old_billing_refusals_keep_other_keys
 }
 
 #[tokio::test]
+async fn unchanged_context_reads_without_reserving_the_writer() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    let fingerprint = match credentials.listing_fingerprint("oauth:test") {
+        crate::broca_credentials::ListingLookup::Listed(fingerprint) => fingerprint,
+        _ => panic!("the fixture must have a successful listing"),
+    };
+    harness
+        .store()
+        .record_account_eligibility(&prefrontal_routing_store::AccountEligibilityFact {
+            provider: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            model: "unlisted-model".into(),
+            listing_fingerprint: Some(fingerprint),
+            code: "ineligible".into(),
+            observed_at: NOW as i64,
+        })
+        .unwrap();
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    let writer = rusqlite::Connection::open(harness.store_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let before = harness.store().account_write_transaction_count_for_test();
+    let context = crate::account_selection::ClassContext::load(
+        harness.store(),
+        &shared,
+        harness.operator_config(),
+        crate::ACCOUNT_QUOTA.get(),
+        NOW as i64,
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert!(context.is_ok(), "a context with nothing to reconcile must read while another connection holds the writer: {:?}", context.err());
+    assert_eq!(
+        harness.store().account_write_transaction_count_for_test() - before,
+        0
+    );
+    assert_eq!(harness.store().account_eligibility().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn selection_reuses_one_read_only_context_across_ladder_entries() {
+    let (loads, _) = select_past_held_ladder_entry().await;
+    assert_eq!(loads, 1);
+}
+
+#[tokio::test]
+async fn selection_with_unchanged_context_opens_no_account_write_transactions() {
+    let (_, writes) = select_past_held_ladder_entry().await;
+    assert_eq!(writes, 0);
+}
+
+async fn select_past_held_ladder_entry() -> (u64, u64) {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let first = crate::tests::fact("synthetic", "model");
+    let mut other = crate::tests::fact("secondary", "model");
+    other.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
+    harness.install_facts(&[first.clone(), other.clone()]);
+    catalog_fact(&harness, &other);
+    let mut rows = credentials.listed_credentials().to_vec();
+    for row in &mut rows {
+        row.provider_ids.push("secondary".into());
+    }
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "two-providers".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[first, other]),
+    );
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| config["consumers"]["mason"]=json!({"owner":OWNER,"mode":"ladder","ladder":["synthetic/model","secondary/model"]}));
+    exhaust_oauth(&harness, "synthetic");
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let loads = crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get());
+    let writes = harness.store().account_write_transaction_count_for_test();
+    let serving = harness.store().account_serving_counts().unwrap();
+    let selected = caller
+        .select_with_profiles(
+            &json!({"consumer":"mason","requirements":{"iq":30},"hold_ok":false}),
+            &|_, _, _| crate::select::TaskProfileLookup {
+                profiles: Default::default(),
+                providers_without_cache_write_reports: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        selected["route"]["provider"], "secondary",
+        "the held first entry must be checked before choosing the second"
+    );
+    assert_eq!(
+        harness.store().account_serving_counts().unwrap(),
+        serving,
+        "model selection must not create account admissions"
+    );
+    (
+        crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get()) - loads,
+        harness.store().account_write_transaction_count_for_test() - writes,
+    )
+}
+
+#[tokio::test]
 async fn ladder_holds_a_blocked_entry_but_demand_and_no_wait_use_the_next_model() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = setup("synthetic", false);

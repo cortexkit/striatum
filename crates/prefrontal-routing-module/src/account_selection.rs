@@ -186,6 +186,11 @@ pub(crate) struct ClassContext {
     targets: BTreeMap<String, String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CONTEXT_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) struct RouteClass<'a> {
     pub rows: Vec<&'a cortexkit_claustrum_client::ListedCredential>,
     pub subscription: bool,
@@ -262,6 +267,8 @@ impl ClassContext {
         mut facts: Vec<prefrontal_routing_core::ModelFact>,
         now_ms: i64,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
         let refusals = crate::credential_fences::live(store, credentials)?;
         let credentials = credentials
             .lock()
@@ -298,7 +305,7 @@ impl ClassContext {
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
             .unwrap_or_default();
         let fences = store
-            .account_transaction(|tx| {
+            .account_read(|tx| {
                 facts
                     .iter()
                     .map(|fact| fact.provider_id.clone())
@@ -2727,7 +2734,7 @@ pub(crate) fn preflight_model_for_class(
         });
     let (decision, fences) = ctx
         .store
-        .account_transaction(|tx| {
+        .account_read(|tx| {
             let fences = load_fences(tx, provider)?;
             let decision = prefrontal_routing_core::accounts::decide_with_context(
                 &request,

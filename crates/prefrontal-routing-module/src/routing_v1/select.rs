@@ -456,6 +456,7 @@ pub(super) async fn select_with_profile_lookup(
         deps,
         sources: &sources,
         account_flags: live_config.account_flags(),
+        classes: priced.classes.as_ref(),
         scope: caller.scope.clone(),
         now,
         hold_ok: params
@@ -839,6 +840,7 @@ struct Selection<'a> {
     deps: &'a Deps<'a>,
     sources: &'a SelectionPolicySources<'a>,
     account_flags: config_overrides::AccountSelectionFlags,
+    classes: Option<&'a account_selection::ClassContext>,
     /// The scope the selecting route is bound under, recorded with a refusal
     /// the same way a decision records it.
     scope: Option<crate::DecisionScope>,
@@ -1073,8 +1075,7 @@ impl<'a> Selection<'a> {
             .sources
             .operator_config
             .allocator_policy(&selected.model.provider_id);
-        let ctx = super::account_ctx(self.deps, self.account_flags, &policy)?;
-        if let Some(classes) = &ctx.classes {
+        if let Some(classes) = self.classes {
             match classes
                 .probe(
                     &selected.model.provider_id,
@@ -1100,6 +1101,16 @@ impl<'a> Selection<'a> {
                 _ => {}
             }
         }
+        let ctx = account_selection::Ctx {
+            store: self.deps.store,
+            accounts: crate::ACCOUNT_QUOTA.get(),
+            flags: self.account_flags,
+            policy: &policy,
+            now_ms: self
+                .classes
+                .map_or((self.now * 1000.0) as i64, |classes| classes.now_ms),
+            classes: self.classes.cloned(),
+        };
         account_selection::preflight_model_for_class(
             &ctx,
             &selected.model.provider_id,
