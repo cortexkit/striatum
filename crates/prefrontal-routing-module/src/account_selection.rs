@@ -486,6 +486,7 @@ impl ClassContext {
                 && fence.credential_id == row.id
                 && (self.targets.contains_key(&fact.provider_id)
                     || !crate::credential_fences::probe_allowed(
+                        &fence.code,
                         self.has_quota_signal(&fact.provider_id, &row.id),
                         self.now_ms.saturating_sub(fence.observed_at_ms),
                     ))
@@ -498,6 +499,7 @@ impl ClassContext {
                 fence.provider_id == provider
                     && fence.credential_id == credential
                     && crate::credential_fences::probe_allowed(
+                        &fence.code,
                         self.has_quota_signal(provider, credential),
                         self.now_ms.saturating_sub(fence.observed_at_ms),
                     )
@@ -1800,8 +1802,9 @@ pub(crate) fn refresh_all_blocks(
 }
 
 /// Reconcile both newly reported and persisted credential refusals. Once an
-/// exhausted subscription reading supplies a reset, store an ordinary pool
-/// block so the hold survives stale readings and uses normal block recovery.
+/// exhausted subscription reading supplies a reset for a billing refusal,
+/// store an ordinary pool block so the hold survives stale readings and uses
+/// normal block recovery.
 /// The credential row remains as refusal evidence and also excludes paid-credit
 /// placement: a billing refusal must not be bypassed by switching payment class.
 pub(crate) fn refresh_credential_quota_holds(
@@ -1815,6 +1818,14 @@ pub(crate) fn refresh_credential_quota_holds(
 ) -> Result<Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>, String> {
     let mut kept = Vec::new();
     for refusal in refusals {
+        if !crate::credential_fences::is_billing_code(&refusal.code) {
+            // Quota utilization cannot establish entitlement. Remove quota
+            // blocks left by older reconciliation, but retain the refusal so
+            // a timed probe can discover a provider-side reversal.
+            crate::credential_fences::clear_quota_holds(store, &refusal, "entitlement_not_quota")?;
+            kept.push(refusal);
+            continue;
+        }
         let Some(account) =
             crate::credential_fences::credential_account_id(credentials, &refusal.credential_id)
         else {
@@ -2882,20 +2893,24 @@ fn empty_roster_refusal(
             row_resets.push(row_reset);
             continue;
         }
-        if classes.refusals.iter().any(|fence| {
+        if let Some(refusal) = classes.refusals.iter().find(|fence| {
             fence.provider_id == provider
                 && fence.credential_id == row.id
                 && (classes.targets.contains_key(provider)
                     || !crate::credential_fences::probe_allowed(
+                        &fence.code,
                         classes.has_quota_signal(provider, &row.id),
                         now.saturating_sub(fence.observed_at_ms),
                     ))
         }) {
             fenced_cause = true;
-            // An entitlement fence on a subscription account with an
-            // exhausted reading is a quota hold until that reading's reset,
-            // not a billing fence with a probe timer.
-            row_resets.push(classes.quota_hold_reset(provider, &row.id));
+            // Only a billing refusal can inherit a quota reset. Entitlement
+            // recovery depends on a successful request, not utilization.
+            row_resets.push(
+                crate::credential_fences::is_billing_code(&refusal.code)
+                    .then(|| classes.quota_hold_reset(provider, &row.id))
+                    .flatten(),
+            );
             continue;
         }
         if classes.eligibility.iter().any(|fact_| {

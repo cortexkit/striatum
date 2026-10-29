@@ -122,9 +122,8 @@ pub(crate) struct Evidence {
     pub decisions_truncated: bool,
     /// Every catalog model as `provider/model`.
     pub catalog_models: BTreeSet<String>,
-    /// Latest quota state for subscription-hold wording: a fence whose
-    /// credential maps to an account with a reading is a quota hold, not a
-    /// billing fence.
+    /// Latest quota state for subscription billing-hold wording. Entitlement
+    /// refusals remain independent of quota utilization.
     pub quota: crate::account_quota::AccountQuotaState,
 }
 
@@ -318,7 +317,7 @@ fn credential_fences(
                 )
             });
             let quota_reset = stored_reset.into_iter().chain(reading_reset).max();
-            if has_signal {
+            if billing && has_signal {
                 if let Some(reset) = quota_reset.filter(|reset| *reset > now_ms) {
                     let reset_label = crate::account_selection::rfc3339(reset);
                     return Finding {
@@ -369,17 +368,10 @@ fn credential_fences(
                     age(now_ms, fence.observed_at_ms),
                     fence.provider_id,
                 );
-                let hint = if billing {
-                    format!(
-                        "This subscription credential has a quota reading, so routing never probes it on a timer. Check the account's plan and its Insula quota reading; lift by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}} when the plan changes.",
-                        fence.credential_id
-                    )
-                } else {
-                    format!(
-                        "The provider refused this subscription credential ({}). Check the account's entitlement, client requirements and Insula quota reading, or lift by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. No timed probe is admitted while a quota reading exists.",
-                        fence.code, fence.credential_id
-                    )
-                };
+                let hint = format!(
+                    "This subscription credential has a quota reading, so routing never probes it on a timer. Check the account's plan and its Insula quota reading; lift by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}} when the plan changes.",
+                    fence.credential_id
+                );
                 return Finding {
                     check: CHECK_CREDENTIAL_FENCES,
                     key: format!("{}/{}", fence.provider_id, fence.credential_id),
@@ -410,8 +402,8 @@ fn credential_fences(
                 )
             } else {
                 format!(
-                    "The account has no plan for {}'s models. Change the plan or remove the credential from the vault (a vault listing change lifts the fence), or lift it by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}.",
-                    fence.provider_id, fence.credential_id
+                    "The provider refused this credential ({}). Check the account's entitlement and client requirements, or lift the fence by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. Routing also admits one probe request on it every 6 hours.",
+                    fence.code, fence.credential_id
                 )
             };
             Finding {

@@ -21,10 +21,11 @@
 //!
 //! A subscription is a quota: its Insula reading already names the exhausted
 //! window and its reset, and a fresh reading with headroom lifts the hold.
-//! A billing- or entitlement-class refusal for such a credential is therefore
+//! A billing-class refusal for such a credential is therefore
 //! a quota hold until that reset, never a billing fence with a timer. See
-//! [`probe_allowed`]: only a credential with no quota reading at all (a
-//! pay-per-token credential) may probe.
+//! [`probe_allowed`]: billing fences probe only without a quota signal.
+//! Entitlement refusals always keep the timed probe: quota utilization says
+//! nothing about entitlement, so a reading cannot lift or convert that fence.
 
 use std::collections::HashSet;
 
@@ -42,14 +43,13 @@ use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 /// does not change the credential's vault listing, so without a recheck the
 /// fence would hold until the listing changed for an unrelated reason.
 ///
-/// This interval applies only to credentials with no quota signal (see
-/// [`probe_allowed`]). A subscription credential always has an Insula reading
-/// for its account, and that reading already carries the reset and lifts on
-/// headroom, so a timer would only spend a real request known to fail.
+/// Billing fences use this interval only without a quota signal (see
+/// [`probe_allowed`]). A subscription's billing hold uses its quota reset and
+/// headroom readings instead; entitlement refusals always keep timed probes.
 pub(crate) const FENCE_PROBE_RECHECK_MS: i64 = 6 * 60 * 60 * 1000;
 
 /// A window reading at or above this used percent counts as exhausted for
-/// turning a billing- or entitlement-class refusal into a quota hold. The
+/// turning a billing-class refusal into a quota hold. The
 /// one-point margin catches a producer that reports 99.x for a full window
 /// while keeping the hold to genuinely full windows.
 pub(crate) const QUOTA_HOLD_USED_THRESHOLD: f64 = 99.0;
@@ -59,14 +59,13 @@ pub(crate) const QUOTA_HOLD_USED_THRESHOLD: f64 = 99.0;
 /// A pay-per-token credential (for example an API key out of credit) has no
 /// Insula quota reading: topping its balance up changes no vault listing and
 /// publishes no reading, so without a timed recheck the fence would hold
-/// until the listing changed for an unrelated reason. A subscription
-/// credential always has a quota reading for its account, and that reading
-/// already says when the window resets and lifts the hold on headroom: a
-/// timed probe would spend a real request that is known to fail. So only a
-/// fence whose credential has no quota signal may probe, and only once it is
-/// older than [`FENCE_PROBE_RECHECK_MS`].
-pub(crate) fn probe_allowed(has_quota_signal: bool, age_ms: i64) -> bool {
-    !has_quota_signal && age_ms > FENCE_PROBE_RECHECK_MS
+/// until the listing changed for an unrelated reason. A subscription's billing
+/// refusal uses its quota reset and fresh headroom readings instead of blind
+/// probes. An entitlement refusal is independent of quota utilization: only a
+/// real request can discover a provider-side reversal without a listing change
+/// or an operator lift, so it keeps the six-hour probe even with quota readings.
+pub(crate) fn probe_allowed(code: &str, has_quota_signal: bool, age_ms: i64) -> bool {
+    (!is_billing_code(code) || !has_quota_signal) && age_ms > FENCE_PROBE_RECHECK_MS
 }
 
 /// Whether routing holds any quota reading for `credential_id`'s account.
@@ -146,9 +145,8 @@ pub(crate) fn exhausted_quota_reset_for_account(
 
 /// Whether a fresh reading with headroom arrived after `fence_observed_ms`
 /// for `account_id`: no window at or above the hold threshold. A quota hold
-/// lifts on such a reading; an entitlement fence made while the reading
-/// already showed headroom stays, because the later reading is not newer
-/// than the fence.
+/// lifts on such a reading. An older reading cannot heal a newer refusal.
+/// Entitlement fences must not use quota readings for recovery.
 pub(crate) fn fresh_headroom_after_for_account(
     quota: &crate::account_quota::AccountQuotaState,
     account_id: &str,
@@ -272,7 +270,7 @@ pub(crate) fn quota_hold_prefix(fence: &CredentialEntitlementFence) -> String {
     )
 }
 
-fn clear_quota_holds(
+pub(crate) fn clear_quota_holds(
     store: &SqliteRouteStateStore,
     fence: &CredentialEntitlementFence,
     reason: &str,
@@ -406,7 +404,11 @@ pub(crate) fn live(
 /// A fence whose refusal is older than the recheck interval: the next
 /// account admission may reserve one probe request on it and stamp it fresh.
 fn is_stale(fence: &CredentialEntitlementFence, now_ms: i64) -> bool {
-    probe_allowed(false, now_ms.saturating_sub(fence.observed_at_ms))
+    probe_allowed(
+        &fence.code,
+        false,
+        now_ms.saturating_sub(fence.observed_at_ms),
+    )
 }
 
 /// Split live fences into fresh restrictions and potential account-admission
@@ -646,6 +648,29 @@ pub(crate) fn is_billing_code(code: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_signals_disable_only_billing_probes() {
+        for (code, probes_with_quota) in [
+            ("billing_exhausted", false),
+            ("insufficient_quota", false),
+            ("credit_insufficient", false),
+            ("ENTITLEMENT_ERROR", true),
+            ("client_attestation_denied", true),
+        ] {
+            for has_signal in [false, true] {
+                assert!(
+                    !probe_allowed(code, has_signal, FENCE_PROBE_RECHECK_MS),
+                    "{code}, signal={has_signal}"
+                );
+                assert_eq!(
+                    probe_allowed(code, has_signal, FENCE_PROBE_RECHECK_MS + 1),
+                    if has_signal { probes_with_quota } else { true },
+                    "{code}, signal={has_signal}"
+                );
+            }
+        }
+    }
 
     fn fence(provider: &str, credential: &str) -> CredentialEntitlementFence {
         CredentialEntitlementFence {
