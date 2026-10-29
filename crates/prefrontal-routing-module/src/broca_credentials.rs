@@ -200,6 +200,31 @@ impl BrocaCredentials {
         &self.listed
     }
 
+    /// Exact API-key vault ids grouped by the providers they serve, using the same
+    /// metadata mapping as route admission. Credential names are not provider ids.
+    pub(crate) fn api_key_credentials_by_provider(
+        &self,
+        now_ms: u64,
+    ) -> BTreeMap<String, BTreeSet<String>> {
+        let mut mapped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        if !self.listing_is_fresh(now_ms) {
+            return mapped;
+        }
+        for row in self.listed.iter().filter(|row| {
+            row.state == "active"
+                && row.auth_method.as_deref() == Some("apikey")
+                && row
+                    .categories
+                    .iter()
+                    .any(|category| category == "llm-provider")
+        }) {
+            for provider in credential_providers(row, &self.catalog_providers) {
+                mapped.entry(provider).or_default().insert(row.id.clone());
+            }
+        }
+        mapped
+    }
+
     pub(crate) fn listing_version(&self) -> Option<(&str, u64)> {
         Some((self.view.as_deref()?, self.reached_at_ms?))
     }
@@ -805,6 +830,51 @@ impl BrocaCredentials {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_key_provider_mapping_uses_active_metadata_and_expires() {
+        let mut explicit = credential("opaque-key", &["opencode-go", "another-provider"]);
+        explicit.auth_method = Some("apikey".into());
+        let mut inferred = credential("unrelated-name", &[]);
+        inferred.auth_method = Some("apikey".into());
+        inferred.serves = vec!["kimi-for-coding".into()];
+        let mut inactive = explicit.clone();
+        inactive.id = "inactive".into();
+        inactive.state = "disabled".into();
+        let mut other_category = explicit.clone();
+        other_category.id = "other-category".into();
+        other_category.categories = vec!["storage".into()];
+        let mut oauth = explicit.clone();
+        oauth.id = "oauth-record".into();
+        oauth.auth_method = Some("oauth".into());
+        let mut unmapped = inferred.clone();
+        unmapped.id = "unmapped".into();
+        unmapped.serves = vec!["unknown".into()];
+        let mut cache = BrocaCredentials::default();
+        cache.catalog_providers = ["kimi-for-coding".into()].into();
+        cache.apply_listing(
+            &listing(vec![
+                explicit,
+                inferred,
+                inactive,
+                other_category,
+                oauth,
+                unmapped,
+            ]),
+            100,
+        );
+        assert_eq!(
+            cache.api_key_credentials_by_provider(100),
+            BTreeMap::from([
+                ("opencode-go".into(), ["opaque-key".into()].into()),
+                ("another-provider".into(), ["opaque-key".into()].into()),
+                ("kimi-for-coding".into(), ["unrelated-name".into()].into()),
+            ])
+        );
+        assert!(cache
+            .api_key_credentials_by_provider(100 + MAX_AGE_MS + 1)
+            .is_empty());
+    }
+
     #[test]
     fn listed_credentials_preserve_the_vault_type_without_adapter_inference() {
         let mut credentials = super::BrocaCredentials::default();

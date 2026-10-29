@@ -327,6 +327,60 @@ fn fallback_plan() -> SubscriptionPlan {
     }
 }
 
+fn credential_plan<'a>(report: &'a Value, credential_id: &str) -> Option<&'a Value> {
+    let mut matches = report["latest"].as_array()?.iter().filter(|row| {
+        row["plan"].is_string()
+            && row["plan_prices"].as_array().is_some_and(|prices| {
+                prices
+                    .iter()
+                    .any(|price| price["credential_ref"] == credential_id)
+            })
+    });
+    let row = matches.next()?;
+    matches.next().is_none().then_some(row)
+}
+
+fn build_with_credentials(
+    state: &AccountQuotaState,
+    report: &Value,
+    prices: &Value,
+    now: i64,
+    credentials: &BTreeMap<String, BTreeSet<String>>,
+) -> EconomicsCache {
+    let mut out = build(state, report, prices, now);
+    for (provider, ids) in credentials {
+        // Leave pools created from account-quota readings unchanged, even if no
+        // usable capacity was found. Credential-only providers use the existing
+        // unknown-capacity fallback.
+        if out.pools.contains_key(provider) {
+            continue;
+        }
+        let mut rows = ids.iter().map(|id| credential_plan(report, id));
+        let Some(Some(row)) = rows.next() else {
+            continue;
+        };
+        // Without capacity observations there is no basis for weighting distinct
+        // plans. Every mapped API-key credential must identify the same unique row.
+        if !rows.all(|other| other.is_some_and(|other| std::ptr::eq(row, other))) {
+            continue;
+        }
+        out.pools.insert(
+            provider.clone(),
+            SubscriptionPool {
+                provider: provider.clone(),
+                now_ms: now,
+                plans: vec![SubscriptionPlan {
+                    plan: row["plan"].as_str().map(str::to_string),
+                    measured: measured(row),
+                    ..fallback_plan()
+                }],
+                ..Default::default()
+            },
+        );
+    }
+    out
+}
+
 pub(crate) async fn refresh(
     connection: &Path,
     project: &Path,
@@ -356,13 +410,16 @@ pub(crate) async fn refresh(
             .await
             .unwrap_or(Value::Null);
     }
-    if let Ok(mut credentials) = credentials.lock() {
+    let credential_ids = if let Ok(mut credentials) = credentials.lock() {
         credentials.publish_plan_prices(&prices);
-    }
+        credentials.api_key_credentials_by_provider(now as u64)
+    } else {
+        BTreeMap::new()
+    };
     let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
         return;
     };
-    let mut next = build(&snapshot, &report, &prices, now);
+    let mut next = build_with_credentials(&snapshot, &report, &prices, now, &credential_ids);
     if let Some(listing) = listing {
         next.unpriced_tiers = unpriced_tiers(listing, &prices);
     }
@@ -490,6 +547,335 @@ fn overlay_pools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn credential_fixture() -> (Value, BTreeMap<String, BTreeSet<String>>, i64) {
+        use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+        let report = serde_json::from_str::<Value>(include_str!(
+            "../fixtures/astrocyte-multiplier-report-v2-2026-10-29.json"
+        ))
+        .unwrap()["result"]
+            .clone();
+        let now = report["latest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["interval_end_ms"].as_i64().unwrap())
+            .max()
+            .unwrap()
+            + 1;
+        let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "credential-plans".into(),
+                credentials: [
+                    ("apikey:fixture-opencode-go", "opencode-go"),
+                    ("apikey:fixture-kimi-for-coding", "kimi-for-coding"),
+                ]
+                .into_iter()
+                .map(|(id, provider)| ListedCredential {
+                    id: id.into(),
+                    state: "active".into(),
+                    categories: vec!["llm-provider".into()],
+                    credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
+                    provider_ids: vec![provider.into()],
+                    ..Default::default()
+                })
+                .collect(),
+                ..Default::default()
+            },
+            now as u64,
+        );
+        (
+            report,
+            credentials.api_key_credentials_by_provider(now as u64),
+            now,
+        )
+    }
+
+    fn credential_route_price(
+        pools: HashMap<String, SubscriptionPool>,
+        now: i64,
+        provider: &str,
+        operator: Option<f64>,
+    ) -> prefrontal_routing_core::subscription::SubscriptionPricing {
+        use prefrontal_routing_core::model_router::{select_model_route, SelectModelRouteInput};
+        let mut snapshot = ModelRouteStateSnapshot::default();
+        let mut pricing = RoutePricing::default();
+        if let Some(value) = operator {
+            pricing
+                .subscription_multipliers
+                .insert(provider.into(), value);
+        }
+        let mut fact: ModelFact = serde_json::from_value(json!({
+            "providerID":provider, "modelID":"fixture", "confidence":"curated", "family":"fixture",
+            "scores":{"elo":1960.0,"eq":2200.0,"speed":0.0}, "costPerMTokOut":20.0
+        }))
+        .unwrap();
+        fact.subscription_multiplier = operator;
+        overlay_pools(pools, &mut snapshot, &[fact.clone()], now, &pricing);
+        select_model_route(SelectModelRouteInput {
+            target_agent: "alfonso".into(),
+            target_is_head: true,
+            requirements: prefrontal_routing_core::ModelRequirements { iq: 70.0, eq: 0.0 },
+            facts: vec![fact],
+            runtime_snapshot: Some(snapshot),
+            available_models: [format!("{provider}/fixture")].into(),
+            is_subscription_route: Some(Box::new(|_| true)),
+            exclude_route_keys: Vec::new(),
+            operator_exclude_keys: Vec::new(),
+            required_capabilities: None,
+            min_best_effort_adequacy: None,
+            prefer_prompt_cache: false,
+            providers_without_prompt_cache: Default::default(),
+            providers_without_cache_write_reports: Default::default(),
+        })
+        .unwrap()
+        .score
+        .objective
+        .subscription_pricing
+        .unwrap()
+    }
+
+    #[test]
+    fn subscription_credential_eligible_rows_price_mapped_routes() {
+        let (mut report, credentials, now) = credential_fixture();
+        assert_eq!(
+            credentials["opencode-go"],
+            BTreeSet::from(["apikey:fixture-opencode-go".to_string()])
+        );
+        for row in report["latest"].as_array_mut().unwrap() {
+            if ["opencodego", "kimi-for-coding"].contains(&row["quota_provider"].as_str().unwrap())
+            {
+                row["routing_eligible"] = json!(true);
+                row["multiplier"] = json!(if row["quota_provider"] == "opencodego" {
+                    8.0
+                } else {
+                    13.0
+                });
+            }
+        }
+        let pools = build_with_credentials(
+            &AccountQuotaState::default(),
+            &report,
+            &Value::Null,
+            now,
+            &credentials,
+        )
+        .pools;
+        for (provider, plan, multiplier) in [
+            ("opencode-go", "opencode-go/go", 8.0),
+            ("kimi-for-coding", "kimi-code-plan-global/allegro", 13.0),
+        ] {
+            assert!(pools[provider].plans[0].accounts.is_empty());
+            for operator in [Some(6.0), None] {
+                let price = credential_route_price(pools.clone(), now, provider, operator);
+                assert_eq!(price.value_multiplier, multiplier);
+                assert_eq!(price.plan_values[0].plan.as_deref(), Some(plan));
+                assert_eq!(price.plan_values[0].source, "measured");
+                assert_eq!(price.plan_values[0].weight, 1.0);
+            }
+        }
+        report["latest"].as_array_mut().unwrap().reverse();
+        assert_eq!(
+            pools,
+            build_with_credentials(
+                &AccountQuotaState::default(),
+                &report,
+                &Value::Null,
+                now,
+                &credentials
+            )
+            .pools
+        );
+    }
+
+    #[test]
+    fn subscription_credential_ineligible_rows_use_operator_then_default() {
+        let (report, credentials, now) = credential_fixture();
+        for eligibility in [Some(false), None] {
+            let mut report = report.clone();
+            for row in report["latest"].as_array_mut().unwrap() {
+                if row["plan_prices"][0]["credential_ref"].is_string() {
+                    row["multiplier"] = json!(19.0);
+                    if let Some(eligible) = eligibility {
+                        row["routing_eligible"] = json!(eligible);
+                    } else {
+                        row.as_object_mut().unwrap().remove("routing_eligible");
+                    }
+                }
+            }
+            let pools = build_with_credentials(
+                &AccountQuotaState::default(),
+                &report,
+                &Value::Null,
+                now,
+                &credentials,
+            )
+            .pools;
+            for provider in ["opencode-go", "kimi-for-coding"] {
+                assert!(pools[provider].plans[0].measured.is_none());
+                for operator in [Some(6.0), None] {
+                    let price = credential_route_price(pools.clone(), now, provider, operator);
+                    assert_eq!(price.value_multiplier, operator.unwrap_or(1.0));
+                    assert_eq!(
+                        price.plan_values[0].source,
+                        if operator.is_some() {
+                            "operator"
+                        } else {
+                            "default"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn subscription_credential_join_rejects_unmatched_and_ambiguous_ids() {
+        let (mut report, credentials, now) = credential_fixture();
+        let row = report["latest"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["quota_provider"] == "opencodego")
+            .unwrap();
+        row["routing_eligible"] = json!(true);
+        row["multiplier"] = json!(8.0);
+        let row = row.clone();
+        let mut unmatched = credentials.clone();
+        unmatched.insert("opencode-go".into(), ["apikey:not-listed".into()].into());
+        let unknown = build_with_credentials(
+            &AccountQuotaState::default(),
+            &report,
+            &Value::Null,
+            now,
+            &unmatched,
+        )
+        .pools;
+        let price = credential_route_price(unknown, now, "opencode-go", None);
+        assert_eq!(price.value_multiplier, 1.0);
+        assert!(price.plan_values[0].plan.is_none());
+        assert_eq!(price.plan_values[0].source, "default");
+
+        let mut shared = report.clone();
+        shared["latest"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["quota_provider"] == "opencodego")
+            .unwrap()["plan_prices"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"credential_ref":"opaque-second-key"}));
+        let mut shared_ids = credentials.clone();
+        shared_ids
+            .get_mut("opencode-go")
+            .unwrap()
+            .insert("opaque-second-key".into());
+        let shared_pools = build_with_credentials(
+            &AccountQuotaState::default(),
+            &shared,
+            &Value::Null,
+            now,
+            &shared_ids,
+        )
+        .pools;
+        assert_eq!(shared_pools["opencode-go"].plans.len(), 1);
+        assert_eq!(
+            credential_route_price(shared_pools, now, "opencode-go", None).value_multiplier,
+            8.0
+        );
+
+        for different_plan in [false, true] {
+            let mut report = report.clone();
+            let mut duplicate = row.clone();
+            if different_plan {
+                duplicate["plan"] = json!("opencode-go/other");
+                duplicate["plan_prices"][0]["plan"] = json!("opencode-go/other");
+            }
+            report["latest"].as_array_mut().unwrap().push(duplicate);
+            for reverse in [false, true] {
+                if reverse {
+                    report["latest"].as_array_mut().unwrap().reverse();
+                }
+                let pools = build_with_credentials(
+                    &AccountQuotaState::default(),
+                    &report,
+                    &Value::Null,
+                    now,
+                    &credentials,
+                )
+                .pools;
+                assert!(!pools.contains_key("opencode-go"));
+                let price = credential_route_price(pools, now, "opencode-go", Some(6.0));
+                assert_eq!(price.value_multiplier, 6.0);
+                assert!(price.plan_values[0].plan.is_none());
+                assert_eq!(price.plan_values[0].source, "operator");
+            }
+        }
+        unmatched
+            .get_mut("opencode-go")
+            .unwrap()
+            .insert("apikey:fixture-opencode-go".into());
+        assert!(!build_with_credentials(
+            &AccountQuotaState::default(),
+            &report,
+            &Value::Null,
+            now,
+            &unmatched
+        )
+        .pools
+        .contains_key("opencode-go"));
+    }
+
+    #[test]
+    fn subscription_credential_capture_does_not_change_account_pools_or_v1() {
+        let (capture, mut credentials, now) = credential_fixture();
+        let mut report = report_v2();
+        report["latest"].as_array_mut().unwrap().extend(
+            capture["latest"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["plan_prices"][0]["credential_ref"].is_string())
+                .cloned(),
+        );
+        credentials.insert(
+            "openai".into(),
+            ["apikey:fixture-opencode-go".into()].into(),
+        );
+        let state = v2_state(now);
+        let accounts = build(&state, &report, &Value::Null, now).pools;
+        assert!(accounts["openai"]
+            .plans
+            .iter()
+            .any(|plan| plan.measured.is_some()));
+        let combined =
+            build_with_credentials(&state, &report, &Value::Null, now, &credentials).pools;
+        for (provider, pool) in accounts {
+            assert_eq!(combined[&provider], pool);
+        }
+        assert!(build_with_credentials(
+            &AccountQuotaState::default(),
+            &self::report(),
+            &Value::Null,
+            now,
+            &credentials
+        )
+        .pools
+        .is_empty());
+    }
+
+    #[test]
+    fn subscription_credential_live_fixture_is_digest_pinned() {
+        let bytes = include_bytes!("../fixtures/astrocyte-multiplier-report-v2-2026-10-29.json");
+        assert_eq!(bytes.len(), 991_100);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            "3c9d952bdc3fa9387e39d38cb71367443a3cdf07ba8dc52dc8002b30332c24d4"
+        );
+    }
 
     /// The head agents a converted config lists (`head_agents`).
     fn head_agents_of_converted_config() -> Vec<String> {
