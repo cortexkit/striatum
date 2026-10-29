@@ -238,6 +238,35 @@ async fn a_credential_probe_is_a_fallback_and_an_entitlement_failure_renews_it()
     );
 }
 
+#[tokio::test]
+async fn a_client_attestation_refusal_fences_the_reported_credential() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _credentials) = setup("synthetic", false);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let failed = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":selected.1["result"]["decision_id"],"outcome":"failed","credential_id":"oauth:test","runner_code":"client_attestation_denied"}),
+        )
+        .await;
+    assert_eq!(failed.0, FrameType::Response, "{}", failed.1);
+    let fence = harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .into_iter()
+        .find(|fence| fence.credential_id == "oauth:test")
+        .expect("the refused credential is fenced");
+    assert_eq!(fence.code, "client_attestation_denied");
+}
+
 fn catalog_fact(harness: &Harness, fact: &prefrontal_routing_core::ModelFact) {
     use prefrontal_routing_store::{FusiformCatalogCursor, FusiformFactUpdate};
     use std::sync::atomic::{AtomicU64, Ordering};

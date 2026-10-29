@@ -249,7 +249,11 @@ fn record_account_facts(
         .unwrap_or("");
     if matches!(
         code,
-        "ENTITLEMENT_ERROR" | "billing_exhausted" | "credit_insufficient" | "insufficient_quota"
+        "ENTITLEMENT_ERROR"
+            | "client_attestation_denied"
+            | "billing_exhausted"
+            | "credit_insufficient"
+            | "insufficient_quota"
     ) {
         crate::credential_fences::record(
             deps.store,
