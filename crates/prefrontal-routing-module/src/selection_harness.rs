@@ -33,6 +33,9 @@ pub(crate) enum Workload {
     /// A reader the sidekick lead opened to answer one question.
     #[serde(rename = "sidekick.reader")]
     Reader,
+    /// A sidekick map lane: returns the code excerpts a change needs.
+    #[serde(rename = "sidekick.map")]
+    Map,
     /// A review session core opened for a sidekick comment-review handoff.
     #[serde(rename = "sidekick.reviewer")]
     Reviewer,
@@ -55,6 +58,7 @@ impl Workload {
             Self::Planner => "sidekick.planner",
             Self::Lead => "sidekick.lead",
             Self::Reader => "sidekick.reader",
+            Self::Map => "sidekick.map",
             Self::Reviewer => "sidekick.reviewer",
             Self::Athena => "athena",
             Self::Hire => "hire",
