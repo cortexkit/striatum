@@ -266,10 +266,7 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     root.remove("pins");
     root.remove("score_alias");
     root.extend(old);
-    // Family rules are first-match-wins; the data file holds them as an
-    // ordered list, which keeps that order through any JSON round trip.
-    root.entry("model_families")
-        .or_insert_with(|| data["model_families"].clone());
+    root.remove("model_families");
     root.entry("model_naming")
         .or_insert_with(|| data["model_naming"].clone());
     root.entry("head_agents")
@@ -307,86 +304,5 @@ fn remove_account_flag(root: &mut Map<String, Value>) -> Result<(), String> {
 pub fn convert(document: &str) -> Result<String, String> {
     let json = subc_jsonc::jsonc_to_json(document)?;
     let value = serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    #[derive(serde::Deserialize)]
-    struct FamilyDocument {
-        #[serde(default)]
-        model_families: OrderedFamilies,
-    }
-    let families: FamilyDocument =
-        serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    let converted = convert_value(value)?;
-    serde_json::to_string_pretty(&ConvertedDocument {
-        root: converted.as_object().unwrap(),
-        families: &families.model_families,
-    })
-    .map_err(|error| error.to_string())
-}
-
-// Family rules are first-match-wins. serde_json::Value sorts object keys, so
-// preserve this one ordered map while serializing the converted document.
-#[derive(Default)]
-struct OrderedFamilies(Vec<(String, Value)>);
-
-impl<'de> serde::Deserialize<'de> for OrderedFamilies {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = OrderedFamilies;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an ordered family-rule object")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut entries = Vec::new();
-                while let Some(entry) = map.next_entry()? {
-                    entries.push(entry);
-                }
-                Ok(OrderedFamilies(entries))
-            }
-            // List-form rules are ordered already; the converted document
-            // writes them as the input value holds them.
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(OrderedFamilies::default())
-            }
-        }
-        deserializer.deserialize_any(Visitor)
-    }
-}
-
-impl serde::Serialize for OrderedFamilies {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (name, rules) in &self.0 {
-            map.serialize_entry(name, rules)?;
-        }
-        map.end()
-    }
-}
-
-struct ConvertedDocument<'a> {
-    root: &'a Map<String, Value>,
-    families: &'a OrderedFamilies,
-}
-impl serde::Serialize for ConvertedDocument<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.root.len()))?;
-        for (key, value) in self.root {
-            // A document's own map-form rules keep their written order; the
-            // converter's list-form defaults are ordered already.
-            if key == "model_families" && !self.families.0.is_empty() {
-                map.serialize_entry(key, self.families)?;
-            } else {
-                map.serialize_entry(key, value)?;
-            }
-        }
-        map.end()
-    }
+    serde_json::to_string_pretty(&convert_value(value)?).map_err(|error| error.to_string())
 }

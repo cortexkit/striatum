@@ -237,6 +237,8 @@ struct CatalogModelFacts {
     /// through by Fusiform. `null` and an unserved key both mean no status.
     #[serde(rename = "model.status", default)]
     status: Option<String>,
+    #[serde(rename = "model.lineage", default)]
+    lineage: Option<String>,
 }
 
 fn served_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -876,6 +878,7 @@ fn decode_model_entry(
             .canonical_id
             .filter(|canonical_id| !canonical_id.trim().is_empty()),
         upstream_status: model.status.filter(|status| !status.trim().is_empty()),
+        lineage: model.lineage,
     };
     Ok((fact, model_rates))
 }
@@ -1337,22 +1340,20 @@ struct CycleOutcome {
     get_calls: usize,
 }
 
-/// Apply one fetched catalog snapshot plus the family rules that follow it. A
+/// Apply one fetched catalog snapshot. A
 /// catalog apply can add, withdraw, or re-price a route, so when `ladder` is
 /// given the winner ladder is compared around it and a move is announced.
 fn apply_catalog_snapshot(
     store: &SqliteRouteStateStore,
     snapshot: &CatalogSnapshot,
-    family_config_path: Option<&Path>,
+    config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
     credentials: Option<&crate::broca_credentials::SharedBrocaCredentials>,
     context: &str,
 ) -> Result<(), FusiformCatalogError> {
     apply_mapped_catalog(store, snapshot, credentials, None)
         .map_err(|reason| error(format!("apply {context}: {reason}")))?;
-    if let Some(path) = family_config_path {
-        crate::config_overrides::apply_family_rules_from_config(store, path)
-            .map_err(|reason| error(format!("apply catalog family rules: {reason}")))?;
+    if let Some(path) = config_path {
         let shadowed = crate::config_overrides::live_config(path).shadowed_operator_grades(
             &store
                 .operator_quality()
@@ -1533,19 +1534,19 @@ async fn apply_and_report(
     store: &Arc<SqliteRouteStateStore>,
     health: &SharedCatalogHealth,
     snapshot: CatalogSnapshot,
-    family_config_path: Option<&Path>,
+    config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
     credentials: Option<crate::broca_credentials::SharedBrocaCredentials>,
     context: &'static str,
 ) -> Result<(), FusiformCatalogError> {
     let (store, health) = (Arc::clone(store), Arc::clone(health));
-    let family_config_path = family_config_path.map(Path::to_path_buf);
+    let config_path = config_path.map(Path::to_path_buf);
     let ladder = ladder.cloned();
     on_blocking_thread(move || {
         apply_catalog_snapshot(
             &store,
             &snapshot,
-            family_config_path.as_deref(),
+            config_path.as_deref(),
             ladder.as_ref(),
             credentials.as_ref(),
             context,
@@ -1559,7 +1560,7 @@ async fn bootstrap_cycle<C: CatalogWire>(
     client: &mut C,
     store: &Arc<SqliteRouteStateStore>,
     health: &SharedCatalogHealth,
-    family_config_path: Option<&Path>,
+    config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let snapshot = client.catalog_get().await?;
@@ -1568,7 +1569,7 @@ async fn bootstrap_cycle<C: CatalogWire>(
         store,
         health,
         snapshot,
-        family_config_path,
+        config_path,
         ladder,
         client.credentials(),
         "catalog.get",
@@ -1585,7 +1586,7 @@ async fn poll_cycle<C: CatalogWire>(
     client: &mut C,
     store: &Arc<SqliteRouteStateStore>,
     health: &SharedCatalogHealth,
-    family_config_path: Option<&Path>,
+    config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let status = client.catalog_status().await?;
@@ -1609,7 +1610,7 @@ async fn poll_cycle<C: CatalogWire>(
             store,
             health,
             snapshot,
-            family_config_path,
+            config_path,
             ladder,
             client.credentials(),
             "catalog replay",
@@ -1636,7 +1637,7 @@ pub async fn catalog_refresh_loop(
     let _ = std::fs::create_dir_all(&project_root);
     let mut bootstrapped = false;
     let mut last_logged_error: Option<String> = None;
-    let family_config_path = crate::config_overrides::config_path();
+    let config_path = crate::config_overrides::config_path();
     let wake = {
         let mut guard = credentials.lock().unwrap();
         guard.connection_file_path = Some(connection_file_path.clone());
@@ -1651,7 +1652,7 @@ pub async fn catalog_refresh_loop(
                         &mut consumer,
                         &store,
                         &health,
-                        Some(&family_config_path),
+                        Some(&config_path),
                         Some(&ladder_sources),
                     )
                     .await
@@ -1662,7 +1663,7 @@ pub async fn catalog_refresh_loop(
                         &mut consumer,
                         &store,
                         &health,
-                        Some(&family_config_path),
+                        Some(&config_path),
                         Some(&ladder_sources),
                     )
                     .await
@@ -1672,8 +1673,7 @@ pub async fn catalog_refresh_loop(
         match result {
             Ok(_) => {
                 bootstrapped = true;
-                let cadence =
-                    crate::config_overrides::live_config(&family_config_path).catalog_poll_ms();
+                let cadence = crate::config_overrides::live_config(&config_path).catalog_poll_ms();
                 if let Ok(mut health) = health.lock() {
                     health.set_poll_ms(cadence);
                 }
@@ -1707,6 +1707,7 @@ mod tests {
     include!("operator_quality_tests.rs");
     include!("fusiform_catalog_paging_tests.rs");
     include!("billing_readiness_tests.rs");
+    include!("lineage_tests.rs");
     use super::*;
     use sha2::{Digest, Sha256};
 

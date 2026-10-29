@@ -1,0 +1,35 @@
+{
+  "catalog_version": 48,
+  "resolved_at_ms": 1000,
+  "models": {
+    "lineage-fixture/claude-impostor-a": {
+      "existence": "present", "model.lineage": "qwen",
+      "limit.context": 100000, "capability.tool_call": true,
+      "rate.output": {"state": "priced", "currency": "USD", "units": 1, "exponent": 0}
+    },
+    "lineage-fixture/gpt-impostor-b": {
+      "existence": "present", "model.lineage": "qwen",
+      "limit.context": 100000, "capability.tool_call": true,
+      "rate.output": {"state": "priced", "currency": "USD", "units": 1, "exponent": 0}
+    },
+    "lineage-fixture/claude-impostor-c": {
+      "existence": "present", "model.lineage": "gpt",
+      "limit.context": 100000, "capability.tool_call": true,
+      "rate.output": {"state": "priced", "currency": "USD", "units": 1, "exponent": 0}
+    },
+    "lineage-fixture/unknown-a": {
+      "existence": "present", "limit.context": 100000, "capability.tool_call": true,
+      "rate.output": {"state": "priced", "currency": "USD", "units": 1, "exponent": 0}
+    },
+    "lineage-fixture/unknown-b": {
+      "existence": "present", "model.lineage": null,
+      "limit.context": 100000, "capability.tool_call": true,
+      "rate.output": {"state": "priced", "currency": "USD", "units": 1, "exponent": 0}
+    },
+    "lineage-fixture/verbatim": {
+      "existence": "present", "model.lineage": " QWEN ",
+      "limit.context": 100000, "capability.tool_call": true,
+      "rate.output": {"state": "priced", "currency": "USD", "units": 1, "exponent": 0}
+    }
+  }
+}

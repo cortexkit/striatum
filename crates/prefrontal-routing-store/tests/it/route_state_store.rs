@@ -3070,6 +3070,7 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
         reasoning_efforts: None,
         canonical_id: None,
         upstream_status: None,
+        lineage: None,
     };
     store
         .apply_fusiform_catalog(
@@ -3177,6 +3178,7 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
         reasoning_efforts: None,
         canonical_id: None,
         upstream_status: None,
+        lineage: None,
     };
     store
         .apply_fusiform_catalog(
@@ -3225,6 +3227,7 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
         reasoning_efforts: None,
         canonical_id: None,
         upstream_status: None,
+        lineage: None,
     };
     store
         .apply_fusiform_catalog(
@@ -3283,6 +3286,7 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
         reasoning_efforts: None,
         canonical_id: None,
         upstream_status: None,
+        lineage: None,
     };
     let routable_before = store.get_facts().unwrap().len();
     assert!(store.get_facts().unwrap().iter().any(|fact| make_route_key(
@@ -3362,6 +3366,7 @@ fn fusiform_apply_treats_a_pair_minted_earlier_in_the_batch_as_stored() {
         reasoning_efforts: None,
         canonical_id: None,
         upstream_status: None,
+        lineage: None,
     };
     let before = store.get_catalog_facts().unwrap().len();
 
@@ -4281,6 +4286,7 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
         reasoning_efforts: None,
         canonical_id: None,
         upstream_status: None,
+        lineage: None,
     };
     store
         .apply_fusiform_catalog_snapshot_for_providers(
@@ -4491,6 +4497,7 @@ fn new_routes_inherit_the_provider_wall_cause_through_the_insert_trigger() {
                 reasoning_efforts: None,
                 canonical_id: None,
                 upstream_status: None,
+                lineage: None,
             }],
             FusiformCatalogCursor {
                 catalog_version: 1,

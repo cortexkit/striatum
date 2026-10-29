@@ -316,21 +316,19 @@ fn sibling_pro_preference_requires_class_and_policy_floor() {
 }
 
 #[test]
-fn unlabeled_families_are_dropped_even_without_classifier_diversity() {
+fn absent_lineage_shares_one_other_seat_without_classifier_diversity() {
     let panel = choose(
         vec![
             fact("unlabeled", 2000.0, None),
+            fact("also-unlabeled", 1900.0, None),
             fact("labeled", 100.0, Some("a")),
         ],
         PanelClass::Lab,
         policy(2, PanelOrder::Iq, None),
     );
-    assert_eq!(keys(&panel), ["p/labeled"]);
-    let shortfall = panel.shortfall.unwrap();
-    assert!(shortfall
-        .causes
-        .iter()
-        .any(|cause| cause.reason == PanelCauseReason::FamilyUnlabeled));
+    assert_eq!(keys(&panel), ["p/unlabeled", "p/labeled"]);
+    assert_eq!(panel.members[0].family.as_deref(), Some("other"));
+    assert!(panel.shortfall.is_none());
 }
 
 #[test]

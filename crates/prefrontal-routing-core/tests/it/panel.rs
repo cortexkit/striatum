@@ -708,41 +708,36 @@ fn reserved_headroom_panel_cause_publishes_structured_reset_without_prose_timest
 }
 
 #[test]
-fn family_diversity_excludes_unlabeled_everywhere() {
+fn family_diversity_groups_absent_lineage_with_other() {
     let facts = vec![
         fact("a1", 60.0, Some("a")),
         fact("a2", 59.0, Some("a")),
         fact("unlabeled", 58.0, None),
+        fact("also-unlabeled", 57.0, None),
+        fact("explicit-other", 56.0, Some("other")),
     ];
-    // Family exclusion is an n_pick rule; a pinned roster seats what the caller
-    // pinned regardless of labels.
     let family = select_panel(n_pick_input(
         facts.clone(),
-        spec(2, 0.0, PanelDiversity::Family),
+        spec(3, 0.0, PanelDiversity::Family),
     ))
     .unwrap();
-    assert_eq!(family.members.len(), 1);
-    assert!(family
-        .runner_up
-        .iter()
-        .all(|spare| spare.route_key != "p/unlabeled"));
+    assert_eq!(family.members.len(), 2);
+    assert_eq!(family.members[1].route_key, "p/unlabeled");
+    assert_eq!(family.members[1].family.as_deref(), Some("other"));
     let shortfall = family.shortfall.unwrap();
     assert_eq!(shortfall.code, PanelShortfallCode::DiversityUnmeetable);
-    assert!(shortfall.detail.contains("1 distinct labeled families"));
-    assert!(shortfall
-        .causes
-        .iter()
-        .any(|cause| cause.reason == PanelCauseReason::FamilyUnlabeled));
     assert!(shortfall
         .causes
         .iter()
         .any(|cause| cause.reason == PanelCauseReason::FamilyDuplicate));
-
-    let none = select_panel(panel_input(facts, spec(3, 0.0, PanelDiversity::None))).unwrap();
-    assert!(none
-        .members
+    assert!(!shortfall
+        .causes
         .iter()
-        .any(|member| member.route_key == "p/unlabeled" && member.family.is_none()));
+        .any(|cause| cause.reason == PanelCauseReason::FamilyUnlabeled));
+    let roster = select_panel(panel_input(facts, spec(5, 0.0, PanelDiversity::None))).unwrap();
+    assert!(roster.members.iter().any(
+        |member| member.route_key == "p/unlabeled" && member.family.as_deref() == Some("other")
+    ));
 }
 
 #[test]

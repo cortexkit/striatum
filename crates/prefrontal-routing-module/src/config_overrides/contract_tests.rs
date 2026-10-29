@@ -633,7 +633,6 @@ fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
         );
         assert!(active.operator_policy().score_alias.is_empty());
         let model = &section.models["openai/gpt-6/high"];
-        assert_eq!(model.family, Some(Some("gpt".into())));
         assert_eq!(
             (model.elo, model.eq, model.speed),
             (Some(1800.0), Some(1750.0), Some(90.0))
@@ -675,9 +674,6 @@ fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
             active.account_flags(),
             AccountSelectionFlags { enabled: true }
         );
-        assert_eq!(active.config.model_families.0.len(), 2);
-        assert_eq!(active.config.model_families.0[0].family, GrandFamily::Gpt);
-        assert_eq!(active.config.model_families.0[0].globs, ["openai/*"]);
     }
 }
 
@@ -823,12 +819,9 @@ fn generated_schema_is_current_and_closed() {
             "{name}"
         );
     }
-    // Family rules take an ordered map or an ordered list; both forms are closed.
-    let family_forms = schema["$defs"]["ModelFamilyRules"]["oneOf"]
-        .as_array()
-        .expect("ModelFamilyRules has a map form and a list form");
-    assert_eq!(family_forms[0]["additionalProperties"], false);
-    assert_eq!(family_forms[1]["items"]["additionalProperties"], false);
+    assert!(schema["$defs"].get("ModelFamilyRules").is_none());
+    assert!(schema["properties"].get("model_families").is_none());
+    assert!(schema["$defs"]["ProviderAccountsPolicy"]["properties"].get("model_families").is_some());
     let properties = &schema["properties"];
     assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
     let retired = super::validate_document(r#"{"accounts":{"enabled":false}}"#).unwrap_err();

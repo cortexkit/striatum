@@ -263,6 +263,7 @@ fn catalog_fact(harness: &Harness, fact: &prefrontal_routing_core::ModelFact) {
                 reasoning_efforts: None,
                 canonical_id: None,
                 upstream_status: None,
+                lineage: None,
             }],
             FusiformCatalogCursor {
                 catalog_version: VERSION.fetch_add(1, Ordering::Relaxed) as i64,

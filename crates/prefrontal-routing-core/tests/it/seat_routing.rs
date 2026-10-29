@@ -173,19 +173,18 @@ fn grand_family_vocabulary_accepts_only_closed_wire_ids() {
 
 #[test]
 fn grand_family_fact_is_data_never_inferred_from_names() {
-    // A model literally named like a GPT carries NO family fact → None.
+    // A GPT-looking name without lineage belongs to `other`, not GPT.
     let unlabeled = fact("openai", "gpt-9", None, 50.0, 5.0);
-    assert_eq!(unlabeled.grand_family_id(), None);
+    assert_eq!(unlabeled.grand_family_id(), Some("other"));
 
     // A family fact contradicting the model name wins: the curated datum is
     // authoritative and nothing looks at the name.
     let cross_labeled = fact("acme", "gpt-clone", Some("deepseek"), 50.0, 5.0);
     assert_eq!(cross_labeled.grand_family_id(), Some("deepseek"));
 
-    // A curated value outside the canonical grammar reads as absent, not as a
-    // silently normalized family.
+    // Served strings are never silently normalized or discarded.
     let malformed = fact("acme", "m1", Some("Not Canonical"), 50.0, 5.0);
-    assert_eq!(malformed.grand_family_id(), None);
+    assert_eq!(malformed.grand_family_id(), Some("Not Canonical"));
 }
 
 #[test]
@@ -220,9 +219,8 @@ fn incumbent_families_resolve_from_facts_only() {
             "unknown/route".to_string(),
         ],
     );
-    // Only the labeled, matching incumbent contributes; unknown-family and
-    // unmatched incumbents contribute nothing (and never fail resolution).
-    assert_eq!(incumbents, families(&["claude"]));
+    // Matched incumbents without lineage contribute `other`; unmatched ones do not.
+    assert_eq!(incumbents, families(&["claude", "other"]));
 }
 
 // ── criterion 6: explicit pins ──────────────────────────────────────────────
@@ -467,16 +465,15 @@ fn diversity_is_preference_not_gate_when_only_incumbent_family_is_adequate() {
 }
 
 #[test]
-fn unknown_family_never_satisfies_the_diversity_preference() {
-    // An unknown family cannot establish diversity from the incumbents.
-    // The labeled Claude route is preferred despite its higher cost.
+fn absent_lineage_does_not_add_diversity_to_an_other_incumbent() {
+    // Missing lineage shares the incumbent's `other` family, so Claude is preferred.
     let facts = vec![
         fact("prov-x", "unlabeled", None, 50.0, 1.0),
         fact("prov-b", "model-b", Some("claude"), 50.0, 10.0),
     ];
     let selection = select_seat_route(
         InputBuilder::new(facts)
-            .incumbents(families(&["gpt"]))
+            .incumbents(families(&["other"]))
             .build(),
     )
     .expect("route must select");
@@ -485,10 +482,7 @@ fn unknown_family_never_satisfies_the_diversity_preference() {
 }
 
 #[test]
-fn unknown_family_route_remains_adequate_and_selectable() {
-    // Missing family data never makes a route inadequate: with no labeled
-    // alternative satisfying the preference, the unlabeled route still seats
-    // via the deterministic fallback.
+fn absent_lineage_adds_other_diversity_to_a_named_incumbent() {
     let facts = vec![
         fact("prov-x", "unlabeled", None, 50.0, 1.0),
         fact("prov-a", "model-a", Some("gpt"), 50.0, 10.0),
@@ -499,17 +493,15 @@ fn unknown_family_route_remains_adequate_and_selectable() {
             .build(),
     )
     .expect("route must select");
-    // Neither candidate adds diversity: the unknown family proves nothing, and GPT matches.
-    // The deterministic fallback therefore chooses the cheapest adequate route.
+    // `other` differs from the GPT incumbent.
     assert_eq!(selection.route_key, "prov-x/unlabeled");
-    assert!(!selection.diversity_satisfied);
-    assert_eq!(selection.grand_family_id, None);
+    assert!(selection.diversity_satisfied);
+    assert_eq!(selection.grand_family_id.as_deref(), Some("other"));
 }
 
 #[test]
 fn all_family_facts_absent_is_deterministic_cost_order() {
-    // With no family facts anywhere, diversity is inert and the existing
-    // cost-primary deterministic order decides: repeatably.
+    // All absent lineages share `other`, so cost order breaks the tie.
     let facts = vec![
         fact("prov-x", "m-x", None, 50.0, 5.0),
         fact("prov-y", "m-y", None, 50.0, 1.0),

@@ -187,17 +187,31 @@ fn converter_preserves_runner_order_and_rejects_map_shape() {
 }
 
 #[test]
-fn conversion_preserves_first_match_family_rule_order() {
+fn conversion_discards_removed_family_rules_but_keeps_quota_families() {
     let document = crate::config_convert::convert(
         r#"{
         "model_routing": {},
-        "model_families": {"other": ["*"], "gpt": ["p/*"]}
+        "model_families": {"other": ["*"], "gpt": ["p/*"]},
+        "accounts": {"model_families": [{"model": "claude-fake", "family": "opus"}]}
     }"#,
     )
     .unwrap();
-    let config = parse_config(&document).unwrap();
-    assert_eq!(config.model_families.0[0].family, GrandFamily::Other);
-    assert_eq!(config.model_families.0[1].family, GrandFamily::Gpt);
+    parse_config(&document).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+    assert!(value.get("model_families").is_none());
+    assert_eq!(value["accounts"]["model_families"][0]["family"], "opus");
+}
+
+#[test]
+fn top_level_family_rules_are_refused_with_catalog_cutover_guidance() {
+    for value in [json!(null), json!({}), json!({"gpt": ["*"]}), json!([])] {
+        let error = parse_config(&json!({"model_families": value}).to_string()).unwrap_err();
+        assert!(error.contains("model_families"), "{error}");
+        assert!(error.contains("Fusiform's model.lineage"), "{error}");
+        assert!(error.contains("delete this section"), "{error}");
+    }
+    parse_config(r#"{"accounts":{"model_families":[{"model":"claude-fake","family":"opus"}]}}"#)
+        .unwrap();
 }
 
 #[test]
