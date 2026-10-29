@@ -793,6 +793,38 @@ fn renamed_reload_keeps_last_good_and_reports_once_per_old_name_change() {
 }
 
 #[test]
+fn retired_account_model_families_load_with_named_warnings_and_preserve_rule_order() {
+    let mut warnings = Vec::new();
+    let config = super::parse_config_with_reporter(
+        r#"{
+        "model_families": {"other": ["*"], "gpt": ["openai/*"]},
+        "accounts": {"model_families": [{"model":"claude-fable-5", "family":"opus"}]},
+        "providers": {"anthropic": {"accounts": {"model_families": null}}}
+    }"#,
+        |warning| warnings.push(warning.to_string()),
+    )
+    .unwrap();
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings[0].contains("`accounts.model_families`"));
+    assert!(warnings[1].contains("`providers.anthropic.accounts.model_families`"));
+    assert!(warnings
+        .iter()
+        .all(|warning| warning.contains("ignored") && warning.contains("delete this key")));
+    assert_eq!(config.model_families.0[0].family, GrandFamily::Other);
+    let policy = super::allocator_policy_from(&config.accounts, None).unwrap();
+    assert_eq!(
+        policy.family_for_model("claude-fable-5"),
+        prefrontal_routing_core::accounts::ModelFamily::Fable
+    );
+    assert!(super::parse_config_with_reporter(
+        r#"{"accounts":{"model_families":false, "typo":true}}"#,
+        |_| {}
+    )
+    .unwrap_err()
+    .contains("typo"));
+}
+
+#[test]
 fn generated_schema_is_current_and_closed() {
     let generated = routing_config_schema();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("routing-config.schema.json");
@@ -831,6 +863,11 @@ fn generated_schema_is_current_and_closed() {
     assert_eq!(family_forms[1]["items"]["additionalProperties"], false);
     let properties = &schema["properties"];
     assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
+    assert!(schema["$defs"].get("AccountModelFamily").is_none());
+    assert!(schema["$defs"]["ProviderAccountsPolicy"]["properties"]
+        .get("model_families")
+        .is_none());
+    assert!(properties.get("model_families").is_some());
     let retired = super::validate_document(r#"{"accounts":{"enabled":false}}"#).unwrap_err();
     assert!(retired.contains("accounts.enabled"));
     assert!(retired.contains(crate::config_convert::COMMAND));

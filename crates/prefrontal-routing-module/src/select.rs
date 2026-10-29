@@ -1092,7 +1092,6 @@ pub(super) async fn handle_select_request(
     if account_selection::handles(&envelope.method) {
         let principal = route_principal(channel, epoch);
         let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
-            model_families: live_config.account_model_families(),
             model_pools: live_config.quota_model_pools(),
             ..Default::default()
         };
@@ -1979,7 +1978,6 @@ pub(super) async fn handle_select_request(
         });
         let selection = selection.and_then(|(selected, variant_choice)| {
             let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
-                model_families: live_config.account_model_families(),
                 model_pools: live_config.quota_model_pools(),
                 ..Default::default()
             };

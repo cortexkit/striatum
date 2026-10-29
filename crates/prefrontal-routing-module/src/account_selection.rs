@@ -414,7 +414,12 @@ impl ClassContext {
             }],
             model_reach,
             quota: reading.and_then(|reading| {
-                quota_reading_for_model(&reading.entry, Some(&capacity), &model_pools)
+                quota_reading_for_model(
+                    &reading.entry,
+                    &reading.account_id,
+                    Some(&capacity),
+                    &model_pools,
+                )
             }),
         }
     }
@@ -1254,6 +1259,7 @@ fn quota_window(window: &RateWindow) -> Option<QuotaWindow> {
 /// `pool_windows` keeps every pool of the whole reading for block recovery.
 fn quota_reading_for_model(
     entry: &Value,
+    account_id: &str,
     capacity_key: Option<&str>,
     model_pools: &[prefrontal_routing_core::quota_extract::ModelPool],
 ) -> Option<QuotaReading> {
@@ -1292,6 +1298,13 @@ fn quota_reading_for_model(
                 })
                 .filter_map(|extra| {
                     let window = extra.window.as_ref()?;
+                    if extra.id.as_deref().is_none_or(str::is_empty)
+                        && claim_unattributable_scope_warning(account_id)
+                    {
+                        crate::warn_operator(format!(
+                            "[prefrontal-routing] account {account_id}: ignored unattributable extraRateWindows window without an id; general quota windows still apply"
+                        ));
+                    }
                     Some(ScopedWindow {
                         scope_id: extra.id.clone().unwrap_or_default(),
                         window_minutes: window
@@ -1349,6 +1362,18 @@ fn quota_reading_for_model(
                 .collect(),
         ),
     })
+}
+
+/// Bad producer metadata can be encountered on every selection. Warn once per
+/// account for the process lifetime rather than flooding the operator log.
+fn claim_unattributable_scope_warning(account_id: &str) -> bool {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .expect("unattributable scope warning lock")
+        .insert(account_id.to_string())
 }
 
 /// Join the vault roster with Insula readings for one routing provider.
@@ -1520,6 +1545,7 @@ fn allocator_roster_for_model(
                     quota: reading.and_then(|reading| {
                         quota_reading_for_model(
                             &reading.entry,
+                            &reading.account_id,
                             capacity_key.as_deref(),
                             model_pools,
                         )
@@ -2292,7 +2318,8 @@ fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
             return WarmReason::ReadingMissing;
         };
         observed_at = entry.fetched_at.clone();
-        let Some(reading) = quota_reading_for_model(&stored.entry, None, &[]) else {
+        let Some(reading) = quota_reading_for_model(&stored.entry, &stored.account_id, None, &[])
+        else {
             return WarmReason::ReadingMissing;
         };
         let freshness = assess_reading(Some(&reading), ctx.now_ms, ctx.policy);
@@ -3987,16 +4014,9 @@ mod tests {
             .expect("converter quota model pools")
     }
 
-    /// The account policy a converted config yields when the operator wrote no
-    /// account tuning: today's defaults with the shipped model-scoped families
-    /// and model-specific quota pools.
+    /// Default account tuning with the converter's model-specific quota pools.
     fn default_account_policy() -> prefrontal_routing_core::accounts::AllocatorPolicy {
-        let families: Vec<crate::config_policy::AccountModelFamily> = serde_json::from_value(
-            crate::config_convert::defaults()["account_model_families"].clone(),
-        )
-        .expect("converter account families");
         prefrontal_routing_core::accounts::AllocatorPolicy {
-            model_families: crate::config_policy::account_model_families(&families),
             model_pools: shipped_model_pools(),
             ..Default::default()
         }
@@ -4058,6 +4078,115 @@ mod tests {
     }
 
     #[test]
+    fn live_display_name_scope_adds_to_weekly_only_for_fable() {
+        use prefrontal_routing_core::accounts::eligibility::evaluate_quota;
+        let mut entry = claude_entry("live-scope");
+        entry["usage"]["tertiary"] = Value::Null;
+        let policy = default_account_policy();
+        let evaluate = |entry: &Value, model| {
+            let reading = quota_reading_for_model(entry, "live-scope", None, &[]).unwrap();
+            evaluate_quota(Some(&reading), model, CallerKind::Plugin, NOW, &policy)
+        };
+        for model in [
+            "claude-fable-5",
+            "claude-fable-5[1m]",
+            "claude-fable-5-1",
+            "claude-fable-5-1[1m]",
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
+            "claude-mythos-5-1",
+            "claude-mythos-5-1[1m]",
+        ] {
+            let eval = evaluate(&entry, model);
+            assert!(eval.eligible(), "{model}: {eval:?}");
+            assert!(eval
+                .window_weights
+                .iter()
+                .any(|window| window.window == ApplicableWindow::SevenDay));
+            let scoped: Vec<_> = eval
+                .window_weights
+                .iter()
+                .filter(|window| window.window == ApplicableWindow::FamilyScope)
+                .collect();
+            let fable = model.starts_with("claude-fable-");
+            assert_eq!(scoped.len(), usize::from(fable), "{model}");
+            assert_eq!(
+                eval.window_weights.len(),
+                if fable { 3 } else { 2 },
+                "{model}"
+            );
+
+            let mut exhausted = entry.clone();
+            exhausted["usage"]["extraRateWindows"][0]["window"]["usedPercent"] = json!(100.0);
+            assert_eq!(evaluate(&exhausted, model).eligible(), !fable, "{model}");
+            exhausted["usage"]["secondary"]["usedPercent"] = json!(100.0);
+            assert!(
+                !evaluate(&exhausted, model).eligible(),
+                "{model}: weekly must always apply"
+            );
+        }
+    }
+
+    #[test]
+    fn future_model_id_scope_applies_without_a_family_table() {
+        use prefrontal_routing_core::accounts::eligibility::evaluate_quota;
+        let mut entry = claude_entry("future-scope");
+        entry["usage"]["extraRateWindows"][0]["id"] = json!("claude-fable-5");
+        entry["usage"]["extraRateWindows"][0]["window"]["usedPercent"] = json!(100.0);
+        let reading = quota_reading_for_model(&entry, "future-scope", None, &[]).unwrap();
+        let eval = evaluate_quota(
+            Some(&reading),
+            "claude-fable-5-1[1m]",
+            CallerKind::Plugin,
+            NOW,
+            &default_account_policy(),
+        );
+        assert!(
+            eval.reserve.iter().any(|reason| matches!(
+                reason,
+                prefrontal_routing_core::accounts::ExclusionReason::ScopeExhausted { .. }
+            )),
+            "future id must gate the pick: {eval:?}"
+        );
+    }
+
+    #[test]
+    fn literal_null_scope_id_never_uses_the_title_and_warns_once_per_account() {
+        use prefrontal_routing_core::accounts::eligibility::evaluate_quota;
+        let account = "null-scope-warning-account";
+        let mut entry = claude_entry(account);
+        entry["usage"]["extraRateWindows"][0]["id"] = Value::Null;
+        entry["usage"]["extraRateWindows"][0]["window"]["usedPercent"] = json!(100.0);
+        for title in ["Fable", "7 Day (Fable)"] {
+            entry["usage"]["extraRateWindows"][0]["title"] = json!(title);
+            let reading = quota_reading_for_model(&entry, account, None, &[]).unwrap();
+            let eval = evaluate_quota(
+                Some(&reading),
+                "claude-fable-5",
+                CallerKind::Plugin,
+                NOW,
+                &default_account_policy(),
+            );
+            assert!(eval.eligible(), "{eval:?}");
+            assert_eq!(eval.window_weights.len(), 2);
+        }
+        assert!(!claim_unattributable_scope_warning(account));
+        let other = "another-null-scope-warning-account";
+        assert!(claim_unattributable_scope_warning(other));
+        assert!(!claim_unattributable_scope_warning(other));
+        entry["usage"]["extraRateWindows"][0]["id"] = json!("unrelated");
+        let reading = quota_reading_for_model(&entry, account, None, &[]).unwrap();
+        assert!(evaluate_quota(
+            Some(&reading),
+            "claude-fable-5",
+            CallerKind::Plugin,
+            NOW,
+            &default_account_policy()
+        )
+        .eligible());
+    }
+
+    #[test]
     fn last_good_is_admissible_until_thirty_minutes_but_not_after_a_reset() {
         use prefrontal_routing_core::accounts::eligibility::evaluate_quota;
         use prefrontal_routing_core::accounts::ExclusionReason;
@@ -4082,11 +4211,11 @@ mod tests {
         )
         .unwrap();
         let entry = &state.readings.readings.values().next().unwrap().entry;
-        let reading = quota_reading_for_model(entry, None, &[]).unwrap();
+        let reading = quota_reading_for_model(entry, "acct-a", None, &[]).unwrap();
         let evaluate = |reading: &QuotaReading, now| {
             evaluate_quota(
                 Some(reading),
-                ModelFamily::Opus,
+                "claude-opus-5-5",
                 CallerKind::Plugin,
                 now,
                 &AllocatorPolicy::default(),
@@ -4103,7 +4232,7 @@ mod tests {
 
         let mut past_reset = entry.clone();
         past_reset["usage"]["primary"]["resetsAt"] = json!("2026-09-29T12:01:00Z");
-        let reading = quota_reading_for_model(&past_reset, None, &[]).unwrap();
+        let reading = quota_reading_for_model(&past_reset, "acct-a", None, &[]).unwrap();
         let expired_window = evaluate(&reading, NOW + 2 * 60_000);
         assert!(!expired_window.eligible());
         assert!(expired_window

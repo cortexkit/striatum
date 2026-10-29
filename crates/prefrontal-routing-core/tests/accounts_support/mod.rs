@@ -6,9 +6,8 @@
 use prefrontal_routing_core::accounts::{
     AccountRequest, AccountView, AdmissionDemand, AdmissionState, AllocatorPolicy, AllocatorState,
     CallerKind, CandidateRef, ConversationAffinity, ConversationKeySource, CredentialRecord,
-    EpochMs, Fence, FenceScope, GeneralWindow, ModelFamily, ModelFamilyMapping, ModelReach,
-    ObservationSource, QuotaReading, QuotaWindow, ResetTime, Roster, RunnerCandidates, ScopedList,
-    ScopedWindow,
+    EpochMs, Fence, FenceScope, GeneralWindow, ModelReach, ObservationSource, QuotaReading,
+    QuotaWindow, ResetTime, Roster, RunnerCandidates, ScopedList, ScopedWindow,
 };
 
 /// The golden fixtures' clock: 2026-09-29T12:00:00Z.
@@ -86,26 +85,9 @@ pub fn state(accounts: Vec<AccountView>) -> AllocatorState {
     }
 }
 
-/// The default policy with the model-scoped quota families operator config
-/// carries (`accounts.model_families`, written by the config converter).
+/// Default account allocation policy.
 pub fn policy() -> AllocatorPolicy {
-    let family = |model: &str, family| ModelFamilyMapping {
-        model: model.to_string(),
-        family,
-    };
-    AllocatorPolicy {
-        model_families: vec![
-            family("claude-fable-5", ModelFamily::Fable),
-            family("claude-fable-5[1m]", ModelFamily::Fable),
-            family("claude-fable-5-1", ModelFamily::Fable),
-            family("claude-fable-5-1[1m]", ModelFamily::Fable),
-            family("claude-mythos-5-1", ModelFamily::Mythos),
-            family("claude-mythos-5-1[1m]", ModelFamily::Mythos),
-            family("claude-opus-5-5", ModelFamily::Opus),
-            family("claude-opus-5-5[1m]", ModelFamily::Opus),
-        ],
-        ..AllocatorPolicy::default()
-    }
+    AllocatorPolicy::default()
 }
 
 pub fn request() -> AccountRequest {

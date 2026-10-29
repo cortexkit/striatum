@@ -44,7 +44,7 @@ pub use types::{
     AccountRef, AccountRequest, AccountView, AdmissionDemand, AdmissionState, AllocatorPolicy,
     AllocatorState, CallerKind, CandidateRef, ConfirmationSource, ConversationAffinity,
     ConversationKeySource, CredentialRecord, EpochMs, Fence, FenceScope, GeneralWindow,
-    ModelFamily, ModelFamilyMapping, ModelReach, ObservationSource, OperatorOverride,
-    PrincipalExclusion, QuotaReading, QuotaWindow, ResetTime, Roster, RunnerCandidates,
-    ScopeIdMapping, ScopedList, ScopedWindow, StaleDisclosure,
+    ModelFamily, ModelReach, ObservationSource, OperatorOverride, PrincipalExclusion, QuotaReading,
+    QuotaWindow, ResetTime, Roster, RunnerCandidates, ScopeIdMapping, ScopedList, ScopedWindow,
+    StaleDisclosure,
 };

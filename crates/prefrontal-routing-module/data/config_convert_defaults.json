@@ -18,16 +18,6 @@
     { "family": "llama", "globs": ["*/llama-*", "meta/*"] },
     { "family": "other", "globs": ["*"] }
   ],
-  "account_model_families": [
-    { "model": "claude-fable-5", "family": "fable" },
-    { "model": "claude-fable-5[1m]", "family": "fable" },
-    { "model": "claude-fable-5-1", "family": "fable" },
-    { "model": "claude-fable-5-1[1m]", "family": "fable" },
-    { "model": "claude-mythos-5-1", "family": "mythos" },
-    { "model": "claude-mythos-5-1[1m]", "family": "mythos" },
-    { "model": "claude-opus-5-5", "family": "opus" },
-    { "model": "claude-opus-5-5[1m]", "family": "opus" }
-  ],
   "model_naming": {
     "vendor_prefixes": [
       { "prefix": "claude-", "vendor": "anthropic" },

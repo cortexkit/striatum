@@ -295,8 +295,8 @@ fn parse_config_with_reporter(
     document: &str,
     mut report: impl FnMut(&str),
 ) -> Result<RoutingConfigFile, String> {
-    let json = jsonc_to_json(document)?;
-    let value: serde_json::Value =
+    let mut json = jsonc_to_json(document)?;
+    let mut value: serde_json::Value =
         serde_json::from_str(&json).map_err(|error| error.to_string())?;
     // Report the removed `aa` key with deletion guidance before checking unknown
     // fields, including when its value is null.
@@ -321,7 +321,31 @@ fn parse_config_with_reporter(
             ));
         }
     }
-    // Parse the original text so ordered model_families rules retain their order.
+    if let Some(root) = value.as_object_mut() {
+        let removed = crate::config_convert::remove_account_model_families(root);
+        if !removed.is_empty() {
+            // Preserve the raw root diversity rules: serializing them through
+            // Value would sort an ordered model_families map alphabetically.
+            let mut raw: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_str(&json).map_err(|error| error.to_string())?;
+            for key in ["accounts", "providers"] {
+                if let Some(section) = root.get(key) {
+                    raw.insert(
+                        key.into(),
+                        serde_json::value::to_raw_value(section)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+            }
+            json = serde_json::to_string(&raw).map_err(|error| error.to_string())?;
+            for key in removed {
+                report(&format!(
+                    "ignored retired key `{key}`; quota scopes are derived from Insula window ids; delete this key"
+                ));
+            }
+        }
+    }
+    // Parse the original family-rule text so first-match ordering is retained.
     let mut config: RoutingConfigFile =
         serde_json::from_str(&json).map_err(|error| format!("invalid routing config: {error}"))?;
     let section = &mut config.model_routing;
@@ -1062,9 +1086,6 @@ fn allocator_policy_from(
         if let Some(reset) = source.spend_budget_reset_at_ms {
             policy.spend_budget_reset_at_ms = Some(reset);
         }
-        if let Some(families) = &source.model_families {
-            policy.model_families = crate::config_policy::account_model_families(families);
-        }
     }
     Ok(policy)
 }
@@ -1111,19 +1132,6 @@ impl LiveConfig {
     /// The configured model-id spelling and capability families.
     pub(crate) fn model_naming(&self) -> prefrontal_routing_core::ModelNaming {
         self.config.model_naming.naming()
-    }
-
-    /// The model-to-family map of the top-level `accounts` section, for
-    /// account requests that are not tied to one provider's policy.
-    pub(crate) fn account_model_families(
-        &self,
-    ) -> Vec<prefrontal_routing_core::accounts::ModelFamilyMapping> {
-        self.config
-            .accounts
-            .model_families
-            .as_deref()
-            .map(crate::config_policy::account_model_families)
-            .unwrap_or_default()
     }
 
     pub(crate) fn allocator_policy(
