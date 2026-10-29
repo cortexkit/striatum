@@ -1000,6 +1000,7 @@ fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
         "sidekick.planner",
         "sidekick.lead",
         "sidekick.reader",
+        "sidekick.map",
         "sidekick.reviewer",
         "hire",
         "persona_seat",

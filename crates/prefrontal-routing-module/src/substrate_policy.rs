@@ -31,7 +31,7 @@ impl Harness {
     }
 }
 
-const GROUP_NAMES: [&str; 18] = [
+const GROUP_NAMES: [&str; 19] = [
     "all",
     "mason",
     "sidekick",
@@ -47,6 +47,7 @@ const GROUP_NAMES: [&str; 18] = [
     "sidekick.planner",
     "sidekick.lead",
     "sidekick.reader",
+    "sidekick.map",
     "sidekick.reviewer",
     "hire",
     "persona_seat",
