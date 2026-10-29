@@ -195,16 +195,7 @@ fn snapshot_from_store(
         }
     }
     let Some((_route_key, fact)) = selected else {
-        // An unknown route has no catalog lineage. Supplying `other` also keeps
-        // the generic capability resolver from guessing family from its name.
-        let entry = ModelCapabilitiesSnapshotEntry {
-            id: alias.canonical_model_id.clone(),
-            family: Some("other".into()),
-            ..Default::default()
-        };
-        return Ok(ModelCapabilitiesSnapshot {
-            models: [(alias.canonical_model_id, entry)].into_iter().collect(),
-        });
+        return Ok(ModelCapabilitiesSnapshot::default());
     };
     let mut input_modalities = vec!["text".to_string()];
     if fact.supports_vision == Some(true) {
@@ -438,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_family_is_catalog_lineage_or_other_never_a_name_heuristic() {
+    fn known_route_capabilities_family_uses_catalog_lineage() {
         let dir = prefrontal_test_support::scratch_root().join(format!(
             "routing-capabilities-lineage-{}",
             std::process::id()
@@ -459,11 +450,6 @@ mod tests {
             runtime_model: None,
             desired: None,
         };
-        assert_eq!(
-            capabilities_reply(&store, request(), &default_model_naming()).unwrap()["capabilities"]
-                ["family"],
-            "other"
-        );
         let snapshot = crate::fusiform_catalog::decode_catalog_get(include_bytes!(
             "../fixtures/catalog-lineage.json"
         ))
@@ -479,6 +465,43 @@ mod tests {
             capabilities_reply(&store, request(), &default_model_naming()).unwrap()["capabilities"]
                 ["family"],
             "qwen"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_route_keeps_an_empty_capabilities_snapshot() {
+        let dir = prefrontal_test_support::scratch_root().join(format!(
+            "routing-capabilities-unknown-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: SharedStore = std::sync::Arc::new(
+            prefrontal_routing_store::SqliteRouteStateStore::open(
+                &prefrontal_routing_store::dev_descriptor(
+                    "capabilities-unknown",
+                    dir.join("store.db").to_string_lossy().into_owned(),
+                ),
+            )
+            .unwrap(),
+        );
+        let snapshot = snapshot_from_store(&store, "lineage-fixture", "claude-impostor-a").unwrap();
+        assert_eq!(snapshot, ModelCapabilitiesSnapshot::default());
+        let reply = capabilities_reply(
+            &store,
+            CapabilitiesParams {
+                provider_id: "lineage-fixture".into(),
+                model_id: "claude-impostor-a".into(),
+                runtime_model: None,
+                desired: None,
+            },
+            &default_model_naming(),
+        )
+        .unwrap();
+        assert_eq!(
+            reply["capabilities"]["diagnostics"]["snapshot"]["source"],
+            "none"
         );
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
