@@ -251,17 +251,146 @@ fn record_account_facts(
         code,
         "ENTITLEMENT_ERROR" | "billing_exhausted" | "credit_insufficient" | "insufficient_quota"
     ) {
-        crate::credential_fences::record(
-            deps.store,
-            deps.broca_credentials,
-            &prefrontal_routing_core::route_state_store::CredentialRefusal {
-                provider_id: decision.provider.clone(),
-                credential_id: credential.into(),
-                code: code.into(),
-            },
-            now,
-        )
-        .map_err(store_refusal)?;
+        // A subscription is a quota: when the account's latest fresh reading
+        // already shows an exhausted window, the refusal is a quota hold
+        // until that window's reset, not a billing fence with a 6h probe.
+        // The pool fence below holds the account (and a fresh headroom
+        // reading lifts it via the usual block refresh); a run-reported reset
+        // on the same report still fences its route, so the later of the two
+        // resets wins. Only a credential with no quota reading at all (a
+        // pay-per-token key) becomes a billing fence.
+        let account_id = classes
+            .credentials
+            .listed_credentials()
+            .iter()
+            .find(|row| row.id == credential)
+            .map(|row| row.account_id.clone().unwrap_or_else(|| row.id.clone()));
+        let reading_reset = account_id.as_deref().and_then(|account| {
+            crate::credential_fences::exhausted_quota_reset_for_account(
+                &classes.quota,
+                account,
+                now,
+            )
+        });
+        // A paid balance that is itself exhausted must also block paid-credit
+        // placement, which pool fences never do (quota exhaustion leaves paid
+        // credits usable). When the reading still reports spendable credits,
+        // keep the entitlement fence so even paid placement holds; it is still
+        // treated as a quota hold (no probe, reset from the reading).
+        let has_spendable = account_id.as_deref().and_then(|account| {
+            classes
+                .quota
+                .readings
+                .readings
+                .values()
+                .find(|reading| reading.account_id == account && reading.tombstoned_at_ms.is_none())
+                .and_then(|reading| {
+                    let entry: crate::account_quota::AccountEntry =
+                        serde_json::from_value(reading.entry.clone()).ok()?;
+                    let policy = classes.config.allocator_policy(&decision.provider);
+                    if !policy.paid_credits {
+                        return None;
+                    }
+                    for pool in entry.spend.iter() {
+                        let id = pool.get("id").and_then(serde_json::Value::as_str)?;
+                        if !matches!(id, "extra_usage" | "credits") {
+                            continue;
+                        }
+                        let remaining = pool
+                            .get("remaining")
+                            .and_then(|value| {
+                                serde_json::from_value::<
+                                    prefrontal_routing_core::quota::SpendBalance,
+                                >(value.clone())
+                                .ok()
+                            })
+                            .map(|balance| balance.minor as f64 * 10_f64.powi(-balance.exponent))?;
+                        if remaining.is_finite()
+                            && remaining > 0.0
+                            && pool.get("spendable").and_then(serde_json::Value::as_bool)
+                                != Some(false)
+                        {
+                            return Some(());
+                        }
+                    }
+                    None
+                })
+        });
+        if has_spendable.is_some() {
+            crate::credential_fences::record(
+                deps.store,
+                deps.broca_credentials,
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: decision.provider.clone(),
+                    credential_id: credential.into(),
+                    code: code.into(),
+                },
+                now,
+            )
+            .map_err(store_refusal)?;
+        } else if let (Some(account_id), Some(reading_reset)) = (account_id, reading_reset) {
+            let run_reset = params
+                .get("reset_at_ms")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|reset| *reset > now);
+            let reset = run_reset
+                .map(|run| run.max(reading_reset))
+                .unwrap_or(reading_reset);
+            let fence = prefrontal_routing_core::accounts::Fence {
+                account_id: account_id.clone(),
+                pool: None,
+                recovery_set: Vec::new(),
+                observed_at_ms: now,
+                reset: prefrontal_routing_core::accounts::ResetTime::At(reset),
+                retry_hint_ms: None,
+                source: prefrontal_routing_core::accounts::ConfirmationSource::BrocaAccountLimit,
+            };
+            let fence_json = serde_json::to_value(&fence)
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let scope_json = serde_json::to_value(&fence.pool)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|_| "null".into());
+            let source = match serde_json::to_value(&fence.source) {
+                Ok(serde_json::Value::String(text)) => text,
+                Ok(other) => other.to_string(),
+                Err(_) => "broca_account_limit".into(),
+            };
+            let row = prefrontal_routing_store::AccountPoolFenceRow {
+                evidence: prefrontal_routing_store::AccountFenceRow {
+                    fence_id: format!("qhold-{}-{now}", decision.decision_id),
+                    provider: decision.provider.clone(),
+                    account_id,
+                    scope_json,
+                    fence_json,
+                    source,
+                    observed_at: now,
+                    principal: decision.principal.clone(),
+                    admission_id: None,
+                    observation_id: None,
+                    created_at: now,
+                    cleared_at: None,
+                    cleared_reason: None,
+                },
+                pool_key: None,
+                recovery_set: Vec::new(),
+            };
+            deps.store
+                .account_transaction(|tx| tx.insert_pool_fence(&row))
+                .map_err(store_refusal)?;
+        } else {
+            crate::credential_fences::record(
+                deps.store,
+                deps.broca_credentials,
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: decision.provider.clone(),
+                    credential_id: credential.into(),
+                    code: code.into(),
+                },
+                now,
+            )
+            .map_err(store_refusal)?;
+        }
     }
     if let Some(tokens) = params.get("request_input_tokens").and_then(Value::as_u64) {
         let class = prefrontal_routing_core::accounts::input_size_class(tokens);

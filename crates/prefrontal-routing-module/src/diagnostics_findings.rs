@@ -122,6 +122,10 @@ pub(crate) struct Evidence {
     pub decisions_truncated: bool,
     /// Every catalog model as `provider/model`.
     pub catalog_models: BTreeSet<String>,
+    /// Latest quota state for subscription-hold wording: a fence whose
+    /// credential maps to an account with a reading is a quota hold, not a
+    /// billing fence.
+    pub quota: crate::account_quota::AccountQuotaState,
 }
 
 impl Evidence {
@@ -165,6 +169,10 @@ impl Evidence {
                     prefrontal_routing_core::make_capacity_key(&fact.provider_id, &fact.model_id)
                 })
                 .collect(),
+            quota: crate::ACCOUNT_QUOTA
+                .get()
+                .and_then(|quota| quota.lock().ok().map(|state| state.clone()))
+                .unwrap_or_else(|| crate::account_quota::restore_account_state(store)),
         })
     }
 }
@@ -173,7 +181,7 @@ impl Evidence {
 /// under the size cap, the least severe are left out.
 pub(crate) fn report(evidence: &Evidence, now_ms: i64, window_ms: i64) -> Value {
     let mut findings = Vec::new();
-    findings.extend(credential_fences(&evidence.fences, now_ms));
+    findings.extend(credential_fences(&evidence.fences, &evidence.quota, now_ms));
     findings.extend(route_blocks(evidence, now_ms));
     findings.extend(refusal_rate(evidence));
     findings.extend(empty_candidate_sets(evidence));
@@ -274,13 +282,117 @@ fn age(now_ms: i64, then_ms: i64) -> String {
 // credential_fences
 // ---------------------------------------------------------------------------
 
-fn credential_fences(fences: &[CredentialEntitlementFence], now_ms: i64) -> Vec<Finding> {
+fn credential_fences(
+    fences: &[CredentialEntitlementFence],
+    quota: &crate::account_quota::AccountQuotaState,
+    now_ms: i64,
+) -> Vec<Finding> {
     fences
         .iter()
         .map(|fence| {
             let age_ms = now_ms.saturating_sub(fence.observed_at_ms).max(0);
             let billing = crate::credential_fences::is_billing_code(&fence.code);
             let kind = if billing { "billing" } else { "entitlement" };
+            // A subscription is a quota: when the fenced credential's account
+            // has an Insula reading, the hold is a quota hold until that
+            // reading's reset, never a billing fence with a 6h probe. Only a
+            // credential with no reading at all (a pay-per-token key) keeps
+            // the top-up hint and the timed probe.
+            let account_id =
+                crate::credential_fences::roster_account_id(quota, &fence.credential_id);
+            let has_signal = account_id.as_deref().is_some_and(|account| {
+                crate::credential_fences::has_quota_signal_for_account(quota, account)
+            });
+            let quota_reset = account_id.as_deref().and_then(|account| {
+                crate::credential_fences::exhausted_quota_reset_for_account(
+                    quota, account, now_ms,
+                )
+            });
+            if has_signal {
+                if let Some(reset) = quota_reset.filter(|reset| *reset > now_ms) {
+                    let reset_label = crate::account_selection::rfc3339(reset);
+                    return Finding {
+                        check: CHECK_CREDENTIAL_FENCES,
+                        key: format!("{}/{}", fence.provider_id, fence.credential_id),
+                        severity: if age_ms > FENCE_ERROR_AGE_MS {
+                            Severity::Error
+                        } else {
+                            Severity::Warning
+                        },
+                        count: 1,
+                        first_seen_ms: fence.observed_at_ms,
+                        last_seen_ms: now_ms,
+                        summary: clip(
+                            &format!(
+                                "{} is quota-held on credential {} until {} ({}: {}), last confirmed {} ago; routing will not use {} through that credential and admits no probe",
+                                fence.provider_id,
+                                fence.credential_id,
+                                reset_label,
+                                kind,
+                                fence.code,
+                                age(now_ms, fence.observed_at_ms),
+                                fence.provider_id,
+                            ),
+                            MAX_SUMMARY_CHARS,
+                        ),
+                        samples: vec![json!({
+                            "provider_id": fence.provider_id,
+                            "credential_id": fence.credential_id,
+                            "code": fence.code,
+                            "kind": kind,
+                            "quota_hold": true,
+                            "reset_at_ms": reset,
+                            "age_ms": age_ms,
+                            "observed_at_ms": fence.observed_at_ms,
+                        })],
+                        hint: format!(
+                            "The subscription quota for {} is exhausted until {} ({}). Routing holds the account until then; a fresh quota reading with headroom lifts it early and no probe is admitted. If the reading stays stale, lift by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}.",
+                            fence.provider_id, reset_label, fence.code, fence.credential_id
+                        ),
+                    };
+                }
+                let summary = format!(
+                    "{} is fenced on credential {} ({kind}: {}), last confirmed {} ago; routing will not use {} through that credential and admits no probe (subscription quota signal present)",
+                    fence.provider_id,
+                    fence.credential_id,
+                    fence.code,
+                    age(now_ms, fence.observed_at_ms),
+                    fence.provider_id,
+                );
+                let hint = if billing {
+                    format!(
+                        "This subscription credential has a quota reading, so routing never probes it on a timer. Check the account's plan and its Insula quota reading; lift by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}} when the plan changes.",
+                        fence.credential_id
+                    )
+                } else {
+                    format!(
+                        "The account has no plan for {}'s models. Change the plan or remove the credential from the vault (a vault listing change lifts the fence), or lift it by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. No probe is admitted while a quota reading exists.",
+                        fence.provider_id, fence.credential_id
+                    )
+                };
+                return Finding {
+                    check: CHECK_CREDENTIAL_FENCES,
+                    key: format!("{}/{}", fence.provider_id, fence.credential_id),
+                    severity: if age_ms > FENCE_ERROR_AGE_MS {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    },
+                    count: 1,
+                    first_seen_ms: fence.observed_at_ms,
+                    last_seen_ms: now_ms,
+                    summary: clip(&summary, MAX_SUMMARY_CHARS),
+                    samples: vec![json!({
+                        "provider_id": fence.provider_id,
+                        "credential_id": fence.credential_id,
+                        "code": fence.code,
+                        "kind": kind,
+                        "age_ms": age_ms,
+                        "observed_at_ms": fence.observed_at_ms,
+                    })],
+                    hint,
+                };
+            }
             let hint = if billing {
                 format!(
                     "Top up the credential's paid balance, then lift the fence with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. Routing also admits one probe request on it every 6h.",
@@ -1076,6 +1188,7 @@ mod tests {
             decisions: Vec::new(),
             decisions_truncated: false,
             catalog_models: BTreeSet::new(),
+            quota: crate::account_quota::AccountQuotaState::default(),
         }
     }
 
@@ -1498,5 +1611,71 @@ mod tests {
         assert!(parse(json!({"method": OP, "params": {"window_ms": 0}})).is_err());
         assert!(parse(json!({"method": OP, "params": {"window_ms": MAX_WINDOW_MS + 1}})).is_err());
         assert!(parse(json!({"method": OP, "params": {"since": 1}})).is_err());
+    }
+    #[test]
+    fn subscription_quota_hold_finding_names_reset_and_no_top_up() {
+        use crate::account_quota::{AccountQuotaState, RosterIdentity, VaultRoster};
+        let reset = NOW + 7 * 24 * 60 * MINUTE;
+        let reset_label = crate::account_selection::rfc3339(reset);
+        let mut evidence = empty();
+        evidence.fences = vec![fence("xai", "oauth:xai", "billing_exhausted", 10 * MINUTE)];
+        let mut quota = AccountQuotaState::default();
+        quota.roster = Some(VaultRoster {
+            view: "vault-view-1".into(),
+            fetched_at_ms: NOW - MINUTE,
+            identities: vec![RosterIdentity {
+                refresh_adapter: "xai".into(),
+                account_id: "account-1".into(),
+                credential_ids: vec!["oauth:xai".into()],
+                active_credential_ids: vec!["oauth:xai".into()],
+                first_seen_ms: NOW - MINUTE,
+                plan_tier: None,
+            }],
+            grants: Vec::new(),
+        });
+        let entry = serde_json::json!({
+            "provider": "grok",
+            "apiProvider": "xai",
+            "account": "account-1",
+            "fetchedAt": crate::account_selection::rfc3339(NOW),
+            "usage": {"primary": {"usedPercent": 100.0, "windowMinutes": 10080,
+                "resetsAt": crate::account_selection::rfc3339(reset)}},
+        });
+        quota.readings.readings.insert(
+            ("grok".into(), "account-1".into()),
+            crate::account_quota::StoredReading {
+                provider: "grok".into(),
+                account_id: "account-1".into(),
+                entry,
+                received_at_ms: NOW,
+                tombstoned_at_ms: None,
+            },
+        );
+        evidence.quota = quota;
+        let found = findings(&evidence, CHECK_CREDENTIAL_FENCES);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let summary = found[0]["summary"].as_str().unwrap();
+        assert!(
+            summary.contains(&reset_label),
+            "quota-hold summary names its reset: {summary}"
+        );
+        assert!(
+            summary.contains("quota-held") && summary.contains("admits no probe"),
+            "quota-hold summary says it is a hold with no probe: {summary}"
+        );
+        let hint = found[0]["hint"].as_str().unwrap();
+        assert!(
+            !hint.to_lowercase().contains("top up") && !hint.contains("paid balance"),
+            "no top-up for a subscription: {hint}"
+        );
+        assert!(hint.contains(&reset_label), "hint names the reset: {hint}");
+        assert_eq!(
+            found[0]["samples"][0]["quota_hold"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            found[0]["samples"][0]["reset_at_ms"],
+            serde_json::json!(reset)
+        );
     }
 }

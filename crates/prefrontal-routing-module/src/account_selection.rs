@@ -297,6 +297,53 @@ impl ClassContext {
         let quota = accounts
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
             .unwrap_or_default();
+        // Existing entitlement fences on subscription accounts convert on
+        // refresh: a quota hold lifts when a fresh reading with headroom
+        // arrives after the fence, while an exhausted reading keeps the hold
+        // with no timed probe. Without this, a subscription fence made before
+        // routing learned the reading would probe every 6h on a window known
+        // to be full.
+        let refusals = {
+            let mut kept = Vec::with_capacity(refusals.len());
+            for fence in refusals {
+                let Some(account_id) = credentials
+                    .listed_credentials()
+                    .iter()
+                    .find(|row| row.id == fence.credential_id)
+                    .map(|row| row.account_id.clone().unwrap_or_else(|| row.id.clone()))
+                else {
+                    kept.push(fence);
+                    continue;
+                };
+                if !crate::credential_fences::has_quota_signal_for_account(&quota, &account_id) {
+                    kept.push(fence);
+                    continue;
+                }
+                if crate::credential_fences::fresh_headroom_after_for_account(
+                    &quota,
+                    &account_id,
+                    fence.observed_at_ms,
+                    now_ms,
+                ) {
+                    if store
+                        .clear_credential_entitlement_fence(
+                            &fence.provider_id,
+                            &fence.credential_id,
+                        )
+                        .map_err(|error| error.to_string())?
+                        > 0
+                    {
+                        eprintln!(
+                            "[prefrontal-routing] credential entitlement fence lifted provider={} credential={}: fresh quota reading shows headroom",
+                            fence.provider_id, fence.credential_id
+                        );
+                    }
+                    continue;
+                }
+                kept.push(fence);
+            }
+            kept
+        };
         let fences = store
             .account_transaction(|tx| {
                 facts
@@ -432,8 +479,14 @@ impl ClassContext {
             fence.provider_id == fact.provider_id
                 && fence.credential_id == row.id
                 && (self.targets.contains_key(&fact.provider_id)
-                    || self.now_ms.saturating_sub(fence.observed_at_ms)
-                        <= crate::credential_fences::FENCE_PROBE_RECHECK_MS)
+                    || !crate::credential_fences::probe_allowed(
+                        crate::credential_fences::has_quota_signal(
+                            &self.quota,
+                            &self.credentials,
+                            &row.id,
+                        ),
+                        self.now_ms.saturating_sub(fence.observed_at_ms),
+                    ))
         })
     }
 
@@ -442,8 +495,14 @@ impl ClassContext {
             && self.refusals.iter().any(|fence| {
                 fence.provider_id == provider
                     && fence.credential_id == credential
-                    && self.now_ms.saturating_sub(fence.observed_at_ms)
-                        > crate::credential_fences::FENCE_PROBE_RECHECK_MS
+                    && crate::credential_fences::probe_allowed(
+                        crate::credential_fences::has_quota_signal(
+                            &self.quota,
+                            &self.credentials,
+                            credential,
+                        ),
+                        self.now_ms.saturating_sub(fence.observed_at_ms),
+                    )
             })
     }
 
@@ -2635,20 +2694,53 @@ fn empty_roster_refusal(
         .unwrap_or_else(|| params.initial_input_bytes.div_ceil(4));
     let size_class = prefrontal_routing_core::accounts::input_size_class(tokens);
     let mut fenced_cause = false;
+    let mut row_resets: Vec<Option<i64>> = Vec::new();
     for row in &rows {
         let account = row.account_id.clone().unwrap_or_else(|| row.id.clone());
-        if fenced.contains_key(&account) {
+        let route_reset = fenced.get(&account).copied();
+        if route_reset.is_some() {
             fenced_cause = true;
+            // A run-reported route fence and a reading hold combine by the
+            // later reset: the account stays closed for this route until
+            // both have lifted.
+            let quota_reset = crate::credential_fences::exhausted_quota_reset(
+                &classes.quota,
+                &classes.credentials,
+                &row.id,
+                now,
+            );
+            let row_reset = match (route_reset, quota_reset) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            row_resets.push(row_reset);
             continue;
         }
         if classes.refusals.iter().any(|fence| {
             fence.provider_id == provider
                 && fence.credential_id == row.id
                 && (classes.targets.contains_key(provider)
-                    || now.saturating_sub(fence.observed_at_ms)
-                        <= crate::credential_fences::FENCE_PROBE_RECHECK_MS)
+                    || !crate::credential_fences::probe_allowed(
+                        crate::credential_fences::has_quota_signal(
+                            &classes.quota,
+                            &classes.credentials,
+                            &row.id,
+                        ),
+                        now.saturating_sub(fence.observed_at_ms),
+                    ))
         }) {
             fenced_cause = true;
+            // An entitlement fence on a subscription account with an
+            // exhausted reading is a quota hold until that reading's reset,
+            // not a billing fence with a probe timer.
+            row_resets.push(crate::credential_fences::exhausted_quota_reset(
+                &classes.quota,
+                &classes.credentials,
+                &row.id,
+                now,
+            ));
             continue;
         }
         if classes.eligibility.iter().any(|fact_| {
@@ -2671,7 +2763,18 @@ fn empty_roster_refusal(
         // filter cannot silently become a timed pool refusal.
     }
     if fenced_cause {
-        return exhausted(fenced.values().min().copied());
+        // Every blocked row with an unknown reset keeps the hold unknown:
+        // the roster stays empty past any known reset another row names.
+        if row_resets.iter().any(|reset| reset.is_none()) {
+            // Prefer a route fence's known reset when one exists, so a
+            // mixed hold still names the time its route fence lifts; a
+            // pure entitlement hold with no reading reset stays unknown.
+            let known = row_resets.iter().filter_map(|reset| *reset).min();
+            let route_known = fenced.values().min().copied();
+            return exhausted(known.or(route_known));
+        }
+        let earliest = row_resets.into_iter().flatten().min();
+        return exhausted(earliest);
     }
     untimed(
         "account_not_authorized",

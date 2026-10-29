@@ -18,6 +18,13 @@
 //! interval, a successful outcome ends the fence, and a billing or entitlement
 //! failure renews it for another interval. An operator lifts every fence on a
 //! named credential at once, for use right after topping it up.
+//!
+//! A subscription is a quota: its Insula reading already names the exhausted
+//! window and its reset, and a fresh reading with headroom lifts the hold.
+//! A billing- or entitlement-class refusal for such a credential is therefore
+//! a quota hold until that reset, never a billing fence with a timer. See
+//! [`probe_allowed`]: only a credential with no quota reading at all (a
+//! pay-per-token credential) may probe.
 
 use std::collections::HashSet;
 
@@ -34,7 +41,243 @@ use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 /// probe request on the fenced credential: six hours. Topping up a balance
 /// does not change the credential's vault listing, so without a recheck the
 /// fence would hold until the listing changed for an unrelated reason.
+///
+/// This interval applies only to credentials with no quota signal (see
+/// [`probe_allowed`]). A subscription credential always has an Insula reading
+/// for its account, and that reading already carries the reset and lifts on
+/// headroom, so a timer would only spend a real request known to fail.
 pub(crate) const FENCE_PROBE_RECHECK_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// A window reading at or above this used percent counts as exhausted for
+/// turning a billing- or entitlement-class refusal into a quota hold. The
+/// one-point margin catches a producer that reports 99.x for a full window
+/// while keeping the hold to genuinely full windows.
+pub(crate) const QUOTA_HOLD_USED_THRESHOLD: f64 = 99.0;
+
+/// Whether a timed probe may be admitted for a fence of this age.
+///
+/// A pay-per-token credential (for example an API key out of credit) has no
+/// Insula quota reading: topping its balance up changes no vault listing and
+/// publishes no reading, so without a timed recheck the fence would hold
+/// until the listing changed for an unrelated reason. A subscription
+/// credential always has a quota reading for its account, and that reading
+/// already says when the window resets and lifts the hold on headroom: a
+/// timed probe would spend a real request that is known to fail. So only a
+/// fence whose credential has no quota signal may probe, and only once it is
+/// older than [`FENCE_PROBE_RECHECK_MS`].
+pub(crate) fn probe_allowed(has_quota_signal: bool, age_ms: i64) -> bool {
+    !has_quota_signal && age_ms > FENCE_PROBE_RECHECK_MS
+}
+
+/// Whether routing holds any quota reading for `credential_id`'s account.
+/// The join is by vault account id only, never by provider name: Insula's
+/// provider spelling (for example the usage feed) and routing's provider id
+/// (the catalog vendor) need not match. Any non-tombstoned reading counts as
+/// a signal, even a stale one: a subscription account keeps its signal while
+/// its reading ages, and a pay-per-token credential never gains one.
+pub(crate) fn has_quota_signal(
+    quota: &crate::account_quota::AccountQuotaState,
+    credentials: &crate::broca_credentials::BrocaCredentials,
+    credential_id: &str,
+) -> bool {
+    let Some(account_id) = credential_account_id(credentials, credential_id) else {
+        return false;
+    };
+    has_quota_signal_for_account(quota, &account_id)
+}
+
+/// The reset a quota hold on `credential_id` runs until, when its latest
+/// fresh reading shows an exhausted window (at or near 100%) with a future
+/// reset. Returns the latest such reset, so a run-reported reset and a
+/// reading reset combine by taking the later. `None` when the credential has
+/// no reading, the latest reading is not fresh, or no exhausted window names
+/// a future reset: the refusal is not a quota hold.
+pub(crate) fn exhausted_quota_reset(
+    quota: &crate::account_quota::AccountQuotaState,
+    credentials: &crate::broca_credentials::BrocaCredentials,
+    credential_id: &str,
+    now_ms: i64,
+) -> Option<i64> {
+    let account_id = credential_account_id(credentials, credential_id)?;
+    exhausted_quota_reset_for_account(quota, &account_id, now_ms)
+}
+
+/// Latest fresh exhausted reset for one vault account, by account id.
+/// Fresh means the reading's producer date is inside the full (under 5 minutes)
+/// or discounted (under 20 minutes) age band defined in `account_quota`, with
+/// no entry error and no unrecognized stale class. Exhausted means at or above
+/// [`QUOTA_HOLD_USED_THRESHOLD`] with a future reset; the latest such reset
+/// wins.
+pub(crate) fn exhausted_quota_reset_for_account(
+    quota: &crate::account_quota::AccountQuotaState,
+    account_id: &str,
+    now_ms: i64,
+) -> Option<i64> {
+    let entry = latest_fresh_entry(quota, account_id, now_ms)?;
+    let usage = entry.usage.as_ref()?;
+    let mut resets = Vec::new();
+    for window in [
+        usage.primary.as_ref(),
+        usage.secondary.as_ref(),
+        usage.tertiary.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        usage
+            .extra_rate_windows
+            .iter()
+            .flatten()
+            .filter_map(|extra| extra.window.as_ref()),
+    ) {
+        if window.used_percent.is_finite() && window.used_percent >= QUOTA_HOLD_USED_THRESHOLD {
+            if let Some(reset) = window
+                .resets_at
+                .as_deref()
+                .and_then(crate::account_quota::parse_rfc3339_ms)
+                .filter(|reset| *reset > now_ms)
+            {
+                resets.push(reset);
+            }
+        }
+    }
+    resets.into_iter().max()
+}
+
+/// Whether a fresh reading with headroom arrived after `fence_observed_ms`
+/// for `account_id`: no window at or above the hold threshold. A quota hold
+/// lifts on such a reading; an entitlement fence made while the reading
+/// already showed headroom stays, because the later reading is not newer
+/// than the fence.
+pub(crate) fn fresh_headroom_after_for_account(
+    quota: &crate::account_quota::AccountQuotaState,
+    account_id: &str,
+    fence_observed_ms: i64,
+    now_ms: i64,
+) -> bool {
+    let Some(entry) = latest_fresh_entry(quota, account_id, now_ms) else {
+        return false;
+    };
+    let fetched = entry
+        .fetched_at
+        .as_deref()
+        .and_then(crate::account_quota::parse_rfc3339_ms);
+    if fetched.is_none_or(|fetched| fetched <= fence_observed_ms) {
+        return false;
+    }
+    let Some(usage) = entry.usage.as_ref() else {
+        return false;
+    };
+    for window in [
+        usage.primary.as_ref(),
+        usage.secondary.as_ref(),
+        usage.tertiary.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if window.used_percent.is_finite() && window.used_percent >= QUOTA_HOLD_USED_THRESHOLD {
+            return false;
+        }
+    }
+    if let Some(extras) = usage.extra_rate_windows.as_ref() {
+        for extra in extras {
+            if let Some(window) = extra.window.as_ref() {
+                if window.used_percent.is_finite()
+                    && window.used_percent >= QUOTA_HOLD_USED_THRESHOLD
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn latest_fresh_entry(
+    quota: &crate::account_quota::AccountQuotaState,
+    account_id: &str,
+    now_ms: i64,
+) -> Option<crate::account_quota::AccountEntry> {
+    let reading = quota
+        .readings
+        .readings
+        .values()
+        .filter(|reading| reading.account_id == account_id && reading.tombstoned_at_ms.is_none())
+        .max_by_key(|reading| {
+            reading
+                .entry
+                .get("fetchedAt")
+                .and_then(serde_json::Value::as_str)
+                .and_then(crate::account_quota::parse_rfc3339_ms)
+        })?;
+    let entry: crate::account_quota::AccountEntry =
+        serde_json::from_value(reading.entry.clone()).ok()?;
+    if entry.error_class.is_some() || entry.error.is_some() {
+        return None;
+    }
+    if let Some(stale) = entry
+        .stale
+        .as_ref()
+        .and_then(|stale| stale.class.as_deref())
+    {
+        if stale != "upstream_failed" {
+            return None;
+        }
+    }
+    let fetched = entry
+        .fetched_at
+        .as_deref()
+        .and_then(crate::account_quota::parse_rfc3339_ms)?;
+    let age = now_ms.saturating_sub(fetched);
+    // Fresh means routing would still place cold work on the reading's age:
+    // inside the full (under `FULL_BAND_MS`) or discounted (under
+    // `EXCLUDED_BAND_MS`) band from `account_quota`, not excluded and not
+    // clock-invalid.
+    if age < -crate::account_quota::FUTURE_SKEW_MS || age >= crate::account_quota::EXCLUDED_BAND_MS
+    {
+        return None;
+    }
+    Some(entry)
+}
+
+fn credential_account_id(
+    credentials: &crate::broca_credentials::BrocaCredentials,
+    credential_id: &str,
+) -> Option<String> {
+    credentials
+        .listed_credentials()
+        .iter()
+        .find(|row| row.id == credential_id)
+        .map(|row| row.account_id.clone().unwrap_or_else(|| row.id.clone()))
+}
+
+/// The vault account for `credential_id` from the quota state's roster, when
+/// the roster lists it. Used by diagnostics, which has no vault view.
+pub(crate) fn roster_account_id(
+    quota: &crate::account_quota::AccountQuotaState,
+    credential_id: &str,
+) -> Option<String> {
+    quota.roster.as_ref().and_then(|roster| {
+        roster
+            .identities
+            .iter()
+            .find(|identity| identity.credential_ids.iter().any(|id| id == credential_id))
+            .map(|identity| identity.account_id.clone())
+    })
+}
+
+/// Whether `account_id` has any non-tombstoned quota reading.
+pub(crate) fn has_quota_signal_for_account(
+    quota: &crate::account_quota::AccountQuotaState,
+    account_id: &str,
+) -> bool {
+    quota
+        .readings
+        .readings
+        .values()
+        .any(|reading| reading.account_id == account_id && reading.tombstoned_at_ms.is_none())
+}
 
 /// Store a reported refusal against the credential's current vault listing.
 pub(crate) fn record(
@@ -119,13 +362,19 @@ pub(crate) fn live(
 
 /// A fence whose refusal is older than the recheck interval: the next
 /// account admission may reserve one probe request on it and stamp it fresh.
+/// See [`probe_allowed`]: subscription fences never become stale, because a
+/// timed probe on a quota-held account would spend a real request known to
+/// fail.
 fn is_stale(fence: &CredentialEntitlementFence, now_ms: i64) -> bool {
-    now_ms.saturating_sub(fence.observed_at_ms) > FENCE_PROBE_RECHECK_MS
+    probe_allowed(false, now_ms.saturating_sub(fence.observed_at_ms))
 }
 
 /// Split live fences into fresh restrictions and potential account-admission
 /// probes. Every fence counts as billing or entitlement: the reason
-/// a route refusal carries is one of the two, so age alone decides.
+/// a route refusal carries is one of the two, so age alone decides. This
+/// age-only split is kept for callers with no quota view; account selection
+/// uses [`split_with_signal`], which suppresses probes for credentials with
+/// quota readings via [`probe_allowed`].
 pub(crate) fn split(
     fences: &[CredentialEntitlementFence],
     now_ms: i64,
@@ -133,10 +382,24 @@ pub(crate) fn split(
     Vec<CredentialEntitlementFence>,
     Vec<CredentialEntitlementFence>,
 ) {
+    split_with_signal(fences, now_ms, |_| false)
+}
+
+/// Signal-aware split: a fence whose credential has a quota reading stays
+/// enforcing however old it is, so no timed probe is admitted on it.
+pub(crate) fn split_with_signal(
+    fences: &[CredentialEntitlementFence],
+    now_ms: i64,
+    has_signal: impl Fn(&CredentialEntitlementFence) -> bool,
+) -> (
+    Vec<CredentialEntitlementFence>,
+    Vec<CredentialEntitlementFence>,
+) {
     let mut enforcing = Vec::new();
     let mut stale = Vec::new();
     for fence in fences {
-        if is_stale(fence, now_ms) {
+        let age = now_ms.saturating_sub(fence.observed_at_ms);
+        if probe_allowed(has_signal(fence), age) {
             stale.push(fence.clone());
         } else {
             enforcing.push(fence.clone());
