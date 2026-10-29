@@ -2912,49 +2912,24 @@ async fn handle_set_decision_outcome(
     // decision ledger still holds: the report names the provider and the
     // credential itself. Recording renews a repeated refusal, so a fence that
     // keeps failing stays fresh and its next recheck probe waits another
-    // interval. A subscription refusal with an exhausted quota reading is a
-    // quota hold until that reset, not a billing fence: the reading itself
-    // holds and lifts on headroom, and only a credential with no quota
-    // reading at all probes on a timer.
+    // interval. Subscription refusals are reconciled against quota readings
+    // by account selection, including fences persisted before quota delivery.
     if let Some(refusal) = provider_outcome
         .as_ref()
         .and_then(|provider| provider.credential_refusal.as_ref())
     {
-        let quota_hold = matches!(
-            refusal.code.as_str(),
-            "ENTITLEMENT_ERROR"
-                | "billing_exhausted"
-                | "credit_insufficient"
-                | "insufficient_quota"
-        ) && ACCOUNT_QUOTA
-            .get()
-            .and_then(|quota| quota.lock().ok())
-            .and_then(|quota| {
-                broca_credentials.lock().ok().and_then(|creds| {
-                    crate::credential_fences::exhausted_quota_reset(
-                        &quota,
-                        &creds,
-                        &refusal.credential_id,
-                        observed_at_ms,
-                    )
-                })
-            })
-            .is_some();
-        if !quota_hold {
-            if let Err(e) =
-                credential_fences::record(store, broca_credentials, refusal, observed_at_ms)
-            {
-                return send_route_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "store_error",
-                    &format!("set_decision_outcome: credential entitlement fence: {e}"),
-                )
-                .await;
-            }
+        if let Err(e) = credential_fences::record(store, broca_credentials, refusal, observed_at_ms)
+        {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("set_decision_outcome: credential entitlement fence: {e}"),
+            )
+            .await;
         }
     }
     // Only the credential that actually served the completed run is healed.

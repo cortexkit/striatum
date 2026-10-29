@@ -168,6 +168,7 @@ pub(crate) fn fresh_headroom_after_for_account(
     let Some(usage) = entry.usage.as_ref() else {
         return false;
     };
+    let mut saw_window = false;
     for window in [
         usage.primary.as_ref(),
         usage.secondary.as_ref(),
@@ -176,30 +177,31 @@ pub(crate) fn fresh_headroom_after_for_account(
     .into_iter()
     .flatten()
     {
-        if window.used_percent.is_finite() && window.used_percent >= QUOTA_HOLD_USED_THRESHOLD {
+        saw_window = true;
+        if !window.used_percent.is_finite() || window.used_percent >= QUOTA_HOLD_USED_THRESHOLD {
             return false;
         }
     }
     if let Some(extras) = usage.extra_rate_windows.as_ref() {
         for extra in extras {
             if let Some(window) = extra.window.as_ref() {
-                if window.used_percent.is_finite()
-                    && window.used_percent >= QUOTA_HOLD_USED_THRESHOLD
+                saw_window = true;
+                if !window.used_percent.is_finite()
+                    || window.used_percent >= QUOTA_HOLD_USED_THRESHOLD
                 {
                     return false;
                 }
             }
         }
     }
-    true
+    saw_window
 }
 
-fn latest_fresh_entry(
-    quota: &crate::account_quota::AccountQuotaState,
+pub(crate) fn latest_reading_for_account<'a>(
+    quota: &'a crate::account_quota::AccountQuotaState,
     account_id: &str,
-    now_ms: i64,
-) -> Option<crate::account_quota::AccountEntry> {
-    let reading = quota
+) -> Option<&'a crate::account_quota::StoredReading> {
+    quota
         .readings
         .readings
         .values()
@@ -210,7 +212,15 @@ fn latest_fresh_entry(
                 .get("fetchedAt")
                 .and_then(serde_json::Value::as_str)
                 .and_then(crate::account_quota::parse_rfc3339_ms)
-        })?;
+        })
+}
+
+fn latest_fresh_entry(
+    quota: &crate::account_quota::AccountQuotaState,
+    account_id: &str,
+    now_ms: i64,
+) -> Option<crate::account_quota::AccountEntry> {
+    let reading = latest_reading_for_account(quota, account_id)?;
     let entry: crate::account_quota::AccountEntry =
         serde_json::from_value(reading.entry.clone()).ok()?;
     if entry.error_class.is_some() || entry.error.is_some() {
@@ -241,7 +251,7 @@ fn latest_fresh_entry(
     Some(entry)
 }
 
-fn credential_account_id(
+pub(crate) fn credential_account_id(
     credentials: &crate::broca_credentials::BrocaCredentials,
     credential_id: &str,
 ) -> Option<String> {
@@ -250,6 +260,38 @@ fn credential_account_id(
         .iter()
         .find(|row| row.id == credential_id)
         .map(|row| row.account_id.clone().unwrap_or_else(|| row.id.clone()))
+}
+
+/// Stable link from refusal evidence to its ordinary account pool blocks.
+/// Keep the credential evidence for diagnostics and paid-credit exclusion;
+/// pool blocks supply the durable reset and normal headroom recovery rules.
+pub(crate) fn quota_hold_prefix(fence: &CredentialEntitlementFence) -> String {
+    format!(
+        "credential-quota:{}:",
+        serde_json::json!([fence.provider_id, fence.credential_id])
+    )
+}
+
+fn clear_quota_holds(
+    store: &SqliteRouteStateStore,
+    fence: &CredentialEntitlementFence,
+    reason: &str,
+) -> Result<(), String> {
+    let prefix = quota_hold_prefix(fence);
+    store
+        .account_transaction(|tx| {
+            for block in tx.active_pool_fences(&fence.provider_id)? {
+                if block.evidence.fence_id.starts_with(&prefix) {
+                    tx.clear_fence(
+                        &block.evidence.fence_id,
+                        crate::account_selection::now_ms(),
+                        reason,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
 }
 
 /// The vault account for `credential_id` from the quota state's roster, when
@@ -344,6 +386,7 @@ pub(crate) fn live(
             }
             // The listing changed (or no longer names the credential): lift.
             _ => {
+                clear_quota_holds(store, &fence, "vault_listing_changed")?;
                 store
                     .clear_credential_entitlement_fences(
                         &fence.credential_id,
@@ -362,9 +405,6 @@ pub(crate) fn live(
 
 /// A fence whose refusal is older than the recheck interval: the next
 /// account admission may reserve one probe request on it and stamp it fresh.
-/// See [`probe_allowed`]: subscription fences never become stale, because a
-/// timed probe on a quota-held account would spend a real request known to
-/// fail.
 fn is_stale(fence: &CredentialEntitlementFence, now_ms: i64) -> bool {
     probe_allowed(false, now_ms.saturating_sub(fence.observed_at_ms))
 }
@@ -372,9 +412,8 @@ fn is_stale(fence: &CredentialEntitlementFence, now_ms: i64) -> bool {
 /// Split live fences into fresh restrictions and potential account-admission
 /// probes. Every fence counts as billing or entitlement: the reason
 /// a route refusal carries is one of the two, so age alone decides. This
-/// age-only split is kept for callers with no quota view; account selection
-/// uses [`split_with_signal`], which suppresses probes for credentials with
-/// quota readings via [`probe_allowed`].
+/// age-only split is kept for callers with no quota view. Account selection
+/// checks [`probe_allowed`] with the credential's quota signal instead.
 pub(crate) fn split(
     fences: &[CredentialEntitlementFence],
     now_ms: i64,
@@ -382,24 +421,10 @@ pub(crate) fn split(
     Vec<CredentialEntitlementFence>,
     Vec<CredentialEntitlementFence>,
 ) {
-    split_with_signal(fences, now_ms, |_| false)
-}
-
-/// Signal-aware split: a fence whose credential has a quota reading stays
-/// enforcing however old it is, so no timed probe is admitted on it.
-pub(crate) fn split_with_signal(
-    fences: &[CredentialEntitlementFence],
-    now_ms: i64,
-    has_signal: impl Fn(&CredentialEntitlementFence) -> bool,
-) -> (
-    Vec<CredentialEntitlementFence>,
-    Vec<CredentialEntitlementFence>,
-) {
     let mut enforcing = Vec::new();
     let mut stale = Vec::new();
     for fence in fences {
-        let age = now_ms.saturating_sub(fence.observed_at_ms);
-        if probe_allowed(has_signal(fence), age) {
+        if is_stale(fence, now_ms) {
             stale.push(fence.clone());
         } else {
             enforcing.push(fence.clone());
@@ -447,6 +472,14 @@ pub(crate) fn lift_after_success(
     provider_id: &str,
     credential_id: &str,
 ) -> Result<bool, String> {
+    for fence in store
+        .credential_entitlement_fences()
+        .map_err(|error| error.to_string())?
+        .iter()
+        .filter(|fence| fence.provider_id == provider_id && fence.credential_id == credential_id)
+    {
+        clear_quota_holds(store, fence, "run_succeeded")?;
+    }
     let lifted = store
         .clear_credential_entitlement_fence(provider_id, credential_id)
         .map_err(|e| e.to_string())?;
@@ -476,6 +509,7 @@ pub(crate) fn lift_for_operator(
         .clear_credential_entitlement_fences_for_credential(credential_id)
         .map_err(|e| e.to_string())?;
     for fence in &lifted {
+        clear_quota_holds(store, fence, "operator_lift")?;
         eprintln!(
             "[prefrontal-routing] credential entitlement fence lifted provider={} credential={}: operator lift after top-up",
             fence.provider_id, fence.credential_id

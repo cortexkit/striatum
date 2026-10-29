@@ -181,7 +181,12 @@ impl Evidence {
 /// under the size cap, the least severe are left out.
 pub(crate) fn report(evidence: &Evidence, now_ms: i64, window_ms: i64) -> Value {
     let mut findings = Vec::new();
-    findings.extend(credential_fences(&evidence.fences, &evidence.quota, now_ms));
+    findings.extend(credential_fences(
+        &evidence.fences,
+        &evidence.quota,
+        &evidence.account_blocks,
+        now_ms,
+    ));
     findings.extend(route_blocks(evidence, now_ms));
     findings.extend(refusal_rate(evidence));
     findings.extend(empty_candidate_sets(evidence));
@@ -285,6 +290,7 @@ fn age(now_ms: i64, then_ms: i64) -> String {
 fn credential_fences(
     fences: &[CredentialEntitlementFence],
     quota: &crate::account_quota::AccountQuotaState,
+    blocks: &[DiagnosticAccountBlock],
     now_ms: i64,
 ) -> Vec<Finding> {
     fences
@@ -293,21 +299,25 @@ fn credential_fences(
             let age_ms = now_ms.saturating_sub(fence.observed_at_ms).max(0);
             let billing = crate::credential_fences::is_billing_code(&fence.code);
             let kind = if billing { "billing" } else { "entitlement" };
-            // A subscription is a quota: when the fenced credential's account
-            // has an Insula reading, the hold is a quota hold until that
-            // reading's reset, never a billing fence with a 6h probe. Only a
-            // credential with no reading at all (a pay-per-token key) keeps
-            // the top-up hint and the timed probe.
             let account_id =
-                crate::credential_fences::roster_account_id(quota, &fence.credential_id);
-            let has_signal = account_id.as_deref().is_some_and(|account| {
+                crate::credential_fences::roster_account_id(quota, &fence.credential_id)
+                    .or_else(|| Some(fence.credential_id.clone()));
+            // A stored pool block keeps its reset even after the reading ages
+            // out. Diagnostics must describe the durable hold, not a probe.
+            let prefix = crate::credential_fences::quota_hold_prefix(fence);
+            let stored_reset = blocks.iter().filter(|block| block.fence_id.starts_with(&prefix))
+                .filter_map(|block| serde_json::from_str::<prefrontal_routing_core::accounts::Fence>(&block.fence_json).ok())
+                .filter_map(|block| match block.reset { ResetTime::At(reset) if reset > now_ms => Some(reset), _ => None })
+                .max();
+            let has_signal = stored_reset.is_some() || account_id.as_deref().is_some_and(|account| {
                 crate::credential_fences::has_quota_signal_for_account(quota, account)
             });
-            let quota_reset = account_id.as_deref().and_then(|account| {
+            let reading_reset = account_id.as_deref().and_then(|account| {
                 crate::credential_fences::exhausted_quota_reset_for_account(
                     quota, account, now_ms,
                 )
             });
+            let quota_reset = stored_reset.into_iter().chain(reading_reset).max();
             if has_signal {
                 if let Some(reset) = quota_reset.filter(|reset| *reset > now_ms) {
                     let reset_label = crate::account_selection::rfc3339(reset);
@@ -346,8 +356,8 @@ fn credential_fences(
                             "observed_at_ms": fence.observed_at_ms,
                         })],
                         hint: format!(
-                            "The subscription quota for {} is exhausted until {} ({}). Routing holds the account until then; a fresh quota reading with headroom lifts it early and no probe is admitted. If the reading stays stale, lift by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}.",
-                            fence.provider_id, reset_label, fence.code, fence.credential_id
+                            "The subscription quota for {} is exhausted until {} ({}). Routing holds the account until then; a fresh quota reading with headroom lifts it early. No timed probe is admitted.",
+                            fence.provider_id, reset_label, fence.code
                         ),
                     };
                 }
@@ -366,8 +376,8 @@ fn credential_fences(
                     )
                 } else {
                     format!(
-                        "The account has no plan for {}'s models. Change the plan or remove the credential from the vault (a vault listing change lifts the fence), or lift it by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. No probe is admitted while a quota reading exists.",
-                        fence.provider_id, fence.credential_id
+                        "The provider refused this subscription credential ({}). Check the account's entitlement, client requirements and Insula quota reading, or lift by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. No timed probe is admitted while a quota reading exists.",
+                        fence.code, fence.credential_id
                     )
                 };
                 return Finding {
