@@ -53,6 +53,7 @@ pub const REASON_EXCLUDED: &str = "excluded";
 /// set that was is a property of the caller, so consumers that can name it
 /// attach it as the rejection's detail.
 pub const REASON_NOT_AVAILABLE: &str = "not_available";
+pub const REASON_RUNNER_WIRE_FAMILY_UNVERIFIED: &str = "runner_wire_family_unverified";
 /// A route the upstream catalog marks `deprecated` (Fusiform's `model.status`):
 /// the provider no longer serves it, so no selection, panel seat or pin may
 /// use it. Checked before every other fence, because no policy can make a
@@ -901,15 +902,25 @@ pub fn admit_routes_with_availability(
         {
             let runtime = merged_runtime_state(&route, runtime_snapshot);
             let refusal = runtime.credential_refusal.as_ref();
+            let wire_unverified = availability_rejections
+                .get(&route.route_key)
+                .is_some_and(|reason| reason == REASON_RUNNER_WIRE_FAMILY_UNVERIFIED);
             rejected.push(RejectedRoute {
-                detail: if refusal.is_some() {
+                detail: if refusal.is_some() || wire_unverified {
                     None
                 } else {
                     availability_rejections.get(&route.route_key).cloned()
                 },
                 route_key: route.route_key,
                 reason: refusal
-                    .map_or(REASON_NOT_AVAILABLE, |mark| mark.reason)
+                    .map_or(
+                        if wire_unverified {
+                            REASON_RUNNER_WIRE_FAMILY_UNVERIFIED
+                        } else {
+                            REASON_NOT_AVAILABLE
+                        },
+                        |mark| mark.reason,
+                    )
                     .to_string(),
                 credential_ids: refusal.map_or_else(Vec::new, |mark| mark.credential_ids.clone()),
             });

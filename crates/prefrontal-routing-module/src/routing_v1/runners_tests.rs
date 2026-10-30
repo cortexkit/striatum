@@ -54,7 +54,7 @@ fn credentials(facts: &[ModelFact], row: ListedCredential, now: u64) -> BrocaCre
         .map(|fact| {
             (
                 format!("{}/{}", fact.provider_id, fact.model_id),
-                "messages".into(),
+                "anthropic.messages".into(),
             )
         })
         .collect();
@@ -87,6 +87,352 @@ fn routes(registry: Registry) -> Vec<String> {
         .policy
         .routes
         .unwrap()
+}
+
+fn served_wire_example(name: &str) -> Value {
+    let examples: Value =
+        serde_json::from_str(include_str!("../../fixtures/runner-wire-families.json")).unwrap();
+    examples[name].clone()
+}
+
+fn opus_wire_catalog() -> Value {
+    let mut catalog = served_wire_example("catalog.get — one model, current");
+    // The upstream unfiltered example is Sonnet. Re-key its served entry to
+    // Opus to exercise THALAMUS's model choice without inventing a wire fact.
+    let entry = catalog["models"]
+        .as_object_mut()
+        .unwrap()
+        .remove("anthropic/claude-sonnet-4-5")
+        .unwrap();
+    catalog["models"]["anthropic/claude-opus-5-5"] = entry;
+    catalog
+}
+
+#[tokio::test]
+async fn thalamus_opencode_selects_anthropic_opus_through_oauth() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = Harness::new("thalamus-opus-wire");
+    let facts = vec![fact("anthropic", "claude-opus-5-5", Some(&["oauth"]))];
+    harness.install_facts(&facts);
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"thalamus", "via_vault":true}]);
+    });
+    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
+    credentials.wire_apis.clear();
+    credentials.runner_declarations.insert(
+        "thalamus".into(),
+        runners::parse_declaration(&json!({
+            "runner": {"pairs":[{"wire_api":"anthropic.messages", "auth_method":"oauth"}],
+            "harnesses":["opencode"], "default_harness":"opencode", "follows_account_choice":true}
+        }))
+        .unwrap()
+        .unwrap(),
+    );
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(credentials));
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&opus_wire_catalog()).unwrap(),
+    )
+    .unwrap();
+    crate::fusiform_catalog::apply_mapped_catalog(harness.store(), &snapshot, Some(&shared), None)
+        .unwrap();
+    harness.set_credentials(shared.lock().unwrap().clone());
+    let caller = harness.bind(reserved("example-consumer"), None).await;
+    let reply = caller.call("route.select", &json!({"consumer":"mason", "requirements":{"iq":0}, "harness":"opencode", "detail":true})).await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    assert_eq!(reply.1["result"]["route"]["provider"], "anthropic");
+    assert_eq!(reply.1["result"]["route"]["model"], "claude-opus-5-5");
+    assert_eq!(reply.1["result"]["runner"]["module"], "thalamus");
+    assert_eq!(reply.1["result"]["runner"]["harness"], "opencode");
+}
+
+#[tokio::test]
+async fn missing_wire_family_is_named_in_selected_and_no_route_rejections() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = Harness::new("unverified-wire");
+    let facts = vec![
+        fact("anthropic", "claude-opus-5-5", None),
+        fact("anthropic", "claude-sonnet-4-5", None),
+    ];
+    harness.install_facts(&facts);
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"fixture-runner", "via_vault":true}])
+    });
+    let caller = harness.bind(reserved("example-consumer"), None).await;
+    let mut catalog = opus_wire_catalog();
+    let opus = catalog["models"]["anthropic/claude-opus-5-5"]
+        .as_object_mut()
+        .unwrap();
+    opus.remove("wire.family");
+    opus.insert("transport.wire_api".into(), json!("anthropic.messages"));
+    catalog["models"]["anthropic/claude-sonnet-4-5"] =
+        served_wire_example("catalog.get — one model, current")["models"]
+            ["anthropic/claude-sonnet-4-5"]
+            .clone();
+    for all_unverified in [false, true] {
+        if all_unverified {
+            catalog["models"]["anthropic/claude-sonnet-4-5"]
+                .as_object_mut()
+                .unwrap()
+                .remove("wire.family");
+        }
+        let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
+        credentials.runner_declarations.insert(
+            "fixture-runner".into(),
+            declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
+        );
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(credentials));
+        let snapshot =
+            crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
+                .unwrap();
+        crate::fusiform_catalog::apply_mapped_catalog(
+            harness.store(),
+            &snapshot,
+            Some(&shared),
+            None,
+        )
+        .unwrap();
+        harness.set_credentials(shared.lock().unwrap().clone());
+        let reply = caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason", "requirements":{"iq":0}, "detail":true}),
+            )
+            .await;
+        let rejected = if all_unverified {
+            assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+            assert_eq!(reply.1["code"], "no_route", "{reply:?}");
+            &reply.1["detail"]["rejected"]
+        } else {
+            assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+            assert_eq!(reply.1["result"]["route"]["model"], "claude-sonnet-4-5");
+            &reply.1["result"]["detail"]["rejected"]
+        };
+        assert!(
+            rejected
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["routeKey"] == "anthropic/claude-opus-5-5"
+                    && entry["reason"] == "runner_wire_family_unverified"),
+            "{reply:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn broca_without_pairs_keeps_pick_and_rejected_bytes_when_wire_facts_change() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = Harness::new("broca-wire-baseline");
+    for seeded in harness.store().get_facts().unwrap() {
+        harness
+            .store()
+            .delete_fact(&prefrontal_routing_core::fact_to_route(&seeded).route_key)
+            .unwrap();
+    }
+    let facts = vec![
+        fact("anthropic", "claude-opus-5-5", None),
+        fact("anthropic", "claude-sonnet-4-5", None),
+    ];
+    harness.install_facts(&facts);
+    harness.edit_config(|config| config["runners"] = json!([{"module":"broca", "via_vault":true}]));
+    let caller = harness.bind(reserved("example-consumer"), None).await;
+    let mut baseline = None;
+    for wire in [None, Some("anthropic.messages"), Some("future.wire")] {
+        let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
+        credentials.wire_apis.clear();
+        if let Some(wire) = wire {
+            for fact in &facts {
+                credentials.wire_apis.insert(
+                    format!("{}/{}", fact.provider_id, fact.model_id),
+                    wire.into(),
+                );
+            }
+        }
+        assert!(credentials.runner_declarations.is_empty());
+        harness.set_credentials(credentials);
+        let reply = caller.call("route.select", &json!({"consumer":"mason", "requirements":{"iq":0}, "exclude":["anthropic/claude-sonnet-4-5"], "detail":true})).await;
+        assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+        let result = &reply.1["result"];
+        assert_eq!(result["route"]["provider"], "anthropic");
+        assert_eq!(result["route"]["model"], "claude-opus-5-5");
+        assert_eq!(result["runner"]["module"], "broca");
+        assert_eq!(
+            result["detail"]["rejected"],
+            json!([
+                {"routeKey":"anthropic/claude-sonnet-4-5", "reason":"excluded"}
+            ])
+        );
+        let bytes = serde_json::to_vec(&json!({"route":result["route"], "runner":result["runner"], "rejected":result["detail"]["rejected"]})).unwrap();
+        if let Some(baseline) = &baseline {
+            assert_eq!(
+                &bytes, baseline,
+                "wire fact changed Broca's pick or rejection list"
+            );
+        } else {
+            baseline = Some(bytes);
+        }
+    }
+}
+
+#[test]
+fn served_wire_family_requires_an_exact_known_wire_and_canonical_auth_pair() {
+    let facts = vec![fact("anthropic", "claude-sonnet-4-5", None)];
+    let mut row = row(&["anthropic"], &[], Some("oauth"));
+    row.id = "apikey:misleading-id".into();
+    row.credential_type = "apikey".into();
+    row.refresh_adapter = Some("chatgpt".into());
+    let mut credentials = credentials(&facts, row, NOW);
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&served_wire_example("catalog.get — one model, current")).unwrap(),
+    )
+    .unwrap();
+    credentials.wire_apis = snapshot.wire_apis;
+    for (wire, auth, matches) in [
+        ("anthropic.messages", "oauth", true),
+        ("openai.responses", "oauth", false),
+        ("anthropic.messages", "apikey", false),
+        ("messages", "oauth", false),
+    ] {
+        credentials.runner_declarations.insert(
+            "fixture-runner".into(),
+            declaration(json!([{"wire_api":wire, "auth_method":auth}])),
+        );
+        let actual = routes(Registry::build(
+            vec![policy(None)],
+            &credentials,
+            &facts,
+            NOW,
+        ));
+        assert_eq!(
+            actual,
+            if matches {
+                vec!["anthropic/claude-sonnet-4-5"]
+            } else {
+                vec![]
+            },
+            "{wire}/{auth}"
+        );
+    }
+}
+
+#[test]
+fn served_billing_plane_wire_overrides_base_and_missing_plane_wire_fails_closed() {
+    let facts = vec![fact("openai", "gpt-5.6-luna", None)];
+    let mut credentials = credentials(&facts, row(&["openai"], &[], Some("chatgpt")), NOW);
+    let base = served_wire_example("apikey luna — published cache-write");
+    credentials.wire_apis =
+        crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&base).unwrap())
+            .unwrap()
+            .wire_apis;
+    let mut plane = served_wire_example("chatgpt luna — named, unfiltered");
+    credentials.billing_catalog = credentials
+        .billing_catalog
+        .clone()
+        .with_test_plane(&serde_json::to_vec(&plane).unwrap());
+    for (wire, matches) in [
+        ("openai.chatgpt_responses", true),
+        ("openai.responses", false),
+    ] {
+        credentials.runner_declarations.insert(
+            "fixture-runner".into(),
+            declaration(json!([{"wire_api":wire, "auth_method":"chatgpt"}])),
+        );
+        assert_eq!(
+            !routes(Registry::build(
+                vec![policy(None)],
+                &credentials,
+                &facts,
+                NOW
+            ))
+            .is_empty(),
+            matches
+        );
+    }
+    plane["models"]["openai/gpt-5.6-luna"]
+        .as_object_mut()
+        .unwrap()
+        .remove("wire.family");
+    credentials.billing_catalog = credentials
+        .billing_catalog
+        .clone()
+        .with_test_plane(&serde_json::to_vec(&plane).unwrap());
+    let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
+    assert!(registry.wire_family_unverified(
+        "fixture-runner",
+        "openai/gpt-5.6-luna",
+        "openai/gpt-5.6-luna"
+    ));
+    assert!(routes(registry).is_empty());
+
+    let facts = vec![fact("meta", "muse-wonder-full-1.0", Some(&["oauth"]))];
+    let mut credentials =
+        super::runners_tests::credentials(&facts, row(&["meta"], &[], Some("oauth")), NOW);
+    credentials.wire_apis.clear();
+    credentials.billing_catalog = credentials.billing_catalog.clone().with_test_plane(
+        &serde_json::to_vec(&served_wire_example(
+            "catalog.get — meta oauth serves the curated row",
+        ))
+        .unwrap(),
+    );
+    credentials.runner_declarations.insert(
+        "fixture-runner".into(),
+        declaration(json!([{"wire_api":"openai.responses", "auth_method":"oauth"}])),
+    );
+    assert_eq!(
+        routes(Registry::build(
+            vec![policy(None)],
+            &credentials,
+            &facts,
+            NOW
+        )),
+        ["meta/muse-wonder-full-1.0"]
+    );
+}
+
+#[test]
+fn unknown_pair_tokens_decode_but_never_match_and_warn_once_per_runner() {
+    let facts = vec![fact("vendor-a", "model", None)];
+    crate::take_operator_warnings();
+    for (wire, method, field, token) in [
+        ("future.wire", "oauth", "wire_api", "future.wire"),
+        (
+            "anthropic.messages",
+            "future_auth",
+            "auth_method",
+            "future_auth",
+        ),
+    ] {
+        let mut credentials = credentials(&facts, row(&["vendor-a"], &[], Some(method)), NOW);
+        credentials
+            .wire_apis
+            .insert("vendor-a/model".into(), wire.into());
+        let declaration = declaration(json!([{"wire_api":wire, "auth_method":method}]));
+        for suffix in ["a", "b"] {
+            let module = format!("unknown-{field}-runner-{suffix}");
+            credentials
+                .runner_declarations
+                .insert(module.clone(), declaration.clone());
+            let mut policy = policy(None);
+            policy.module = module.clone();
+            for _ in 0..2 {
+                assert!(routes(Registry::build(
+                    vec![policy.clone()],
+                    &credentials,
+                    &facts,
+                    NOW
+                ))
+                .is_empty());
+            }
+            let warnings = crate::take_operator_warnings();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings[0].contains(&module)
+                    && warnings[0].contains(field)
+                    && warnings[0].contains(token),
+                "{warnings:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -124,7 +470,7 @@ fn declaration_pairs_intersect_routes_and_replace_interim_facts() {
     );
     let policies = vec![policy(Some(vec!["vendor-a/allowed"]))];
     credentials.runner_declarations.insert("fixture-runner".into(), declaration(json!([
-        {"wire_api": "messages", "auth_method": "oauth"}, {"wire_api": "other", "auth_method": "apikey"}
+        {"wire_api": "anthropic.messages", "auth_method": "oauth"}, {"wire_api": "other", "auth_method": "apikey"}
     ])));
     let broad = Registry::build(policies.clone(), &credentials, &facts, NOW);
     assert_eq!(
@@ -163,7 +509,7 @@ fn missing_auth_method_never_inherits_a_refresh_adapter_method() {
     );
     credentials.runner_declarations.insert(
         "fixture-runner".into(),
-        declaration(json!([{"wire_api":"messages", "auth_method":"oauth"}])),
+        declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
     );
     assert!(routes(Registry::build(
         vec![policy(None)],
@@ -190,7 +536,7 @@ fn runner_reach_uses_resolved_account_membership_before_and_after_declaration() 
             if declared {
                 credentials.runner_declarations.insert(
                     "fixture-runner".into(),
-                    declaration(json!([{"wire_api":"messages", "auth_method":"oauth"}])),
+                    declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
                 );
             }
             assert_eq!(
@@ -215,7 +561,7 @@ fn runner_reach_uses_resolved_account_membership_before_and_after_declaration() 
 
 #[test]
 fn standing_provider_limits_and_verified_catalog_replacement_are_enforced() {
-    let slot = json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}],
+    let slot = json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}],
         "standing_limits": {"explicit_providers": ["vendor-a"]}}});
     let entry = |verified| {
         json!({"module_id":"fixture-runner", "nonce_verified": verified,
@@ -252,7 +598,8 @@ fn standing_provider_limits_and_verified_catalog_replacement_are_enforced() {
 
 #[test]
 fn runner_declaration_validation_matches_the_shared_contract_shape() {
-    let valid = json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}]}});
+    let valid =
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}]}});
     assert!(
         runners::parse_declaration(&valid)
             .unwrap()
@@ -268,17 +615,17 @@ fn runner_declaration_validation_matches_the_shared_contract_shape() {
     for invalid in [
         json!({"runner": {"pairs": []}}),
         json!({"runner": {"pairs": [{"wire_api":"Messages", "auth_method":"oauth"}]}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}, {"wire_api":"messages", "auth_method":"oauth"}]}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}], "unknown": true}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth", "unknown": true}]}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}], "tool_capabilities": ["test:cap_0/v1", "test:cap_0/v1"]}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}], "standing_limits": {"explicit_providers": []}}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}], "standing_limits": {"unknown": true}}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}], "harnesses": ["Not A Token"]}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}], "harnesses": ["pi", "pi"]}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}], "harnesses": ["pi"], "default_harness": "other"}}),
-        json!({"runner": {"pairs": vec![json!({"wire_api":"messages", "auth_method":"oauth"}); 65]}}),
-        json!({"runner": {"pairs": [{"wire_api":"messages", "auth_method":"oauth"}], "tool_capabilities": (0..65).map(|n| format!("test:cap_{n}/v1")).collect::<Vec<_>>()}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}, {"wire_api":"anthropic.messages", "auth_method":"oauth"}]}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "unknown": true}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth", "unknown": true}]}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "tool_capabilities": ["test:cap_0/v1", "test:cap_0/v1"]}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "standing_limits": {"explicit_providers": []}}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "standing_limits": {"unknown": true}}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "harnesses": ["Not A Token"]}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "harnesses": ["pi", "pi"]}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "harnesses": ["pi"], "default_harness": "other"}}),
+        json!({"runner": {"pairs": vec![json!({"wire_api":"anthropic.messages", "auth_method":"oauth"}); 65]}}),
+        json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}], "tool_capabilities": (0..65).map(|n| format!("test:cap_{n}/v1")).collect::<Vec<_>>()}}),
         json!({"unknown": true}),
     ] {
         assert!(runners::parse_declaration(&invalid).is_err(), "{invalid}");
@@ -329,7 +676,7 @@ async fn select_then_account_for_keeps_resolved_membership_across_runner_declara
             if declared {
                 credentials.runner_declarations.insert(
                     "fixture-runner".into(),
-                    declaration(json!([{"wire_api":"messages", "auth_method":"oauth"}])),
+                    declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
                 );
             }
             harness.set_credentials(credentials.clone());
@@ -410,7 +757,7 @@ fn variants_share_model_reach_but_never_bypass_operator_variant_rules() {
         if declared {
             credentials.runner_declarations.insert(
                 "fixture-runner".into(),
-                declaration(json!([{"wire_api":"messages", "auth_method":"oauth"}])),
+                declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
             );
         }
         let registry = Registry::build(
@@ -436,19 +783,19 @@ async fn catalog_wire_api_reaches_selection_without_provider_name_inference() {
     });
     let caller = harness.bind(reserved("example-consumer"), None).await;
     for (version, api, expected) in [
-        (1, "messages", FrameType::Response),
+        (1, "anthropic.messages", FrameType::Response),
         (2, "different", FrameType::Error),
     ] {
         let mut credentials = credentials(&facts, row(&["vendor-a"], &[], Some("oauth")), NOW);
         credentials.wire_apis.clear();
         credentials.runner_declarations.insert(
             "fixture-runner".into(),
-            declaration(json!([{"wire_api":"messages", "auth_method":"oauth"}])),
+            declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"oauth"}])),
         );
         let shared = std::sync::Arc::new(std::sync::Mutex::new(credentials));
         let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
             "catalog_version":version, "resolved_at_ms":NOW,
-            "models":{"vendor-a/model":{"existence":"present", "transport.wire_api":api, "limit.context":200_000}},
+            "models":{"vendor-a/model":{"existence":"present", "wire.family":api, "limit.context":200_000}},
             "curated":[{"model":"vendor-a/model", "auth_methods":["oauth"]}]
         })).unwrap()).unwrap();
         crate::fusiform_catalog::apply_mapped_catalog(

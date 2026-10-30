@@ -292,6 +292,29 @@ pub(super) async fn select_with_profile_lookup(
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
         })
         .collect();
+    let pair_rejections: HashMap<String, String> = facts
+        .iter()
+        .filter_map(|fact| {
+            let route = fact_to_route(fact);
+            let unverified = !runners
+                .iter()
+                .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
+                && runners.iter().any(|runner| {
+                    registry.wire_family_unverified(
+                        &runner.module,
+                        &route.route_key,
+                        &route.capacity_key,
+                    )
+                });
+            unverified.then(|| {
+                (
+                    route.route_key,
+                    prefrontal_routing_core::model_router::REASON_RUNNER_WIRE_FAMILY_UNVERIFIED
+                        .into(),
+                )
+            })
+        })
+        .collect();
     let requirements = &request.requirements;
     let modalities = requirements.modalities.clone().unwrap_or_default();
     let unconfirmable = modalities
@@ -332,7 +355,7 @@ pub(super) async fn select_with_profile_lookup(
         .into_iter()
         .filter(|fact| !key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))
         .collect();
-    if capable.is_empty() {
+    if capable.is_empty() && pair_rejections.is_empty() {
         return Err(if key_pool_only {
             key_pool_route_refusal()
         } else {
@@ -351,7 +374,7 @@ pub(super) async fn select_with_profile_lookup(
         &facts,
         &mut snapshot,
         available,
-        HashMap::new(),
+        pair_rejections,
         select_policy::CandidateSource::Vault {
             credentials: deps.broca_credentials,
             fences: &priced.entitlement_fences,
