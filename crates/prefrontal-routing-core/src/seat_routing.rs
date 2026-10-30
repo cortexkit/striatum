@@ -11,10 +11,9 @@
 //! incumbent grand family, and resolves the remainder with the existing
 //! deterministic cost and speed tie-breaks.
 //!
-//! Grand families are curated model facts (`ModelFact::grand_family_id`),
-//! never inferred from provider or model names. A route with unknown family is
-//! never inadequate for that reason alone: it simply cannot satisfy the
-//! diversity preference.
+//! Grand families are catalog lineage facts (`ModelFact::grand_family_id`),
+//! never inferred from provider or model names. An absent lineage belongs to
+//! `other`, including for the diversity preference.
 //!
 //! Seat routing has NO best-effort fallback band: a seat that cannot be given
 //! an adequate model must fail loudly (the invitation is refused) instead of
@@ -183,10 +182,10 @@ impl std::fmt::Display for SeatRouteError {
 
 impl std::error::Error for SeatRouteError {}
 
-/// Resolve the known grand families of incumbent members from curated facts.
+/// Resolve the grand families of incumbent members from catalog facts.
 /// `incumbent_keys` may be route keys or capacity keys. Incumbents without a
-/// matching fact, or whose fact carries no valid canonical family, are simply
-/// absent from the result: unknown incumbents never block diversity.
+/// matching fact are absent from the result. A matching fact without lineage
+/// contributes `other`.
 pub fn incumbent_grand_families(
     facts: &[ModelFact],
     incumbent_keys: &[String],
@@ -310,9 +309,8 @@ pub fn select_seat_route_with_config(
     let ordered = order_candidates(pool, &input);
 
     // Diversity preference: first candidate (in deterministic tie-break order)
-    // whose KNOWN grand family is absent from every known incumbent family.
-    // Unknown family never satisfies the preference; when nothing satisfies it,
-    // fall back to the deterministic head of the pool.
+    // whose lineage (or `other` when absent) differs from every incumbent family.
+    // When nothing satisfies it, fall back to the deterministic head of the pool.
     let preferred_index = ordered.iter().position(|candidate| {
         candidate
             .admitted

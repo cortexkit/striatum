@@ -1861,7 +1861,7 @@ pub(crate) fn refresh_credential_quota_holds(
         let prefix = crate::credential_fences::quota_hold_prefix(&refusal);
         let policy = config.allocator_policy(&refusal.provider_id);
         let reading = crate::credential_fences::latest_reading_for_account(quota, &account)
-            .and_then(|reading| quota_reading_for_model(&reading.entry, None, &[]));
+            .and_then(|reading| quota_reading_for_model(&reading.entry, &account, None, &[]));
         let reading_reset =
             crate::credential_fences::exhausted_quota_reset_for_account(quota, &account, now);
         let lifted = store

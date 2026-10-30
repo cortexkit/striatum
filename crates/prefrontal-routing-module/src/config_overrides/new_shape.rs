@@ -5,8 +5,7 @@ use crate::config_policy::{
 
 impl ModelFactOverride {
     pub(super) fn has_fact_override(&self) -> bool {
-        self.family.is_some()
-            || self.elo.is_some()
+        self.elo.is_some()
             || self.eq.is_some()
             || self.speed.is_some()
             || self.cost_per_mtok_out.is_some()

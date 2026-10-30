@@ -194,20 +194,16 @@ fn snapshot_from_store(
             Err(error) => return Err(format!("model_capabilities: {error}")),
         }
     }
-    let Some((route_key, fact)) = selected else {
+    let Some((_route_key, fact)) = selected else {
         return Ok(ModelCapabilitiesSnapshot::default());
     };
-    let routed_family = store
-        .get_model_family(&route_key)
-        .map_err(|error| format!("model_capabilities family: {error}"))?
-        .and_then(|(family, _)| family.map(|family| family.as_str().to_string()));
     let mut input_modalities = vec!["text".to_string()];
     if fact.supports_vision == Some(true) {
         input_modalities.push("image".to_string());
     }
     let entry = ModelCapabilitiesSnapshotEntry {
         id: alias.canonical_model_id.clone(),
-        family: fact.family.or(routed_family),
+        family: fact.grand_family_id().map(str::to_string),
         tool_call: fact.supports_tool_use,
         modalities: Some(SnapshotModalities {
             input: Some(input_modalities),
@@ -432,9 +428,87 @@ mod tests {
         assert_eq!(suggestion["model"]["modelID"], "claude-sonnet-4");
     }
 
-    /// The capabilities answer is a pure function of the request and the catalog,
-    /// so the reply has to say which catalog it was computed against: that is the
-    /// only thing a caller keeping the reply can check it against.
+    #[test]
+    fn known_route_capabilities_family_uses_catalog_lineage() {
+        let dir = prefrontal_test_support::scratch_root().join(format!(
+            "routing-capabilities-lineage-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: SharedStore = std::sync::Arc::new(
+            prefrontal_routing_store::SqliteRouteStateStore::open(
+                &prefrontal_routing_store::dev_descriptor(
+                    "capabilities-lineage",
+                    dir.join("store.db").to_string_lossy().into_owned(),
+                ),
+            )
+            .unwrap(),
+        );
+        let request = || CapabilitiesParams {
+            provider_id: "lineage-fixture".into(),
+            model_id: "claude-impostor-a".into(),
+            runtime_model: None,
+            desired: None,
+        };
+        let snapshot = crate::fusiform_catalog::decode_catalog_get(include_bytes!(
+            "../fixtures/catalog-lineage.json"
+        ))
+        .unwrap();
+        crate::fusiform_catalog::apply_mapped_catalog(
+            &store,
+            &snapshot,
+            None,
+            Some("lineage-fixture"),
+        )
+        .unwrap();
+        assert_eq!(
+            capabilities_reply(&store, request(), &default_model_naming()).unwrap()["capabilities"]
+                ["family"],
+            "qwen"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_route_keeps_an_empty_capabilities_snapshot() {
+        let dir = prefrontal_test_support::scratch_root().join(format!(
+            "routing-capabilities-unknown-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: SharedStore = std::sync::Arc::new(
+            prefrontal_routing_store::SqliteRouteStateStore::open(
+                &prefrontal_routing_store::dev_descriptor(
+                    "capabilities-unknown",
+                    dir.join("store.db").to_string_lossy().into_owned(),
+                ),
+            )
+            .unwrap(),
+        );
+        let snapshot = snapshot_from_store(&store, "lineage-fixture", "claude-impostor-a").unwrap();
+        assert_eq!(snapshot, ModelCapabilitiesSnapshot::default());
+        let reply = capabilities_reply(
+            &store,
+            CapabilitiesParams {
+                provider_id: "lineage-fixture".into(),
+                model_id: "claude-impostor-a".into(),
+                runtime_model: None,
+                desired: None,
+            },
+            &default_model_naming(),
+        )
+        .unwrap();
+        assert_eq!(
+            reply["capabilities"]["diagnostics"]["snapshot"]["source"],
+            "none"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The capabilities answer names the catalog it was computed against so a
+    /// caller can invalidate a cached answer after a catalog refresh.
     #[test]
     fn capabilities_reply_states_the_catalog_it_was_computed_against() {
         let dir = prefrontal_test_support::scratch_root().join(format!(

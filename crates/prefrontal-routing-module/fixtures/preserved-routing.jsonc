@@ -1,6 +1,5 @@
 {
   // Every preserved key.
-  "model_families": {"gpt": ["openai/*"], "other": ["*"]},
   "catalog": {"poll_ms": 12345},
   "account_selection": {"enabled": true},
   "model_routing": {
@@ -16,7 +15,7 @@
     "score_alias": {"anthropic-platform": "anthropic"},
     "models": {
       "openai/gpt-6/high": {
-        "family": "gpt", "elo": 1800, "eq": 1750, "speed": 90,
+        "elo": 1800, "eq": 1750, "speed": 90,
         "cost_per_mtok_out": 4, "context_window": 100000,
         "vision": true, "speed_multiplier": 1.5, "subscription_multiplier": 20
       }

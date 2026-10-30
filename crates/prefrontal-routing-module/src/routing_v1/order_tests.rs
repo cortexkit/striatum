@@ -85,6 +85,7 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
             reasoning_efforts: None,
             canonical_id: None,
             upstream_status: None,
+            lineage: fact.family.clone(),
         })
         .collect();
     harness

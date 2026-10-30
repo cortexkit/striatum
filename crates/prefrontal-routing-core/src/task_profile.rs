@@ -209,10 +209,7 @@ pub fn summarize(tasks: &[ClosedTask<'_>]) -> Option<ProfileStats> {
 }
 
 fn same_family(a: &ModelFact, b: &ModelFact) -> bool {
-    match (a.family.as_deref(), b.family.as_deref()) {
-        (Some(a), Some(b)) if !a.trim().is_empty() => a.trim().eq_ignore_ascii_case(b.trim()),
-        _ => false,
-    }
+    a.grand_family_id() == b.grand_family_id()
 }
 
 fn served(stats: ProfileStats, level: ProfileLevel, own: Option<ProfileStats>) -> TaskProfile {

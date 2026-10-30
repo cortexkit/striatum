@@ -321,7 +321,7 @@ pub struct ModelFact {
     pub auth_methods: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
-    /// Curated model lineage used for diversity; never inferred from provider id.
+    /// Fusiform's `model.lineage`, verbatim; absence belongs to `other`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     pub scores: ModelScores,
@@ -457,12 +457,9 @@ impl ModelFact {
         self.upstream_status.as_deref() == Some(UPSTREAM_STATUS_DEPRECATED)
     }
 
-    /// Grand families are curated catalog data and are never inferred from route names.
+    /// Fusiform's lineage is used verbatim; an absent lineage belongs to `other`.
     pub fn grand_family_id(&self) -> Option<&str> {
-        self.family
-            .as_deref()
-            .and_then(GrandFamily::from_wire)
-            .map(GrandFamily::as_str)
+        Some(self.family.as_deref().unwrap_or("other"))
     }
 
     /// The ephemeral vector attached by `get_facts_with_observed_speed`, whether

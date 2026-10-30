@@ -14,9 +14,9 @@ use cortexkit_store::{open_sqlite, Migration, SqliteStore};
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
 use prefrontal_routing_core::canonical_scores::resolve_canonical_scores;
 use prefrontal_routing_core::model_facts::{
-    normalize_grand_family_id, ClassVector, Confidence, FamilySource, GrandFamily, ModelFact,
-    ModelPromptDefaults, ModelScores, CLASS_VECTOR_TRAILING_WINDOW_DAYS,
-    CLASS_VECTOR_TRAILING_WINDOW_MS, ENUMERATED_WORKLOAD_CLASSES,
+    ClassVector, Confidence, FamilySource, GrandFamily, ModelFact, ModelPromptDefaults,
+    ModelScores, CLASS_VECTOR_TRAILING_WINDOW_DAYS, CLASS_VECTOR_TRAILING_WINDOW_MS,
+    ENUMERATED_WORKLOAD_CLASSES,
 };
 use prefrontal_routing_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
 use prefrontal_routing_core::quota::quota_poll::reading_log_retention_cutoff;
@@ -576,7 +576,13 @@ fn validate_family_spellings(store: &SqliteStore) -> RouteStateResult<()> {
     let unknown = store
         .with_conn(|connection: &Connection| {
             let mut statement = connection.prepare(
-                "SELECT route_key, family FROM model_facts WHERE family IS NOT NULL ORDER BY route_key",
+                "SELECT route_key, family FROM model_facts AS candidate
+                 WHERE family IS NOT NULL AND NOT EXISTS (
+                   SELECT 1 FROM model_facts AS authority
+                   WHERE authority.provider_id = candidate.provider_id
+                     AND authority.model_id = candidate.model_id
+                     AND authority.facts_source = 'fusiform'
+                 ) ORDER BY route_key",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -677,6 +683,8 @@ pub struct FusiformFactUpdate {
     /// Fusiform's `model.status` verbatim (`deprecated`, `beta`, `alpha`), or
     /// `None` when the catalog states no status.
     pub upstream_status: Option<String>,
+    /// Fusiform's `model.lineage`, without rewriting or inferring a value.
+    pub lineage: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1886,6 +1894,18 @@ impl SqliteRouteStateStore {
                             ],
                         )?;
                     }
+                    // Lineage is catalog-owned even when a row previously carried
+                    // an operator family or a glob-derived family. Update variants too.
+                    tx.execute(
+                        "UPDATE model_facts SET family = ?1, family_source = ?2
+                         WHERE provider_id = ?3 AND model_id = ?4",
+                        params![
+                            fact.lineage,
+                            if fact.lineage.is_some() { "curated" } else { "absent" },
+                            fact.provider_id,
+                            fact.model_id,
+                        ],
+                    )?;
                 }
                 tx.execute(
                     "INSERT INTO fusiform_catalog_cursor (
@@ -3135,17 +3155,6 @@ impl SqliteRouteStateStore {
 
 impl RouteStateStore for SqliteRouteStateStore {
     fn upsert_fact(&self, fact: &ModelFact, source: FactSource) -> RouteStateResult<()> {
-        let mut fact = fact.clone();
-        if let Some(family) = fact.family.as_deref() {
-            let normalized = normalize_grand_family_id(family).ok_or_else(|| {
-                err(format!(
-                    "unknown model family spelling for {}/{}: {family}",
-                    fact.provider_id, fact.model_id
-                ))
-            })?;
-            fact.family = Some(normalized.as_str().to_string());
-        }
-        let fact = &fact;
         let route = fact_to_route(fact);
         derive_provider_key(&fact.provider_id)
             .ok_or_else(|| err("model fact has no canonical provider key"))?;
@@ -3185,6 +3194,16 @@ impl RouteStateStore for SqliteRouteStateStore {
                         }
                     }
                 }
+                 // Score placement and new variants cannot replace catalog lineage,
+                 // including an explicitly absent lineage.
+                 let lineage: Option<Option<String>> = tx.query_row(
+                     "SELECT family FROM model_facts
+                      WHERE provider_id = ?1 AND model_id = ?2 AND facts_source = 'fusiform'
+                      ORDER BY route_key LIMIT 1",
+                     params![fact.provider_id, fact.model_id],
+                     |row| row.get(0),
+                 ).optional()?;
+                 let family = lineage.as_ref().unwrap_or(&fact.family);
                  // Login restrictions, the canonical model identity and the
                  // upstream status belong to the served model, not its route
                  // variant. When upsert_fact places a new variant's scores, it
@@ -3207,10 +3226,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                       ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,
-                       family_source=CASE
-                         WHEN model_facts.family_source IN ('override', 'rule') THEN model_facts.family_source
-                         ELSE excluded.family_source
-                       END,
+                        family_source=excluded.family_source,
                        scores_json=excluded.scores_json, context_window=excluded.context_window,
                        max_output_tokens=excluded.max_output_tokens, cost_tier=excluded.cost_tier,
                        cost_per_mtok_out=excluded.cost_per_mtok_out,
@@ -3229,8 +3245,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                         fact.provider_id,
                         fact.model_id,
                         fact.variant,
-                         fact.family,
-                         if fact.family.is_some() {
+                         family,
+                         if family.is_some() {
                              FamilySource::Curated.as_str()
                          } else {
                              FamilySource::Absent.as_str()
@@ -6968,6 +6984,7 @@ mod tests {
                     reasoning_efforts: None,
                     canonical_id: None,
                     upstream_status: None,
+                    lineage: None,
                 }],
                 FusiformCatalogCursor {
                     catalog_version: 3,

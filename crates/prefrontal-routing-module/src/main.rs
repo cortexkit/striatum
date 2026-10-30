@@ -1807,6 +1807,11 @@ fn merge_model_upsert(
     existing: Option<ModelFact>,
     params: &ModelUpsertParams,
 ) -> Result<ModelFact, String> {
+    if params.family.is_some() {
+        return Err(
+            "model_upsert: family now comes from Fusiform's model.lineage; remove family".into(),
+        );
+    }
     let mut fact = match existing {
         Some(fact)
             if fact.score_provenance == ScoreProvenance::Unscored
@@ -1880,9 +1885,6 @@ fn merge_model_upsert(
     }
     if let Some(speed) = params.speed {
         fact.scores.speed = speed;
-    }
-    if params.family.is_some() {
-        fact.family = params.family.clone();
     }
     if params.context_window.is_some() {
         fact.context_window = params.context_window;
@@ -2560,7 +2562,7 @@ async fn handle_model_fact(
     let route_key = make_route_key(&params.provider_id, &params.model_id, None);
     let result = match store.get_fact_by_route_key(&route_key) {
         Ok(Some(fact)) => {
-            let (family, family_source) = match store.get_model_family(&route_key) {
+            let (_, family_source) = match store.get_model_family(&route_key) {
                 Ok(Some(family)) => family,
                 Ok(None) => (None, prefrontal_routing_core::FamilySource::Absent),
                 Err(error) => {
@@ -2590,7 +2592,7 @@ async fn handle_model_fact(
                     .context_window
                     .filter(|window| window.is_finite() && *window >= 1.0)
                     .map(|window| window as u64),
-                "family": family.map(prefrontal_routing_core::GrandFamily::as_str),
+                "family": fact.grand_family_id(),
                 "familySource": family_source.as_str(),
             })
         }
@@ -2601,7 +2603,7 @@ async fn handle_model_fact(
                 "supportsVision": null,
                 "maxOutputTokens": null,
                 "contextWindow": null,
-                "family": null,
+                "family": "other",
                 "familySource": "absent"
             })
         }
@@ -6148,6 +6150,15 @@ mod tests {
         assert_eq!(merged.cost_per_m_tok_out, stored.cost_per_m_tok_out);
         assert_eq!(merged.supports_vision, stored.supports_vision);
         assert_eq!(merged.family, stored.family);
+    }
+
+    #[test]
+    fn model_upsert_refuses_operator_family_in_favor_of_catalog_lineage() {
+        let mut params = upsert_params("lineage-fixture", "m");
+        params.family = Some("claude".into());
+        let error = merge_model_upsert(Some(fact("lineage-fixture", "m")), &params).unwrap_err();
+        assert!(error.contains("family"));
+        assert!(error.contains("Fusiform's model.lineage"));
     }
 
     #[test]
@@ -11796,6 +11807,7 @@ mod tests {
                     reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
                     canonical_id: None,
                     upstream_status: None,
+                    lineage: None,
                 },
             )
             .collect::<Vec<_>>();
@@ -13625,6 +13637,7 @@ mod tests {
                 reasoning_efforts: None,
                 canonical_id: canonical.map(str::to_string),
                 upstream_status: None,
+                lineage: None,
             }
         };
         store

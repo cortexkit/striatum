@@ -350,6 +350,7 @@ fn install_catalog(
             reasoning_efforts: list("reasoning_efforts"),
             canonical_id: text("canonical_id"),
             upstream_status: None,
+            lineage: fact.family.clone(),
         });
     }
     store
