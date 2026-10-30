@@ -26,6 +26,11 @@ pub struct PoolFloor {
 pub struct CreditReading {
     pub observed_at_ms: EpochMs,
     pub spendable: bool,
+    /// A prepaid balance the provider draws once the plan's limit is reached
+    /// (the `credits` pool), as opposed to metered overage billed afterwards
+    /// (`extra_usage`). Only prepaid credits may carry new work while routing's
+    /// reserve, rather than the plan's limit, holds an account back.
+    pub prepaid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1067,10 +1067,8 @@ fn add_spend_inputs(
                 })
                 .map(|balance| balance.minor as f64 * 10_f64.powi(-balance.exponent))
         };
-        if matches!(
-            pool.get("id").and_then(Value::as_str),
-            Some("extra_usage" | "credits")
-        ) {
+        let pool_id = pool.get("id").and_then(Value::as_str);
+        if matches!(pool_id, Some("extra_usage" | "credits")) {
             let Some(remaining) = amount("remaining").filter(|amount| amount.is_finite()) else {
                 continue;
             };
@@ -1081,6 +1079,7 @@ fn add_spend_inputs(
                 CreditReading {
                     observed_at_ms: at,
                     spendable,
+                    prepaid: pool_id == Some("credits"),
                 },
             );
         } else if let (Some(total), Some(remaining)) = (amount("total"), amount("remaining")) {
@@ -1126,7 +1125,16 @@ mod spend_input_tests {
         let mut context = prefrontal_routing_core::accounts::AllocationContext::default();
         add_spend_inputs(&mut context, "a", &entry);
         assert!(context.credits["a"].spendable);
+        assert!(context.credits["a"].prepaid, "the credits pool is prepaid");
         assert_eq!(context.credits["a"].observed_at_ms, at);
+        let overage = json!({"fetchedAt":rfc3339(at),"spend":[{"id":"extra_usage","remaining":{"minor":100,"exponent":0,"unit":"usd"}}]});
+        let mut context = prefrontal_routing_core::accounts::AllocationContext::default();
+        add_spend_inputs(&mut context, "a", &overage);
+        assert!(context.credits["a"].spendable);
+        assert!(
+            !context.credits["a"].prepaid,
+            "extra usage is metered overage"
+        );
     }
 }
 
@@ -6811,6 +6819,7 @@ mod tests {
                 prefrontal_routing_core::accounts::CreditReading {
                     observed_at_ms: NOW,
                     spendable,
+                    prepaid: false,
                 },
             )]),
             ..AllocationContext::default()

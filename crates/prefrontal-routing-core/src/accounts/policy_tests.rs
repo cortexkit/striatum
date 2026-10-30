@@ -211,6 +211,7 @@ fn credits_require_all_exhausted_and_a_reading_under_fifteen_minutes() {
         CreditReading {
             observed_at_ms: NOW,
             spendable: true,
+            prepaid: false,
         },
     );
     let decision = decide_with_context(&request(), &state, NOW, &inputs);
@@ -266,6 +267,94 @@ fn spend_budget_has_its_own_reset() {
         )),
         "a"
     );
+}
+
+/// A seven-day reading at `used` percent, resetting long after `NOW`.
+fn weekly(used: f64) -> QuotaReading {
+    let window = QuotaWindow {
+        used_percent: used,
+        raw_utilization: None,
+        source: ObservationSource::Poll,
+        resets_at: ResetTime::At(NOW + 4 * 24 * 3_600_000),
+        window_minutes: 10_080,
+        window_kind: None,
+    };
+    QuotaReading {
+        observed_at_ms: Some(NOW),
+        error_class: None,
+        stale: None,
+        five_hour: None,
+        seven_day: Some(window.clone()),
+        general_windows: Some(vec![window]),
+        scoped: ScopedList::Missing,
+        pool_windows: None,
+    }
+}
+
+fn broca_request() -> AccountRequest {
+    let mut request = request();
+    request.caller = CallerKind::Broca;
+    request
+}
+
+fn credit(prepaid: bool) -> CreditReading {
+    CreditReading {
+        observed_at_ms: NOW,
+        spendable: true,
+        prepaid,
+    }
+}
+
+/// Routing's reserve stops a Broca worker a few points short of the weekly
+/// limit, and the provider draws prepaid credits only once that limit is
+/// reached. With every account held by the reserve, an account with prepaid
+/// credits must take the work, or the credits are never used.
+#[test]
+fn prepaid_credits_carry_work_once_the_reserve_holds_every_account() {
+    let mut state = state(&["a", "b", "c"]);
+    state.policy.paid_credits = true;
+    let accounts = &mut state.roster.as_mut().unwrap().accounts;
+    accounts[0].quota = Some(weekly(96.0));
+    accounts[1].quota = Some(weekly(95.0));
+    accounts[2].quota = Some(weekly(100.0));
+    let mut inputs = AllocationContext::default();
+    inputs.credits.insert("b".into(), credit(true));
+
+    let without_credits = decide(&broca_request(), &state, NOW);
+    assert!(
+        !matches!(without_credits.outcome, Outcome::Admit(_)),
+        "the reserve holds every account: {:?}",
+        without_credits.outcome
+    );
+
+    let decision = decide_with_context(&broca_request(), &state, NOW, &inputs);
+    match decision.outcome {
+        Outcome::Admit(admission) => {
+            assert_eq!(admission.account_id, "b");
+            assert_eq!(admission.reason, AdmitReason::PaidCredits);
+        }
+        other => panic!("prepaid credits should carry the work: {other:?}"),
+    }
+
+    // Metered overage waits for real exhaustion: it never stands in for the
+    // reserve.
+    inputs.credits.insert("b".into(), credit(false));
+    assert!(!matches!(
+        decide_with_context(&broca_request(), &state, NOW, &inputs).outcome,
+        Outcome::Admit(_)
+    ));
+
+    // Free quota above the reserve still comes first.
+    inputs.credits.insert("b".into(), credit(true));
+    state.roster.as_mut().unwrap().accounts[0].quota = Some(weekly(50.0));
+    let decision = decide_with_context(&broca_request(), &state, NOW, &inputs);
+    match decision.outcome {
+        Outcome::Admit(admission) => {
+            assert_eq!(admission.account_id, "a");
+            assert_ne!(admission.reason, AdmitReason::PaidCredits);
+        }
+        other => panic!("free quota should be used first: {other:?}"),
+    }
 }
 
 fn reading(used: f64, pool: &str) -> QuotaReading {

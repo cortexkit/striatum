@@ -99,6 +99,7 @@ pub fn decide_with_context(
         policy,
         context,
         credit_mode: false,
+        reserve_credit_mode: false,
         now,
         model,
         affinity_model,
@@ -179,6 +180,10 @@ struct Allocator<'a> {
     policy: &'a AllocatorPolicy,
     context: &'a AllocationContext,
     credit_mode: bool,
+    /// Credit mode entered because routing's reserve holds back free quota on
+    /// some account, not because every plan is exhausted. Only prepaid credits
+    /// count then.
+    reserve_credit_mode: bool,
     now: EpochMs,
     model: String,
     affinity_model: String,
@@ -193,9 +198,22 @@ impl<'a> Allocator<'a> {
     // the operator override; then existing affinity; then a one-time import;
     // then `requested_account`; then scoring.
     fn run(mut self) -> Decision {
-        self.credit_mode = self.policy.paid_credits
+        let all_exhausted =
+            !self.views.is_empty() && self.views.iter().all(|view| self.free_exhausted(view));
+        // Routing's reserve stops new work a few points short of a plan's
+        // limit, and a provider draws prepaid credits only once that limit is
+        // reached, so an account the reserve holds back would never reach its
+        // credits. When every account is exhausted or held by the reserve,
+        // prepaid credits carry new work; metered overage still waits for real
+        // exhaustion.
+        let all_held = !all_exhausted
             && !self.views.is_empty()
-            && self.views.iter().all(|view| self.free_exhausted(view));
+            && self
+                .views
+                .iter()
+                .all(|view| self.free_exhausted(view) || self.held_by_reserve(view));
+        self.credit_mode = self.policy.paid_credits && (all_exhausted || all_held);
+        self.reserve_credit_mode = self.credit_mode && !all_exhausted;
         if let Some(override_) = &self.state.operator_override {
             return self.operator_override(override_);
         }
@@ -479,8 +497,23 @@ impl<'a> Allocator<'a> {
     fn using_credits(&self, account: &str) -> bool {
         self.credit_mode
             && self.context.credits.get(account).is_some_and(|credit| {
-                credit.spendable && (0..15 * 60_000).contains(&(self.now - credit.observed_at_ms))
+                credit.spendable
+                    && (!self.reserve_credit_mode || credit.prepaid)
+                    && (0..15 * 60_000).contains(&(self.now - credit.observed_at_ms))
             })
+    }
+
+    /// The account passes every hard filter and has a usable reading, but its
+    /// remaining free quota sits inside routing's reserve for this caller: the
+    /// kept-back points, the Broca floor, a soft or pool floor, or an exhausted
+    /// family scope. Only evaluated before credit mode is decided, so the quota
+    /// evaluation here never sets the reading aside for credits.
+    fn held_by_reserve(&self, view: &AccountView) -> bool {
+        if !self.hard_filters(view, None).reasons.is_empty() {
+            return false;
+        }
+        let quota = self.evaluate_quota(view);
+        quota.unknown.is_empty() && !quota.reserve.is_empty()
     }
 
     fn budget_blocked(&self, account: &str) -> bool {
