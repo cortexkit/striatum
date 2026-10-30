@@ -860,6 +860,199 @@ fn oauth_reading(used_percent: f64) {
 }
 
 #[tokio::test]
+async fn account_reserve_does_not_rescale_demand_to_a_weaker_model() {
+    assert_account_unavailability_keeps_frontier("reserve").await;
+}
+
+#[tokio::test]
+async fn account_exhaustion_does_not_rescale_demand_to_a_weaker_model() {
+    assert_account_unavailability_keeps_frontier("exhausted").await;
+}
+
+#[tokio::test]
+async fn refused_credential_does_not_rescale_demand_to_a_weaker_model() {
+    assert_account_unavailability_keeps_frontier("refused").await;
+}
+
+#[tokio::test]
+async fn stale_credential_listing_does_not_rescale_demand_to_a_weaker_model() {
+    assert_account_unavailability_keeps_frontier("stale").await;
+}
+
+async fn assert_account_unavailability_keeps_frontier(block: &str) {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    harness.edit_config(|config| {
+        config["runners"] = json!([
+            {"module":RUNNER,"via_vault":true,"routes":["synthetic/model"]},
+            {"module":"direct-runner","routes":["fallback/model"]}
+        ])
+    });
+    oauth_reading(0.0);
+    let mut top = crate::tests::fact("synthetic", "model");
+    top.scores.elo = 1_800.0;
+    top.auth_methods = Some(vec!["oauth".into()]);
+    let mut weak = crate::tests::fact("fallback", "model");
+    weak.scores.elo = 500.0;
+    weak.auth_methods = Some(vec!["apikey".into()]);
+    harness.install_facts(&[top.clone(), weak.clone()]);
+    catalog_fact(&harness, &top);
+    catalog_fact(&harness, &weak);
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.push(ListedCredential {
+        id: "apikey:fallback".into(),
+        account_id: Some("fallback-account".into()),
+        state: "active".into(),
+        categories: vec!["llm-provider".into()],
+        provider_ids: vec!["fallback".into()],
+        serves: vec!["fallback".into()],
+        credential_type: "apikey".into(),
+        auth_method: Some("apikey".into()),
+        ..Default::default()
+    });
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "frontier".into(),
+            credentials: rows.clone(),
+            ..Default::default()
+        },
+        NOW,
+    );
+    credentials.refresh_serving_methods(
+        &Default::default(),
+        &[top.clone(), weak.clone()],
+        NOW as i64,
+        &[],
+    );
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[top.clone(), weak]),
+    );
+    harness.set_credentials(credentials.clone());
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let request = json!({"consumer":"mason", "requirements":{"iq":90}, "detail":true});
+    let baseline = caller.call("route.select", &request).await;
+    assert_eq!(baseline.0, FrameType::Response, "{block}: {}", baseline.1);
+    assert_eq!(
+        baseline.1["result"]["route"]["provider"], "synthetic",
+        "{}",
+        baseline.1
+    );
+    match block {
+        "reserve" => oauth_reading(99.0),
+        "exhausted" => exhaust_oauth(&harness, "synthetic"),
+        "refused" => {
+            crate::credential_fences::record(
+                harness.store(),
+                &Arc::new(std::sync::Mutex::new(credentials.clone())),
+                &CredentialRefusal {
+                    provider_id: "synthetic".into(),
+                    credential_id: "oauth:test".into(),
+                    code: "ENTITLEMENT_ERROR".into(),
+                },
+                NOW as i64,
+            )
+            .unwrap();
+        }
+        "stale" => {
+            credentials.apply_listing(
+                &ScopedCredentialListing {
+                    view: "frontier-stale".into(),
+                    credentials: rows.clone(),
+                    ..Default::default()
+                },
+                NOW - 15 * 60_000 - 1,
+            );
+            harness.set_credentials(credentials.clone());
+        }
+        _ => unreachable!(),
+    }
+    if matches!(block, "reserve" | "exhausted") {
+        let classes = crate::account_selection::ClassContext::read(
+            harness.store(),
+            &Arc::new(std::sync::Mutex::new(credentials.clone())),
+            harness.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            vec![top],
+            NOW as i64,
+        )
+        .unwrap();
+        let decision = classes.probe(
+            "synthetic",
+            "model",
+            false,
+            false,
+            None,
+            "frontier-regression",
+        );
+        assert_eq!(
+            decision.refusal().unwrap().code,
+            if block == "reserve" {
+                prefrontal_routing_core::accounts::RefusalCode::AccountPoolReserveLimited
+            } else {
+                prefrontal_routing_core::accounts::RefusalCode::AccountPoolExhausted
+            }
+        );
+    }
+    let blocked = caller.call("route.select", &request).await;
+    assert_eq!(blocked.0, FrameType::Error, "{block}: {}", blocked.1);
+    assert_eq!(blocked.1["code"], "no_route", "{block}: {}", blocked.1);
+    assert_eq!(
+        blocked.1["detail"]["reason"],
+        if block != "exhausted" {
+            json!(cortexkit_role_routing::errors::NoRouteReason::AllInadequate)
+        } else {
+            json!("accounts_blocked")
+        },
+        "{block}: {}",
+        blocked.1
+    );
+    if matches!(block, "refused" | "stale") {
+        let rejected = blocked.1["detail"]["rejected"].as_array().unwrap();
+        let top = rejected
+            .iter()
+            .find(|route| route["routeKey"] == "synthetic/model")
+            .unwrap();
+        assert_eq!(
+            top,
+            &if block == "refused" {
+                json!({"routeKey":"synthetic/model", "reason":"credential_unentitled", "credentialIds":["oauth:test"]})
+            } else {
+                json!({"routeKey":"synthetic/model", "reason":"not_available"})
+            }
+        );
+    }
+
+    // A provider with no serving credential cannot define the maximum model
+    // scores used to interpret IQ, unlike a listed but unavailable credential.
+    rows.retain(|row| {
+        !row.provider_ids
+            .iter()
+            .any(|provider| provider == "synthetic")
+    });
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "no-top-credential".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW + 1,
+    );
+    harness.set_credentials(credentials);
+    let unreachable = caller.call("route.select", &request).await;
+    assert_eq!(
+        unreachable.0,
+        FrameType::Response,
+        "{block}: {}",
+        unreachable.1
+    );
+    assert_eq!(
+        unreachable.1["result"]["route"]["provider"], "fallback",
+        "{}",
+        unreachable.1
+    );
+}
+
+#[tokio::test]
 async fn provider_strategies_never_escape_the_subscription_class() {
     let _clock = crate::InjectedClock::set(NOW);
     for strategy in ["round_robin", "ordered"] {

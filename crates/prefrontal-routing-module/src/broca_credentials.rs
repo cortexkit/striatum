@@ -804,6 +804,19 @@ impl BrocaCredentials {
         report
     }
 
+    pub(crate) fn statically_served_routes(&self, facts: &[ModelFact]) -> HashSet<String> {
+        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        facts
+            .iter()
+            .filter(|fact| {
+                self.listed
+                    .iter()
+                    .any(|row| credential_serves_fact(row, fact, &catalog))
+            })
+            .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
+            .collect()
+    }
+
     /// Rows arrive already filtered for catalog withdrawals. When the vault
     /// listing is unknown, stale, or has no mapped providers, unrestricted models
     /// fall back to that served catalog, never the caller's host list. A fresh

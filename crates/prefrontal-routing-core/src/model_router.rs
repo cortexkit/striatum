@@ -78,6 +78,11 @@ pub struct CredentialRefusalMark {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteRuntimeState {
+    /// Request-local reachability independent of runtime availability. A known
+    /// credential/transport match still anchors quality when its accounts cannot
+    /// send; missing credentials do not. None uses the caller's availability set/map.
+    /// This affects quality normalization only, never candidate admission.
+    pub statically_routable: Option<bool>,
     /// Slow-refresh account economics, shared by every route on this provider.
     pub subscription_pool: Option<std::sync::Arc<crate::subscription::SubscriptionPool>>,
     /// Confirmed cooldown/retry-after; route inadmissible until this time (ms epoch).
@@ -707,6 +712,12 @@ pub(crate) fn merged_runtime_state(
     let by_capacity = snapshot.and_then(|s| s.by_capacity.get(&route.capacity_key));
     let mut merged = by_capacity.cloned().unwrap_or_default();
     if let Some(route_state) = by_route {
+        merged.statically_routable =
+            match (merged.statically_routable, route_state.statically_routable) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                _ => None,
+            };
         // Hard blocks compose across both scopes: a stale route deadline cannot
         // shorten a live capacity-wide block. The wall's typed cause and error text
         // are not merged here: break-glass reads them per scope from the snapshot
@@ -789,8 +800,8 @@ pub struct AdmissionResult {
 }
 
 /// Apply the shared hard-admission boundary used by singular, panel, and seat routing.
-/// The request frontier is computed after static exclusions, availability, and
-/// capability requirements, but before quota or cooldown state.
+/// The maximum quality scores exclude unreachable routes and capability
+/// mismatches, but not runtime availability, quota or cooldown state.
 pub fn admit_routes(
     facts: &[ModelFact],
     runtime_snapshot: Option<&ModelRouteStateSnapshot>,
@@ -897,10 +908,16 @@ pub fn admit_routes_with_availability(
             });
             continue;
         }
-        if availability_rejections.contains_key(&route.route_key)
-            || !is_route_available(&route, available_models)
-        {
-            let runtime = merged_runtime_state(&route, runtime_snapshot);
+        let runtime = merged_runtime_state(&route, runtime_snapshot);
+        let unavailable = availability_rejections.contains_key(&route.route_key)
+            || !is_route_available(&route, available_models);
+        let capability_rejection = capability_rejection_reason(fact, required_capabilities);
+        // Preserve availability's rejection precedence, while computing quality
+        // against every statically routable model, even when its accounts cannot send.
+        if runtime.statically_routable.unwrap_or(!unavailable) && capability_rejection.is_none() {
+            top_routable.include(fact.scores);
+        }
+        if unavailable {
             let refusal = runtime.credential_refusal.as_ref();
             let wire_unverified = availability_rejections
                 .get(&route.route_key)
@@ -926,7 +943,7 @@ pub fn admit_routes_with_availability(
             });
             continue;
         }
-        if let Some(reason) = capability_rejection_reason(fact, required_capabilities) {
+        if let Some(reason) = capability_rejection {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
                 reason: reason.to_string(),
@@ -935,7 +952,6 @@ pub fn admit_routes_with_availability(
             });
             continue;
         }
-        top_routable.include(fact.scores);
         static_candidates.push((fact, route));
     }
 
