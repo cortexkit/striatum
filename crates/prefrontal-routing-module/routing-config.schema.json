@@ -10,7 +10,6 @@
         "hold_when_reset_within": null,
         "max_hold": null,
         "metered_fallback": false,
-        "model_families": null,
         "order": null,
         "ordered": null,
         "paid_credits": null,
@@ -80,10 +79,6 @@
       ],
       "format": "double",
       "default": null
-    },
-    "model_families": {
-      "$ref": "#/$defs/ModelFamilyRules",
-      "default": {}
     },
     "model_naming": {
       "description": "How providers spell model ids and which model families the capability\nheuristic recognizes; see `ModelNamingConfig`.",
@@ -173,23 +168,6 @@
         }
       ]
     },
-    "AccountModelFamily": {
-      "description": "One model's quota family under `accounts.model_families`.",
-      "type": "object",
-      "properties": {
-        "family": {
-          "$ref": "#/$defs/AccountQuotaFamily"
-        },
-        "model": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "model",
-        "family"
-      ]
-    },
     "AccountPoolFloor": {
       "type": "object",
       "properties": {
@@ -221,16 +199,6 @@
       "additionalProperties": false,
       "required": [
         "remaining_percent"
-      ]
-    },
-    "AccountQuotaFamily": {
-      "description": "The model-scoped quota families account selection keeps apart.",
-      "type": "string",
-      "enum": [
-        "fable",
-        "mythos",
-        "opus",
-        "other"
       ]
     },
     "BasicFamilyConfig": {
@@ -447,14 +415,6 @@
           "format": "double",
           "exclusiveMinimum": 0
         },
-        "family": {
-          "description": "Outer None means absent; Some(None) means an explicit JSON null clears it.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
         "not_for": {
           "type": [
             "array",
@@ -522,136 +482,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "ModelFamilyRules": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "claude": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "deepseek": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "gemini": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "glm": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "gpt": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "grok": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "kimi": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "llama": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "minimax": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "mistral": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "other": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            },
-            "qwen": {
-              "type": "array",
-              "items": {
-                "type": "string",
-                "pattern": "\\S"
-              }
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "properties": {
-              "family": {
-                "enum": [
-                  "claude",
-                  "gpt",
-                  "gemini",
-                  "grok",
-                  "qwen",
-                  "kimi",
-                  "glm",
-                  "deepseek",
-                  "minimax",
-                  "mistral",
-                  "llama",
-                  "other"
-                ]
-              },
-              "globs": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "pattern": "\\S"
-                }
-              }
-            },
-            "additionalProperties": false,
-            "required": [
-              "family",
-              "globs"
-            ]
-          }
-        }
-      ]
     },
     "ModelNamingConfig": {
       "description": "Operator config for `prefrontal_routing_core::ModelNaming`, the model-id\nspelling `route.resolve_model` applies per provider and the model families\n`route.model_capabilities` recognizes by name. The config converter writes\nthe shipped values from its data file.",
@@ -1008,17 +838,6 @@
           "type": "boolean",
           "default": false
         },
-        "model_families": {
-          "description": "The models that draw on a model-scoped quota family, by exact model\nid. A model not listed counts as `other`.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "default": null,
-          "items": {
-            "$ref": "#/$defs/AccountModelFamily"
-          }
-        },
         "order": {
           "type": [
             "array",
@@ -1098,7 +917,6 @@
             "hold_when_reset_within": null,
             "max_hold": null,
             "metered_fallback": false,
-            "model_families": null,
             "order": null,
             "ordered": null,
             "paid_credits": null,

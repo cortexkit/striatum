@@ -263,6 +263,7 @@ fn catalog_fact(harness: &Harness, fact: &prefrontal_routing_core::ModelFact) {
                 reasoning_efforts: None,
                 canonical_id: None,
                 upstream_status: None,
+                lineage: None,
             }],
             FusiformCatalogCursor {
                 catalog_version: VERSION.fetch_add(1, Ordering::Relaxed) as i64,
@@ -1412,12 +1413,12 @@ async fn paid_credit_readings_are_explicit_fresh_inputs_and_refusals_cannot_rewr
             &account_request("synthetic", "credits-refused"),
         )
         .await;
-    // Credential fences filtered the subscription class with no reset: an
-    // account limit without a known reset.
+    // A subscription billing refusal with an exhausted reading is a quota
+    // hold until that reading's reset, not an untimed billing fence.
     assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
     assert_eq!(
         blocked.1["detail"]["reset_at_ms"],
-        json!(null),
+        json!(NOW as i64 + 3_600_000),
         "{}",
         blocked.1
     );
@@ -1640,5 +1641,660 @@ async fn pay_per_token_never_uses_subscription_when_the_api_key_disappears() {
                 assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
             }
         }
+    }
+}
+fn oauth_weekly_reading_at(used_percent: f64, reset_ms: i64, fetched_ms: i64) {
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    crate::account_quota::apply_provider_reply(
+        &mut state,
+        "test-source",
+        &serde_json::to_vec(&json!({
+            "result":[{"provider":"test-source","apiProvider":"synthetic","account":"oauth-account","source":"vault",
+                "fetchedAt":crate::account_selection::rfc3339(fetched_ms),
+                "usage":{"primary":{"usedPercent":used_percent,"windowMinutes":10080,
+                    "resetsAt":crate::account_selection::rfc3339(reset_ms)}}}],
+            "completeProviders":["test-source"]
+        }))
+        .unwrap(),
+        fetched_ms,
+    )
+    .unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+}
+
+#[tokio::test]
+async fn subscription_billing_refusal_with_exhausted_reading_holds_until_reset_without_probe() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let reset = NOW as i64 + 7 * 24 * 60 * 60_000;
+    oauth_weekly_reading_at(10.0, reset, NOW as i64);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let decision = selected.1["result"]["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    oauth_weekly_reading_at(100.0, reset, NOW as i64);
+    let reported = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":decision,"outcome":"refused","credential_id":"oauth:test","runner_code":"billing_exhausted"}),
+        )
+        .await;
+    assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
+    let blocks = harness
+        .store()
+        .account_transaction(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap();
+    assert_eq!(
+        blocks.len(),
+        1,
+        "the refusal creates an ordinary quota block"
+    );
+    let fence: prefrontal_routing_core::accounts::Fence =
+        serde_json::from_str(&blocks[0].evidence.fence_json).unwrap();
+    assert_eq!(
+        fence.reset,
+        prefrontal_routing_core::accounts::ResetTime::At(reset)
+    );
+    let blocked = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "quota-held"),
+        )
+        .await;
+    assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+    assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+    assert_eq!(
+        blocked.1["detail"]["reset_at_ms"],
+        json!(reset),
+        "held until the reading's reset: {}",
+        blocked.1
+    );
+    let probe_at = NOW as i64 + crate::credential_fences::FENCE_PROBE_RECHECK_MS + 1;
+    let _later = crate::InjectedClock::set(probe_at as u64);
+    // The original reading is stale now; its known reset must still hold.
+    let still = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "quota-held-after-probe-interval"),
+        )
+        .await;
+    assert_eq!(still.0, FrameType::Error, "{}", still.1);
+    assert_eq!(still.1["code"], "account_pool_exhausted", "{}", still.1);
+    assert_eq!(
+        still.1["detail"]["reset_at_ms"],
+        json!(reset),
+        "no probe is admitted before the reset: {}",
+        still.1
+    );
+    let evidence =
+        crate::diagnostics_findings::Evidence::gather(harness.store(), probe_at, 60_000).unwrap();
+    let diagnostics = crate::diagnostics_findings::report(&evidence, probe_at, 60_000);
+    let finding = diagnostics["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["check"] == "credential_fences")
+        .unwrap();
+    assert!(
+        finding["summary"]
+            .as_str()
+            .unwrap()
+            .contains(&crate::account_selection::rfc3339(reset)),
+        "{finding}"
+    );
+    assert!(
+        finding["summary"].as_str().unwrap().contains("quota-held"),
+        "{finding}"
+    );
+    assert!(
+        !finding["hint"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("top up"),
+        "{finding}"
+    );
+}
+
+#[tokio::test]
+async fn subscription_quota_hold_lifts_on_fresh_headroom_reading() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let reset = NOW as i64 + 3_600_000;
+    oauth_weekly_reading_at(10.0, reset, NOW as i64);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let decision = selected.1["result"]["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    oauth_weekly_reading_at(100.0, reset, NOW as i64);
+    let reported = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":decision,"outcome":"refused","credential_id":"oauth:test","runner_code":"billing_exhausted"}),
+        )
+        .await;
+    assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
+    let blocked = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "before-headroom"),
+        )
+        .await;
+    assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+    oauth_weekly_reading_at(10.0, reset, NOW as i64 + 60_000);
+    let _later = crate::InjectedClock::set(NOW + 60_000);
+    let admitted = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "after-headroom"),
+        )
+        .await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    assert_credential(&admitted, "oauth:test");
+}
+
+#[tokio::test]
+async fn pay_per_token_credential_without_reading_keeps_the_six_hour_probe() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    oauth_weekly_reading_at(10.0, NOW as i64 + 3_600_000, NOW as i64);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"codemode","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let reported = caller
+        .call(
+            "route.report",
+            &json!({
+                "decision_id": selected.1["result"]["decision_id"], "outcome":"refused",
+                "credential_id":"apikey:test", "runner_code":"billing_exhausted",
+            }),
+        )
+        .await;
+    assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
+    let mut request = account_request("synthetic", "apikey-probe");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    let blocked = runner.call("route.account_for", &request).await;
+    assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+    assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+    let _later = crate::InjectedClock::set(
+        NOW + crate::credential_fences::FENCE_PROBE_RECHECK_MS as u64 + 1,
+    );
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_credential(&admitted, "apikey:test");
+    assert_eq!(
+        admitted.1["result"]["reason"]["code"], "credential_fence_probe",
+        "{}",
+        admitted.1
+    );
+}
+
+#[tokio::test]
+async fn subscription_hold_diagnostics_names_reset_without_a_top_up_hint() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    let reset = NOW as i64 + 7 * 24 * 60 * 60_000;
+    oauth_weekly_reading_at(100.0, reset, NOW as i64);
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    crate::credential_fences::record(
+        harness.store(),
+        &shared,
+        &CredentialRefusal {
+            provider_id: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            code: "billing_exhausted".into(),
+        },
+        NOW as i64,
+    )
+    .unwrap();
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let _ = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "diagnostic-hold"),
+        )
+        .await;
+    let evidence =
+        crate::diagnostics_findings::Evidence::gather(harness.store(), NOW as i64, 60_000).unwrap();
+    let report = crate::diagnostics_findings::report(&evidence, NOW as i64, 60_000);
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["check"] == "credential_fences")
+        .unwrap();
+    assert!(
+        finding["summary"]
+            .as_str()
+            .unwrap()
+            .contains(&crate::account_selection::rfc3339(reset)),
+        "{finding}"
+    );
+    assert!(
+        finding["hint"]
+            .as_str()
+            .unwrap()
+            .contains(&crate::account_selection::rfc3339(reset)),
+        "{finding}"
+    );
+    assert!(
+        !finding["hint"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("top up"),
+        "{finding}"
+    );
+    assert!(
+        !finding["hint"].as_str().unwrap().contains("paid balance"),
+        "{finding}"
+    );
+}
+
+#[tokio::test]
+async fn repeated_subscription_refusals_keep_the_reset_and_require_newer_headroom() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    let reset = NOW as i64 + 7_200_000;
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    let refusal = CredentialRefusal {
+        provider_id: "synthetic".into(),
+        credential_id: "oauth:test".into(),
+        code: "billing_exhausted".into(),
+    };
+    oauth_weekly_reading_at(100.0, reset, NOW as i64);
+    crate::credential_fences::record(harness.store(), &shared, &refusal, NOW as i64).unwrap();
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let first = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "first-refusal"),
+        )
+        .await;
+    assert_eq!(
+        first.1["detail"]["reset_at_ms"],
+        json!(reset),
+        "{}",
+        first.1
+    );
+
+    let _later = crate::InjectedClock::set(NOW + 60_000);
+    crate::credential_fences::record(harness.store(), &shared, &refusal, NOW as i64 + 60_000)
+        .unwrap();
+    let second = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "second-refusal"),
+        )
+        .await;
+    assert_eq!(
+        second.1["detail"]["reset_at_ms"],
+        json!(reset),
+        "{}",
+        second.1
+    );
+    oauth_weekly_reading_at(10.0, reset, NOW as i64 + 30_000);
+    let older = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "older-headroom"),
+        )
+        .await;
+    assert_eq!(older.0, FrameType::Error, "{}", older.1);
+    assert_eq!(
+        older.1["detail"]["reset_at_ms"],
+        json!(reset),
+        "{}",
+        older.1
+    );
+
+    let _latest = crate::InjectedClock::set(NOW + 90_000);
+    oauth_weekly_reading_at(10.0, reset, NOW as i64 + 90_000);
+    let admitted = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "newer-headroom"),
+        )
+        .await;
+    assert_credential(&admitted, "oauth:test");
+    assert!(harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .is_empty());
+    assert!(harness
+        .store()
+        .account_transaction(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn persisted_subscription_billing_fence_converts_and_lifts_at_its_known_reset() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    let reset = NOW as i64 + 7 * 24 * 60 * 60_000;
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    crate::credential_fences::record(
+        harness.store(),
+        &shared,
+        &CredentialRefusal {
+            provider_id: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            code: "billing_exhausted".into(),
+        },
+        NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1,
+    )
+    .unwrap();
+    oauth_weekly_reading_at(99.5, reset, NOW as i64);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let blocked = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "converted-hold"),
+        )
+        .await;
+    assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+    assert_eq!(
+        blocked.1["detail"]["reset_at_ms"],
+        json!(reset),
+        "{}",
+        blocked.1
+    );
+    let blocks = harness
+        .store()
+        .account_transaction(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap();
+    assert_eq!(
+        blocks.len(),
+        1,
+        "persisted billing refusal becomes a quota block"
+    );
+
+    let _later = crate::InjectedClock::set(reset as u64 + 1);
+    // No new reading is needed to end a hold with a known reset.
+    let _ = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "after-known-reset"),
+        )
+        .await;
+    assert!(harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .is_empty());
+    assert!(harness
+        .store()
+        .account_transaction(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn run_and_reading_resets_keep_the_later_time_and_headroom_lifts_both() {
+    for (run_offset, reading_offset) in [(3_600_000, 7_200_000), (7_200_000, 3_600_000)] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let (harness, _) = setup("synthetic", false);
+        let reading_reset = NOW as i64 + reading_offset;
+        oauth_weekly_reading_at(10.0, reading_reset, NOW as i64);
+        let caller = harness.bind(reserved(OWNER), None).await;
+        let runner = harness.bind(reserved(RUNNER), None).await;
+        let selected = caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30}}),
+            )
+            .await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        oauth_weekly_reading_at(100.0, reading_reset, NOW as i64);
+        let reported = caller.call("route.report", &json!({
+            "decision_id":selected.1["result"]["decision_id"], "outcome":"failed", "credential_id":"oauth:test",
+            "runner_code":"account_limit_exhausted", "reset_at_ms":NOW as i64 + run_offset,
+        })).await;
+        assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
+        let blocked = runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "later-known-reset"),
+            )
+            .await;
+        assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+        assert_eq!(
+            blocked.1["detail"]["reset_at_ms"],
+            json!(NOW as i64 + 7_200_000),
+            "{}",
+            blocked.1
+        );
+        oauth_weekly_reading_at(10.0, reading_reset, NOW as i64 + 60_000);
+        let _later = crate::InjectedClock::set(NOW + 60_000);
+        let admitted = runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "headroom-after-run"),
+            )
+            .await;
+        assert_credential(&admitted, "oauth:test");
+        assert!(harness
+            .store()
+            .account_route_fences(NOW as i64 + 60_000)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn client_attestation_denied_fences_the_serving_credential() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let reset = NOW as i64 + 7 * 24 * 60 * 60_000;
+    oauth_weekly_reading_at(10.0, reset, NOW as i64);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let reported = caller.call("route.report", &json!({
+        "decision_id":selected.1["result"]["decision_id"], "outcome":"refused", "credential_id":"oauth:test",
+        "runner_code":"client_attestation_denied",
+    })).await;
+    assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
+    let fences = harness.store().credential_entitlement_fences().unwrap();
+    assert_eq!(fences.len(), 1, "{fences:?}");
+    assert_eq!(fences[0].code, "client_attestation_denied");
+    let blocked = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "attestation-fenced"),
+        )
+        .await;
+    assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+    assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+
+    let _newer = crate::InjectedClock::set(NOW + 60_000);
+    oauth_weekly_reading_at(10.0, reset, NOW as i64 + 60_000);
+    let still_fenced = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "newer-attestation-headroom"),
+        )
+        .await;
+    assert_eq!(still_fenced.0, FrameType::Error, "{}", still_fenced.1);
+    let fences = harness.store().credential_entitlement_fences().unwrap();
+    assert_eq!(fences.len(), 1, "headroom does not establish entitlement");
+    assert_eq!(fences[0].observed_at_ms, NOW as i64);
+
+    let probe_at = NOW + crate::credential_fences::FENCE_PROBE_RECHECK_MS as u64 + 1;
+    let _probe_time = crate::InjectedClock::set(probe_at);
+    oauth_weekly_reading_at(10.0, reset, probe_at as i64);
+    let request = account_request("synthetic", "attestation-probe");
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_credential(&admitted, "oauth:test");
+    assert_eq!(
+        admitted.1["result"]["reason"]["code"], "credential_fence_probe",
+        "{}",
+        admitted.1
+    );
+    assert_eq!(
+        runner.call("route.account_for", &request).await,
+        admitted,
+        "replay does not spend another probe"
+    );
+    let second = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "second-attestation-probe"),
+        )
+        .await;
+    assert_eq!(
+        second.0,
+        FrameType::Error,
+        "only one probe is admitted: {}",
+        second.1
+    );
+    assert_eq!(
+        harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms,
+        probe_at as i64
+    );
+}
+
+#[tokio::test]
+async fn entitlement_refusals_never_convert_to_quota_blocks() {
+    for code in ["ENTITLEMENT_ERROR", "client_attestation_denied"] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let (harness, credentials) = setup("synthetic", false);
+        let reset = NOW as i64 + 3_600_000;
+        oauth_weekly_reading_at(100.0, reset, NOW as i64);
+        let shared = Arc::new(std::sync::Mutex::new(credentials));
+        crate::credential_fences::record(
+            harness.store(),
+            &shared,
+            &CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "oauth:test".into(),
+                code: code.into(),
+            },
+            NOW as i64,
+        )
+        .unwrap();
+        let runner = harness.bind(reserved(RUNNER), None).await;
+        let blocked = runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "entitlement-not-quota"),
+            )
+            .await;
+        assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+        assert_eq!(
+            blocked.1["detail"]["reset_at_ms"],
+            json!(null),
+            "entitlement has no quota reset: {}",
+            blocked.1
+        );
+        assert!(
+            harness
+                .store()
+                .account_transaction(|tx| tx.active_pool_fences("synthetic"))
+                .unwrap()
+                .is_empty(),
+            "{code} is not quota exhaustion"
+        );
+        let _later = crate::InjectedClock::set(reset as u64 + 1);
+        oauth_weekly_reading_at(10.0, reset + 3_600_000, reset + 1);
+        let blocked = runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "entitlement-after-quota-reset"),
+            )
+            .await;
+        assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+        assert_eq!(
+            harness.store().credential_entitlement_fences().unwrap()[0].code,
+            code
+        );
+    }
+}
+
+#[tokio::test]
+async fn entitlement_finding_with_quota_reading_names_the_probe_and_hand_lift() {
+    for used_percent in [10.0, 100.0] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let (harness, credentials) = setup("synthetic", false);
+        oauth_weekly_reading_at(used_percent, NOW as i64 + 3_600_000, NOW as i64);
+        let shared = Arc::new(std::sync::Mutex::new(credentials));
+        crate::credential_fences::record(
+            harness.store(),
+            &shared,
+            &CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "oauth:test".into(),
+                code: "client_attestation_denied".into(),
+            },
+            NOW as i64,
+        )
+        .unwrap();
+        // Give diagnostics the same vault-to-account join used by selection.
+        crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap().roster =
+            Some(crate::account_quota::VaultRoster {
+                view: "test-view".into(),
+                fetched_at_ms: NOW as i64,
+                identities: vec![crate::account_quota::RosterIdentity {
+                    refresh_adapter: "test-source".into(),
+                    account_id: "oauth-account".into(),
+                    credential_ids: vec!["oauth:test".into()],
+                    active_credential_ids: vec!["oauth:test".into()],
+                    first_seen_ms: NOW as i64,
+                    plan_tier: None,
+                }],
+                grants: vec![],
+            });
+        let evidence =
+            crate::diagnostics_findings::Evidence::gather(harness.store(), NOW as i64, 60_000)
+                .unwrap();
+        let report = crate::diagnostics_findings::report(&evidence, NOW as i64, 60_000);
+        let finding = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["check"] == "credential_fences")
+            .unwrap();
+        let hint = finding["hint"].as_str().unwrap();
+        assert!(hint.contains("every 6 hours"), "{hint}");
+        assert!(
+            hint.contains("route.clear_credential_fences {\"credentialId\":\"oauth:test\"}"),
+            "{hint}"
+        );
+        assert!(!hint.contains("No timed probe"), "{hint}");
+        assert!(
+            !finding["summary"].as_str().unwrap().contains("quota-held"),
+            "{finding}"
+        );
     }
 }

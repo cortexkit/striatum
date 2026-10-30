@@ -1,5 +1,6 @@
-//! One-shot conversion of routing configuration. Runtime loading never calls
-//! this module: an operator must explicitly convert a legacy document.
+//! One-shot conversion of routing configuration and retired-key filtering.
+//! Runtime loading shares the quota-table filter, but never converts a legacy
+//! document: an operator must explicitly request conversion.
 
 use serde_json::{json, Map, Value};
 
@@ -26,6 +27,7 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
         .as_object()
         .cloned()
         .ok_or("routing config must be an object")?;
+    remove_account_model_families(&mut root);
     remove_account_flag(&mut root)?;
     if !root.contains_key("model_routing")
         && !root.contains_key("account_selection")
@@ -266,10 +268,7 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     root.remove("pins");
     root.remove("score_alias");
     root.extend(old);
-    // Family rules are first-match-wins; the data file holds them as an
-    // ordered list, which keeps that order through any JSON round trip.
-    root.entry("model_families")
-        .or_insert_with(|| data["model_families"].clone());
+    root.remove("model_families");
     root.entry("model_naming")
         .or_insert_with(|| data["model_naming"].clone());
     root.entry("head_agents")
@@ -280,15 +279,33 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
         root.insert("accounts".into(), accounts);
         remove_account_flag(&mut root)?;
     }
-    let accounts = root
-        .entry("accounts")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or("accounts must be an object")?;
-    accounts
-        .entry("model_families")
-        .or_insert_with(|| data["account_model_families"].clone());
+    remove_account_model_families(&mut root);
+    remove_account_flag(&mut root)?;
     Ok(Value::Object(root))
+}
+
+/// Drop the retired quota-family table without relaxing other unknown-key
+/// checks. The returned paths let runtime loading explain what was ignored.
+pub(crate) fn remove_account_model_families(root: &mut Map<String, Value>) -> Vec<String> {
+    let mut removed = Vec::new();
+    let mut remove = |accounts: Option<&mut Value>, path: String| {
+        if accounts
+            .and_then(Value::as_object_mut)
+            .is_some_and(|accounts| accounts.remove("model_families").is_some())
+        {
+            removed.push(path);
+        }
+    };
+    remove(root.get_mut("accounts"), "accounts.model_families".into());
+    if let Some(providers) = root.get_mut("providers").and_then(Value::as_object_mut) {
+        for (name, provider) in providers {
+            remove(
+                provider.get_mut("accounts"),
+                format!("providers.{name}.accounts.model_families"),
+            );
+        }
+    }
+    removed
 }
 
 fn remove_account_flag(root: &mut Map<String, Value>) -> Result<(), String> {
@@ -307,86 +324,5 @@ fn remove_account_flag(root: &mut Map<String, Value>) -> Result<(), String> {
 pub fn convert(document: &str) -> Result<String, String> {
     let json = subc_jsonc::jsonc_to_json(document)?;
     let value = serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    #[derive(serde::Deserialize)]
-    struct FamilyDocument {
-        #[serde(default)]
-        model_families: OrderedFamilies,
-    }
-    let families: FamilyDocument =
-        serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    let converted = convert_value(value)?;
-    serde_json::to_string_pretty(&ConvertedDocument {
-        root: converted.as_object().unwrap(),
-        families: &families.model_families,
-    })
-    .map_err(|error| error.to_string())
-}
-
-// Family rules are first-match-wins. serde_json::Value sorts object keys, so
-// preserve this one ordered map while serializing the converted document.
-#[derive(Default)]
-struct OrderedFamilies(Vec<(String, Value)>);
-
-impl<'de> serde::Deserialize<'de> for OrderedFamilies {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = OrderedFamilies;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an ordered family-rule object")
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut entries = Vec::new();
-                while let Some(entry) = map.next_entry()? {
-                    entries.push(entry);
-                }
-                Ok(OrderedFamilies(entries))
-            }
-            // List-form rules are ordered already; the converted document
-            // writes them as the input value holds them.
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(OrderedFamilies::default())
-            }
-        }
-        deserializer.deserialize_any(Visitor)
-    }
-}
-
-impl serde::Serialize for OrderedFamilies {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (name, rules) in &self.0 {
-            map.serialize_entry(name, rules)?;
-        }
-        map.end()
-    }
-}
-
-struct ConvertedDocument<'a> {
-    root: &'a Map<String, Value>,
-    families: &'a OrderedFamilies,
-}
-impl serde::Serialize for ConvertedDocument<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.root.len()))?;
-        for (key, value) in self.root {
-            // A document's own map-form rules keep their written order; the
-            // converter's list-form defaults are ordered already.
-            if key == "model_families" && !self.families.0.is_empty() {
-                map.serialize_entry(key, self.families)?;
-            } else {
-                map.serialize_entry(key, value)?;
-            }
-        }
-        map.end()
-    }
+    serde_json::to_string_pretty(&convert_value(value)?).map_err(|error| error.to_string())
 }

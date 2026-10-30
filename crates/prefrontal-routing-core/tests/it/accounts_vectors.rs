@@ -178,14 +178,12 @@ fn adapt_scoped(quota: &Value) -> ScopedList {
 
 #[test]
 fn scope_vectors_family_scope_and_absent_scope_predicate() {
-    let policy = policy();
     let value = vectors();
     let rows = value["scopes"].as_array().unwrap();
     assert_eq!(rows.len(), 9);
     for row in rows {
         let id = row["id"].as_str().unwrap();
-        let family = policy.family_for_model(row["model"].as_str().unwrap());
-        let check = scope_check(family, &adapt_scoped(&row["quota"]), &policy);
+        let check = scope_check(row["model"].as_str().unwrap(), &adapt_scoped(&row["quota"]));
         assert_eq!(
             check.matched,
             row["matched"].as_bool().unwrap(),
@@ -198,8 +196,8 @@ fn scope_vectors_family_scope_and_absent_scope_predicate() {
         );
     }
     // The two absent-scope cases pass but stay distinguishable.
-    let missing = scope_check(ModelFamily::Fable, &ScopedList::Missing, &policy);
-    let empty = scope_check(ModelFamily::Fable, &ScopedList::Listed(Vec::new()), &policy);
+    let missing = scope_check("claude-fable-5", &ScopedList::Missing);
+    let empty = scope_check("claude-fable-5", &ScopedList::Listed(Vec::new()));
     assert_ne!(missing.list_state, empty.list_state);
 }
 

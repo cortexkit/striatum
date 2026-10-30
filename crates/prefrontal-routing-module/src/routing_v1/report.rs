@@ -249,7 +249,11 @@ fn record_account_facts(
         .unwrap_or("");
     if matches!(
         code,
-        "ENTITLEMENT_ERROR" | "billing_exhausted" | "credit_insufficient" | "insufficient_quota"
+        "ENTITLEMENT_ERROR"
+            | "client_attestation_denied"
+            | "billing_exhausted"
+            | "credit_insufficient"
+            | "insufficient_quota"
     ) {
         crate::credential_fences::record(
             deps.store,
@@ -259,6 +263,14 @@ fn record_account_facts(
                 credential_id: credential.into(),
                 code: code.into(),
             },
+            now,
+        )
+        .map_err(store_refusal)?;
+        crate::account_selection::ClassContext::load(
+            deps.store,
+            deps.broca_credentials,
+            super::operator_config(deps),
+            crate::ACCOUNT_QUOTA.get(),
             now,
         )
         .map_err(store_refusal)?;

@@ -1817,12 +1817,21 @@ pub async fn account_quota_loop(
         // store transaction is open.
         let snapshot = state.lock().ok().map(|guard| guard.clone());
         if let Some(snapshot) = snapshot {
-            if let Err(error) = crate::account_selection::refresh_all_blocks(
+            let config =
+                crate::config_overrides::live_config(&crate::config_overrides::config_path());
+            let quota_view = Arc::new(Mutex::new(snapshot.clone()));
+            if let Err(error) = crate::account_selection::ClassContext::load(
                 &store,
-                &snapshot,
-                &crate::config_overrides::live_config(&crate::config_overrides::config_path()),
-                now_ms(),
+                &broca_credentials,
+                config.clone(),
+                Some(&quota_view),
+                at_ms,
             ) {
+                tracing::warn!(error = %error, "credential quota holds not refreshed");
+            }
+            if let Err(error) =
+                crate::account_selection::refresh_all_blocks(&store, &snapshot, &config, at_ms)
+            {
                 tracing::warn!(error = %error, "account blocks not refreshed");
             }
         }

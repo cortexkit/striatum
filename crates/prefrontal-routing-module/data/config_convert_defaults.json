@@ -4,30 +4,6 @@
   "subscription": ["opencode-go", "ollama-cloud"],
   "consumers": ["mason", "sidekick", "athena", "lab", "core", "codemode", "flow", "mc_summary", "mc_dream", "mc_dream_verify", "mc_dream_map", "mc_dream_curate", "mc_dream_classify", "mc_dream_review_user", "mc_dream_retrospective", "mc_dream_primers", "mc_dream_compress_cues", "mc_dream_docs"],
   "pay_per_token": ["codemode", "flow"],
-  "model_families": [
-    { "family": "claude", "globs": ["*/claude-*", "anthropic/*", "google/antigravity-claude-*"] },
-    { "family": "gpt", "globs": ["openai/*", "*/gpt-*", "*/o1*", "*/o3*", "*/o4*"] },
-    { "family": "gemini", "globs": ["*/gemini-*", "google/*"] },
-    { "family": "grok", "globs": ["*/grok-*", "xai/*"] },
-    { "family": "qwen", "globs": ["*/qwen*", "alibaba-*/*"] },
-    { "family": "kimi", "globs": ["*/kimi*", "moonshotai/*", "kimi-for-coding/*"] },
-    { "family": "glm", "globs": ["*/glm-*", "zai/*"] },
-    { "family": "deepseek", "globs": ["*/deepseek-*", "deepseek/*"] },
-    { "family": "minimax", "globs": ["*/minimax-*", "minimax/*"] },
-    { "family": "mistral", "globs": ["*/mistral-*", "mistral/*"] },
-    { "family": "llama", "globs": ["*/llama-*", "meta/*"] },
-    { "family": "other", "globs": ["*"] }
-  ],
-  "account_model_families": [
-    { "model": "claude-fable-5", "family": "fable" },
-    { "model": "claude-fable-5[1m]", "family": "fable" },
-    { "model": "claude-fable-5-1", "family": "fable" },
-    { "model": "claude-fable-5-1[1m]", "family": "fable" },
-    { "model": "claude-mythos-5-1", "family": "mythos" },
-    { "model": "claude-mythos-5-1[1m]", "family": "mythos" },
-    { "model": "claude-opus-5-5", "family": "opus" },
-    { "model": "claude-opus-5-5[1m]", "family": "opus" }
-  ],
   "model_naming": {
     "vendor_prefixes": [
       { "prefix": "claude-", "vendor": "anthropic" },

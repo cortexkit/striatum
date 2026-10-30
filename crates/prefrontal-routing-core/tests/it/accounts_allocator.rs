@@ -1081,7 +1081,52 @@ fn family_scope_excludes_only_its_family_and_absent_scope_passes() {
 }
 
 #[test]
-fn unmapped_scope_id_makes_only_fable_unknown() {
+fn model_id_scopes_gate_cold_and_sticky_picks_and_all_matching_windows_apply() {
+    let model = "claude-nova-8[1m]";
+    let mut r = reading(10.0, 10.0);
+    r.scoped = ScopedList::Listed(vec![
+        ScopedWindow {
+            scope_id: "Nova".into(),
+            used_percent: 5.0,
+            ..fable_window(5.0)
+        },
+        ScopedWindow {
+            scope_id: "claude-nova-8".into(),
+            used_percent: 100.0,
+            resets_at: ResetTime::At(NOW + 5 * MINUTE),
+            ..fable_window(100.0)
+        },
+    ]);
+    let mut st = state(vec![account("acct-a", Some(r.clone()))]);
+    let req = with_model(request(), model);
+    let cold = decide(&req, &st, NOW);
+    assert!(cold.hold().is_some(), "{cold:?}");
+    assert!(exclusions(&cold, "acct-a")
+        .iter()
+        .any(|reason| matches!(reason, ExclusionReason::ScopeExhausted { .. })));
+    st.affinity = Some(affinity("acct-a", model, 1));
+    let sticky = decide(&req, &st, NOW);
+    assert!(sticky.hold().is_some(), "{sticky:?}");
+
+    if let ScopedList::Listed(windows) = &mut r.scoped {
+        windows[1].used_percent = 50.0;
+    }
+    let healthy = decide(&req, &state(vec![account("acct-a", Some(r))]), NOW);
+    assert_eq!(admitted(&healthy), "acct-a");
+    assert_eq!(
+        healthy
+            .account_note("acct-a")
+            .unwrap()
+            .window_weights
+            .iter()
+            .filter(|window| window.window == ApplicableWindow::FamilyScope)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn unrelated_scope_id_does_not_make_model_quota_unknown() {
     let mut r = reading(10.0, 10.0);
     r.scoped = ScopedList::Listed(vec![ScopedWindow {
         scope_id: "claude-fable-weekly-v2".into(),
@@ -1091,14 +1136,14 @@ fn unmapped_scope_id_makes_only_fable_unknown() {
     }]);
     let st = state(vec![account("acct-a", Some(r))]);
     let decision = decide(&with_model(request(), "claude-fable-5"), &st, NOW);
-    assert_eq!(refused(&decision), RefusalCode::AccountQuotaUnknown);
-    assert_eq!(
-        exclusions(&decision, "acct-a"),
-        [ExclusionReason::ScopeUnmapped {
-            family: ModelFamily::Fable,
-            unmapped_scope_ids: vec!["claude-fable-weekly-v2".into()],
-        }]
-    );
+    assert_eq!(admitted(&decision), "acct-a");
+    assert!(exclusions(&decision, "acct-a").is_empty());
+    assert!(decision
+        .account_note("acct-a")
+        .unwrap()
+        .window_weights
+        .iter()
+        .all(|window| window.window != ApplicableWindow::FamilyScope));
     assert_eq!(
         admitted(&decide(&with_model(request(), "claude-opus-5-5"), &st, NOW)),
         "acct-a"

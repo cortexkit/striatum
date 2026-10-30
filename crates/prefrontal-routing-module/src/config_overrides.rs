@@ -17,17 +17,15 @@ use prefrontal_routing_core::model_facts::{
     Confidence, ModelFact, ModelScores, RoutePricing, ScoreProvenance,
 };
 use prefrontal_routing_core::{
-    make_capacity_key, make_route_key, FailureBackoffConfig, FamilySource, GrandFamily,
-    ModelRoutingPolicyInput, OverqualificationConfig, RouteStateStore, RoutingConfig,
-    DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
+    make_route_key, FailureBackoffConfig, ModelRoutingPolicyInput, OverqualificationConfig,
+    RoutingConfig, DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD, DEFAULT_DEMAND_EXPONENT,
     DEFAULT_OVERQUALIFICATION,
 };
 #[cfg(test)]
-use prefrontal_routing_core::{model_facts_seed, CatalogFactField, FactSource};
+use prefrontal_routing_core::{model_facts_seed, CatalogFactField, FactSource, RouteStateStore};
 use prefrontal_routing_store::ReasoningCatalog;
 use schemars::JsonSchema;
-use serde::de::{MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
@@ -295,13 +293,16 @@ fn parse_config_with_reporter(
     document: &str,
     mut report: impl FnMut(&str),
 ) -> Result<RoutingConfigFile, String> {
-    let json = jsonc_to_json(document)?;
-    let value: serde_json::Value =
+    let mut json = jsonc_to_json(document)?;
+    let mut value: serde_json::Value =
         serde_json::from_str(&json).map_err(|error| error.to_string())?;
     // Report the removed `aa` key with deletion guidance before checking unknown
     // fields, including when its value is null.
     if value.get("aa").is_some() {
         return Err("config_key_removed: aa; delete this key".into());
+    }
+    if value.get("model_families").is_some() {
+        return Err("config_key_removed: model_families; families now come from Fusiform's model.lineage; delete this section".into());
     }
     if value
         .get("accounts")
@@ -321,7 +322,30 @@ fn parse_config_with_reporter(
             ));
         }
     }
-    // Parse the original text so ordered model_families rules retain their order.
+    if let Some(root) = value.as_object_mut() {
+        let removed = crate::config_convert::remove_account_model_families(root);
+        if !removed.is_empty() {
+            // Re-serialize only the edited sections. Every other section keeps
+            // its raw text, because a round trip through Value reorders map keys.
+            let mut raw: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_str(&json).map_err(|error| error.to_string())?;
+            for key in ["accounts", "providers"] {
+                if let Some(section) = root.get(key) {
+                    raw.insert(
+                        key.into(),
+                        serde_json::value::to_raw_value(section)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+            }
+            json = serde_json::to_string(&raw).map_err(|error| error.to_string())?;
+            for key in removed {
+                report(&format!(
+                    "ignored retired key `{key}`; quota scopes are derived from Insula window ids; delete this key"
+                ));
+            }
+        }
+    }
     let mut config: RoutingConfigFile =
         serde_json::from_str(&json).map_err(|error| format!("invalid routing config: {error}"))?;
     let section = &mut config.model_routing;
@@ -948,8 +972,6 @@ struct RoutingConfigFile {
     consumers: BTreeMap<String, ConsumerPolicy>,
     #[serde(default)]
     runners: Vec<RunnerPolicy>,
-    #[serde(default)]
-    model_families: ModelFamilyRules,
     /// How providers spell model ids and which model families the capability
     /// heuristic recognizes; see `ModelNamingConfig`.
     #[serde(default)]
@@ -1062,9 +1084,6 @@ fn allocator_policy_from(
         if let Some(reset) = source.spend_budget_reset_at_ms {
             policy.spend_budget_reset_at_ms = Some(reset);
         }
-        if let Some(families) = &source.model_families {
-            policy.model_families = crate::config_policy::account_model_families(families);
-        }
     }
     Ok(policy)
 }
@@ -1111,19 +1130,6 @@ impl LiveConfig {
     /// The configured model-id spelling and capability families.
     pub(crate) fn model_naming(&self) -> prefrontal_routing_core::ModelNaming {
         self.config.model_naming.naming()
-    }
-
-    /// The model-to-family map of the top-level `accounts` section, for
-    /// account requests that are not tied to one provider's policy.
-    pub(crate) fn account_model_families(
-        &self,
-    ) -> Vec<prefrontal_routing_core::accounts::ModelFamilyMapping> {
-        self.config
-            .accounts
-            .model_families
-            .as_deref()
-            .map(crate::config_policy::account_model_families)
-            .unwrap_or_default()
     }
 
     pub(crate) fn allocator_policy(
@@ -1290,133 +1296,6 @@ impl ModelNamingConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelFamilyRule {
-    family: GrandFamily,
-    globs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelFamilyRules(Vec<ModelFamilyRule>);
-
-impl Serialize for ModelFamilyRules {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for rule in &self.0 {
-            map.serialize_entry(&rule.family, &rule.globs)?;
-        }
-        map.end()
-    }
-}
-
-impl JsonSchema for ModelFamilyRules {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "ModelFamilyRules".into()
-    }
-
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        let globs =
-            serde_json::json!({"type": "array", "items": {"type": "string", "pattern": "\\S"}});
-        let families: Vec<&str> = GrandFamily::ALL
-            .iter()
-            .map(|family| family.as_str())
-            .collect();
-        let properties: serde_json::Map<String, serde_json::Value> = families
-            .iter()
-            .map(|family| ((*family).to_owned(), globs.clone()))
-            .collect();
-        schemars::json_schema!({"oneOf": [
-            {"type": "object", "additionalProperties": false, "properties": properties},
-            {"type": "array", "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["family", "globs"],
-                "properties": {"family": {"enum": families}, "globs": globs}
-            }}
-        ]})
-    }
-}
-
-/// No rules unless the operator config writes them. The converter writes the
-/// shipped rules from its data file as an ordered list.
-impl Default for ModelFamilyRules {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
-
-impl ModelFamilyRules {
-    fn rule(wire_family: String, globs: Vec<String>) -> Result<ModelFamilyRule, String> {
-        let family = GrandFamily::from_wire(&wire_family)
-            .ok_or_else(|| format!("unknown model_families key `{wire_family}`"))?;
-        if globs.iter().any(|glob| glob.trim().is_empty()) {
-            return Err(format!(
-                "model_families.{wire_family} entries must be non-empty route globs"
-            ));
-        }
-        Ok(ModelFamilyRule { family, globs })
-    }
-}
-
-impl<'de> Deserialize<'de> for ModelFamilyRules {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct RulesVisitor;
-
-        impl<'de> Visitor<'de> for RulesVisitor {
-            type Value = ModelFamilyRules;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(
-                    "an ordered map of grand-family ids to route globs, or a list of \
-                     {family, globs} rules",
-                )
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut rules = Vec::new();
-                while let Some((wire_family, globs)) = map.next_entry::<String, Vec<String>>()? {
-                    rules.push(
-                        ModelFamilyRules::rule(wire_family, globs)
-                            .map_err(serde::de::Error::custom)?,
-                    );
-                }
-                Ok(ModelFamilyRules(rules))
-            }
-
-            // The list form keeps first-match order through any JSON value
-            // round trip, which sorts object keys.
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct Entry {
-                    family: String,
-                    globs: Vec<String>,
-                }
-                let mut rules = Vec::new();
-                while let Some(entry) = seq.next_element::<Entry>()? {
-                    rules.push(
-                        ModelFamilyRules::rule(entry.family, entry.globs)
-                            .map_err(serde::de::Error::custom)?,
-                    );
-                }
-                Ok(ModelFamilyRules(rules))
-            }
-        }
-
-        deserializer.deserialize_any(RulesVisitor)
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = routing_schema_constraints)]
@@ -1562,9 +1441,6 @@ impl OverqualificationSection {
 #[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ModelFactOverride {
-    /// Outer None means absent; Some(None) means an explicit JSON null clears it.
-    #[serde(default, deserialize_with = "deserialize_family_override")]
-    family: Option<Option<String>>,
     #[schemars(transform = positive_number)]
     elo: Option<f64>,
     #[schemars(transform = positive_number)]
@@ -1621,18 +1497,8 @@ fn parse_model_key(key: &str) -> Option<(String, String, Option<String>)> {
     Some((provider.to_string(), model.to_string(), variant))
 }
 
-fn deserialize_family_override<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(Some)
-}
-
 fn merge_override(base: &ModelFact, ov: &ModelFactOverride) -> ModelFact {
     let mut fact = base.clone();
-    if let Some(family) = &ov.family {
-        fact.family = family.clone();
-    }
     fact.scores = ModelScores {
         elo: ov.elo.unwrap_or(base.scores.elo),
         eq: ov.eq.unwrap_or(base.scores.eq),
@@ -1731,7 +1597,6 @@ pub fn apply_overrides_from_config<S: RouteStateStore>(
 ) -> Result<OverrideOutcome, String> {
     let config = read_routing_config(path)?.unwrap_or_default();
     let outcome = apply_overrides(store, &config.model_routing.models)?;
-    apply_family_rules(store, &config.model_families, &config.model_routing.models)?;
     Ok(outcome)
 }
 
@@ -1763,113 +1628,6 @@ pub(crate) fn read_routing_config_value(path: &Path) -> Result<Option<serde_json
     serde_json::from_str(&json)
         .map(Some)
         .map_err(|error| format!("invalid json in {}: {error}", path.display()))
-}
-
-pub(crate) fn apply_family_rules_from_config<S: RouteStateStore>(
-    store: &S,
-    path: &Path,
-) -> Result<usize, String> {
-    let config = &live_config(path).config;
-    apply_family_rules(store, &config.model_families, &config.model_routing.models)
-}
-
-fn glob_matches(pattern: &str, candidate: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let candidate = candidate.as_bytes();
-    let mut previous = vec![false; candidate.len() + 1];
-    previous[0] = true;
-    for token in pattern {
-        let mut next = vec![false; candidate.len() + 1];
-        if *token == b'*' {
-            next[0] = previous[0];
-            for index in 1..=candidate.len() {
-                next[index] = previous[index] || next[index - 1];
-            }
-        } else {
-            for index in 1..=candidate.len() {
-                next[index] =
-                    previous[index - 1] && (*token == b'?' || *token == candidate[index - 1]);
-            }
-        }
-        previous = next;
-    }
-    previous[candidate.len()]
-}
-
-fn matching_family(rules: &ModelFamilyRules, route_key: &str) -> Option<GrandFamily> {
-    rules.0.iter().find_map(|rule| {
-        rule.globs
-            .iter()
-            .any(|glob| glob_matches(glob, route_key))
-            .then_some(rule.family)
-    })
-}
-
-fn apply_family_rules<S: RouteStateStore>(
-    store: &S,
-    rules: &ModelFamilyRules,
-    overrides: &HashMap<String, ModelFactOverride>,
-) -> Result<usize, String> {
-    let mut explicit = HashMap::new();
-    for (key, model_override) in overrides {
-        let Some(family) = &model_override.family else {
-            continue;
-        };
-        let Some((provider_id, model_id, variant)) = parse_model_key(key) else {
-            continue;
-        };
-        let family = family
-            .as_deref()
-            .map(|wire| {
-                GrandFamily::from_wire(wire).ok_or_else(|| {
-                    format!("model_routing.models.{key}.family has unknown value `{wire}`")
-                })
-            })
-            .transpose()?;
-        explicit.insert(
-            make_route_key(&provider_id, &model_id, variant.as_deref()),
-            family,
-        );
-    }
-
-    let facts = store
-        .get_facts()
-        .map_err(|error| format!("listing model families: {error}"))?;
-    let mut updated = 0;
-    for fact in facts {
-        let route_key = make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
-        let (family, source) = if let Some(family) = explicit.get(&route_key) {
-            (*family, FamilySource::Override)
-        } else {
-            let capacity_key = make_capacity_key(&fact.provider_id, &fact.model_id);
-            if let Some(family) = matching_family(rules, &capacity_key) {
-                (Some(family), FamilySource::Rule)
-            } else {
-                let current = store
-                    .get_model_family(&route_key)
-                    .map_err(|error| format!("reading model family {route_key}: {error}"))?;
-                match current {
-                    Some((_, FamilySource::Rule)) => (None, FamilySource::Absent),
-                    Some((_, FamilySource::Override)) => {
-                        let restored = fact.family.as_deref().and_then(GrandFamily::from_wire);
-                        let source = if restored.is_some() {
-                            FamilySource::Curated
-                        } else {
-                            FamilySource::Absent
-                        };
-                        (restored, source)
-                    }
-                    Some((family, source)) => (family, source),
-                    None => continue,
-                }
-            }
-        };
-        store
-            .set_model_family(&route_key, family, source)
-            .map_err(|error| format!("writing model family {route_key}: {error}"))?;
-        updated += 1;
-    }
-    Ok(updated)
 }
 
 /// Read `min_best_effort_adequacy` from the routing config file, validating and
@@ -2406,7 +2164,6 @@ fn apply_overrides<S: RouteStateStore>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use super::*;
 
@@ -2426,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn family_override_distinguishes_absent_null_and_value() {
+    fn model_overrides_preserve_catalog_family_and_refuse_family_writes() {
         let base = ModelFact {
             billing_plane: None,
             auth_methods: None,
@@ -2481,10 +2238,8 @@ mod tests {
             merge_override(&base, &absent).family.as_deref(),
             Some("original")
         );
-        let cleared: ModelFactOverride = serde_json::from_str(r#"{"family":null}"#).unwrap();
-        assert_eq!(merge_override(&base, &cleared).family, None);
-        let set: ModelFactOverride = serde_json::from_str(r#"{"family":"gpt"}"#).unwrap();
-        assert_eq!(merge_override(&base, &set).family.as_deref(), Some("gpt"));
+        assert!(serde_json::from_str::<ModelFactOverride>(r#"{"family":null}"#).is_err());
+        assert!(serde_json::from_str::<ModelFactOverride>(r#"{"family":"gpt"}"#).is_err());
     }
 
     fn family_rule_rig(
@@ -2680,83 +2435,6 @@ mod tests {
         assert_ne!(sources.1.as_deref(), Some("override"));
         assert_eq!(sources.2.as_deref(), Some("override"));
 
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn explicit_family_override_beats_matching_rule() {
-        let (root, config_path, store) = family_rule_rig("override-wins");
-        crate::test_config::write(
-            &config_path,
-            r#"{
-                "model_families": { "gpt": ["openai/*"] },
-                "model_routing": {
-                    "models": { "openai/gpt-5.4": { "family": "other" } }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        apply_overrides_from_config(&store, &config_path).unwrap();
-        assert_eq!(
-            store.get_model_family("openai/gpt-5.4").unwrap(),
-            Some((Some(GrandFamily::Other), FamilySource::Override))
-        );
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn family_glob_order_uses_the_first_written_match() {
-        let (root, config_path, store) = family_rule_rig("first-match");
-        crate::test_config::write(
-            &config_path,
-            r#"{
-                "model_families": {
-                    "other": ["google/*"],
-                    "claude": ["google/antigravity-claude-*"]
-                }
-            }"#,
-        )
-        .unwrap();
-
-        apply_overrides_from_config(&store, &config_path).unwrap();
-        assert_eq!(
-            store
-                .get_model_family("google/antigravity-claude-opus-4-6-thinking")
-                .unwrap(),
-            Some((Some(GrandFamily::Other), FamilySource::Rule))
-        );
-        drop(store);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn example_family_rules_cover_every_seed_catalog_row() {
-        let (root, _config_path, store) = family_rule_rig("example-coverage");
-        let example = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/alfonso-routing.example.jsonc");
-        // Check that the example's model_families rules cover every catalog row
-        // without validating unrelated example settings.
-        #[derive(Deserialize)]
-        struct FamilyOnly {
-            model_families: ModelFamilyRules,
-        }
-        let document = jsonc_to_json(&std::fs::read_to_string(example).unwrap()).unwrap();
-        let families: FamilyOnly = serde_json::from_str(&document).unwrap();
-        apply_family_rules(&store, &families.model_families, &HashMap::new()).unwrap();
-        let facts = store.get_facts().unwrap();
-        let absent = facts.iter().filter(|fact| fact.family.is_none()).count();
-        assert_eq!(
-            absent, 0,
-            "the shipped catch-all must cover new catalog rows"
-        );
-        let mut counts = BTreeMap::<String, usize>::new();
-        for fact in facts {
-            *counts.entry(fact.family.unwrap()).or_default() += 1;
-        }
-        eprintln!("example model-family counts: {counts:?}");
-        drop(store);
         let _ = std::fs::remove_dir_all(root);
     }
 

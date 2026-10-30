@@ -986,19 +986,13 @@ fn select_panel_admitted(
     };
 
     let enforce_family_diversity = automatic;
-    if enforce_family_diversity {
-        candidates.retain(|candidate| match candidate.route.fact.family.as_ref() {
-            Some(_) => true,
-            None => {
-                causes.push(PanelCause {
-                    model: candidate.route.capacity_key.clone(),
-                    reason: PanelCauseReason::FamilyUnlabeled,
-                    reset_at_ms: None,
-                    detail: None,
-                });
-                false
-            }
-        });
+    // A catalog without lineage still supplies one family for diversity: `other`.
+    for candidate in &mut candidates {
+        candidate
+            .route
+            .fact
+            .family
+            .get_or_insert_with(|| "other".into());
     }
 
     if automatic {

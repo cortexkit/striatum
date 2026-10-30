@@ -98,6 +98,7 @@ fn harness_of(route_keys: &[&str], plan_prices: Value) -> Arc<Harness> {
                     reasoning_efforts: None,
                     canonical_id: None,
                     upstream_status: None,
+                    lineage: None,
                 }],
                 FusiformCatalogCursor {
                     catalog_version: 1,
