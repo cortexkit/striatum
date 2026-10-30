@@ -263,6 +263,30 @@ fn conversion_keeps_other_consumers_provider_restrictions_on_model_exceptions() 
     assert!(config.route_allowed("mason", "q/sidekick-only", false));
 }
 
+/// A scarce subscription model can serve Athena automatically while masons
+/// reach it only by an explicit pin; consumers outside `only_for` stay refused
+/// even when pinned.
+#[test]
+fn pin_only_for_requires_a_pin_only_for_the_named_consumers() {
+    let config = config(json!({
+        "models": {"anthropic/claude-opus-5-5": {
+            "only_for": ["athena", "lab", "mason"],
+            "pin_only_for": ["mason"]
+        }}
+    }));
+    let opus = "anthropic/claude-opus-5-5";
+    assert!(config.route_allowed("athena", opus, false));
+    assert!(config.route_allowed("athena.seat", opus, false));
+    assert!(!config.route_allowed("mason", opus, false));
+    assert!(config.route_allowed("mason", opus, true));
+    assert!(!config.route_allowed("sidekick", opus, true));
+    assert!(config
+        .config
+        .route_refusal("mason", opus, false)
+        .unwrap()
+        .contains("pin_only_for"));
+}
+
 #[test]
 fn consumer_pins_load_when_the_config_does_not_refuse_them_for_their_consumer() {
     // The pinned model is refused for sidekick only, so the athena and lab

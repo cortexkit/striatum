@@ -405,6 +405,10 @@ pub struct EntityPolicy {
     pub only_for: Option<Vec<String>>,
     pub not_for: Option<Vec<String>>,
     pub pin_only: Option<bool>,
+    /// Like `pin_only`, but only for these consumers and their dotted
+    /// descendants: other admitted consumers still route here automatically.
+    /// Lets a scarce model serve one consumer by choice and others by pin.
+    pub pin_only_for: Option<Vec<String>>,
     pub subscription: Option<bool>,
 }
 

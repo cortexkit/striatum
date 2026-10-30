@@ -239,8 +239,8 @@ impl LiveConfig {
         resolve_consumer_policy(consumer, &self.config.consumers, request, declared)
     }
 
-    /// Explicit pins bypass `pin_only`, but never a provider/model `only_for`
-    /// or `not_for` restriction.
+    /// Explicit pins bypass `pin_only` and `pin_only_for`, but never a
+    /// provider/model `only_for` or `not_for` restriction.
     pub fn route_allowed(&self, consumer: &str, route: &str, pinned: bool) -> bool {
         self.config.route_refusal(consumer, route, pinned).is_none()
     }
@@ -249,8 +249,8 @@ impl LiveConfig {
 impl RoutingConfigFile {
     /// Why this config refuses `route` for `consumer`, naming the config rule
     /// that refuses it, or `None` when the route is allowed. Explicit pins
-    /// bypass `pin_only`, but never a provider/model `only_for` or `not_for`
-    /// restriction, nor a provider's `models` list. The most specific
+    /// bypass `pin_only` and `pin_only_for`, but never a provider/model
+    /// `only_for` or `not_for` restriction, nor a provider's `models` list. The most specific
     /// `models` entry that sets a rule replaces the provider's rule.
     pub(super) fn route_refusal(
         &self,
@@ -270,6 +270,9 @@ impl RoutingConfigFile {
         let mut pin_only = provider_rules
             .and_then(|rules| rules.pin_only)
             .map(|value| (provider_source("pin_only"), value));
+        let mut pin_only_for = provider_rules
+            .and_then(|rules| rules.pin_only_for.as_ref())
+            .map(|names| (provider_source("pin_only_for"), names));
         let mut models: Vec<_> = self
             .model_routing
             .models
@@ -288,6 +291,9 @@ impl RoutingConfigFile {
             if let Some(value) = model.rules.pin_only {
                 pin_only = Some((model_source("pin_only"), value));
             }
+            if let Some(names) = &model.rules.pin_only_for {
+                pin_only_for = Some((model_source("pin_only_for"), names));
+            }
         }
         if let Some((source, names)) = only_for {
             if !names.iter().any(|name| consumer_matches(name, consumer)) {
@@ -302,6 +308,15 @@ impl RoutingConfigFile {
         if let Some((source, true)) = pin_only {
             if !pinned {
                 return Some(format!("{source} admits the route only when pinned"));
+            }
+        }
+        if let Some((source, names)) = pin_only_for {
+            if !pinned {
+                if let Some(name) = names.iter().find(|name| consumer_matches(name, consumer)) {
+                    return Some(format!(
+                        "{source} lists {name:?}, so it admits the route only when pinned"
+                    ));
+                }
             }
         }
         let listed = self.providers.get(provider)?.models.as_ref()?;

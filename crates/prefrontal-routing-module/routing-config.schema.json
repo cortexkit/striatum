@@ -442,6 +442,17 @@
           ],
           "default": null
         },
+        "pin_only_for": {
+          "description": "Like `pin_only`, but only for these consumers and their dotted\ndescendants: other admitted consumers still route here automatically.\nLets a scarce model serve one consumer by choice and others by pin.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
         "speed": {
           "type": [
             "number",
@@ -971,6 +982,17 @@
             "null"
           ],
           "default": null
+        },
+        "pin_only_for": {
+          "description": "Like `pin_only`, but only for these consumers and their dotted\ndescendants: other admitted consumers still route here automatically.\nLets a scarce model serve one consumer by choice and others by pin.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
         },
         "prompt_cache": {
           "type": [
