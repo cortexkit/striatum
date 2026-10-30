@@ -1,0 +1,76 @@
+{
+  "source": {
+    "repository": "fusiform",
+    "commit": "119258da721c5fac0e197d38f318e62100f8598e",
+    "path": "crates/fusiform-module/fixtures/served-payloads.json",
+    "projection": "Only routing identity, limits, tool support, wire.family and plane identity are retained. Entry names below identify the upstream served examples; no fact values are rewritten."
+  },
+  "catalog.get — one model, current": {
+    "catalog_version": 0,
+    "resolved_at_ms": -1,
+    "models": {
+      "anthropic/claude-sonnet-4-5": {
+        "capability.tool_call": true,
+        "existence": "present",
+        "limit.context": 1000000,
+        "limit.output": 64000,
+        "wire.family": "anthropic.messages"
+      }
+    }
+  },
+  "apikey luna — published cache-write": {
+    "catalog_version": 0,
+    "resolved_at_ms": -1,
+    "models": {
+      "openai/gpt-5.6-luna": {
+        "capability.tool_call": true,
+        "existence": "present",
+        "limit.context": 1050000,
+        "limit.output": 128000,
+        "wire.family": "openai.responses"
+      }
+    },
+    "plane": {
+      "auth_method": "apikey",
+      "kind": "upstream",
+      "provider_id": "openai"
+    }
+  },
+  "chatgpt luna — named, unfiltered": {
+    "catalog_version": 0,
+    "resolved_at_ms": -1,
+    "models": {
+      "openai/gpt-5.6-luna": {
+        "capability.tool_call": true,
+        "existence": "present",
+        "limit.context": 1050000,
+        "limit.output": 128000,
+        "wire.family": "openai.chatgpt_responses"
+      }
+    },
+    "plane": {
+      "auth_method": "chatgpt",
+      "kind": "quota_proxy",
+      "provider_id": "openai"
+    }
+  },
+  "catalog.get — meta oauth serves the curated row": {
+    "catalog_version": 0,
+    "resolved_at_ms": -1,
+    "curated": [{"model": "meta/muse-wonder-full-1.0", "auth_methods": ["oauth"]}],
+    "models": {
+      "meta/muse-wonder-full-1.0": {
+        "capability.tool_call": true,
+        "existence": "present",
+        "limit.context": 1048576,
+        "limit.output": null,
+        "wire.family": "openai.responses"
+      }
+    },
+    "plane": {
+      "auth_method": "oauth",
+      "kind": "quota_proxy",
+      "provider_id": "meta"
+    }
+  }
+}

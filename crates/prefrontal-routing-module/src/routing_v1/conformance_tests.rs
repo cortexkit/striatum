@@ -578,8 +578,8 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
         .zip(&runners)
         .map(|(runner, policy)| {
             let pairs = json!([
-                {"wire_api":"messages", "auth_method":"apikey"},
-                {"wire_api":"messages", "auth_method":"oauth"}
+                {"wire_api":"anthropic.messages", "auth_method":"apikey"},
+                {"wire_api":"anthropic.messages", "auth_method":"oauth"}
             ]);
             // Pass the fixture's tags through unchanged, so an invalid fixture tag
             // fails here rather than being filtered out of the declaration.
@@ -662,9 +662,6 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
                 })
             })
             .collect();
-        credentials.publish_billing_catalog(
-            crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&billing_facts),
-        );
         credentials.runner_declarations =
             super::runners::declarations_from_catalog(&json!(declarations));
         assert_eq!(credentials.runner_declarations.len(), catalog.runners.len());
@@ -673,10 +670,14 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
             .map(|fact| {
                 (
                     format!("{}/{}", fact.provider_id, fact.model_id),
-                    "messages".into(),
+                    "anthropic.messages".into(),
                 )
             })
             .collect();
+        let billing_catalog =
+            crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&billing_facts)
+                .with_wire_apis(&credentials.wire_apis);
+        credentials.publish_billing_catalog(billing_catalog);
     }
     harness.edit_config(|config| {
         config["runners"] = json!(runners);

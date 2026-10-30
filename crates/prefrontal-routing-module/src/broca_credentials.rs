@@ -185,14 +185,15 @@ impl BrocaCredentials {
                 .is_some_and(|at| now_ms.saturating_sub(at) <= MAX_AGE_MS)
     }
 
-    pub(crate) fn wire_api(&self, fact: &ModelFact) -> Option<&str> {
+    pub(crate) fn wire_api(&self, fact: &ModelFact, auth_method: &str) -> Option<&str> {
         let provider = self
             .priced_targets
             .get(&fact.provider_id)
             .unwrap_or(&fact.provider_id);
-        self.wire_apis
-            .get(&format!("{provider}/{}", fact.model_id))
-            .map(String::as_str)
+        let model = format!("{provider}/{}", fact.model_id);
+        self.billing_catalog
+            .wire_api(&model, auth_method)
+            .unwrap_or_else(|| self.wire_apis.get(&model).map(String::as_str))
     }
     /// The vault's listed facts, without deriving a credential kind from its id
     /// or refresh adapter. Selection uses these facts to classify account coverage.

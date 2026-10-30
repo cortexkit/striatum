@@ -409,6 +409,7 @@ struct BillingRule {
 struct PlanePage {
     plane: PlaneDescriptor,
     rates: BTreeMap<String, ModelRates>,
+    wire_apis: BTreeMap<String, String>,
     billing_rules: Vec<BillingRule>,
 }
 
@@ -416,6 +417,20 @@ struct PlanePage {
 enum PlaneReply {
     Served(PlanePage),
     Refused { code: String, message: String },
+}
+
+fn wire_families(models: &Value) -> BTreeMap<String, String> {
+    models
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(model, entry)| {
+            Some((
+                model.clone(),
+                entry.get("wire.family")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
 }
 
 fn decode_plane_get(bytes: &[u8]) -> Result<PlaneReply, FusiformCatalogError> {
@@ -435,6 +450,7 @@ fn decode_plane_get(bytes: &[u8]) -> Result<PlaneReply, FusiformCatalogError> {
         plane: serde_json::from_value(value["plane"].clone())
             .map_err(FusiformCatalogError::Json)?,
         rates: model_rates(&value["models"])?,
+        wire_apis: wire_families(&value["models"]),
         billing_rules: serde_json::from_value(
             value
                 .get("billing_rules")
@@ -471,6 +487,16 @@ pub(crate) struct PlaneCatalog {
 }
 
 impl PlaneCatalog {
+    /// A served plane is authoritative, including when it has no wire fact.
+    /// Only routes without a served plane may use the ordinary catalog value.
+    pub(crate) fn wire_api(&self, model: &str, auth_method: &str) -> Option<Option<&str>> {
+        let provider = model.split_once('/')?.0;
+        match self.pages.get(&(provider.into(), auth_method.into())) {
+            Some(PlaneReply::Served(page)) => Some(page.wire_apis.get(model).map(String::as_str)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn subscription_plan_providers(&self) -> BTreeSet<String> {
         self.pages
             .values()
@@ -485,6 +511,31 @@ impl PlaneCatalog {
 
     pub(crate) fn is_loaded(&self) -> bool {
         self.version.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_wire_apis(mut self, wire_apis: &BTreeMap<String, String>) -> Self {
+        for reply in self.pages.values_mut() {
+            if let PlaneReply::Served(page) = reply {
+                page.wire_apis = wire_apis.clone();
+            }
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_plane(mut self, bytes: &[u8]) -> Self {
+        let PlaneReply::Served(page) = decode_plane_get(bytes).unwrap() else {
+            panic!("expected a served billing plane");
+        };
+        self.pages.insert(
+            (
+                page.plane.provider_id.clone(),
+                page.plane.auth_method.clone(),
+            ),
+            PlaneReply::Served(page),
+        );
+        self
     }
 
     #[cfg(test)]
@@ -513,6 +564,7 @@ impl PlaneCatalog {
                             },
                         )]),
                         billing_rules: vec![],
+                        wire_apis: BTreeMap::new(),
                     }),
                 );
                 continue;
@@ -796,7 +848,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         ) {
             Ok((fact, model_rates)) => {
                 facts.push(fact);
-                if let Some(api) = entry.get("transport.wire_api").and_then(Value::as_str) {
+                if let Some(api) = entry.get("wire.family").and_then(Value::as_str) {
                     wire_apis.insert(served_key.clone(), api.to_owned());
                 }
                 rates.insert(served_key, model_rates);
@@ -1448,15 +1500,7 @@ pub(crate) fn apply_mapped_catalog(
         let mut credentials = credentials
             .lock()
             .map_err(|_| error("credential cache poisoned"))?;
-        // An unreadable entry is not a withdrawal of its last known transport.
-        let previous = credentials.wire_apis.clone();
         credentials.wire_apis = snapshot.wire_apis.clone();
-        for (provider, model) in &snapshot.retained {
-            let key = format!("{provider}/{model}");
-            if let Some(api) = previous.get(&key) {
-                credentials.wire_apis.insert(key, api.clone());
-            }
-        }
         credentials.catalog_snapshot = Some(Arc::new(snapshot.clone()));
     }
     Ok(())

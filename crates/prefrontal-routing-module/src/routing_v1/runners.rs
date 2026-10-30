@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 pub(crate) use cortexkit_role_routing::declarations::RunnerDeclaration;
 use cortexkit_role_routing::declarations::{RunnerPair, StandingLimits};
+use cortexkit_role_routing::spellings::{AUTH_METHODS, WIRE_APIS};
 use prefrontal_routing_core::RouteStateStore;
 use prefrontal_routing_core::{
     make_route_key,
@@ -36,6 +37,8 @@ pub(crate) struct EffectiveRunner {
     route_policy: Option<Vec<String>>,
     #[serde(skip)]
     reachable_models: BTreeSet<String>,
+    #[serde(skip)]
+    unverified_wire_models: BTreeSet<String>,
 }
 
 fn is_true(value: &bool) -> bool {
@@ -80,7 +83,11 @@ impl Registry {
             .into_iter()
             .map(|mut policy| {
                 let declaration = credentials.runner_declarations.get(&policy.module);
+                if let Some(declaration) = declaration {
+                    report_unknown_pair_tokens_once(&policy.module, declaration);
+                }
                 let needs_vault = declaration.is_some() || policy.via_vault;
+                let mut unverified_wire_models = BTreeSet::new();
                 let reachable_models: BTreeSet<_> = facts
                     .iter()
                     .filter(|fact| {
@@ -98,17 +105,36 @@ impl Registry {
                                                 .is_none_or(|providers| {
                                                     providers.contains(&fact.provider_id)
                                                 })
-                                                && declaration.pairs.iter().any(|pair| {
-                                                    credentials.wire_api(fact)
-                                                        == Some(pair.wire_api.as_str())
-                                                        && row.auth_method.as_ref()
-                                                            == Some(&pair.auth_method)
-                                                })
+                                                && {
+                                                    let method =
+                                                        row.auth_method.as_deref().unwrap_or("");
+                                                    if fact.billing_plane.as_ref().is_some_and(
+                                                        |plane| plane.auth_method != method,
+                                                    ) {
+                                                        return false;
+                                                    }
+                                                    let Some(api) =
+                                                        credentials.wire_api(fact, method)
+                                                    else {
+                                                        unverified_wire_models.insert(format!(
+                                                            "{}/{}",
+                                                            fact.provider_id, fact.model_id
+                                                        ));
+                                                        return false;
+                                                    };
+                                                    declaration.pairs.iter().any(|pair| {
+                                                        known_pair(pair)
+                                                            && api == pair.wire_api
+                                                            && row.auth_method.as_ref()
+                                                                == Some(&pair.auth_method)
+                                                    })
+                                                }
                                         })
                                 }))
                     })
                     .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
                     .collect();
+                unverified_wire_models.retain(|model| !reachable_models.contains(model));
                 let route_policy = policy.routes.clone();
                 let routes = facts
                     .iter()
@@ -147,6 +173,7 @@ impl Registry {
                     starts_sessions: declaration.is_none_or(|d| d.starts_sessions),
                     route_policy,
                     reachable_models,
+                    unverified_wire_models,
                 }
             })
             .collect();
@@ -174,6 +201,16 @@ impl Registry {
             // Variants share their model's transport and credential reach, but
             // operator route rules still judge the exact requested variant.
             runner.reachable_models.contains(capacity)
+                && runner
+                    .route_policy
+                    .as_ref()
+                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+        })
+    }
+
+    pub(crate) fn wire_family_unverified(&self, module: &str, route: &str, capacity: &str) -> bool {
+        self.get(module).is_some_and(|runner| {
+            runner.unverified_wire_models.contains(capacity)
                 && runner
                     .route_policy
                     .as_ref()
@@ -208,6 +245,30 @@ pub(crate) fn parse_declaration(
         .map_err(|error| error.to_string())
 }
 
+fn known_pair(pair: &RunnerPair) -> bool {
+    WIRE_APIS.contains(&pair.wire_api.as_str()) && AUTH_METHODS.contains(&pair.auth_method.as_str())
+}
+
+fn report_unknown_pair_tokens_once(module: &str, declaration: &RunnerDeclaration) {
+    use std::sync::Mutex;
+    static REPORTED: Mutex<BTreeSet<(String, &'static str, String)>> = Mutex::new(BTreeSet::new());
+    let Ok(mut reported) = REPORTED.lock() else {
+        return;
+    };
+    for pair in &declaration.pairs {
+        for (field, token, known) in [
+            ("wire_api", pair.wire_api.as_str(), WIRE_APIS),
+            ("auth_method", pair.auth_method.as_str(), AUTH_METHODS),
+        ] {
+            if !known.contains(&token) && reported.insert((module.into(), field, token.into())) {
+                crate::warn_operator(format!(
+                    "[prefrontal-routing] runner {module}: unknown {field} token {token:?}; pair cannot match"
+                ));
+            }
+        }
+    }
+}
+
 /// Each successful catalog read replaces the declaration snapshot, so removal
 /// or loss of nonce verification also removes a module's previously trusted facts.
 pub(crate) fn declarations_from_catalog(
@@ -220,7 +281,10 @@ pub(crate) fn declarations_from_catalog(
         let module = entry.get("module_id")?.as_str()?;
         let slot = entry.get("role_declarations")?.get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)?;
         match parse_declaration(slot) {
-            Ok(Some(declaration)) => Some((module.to_owned(), declaration)),
+            Ok(Some(declaration)) => {
+                report_unknown_pair_tokens_once(module, &declaration);
+                Some((module.to_owned(), declaration))
+            }
             Ok(None) => None,
             Err(error) => {
                 crate::warn_operator(format!("[prefrontal-routing] ignored invalid runner declaration from {module}: {error}"));
