@@ -814,6 +814,70 @@ fn spend_pool_without_a_stated_balance_decodes_and_neither_walls_nor_paces() {
     assert_eq!(decoded, windows[1]);
 }
 
+/// Live on 2026-10-30 from 12:06Z: every Codex account reached its weekly limit
+/// while two of them still held prepaid credits, which OpenAI draws once that
+/// limit is reached. The overlay walled GPT-6.1 Sol until the weekly reset four
+/// days out, so selection refused every worker launch before the account allocator,
+/// which admits on prepaid credits, was asked. A full window on an account with
+/// a positive credits balance paces the route but does not wall it; with no
+/// balance left, or the pool closed, the same window walls as before.
+#[test]
+fn a_full_window_does_not_wall_an_account_that_holds_prepaid_credits() {
+    let facts = vec![fact("openai", "gpt-6.1-sol", 1.0)];
+    let codex = |credits: serde_json::Value| {
+        usage_from_json(serde_json::json!({
+            "provider": "codex", "apiProvider": "openai",
+            "account": "00000000-0000-4000-8000-0000000000a2",
+            "usage": { "primary": {
+                "usedPercent": 100.0, "windowMinutes": 10080,
+                "resetsAt": "2099-01-01T00:00:00Z"
+            } },
+            "spend": [credits]
+        }))
+    };
+    let pool = |minor: i64, spendable: Option<bool>| {
+        let mut pool = serde_json::json!({
+            "basis": "reported", "funding": "unknown", "id": "credits",
+            "label": "Prepaid credits",
+            "remaining": { "exponent": 9, "minor": minor, "unit": "credit" }
+        });
+        if let Some(spendable) = spendable {
+            pool["spendable"] = serde_json::json!(spendable);
+        }
+        pool
+    };
+    let state = |credits| {
+        overlay(&[codex(credits)], &facts)
+            .by_capacity
+            .get(&make_capacity_key("openai", "gpt-6.1-sol"))
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let carried = state(pool(53_287_321_383_500, None));
+    assert_eq!(
+        carried.quota_exhausted_until, None,
+        "prepaid credits carry the account past its full window"
+    );
+    assert!(
+        carried
+            .quota_pressure
+            .is_some_and(|pressure| pressure > 0.0),
+        "the full window still paces the route: {carried:?}"
+    );
+
+    assert!(
+        state(pool(0, None)).quota_exhausted_until.is_some(),
+        "an empty credits balance leaves the full window walling the route"
+    );
+    assert!(
+        state(pool(53_287_321_383_500, Some(false)))
+            .quota_exhausted_until
+            .is_some(),
+        "a credits pool the producer closed leaves the full window walling the route"
+    );
+}
+
 /// An idle account is a FREE account, and the across-account fold walls a
 /// capacity only when every account holding a signal for it is walled. An
 /// account that contributes no signal holds none, so an idle sibling used to

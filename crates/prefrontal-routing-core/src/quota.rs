@@ -172,6 +172,18 @@ impl SpendPool {
         self.remaining.is_some() && self.producer_allows_spend() && self.has_supported_funding()
     }
 
+    /// A prepaid-credits pool (`credits`) with a stated positive balance that
+    /// the producer has not closed. The provider draws it once the plan's limit
+    /// is reached, so it keeps the account serving past a full window.
+    pub fn carries_prepaid_credits(&self) -> bool {
+        self.id == "credits"
+            && self.producer_allows_spend()
+            && self
+                .remaining
+                .as_ref()
+                .is_some_and(|balance| !balance.is_non_positive())
+    }
+
     fn utilization(&self) -> f64 {
         let Some(remaining) = self.remaining.as_ref() else {
             // Unreachable through `can_inform_pacing`; an unknown balance adds
@@ -618,6 +630,13 @@ pub fn merge_quota_overlay_with(
             join.provider_id.to_string(),
             entry.account.clone().unwrap_or_default(),
         );
+        // The provider draws an account's prepaid credits once its plan limit
+        // is reached, so a full window on an account that still holds credits
+        // is not a wall. Whether new work may spend those credits is the account
+        // allocator's decision under its paid-credits policy, made on the same
+        // reading; walling the route here would refuse the work before the
+        // allocator is asked. The full window still paces the route.
+        let carries_prepaid_credits = entry.spend.iter().any(SpendPool::carries_prepaid_credits);
         for win in extracted {
             if win.resets_at.is_some_and(|resets_at| resets_at <= now_ms) {
                 continue; // an explicitly past reset is no longer in force
@@ -640,7 +659,8 @@ pub fn merge_quota_overlay_with(
                 // selector choose the exhausted route (Loop R140).
                 Err(PaceError::RollingWindow) => None,
             };
-            let blocked = win.limit_reached || win.utilization >= hard_block_threshold;
+            let blocked = !carries_prepaid_credits
+                && (win.limit_reached || win.utilization >= hard_block_threshold);
 
             // The capacities this window applies to.
             let targets: Vec<String> = match win.scope_kind {
