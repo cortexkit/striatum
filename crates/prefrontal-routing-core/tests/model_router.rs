@@ -4298,6 +4298,7 @@ fn quota_account(used: f64) -> prefrontal_routing_core::subscription::QuotaAccou
         short_windows: Vec::new(),
         banked_resets: 3,
         banked_expires_at_ms: Some(2_000_000),
+        prepaid_credits: false,
     }
 }
 

@@ -1438,6 +1438,7 @@ fn decision_rejections_retain_subscription_reserve_numbers_ahead_of_catalog_tail
                 short_windows: Vec::new(),
                 banked_resets: 0,
                 banked_expires_at_ms: None,
+                prepaid_credits: false,
             }],
         }],
         ..Default::default()

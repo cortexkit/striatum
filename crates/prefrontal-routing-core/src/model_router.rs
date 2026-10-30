@@ -3010,6 +3010,7 @@ mod task_profile_pricing_tests {
                         short_windows: Vec::new(),
                         banked_resets: 0,
                         banked_expires_at_ms: None,
+                        prepaid_credits: false,
                     }],
                 }],
                 ..Default::default()

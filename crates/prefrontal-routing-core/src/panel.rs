@@ -1352,6 +1352,7 @@ mod reset_tests {
             short_windows: vec![],
             banked_resets: 0,
             banked_expires_at_ms: None,
+            prepaid_credits: false,
         };
         let runtime = crate::model_router::RouteRuntimeState {
             subscription_pool: Some(std::sync::Arc::new(SubscriptionPool {

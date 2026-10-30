@@ -131,6 +131,21 @@ fn astro_fee(row: &Value, account_id: &str, now: i64) -> Option<f64> {
     (fee.is_finite() && fee > 0.0).then_some(fee)
 }
 
+/// A `credits` spend pool with a positive balance the producer has not closed
+/// (`spendable: false`). The provider draws it once the plan's limit is
+/// reached, so the account keeps serving past a full window.
+fn carries_prepaid_credits(reading: &Value) -> bool {
+    reading["spend"].as_array().is_some_and(|pools| {
+        pools.iter().any(|pool| {
+            pool["id"] == "credits"
+                && pool["spendable"].as_bool() != Some(false)
+                && pool["remaining"]["minor"]
+                    .as_i64()
+                    .is_some_and(|minor| minor > 0)
+        })
+    })
+}
+
 fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
     let usage = reading.get("usage")?;
     let mut windows: Vec<&Value> = ["primary", "secondary", "tertiary"]
@@ -217,6 +232,7 @@ fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
                             .min()
                     })
             }),
+        prepaid_credits: carries_prepaid_credits(reading),
     })
 }
 

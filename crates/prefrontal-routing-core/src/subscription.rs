@@ -43,6 +43,10 @@ pub struct QuotaAccount {
     pub short_windows: Vec<QuotaConstraint>,
     pub banked_resets: u32,
     pub banked_expires_at_ms: Option<i64>,
+    /// The account holds a spendable prepaid-credits balance, which the
+    /// provider draws once the plan's limit is reached. Such an account keeps
+    /// serving with no weekly headroom, so it never leaves the pool walled.
+    pub prepaid_credits: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -228,7 +232,17 @@ impl SubscriptionPool {
     }
 
     pub fn available(&self, keep_free: f64, head: bool) -> bool {
-        self.plans.is_empty() && (head || keep_free == 0.0)
+        // Prepaid credits carry an account past its plan limit, so the keep-free
+        // margin, which protects the plan's own quota, cannot leave a pool with
+        // such an account empty. The account allocator then spends the credits
+        // under its paid-credits policy.
+        let credit_backed = self.plans.iter().any(|plan| {
+            plan.accounts
+                .iter()
+                .any(|account| account.prepaid_credits && !account.short_walled)
+        });
+        credit_backed
+            || self.plans.is_empty() && (head || keep_free == 0.0)
             || self.plans.iter().enumerate().any(|(index, plan)| {
                 match plan
                     .budget(
@@ -538,6 +552,7 @@ mod tests {
                 short_windows: Vec::new(),
                 banked_resets: 3,
                 banked_expires_at_ms: Some(10_000),
+                prepaid_credits: false,
             }],
         }
     }
@@ -554,6 +569,33 @@ mod tests {
         assert!(banked.1 < ordinary.1);
         assert_eq!(p.budget(100.0, false, true, 1).0, Some(0.0));
         assert_eq!(p.budget(0.0, false, true, 10_001).2, 0);
+    }
+
+    /// Live on 2026-10-30 after 14:20Z: every Codex account sat at its weekly
+    /// limit while two held prepaid credits, and the keep-free check refused
+    /// every worker before the account allocator, which spends credits, ran.
+    #[test]
+    fn prepaid_credits_keep_a_full_pool_available_to_workers() {
+        let pool = |credits| SubscriptionPool {
+            provider: "openai".into(),
+            keep_free_percent: 5.0,
+            plans: vec![{
+                let mut p = plan(100.0);
+                p.accounts[0].banked_resets = 0;
+                p.accounts[0].prepaid_credits = credits;
+                p
+            }],
+            allow_banked: true,
+            now_ms: 1,
+        };
+        assert!(!pool(false).available(5.0, false));
+        assert!(pool(true).available(5.0, false));
+        let mut walled = pool(true);
+        walled.plans[0].accounts[0].short_walled = true;
+        assert!(
+            !walled.available(5.0, false),
+            "a short window still walls the account"
+        );
     }
 
     #[test]
