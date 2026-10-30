@@ -956,6 +956,8 @@ pub struct SqliteRouteStateStore {
     /// `None` until a fingerprint is computed while the change tracking is in
     /// place, and reset whenever that tracking has to be installed again.
     catalog_fingerprint: Mutex<Option<CachedCatalogFingerprint>>,
+    #[cfg(any(test, feature = "test-support"))]
+    account_write_transactions: AtomicU64,
 }
 
 /// What a cached catalog fingerprint is valid for: this connection's count of
@@ -1244,6 +1246,8 @@ impl SqliteRouteStateStore {
             usage_generation: AtomicU64::new(0),
             reported_score_conflicts: Mutex::new(HashSet::new()),
             catalog_fingerprint: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            account_write_transactions: AtomicU64::new(0),
         })
     }
 
