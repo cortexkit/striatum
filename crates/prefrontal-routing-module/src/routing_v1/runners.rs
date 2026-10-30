@@ -38,6 +38,8 @@ pub(crate) struct EffectiveRunner {
     #[serde(skip)]
     reachable_models: BTreeSet<String>,
     #[serde(skip)]
+    statically_reachable_models: BTreeSet<String>,
+    #[serde(skip)]
     unverified_wire_models: BTreeSet<String>,
 }
 
@@ -88,52 +90,56 @@ impl Registry {
                 }
                 let needs_vault = declaration.is_some() || policy.via_vault;
                 let mut unverified_wire_models = BTreeSet::new();
-                let reachable_models: BTreeSet<_> = facts
+                let statically_reachable_models: BTreeSet<_> = facts
                     .iter()
                     .filter(|fact| {
                         !needs_vault
-                            || (credentials.listing_is_fresh(now_ms)
-                                && credentials.listed_credentials().iter().any(|row| {
-                                    credential_serves_fact(row, fact, &catalog)
-                                        && declaration.is_none_or(|declaration| {
-                                            declaration
-                                                .standing_limits
-                                                .as_ref()
-                                                .and_then(|limits| {
-                                                    limits.explicit_providers.as_ref()
-                                                })
-                                                .is_none_or(|providers| {
-                                                    providers.contains(&fact.provider_id)
-                                                })
-                                                && {
-                                                    let method =
-                                                        row.auth_method.as_deref().unwrap_or("");
-                                                    if fact.billing_plane.as_ref().is_some_and(
-                                                        |plane| plane.auth_method != method,
-                                                    ) {
-                                                        return false;
-                                                    }
-                                                    let Some(api) =
-                                                        credentials.wire_api(fact, method)
-                                                    else {
-                                                        unverified_wire_models.insert(format!(
-                                                            "{}/{}",
-                                                            fact.provider_id, fact.model_id
-                                                        ));
-                                                        return false;
-                                                    };
-                                                    declaration.pairs.iter().any(|pair| {
-                                                        known_pair(pair)
-                                                            && api == pair.wire_api
-                                                            && row.auth_method.as_ref()
-                                                                == Some(&pair.auth_method)
-                                                    })
+                            || credentials.listed_credentials().iter().any(|row| {
+                                credential_serves_fact(row, fact, &catalog)
+                                    && declaration.is_none_or(|declaration| {
+                                        declaration
+                                            .standing_limits
+                                            .as_ref()
+                                            .and_then(|limits| limits.explicit_providers.as_ref())
+                                            .is_none_or(|providers| {
+                                                providers.contains(&fact.provider_id)
+                                            })
+                                            && {
+                                                let method =
+                                                    row.auth_method.as_deref().unwrap_or("");
+                                                if fact.billing_plane.as_ref().is_some_and(
+                                                    |plane| plane.auth_method != method,
+                                                ) {
+                                                    return false;
                                                 }
-                                        })
-                                }))
+                                                let Some(api) = credentials.wire_api(fact, method)
+                                                else {
+                                                    unverified_wire_models.insert(format!(
+                                                        "{}/{}",
+                                                        fact.provider_id, fact.model_id
+                                                    ));
+                                                    return false;
+                                                };
+                                                declaration.pairs.iter().any(|pair| {
+                                                    known_pair(pair)
+                                                        && api == pair.wire_api
+                                                        && row.auth_method.as_ref()
+                                                            == Some(&pair.auth_method)
+                                                })
+                                            }
+                                    })
+                            })
                     })
                     .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
                     .collect();
+                // Listing age can stop a send, but cannot change which model
+                // scores define IQ when the last listing still names its credential.
+                let reachable_models = if !needs_vault || credentials.listing_is_fresh(now_ms) {
+                    statically_reachable_models.clone()
+                } else {
+                    unverified_wire_models.clear();
+                    BTreeSet::new()
+                };
                 unverified_wire_models.retain(|model| !reachable_models.contains(model));
                 let route_policy = policy.routes.clone();
                 let routes = facts
@@ -173,6 +179,7 @@ impl Registry {
                     starts_sessions: declaration.is_none_or(|d| d.starts_sessions),
                     route_policy,
                     reachable_models,
+                    statically_reachable_models,
                     unverified_wire_models,
                 }
             })
@@ -201,6 +208,16 @@ impl Registry {
             // Variants share their model's transport and credential reach, but
             // operator route rules still judge the exact requested variant.
             runner.reachable_models.contains(capacity)
+                && runner
+                    .route_policy
+                    .as_ref()
+                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+        })
+    }
+
+    pub(crate) fn can_run(&self, module: &str, route: &str, capacity: &str) -> bool {
+        self.get(module).is_some_and(|runner| {
+            runner.statically_reachable_models.contains(capacity)
                 && runner
                     .route_policy
                     .as_ref()

@@ -287,9 +287,9 @@ pub(super) async fn select_with_profile_lookup(
         .iter()
         .filter(|fact| {
             let route = fact_to_route(fact);
-            runners
-                .iter()
-                .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
+            runners.iter().any(|runner| {
+                registry.can_run(&runner.module, &route.route_key, &route.capacity_key)
+            })
         })
         .collect();
     let pair_rejections: HashMap<String, String> = facts
@@ -343,14 +343,21 @@ pub(super) async fn select_with_profile_lookup(
     // will. Answering such a route would send the work with the wrong
     // credential or none, so it is not a v1 candidate until the answer can
     // carry its key.
-    let key_pool_routes: Vec<&ModelFact> = capable
-        .iter()
-        .copied()
-        .filter(|fact| key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))
-        .collect();
     // Every route that could serve this request is a key-pool one: if any other
     // route were adequate, the filter below would keep it.
-    let key_pool_only = !key_pool_routes.is_empty() && key_pool_routes.len() == capable.len();
+    let currently_capable: Vec<_> = capable
+        .iter()
+        .filter(|fact| {
+            let route = fact_to_route(fact);
+            runners
+                .iter()
+                .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
+        })
+        .collect();
+    let key_pool_only = !currently_capable.is_empty()
+        && currently_capable
+            .iter()
+            .all(|fact| key_pool::is_pool_provider(&catalog_targets, &fact.provider_id));
     let capable: Vec<&ModelFact> = capable
         .into_iter()
         .filter(|fact| !key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))
@@ -363,10 +370,27 @@ pub(super) async fn select_with_profile_lookup(
         });
     }
 
-    let available: HashSet<String> = capable
+    let statically_available: HashSet<String> = capable
         .iter()
         .map(|fact| fact_to_route(fact).route_key)
         .collect();
+    let available: HashSet<String> = capable
+        .iter()
+        .filter_map(|fact| {
+            let route = fact_to_route(fact);
+            runners
+                .iter()
+                .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
+                .then_some(route.route_key)
+        })
+        .collect();
+    if available.is_empty() && pair_rejections.is_empty() {
+        return Err(if key_pool_only {
+            key_pool_route_refusal()
+        } else {
+            Refusal::no_route(NoRouteReason::MissingCapability, None)
+        });
+    }
     if let Some(classes) = &priced.classes {
         classes.apply_eligibility(&mut snapshot, &facts, priced_per_token, false);
     }
@@ -391,6 +415,11 @@ pub(super) async fn select_with_profile_lookup(
     );
     let available = candidates.available;
     let mut usable = available.clone();
+    let mut runtime_unavailable: HashSet<String> = statically_available
+        .difference(&available)
+        .filter(|key| !candidates.rejected.contains_key(*key))
+        .cloned()
+        .collect();
     let mut account_blocks = HashMap::new();
     if let Some(classes) = &priced.classes {
         for fact in &facts {
@@ -407,7 +436,10 @@ pub(super) async fn select_with_profile_lookup(
                     .outcome,
                 prefrontal_routing_core::accounts::Outcome::Admit(_)
             ) {
-                usable.remove(&prefrontal_routing_core::fact_to_route(fact).route_key);
+                let key = fact_to_route(fact).route_key;
+                if usable.remove(&key) && !candidates.rejected.contains_key(&key) {
+                    runtime_unavailable.insert(key);
+                }
                 if let Some(reset) =
                     classes.blocked_reset(&fact.provider_id, &fact.model_id, priced_per_token)
                 {
@@ -472,6 +504,7 @@ pub(super) async fn select_with_profile_lookup(
         consumer_exclude: &consumer_exclude,
         subscription_keys: &subscription_keys,
         rejections: &rejections,
+        runtime_unavailable: &runtime_unavailable,
         routing_config: &priced.routing_config,
         slots: slots.as_ref(),
         min_band: live_config.min_band(),
@@ -856,6 +889,7 @@ struct Selection<'a> {
     subscription_keys: &'a HashSet<String>,
     /// Route-local refusals, by route key ([`select_policy::candidate_rejections`]).
     rejections: &'a HashMap<String, String>,
+    runtime_unavailable: &'a HashSet<String>,
     routing_config: &'a RoutingConfig,
     slots: Option<&'a ConcurrencySlots>,
     min_band: Option<f64>,
@@ -881,7 +915,24 @@ impl<'a> Selection<'a> {
             })
             .cloned()
             .collect();
-        let input = self.pass().input(&allowed, self.snapshot.clone());
+        let mut snapshot = self.snapshot.clone();
+        for key in self.runtime_unavailable {
+            // Account availability cannot lower the maximum model scores used to
+            // interpret IQ. Operator exclusions still can, including not_for rules.
+            if self
+                .sources
+                .operator_config
+                .route_allowed(self.consumer, key, false)
+            {
+                snapshot
+                    .by_route
+                    .entry(key.clone())
+                    .or_default()
+                    .statically_routable
+                    .get_or_insert(true);
+            }
+        }
+        let input = self.pass().input(&allowed, snapshot);
         self.score_input(input, self.consumer_exclude, None)
             .map_err(select_policy::describe_filter_refusal)
     }

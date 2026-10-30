@@ -308,6 +308,13 @@ pub(crate) fn prepare_candidates(
                         })
                     })
                     .collect();
+                if serving.is_empty() {
+                    snapshot
+                        .by_route
+                        .entry(route.route_key.clone())
+                        .or_default()
+                        .statically_routable = Some(false);
+                }
                 let resolved = classes.map(|classes| classes.class(fact, priced_per_token));
                 let fallback = crate::account_selection::resolve_class(
                     rows,

@@ -576,6 +576,162 @@ fn quota_exhaustion_does_not_change_the_request_frontier() {
 
 // ── admission filters ───────────────────────────────────────────────────────
 
+#[test]
+fn runtime_availability_preserves_frontier_without_admitting_blocked_routes() {
+    use prefrontal_routing_core::model_router::{
+        admit_routes_with_availability, select_model_route_with_availability, CredentialRefusalMark,
+    };
+
+    let facts: Vec<_> = [
+        ("top", 1_800.0),
+        ("weak", 500.0),
+        ("pin-only", 9_000.0),
+        ("unreachable", 8_000.0),
+    ]
+    .into_iter()
+    .map(|(model, elo)| {
+        fact(FactBuilder {
+            provider_id: "p".into(),
+            model_id: model.into(),
+            scores: scores(elo, elo, 60.0),
+            ..Default::default()
+        })
+    })
+    .collect();
+    let operator = vec!["p/pin-only".to_string()];
+    let available = HashSet::from([
+        "p/top".to_string(),
+        "p/weak".to_string(),
+        "p/pin-only".to_string(),
+    ]);
+    let demand = req(90.0, 0.0);
+    let baseline = admit_routes_with_availability(
+        &facts,
+        None,
+        ExclusionPolicy {
+            operator: &operator,
+            caller: &[],
+        },
+        &[],
+        None,
+        &available,
+        &demand,
+        &DEFAULT_ROUTING_CONFIG,
+        &HashMap::new(),
+    );
+    let baseline_weak = &baseline
+        .admitted
+        .iter()
+        .find(|r| r.route.route_key == "p/weak")
+        .unwrap()
+        .adequacy;
+    assert_eq!(baseline.top_routable.elo, 1_800.0);
+    assert!(baseline_weak.adequacy < MIN_BEST_EFFORT_ADEQUACY);
+
+    for (detail, refusal, keep_available) in [
+        (None, None, false),
+        (Some("account_pool_reserve_limited"), None, false),
+        (
+            Some("explicit_provider_pool_exhausted: no free key"),
+            None,
+            true,
+        ),
+        (None, Some("credential_unentitled"), false),
+        (None, Some("credential_billing_exhausted"), false),
+    ] {
+        let mut snapshot = ModelRouteStateSnapshot::default();
+        for key in ["p/top", "p/pin-only"] {
+            snapshot.by_route.insert(
+                key.into(),
+                RouteRuntimeState {
+                    statically_routable: Some(true),
+                    credential_refusal: refusal.map(|reason| CredentialRefusalMark {
+                        reason,
+                        credential_ids: vec!["credential:top".into()],
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        let mut current = available.clone();
+        if !keep_available {
+            current.remove("p/top");
+        }
+        let rejections = detail
+            .map(|detail| HashMap::from([("p/top".into(), detail.to_string())]))
+            .unwrap_or_default();
+        let blocked = admit_routes_with_availability(
+            &facts,
+            Some(&snapshot),
+            ExclusionPolicy {
+                operator: &operator,
+                caller: &[],
+            },
+            &[],
+            None,
+            &current,
+            &demand,
+            &DEFAULT_ROUTING_CONFIG,
+            &rejections,
+        );
+        assert_eq!(blocked.top_routable, baseline.top_routable);
+        assert_eq!(
+            &blocked
+                .admitted
+                .iter()
+                .find(|r| r.route.route_key == "p/weak")
+                .unwrap()
+                .adequacy,
+            baseline_weak
+        );
+        assert_eq!(blocked.admitted.len(), 1);
+        let rejection = blocked
+            .rejected
+            .iter()
+            .find(|r| r.route_key == "p/top")
+            .unwrap();
+        assert_eq!(rejection.reason, refusal.unwrap_or("not_available"));
+        assert_eq!(rejection.detail.as_deref(), detail);
+        assert_eq!(
+            rejection.credential_ids,
+            if refusal.is_some() {
+                vec!["credential:top"]
+            } else {
+                vec![]
+            }
+        );
+        assert!(blocked
+            .rejected
+            .iter()
+            .any(|r| r.route_key == "p/pin-only" && r.reason == "excluded_by_operator"));
+        assert!(blocked
+            .rejected
+            .iter()
+            .any(|r| r.route_key == "p/unreachable"
+                && r.reason == "not_available"
+                && r.detail.is_none()));
+        let mut request = input(
+            facts.clone(),
+            demand,
+            Extra {
+                available_models: Some(current),
+                runtime_snapshot: Some(snapshot),
+                ..Default::default()
+            },
+        );
+        request.operator_exclude_keys = operator.clone();
+        let error = select_model_route_with_availability(
+            request,
+            &DEFAULT_ROUTING_CONFIG,
+            None,
+            &[],
+            &rejections,
+        )
+        .unwrap_err();
+        assert_eq!(error.reason, RouteFailureReason::AllRoutesInadequate);
+    }
+}
+
 fn strong_25() -> ModelFact {
     fact(FactBuilder {
         provider_id: "p".into(),

@@ -1576,6 +1576,10 @@ pub(super) async fn handle_select_request(
         .cloned()
         .collect();
     let broca_models: HashSet<String> = availability.models.iter().cloned().collect();
+    let frontier_broca_models = broca_credentials
+        .lock()
+        .map(|credentials| credentials.statically_served_routes(&facts))
+        .unwrap_or_default();
     let executor_models = if is_broca_substrate(params.substrate.as_deref()) {
         &broca_models
     } else {
@@ -1598,15 +1602,15 @@ pub(super) async fn handle_select_request(
     // inside the list: Broca's reach decides which of those models can run,
     // never which other models may. A pin names its own model and is not
     // confined.
-    let confined_broca_models = ((host_run_harness.is_some()
+    let confine_broca = (host_run_harness.is_some()
         || (is_broca_substrate(params.substrate.as_deref())
             && params.executor.is_none()
             && params.workload.is_none()
             && params.required_harness.is_none()))
         && params.pin.is_none()
         && params.model_pin.is_none()
-        && !params.available_models.is_empty())
-    .then(|| {
+        && !params.available_models.is_empty();
+    let confined_broca_models = confine_broca.then(|| {
         let confined = confine_to_caller_list(&broca_models, &params.available_models, &facts);
         if let Some(note) = availability.note.as_mut() {
             note.push_str(&format!(
@@ -1628,6 +1632,29 @@ pub(super) async fn handle_select_request(
         }
     } else {
         harness_context.availability(&facts)
+    };
+    let frontier_models = if host_run || confine_broca {
+        if host_run_harness.is_some() || !host_run {
+            if confine_broca {
+                confine_to_caller_list(&frontier_broca_models, &params.available_models, &facts)
+            } else {
+                frontier_broca_models.clone()
+            }
+        } else {
+            host_models.clone()
+        }
+    } else {
+        selection_harness::SelectionHarness {
+            broca_models: &frontier_broca_models,
+            executor_models: if is_broca_substrate(params.substrate.as_deref()) {
+                &frontier_broca_models
+            } else {
+                &host_models
+            },
+            ..harness_context
+        }
+        .availability(&facts)
+        .models
     };
     let host_auth = params.provider_auth_types.clone().unwrap_or_default();
     if let Some(classes) = &classes {
@@ -1709,6 +1736,30 @@ pub(super) async fn handle_select_request(
             )
             .is_some()
         });
+    }
+    for fact in &facts {
+        let route = fact_to_route(fact);
+        if frontier_models.contains(&route.route_key)
+            && (!mapped_availability.models.contains(&route.route_key)
+                || mapped_availability.rejected.contains_key(&route.route_key))
+            && !candidate_filters.contains_key(&route.route_key)
+            && operator_config.route_allowed(consumer_id, &route.route_key, false)
+            && select_policy::choose_runner(
+                &configured_runners,
+                consumer_policy.runner.as_deref(),
+                &route.route_key,
+                &route.capacity_key,
+                |runner, key, capacity| runner_registry.can_run(&runner.module, key, capacity),
+            )
+            .is_some()
+        {
+            snapshot
+                .by_route
+                .entry(route.route_key)
+                .or_default()
+                .statically_routable
+                .get_or_insert(true);
+        }
     }
     let available = mapped_availability.models.clone();
     let runner_module = |selected: &SelectedModelRoute| -> Option<String> {
@@ -2964,6 +3015,49 @@ async fn handle_select_panel(
         executor_models: &available_models,
     }
     .availability(&prepared.facts);
+    if availability_substrate != AvailabilitySubstrate::Host {
+        if let Ok(credentials) = broca_credentials.lock() {
+            let served = credentials.statically_served_routes(&prepared.facts);
+            let registry = routing_v1::runners::Registry::build(
+                operator_config.v1_runners(),
+                &credentials,
+                &prepared.facts,
+                prepared.now as u64,
+            );
+            let frontier = selection_harness::SelectionHarness {
+                groups: operator_config.substrate_groups(),
+                consumer: None,
+                workload: Some(selection_harness::Workload::Athena),
+                executor: true,
+                required: None,
+                caller: params.harness.as_deref(),
+                host_models: &served,
+                broca_models: &served,
+                executor_models: &served,
+            }
+            .availability(&prepared.facts);
+            let runners = registry.policies();
+            for fact in &prepared.facts {
+                let route = fact_to_route(fact);
+                let can_run = runners.iter().any(|runner| {
+                    registry.can_run(&runner.module, &route.route_key, &route.capacity_key)
+                });
+                let state = prepared
+                    .snapshot
+                    .by_route
+                    .entry(route.route_key.clone())
+                    .or_default();
+                if !served.contains(&route.route_key) || !can_run {
+                    state.statically_routable = Some(false);
+                } else if frontier.models.contains(&route.route_key)
+                    && (!mapped_availability.models.contains(&route.route_key)
+                        || mapped_availability.rejected.contains_key(&route.route_key))
+                {
+                    state.statically_routable.get_or_insert(true);
+                }
+            }
+        }
+    }
     // Broca legs have no route.select of their own, so their availability is
     // recorded here for the winner ladder. Host-list panels are not recorded:
     // the host's ladder follows route.select, whose list is already fenced by
@@ -3194,7 +3288,19 @@ async fn handle_select_panel(
             .iter()
             .filter(|fact| fact.provider_id == provider)
         {
-            availability_rejections.insert(fact_to_route(fact).route_key, detail.clone());
+            let route = fact_to_route(fact);
+            if (mapped_availability.models.contains(&route.route_key)
+                || mapped_availability.models.contains(&route.capacity_key))
+                && !availability_rejections.contains_key(&route.route_key)
+            {
+                let state = prepared
+                    .snapshot
+                    .by_route
+                    .entry(route.route_key.clone())
+                    .or_default();
+                state.statically_routable.get_or_insert(true);
+            }
+            availability_rejections.insert(route.route_key, detail.clone());
         }
     };
     let decision = panel_decision_input(
