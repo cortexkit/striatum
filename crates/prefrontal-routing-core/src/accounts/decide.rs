@@ -9,9 +9,7 @@ use super::decision::{
     Outcome, OverrideNote, PreviousPin, Refusal, RefusalCode, RequestedAccountIgnored,
     RequestedAccountNote, RosterNote,
 };
-use super::eligibility::{
-    age_band, evaluate_quota, fable_freshly_exhausted, scope_check, QuotaEval,
-};
+use super::eligibility::{age_band, evaluate_quota, fable_freshly_exhausted, QuotaEval};
 use super::evidence::{hold_until, retry_after_with_jitter};
 use super::policy::{AccountStrategy, AllocationContext};
 use super::pools::{block_end, PoolKey, PoolScope};
@@ -415,7 +413,7 @@ impl<'a> Allocator<'a> {
             } else {
                 view.quota.as_ref()
             },
-            self.family,
+            &self.model,
             self.request.caller,
             self.now,
             self.policy,
@@ -512,7 +510,7 @@ impl<'a> Allocator<'a> {
         }
         view.quota.as_ref().filter(|reading| super::pools::fresh_for_recovery(reading, self.now, self.policy)).is_some_and(|reading| {
             reading.required_windows().iter().filter_map(|id| reading.window(*id)).any(|window| window.used_percent >= 100.0 && window.resets_at.at_ms().is_none_or(|reset| reset > self.now))
-            || matches!(&reading.scoped, super::types::ScopedList::Listed(windows) if windows.iter().any(|window| self.policy.family_for_scope(window)==Some(self.family) && window.used_percent>=100.0))
+            || matches!(&reading.scoped, super::types::ScopedList::Listed(windows) if windows.iter().any(|window| super::types::model_matches_scope(&self.model, &window.scope_id) && window.used_percent>=100.0))
         })
     }
 
@@ -652,22 +650,20 @@ impl<'a> Allocator<'a> {
             });
         }
         if let Some(reading) = reading.filter(|_| !self.using_credits(&affinity.account_id)) {
-            let check = scope_check(self.family, &reading.scoped, self.policy);
-            if check.matched && !check.passes {
-                let reset = match &reading.scoped {
-                    super::types::ScopedList::Listed(windows) => windows
-                        .iter()
-                        .find(|w| self.policy.family_for_scope(w) == Some(self.family))
-                        .map_or(ResetTime::Missing, |w| w.resets_at),
-                    super::types::ScopedList::Missing => ResetTime::Missing,
-                };
-                blockers.push(Blocker {
-                    reset,
-                    basis: HoldBasis::ProactiveReading,
-                    leave: InvalidationReason::FreshFullReading {
-                        window: ApplicableWindow::FamilyScope,
-                    },
-                });
+            if let super::types::ScopedList::Listed(windows) = &reading.scoped {
+                for window in windows.iter().filter(|window| {
+                    super::types::model_matches_scope(&self.model, &window.scope_id)
+                        && window.used_percent.is_finite()
+                        && window.used_percent >= 100.0
+                }) {
+                    blockers.push(Blocker {
+                        reset: window.resets_at,
+                        basis: HoldBasis::ProactiveReading,
+                        leave: InvalidationReason::FreshFullReading {
+                            window: ApplicableWindow::FamilyScope,
+                        },
+                    });
+                }
             }
             for id in reading.required_windows() {
                 if let Some(window) = reading.window(id).filter(|window| {
@@ -1254,16 +1250,15 @@ impl<'a> Allocator<'a> {
     /// their header resets; a Retry-After hint is never a reset.
     fn pool_retry_after(&self, accounts: &[&ColdEval]) -> u64 {
         let family = self.family;
-        let scope_blocked = self.policy.family_has_scope(family)
-            && accounts.iter().all(|eval| {
-                eval.reasons().any(|reason| match reason {
-                    ExclusionReason::ScopeExhausted { .. } => true,
-                    ExclusionReason::ConfirmedFence { pool } => {
-                        pool.as_ref().map(|key| &key.scope) == Some(&PoolScope::Family(family))
-                    }
-                    _ => false,
-                })
-            });
+        let scope_blocked = accounts.iter().all(|eval| {
+            eval.reasons().any(|reason| match reason {
+                ExclusionReason::ScopeExhausted { .. } => true,
+                ExclusionReason::ConfirmedFence { pool } => {
+                    pool.as_ref().map(|key| &key.scope) == Some(&PoolScope::Family(family))
+                }
+                _ => false,
+            })
+        });
         let mut resets: Vec<EpochMs> = Vec::new();
         for eval in accounts {
             let reading = eval.view.quota.as_ref();
@@ -1273,7 +1268,9 @@ impl<'a> Allocator<'a> {
                         resets.extend(
                             windows
                                 .iter()
-                                .filter(|w| self.policy.family_for_scope(w) == Some(family))
+                                .filter(|w| {
+                                    super::types::model_matches_scope(&self.model, &w.scope_id)
+                                })
                                 .filter_map(|w| w.resets_at.at_ms()),
                         );
                     }

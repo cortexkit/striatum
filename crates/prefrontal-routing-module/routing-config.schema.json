@@ -10,7 +10,6 @@
         "hold_when_reset_within": null,
         "max_hold": null,
         "metered_fallback": false,
-        "model_families": null,
         "order": null,
         "ordered": null,
         "paid_credits": null,
@@ -173,23 +172,6 @@
         }
       ]
     },
-    "AccountModelFamily": {
-      "description": "One model's quota family under `accounts.model_families`.",
-      "type": "object",
-      "properties": {
-        "family": {
-          "$ref": "#/$defs/AccountQuotaFamily"
-        },
-        "model": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "model",
-        "family"
-      ]
-    },
     "AccountPoolFloor": {
       "type": "object",
       "properties": {
@@ -221,16 +203,6 @@
       "additionalProperties": false,
       "required": [
         "remaining_percent"
-      ]
-    },
-    "AccountQuotaFamily": {
-      "description": "The model-scoped quota families account selection keeps apart.",
-      "type": "string",
-      "enum": [
-        "fable",
-        "mythos",
-        "opus",
-        "other"
       ]
     },
     "BasicFamilyConfig": {
@@ -1008,17 +980,6 @@
           "type": "boolean",
           "default": false
         },
-        "model_families": {
-          "description": "The models that draw on a model-scoped quota family, by exact model\nid. A model not listed counts as `other`.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "default": null,
-          "items": {
-            "$ref": "#/$defs/AccountModelFamily"
-          }
-        },
         "order": {
           "type": [
             "array",
@@ -1098,7 +1059,6 @@
             "hold_when_reset_within": null,
             "max_hold": null,
             "metered_fallback": false,
-            "model_families": null,
             "order": null,
             "ordered": null,
             "paid_credits": null,

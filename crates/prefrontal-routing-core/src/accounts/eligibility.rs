@@ -47,33 +47,21 @@ pub fn age_band(
     }
 }
 
-/// The result of the family scope predicate on one entry.
+/// The scoped-window predicate for one requested model and account reading.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScopeCheck {
     pub list_state: ScopedListState,
-    /// A window mapped to the requested family is present.
     pub matched: bool,
-    /// The reference's predicate: false only when the matched window has a
-    /// finite remaining value at or below 0. Missing and explicitly empty
-    /// lists pass; a non-finite value passes.
+    /// False when any applicable window reports finite exhaustion.
     pub passes: bool,
-    /// The matched window, when it is valid (finite, 0-100 used) and so joins
-    /// the weight.
-    pub weight_window: Option<ScopedWindow>,
-    /// The matched window is finite but outside 0-100 used without being exhausted.
+    /// All applicable windows with valid percentages contribute to the weight.
+    pub weight_windows: Vec<ScopedWindow>,
     pub invalid: bool,
-    /// Unmapped scope ids present while the family's known id is absent.
-    pub unmapped_scope_ids: Vec<String>,
 }
 
-/// Evaluates the family scope check (design step 3). Scopes are keyed by
-/// producer scope id plus window length; routing never matches titles or
-/// display names.
-pub fn scope_check(
-    family: ModelFamily,
-    scoped: &ScopedList,
-    policy: &AllocatorPolicy,
-) -> ScopeCheck {
+/// Match producer ids, not presentation titles. An unrelated scope does not
+/// make the model's quota unknown: that model still draws on general windows.
+pub fn scope_check(model: &str, scoped: &ScopedList) -> ScopeCheck {
     let windows: &[ScopedWindow] = match scoped {
         ScopedList::Missing => &[],
         ScopedList::Listed(windows) => windows,
@@ -87,36 +75,21 @@ pub fn scope_check(
         list_state,
         matched: false,
         passes: true,
-        weight_window: None,
+        weight_windows: Vec::new(),
         invalid: false,
-        unmapped_scope_ids: Vec::new(),
     };
-    if !policy.family_has_scope(family) {
-        return check;
-    }
-    let matched = windows
+    for window in windows
         .iter()
-        .find(|window| policy.family_for_scope(window) == Some(family));
-    match matched {
-        Some(window) => {
-            check.matched = true;
-            let used = window.used_percent;
-            if used.is_finite() && 100.0 - used <= 0.0 {
-                check.passes = false;
-            } else if used.is_finite() && (0.0..=100.0).contains(&used) {
-                check.weight_window = Some(window.clone());
-            } else if used.is_finite() {
-                check.invalid = true;
-            }
-        }
-        None => {
-            // The known id disappeared and an unknown one appeared: this
-            // family's scope is unknown until the mapping is updated.
-            check.unmapped_scope_ids = windows
-                .iter()
-                .filter(|window| policy.family_for_scope(window).is_none())
-                .map(|window| window.scope_id.clone())
-                .collect();
+        .filter(|window| super::types::model_matches_scope(model, &window.scope_id))
+    {
+        check.matched = true;
+        let used = window.used_percent;
+        if used.is_finite() && used >= 100.0 {
+            check.passes = false;
+        } else if used.is_finite() && (0.0..=100.0).contains(&used) {
+            check.weight_windows.push(window.clone());
+        } else if used.is_finite() {
+            check.invalid = true;
         }
     }
     check
@@ -134,8 +107,11 @@ pub fn fable_freshly_exhausted(
         Ok((AgeBand::Full, _, _))
     );
     full && reading.error_class.is_none() && {
-        let check = scope_check(ModelFamily::Fable, &reading.scoped, policy);
-        check.matched && !check.passes
+        matches!(&reading.scoped, ScopedList::Listed(windows) if windows.iter().any(|window| {
+            policy.family_for_model(&window.scope_id) == ModelFamily::Fable
+                && window.used_percent.is_finite()
+                && window.used_percent >= 100.0
+        }))
     }
 }
 
@@ -280,7 +256,7 @@ pub fn assess_reading(
 /// scope, reserve, Broca floor and weight.
 pub fn evaluate_quota(
     reading: Option<&QuotaReading>,
-    family: ModelFamily,
+    model: &str,
     caller: CallerKind,
     now: EpochMs,
     policy: &AllocatorPolicy,
@@ -331,11 +307,12 @@ pub fn evaluate_quota(
             Some(_) => {}
         }
     }
-    let scope = scope_check(family, &reading.scoped, policy);
+    let family = policy.family_for_model(model);
+    let scope = scope_check(model, &reading.scoped);
     let scope_reset_elapsed = match &reading.scoped {
         ScopedList::Missing => false,
         ScopedList::Listed(windows) => windows.iter().any(|window| {
-            policy.family_for_scope(window) == Some(family)
+            super::types::model_matches_scope(model, &window.scope_id)
                 && matches!(window.resets_at, ResetTime::At(reset) if reset <= now)
         }),
     };
@@ -345,12 +322,6 @@ pub fn evaluate_quota(
         });
     }
     eval.scoped_list = Some(scope.list_state);
-    if !scope.unmapped_scope_ids.is_empty() {
-        eval.unknown.push(ExclusionReason::ScopeUnmapped {
-            family,
-            unmapped_scope_ids: scope.unmapped_scope_ids.clone(),
-        });
-    }
     if scope.invalid {
         eval.unknown.push(ExclusionReason::InvalidPercent {
             window: ApplicableWindow::FamilyScope,
@@ -384,7 +355,7 @@ pub fn evaluate_quota(
         }
         weights.push(weight);
     }
-    if let Some(window) = &scope.weight_window {
+    for window in &scope.weight_windows {
         weights.push(window_weight(
             ApplicableWindow::FamilyScope,
             window.used_percent,

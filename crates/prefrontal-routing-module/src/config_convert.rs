@@ -1,5 +1,6 @@
-//! One-shot conversion of routing configuration. Runtime loading never calls
-//! this module: an operator must explicitly convert a legacy document.
+//! One-shot conversion of routing configuration and retired-key filtering.
+//! Runtime loading shares the quota-table filter, but never converts a legacy
+//! document: an operator must explicitly request conversion.
 
 use serde_json::{json, Map, Value};
 
@@ -26,6 +27,7 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
         .as_object()
         .cloned()
         .ok_or("routing config must be an object")?;
+    remove_account_model_families(&mut root);
     remove_account_flag(&mut root)?;
     if !root.contains_key("model_routing")
         && !root.contains_key("account_selection")
@@ -280,15 +282,33 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
         root.insert("accounts".into(), accounts);
         remove_account_flag(&mut root)?;
     }
-    let accounts = root
-        .entry("accounts")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .ok_or("accounts must be an object")?;
-    accounts
-        .entry("model_families")
-        .or_insert_with(|| data["account_model_families"].clone());
+    remove_account_model_families(&mut root);
+    remove_account_flag(&mut root)?;
     Ok(Value::Object(root))
+}
+
+/// Drop the retired quota-family table without relaxing other unknown-key
+/// checks. The returned paths let runtime loading explain what was ignored.
+pub(crate) fn remove_account_model_families(root: &mut Map<String, Value>) -> Vec<String> {
+    let mut removed = Vec::new();
+    let mut remove = |accounts: Option<&mut Value>, path: String| {
+        if accounts
+            .and_then(Value::as_object_mut)
+            .is_some_and(|accounts| accounts.remove("model_families").is_some())
+        {
+            removed.push(path);
+        }
+    };
+    remove(root.get_mut("accounts"), "accounts.model_families".into());
+    if let Some(providers) = root.get_mut("providers").and_then(Value::as_object_mut) {
+        for (name, provider) in providers {
+            remove(
+                provider.get_mut("accounts"),
+                format!("providers.{name}.accounts.model_families"),
+            );
+        }
+    }
+    removed
 }
 
 fn remove_account_flag(root: &mut Map<String, Value>) -> Result<(), String> {

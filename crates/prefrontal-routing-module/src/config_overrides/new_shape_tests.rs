@@ -201,6 +201,27 @@ fn conversion_preserves_first_match_family_rule_order() {
 }
 
 #[test]
+fn converter_never_emits_retired_account_model_families() {
+    for input in [
+        json!({"model_routing": {}, "accounts": {"model_families": []}}),
+        json!({"model_routing": {}, "account_selection": {"model_families": []}}),
+        json!({"accounts": {"model_families": []}, "providers": {
+            "anthropic": {"accounts": {"model_families": []}}
+        }}),
+        json!({"model_routing": {}}),
+    ] {
+        let converted = crate::config_convert::convert_value(input).unwrap();
+        assert!(converted["accounts"].get("model_families").is_none());
+        assert!(converted["providers"]["anthropic"]["accounts"]
+            .get("model_families")
+            .is_none());
+    }
+    assert!(crate::config_convert::defaults()
+        .get("account_model_families")
+        .is_none());
+}
+
+#[test]
 fn conversion_keeps_other_consumers_provider_restrictions_on_model_exceptions() {
     let converted = crate::config_convert::convert_value(json!({"model_routing": {
         "exclude": {

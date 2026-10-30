@@ -34,16 +34,15 @@ impl GeneralWindow {
     }
 }
 
-/// Model family for scoped quota. Scopes are per family, not per model
-/// spelling: Fable 5 and 5.1 (including `[1m]` variants) share one Fable scope,
-/// and Fable exhaustion never excludes Mythos or Opus (design step 3).
+/// Family labels retained for exhaustion fences and allocation preferences.
+/// Applicable quota windows are derived from the producer's scope ids instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelFamily {
     Fable,
     Mythos,
     Opus,
-    /// Any model the policy's family map does not place in a scoped family.
+    /// Any model without one of the recognized family tokens.
     Other,
 }
 
@@ -447,13 +446,6 @@ pub struct ScopeIdMapping {
     pub family: ModelFamily,
 }
 
-/// Maps a normalized API model id to its family.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelFamilyMapping {
-    pub model: String,
-    pub family: ModelFamily,
-}
-
 /// Routing policy for account selection. `Default` carries the design's
 /// initial values.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -521,7 +513,6 @@ pub struct AllocatorPolicy {
     pub pool_retry_margin_s: u64,
     /// Pool refusal Retry-After when no reset is known.
     pub pool_retry_fallback_s: u64,
-    pub model_families: Vec<ModelFamilyMapping>,
     pub scope_ids: Vec<ScopeIdMapping>,
     /// Pools that meter only some models (operator config
     /// `quota_model_pools`). Not part of the published policy.
@@ -576,9 +567,6 @@ impl Default for AllocatorPolicy {
             quota_unknown_retry_s: 60,
             pool_retry_margin_s: 60,
             pool_retry_fallback_s: 300,
-            // Which models draw on a model-scoped quota family is operator
-            // config (`accounts.model_families`); routing core names no model.
-            model_families: Vec::new(),
             model_pools: Vec::new(),
             // Insula publishes the Fable window's id as upstream
             // `limits[].scope.model.id` when available, else the display name,
@@ -594,11 +582,15 @@ impl Default for AllocatorPolicy {
 
 impl AllocatorPolicy {
     pub fn family_for_model(&self, model: &str) -> ModelFamily {
-        self.model_families
-            .iter()
-            .find(|mapping| mapping.model == model)
-            .map(|mapping| mapping.family)
-            .unwrap_or(ModelFamily::Other)
+        [
+            ("fable", ModelFamily::Fable),
+            ("mythos", ModelFamily::Mythos),
+            ("opus", ModelFamily::Opus),
+        ]
+        .into_iter()
+        .find(|(token, _)| model_matches_scope(model, token))
+        .map(|(_, family)| family)
+        .unwrap_or(ModelFamily::Other)
     }
 
     /// The family a producer scope window belongs to, or `None` when routing
@@ -609,10 +601,56 @@ impl AllocatorPolicy {
             .find(|m| m.scope_id == window.scope_id && m.window_minutes == window.window_minutes)
             .map(|m| m.family)
     }
+}
 
-    /// Whether any scope mapping exists for `family`.
-    pub fn family_has_scope(&self, family: ModelFamily) -> bool {
-        self.scope_ids.iter().any(|m| m.family == family)
+/// A producer scope id applies when it occurs at model-token boundaries.
+/// Multi-token ids also match, so a future `claude-fable-5` scope covers its
+/// version and context-size variants without a model-to-window table.
+pub fn model_matches_scope(model: &str, scope_id: &str) -> bool {
+    let model = model.to_lowercase();
+    let scope = scope_id.to_lowercase();
+    if scope.is_empty() {
+        return false;
+    }
+    let boundary = |c: char| matches!(c, '-' | '/' | '[');
+    model.match_indices(&scope).any(|(start, _)| {
+        let end = start + scope.len();
+        (start == 0 || model[..start].ends_with(boundary))
+            && (end == model.len() || model[end..].starts_with(boundary))
+    })
+}
+
+#[cfg(test)]
+mod scope_matching_tests {
+    use super::model_matches_scope;
+
+    #[test]
+    fn scope_ids_match_whole_model_tokens_and_multi_token_ids() {
+        for model in [
+            "claude-fable-5",
+            "claude-fable-5-1[1m]",
+            "anthropic/claude-FABLE-5",
+            "fable/5",
+            "claude[fable",
+        ] {
+            assert!(model_matches_scope(model, "Fable"), "{model}");
+        }
+        for model in [
+            "claude-fablex-5",
+            "claude-prefable-5",
+            "claude-fablex",
+            "opus",
+        ] {
+            assert!(!model_matches_scope(model, "Fable"), "{model}");
+        }
+        assert!(model_matches_scope(
+            "anthropic/claude-fable-5-1[1m]",
+            "claude-fable-5"
+        ));
+        assert!(!model_matches_scope("claude-fable-50", "claude-fable-5"));
+        assert!(!model_matches_scope("claude-fable-5", ""));
+        assert!(!model_matches_scope("claude-fable-5", "7 Day (Fable)"));
+        assert!(model_matches_scope("claude-nova-8", "Nova"));
     }
 }
 
