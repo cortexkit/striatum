@@ -370,6 +370,7 @@ fn no_route_error(
         best_rejected: None,
         earliest_reset: None,
         earliest_reset_route: None,
+        adequate_blockers: Default::default(),
     }
 }
 

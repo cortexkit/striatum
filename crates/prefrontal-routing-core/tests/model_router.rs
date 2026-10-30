@@ -4896,6 +4896,111 @@ fn no_route_refusal_groups_fences_and_attributes_xai_wall() {
         .any(|group| group["reason"] == "excluded_by_operator" && group["count"] == 10));
 }
 
+#[test]
+fn blocking_causes_identify_only_adequate_routes_and_effective_wall_expiries() {
+    use prefrontal_routing_core::model_router::CredentialRefusalMark;
+    let mut facts = Vec::new();
+    for model in [
+        "quota",
+        "cooldown",
+        "backoff",
+        "excluded",
+        "unentitled",
+        "weak",
+    ] {
+        facts.push(fact(FactBuilder {
+            provider_id: "p".into(),
+            model_id: model.into(),
+            scores: if model == "weak" {
+                scores(1.0, 1.0, 1.0)
+            } else {
+                scores(1500.0, 140.0, 1.0)
+            },
+            ..Default::default()
+        }));
+    }
+    let snapshot = ModelRouteStateSnapshot {
+        now: 1_000.0,
+        by_route: HashMap::from([
+            (
+                "p/quota".into(),
+                RouteRuntimeState {
+                    quota_exhausted_until: Some(2_000.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "p/cooldown".into(),
+                RouteRuntimeState {
+                    cooldown_until: Some(3_000.0),
+                    quota_exhausted_until: Some(4_000.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "p/backoff".into(),
+                RouteRuntimeState {
+                    failure_backoff_until: Some(5_000.0),
+                    failure_backoff_reason: Some("three failed sends".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "p/unentitled".into(),
+                RouteRuntimeState {
+                    credential_refusal: Some(CredentialRefusalMark {
+                        reason: "credential_unentitled",
+                        credential_ids: vec!["credential-1".into()],
+                    }),
+                    ..Default::default()
+                },
+            ),
+        ]),
+        by_capacity: HashMap::new(),
+    };
+    let mut selection = input(
+        facts,
+        req(100.0, 100.0),
+        Extra {
+            runtime_snapshot: Some(snapshot),
+            ..Default::default()
+        },
+    );
+    selection.operator_exclude_keys = vec!["p/excluded".into(), "p/weak".into()];
+    let error = select_model_route(selection).unwrap_err();
+    let groups = serde_json::to_value(error.blocking_causes()).unwrap();
+    for (reason, key, reset) in [
+        ("quota_exhausted", "p/quota", Some(2_000.0)),
+        ("cooldown_active", "p/cooldown", Some(4_000.0)),
+        ("backoff_active", "p/backoff", Some(5_000.0)),
+        ("excluded_by_operator", "p/excluded", None),
+        ("credential_unentitled", "p/unentitled", None),
+    ] {
+        let group = groups
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["reason"] == reason)
+            .unwrap();
+        assert_eq!(group["adequateRoutes"].as_array().unwrap().len(), 1);
+        assert_eq!(group["adequateRoutes"][0]["routeKey"], key);
+        assert_eq!(group["adequateRoutes"][0]["resetAtMs"].as_f64(), reset);
+    }
+    let excluded = groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|group| group["reason"] == "excluded_by_operator")
+        .unwrap();
+    assert_eq!(excluded["count"], 2);
+    assert_eq!(
+        excluded["routes"].as_array().unwrap().len(),
+        2,
+        "full rejected routes remain recorded"
+    );
+    assert_eq!(error.rejected.len(), 6);
+}
+
 /// A plan whose serving credential Fusiform publishes no rates for (`no_coverage`)
 /// has no price unless the operator configured a subscription multiplier for its
 /// provider, in which case the catalog base rates price it. The decision says
