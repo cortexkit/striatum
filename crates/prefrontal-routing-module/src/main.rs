@@ -2912,7 +2912,8 @@ async fn handle_set_decision_outcome(
     // decision ledger still holds: the report names the provider and the
     // credential itself. Recording renews a repeated refusal, so a fence that
     // keeps failing stays fresh and its next recheck probe waits another
-    // interval.
+    // interval. Subscription refusals are reconciled against quota readings
+    // by account selection, including fences persisted before quota delivery.
     if let Some(refusal) = provider_outcome
         .as_ref()
         .and_then(|provider| provider.credential_refusal.as_ref())

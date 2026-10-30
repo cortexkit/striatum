@@ -266,6 +266,14 @@ fn record_account_facts(
             now,
         )
         .map_err(store_refusal)?;
+        crate::account_selection::ClassContext::load(
+            deps.store,
+            deps.broca_credentials,
+            super::operator_config(deps),
+            crate::ACCOUNT_QUOTA.get(),
+            now,
+        )
+        .map_err(store_refusal)?;
     }
     if let Some(tokens) = params.get("request_input_tokens").and_then(Value::as_u64) {
         let class = prefrontal_routing_core::accounts::input_size_class(tokens);
