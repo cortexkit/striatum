@@ -1299,6 +1299,9 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
         .detail
         .insert("rejected".into(), json!(no_route.rejected));
     refusal
+        .detail
+        .insert("blockingCauses".into(), json!(no_route.blocking_causes()));
+    refusal
 }
 
 /// The refusal for work only a key-pool route could serve. A key-pool provider
@@ -1339,6 +1342,7 @@ mod tests {
     #[test]
     fn only_quota_and_cooldown_refusals_carry_a_reset() {
         let refusal = |reason, reset| NoRouteError {
+            adequate_blockers: Default::default(),
             candidates: Vec::new(),
             reason,
             message: "m".into(),
@@ -1363,5 +1367,62 @@ mod tests {
             1_000.0,
         );
         assert_eq!(untimed.wait_until_ms(), None);
+    }
+
+    #[test]
+    fn no_route_reply_keeps_full_rejections_and_routings_cause_groups() {
+        let mut error = NoRouteError {
+            candidates: Vec::new(),
+            reason: RouteFailureReason::QuotaOrCooldownExhausted,
+            message: "no admissible model route for requirements".into(),
+            rejected: Vec::new(),
+            requirements: Some(ModelRequirements {
+                iq: 100.0,
+                eq: 100.0,
+            }),
+            best_rejected: None,
+            earliest_reset: None,
+            earliest_reset_route: None,
+            adequate_blockers: Default::default(),
+        };
+        error
+            .rejected
+            .push(prefrontal_routing_core::model_router::RejectedRoute {
+                route_key: "openai/gpt-6.1-sol".into(),
+                reason: "backoff_active".into(),
+                detail: Some("three failed sends".into()),
+                credential_ids: Vec::new(),
+            });
+        error
+            .adequate_blockers
+            .insert("openai/gpt-6.1-sol".into(), Some(2_000.0));
+        let reply = no_route_refusal(&error, 1_000.0);
+        assert_eq!(reply.detail["rejected"], json!(error.rejected));
+        assert_eq!(
+            reply.detail["blockingCauses"],
+            json!(error.blocking_causes())
+        );
+        let decision = crate::decision_input_for(
+            "mason",
+            &ModelRequirements {
+                iq: 100.0,
+                eq: 100.0,
+            },
+            None,
+            Some(&error),
+            &crate::SelectParams::for_record(),
+            None,
+            None,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&decision.rejected_json).unwrap(),
+            reply.detail["rejected"]
+        );
+        let explanation: Value =
+            serde_json::from_str(decision.explanation_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            explanation["blockingCauses"],
+            reply.detail["blockingCauses"]
+        );
     }
 }

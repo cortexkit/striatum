@@ -534,6 +534,17 @@ pub struct NoRouteError {
     /// epoch). This is not a promise that other admission fences will clear then.
     pub earliest_reset: Option<f64>,
     pub earliest_reset_route: Option<String>,
+    /// Routes that clear the quality gate despite their admission fence, with
+    /// the effective wall expiry when the fence is timed.
+    pub adequate_blockers: std::collections::BTreeMap<String, Option<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdequateBlocker {
+    pub route_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_at_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -542,6 +553,7 @@ pub struct BlockingCause {
     pub reason: String,
     pub count: usize,
     pub routes: Vec<RejectedRoute>,
+    pub adequate_routes: Vec<AdequateBlocker>,
 }
 
 impl NoRouteError {
@@ -558,6 +570,17 @@ impl NoRouteError {
             .map(|(reason, routes)| BlockingCause {
                 reason,
                 count: routes.len(),
+                adequate_routes: routes
+                    .iter()
+                    .filter_map(|route| {
+                        self.adequate_blockers
+                            .get(&route.route_key)
+                            .map(|reset| AdequateBlocker {
+                                route_key: route.route_key.clone(),
+                                reset_at_ms: *reset,
+                            })
+                    })
+                    .collect(),
                 routes,
             })
             .collect()
@@ -1789,6 +1812,7 @@ fn admit_and_price_shortlist(
             best_rejected: None,
             earliest_reset: None,
             earliest_reset_route: None,
+            adequate_blockers: Default::default(),
         });
     }
     let capability_only = all_zero(&requirements);
@@ -1807,6 +1831,7 @@ fn admit_and_price_shortlist(
             best_rejected: None,
             earliest_reset: None,
             earliest_reset_route: None,
+            adequate_blockers: Default::default(),
         });
     }
 
@@ -1854,6 +1879,7 @@ fn admit_and_price_shortlist(
             candidates: candidate_quality_scores(&input.facts, &admissible),
             reason: classify_empty_admission(&rejected),
             message: "no admissible model route for requirements".to_string(),
+            adequate_blockers: adequate_blockers(input, config, top_routable, &rejected),
             rejected,
             requirements: Some(requirements),
             best_rejected: None,
@@ -1903,6 +1929,7 @@ fn admit_and_price_shortlist(
                 "no route clears the adequacy floor ({:.2}); best effort adequacy {:.2} is below the sanity band ({:.2})",
                 ADEQUACY_FLOOR, max_adequacy, min_band
             ),
+            adequate_blockers: adequate_blockers(input, config, top_routable, &rejected),
             rejected,
             requirements: Some(requirements),
             best_rejected,
@@ -2433,6 +2460,45 @@ pub fn select_model_route_with_profiles(
                 floor: ADEQUACY_FLOOR,
             }),
     })
+}
+
+fn adequate_blockers(
+    input: &SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    top_routable: TopRoutableScores,
+    rejected: &[RejectedRoute],
+) -> std::collections::BTreeMap<String, Option<f64>> {
+    let reasons: HashMap<_, _> = rejected
+        .iter()
+        .map(|route| (route.route_key.as_str(), route.reason.as_str()))
+        .collect();
+    input
+        .facts
+        .iter()
+        .filter_map(|fact| {
+            let route = fact_to_route(fact);
+            let reason = reasons.get(route.route_key.as_str())?;
+            if fact.is_deprecated_upstream()
+                || fact.score_provenance == ScoreProvenance::Unscored
+                || capability_rejection_reason(fact, input.required_capabilities).is_some()
+                || !score_adequacy(fact, &input.requirements, top_routable, config)
+                    .clears_adequacy_floor()
+            {
+                return None;
+            }
+            let reset = matches!(
+                *reason,
+                "quota_exhausted" | "cooldown_active" | "backoff_active"
+            )
+            .then(|| {
+                input.runtime_snapshot.as_ref().and_then(|snapshot| {
+                    route_wall_until(snapshot, &route.route_key, &route.capacity_key)
+                })
+            })
+            .flatten();
+            Some((route.route_key, reset))
+        })
+        .collect()
 }
 
 fn earliest_reset_for_rejections(
