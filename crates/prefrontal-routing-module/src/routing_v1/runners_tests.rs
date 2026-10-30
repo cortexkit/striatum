@@ -348,6 +348,29 @@ fn served_billing_plane_wire_overrides_base_and_missing_plane_wire_fails_closed(
             matches
         );
     }
+    let mut selected_on_api = facts.clone();
+    selected_on_api[0].billing_plane = Some(credentials.billing_catalog.for_route(
+        "openai/gpt-5.6-luna",
+        &crate::broca_credentials::ServingMethod {
+            auth_method: Some("apikey".into()),
+            reason: "selected account class".into(),
+        },
+        false,
+    ));
+    credentials.runner_declarations.insert(
+        "fixture-runner".into(),
+        declaration(json!([{"wire_api":"openai.chatgpt_responses", "auth_method":"chatgpt"}])),
+    );
+    assert!(
+        routes(Registry::build(
+            vec![policy(None)],
+            &credentials,
+            &selected_on_api,
+            NOW
+        ))
+        .is_empty(),
+        "a different credential cannot lend its wire and method to the selected billing plane"
+    );
     plane["models"]["openai/gpt-5.6-luna"]
         .as_object_mut()
         .unwrap()

@@ -108,6 +108,11 @@ impl Registry {
                                                 && {
                                                     let method =
                                                         row.auth_method.as_deref().unwrap_or("");
+                                                    if fact.billing_plane.as_ref().is_some_and(
+                                                        |plane| plane.auth_method != method,
+                                                    ) {
+                                                        return false;
+                                                    }
                                                     let Some(api) =
                                                         credentials.wire_api(fact, method)
                                                     else {
