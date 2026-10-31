@@ -38,6 +38,83 @@ pub struct V1Recorded {
 }
 
 impl SqliteRouteStateStore {
+    pub fn record_service_tier(
+        &self,
+        decision_id: &str,
+        tier: &str,
+        accounts: &[String],
+    ) -> RouteStateResult<()> {
+        let accounts = serde_json::to_string(accounts).map_err(err)?;
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "UPDATE model_route_decisions SET service_tier_chosen=?2,
+                 service_tier_accounts_json=?3 WHERE id=?1",
+                    params![decision_id, tier, accounts],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
+    pub fn decision_service_tier(
+        &self,
+        decision_id: &str,
+    ) -> RouteStateResult<Option<(String, Vec<String>)>> {
+        let row: Option<(String, String)> = self
+            .store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT service_tier_chosen, service_tier_accounts_json
+                 FROM model_route_decisions WHERE id=?1 AND service_tier_chosen IS NOT NULL",
+                    params![decision_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+            })
+            .map_err(err)?;
+        row.map(|(tier, accounts)| {
+            serde_json::from_str(&accounts)
+                .map(|accounts| (tier, accounts))
+                .map_err(err)
+        })
+        .transpose()
+    }
+
+    pub fn record_usage_service_tier(
+        &self,
+        usage_id: &str,
+        applied: Option<&str>,
+        served: Option<&str>,
+        cost_usd: Option<f64>,
+    ) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "UPDATE model_route_usage SET service_tier_applied=?2,
+                 service_tier_served=?3, service_tier_price_status=?4,
+                 service_tier_cost_usd=?5 WHERE id=?1",
+                    params![
+                        usage_id,
+                        applied,
+                        served,
+                        if served.is_some() && cost_usd.is_none() {
+                            Some("served_unpriced")
+                        } else if served.is_some() {
+                            Some("confirmed")
+                        } else if applied.is_some() {
+                            Some("unconfirmed_estimate")
+                        } else {
+                            None
+                        },
+                        cost_usd
+                    ],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
     /// Bind a decision and, when it carries an affinity key, make it the key's
     /// previous decision, in one transaction.
     pub fn v1_record_decision(&self, decision: &V1Decision) -> RouteStateResult<()> {

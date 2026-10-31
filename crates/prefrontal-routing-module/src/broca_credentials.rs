@@ -36,6 +36,9 @@ pub struct BrocaCredentials {
     listed: Vec<ListedCredential>,
     catalog_providers: BTreeSet<String>,
     pub(crate) runner_declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
+    pub(crate) runner_service_tiers:
+        BTreeMap<String, cortexkit_role_llm_runner::service_tier::ServiceTiers>,
+    pub(crate) plan_prices: serde_json::Value,
     pub(crate) wire_apis: BTreeMap<String, String>,
     serving: BTreeMap<String, ServingMethod>,
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
@@ -326,6 +329,7 @@ impl BrocaCredentials {
     /// Every published plan counts, including unpriced or refused plan rows.
     /// Unknown membership must not be confused with a successfully empty list.
     pub(crate) fn publish_plan_prices(&mut self, prices: &serde_json::Value) {
+        self.plan_prices = prices.clone();
         self.subscription_plan_providers = prices
             .get("prices")
             .and_then(serde_json::Value::as_array)

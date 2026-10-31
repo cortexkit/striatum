@@ -15,7 +15,7 @@ use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::report::{
     parse_report_request, Outcome, ReportAnswer, ReportRequest, RESET_FENCE_CAP_MS,
 };
-use prefrontal_routing_core::RouteOutcome;
+use prefrontal_routing_core::{RouteOutcome, RouteStateStore};
 use prefrontal_routing_store::V1Recorded;
 use serde_json::Value;
 
@@ -71,7 +71,13 @@ pub(super) fn report_at(
 
     record_account_facts(params, &decision, deps, now as i64)?;
     if let Some(usage) = &request.usage {
-        record_usage(usage, &decision, deps, now)?;
+        record_usage(
+            usage,
+            &decision,
+            request.credential_id.as_deref(),
+            deps,
+            now,
+        )?;
     }
     deps.store
         .record_routing_outcome(
@@ -328,6 +334,7 @@ fn usage_row_id(decision_id: &str) -> String {
 fn record_usage(
     usage: &cortexkit_role_routing::report::Usage,
     decision: &prefrontal_routing_store::V1Decision,
+    reported_credential: Option<&str>,
     deps: &Deps<'_>,
     now: u64,
 ) -> Result<(), Refusal> {
@@ -360,7 +367,73 @@ fn record_usage(
     };
     deps.store
         .record_usage_delivery_for_decision(&observation, &decision.decision_id)
-        .map(|_| ())
+        .map_err(store_refusal)?;
+    let cost = usage
+        .service_tier_served
+        .as_deref()
+        .or(usage.service_tier_applied.as_deref())
+        .and_then(|tier| {
+            let identity = deps
+                .store
+                .decision_provider_identity(&decision.decision_id)
+                .ok()
+                .flatten();
+            let credential = identity
+                .as_ref()
+                .and_then(|identity| identity.credential_id.as_deref())
+                .or(reported_credential)?;
+            let credentials = deps.broca_credentials.lock().ok()?;
+            let row = credentials
+                .listed_credentials()
+                .iter()
+                .find(|row| row.id == credential)?;
+            let mut fact = deps.store.get_facts().ok()?.into_iter().find(|fact| {
+                fact.provider_id == decision.provider && fact.model_id == decision.model
+            })?;
+            credentials.price_for_method(
+                &mut fact,
+                row.auth_method.as_deref()?,
+                &Default::default(),
+            );
+            let credits = crate::ACCOUNT_QUOTA
+                .get()
+                .and_then(|state| state.lock().ok())
+                .and_then(|state| {
+                    state
+                        .readings
+                        .readings
+                        .values()
+                        .filter(|reading| {
+                            reading.account_id == row.account_id.as_deref().unwrap_or(&row.id)
+                                && reading.tombstoned_at_ms.is_none()
+                        })
+                        .max_by_key(|reading| reading.received_at_ms)
+                        .map(|reading| crate::service_tiers::drawing_credits(&reading.entry))
+                })
+                .unwrap_or(false);
+            let rate = crate::service_tiers::plan_rate(
+                &credentials.plan_prices,
+                row,
+                &fact.provider_id,
+                tier,
+                credits,
+            )?;
+            crate::service_tiers::price_fact(
+                &credentials,
+                &mut fact,
+                tier,
+                row.auth_method.as_deref() != Some("apikey"),
+                rate,
+            );
+            crate::service_tiers::usage_cost(&fact, usage)
+        });
+    deps.store
+        .record_usage_service_tier(
+            &observation.id,
+            usage.service_tier_applied.as_deref(),
+            usage.service_tier_served.as_deref(),
+            cost,
+        )
         .map_err(store_refusal)
 }
 

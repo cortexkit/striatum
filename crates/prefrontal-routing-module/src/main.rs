@@ -43,6 +43,7 @@ mod runtime_lag;
 mod select;
 mod select_policy;
 mod selection_harness;
+mod service_tiers;
 mod subscription_economics;
 mod substrate_policy;
 mod task_profile_refresh;
