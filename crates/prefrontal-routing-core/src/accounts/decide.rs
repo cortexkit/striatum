@@ -1004,7 +1004,19 @@ impl<'a> Allocator<'a> {
         for eval in evals.iter_mut().filter(|eval| eval.eligible()) {
             let quota = eval.quota.as_ref().expect("eligible has quota");
             let weight = quota.weight.expect("eligible has weight");
-            let pending = self.pending_bytes(&eval.view.account_id, quota.observed_at_ms);
+            // An account carried by prepaid credits has its quota reading set
+            // aside, so it has no observation point of its own. Its credit
+            // reading is one: without it, every admission the account ever had
+            // would count as pending, and the account with the shortest history
+            // would win every new conversation while the others' credits sat
+            // unused.
+            let observed = quota.observed_at_ms.or_else(|| {
+                self.using_credits(&eval.view.account_id)
+                    .then(|| self.context.credits.get(&eval.view.account_id))
+                    .flatten()
+                    .map(|credit| credit.observed_at_ms)
+            });
+            let pending = self.pending_bytes(&eval.view.account_id, observed);
             let mut score = (pending + self.request_bytes) as f64 / weight;
             let preserved =
                 direct_opus

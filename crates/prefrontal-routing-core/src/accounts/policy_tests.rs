@@ -357,6 +357,49 @@ fn prepaid_credits_carry_work_once_the_reserve_holds_every_account() {
     }
 }
 
+/// Accounts carried by prepaid credits have their quota readings set aside, so
+/// their load is counted from the credit reading. An account with a long
+/// history of finished admissions must not lose every new conversation to one
+/// with a shorter history: only work since the credit reading counts.
+#[test]
+fn credit_accounts_spread_by_recent_load_not_by_lifetime_history() {
+    let mut state = state(&["a", "b"]);
+    state.policy.paid_credits = true;
+    let accounts = &mut state.roster.as_mut().unwrap().accounts;
+    accounts[0].quota = Some(weekly(100.0));
+    accounts[1].quota = Some(weekly(100.0));
+    let mut inputs = AllocationContext::default();
+    inputs.credits.insert("a".into(), credit(true));
+    inputs.credits.insert("b".into(), credit(true));
+    // Weeks ago, "a" ran far more work than "b". All of it finished long
+    // before the credit readings.
+    for (account, count) in [("a", 50), ("b", 10)] {
+        for _ in 0..count {
+            state.admissions.push(AdmissionDemand {
+                account_id: account.into(),
+                state: AdmissionState::Finished,
+                request_bytes: 32_768,
+                committed_at_ms: NOW - 20 * 24 * 3_600_000,
+            });
+        }
+    }
+    // Since the credit readings, "b" has one run in flight and "a" none.
+    state.admissions.push(AdmissionDemand {
+        account_id: "b".into(),
+        state: AdmissionState::Started,
+        request_bytes: 32_768,
+        committed_at_ms: NOW,
+    });
+    let decision = decide_with_context(&broca_request(), &state, NOW, &inputs);
+    match decision.outcome {
+        Outcome::Admit(admission) => {
+            assert_eq!(admission.account_id, "a");
+            assert_eq!(admission.reason, AdmitReason::PaidCredits);
+        }
+        other => panic!("credits should carry the work: {other:?}"),
+    }
+}
+
 fn reading(used: f64, pool: &str) -> QuotaReading {
     let window = QuotaWindow {
         used_percent: used,
