@@ -37,6 +37,7 @@ fn the_older_shapes_are_recognised_by_their_marker_alone() {
         "route.select_panel",
         "route.account_status",
         "route.model_facts",
+        "route.catalog_targets",
     ] {
         assert!(!claims(&body(method, json!({}))), "{method}");
     }

@@ -1031,6 +1031,10 @@ pub(super) async fn handle_select_request(
         .await;
     }
 
+    if envelope.method == ROUTE_CATALOG_TARGETS_OP {
+        return crate::catalog_targets::serve(frame, writer, broca_credentials).await;
+    }
+
     if envelope.method == QUOTA_STATUS_OP {
         let consumer = quota_cache.lock().ok().map(|cache| cache.consumer.clone());
         let (available, refreshed_at_ms, providers, healthy, last_error, restored_from_ms) =

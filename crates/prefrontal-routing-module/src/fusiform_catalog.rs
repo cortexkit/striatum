@@ -314,10 +314,21 @@ pub(crate) struct CatalogSnapshot {
     retained: BTreeSet<(String, String)>,
 }
 
-#[cfg(test)]
 impl CatalogSnapshot {
+    /// Keep the provider index tied to the version of the catalog that supplied it.
+    pub(crate) fn provider_index(&self) -> (i64, BTreeSet<String>) {
+        let providers = self
+            .facts
+            .iter()
+            .map(|row| row.provider_id.clone())
+            .chain(self.retained.iter().map(|(provider, _)| provider.clone()))
+            .collect();
+        (self.cursor.catalog_version, providers)
+    }
+
     /// The decoded rows and cursor, for tests outside this module that apply a
     /// snapshot to a store directly.
+    #[cfg(test)]
     pub(crate) fn parts(&self) -> (&[FusiformFactUpdate], FusiformCatalogCursor) {
         (&self.facts, self.cursor)
     }

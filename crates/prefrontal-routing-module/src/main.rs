@@ -21,6 +21,7 @@ mod background;
 #[cfg(test)]
 mod baseline_tests;
 mod broca_credentials;
+mod catalog_targets;
 mod config_convert;
 mod config_overrides;
 mod config_policy;
@@ -147,6 +148,7 @@ const ROUTE_DECISIONS_LIST_OP: &str = "route.decisions_list";
 const ROUTE_MODEL_FACT_OP: &str = "route.model_fact";
 /// Read the complete durable model catalog for display and observation consumers.
 const ROUTE_MODEL_FACTS_OP: &str = "route.model_facts";
+const ROUTE_CATALOG_TARGETS_OP: &str = "route.catalog_targets";
 /// Live catalog write: add a model or adjust its scores/metadata without a
 /// store migration or module deploy. Merge semantics against the stored fact;
 /// writes land as FactSource::Override so a re-seed never reverts them.
@@ -4062,6 +4064,7 @@ pub(crate) fn handles(method: &str) -> bool {
             | ROUTE_RESOLVE_POLICY_OP
             | ROUTE_MODEL_FACT_OP
             | ROUTE_MODEL_FACTS_OP
+            | ROUTE_CATALOG_TARGETS_OP
             | model_resolution::RESOLVE_MODEL_OP
             | model_resolution::MODEL_CAPABILITIES_OP
             | model_resolution::AGENT_MODEL_REQUIREMENTS_OP
@@ -4129,6 +4132,11 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
         },
         ManagementOperation {
             name: ROUTE_MODEL_FACTS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_CATALOG_TARGETS_OP.to_string(),
             kind: ManagementOperationKind::Query,
             description: None,
         },
@@ -4546,6 +4554,10 @@ impl Error for ModuleError {}
 
 #[cfg(test)]
 mod tests {
+    mod catalog_targets_contract {
+        use super::*;
+        include!("catalog_targets_tests.rs");
+    }
     mod harness_selection {
         use super::*;
         include!("selection_harness/contract_tests.rs");
@@ -14186,6 +14198,7 @@ mod tests {
         }
         assert!(handles(ROUTE_LIST_INFERRED_OP));
         assert!(handles(ROUTE_LIST_UNSCORED_OP));
+        assert!(handles(ROUTE_CATALOG_TARGETS_OP));
         assert!(!handles("route.unknown"));
     }
 

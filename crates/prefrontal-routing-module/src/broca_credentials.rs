@@ -523,8 +523,15 @@ impl BrocaCredentials {
         facts: &[ModelFact],
     ) -> prefrontal_routing_core::score_alias::CatalogResolution {
         let catalog: BTreeSet<String> = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        self.catalog_resolution_for_providers(&catalog)
+    }
+
+    pub(crate) fn catalog_resolution_for_providers(
+        &self,
+        catalog: &BTreeSet<String>,
+    ) -> prefrontal_routing_core::score_alias::CatalogResolution {
         prefrontal_routing_core::score_alias::resolve_catalog_targets(
-            &catalog,
+            catalog,
             self.listed
                 .iter()
                 .filter(|row| {
