@@ -311,13 +311,29 @@ pub(crate) fn declarations_from_catalog(
     }).collect()
 }
 
+pub(crate) fn service_tiers_from_describe(
+    value: &serde_json::Value,
+) -> Option<cortexkit_role_llm_runner::service_tier::ServiceTiers> {
+    let value = value.get("result").unwrap_or(value);
+    if !value["capabilities"]
+        .as_array()?
+        .iter()
+        .any(|capability| capability == "service_tier")
+    {
+        return None;
+    }
+    let tiers = serde_json::from_value(value.get("service_tiers")?.clone()).ok()?;
+    cortexkit_role_llm_runner::service_tier::check_service_tiers(&tiers).ok()?;
+    Some(tiers)
+}
+
 pub(crate) async fn refresh_loop(
     connection_file: std::path::PathBuf,
     credentials: crate::SharedBrocaCredentials,
 ) {
-    use subc_client_rs::{ConsumerOptions, SubcConsumer};
+    use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
     loop {
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
                 .await
                 .map_err(|error| error.to_string())?;
@@ -325,15 +341,56 @@ pub(crate) async fn refresh_loop(
                 .catalog_list()
                 .await
                 .map_err(|error| error.to_string())?;
-            serde_json::to_value(catalog.modules).map_err(|error| error.to_string())
+            let modules =
+                serde_json::to_value(catalog.modules).map_err(|error| error.to_string())?;
+            let declarations = declarations_from_catalog(&modules);
+            let mut tiers = std::collections::BTreeMap::new();
+            // The routing declaration describes reach, not tier application.
+            // Only the runner's own role.describe can establish tier support.
+            for module in declarations.keys() {
+                let reply = consumer
+                    .call(
+                        subc_protocol::RouteTarget::ManagementSurface {
+                            module_id: module.clone(),
+                        },
+                        subc_protocol::BindIdentity::new(
+                            connection_file
+                                .parent()
+                                .unwrap_or(std::path::Path::new(".")),
+                            "prefrontal-routing",
+                            "runner-service-tiers",
+                        ),
+                        serde_json::to_vec(
+                            &serde_json::json!({"method":"role.describe", "params":{}}),
+                        )
+                        .map_err(|error| error.to_string())?,
+                        CallOptions {
+                            timeout: std::time::Duration::from_secs(1),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                if let Ok(bytes) = reply {
+                    if let Some(support) = serde_json::from_slice(&bytes)
+                        .ok()
+                        .as_ref()
+                        .and_then(service_tiers_from_describe)
+                    {
+                        tiers.insert(module.clone(), support);
+                    }
+                }
+            }
+            Ok::<_, String>((modules, declarations, tiers))
         })
         .await;
-        if let Ok(Ok(modules)) = result {
+        if let Ok(Ok((modules, declarations, tiers))) = result {
             super::consumers::replace_catalog(&modules);
-            let declarations = declarations_from_catalog(&modules);
             if let Ok(mut credentials) = credentials.lock() {
                 credentials.runner_declarations = declarations;
+                credentials.runner_service_tiers = tiers;
             }
+        } else if let Ok(mut credentials) = credentials.lock() {
+            credentials.runner_service_tiers.clear();
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }

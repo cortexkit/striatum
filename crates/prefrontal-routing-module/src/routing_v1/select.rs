@@ -56,6 +56,7 @@ const MEMBERS: &[&str] = &[
     "hold_wait_max_s",
     "pin_fallback",
     "prefer",
+    "service_tier",
 ];
 
 /// How long an answer stays current routing. A report after this is still
@@ -127,6 +128,84 @@ pub(super) async fn select_with_profile_lookup(
     caller: &Caller,
     deps: &Deps<'_>,
     profile_lookup: &ProfileLookup,
+) -> Result<Value, Refusal> {
+    use cortexkit_role_routing::service_tier::ServiceTier;
+    super::refuse_unknown_members(params, MEMBERS)?;
+    let request = parse_select_request_serving(params, super::describe::CAPABILITIES)?;
+    let Some(requested) = request.service_tier else {
+        return select_at_tier(params, caller, deps, profile_lookup, None, None).await;
+    };
+    if let Some(previous) = request
+        .affinity
+        .as_deref()
+        .map(|key| {
+            deps.store
+                .v1_affinity_decision(&caller.principal, &request.consumer, key)
+        })
+        .transpose()
+        .map_err(store_refusal)?
+        .flatten()
+    {
+        if let Some((tier, _)) = deps
+            .store
+            .decision_service_tier(&previous.decision_id)
+            .map_err(store_refusal)?
+        {
+            if let Some(tier) = ServiceTier::parse(&tier).filter(|tier| *tier <= requested) {
+                let credential = deps
+                    .store
+                    .decision_provider_identity(&previous.decision_id)
+                    .map_err(store_refusal)?
+                    .and_then(|identity| identity.credential_id);
+                if let Ok(answer) = select_at_tier(
+                    params,
+                    caller,
+                    deps,
+                    profile_lookup,
+                    Some(tier),
+                    credential.as_deref(),
+                )
+                .await
+                {
+                    return Ok(answer);
+                }
+            }
+        }
+    }
+    let mut last = None;
+    for tier in ServiceTier::ALL
+        .iter()
+        .rev()
+        .copied()
+        .filter(|tier| *tier <= requested)
+    {
+        match select_at_tier(params, caller, deps, profile_lookup, Some(tier), None).await {
+            Ok(answer) => return Ok(answer),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "no_route"
+                        | "pin_unavailable"
+                        | "accounts_blocked"
+                        | "account_hold"
+                        | "auth_required"
+                ) =>
+            {
+                last = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None)))
+}
+
+async fn select_at_tier(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    profile_lookup: &ProfileLookup,
+    service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+    sticky_credential: Option<&str>,
 ) -> Result<Value, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
     // An omitted task_ref is valid, but a present value must be a string.
@@ -200,7 +279,7 @@ pub(super) async fn select_with_profile_lookup(
         operator_config_path: deps.operator_config_path,
         catalog_targets: &catalog_targets,
     };
-    let priced = crate::price_selection_inputs(
+    let mut priced = crate::price_selection_inputs(
         &mut facts,
         quota_signal_json,
         &sources,
@@ -275,8 +354,31 @@ pub(super) async fn select_with_profile_lookup(
     if runners.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
+    if let Some(tier) = service_tier {
+        let Some(classes) = &mut priced.classes else {
+            return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
+        };
+        classes.apply_service_tier(
+            &mut facts,
+            tier.as_str(),
+            &runners,
+            &registry,
+            priced_per_token,
+            sticky_credential,
+        );
+    }
     let runs = |runner: &RunnerPolicy, route_key: &str, capacity_key: &str| -> bool {
         registry.runs(&runner.module, route_key, capacity_key)
+            && service_tier.is_none_or(|tier| {
+                priced.classes.as_ref().is_some_and(|classes| {
+                    facts
+                        .iter()
+                        .find(|fact| fact_to_route(fact).route_key == route_key)
+                        .is_some_and(|fact| {
+                            classes.tier_runner_serves(&runner.module, fact, tier.as_str())
+                        })
+                })
+            })
     };
 
     // The routes some eligible runner runs, then the requirements the scorer
@@ -775,6 +877,18 @@ pub(super) async fn select_with_profile_lookup(
             request.task_ref.as_deref(),
         )
         .map_err(store_refusal)?;
+    if let Some(tier) = service_tier {
+        let accounts = priced
+            .classes
+            .as_ref()
+            .map(|classes| {
+                classes.service_tier_accounts(&selected.model.provider_id, &selected.model.model_id)
+            })
+            .unwrap_or_default();
+        deps.store
+            .record_service_tier(&decision_id, tier.as_str(), &accounts)
+            .map_err(store_refusal)?;
+    }
     if registry
         .get(&runner.module)
         .is_some_and(|runner| runner.follows_account_choice)
@@ -847,6 +961,9 @@ pub(super) async fn select_with_profile_lookup(
         expires_at_ms,
         explanation,
     );
+    if let Some(tier) = service_tier {
+        answer = answer.with_service_tier_chosen(tier);
+    }
     let mut detail = (request.detail == Some(true)).then(|| {
         json!({
             "basis": basis.as_str(),

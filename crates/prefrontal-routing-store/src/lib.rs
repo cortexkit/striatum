@@ -225,6 +225,7 @@ const MIGRATION_066: &str = include_str!("../migrations/066_account_eligibility.
 const MIGRATION_067: &str = include_str!("../migrations/067_account_route_fence.sql");
 const MIGRATION_068: &str = include_str!("../migrations/068_account_demand_by_account.sql");
 const MIGRATION_069: &str = include_str!("../migrations/069_task_workload.sql");
+const MIGRATION_071: &str = include_str!("../migrations/071_service_tiers.sql");
 
 /// Stored rejection detail stays useful without growing with every catalog route.
 const MAX_STORED_REJECTIONS: usize = 12;
@@ -280,7 +281,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 69] {
+fn route_state_migrations() -> [Migration; 70] {
     [
         Migration {
             version: 1,
@@ -557,6 +558,10 @@ fn route_state_migrations() -> [Migration; 69] {
         Migration {
             version: 70,
             statements: include_str!("../migrations/070_operator_quality.sql"),
+        },
+        Migration {
+            version: 71,
+            statements: MIGRATION_071,
         },
     ]
 }

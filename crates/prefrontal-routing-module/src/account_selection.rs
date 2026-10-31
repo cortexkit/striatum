@@ -184,6 +184,7 @@ pub(crate) struct ClassContext {
     route_fences: Vec<prefrontal_routing_store::AccountRouteFence>,
     catalog: BTreeSet<String>,
     targets: BTreeMap<String, String>,
+    tier_accounts: Option<BTreeMap<String, Vec<String>>>,
 }
 
 #[cfg(test)]
@@ -247,6 +248,125 @@ pub(crate) fn resolve_class<'a>(
 }
 
 impl ClassContext {
+    pub(crate) fn apply_service_tier(
+        &mut self,
+        facts: &mut [prefrontal_routing_core::ModelFact],
+        tier: &str,
+        runners: &[crate::config_policy::RunnerPolicy],
+        registry: &crate::routing_v1::runners::Registry,
+        priced: bool,
+        sticky_credential: Option<&str>,
+    ) {
+        let mut allowed = BTreeMap::new();
+        for fact in facts {
+            let key = format!("{}/{}", fact.provider_id, fact.model_id);
+            let class = self.class(fact, priced);
+            let mut candidates = Vec::new();
+            if crate::service_tiers::model_offers(&self.credentials, fact, tier) {
+                for row in class.rows {
+                    if sticky_credential.is_some_and(|id| id != row.id)
+                        || !self.usable_candidate(row, fact, true)
+                    {
+                        continue;
+                    }
+                    if !runners.iter().any(|runner| {
+                        registry.runs(
+                            &runner.module,
+                            &prefrontal_routing_core::fact_to_route(fact).route_key,
+                            &key,
+                        ) && crate::service_tiers::runner_supports(
+                            &self.credentials,
+                            &runner.module,
+                            fact,
+                            row,
+                            tier,
+                        )
+                    }) {
+                        continue;
+                    }
+                    let account = row.account_id.as_deref().unwrap_or(&row.id);
+                    let credits = self
+                        .quota
+                        .readings
+                        .readings
+                        .values()
+                        .filter(|reading| {
+                            reading.account_id == account && reading.tombstoned_at_ms.is_none()
+                        })
+                        .max_by_key(|reading| reading.received_at_ms)
+                        .is_some_and(|reading| {
+                            crate::service_tiers::drawing_credits(&reading.entry)
+                        });
+                    if let Some(rate) = crate::service_tiers::plan_rate(
+                        &self.credentials.plan_prices,
+                        row,
+                        &fact.provider_id,
+                        tier,
+                        credits,
+                    ) {
+                        candidates.push((row.id.clone(), rate));
+                    }
+                }
+            }
+            // Accounts on one route share its standard prices. Keep only the
+            // least expensive eligible draw, so later allocation cannot silently
+            // replace the account cost used to rank that route.
+            let lowest = candidates
+                .iter()
+                .map(|(_, rate)| *rate)
+                .min_by(f64::total_cmp);
+            let ids = candidates
+                .into_iter()
+                .filter(|(_, rate)| Some(*rate) == lowest)
+                .map(|(id, _)| id)
+                .collect();
+            if let Some(rate) = lowest {
+                crate::service_tiers::price_fact(
+                    &self.credentials,
+                    fact,
+                    tier,
+                    class.subscription,
+                    rate,
+                );
+            }
+            allowed.insert(key, ids);
+        }
+        self.tier_accounts = Some(allowed);
+    }
+
+    pub(crate) fn service_tier_accounts(&self, provider: &str, model: &str) -> Vec<String> {
+        self.tier_accounts
+            .as_ref()
+            .and_then(|accounts| accounts.get(&format!("{provider}/{model}")))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn tier_runner_serves(
+        &self,
+        module: &str,
+        fact: &prefrontal_routing_core::ModelFact,
+        tier: &str,
+    ) -> bool {
+        self.service_tier_accounts(&fact.provider_id, &fact.model_id)
+            .iter()
+            .any(|id| {
+                self.credentials
+                    .listed_credentials()
+                    .iter()
+                    .find(|row| &row.id == id)
+                    .is_some_and(|row| {
+                        crate::service_tiers::runner_supports(
+                            &self.credentials,
+                            module,
+                            fact,
+                            row,
+                            tier,
+                        )
+                    })
+            })
+    }
+
     pub(crate) fn load(
         store: &SqliteRouteStateStore,
         credentials: &crate::broca_credentials::SharedBrocaCredentials,
@@ -381,6 +501,7 @@ impl ClassContext {
             route_fences,
             catalog,
             targets,
+            tier_accounts: None,
         })
     }
 
@@ -489,7 +610,11 @@ impl ClassContext {
         row: &cortexkit_claustrum_client::ListedCredential,
         fact: &prefrontal_routing_core::ModelFact,
     ) -> bool {
-        !self.eligibility.iter().any(|fact_| {
+        self.tier_accounts.as_ref().is_none_or(|accounts| {
+            accounts
+                .get(&format!("{}/{}", fact.provider_id, fact.model_id))
+                .is_some_and(|ids| ids.contains(&row.id))
+        }) && !self.eligibility.iter().any(|fact_| {
             fact_.provider == fact.provider_id
                 && fact_.credential_id == row.id
                 && (fact_.model.is_empty() || fact_.model == fact.model_id)
@@ -576,6 +701,15 @@ impl ClassContext {
         row: &cortexkit_claustrum_client::ListedCredential,
         fact: &prefrontal_routing_core::ModelFact,
     ) -> bool {
+        self.usable_candidate(row, fact, false)
+    }
+
+    fn usable_candidate(
+        &self,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        fact: &prefrontal_routing_core::ModelFact,
+        only: bool,
+    ) -> bool {
         if !self.eligible(row, fact) {
             return false;
         }
@@ -596,7 +730,8 @@ impl ClassContext {
             .listed_credentials()
             .iter()
             .filter(|other| {
-                covered(other) == covered(row)
+                (!only || other.id == row.id)
+                    && covered(other) == covered(row)
                     && self.eligible(other, fact)
                     && crate::broca_credentials::credential_serves_fact(other, fact, &self.catalog)
             })
@@ -2715,6 +2850,63 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         }
         None => roster_for_model(ctx, &provider, Some(&normalize(&parsed.model))),
     };
+    if let Some(id) = parsed.model_decision_id.as_deref() {
+        match ctx.store.decision_service_tier(id) {
+            Ok(Some((tier, allowed))) => {
+                let runner = match ctx.store.v1_decision(id) {
+                    Ok(decision) => decision.map(|decision| decision.runner_module),
+                    Err(error) => return store_error(error),
+                };
+                if let Some(roster) = &mut roster.roster {
+                    for account in &mut roster.accounts {
+                        account.credentials.retain(|credential| {
+                            allowed.contains(&credential.credential_id)
+                                && ctx.classes.as_ref().is_some_and(|classes| {
+                                    let fact = classes.facts.iter().find(|fact| {
+                                        fact.provider_id == provider
+                                            && fact.model_id == normalize(&parsed.model)
+                                    });
+                                    let row = classes
+                                        .credentials
+                                        .listed_credentials()
+                                        .iter()
+                                        .find(|row| row.id == credential.credential_id);
+                                    match (fact, row, runner.as_deref()) {
+                                        (Some(fact), Some(row), Some(runner)) => {
+                                            crate::service_tiers::model_offers(
+                                                &classes.credentials,
+                                                fact,
+                                                &tier,
+                                            ) && crate::service_tiers::plan_rate(
+                                                &classes.credentials.plan_prices,
+                                                row,
+                                                &provider,
+                                                &tier,
+                                                false,
+                                            )
+                                            .is_some()
+                                                && crate::service_tiers::runner_supports(
+                                                    &classes.credentials,
+                                                    runner,
+                                                    fact,
+                                                    row,
+                                                    &tier,
+                                                )
+                                        }
+                                        _ => false,
+                                    }
+                                })
+                        });
+                    }
+                    roster
+                        .accounts
+                        .retain(|account| !account.credentials.is_empty());
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return store_error(error),
+        }
+    }
     if let Some(classes) = &ctx.classes {
         classes.restrict_size(
             &mut roster,

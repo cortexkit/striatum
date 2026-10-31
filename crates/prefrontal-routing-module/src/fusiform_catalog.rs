@@ -353,15 +353,17 @@ fn entry_rates(model: &str, facts: &Value) -> Result<ModelRates, String> {
         .as_object()
         .ok_or_else(|| "model facts are not an object".to_string())?
     {
-        // Mode rates and unrelated additive catalog facts do not belong to
-        // the ordinary token basket. Keep above-context targets verbatim.
+        // Keep mode rates as well as the ordinary basket: a mode is evidence
+        // that a model offers a service tier, and prices API-key traffic.
         if !prefrontal_routing_core::BasketDimension::ALL
             .into_iter()
             .any(|dimension| {
                 key == dimension.fact_key()
                     || key
                         .strip_prefix(dimension.fact_key())
-                        .is_some_and(|suffix| suffix.starts_with(".above_context."))
+                        .is_some_and(|suffix| {
+                            suffix.starts_with(".above_context.") || suffix.starts_with(".mode.")
+                        })
             })
         {
             continue;
@@ -487,6 +489,31 @@ pub(crate) struct PlaneCatalog {
 }
 
 impl PlaneCatalog {
+    pub(crate) fn offers_tier(&self, model: &str, tier: &str) -> bool {
+        self.base.get(model).is_some_and(|rates| {
+            rates
+                .rates
+                .keys()
+                .any(|key| key.ends_with(&format!(".mode.{tier}")))
+        })
+    }
+
+    pub(crate) fn mode_rates(&self, model: &str, tier: &str) -> BTreeMap<String, BillingRate> {
+        self.base
+            .get(model)
+            .map(|rates| {
+                rates
+                    .rates
+                    .iter()
+                    .filter_map(|(key, rate)| {
+                        key.strip_suffix(&format!(".mode.{tier}"))
+                            .map(|base| (base.to_owned(), rate.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// A served plane is authoritative, including when it has no wire fact.
     /// Only routes without a served plane may use the ordinary catalog value.
     pub(crate) fn wire_api(&self, model: &str, auth_method: &str) -> Option<Option<&str>> {
@@ -511,6 +538,12 @@ impl PlaneCatalog {
 
     pub(crate) fn is_loaded(&self) -> bool {
         self.version.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_catalog(mut self, bytes: &[u8]) -> Self {
+        self.base = decode_catalog_get(bytes).unwrap().rates;
+        self
     }
 
     #[cfg(test)]

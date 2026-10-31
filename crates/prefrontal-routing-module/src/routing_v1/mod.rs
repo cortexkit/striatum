@@ -30,6 +30,8 @@ mod describe;
 mod report;
 pub(crate) mod runners;
 mod select;
+#[cfg(test)]
+mod service_tier_tests;
 
 #[cfg(test)]
 mod account_classes_tests;
