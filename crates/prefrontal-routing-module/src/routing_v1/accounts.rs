@@ -153,6 +153,9 @@ pub(super) fn account_for(
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
     let authority = account_caller(caller, deps)?;
+    if params["mode"] == "continue" {
+        return continue_account(params, caller, &authority, deps);
+    }
     super::refuse_unknown_members(params, FOR_MEMBERS)?;
     let mut request = parse_account_for_request(params)?;
     if let Some(scope) = authority.session {
@@ -270,6 +273,55 @@ pub(super) fn account_for(
         )
         .map_err(store_unavailable)?;
     standing_answer(standing, &body_json)
+}
+
+fn continue_account(
+    params: &Value,
+    caller: &Caller,
+    authority: &AccountCaller<'_>,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
+    super::refuse_unknown_members(
+        params,
+        &[
+            "mode",
+            "run_id",
+            "admission_id",
+            "conversation_key",
+            "previous_decision_id",
+            "exhausted",
+            "selection_id",
+        ],
+    )?;
+    super::refuse_unknown_members(
+        &params["exhausted"],
+        &[
+            "credential_id",
+            "account",
+            "limit_window",
+            "pool",
+            "resets_at_ms",
+            "retry_after_s",
+            "observed_at_ms",
+        ],
+    )?;
+    let describe =
+        serde_json::from_value(super::describe::describe(deps)?).map_err(internal_unavailable)?;
+    let request =
+        cortexkit_role_routing::account_continue::parse_continue_request(params, &describe)?;
+    let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
+    let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
+    let ctx = account_ctx(deps, flags, &policy).map_err(|r| account_unavailable(r.message))?;
+    account_selection::continue_account(
+        &request,
+        &authority.principal,
+        authority.module,
+        caller
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.project_id.as_deref()),
+        &ctx,
+    )
 }
 
 /// The first admission's answer when `body_json` is the same body, and

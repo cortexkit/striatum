@@ -388,6 +388,14 @@ pub struct RunnerCandidates {
     pub accounts: Vec<CandidateRef>,
 }
 
+impl RunnerCandidates {
+    pub fn contains(&self, account_id: &str, credential_id: &str) -> bool {
+        self.accounts.iter().any(|candidate| {
+            candidate.account_id == account_id && candidate.credential_id == credential_id
+        })
+    }
+}
+
 /// Who is asking. Broca runs are frozen for their whole life, so Broca cold
 /// admissions need the extra spendable floor (design step 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

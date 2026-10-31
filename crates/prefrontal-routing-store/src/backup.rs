@@ -126,6 +126,10 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "committed duplicate-request replies, charged demand and lease lifecycle",
     ),
     (
+        "account_continue",
+        "durable selection replies, decision lineage and continuation reservations",
+    ),
+    (
         "account_hold",
         "client-visible retry answers within their window",
     ),

@@ -71,6 +71,9 @@ pub(super) fn report_at(
 
     record_account_facts(params, &decision, deps, now as i64)?;
     if let Some(usage) = &request.usage {
+        deps.store
+            .account_transaction(|tx| tx.use_continuation(&request.decision_id, now as i64))
+            .map_err(store_refusal)?;
         record_usage(
             usage,
             &decision,

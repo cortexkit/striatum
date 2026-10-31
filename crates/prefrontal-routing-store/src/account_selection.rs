@@ -997,6 +997,8 @@ pub struct AccountTx<'a> {
     conn: &'a Connection,
 }
 
+mod continuation;
+
 impl AccountTx<'_> {
     /// The installation-local salt for hashing conversation keys, created with
     /// `fresh` the first time it is needed and never changed afterwards.

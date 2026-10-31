@@ -294,12 +294,10 @@ impl<'a> Allocator<'a> {
     }
 
     fn runner_lists(&self, account_id: &str, credential_id: &str) -> bool {
-        self.request.candidates.as_ref().is_none_or(|candidates| {
-            candidates
-                .accounts
-                .iter()
-                .any(|c| c.account_id == account_id && c.credential_id == credential_id)
-        })
+        self.request
+            .candidates
+            .as_ref()
+            .is_none_or(|candidates| candidates.contains(account_id, credential_id))
     }
 
     /// A refusal exclusion lasts until the runner reports a different view

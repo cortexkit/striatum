@@ -389,6 +389,14 @@ impl ClassContext {
     ) -> Result<Self, String> {
         #[cfg(test)]
         CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
+        if store
+            .account_read(|tx| tx.has_expired_continuations(now_ms))
+            .map_err(|error| error.to_string())?
+        {
+            store
+                .account_transaction(|tx| tx.release_expired_continuations(now_ms))
+                .map_err(|error| error.to_string())?;
+        }
         let refusals = crate::credential_fences::live(store, credentials)?;
         let credentials = credentials
             .lock()
@@ -1960,6 +1968,7 @@ pub(crate) fn refresh_all_blocks(
     now: EpochMs,
 ) -> RouteStateResult<()> {
     store.account_transaction(|tx| {
+        tx.release_expired_continuations(now)?;
         for provider in tx.active_fence_providers()? {
             let accounts = allocator_roster_for_model(state, &provider, None, now, &[])
                 .roster
@@ -2807,6 +2816,9 @@ fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
     }))
 }
 
+mod continuation;
+pub(crate) use continuation::continue_account;
+
 fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     let parsed = match parse_account_for(params) {
         Ok(parsed) => parsed,
@@ -2823,6 +2835,75 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Ok(None) => {}
         Err(error) => return store_error(error),
     }
+    let (roster, route_fenced, class) = match prepare_roster(&parsed, ctx) {
+        Ok(prepared) => prepared,
+        Err(reply) => return reply,
+    };
+    if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
+        return reply;
+    }
+    if !roster
+        .roster
+        .as_ref()
+        .is_some_and(|roster| !roster.accounts.is_empty())
+    {
+        if let Some(classes) = ctx.classes.as_ref() {
+            return empty_roster_refusal(
+                classes,
+                &provider,
+                &normalize(&parsed.model),
+                class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
+                &route_fenced,
+                ctx.now_ms,
+                &parsed,
+            );
+        }
+        // Without class context the vault/quota roster names nothing usable
+        // for this provider/model: no filtering by eligibility, size or
+        // candidates happens here, so an empty roster means no credential
+        // of the right kind serves it. That is `auth_required`, untimed:
+        // the runner needs a login it does not have.
+        return OpReply::typed(
+            "auth_required",
+            format!("routing selects no accounts for provider `{provider}`"),
+            json!({
+                "code": "auth_required",
+                "retry_after_s": null,
+                "decision_id": null,
+                "exclusions": [],
+            }),
+        );
+    }
+    // The roster is read before the transaction: no lock or fetch happens
+    // while the selection transaction is open.
+    ctx.store
+        .account_transaction(|tx| {
+            tx.release_expired_continuations(ctx.now_ms)?;
+            serve(
+                tx,
+                ctx,
+                principal,
+                &parsed,
+                &provider,
+                &roster,
+                &request_fingerprint,
+            )
+        })
+        .unwrap_or_else(store_error)
+}
+
+fn prepare_roster(
+    parsed: &AccountForParams,
+    ctx: &Ctx<'_>,
+) -> Result<
+    (
+        RosterBuild,
+        BTreeMap<String, i64>,
+        prefrontal_routing_core::accounts::AllowedAccountClass,
+    ),
+    OpReply,
+> {
+    let provider = normalize(&parsed.provider);
     let class = match parsed.model_decision_id.as_deref() {
         None => prefrontal_routing_core::accounts::AllowedAccountClass::NotPayPerToken,
         Some(id) => match ctx.store.v1_decision(id) {
@@ -2830,11 +2911,14 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             Ok(None) => match ctx.store.decision_account_class(id) {
                 Ok(Some(class)) => class,
                 Ok(None) => {
-                    return OpReply::error("unknown_decision", "selection decision does not exist")
+                    return Err(OpReply::error(
+                        "unknown_decision",
+                        "selection decision does not exist",
+                    ))
                 }
-                Err(error) => return store_error(error),
+                Err(error) => return Err(store_error(error)),
             },
-            Err(error) => return store_error(error),
+            Err(error) => return Err(store_error(error)),
         },
     };
     let mut route_fenced = BTreeMap::new();
@@ -2855,7 +2939,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             Ok(Some((tier, allowed))) => {
                 let runner = match ctx.store.v1_decision(id) {
                     Ok(decision) => decision.map(|decision| decision.runner_module),
-                    Err(error) => return store_error(error),
+                    Err(error) => return Err(store_error(error)),
                 };
                 if let Some(roster) = &mut roster.roster {
                     for account in &mut roster.accounts {
@@ -2904,7 +2988,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 }
             }
             Ok(None) => {}
-            Err(error) => return store_error(error),
+            Err(error) => return Err(store_error(error)),
         }
     }
     if let Some(classes) = &ctx.classes {
@@ -2917,58 +3001,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 .unwrap_or_else(|| parsed.initial_input_bytes.div_ceil(4)),
         );
     }
-    if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
-        return reply;
-    }
-    if !roster
-        .roster
-        .as_ref()
-        .is_some_and(|roster| !roster.accounts.is_empty())
-    {
-        if let Some(classes) = ctx.classes.as_ref() {
-            let priced =
-                class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly;
-            return empty_roster_refusal(
-                classes,
-                &provider,
-                &normalize(&parsed.model),
-                priced,
-                &route_fenced,
-                ctx.now_ms,
-                &parsed,
-            );
-        }
-        // Without class context the vault/quota roster names nothing usable
-        // for this provider/model: no filtering by eligibility, size or
-        // candidates happens here, so an empty roster means no credential
-        // of the right kind serves it. That is `auth_required`, untimed:
-        // the runner needs a login it does not have.
-        return OpReply::typed(
-            "auth_required",
-            format!("routing selects no accounts for provider `{provider}`"),
-            json!({
-                "code": "auth_required",
-                "retry_after_s": null,
-                "decision_id": null,
-                "exclusions": [],
-            }),
-        );
-    }
-    // The roster is read before the transaction: no lock or fetch happens
-    // while the selection transaction is open.
-    ctx.store
-        .account_transaction(|tx| {
-            serve(
-                tx,
-                ctx,
-                principal,
-                &parsed,
-                &provider,
-                &roster,
-                &request_fingerprint,
-            )
-        })
-        .unwrap_or_else(store_error)
+    Ok((roster, route_fenced, class))
 }
 
 /// The refusal for a request every account it could use is route-fenced on:

@@ -44,6 +44,8 @@ use crate::{
 
 static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
+mod continuation_tests;
+
 /// The provider id the account allocator's quota readings are filed under
 /// for the kit's subscription accounts; any id other than the routing
 /// provider's own name works.
@@ -740,6 +742,119 @@ impl RoutingSubject for KitSubject {
         Ok(())
     }
 
+    async fn configure_continue_credentials(
+        &self,
+        credentials: &[cortexkit_role_routing_conformance::ContinueCredential],
+    ) -> Result<(), String> {
+        let harness = self.harness();
+        let catalog = fixture::continue_catalog();
+        install_catalog(&harness, &catalog);
+        for credential in credentials {
+            for model in catalog.models.iter().filter(|model| {
+                model.provider == credential.account.provider
+                    && !credential.models.contains(&model.model)
+            }) {
+                harness
+                    .store()
+                    .record_account_eligibility(&prefrontal_routing_store::AccountEligibilityFact {
+                        provider: model.provider.clone(),
+                        credential_id: credential.account.credential_id.clone(),
+                        model: model.model.clone(),
+                        listing_fingerprint: None,
+                        code: "model_not_on_account".into(),
+                        observed_at: account_selection::now_ms(),
+                    })
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn configure_service_tiers(
+        &self,
+        plans: &std::collections::BTreeMap<
+            String,
+            Vec<cortexkit_role_routing::service_tier::ServiceTier>,
+        >,
+    ) -> Result<(), String> {
+        let harness = self.harness();
+        let shared = harness.broca_credentials.lock().unwrap().clone();
+        let mut credentials = shared.lock().unwrap();
+        let mut rows = credentials.listed_credentials().to_vec();
+        for row in &mut rows {
+            row.plan_tier = row.account_id.clone();
+        }
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: format!(
+                    "tier-fixture-{}",
+                    NEXT_HARNESS.fetch_add(1, Ordering::Relaxed)
+                ),
+                credentials: rows,
+                ..Default::default()
+            },
+            crate::now_ms(),
+        );
+        let prices: Vec<Value> = plans
+            .iter()
+            .map(|(account, tiers)| {
+                json!({
+                    "provider_id": fixture::SUBSCRIPTION_PROVIDER, "tier": account,
+                    "service_tiers": {
+                        "state": "established",
+                        "tiers": tiers.iter().map(|tier| json!({
+                            "tier": tier.as_str(), "included_usage_rate": {"units":1,"exponent":0},
+                            "credit_rate": {"units":1,"exponent":0}
+                        })).collect::<Vec<_>>()
+                    }
+                })
+            })
+            .collect();
+        credentials.publish_plan_prices(&json!({"prices": prices}));
+        let served: Value = serde_json::from_str(include_str!(
+            "../../fixtures/service-tier-v1/fusiform-served-payloads.json"
+        ))
+        .unwrap();
+        let template = &served["catalog.get — provider default endpoint"]["response"]["models"]
+            ["openai/gpt-6.1-sol"];
+        let models: serde_json::Map<String, Value> = harness
+            .store()
+            .get_facts()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|fact| {
+                (
+                    format!("{}/{}", fact.provider_id, fact.model_id),
+                    template.clone(),
+                )
+            })
+            .collect();
+        let mut tier_catalog =
+            served["catalog.get — provider default endpoint"]["response"].clone();
+        tier_catalog["models"] = json!(models);
+        let catalog = credentials
+            .billing_catalog
+            .clone()
+            .with_test_catalog(&serde_json::to_vec(&tier_catalog).unwrap());
+        credentials.publish_billing_catalog(catalog);
+        for declaration in credentials.runner_declarations.values_mut() {
+            declaration.follows_account_choice = true;
+        }
+        for module in credentials
+            .runner_declarations
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let tiers = super::runners::service_tiers_from_describe(&json!({
+                "capabilities": ["service_tier"],
+                "service_tiers": {"anthropic.messages": {"levels":["fast","ultrafast"],"served":"reported"}}
+            })).unwrap();
+            credentials.runner_service_tiers.insert(module, tiers);
+        }
+        Ok(())
+    }
+
     async fn configure_catalog_declarations(
         &self,
         modules: &[CatalogModule],
@@ -886,9 +1001,10 @@ impl RoutingSubject for KitSubject {
 const NOT_YET_SERVED: &[&str] = &[];
 
 /// The undeclared-group refusal checks apply only to providers that do not
-/// advertise the group; this provider advertises and serves `select_harness`,
+/// advertise the group; this provider serves `account_continue`, `select_harness`,
 /// `select_prefer` and `select_exclude_providers`.
 const NOT_APPLICABLE: &[&str] = &[
+    "continue_undeclared_group_refuses_mode",
     "undeclared_harness_group_refuses_member",
     "undeclared_prefer_group_refuses_member",
     "undeclared_exclude_providers_group_refuses_member",
