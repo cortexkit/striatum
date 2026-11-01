@@ -334,6 +334,25 @@ pub(super) fn usage_observation_from_store(
     params: NativeUsageFacts,
     store: &SharedStore,
 ) -> Result<Option<prefrontal_routing_core::UsageObservation>, String> {
+    Ok(build_usage_observation(
+        &params,
+        &usage_variants_from_store(store)?,
+    ))
+}
+
+pub(super) fn speed_sample_observation_from_store(
+    params: &NativeUsageFacts,
+    store: &SharedStore,
+) -> Result<Option<prefrontal_routing_core::model_resolution::SpeedSampleObservation>, String> {
+    Ok(
+        prefrontal_routing_core::model_resolution::build_speed_sample_observation(
+            params,
+            &usage_variants_from_store(store)?,
+        ),
+    )
+}
+
+fn usage_variants_from_store(store: &SharedStore) -> Result<Vec<VariantFact>, String> {
     let catalog = store
         .get_catalog_facts()
         .map_err(|error| format!("record_usage catalog: {error}"))?;
@@ -349,7 +368,7 @@ pub(super) fn usage_observation_from_store(
                 .or(entry.fact.variant),
         })
         .collect::<Vec<_>>();
-    Ok(build_usage_observation(&params, &variants))
+    Ok(variants)
 }
 
 #[cfg(test)]

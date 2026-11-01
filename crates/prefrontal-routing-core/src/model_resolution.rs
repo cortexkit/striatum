@@ -267,6 +267,21 @@ pub struct ModelSettingsCompatibilityResult {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeUsageFacts {
+    /// A timing-only delivery: its counters never enter usage accounting.
+    #[serde(
+        default,
+        rename = "speed_sample",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub speed_sample: bool,
+    #[serde(
+        default,
+        rename = "service_tier",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
     #[serde(rename = "messageID")]
     pub message_id: String,
     #[serde(rename = "providerID")]
@@ -1401,6 +1416,9 @@ fn usage_duration_ms(facts: &NativeUsageFacts) -> f64 {
 
 fn combined_output_tokens(facts: &NativeUsageFacts) -> f64 {
     let output_tokens = facts.output_tokens.floor();
+    if facts.speed_sample && facts.output_tokens == 0.0 {
+        return facts.reasoning_tokens.unwrap_or(0.0).floor().max(0.0);
+    }
     if !facts.output_tokens.is_finite() || facts.output_tokens <= 0.0 || output_tokens <= 0.0 {
         return facts.output_tokens;
     }
@@ -1544,8 +1562,102 @@ pub fn build_model_speed_observation(
     Some(observation)
 }
 
+/// Independent generation timing, stored outside the accounting history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeedSampleObservation {
+    pub id: String,
+    pub route_key: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub variant: Option<String>,
+    pub service_tier: Option<String>,
+    pub speed: Option<String>,
+    /// Combined visible and reasoning output, matching timed OpenCode assistant usage rows.
+    pub output_tokens: f64,
+    pub reasoning_tokens: Option<f64>,
+    pub duration_ms: f64,
+    pub observed_at: f64,
+}
+
+pub fn build_speed_sample_observation(
+    facts: &NativeUsageFacts,
+    variants: &[VariantFact],
+) -> Option<SpeedSampleObservation> {
+    if !facts.speed_sample {
+        return None;
+    }
+    let observation = build_usage_observation(facts, variants)?;
+    if !observation.output_tokens.is_finite()
+        || observation.output_tokens <= 0.0
+        || !observation.duration_ms.is_finite()
+        || observation.duration_ms <= 0.0
+    {
+        return None;
+    }
+    let variant = observation
+        .route_key
+        .strip_prefix(&format!("{}/", observation.capacity_key))
+        .map(str::to_owned);
+    Some(SpeedSampleObservation {
+        id: observation.id,
+        route_key: observation.route_key,
+        provider_id: observation.provider_id,
+        model_id: facts.model_id.trim().to_owned(),
+        variant,
+        service_tier: facts.service_tier.clone(),
+        speed: facts.speed.clone(),
+        output_tokens: observation.output_tokens,
+        reasoning_tokens: observation.reasoning_tokens,
+        duration_ms: observation.duration_ms,
+        observed_at: observation.observed_at,
+    })
+}
+
+/// Provider words stay raw in storage. Only the ordinary served modes share
+/// the standard/standard population used by OpenCode assistant messages; every other
+/// pair remains distinct, including absence.
+pub fn speed_sample_population<'a>(
+    service_tier: Option<&'a str>,
+    speed: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if matches!(service_tier, None | Some("default" | "standard"))
+        && matches!(speed, None | Some("standard"))
+    {
+        (Some("standard"), Some("standard"))
+    } else {
+        (service_tier, speed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speed_sample_population_keeps_provider_words_and_standard_aliases() {
+        use super::speed_sample_population;
+        for tier in [None, Some("default"), Some("standard")] {
+            for speed in [None, Some("standard")] {
+                assert_eq!(
+                    speed_sample_population(tier, speed),
+                    (Some("standard"), Some("standard")),
+                    "{tier:?}/{speed:?}"
+                );
+            }
+        }
+        for (tier, speed) in [
+            (Some("priority"), None),
+            (Some("flex"), None),
+            (Some("batch"), None),
+            (Some("standard"), Some("fast")),
+            (Some("default"), Some("fast")),
+            (None, Some("fast")),
+            (Some(""), None),
+            (Some("Default"), None),
+            (Some("standard"), Some("")),
+            (Some(" standard "), None),
+        ] {
+            assert_eq!(speed_sample_population(tier, speed), (tier, speed));
+        }
+    }
     use super::*;
 
     /// The model naming the config converter writes into operator config.

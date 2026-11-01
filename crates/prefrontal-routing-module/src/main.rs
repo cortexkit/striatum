@@ -3104,6 +3104,48 @@ async fn handle_record_usage(
                 .await;
             }
         };
+    if params.speed_sample {
+        let result = model_resolution::speed_sample_observation_from_store(&params, store)
+            .and_then(|sample| match sample {
+                Some(sample) => store
+                    .record_speed_sample_delivery(&sample)
+                    .map_err(|e| e.to_string()),
+                None => {
+                    Ok(prefrontal_routing_core::route_state_store::UsageRecordResult::default())
+                }
+            });
+        return match result {
+            Ok(result) => {
+                let body = serde_json::to_vec(&json!({ "result": {
+                    "recorded": result.recorded, "usage_recorded": false,
+                }}))
+                .map_err(ModuleError::Json)?;
+                let response = Frame::build_with_version(
+                    ver,
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, false),
+                    channel,
+                    epoch,
+                    corr,
+                    body,
+                )
+                .map_err(|error| ModuleError::Message(error.to_string()))?;
+                send(writer, response).await
+            }
+            Err(error) => {
+                send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    "store_error",
+                    &format!("record_usage: {error}"),
+                )
+                .await
+            }
+        };
+    }
     let observation = match model_resolution::usage_observation_from_store(params, store) {
         Ok(observation) => observation,
         Err(error) => {
@@ -6925,6 +6967,91 @@ mod tests {
             run_record_usage(&store, usage_params("eligible")).await,
             json!({ "recorded": true, "usage_recorded": true })
         );
+    }
+
+    #[tokio::test]
+    async fn route_record_usage_speed_sample_is_separate_and_idempotent() {
+        let rig = Rig::new("record-speed-sample");
+        let store = Arc::new(rig.open_store());
+        let mut params = usage_params("generation");
+        params["speed_sample"] = json!(true);
+        params["service_tier"] = json!("fast");
+        params["speed"] = json!("fast");
+        params["reasoningTokens"] = json!(25);
+        params["inputTokens"] = json!(999);
+        params["workloadClass"] = json!("ephemeral");
+        assert_eq!(
+            run_record_usage(&store, params.clone()).await,
+            json!({"recorded":true,"usage_recorded":false})
+        );
+        params["outputTokens"] = json!(9999);
+        assert_eq!(
+            run_record_usage(&store, params).await,
+            json!({"recorded":false,"usage_recorded":false})
+        );
+        assert_eq!(usage_row_count(&rig, None), 0);
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let row = connection
+            .query_row(
+                "SELECT COUNT(*), service_tier, speed, output_tokens,
+            reasoning_tokens FROM model_route_speed_samples",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, (1, "fast".into(), "fast".into(), 125, 25));
+        assert!(store
+            .get_class_vector("ephemeral", 10_000.0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn route_record_usage_speed_sample_defaults_and_invalid_durations() {
+        let rig = Rig::new("record-speed-defaults");
+        let store = Arc::new(rig.open_store());
+        let mut params = usage_params("reasoning-only");
+        params["speed_sample"] = json!(true);
+        params["outputTokens"] = json!(0);
+        params["reasoningTokens"] = json!(200);
+        assert_eq!(
+            run_record_usage(&store, params.clone()).await,
+            json!({"recorded":true,"usage_recorded":false})
+        );
+        for (index, completed) in [1_000, 0].into_iter().enumerate() {
+            params["messageID"] = json!(format!("invalid-{index}"));
+            params["completedMs"] = json!(completed);
+            assert_eq!(
+                run_record_usage(&store, params.clone()).await,
+                json!({"recorded":false,"usage_recorded":false})
+            );
+        }
+        assert_eq!(usage_row_count(&rig, None), 0);
+        let connection = rusqlite::Connection::open(rig.dir.join("store.db")).unwrap();
+        let row = connection
+            .query_row(
+                "SELECT COUNT(*), service_tier, speed, output_tokens
+            FROM model_route_speed_samples",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, (1, None, None, 200));
     }
 
     #[tokio::test]

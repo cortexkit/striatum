@@ -44,6 +44,8 @@ fn observed_speed_sample_query_searches_the_route_time_index_without_a_temp_btre
                     USAGE_MIN_OUTPUT_TOKENS as i64,
                     USAGE_MIN_DURATION_MS as i64,
                     OBSERVED_SPEED_SAMPLE_LIMIT,
+                    "standard",
+                    "standard",
                 ],
                 |row| row.get::<_, String>(3),
             )
@@ -67,6 +69,9 @@ fn observed_speed_sample_query_searches_the_route_time_index_without_a_temp_btre
                 .all(|detail| !detail.contains("USE TEMP B-TREE")),
             "expected no temporary sort for {route_key}, got {details:?}"
         );
+        assert!(details.iter().any(|detail| detail.contains(
+            "SEARCH model_route_speed_samples USING INDEX model_route_speed_samples_route_tier_observed_idx"
+        )), "expected an indexed tier/speed lookup, got {details:?}");
     }
 
     drop(connection);

@@ -38,6 +38,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 mod account_selection;
+#[cfg(test)]
+mod speed_sample_tests;
 // The backup table classification is a test oracle: the store's integration
 // tests, the engram catalog test and the restore rehearsal example check the
 // shipped catalog against it, and no production path reads it.
@@ -237,13 +239,20 @@ const MAX_OMITTED_NOT_AVAILABLE_KEYS: usize = 200;
 /// effective catalog key. The window is `(now - 7d, now]`, the same bounds as the
 /// workload-class samples below, so a row exactly seven days old counts in
 /// neither.
-pub const OBSERVED_SPEED_SAMPLES_SQL: &str = "SELECT output_tokens, duration_ms
+pub const OBSERVED_SPEED_SAMPLES_SQL: &str = "SELECT output_tokens, duration_ms, observed_at
      FROM model_route_usage INDEXED BY model_route_usage_route_observed_idx
      WHERE route_key = ?1
+       AND ?7 = 'standard' AND ?8 = 'standard'
        AND observed_at > ?2
        AND observed_at <= ?3
        AND output_tokens >= ?4
        AND duration_ms >= ?5
+     UNION ALL
+     SELECT output_tokens, duration_ms, observed_at
+     FROM model_route_speed_samples INDEXED BY model_route_speed_samples_route_tier_observed_idx
+     WHERE route_key = ?1 AND population_service_tier IS ?7 AND population_speed IS ?8
+       AND observed_at > ?2 AND observed_at <= ?3
+       AND output_tokens >= ?4 AND duration_ms >= ?5
      ORDER BY observed_at DESC
      LIMIT ?6";
 
@@ -281,7 +290,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 71] {
+fn route_state_migrations() -> [Migration; 72] {
     [
         Migration {
             version: 1,
@@ -566,6 +575,10 @@ fn route_state_migrations() -> [Migration; 71] {
         Migration {
             version: 72,
             statements: include_str!("../migrations/072_account_continue.sql"),
+        },
+        Migration {
+            version: 73,
+            statements: include_str!("../migrations/073_speed_samples.sql"),
         },
     ]
 }
@@ -2723,6 +2736,8 @@ impl SqliteRouteStateStore {
                                 USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
                                 USAGE_MIN_DURATION_MS.floor() as i64,
                                 OBSERVED_SPEED_SAMPLE_LIMIT,
+                                "standard",
+                                "standard",
                             ],
                             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
                         )?
@@ -3016,6 +3031,103 @@ impl SqliteRouteStateStore {
 }
 
 impl SqliteRouteStateStore {
+    /// Insert generation timing without changing usage, task totals or cached workload token profiles.
+    /// A repeated sample id is a no-op, even when the redelivery contains different data.
+    pub fn record_speed_sample_delivery(
+        &self,
+        sample: &prefrontal_routing_core::model_resolution::SpeedSampleObservation,
+    ) -> RouteStateResult<UsageRecordResult> {
+        let Some(observed_at) = floored_i64(sample.observed_at) else {
+            return Ok(UsageRecordResult::default());
+        };
+        let Some(output) = stored_output_tokens(sample.output_tokens).filter(|n| *n > 0) else {
+            return Ok(UsageRecordResult::default());
+        };
+        let Some(duration) = floored_i64(sample.duration_ms).filter(|n| *n > 0) else {
+            return Ok(UsageRecordResult::default());
+        };
+        if sample.id.trim().is_empty()
+            || sample.route_key.trim().is_empty()
+            || sample.provider_id.trim().is_empty()
+            || sample.model_id.trim().is_empty()
+        {
+            return Ok(UsageRecordResult::default());
+        }
+        let (population_tier, population_speed) =
+            prefrontal_routing_core::model_resolution::speed_sample_population(
+                sample.service_tier.as_deref(),
+                sample.speed.as_deref(),
+            );
+        let inserted = self
+            .store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "INSERT INTO model_route_speed_samples
+                 (id, route_key, provider_id, model_id, variant, service_tier, speed,
+                  output_tokens, reasoning_tokens, duration_ms, observed_at,
+                  population_service_tier, population_speed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(id) DO NOTHING",
+                    params![
+                        sample.id,
+                        sample.route_key,
+                        sample.provider_id,
+                        sample.model_id,
+                        sample.variant,
+                        sample.service_tier,
+                        sample.speed,
+                        output,
+                        sample.reasoning_tokens.and_then(stored_token_count),
+                        duration,
+                        observed_at,
+                        population_tier,
+                        population_speed
+                    ],
+                )
+            })
+            .map_err(err)?;
+        Ok(UsageRecordResult {
+            recorded: inserted > 0
+                && output >= USAGE_MIN_OUTPUT_TOKENS as i64
+                && duration >= USAGE_MIN_DURATION_MS as i64,
+            usage_recorded: false,
+        })
+    }
+
+    /// Read one served-tier/speed population. Timed OpenCode assistant usage rows belong only to
+    /// standard/standard; selection deliberately continues to use that population.
+    pub fn get_observed_speed_for_tier(
+        &self,
+        route_key: &str,
+        service_tier: Option<&str>,
+        speed: Option<&str>,
+        now: f64,
+    ) -> RouteStateResult<Option<f64>> {
+        let (population_tier, population_speed) =
+            prefrontal_routing_core::model_resolution::speed_sample_population(service_tier, speed);
+        self.store
+            .with_conn(|c: &Connection| {
+                let mut stmt = c.prepare(OBSERVED_SPEED_SAMPLES_SQL)?;
+                let samples = stmt
+                    .query_map(
+                        params![
+                            route_key,
+                            (now - OBSERVED_SPEED_WINDOW_MS).floor() as i64,
+                            now.floor() as i64,
+                            USAGE_MIN_OUTPUT_TOKENS as i64,
+                            USAGE_MIN_DURATION_MS as i64,
+                            OBSERVED_SPEED_SAMPLE_LIMIT,
+                            population_tier,
+                            population_speed,
+                        ],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(observed_speed_from_samples(&samples))
+            })
+            .map_err(err)
+    }
+
     /// Copy task and workload attribution from the decision, never from the report.
     pub fn record_usage_delivery_for_decision(
         &self,
@@ -4361,26 +4473,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         if route_key.trim().is_empty() {
             return Ok(None);
         }
-        self.store
-            .with_conn(|c: &Connection| {
-                // The most-recent eligible rows in the trailing window, capped at the
-                // sample limit; the batched catalog overlay reads the same rows.
-                let mut stmt = c.prepare(OBSERVED_SPEED_SAMPLES_SQL)?;
-                let rows = stmt.query_map(
-                    params![
-                        route_key,
-                        (now - OBSERVED_SPEED_WINDOW_MS).floor() as i64,
-                        now.floor() as i64,
-                        USAGE_MIN_OUTPUT_TOKENS.floor() as i64,
-                        USAGE_MIN_DURATION_MS.floor() as i64,
-                        OBSERVED_SPEED_SAMPLE_LIMIT,
-                    ],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                )?;
-                let samples = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(observed_speed_from_samples(&samples))
-            })
-            .map_err(err)
+        self.get_observed_speed_for_tier(route_key, None, None, now)
     }
 
     fn get_class_vector(

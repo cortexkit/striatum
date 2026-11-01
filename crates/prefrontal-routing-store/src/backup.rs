@@ -57,6 +57,11 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
 /// Tables every backup must carry, each with the reason.
 pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     (
+        "model_route_speed_samples",
+        "per-generation timing history supplies observed speeds by served tier; no smaller \
+         summary is retained, so losing it resets those speeds to cold-start values",
+    ),
+    (
         "routing_unscored_admissible_models",
         "routing-owned first-admission timestamp history; restoring it empty would make \
          previously observed ungraded models appear newly discovered",
