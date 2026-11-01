@@ -211,7 +211,8 @@ fn usage_row_exists(harness: &Harness, decision: &str) -> bool {
 
 /// How many usage rows of the route `decision`'s report row is filed under
 /// the observed-speed query takes as samples, over all time and with no
-/// minimum output or duration.
+/// minimum output or duration. Usage rows count only toward the standard
+/// tier and speed, so the query is asked for that population.
 fn speed_samples(harness: &Harness, decision: &str) -> usize {
     let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
     let route_key: String = connection
@@ -226,7 +227,16 @@ fn speed_samples(harness: &Harness, decision: &str) -> usize {
         .unwrap();
     statement
         .query_map(
-            rusqlite::params![route_key, i64::MIN, i64::MAX, 0, 0, 1_000],
+            rusqlite::params![
+                route_key,
+                i64::MIN,
+                i64::MAX,
+                0,
+                0,
+                1_000,
+                "standard",
+                "standard"
+            ],
             |_| Ok(()),
         )
         .unwrap()
