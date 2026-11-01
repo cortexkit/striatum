@@ -1028,3 +1028,17 @@ async fn undeclared_production_runners_keep_the_same_selection_envelope() {
         assert!(runner.get(field).is_none(), "{reply:?}");
     }
 }
+#[test]
+fn broca_contract_0748_routing_tier_discovery() {
+    for bytes in [
+        include_bytes!("../../../../test-vectors/broca-contract-0748-v1/role-describe/role_describe_reader.json").as_slice(),
+        include_bytes!("../../../../test-vectors/broca-contract-0748-v1/role-describe/role_describe.json").as_slice(),
+        include_bytes!("../../../../test-vectors/broca-contract-0748-v1/role-describe/role_describe.head_additions.json").as_slice(),
+    ] {
+        let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        let describe = raw.get("result").unwrap_or(&raw);
+        assert!(describe["capabilities"].as_array().unwrap().contains(&serde_json::json!("finish_reason")));
+        assert!(super::runners::service_tiers_from_describe(&raw).is_none());
+        assert!(super::runners::service_tiers_from_describe(describe).is_none());
+    }
+}
