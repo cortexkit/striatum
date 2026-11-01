@@ -221,6 +221,20 @@ async fn service_tier_absent_keeps_existing_answer_bytes_and_no_tier_decision() 
 }
 
 #[test]
+fn broca_turn_system_runner_discovery_keeps_absent_service_tiers() {
+    let before = include_bytes!(
+        "../../../../test-vectors/broca-turn-system-v1/before/role-describe.response.json"
+    );
+    let after = include_bytes!(
+        "../../../../test-vectors/broca-turn-system-v1/after/role-describe.response.json"
+    );
+    for bytes in [before.as_slice(), after.as_slice()] {
+        let reply: Value = serde_json::from_slice(bytes).unwrap();
+        assert!(runners::service_tiers_from_describe(&reply).is_none());
+    }
+}
+
+#[test]
 fn service_tier_shared_samples_are_pinned_and_decode_open_records() {
     let bytes = include_bytes!("../../fixtures/service-tier-v1/cases.json");
     assert_eq!(
