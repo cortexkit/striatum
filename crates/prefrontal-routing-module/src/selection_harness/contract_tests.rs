@@ -189,6 +189,7 @@ async fn workload_is_validated_and_resolved_from_the_named_workload() {
     let before = count();
     for extra in [
         json!({"workload": "unknown"}),
+        json!({"workload": "sidekick.lead"}),
         json!({"requiredHarness": "claude-code"}),
         json!({"workload": 3}),
         json!({"executor": "opencode"}),

@@ -513,6 +513,10 @@ async fn run_all(baseline: &Value) -> BTreeMap<String, Value> {
     let _clock = crate::InjectedClock::set(clock_ms(baseline));
     let mut answers = BTreeMap::new();
     for request in baseline["requests"].as_array().expect("requests") {
+        // Keep the frozen history, but skip sidekick.lead because core no longer launches a lead session.
+        if request["params"]["workload"] == "sidekick.lead" {
+            continue;
+        }
         let name = request["name"].as_str().expect("request name").to_owned();
         let answer = run_request(baseline, request).await;
         assert!(
@@ -605,6 +609,9 @@ async fn the_new_pass_on_the_converted_fixture_matches_the_baseline() {
     let answers = run_all(&baseline).await;
     let expected: BTreeMap<String, Value> =
         serde_json::from_value(baseline["expected"].clone()).unwrap();
+    assert!(!answers.contains_key("sidekick-lead"));
+    assert!(!answers.contains_key("sidekick-muse-spark-pin"));
+    assert_eq!(answers.len() + 2, expected.len());
     let mut unexpected = Vec::new();
     for (name, answer) in &answers {
         let wanted = listed_difference(name).unwrap_or_else(|| expected[name].clone());

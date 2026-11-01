@@ -26,10 +26,6 @@ pub(crate) enum Workload {
     /// core that predates the lead keeps routing.
     #[serde(rename = "sidekick.planner")]
     Planner,
-    /// The lead session of a sidekick call: answers research itself, hands
-    /// questions to readers, or reviews comments through core's changed_text.
-    #[serde(rename = "sidekick.lead")]
-    Lead,
     /// A reader the sidekick lead opened to answer one question.
     #[serde(rename = "sidekick.reader")]
     Reader,
@@ -56,7 +52,6 @@ impl Workload {
             Self::Gather => "sidekick.gather",
             Self::Comments => "sidekick.comments",
             Self::Planner => "sidekick.planner",
-            Self::Lead => "sidekick.lead",
             Self::Reader => "sidekick.reader",
             Self::Map => "sidekick.map",
             Self::Reviewer => "sidekick.reviewer",

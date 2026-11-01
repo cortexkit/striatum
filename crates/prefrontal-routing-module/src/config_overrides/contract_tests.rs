@@ -978,6 +978,16 @@ fn substrate_mapping_invalid_keys_and_values_refuse_first_load_and_reload() {
 }
 
 #[test]
+fn retired_sidekick_lead_is_an_unknown_substrate_group() {
+    let document = r#"{"model_routing":{"substrates":{"sidekick.lead":{"default":"broca"}}}}"#;
+    first_load_refuses(document, "model_routing.substrates.sidekick.lead");
+    reload_refuses(document, "model_routing.substrates.sidekick.lead");
+    assert!(
+        serde_json::from_str::<crate::selection_harness::Workload>(r#""sidekick.lead""#).is_err()
+    );
+}
+
+#[test]
 fn absent_substrate_mapping_and_withdrawn_groups_resolve_to_broca() {
     use crate::substrate_policy::{resolve, Harness};
 
@@ -1024,7 +1034,6 @@ fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
         "sidekick.gather",
         "sidekick.comments",
         "sidekick.planner",
-        "sidekick.lead",
         "sidekick.reader",
         "sidekick.map",
         "sidekick.reviewer",
