@@ -258,7 +258,7 @@ fn record_pinned_refusal(
         deps.store
             .record_decision_with_task_ref(&decision, None, None, request.task_ref.as_deref())
     {
-        crate::warn_operator(format!("[TODO(user): refused pinned route.select for {} (task {}) has no decision row: {error}]", request.consumer, request.task_ref.as_deref().unwrap_or("-")));
+        crate::warn_operator(format!("routing refused a pinned route.select for {} (task {}) and couldn't record the decision: {error}", request.consumer, request.task_ref.as_deref().unwrap_or("-")));
     }
 }
 
