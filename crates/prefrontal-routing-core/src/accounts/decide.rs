@@ -738,7 +738,13 @@ impl<'a> Allocator<'a> {
             };
             let retry_after_s =
                 retry_after_with_jitter(&self.request.conversation_key, base_retry_after_s as f64);
-            if retry_after_s > self.request.hold_wait_max_s.min(self.policy.max_hold_s) {
+            // A reset past the provider's ceiling could never be waited out, so
+            // the blocking window explains the move. One within the ceiling but
+            // past the caller's own cap moves because the caller chose not to wait.
+            if retry_after_s > self.policy.max_hold_s {
+                return Leave(blocker.leave.clone());
+            }
+            if retry_after_s > self.request.hold_wait_max_s {
                 return Leave(InvalidationReason::HoldExceedsWait { retry_after_s });
             }
             return AffinityVerdict::Hold(Hold {

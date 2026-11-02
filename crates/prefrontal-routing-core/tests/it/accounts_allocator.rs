@@ -634,9 +634,9 @@ fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
     fable_full.scoped = ScopedList::Listed(vec![fable_window(100.0)]);
     let mut seven_full = reading(100.0, 100.0);
     seven_full.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 14 * MINUTE);
-    for (model, quota, retry_after_s) in [
-        ("claude-fable-5", fable_full, 345_606),
-        ("claude-sonnet-5", seven_full, 259_206),
+    for (model, quota, window) in [
+        ("claude-fable-5", fable_full, ApplicableWindow::FamilyScope),
+        ("claude-sonnet-5", seven_full, ApplicableWindow::SevenDay),
     ] {
         let mut healthy = reading(10.0, 10.0);
         healthy.scoped = ScopedList::Listed(vec![fable_window(10.0)]);
@@ -649,7 +649,7 @@ fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
         let decision = decide(&with_model(request(), model), &st, NOW);
         assert_eq!(
             invalidated(&decision),
-            InvalidationReason::HoldExceedsWait { retry_after_s }
+            InvalidationReason::FreshFullReading { window }
         );
         assert_eq!(admitted(&decision), "acct-b");
         // Plus a confirmed 5h fence 14 minutes from reset.
@@ -658,7 +658,7 @@ fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
         let decision = decide(&with_model(request(), model), &st, NOW);
         assert_eq!(
             invalidated(&decision),
-            InvalidationReason::HoldExceedsWait { retry_after_s }
+            InvalidationReason::FreshFullReading { window }
         );
         assert_eq!(admitted(&decision), "acct-b");
     }
@@ -724,8 +724,8 @@ fn the_latest_blocking_reset_decides_between_a_block_and_a_fresh_reading() {
     assert_eq!(admitted(&decision), "acct-b");
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::HoldExceedsWait {
-            retry_after_s: 7206
+        InvalidationReason::ConfirmedExhaustion {
+            pool: Some(PoolKey::general(GeneralWindow::FiveHour))
         }
     );
     // Block resets in 14 min, reading says 2 h: the reading's window still
@@ -738,8 +738,8 @@ fn the_latest_blocking_reset_decides_between_a_block_and_a_fresh_reading() {
     assert_eq!(admitted(&decision), "acct-b");
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::HoldExceedsWait {
-            retry_after_s: 7206
+        InvalidationReason::FreshFullReading {
+            window: ApplicableWindow::FiveHour
         }
     );
     // Both 14 min away: a hold, on the confirmed block.
@@ -790,8 +790,8 @@ fn any_blocking_window_holds_within_the_bound_and_moves_beyond_it() {
     let decision = decide(&request(), &st, NOW);
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::HoldExceedsWait {
-            retry_after_s: 3606
+        InvalidationReason::ConfirmedExhaustion {
+            pool: Some(PoolKey::general(GeneralWindow::SevenDay))
         }
     );
 
@@ -806,8 +806,8 @@ fn any_blocking_window_holds_within_the_bound_and_moves_beyond_it() {
     let decision = decide(&with_model(request(), "claude-fable-5-1"), &st, NOW);
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::HoldExceedsWait {
-            retry_after_s: 3606
+        InvalidationReason::ConfirmedExhaustion {
+            pool: fable_fence.pool.clone()
         }
     );
     let mut st = pool("claude-opus-5-5");
