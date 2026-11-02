@@ -1478,19 +1478,15 @@ fn report_dormant_config_models(
     version: i64,
     credentials: Option<&crate::broca_credentials::SharedBrocaCredentials>,
 ) -> Result<(), FusiformCatalogError> {
-    let mut facts = store.get_facts().map_err(|reason| {
-        error(format!(
-            "[TODO(user): read catalog for dormant model keys: {reason}]"
-        ))
-    })?;
-    if let Some(credentials) = credentials {
-        let targets = credentials
-            .lock()
-            .map_err(|_| error("credential cache poisoned"))?
-            .catalog_targets(&facts);
-        prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
-    }
-    crate::config_overrides::live_config(path).report_dormant_models(path, version, &facts);
+    let config = crate::config_overrides::live_config(path);
+    let presence = config
+        .model_config_presence(store, credentials)
+        .map_err(|reason| {
+            error(format!(
+                "[TODO(user): read catalog for dormant model keys: {reason}]"
+            ))
+        })?;
+    config.report_dormant_models(path, version, presence);
     Ok(())
 }
 

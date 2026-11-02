@@ -113,6 +113,7 @@ pub(crate) struct Finding {
 /// Everything the checks read, gathered from the store in one pass.
 pub(crate) struct Evidence {
     pub dormant_model_keys: Vec<String>,
+    pub manual_upsert_model_keys: BTreeSet<String>,
     pub catalog_version: Option<i64>,
     pub unscored_admissible_models: Vec<prefrontal_routing_store::UnscoredAdmissibleModel>,
     pub fences: Vec<CredentialEntitlementFence>,
@@ -154,6 +155,7 @@ impl Evidence {
         };
         Ok(Self {
             dormant_model_keys: Vec::new(),
+            manual_upsert_model_keys: BTreeSet::new(),
             catalog_version: store
                 .fusiform_catalog_cursor()
                 .map_err(text)?
@@ -204,8 +206,13 @@ pub(crate) fn report(evidence: &Evidence, now_ms: i64, window_ms: i64) -> Value 
         count: 1,
         first_seen_ms: now_ms,
         last_seen_ms: now_ms,
-        summary: clip(&format!("[TODO(user): models.{key} is dormant because the catalog does not serve it]"), MAX_SUMMARY_CHARS),
-        samples: vec![json!({"config_key": format!("models.{key}"), "catalog_version": evidence.catalog_version})],
+        summary: clip(&if evidence.manual_upsert_model_keys.contains(key) {
+            format!("[TODO(user): models.{key} is not served by Fusiform; the route exists as a manual upsert and config overlays still apply]")
+        } else {
+            format!("[TODO(user): models.{key} is dormant because the catalog does not serve it]")
+        }, MAX_SUMMARY_CHARS),
+        samples: vec![json!({"config_key": format!("models.{key}"), "catalog_version": evidence.catalog_version,
+            "manual_upsert": evidence.manual_upsert_model_keys.contains(key)})],
         hint: "[TODO(user): check the model key or wait for the catalog to finish warming]".into(),
     }));
     findings.extend(
@@ -1183,16 +1190,11 @@ fn answer(
     let now_ms = crate::now_ms() as i64;
     let mut evidence = Evidence::gather(store, now_ms, window_ms)
         .map_err(|message| ErrorBody::new("store_error", format!("{OP}: {message}")))?;
-    let mut facts = store
-        .get_facts()
+    let presence = crate::config_overrides::live_config(config_path)
+        .model_config_presence(store, Some(credentials))
         .map_err(|message| ErrorBody::new("store_error", format!("{OP}: {message}")))?;
-    let targets = credentials
-        .lock()
-        .map(|credentials| credentials.catalog_targets(&facts))
-        .unwrap_or_default();
-    prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
-    evidence.dormant_model_keys =
-        crate::config_overrides::live_config(config_path).dormant_model_keys(&facts);
+    evidence.dormant_model_keys = presence.dormant_keys;
+    evidence.manual_upsert_model_keys = presence.manual_upsert_keys.into_iter().collect();
     Ok(report(&evidence, now_ms, window_ms))
 }
 
@@ -1221,6 +1223,7 @@ mod tests {
     fn empty() -> Evidence {
         Evidence {
             dormant_model_keys: Vec::new(),
+            manual_upsert_model_keys: BTreeSet::new(),
             catalog_version: None,
             unscored_admissible_models: Vec::new(),
             fences: Vec::new(),
@@ -1251,6 +1254,7 @@ mod tests {
         let mut evidence = empty();
         evidence.catalog_version = Some(42);
         evidence.dormant_model_keys = config.dormant_model_keys(&[]);
+        evidence.manual_upsert_model_keys.insert("p/stale".into());
         let rows = findings(&evidence, CHECK_DORMANT_MODEL_CONFIG);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["key"], "models.p/policy-only");
@@ -1259,11 +1263,24 @@ mod tests {
             assert_eq!(row["severity"], "warning");
             assert_eq!(row["samples"][0]["config_key"], row["key"]);
             assert_eq!(row["samples"][0]["catalog_version"], 42);
+            assert_eq!(
+                row["samples"][0]["manual_upsert"],
+                row["key"] == "models.p/stale"
+            );
             assert!(row["summary"]
                 .as_str()
                 .unwrap()
                 .contains(row["key"].as_str().unwrap()));
         }
+        let manual = findings(&evidence, CHECK_DORMANT_MODEL_CONFIG);
+        assert!(manual[1]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("manual upsert"));
+        assert!(manual[1]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("overlays still apply"));
         let facts = ["stale", "policy-only"].map(|model| {
             serde_json::from_value(json!({
                 "providerID": "p", "modelID": model,
