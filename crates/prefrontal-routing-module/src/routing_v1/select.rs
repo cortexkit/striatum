@@ -20,7 +20,7 @@ use std::time::Duration;
 use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal};
 use cortexkit_role_routing::select::{
     parse_select_request_serving, Modality, PinFallback, PinOutcome, RouteRef, RunnerRef,
-    SelectAnswer, ToolsRequirement, EXPLANATION_MAX_CHARS,
+    SelectAnswer, SelectRequest, ToolsRequirement, EXPLANATION_MAX_CHARS,
 };
 use prefrontal_routing_core::model_router::{
     ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
@@ -129,9 +129,38 @@ pub(super) async fn select_with_profile_lookup(
     deps: &Deps<'_>,
     profile_lookup: &ProfileLookup,
 ) -> Result<Value, Refusal> {
-    use cortexkit_role_routing::service_tier::ServiceTier;
     super::refuse_unknown_members(params, MEMBERS)?;
     let request = parse_select_request_serving(params, super::describe::CAPABILITIES)?;
+    let result = select_with_tier_fallback(params, caller, deps, profile_lookup, &request).await;
+    if let Err(refusal) = &result {
+        if request.pin.is_some()
+            && request.pin_fallback != Some(PinFallback::Route)
+            && matches!(
+                refusal.code.as_str(),
+                "no_route"
+                    | "pin_unavailable"
+                    | "accounts_blocked"
+                    | "account_hold"
+                    | "auth_required"
+                    | "provider_requires_runner_pin"
+            )
+        {
+            // Record the final refusal, not unsuccessful probes of higher tiers.
+            // Hard pins bypass scoring, which normally writes the refusal decision.
+            record_pinned_refusal(&request, refusal, caller, deps);
+        }
+    }
+    result
+}
+
+async fn select_with_tier_fallback(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    profile_lookup: &ProfileLookup,
+    request: &SelectRequest,
+) -> Result<Value, Refusal> {
+    use cortexkit_role_routing::service_tier::ServiceTier;
     let Some(requested) = request.service_tier else {
         return select_at_tier(params, caller, deps, profile_lookup, None, None).await;
     };
@@ -197,6 +226,40 @@ pub(super) async fn select_with_profile_lookup(
         }
     }
     Err(last.unwrap_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None)))
+}
+
+fn record_pinned_refusal(
+    request: &SelectRequest,
+    refusal: &Refusal,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) {
+    let decision = prefrontal_routing_core::route_state_store::DecisionInput {
+        decision_kind: "single".into(),
+        consumer: Some(request.consumer.clone()),
+        target_agent: request.consumer.clone(),
+        task_id: request.task_ref.clone(),
+        harness: request.harness.clone(),
+        project_id: caller.scope.as_ref().and_then(|scope| scope.project_id.clone()),
+        workdir: caller.scope.as_ref().and_then(|scope| scope.workdir.clone()),
+        requirements_json: serde_json::to_string(&request.requirements).unwrap(),
+        score_json: "{}".into(),
+        rejected_json: refusal.detail.get("rejected").cloned().unwrap_or_else(|| json!([])).to_string(),
+        explanation_json: Some(json!({
+            "failureReason": refusal.detail.get("reason").and_then(Value::as_str).unwrap_or(refusal.code.as_str()),
+            "refusal": refusal,
+            "pin": request.pin,
+            "correlation_id": request.correlation_id,
+        }).to_string()),
+        anchor_version: prefrontal_routing_core::ANCHOR_VERSION,
+        ..Default::default()
+    };
+    if let Err(error) =
+        deps.store
+            .record_decision_with_task_ref(&decision, None, None, request.task_ref.as_deref())
+    {
+        crate::warn_operator(format!("[TODO(user): refused pinned route.select for {} (task {}) has no decision row: {error}]", request.consumer, request.task_ref.as_deref().unwrap_or("-")));
+    }
 }
 
 async fn select_at_tier(
@@ -373,7 +436,10 @@ async fn select_at_tier(
                 priced.classes.as_ref().is_some_and(|classes| {
                     facts
                         .iter()
-                        .find(|fact| fact_to_route(fact).route_key == route_key)
+                        // Pins may add a reasoning variant absent from the catalog's
+                        // fact rows. Service tiers belong to the underlying model,
+                        // while registry.runs above still checks the exact route.
+                        .find(|fact| fact_to_route(fact).capacity_key == capacity_key)
                         .is_some_and(|fact| {
                             classes.tier_runner_serves(&runner.module, fact, tier.as_str())
                         })
