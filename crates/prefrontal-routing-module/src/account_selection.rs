@@ -185,6 +185,7 @@ pub(crate) struct ClassContext {
     catalog: BTreeSet<String>,
     targets: BTreeMap<String, String>,
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
+    continuation_credential: Option<String>,
 }
 
 #[cfg(test)]
@@ -432,6 +433,9 @@ impl ClassContext {
         let mut route_fences = store
             .account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
+        let latest_reports = store
+            .account_route_fence_latest_reports()
+            .map_err(|error| error.to_string())?;
         let credentials_with_headroom: BTreeSet<_> = route_fences
             .iter()
             .filter_map(|fence| {
@@ -441,11 +445,7 @@ impl ClassContext {
                 )?;
                 // Clear all routes for a credential only after a reading newer
                 // than every report on it; an older reading cannot heal a newer failure.
-                let newest_report = route_fences
-                    .iter()
-                    .filter(|other| other.credential_id == fence.credential_id)
-                    .map(|other| other.recorded_at)
-                    .max()?;
+                let newest_report = *latest_reports.get(&fence.credential_id)?;
                 crate::credential_fences::fresh_headroom_after_for_account(
                     &quota,
                     &account,
@@ -510,6 +510,7 @@ impl ClassContext {
             catalog,
             targets,
             tier_accounts: None,
+            continuation_credential: None,
         })
     }
 
@@ -521,6 +522,23 @@ impl ClassContext {
         let specs = prefrontal_routing_core::provider_model_spec::parse_spec_list(
             &self.config.operator_policy().subscription,
         );
+        let mut restricted = fact.clone();
+        if let Some(credential) = &self.continuation_credential {
+            let method = self.method(credential);
+            restricted.auth_methods = Some(
+                if method != "unknown"
+                    && fact
+                        .auth_methods
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.iter().any(|allowed| allowed == method))
+                {
+                    vec![method.into()]
+                } else {
+                    Vec::new()
+                },
+            );
+        }
+        let fact = &restricted;
         resolve_class(
             self.credentials.listed_credentials(),
             fact,
@@ -531,6 +549,10 @@ impl ClassContext {
             self.config.metered_fallback(&fact.provider_id),
             |row| self.usable(row, fact),
         )
+    }
+
+    pub(crate) fn revalidate_credential(&mut self, credential: &str) {
+        self.continuation_credential = Some(credential.into());
     }
 
     fn view(
@@ -964,7 +986,7 @@ impl ClassContext {
         hold_ok: bool,
         wait: Option<u64>,
         conversation: &str,
-        policy: AllocatorPolicy,
+        mut policy: AllocatorPolicy,
     ) -> Decision {
         let mut request = synthetic_request(provider, model, conversation.into());
         if let Some(wait) = wait {
@@ -972,11 +994,31 @@ impl ClassContext {
         }
         let mut inputs = self.allocation_context(provider, model);
         inputs.hold_ok = Some(hold_ok);
+        // A continuation spends its existing prompt cache. Reuse affinity's
+        // fence checks, retaining a healthy account even when quota readings are
+        // missing or stale, rather than making a cold choice.
+        let affinity = self.continuation_credential.as_ref().and_then(|id| {
+            let row = self
+                .credentials
+                .listed_credentials()
+                .iter()
+                .find(|row| row.id == *id)?;
+            policy.strategy = AccountStrategy::Sticky;
+            Some(ConversationAffinity {
+                pin_id: String::new(),
+                account_id: row.account_id.clone().unwrap_or_else(|| row.id.clone()),
+                credential_id: row.id.clone(),
+                affinity_model: model.into(),
+                pin_generation: 1,
+                expires_at_ms: i64::MAX,
+                lease_active: true,
+            })
+        });
         prefrontal_routing_core::accounts::decide_with_context(
             &request,
             &AllocatorState {
                 roster: self.roster_for(provider, model, priced).roster,
-                affinity: None,
+                affinity,
                 fences: self.fences.get(provider).cloned().unwrap_or_default(),
                 principal_exclusions: Vec::new(),
                 admissions: Vec::new(),
@@ -1094,9 +1136,11 @@ impl ClassContext {
     }
 
     pub(crate) fn needs_credential_pin(&self, provider: &str, model: &str) -> bool {
-        self.refusals
-            .iter()
-            .any(|fact| fact.provider_id == provider)
+        self.continuation_credential.is_some()
+            || self
+                .refusals
+                .iter()
+                .any(|fact| fact.provider_id == provider)
             || self.eligibility.iter().any(|fact| {
                 fact.provider == provider && (fact.model.is_empty() || fact.model == model)
             })

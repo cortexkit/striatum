@@ -290,7 +290,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 72] {
+fn route_state_migrations() -> [Migration; 73] {
     [
         Migration {
             version: 1,
@@ -579,6 +579,10 @@ fn route_state_migrations() -> [Migration; 72] {
         Migration {
             version: 73,
             statements: include_str!("../migrations/073_speed_samples.sql"),
+        },
+        Migration {
+            version: 74,
+            statements: include_str!("../migrations/074_route_fence_report_times.sql"),
         },
     ]
 }

@@ -313,6 +313,35 @@ mod account_fact_tests {
             "the end deletes the row"
         );
     }
+
+    #[test]
+    fn route_fence_keeps_first_receipt_and_latest_evidence_separately() {
+        let scratch = prefrontal_test_support::ScratchDir::new("route-fence-receipts");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "route-fence-receipts",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        for (recorded_at, until_ms, decision_id) in
+            [(10, 500, "first"), (20, 900, "later"), (30, 200, "shorter")]
+        {
+            store
+                .record_account_route_fence(&AccountRouteFence {
+                    provider: "p".into(),
+                    credential_id: "c".into(),
+                    model: "m".into(),
+                    until_ms,
+                    decision_id: decision_id.into(),
+                    recorded_at,
+                })
+                .unwrap();
+        }
+        let fences = store.account_route_fences(100).unwrap();
+        assert_eq!(fences[0].recorded_at, 10);
+        assert_eq!(fences[0].until_ms, 900);
+        assert_eq!(fences[0].decision_id, "first");
+        assert_eq!(store.account_route_fence_latest_reports().unwrap()["c"], 30);
+    }
 }
 
 /// An account/model fact, valid only for the credential listing it was read on.
@@ -575,10 +604,11 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|conn: &Connection| {
                 conn.execute(
-                    "INSERT INTO account_route_fence VALUES (?1,?2,?3,?4,?5,?6) \
+                    "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at) VALUES (?1,?2,?3,?4,?5,?6,?6) \
                 ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
-                until_ms=excluded.until_ms,decision_id=excluded.decision_id,recorded_at=excluded.recorded_at \
-                WHERE excluded.until_ms > account_route_fence.until_ms",
+                until_ms=MAX(account_route_fence.until_ms,excluded.until_ms), \
+                recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at), \
+                last_reported_at=MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at)",
                     params![
                         fence.provider,
                         fence.credential_id,
@@ -591,6 +621,17 @@ impl SqliteRouteStateStore {
                 .map(|_| ())
             })
             .map_err(err)
+    }
+
+    /// Latest evidence per credential, separate from the fence's first receipt.
+    pub fn account_route_fence_latest_reports(
+        &self,
+    ) -> RouteStateResult<std::collections::BTreeMap<String, i64>> {
+        self.store.with_conn(|conn: &Connection| {
+            let mut statement = conn.prepare("SELECT credential_id,MAX(COALESCE(last_reported_at,recorded_at)) FROM account_route_fence GROUP BY credential_id")?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?,row.get(1)?)))?;
+            rows.collect()
+        }).map_err(err)
     }
 
     /// The route fences still standing at `now`. Ended fences are removed on

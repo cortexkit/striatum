@@ -47,6 +47,9 @@ pub(super) struct SelectParams {
     pub(super) pin_fallback: select_policy::PinFallback,
     #[serde(default)]
     pub(super) model_pin: Option<String>,
+    /// Revalidate a retained worker credential without changing its auth method.
+    #[serde(default)]
+    pub(super) continuation_credential_id: Option<String>,
     #[serde(default = "default_target_agent")]
     pub(super) target_agent: String,
     #[serde(default)]
@@ -1557,7 +1560,7 @@ pub(super) async fn handle_select_request(
         provenance,
         entitlement_fences,
         subscription_plan_providers,
-        classes,
+        mut classes,
     } = price_selection_inputs(
         &mut facts,
         quota_signal_json,
@@ -1572,6 +1575,11 @@ pub(super) async fn handle_select_request(
         !host_run,
         priced_per_token,
     )?;
+    if let Some(credential) = &params.continuation_credential_id {
+        if let Some(classes) = &mut classes {
+            classes.revalidate_credential(credential);
+        }
+    }
     add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
     let policy_started = Instant::now();
     let host_models: HashSet<String> = resolved_request

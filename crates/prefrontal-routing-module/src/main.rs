@@ -3058,19 +3058,14 @@ fn record_provider_reset_fence(
     } else {
         return Ok(());
     };
-    // Weekly provider windows can exceed the generic v1 report's one-day cap.
-    // Eight days bounds malformed timestamps without shortening a weekly reset.
-    const MAX_PROVIDER_RESET_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
-    let until = reset.min(now.saturating_add(MAX_PROVIDER_RESET_MS));
-    if until != reset {
-        eprintln!("[prefrontal-routing] provider reset clamped decision={decision_id} provider={provider_id} credential={credential} reset_at_ms={reset} until_ms={until}");
-    }
+    // Provider resets can describe monthly windows as well as weekly ones.
+    // A shorter fence would reopen the route before its account can serve again.
     store
         .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
             provider: provider_id,
             credential_id: credential,
             model,
-            until_ms: until,
+            until_ms: reset,
             decision_id: decision_id.into(),
             recorded_at: now,
         })
@@ -5073,6 +5068,42 @@ mod tests {
         assert_eq!(fences[0].until_ms, reset);
     }
 
+    #[test]
+    fn provider_reset_fence_preserves_a_monthly_reset() {
+        use prefrontal_routing_core::route_state_store::ProviderOutcome;
+        let rig = Rig::new("provider-monthly-reset");
+        let store: SharedStore = Arc::new(rig.open_store());
+        let decision = store
+            .record_decision(&DecisionInput {
+                selected_provider_id: Some("opencode-go".into()),
+                selected_model_id: Some("deepseek-v4.1-flash".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let identity = ProviderOutcome {
+            account_ref: "apikey:opencode-go".into(),
+            credential_id: Some("apikey:opencode-go".into()),
+            resets_at_ms: Some(1_795_357_028_612),
+            credential_refusal: None,
+        };
+        store
+            .set_decision_provider_identity(&decision, &identity)
+            .unwrap();
+        let now = 1_793_604_325_063;
+        record_provider_reset_fence(
+            &store,
+            &SharedBrocaCredentials::default(),
+            &decision,
+            &RouteOutcome::Interrupted,
+            Some(&identity),
+            now,
+        )
+        .unwrap();
+        let fences = store.account_route_fences(now).unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].until_ms, 1_795_357_028_612);
+    }
+
     /// Replay of a live incident: vault credential `apikey:cline-pass` was mapped to
     /// provider `cline-pass`, routing sent a mason to cline-pass, and the provider
     /// answered HTTP 403 `ENTITLEMENT_ERROR` (the account has no plan for the model).
@@ -5299,6 +5330,66 @@ mod tests {
             "{healed}"
         );
         assert!(store.credential_entitlement_fences().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continuation_credential_keeps_cache_or_moves_only_to_a_same_method_sibling() {
+        for (fenced, sibling) in [(false, true), (true, true), (true, false)] {
+            let rig = Rig::new("continuation-credential");
+            let store: SharedStore = Arc::new(rig.open_store());
+            store
+                .upsert_fact(
+                    &fact("cline-pass", "muse-spark-1.3-contributor"),
+                    FactSource::Override,
+                )
+                .unwrap();
+            let mut rows = vec![
+                ("apikey:cline-pass:retained", &["cline-pass"][..], None),
+                ("oauth:cline-pass:other-method", &["cline-pass"][..], None),
+            ];
+            if sibling {
+                rows.push(("apikey:cline-pass:sibling", &["cline-pass"][..], None));
+            }
+            let credentials = vault_listing(&rows);
+            let reset = now_ms() as i64 + 20 * 24 * 3_600_000;
+            if fenced {
+                store
+                    .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                        provider: "cline-pass".into(),
+                        credential_id: "apikey:cline-pass:retained".into(),
+                        model: "muse-spark-1.3-contributor".into(),
+                        until_ms: reset,
+                        decision_id: "first-refusal".into(),
+                        recorded_at: now_ms() as i64,
+                    })
+                    .unwrap();
+            }
+            let frame = run_route_wire_request_with_paths(
+                &store,
+                json!({"method": ROUTE_SELECT_OP, "params": {
+                    "consumer":"mason", "targetAgent":"mason", "requirements":{"iq":30,"eq":0},
+                    "modelPin":"cline-pass/muse-spark-1.3-contributor", "substrate":"broca",
+                    "continuationCredentialId":"apikey:cline-pass:retained"}}),
+                Path::new("/nonexistent/continuation-credential.jsonc"),
+                &credentials,
+            )
+            .await;
+            let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+            if fenced && !sibling {
+                assert!(body.get("result").is_none(), "{body}");
+                assert!(
+                    body.to_string()
+                        .contains(&account_selection::rfc3339(reset)),
+                    "{body}"
+                );
+            } else {
+                assert_eq!(
+                    body["result"]["runner"]["auth"],
+                    json!({"method":"apikey", "account":if fenced {"sibling"} else {"retained"}}),
+                    "{body}"
+                );
+            }
+        }
     }
 
     /// A refusal fences one credential, not the provider: when another credential
