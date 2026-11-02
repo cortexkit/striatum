@@ -13,13 +13,12 @@ use tokio::io::AsyncRead;
 
 use crate::{
     account_quota, config_overrides, fusiform_catalog, now_ms, quota_events, retention, routing_v1,
-    usage_observe, winner_ladder, BrocaCredentials, ModuleConfig, ModuleError,
-    SharedBrocaCredentials, SharedCatalogHealth, SharedQuotaCache, SharedStore, ACCOUNT_QUOTA,
-    DEFAULT_MODULE_ID, USAGE_OBSERVE,
+    winner_ladder, BrocaCredentials, ModuleConfig, ModuleError, SharedBrocaCredentials,
+    SharedCatalogHealth, SharedQuotaCache, SharedStore, ACCOUNT_QUOTA, DEFAULT_MODULE_ID,
 };
 
 /// The long-lived background loops one serving connection starts: retention,
-/// usage observation, quota events, runner declarations, the account roster,
+/// quota events, runner declarations, the account roster,
 /// config refresh, catalog refresh and the winner-ladder watch. Each is written
 /// to run until the process exits, so one
 /// that finishes, by panicking or by returning, has silently stopped a duty
@@ -118,18 +117,10 @@ pub(super) fn start(
         "retention",
         retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
     );
-    // Restore per-account views before the quota consumers start. Header forwarding
-    // owns a separate Insula route so it never interrupts event-cursor delivery.
+    // Restore per-account views before the quota event consumer starts.
     let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
         account_quota::restore_account_state(store.as_ref()),
     ));
-    let usage_observe = USAGE_OBSERVE
-        .get_or_init(usage_observe::SharedUsageObserve::default)
-        .clone();
-    loops.spawn(
-        "Insula usage observer",
-        usage_observe::run(config.connection_file_path.clone(), usage_observe),
-    );
     loops.spawn(
         "quota events",
         quota_events::run(

@@ -1137,14 +1137,6 @@ pub(super) async fn handle_select_request(
             classes: Some(classes),
         };
         let reply = account_selection::handle(&envelope.method, &frame.body, &principal, &ctx);
-        if envelope.method == account_selection::ACCOUNT_OBSERVE_OP {
-            if let (Some(shared), Some(observation)) = (
-                USAGE_OBSERVE.get(),
-                account_selection::usage_observation(&frame.body, &principal, &ctx),
-            ) {
-                shared.record(observation);
-            }
-        }
         return send_account_reply(writer, ver, channel, epoch, corr, reply).await;
     }
 

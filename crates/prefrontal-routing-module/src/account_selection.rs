@@ -4035,61 +4035,6 @@ fn observe(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         .unwrap_or_else(store_error)
 }
 
-/// Resolve response headers only through the admission that this route principal owns.
-pub(crate) fn usage_observation(
-    body: &[u8],
-    principal: &str,
-    ctx: &Ctx<'_>,
-) -> Option<crate::usage_observe::UsageObservation> {
-    if !ctx.flags.enabled {
-        return None;
-    }
-    let params = decode_params(body).ok()?;
-    let parsed: ObserveParams = serde_json::from_value(params).ok()?;
-    if !matches!(parsed.kind.as_str(), "attempt" | "run_finished")
-        || parsed.event_id.trim().is_empty()
-    {
-        return None;
-    }
-    let admission_id = parsed.admission_id.as_deref()?;
-    let admission = ctx
-        .store
-        .account_transaction(|tx| tx.admission(principal, admission_id))
-        .ok()??;
-    if parsed
-        .served_account_id
-        .as_deref()
-        .is_some_and(|served| served != admission.account_id)
-    {
-        // Both callers record the observation first, which logs the mismatch.
-        // Its headers cannot describe the account that the admission assigned.
-        return None;
-    }
-    let is_anthropic_subscription = ctx.accounts.is_some_and(|accounts| {
-        accounts.lock().is_ok_and(|state| {
-            state.roster.as_ref().is_some_and(|roster| {
-                roster.identities.iter().any(|identity| {
-                    identity.account_id == admission.account_id
-                        && identity.refresh_adapter == "anthropic"
-                        && identity.credential_ids.contains(&admission.credential_id)
-                })
-            })
-        })
-    });
-    let headers = parsed
-        .headers
-        .into_iter()
-        .filter(|(name, _)| name.starts_with("anthropic-ratelimit-unified-"))
-        .collect();
-    crate::usage_observe::observation_for_admission(
-        &admission.provider,
-        Some(&admission.account_id),
-        is_anthropic_subscription,
-        parsed.observed_at_ms.unwrap_or(ctx.now_ms),
-        headers,
-    )
-}
-
 fn record_observation(
     tx: &AccountTx<'_>,
     ctx: &Ctx<'_>,
@@ -6329,9 +6274,9 @@ mod tests {
     }
 
     #[test]
-    fn usage_observation_forwards_only_the_admitted_accounts_headers() {
+    fn header_observations_bind_only_to_the_admitted_account() {
         for kind in ["attempt", "run_finished"] {
-            let fixture = fixture("usage-observation-account");
+            let fixture = fixture("header-observation-account");
             let ctx = fixture.ctx(true, NOW);
             let admitted = result(fixture.call(
                 &ctx,
@@ -6345,7 +6290,7 @@ mod tests {
             } else {
                 ACCOUNT_A
             };
-            for (event, served, forwardable) in [
+            for (event, served, bound) in [
                 ("mismatch", Some(other), false),
                 ("matching", Some(account), true),
                 ("unreported", None, true),
@@ -6377,25 +6322,12 @@ mod tests {
                 }))
                 .unwrap();
                 let recorded = result(handle(ACCOUNT_OBSERVE_OP, &body, BROCA, &ctx));
-                assert_eq!(recorded["observation"]["bound"], forwardable);
-                let forwarded = usage_observation(&body, BROCA, &ctx);
-                if forwardable {
-                    assert_eq!(
-                        forwarded,
-                        Some(crate::usage_observe::UsageObservation {
-                            provider: "claude",
-                            account: account.to_string(),
-                            observed_at_ms: NOW - 1_000,
-                            headers,
-                        }),
-                        "{kind}: {event}"
-                    );
-                } else {
+                assert_eq!(recorded["observation"]["bound"], bound, "{kind}: {event}");
+                if !bound {
                     assert_eq!(
                         recorded["observation"]["effects"][0]["effect"],
                         "served_account_mismatch"
                     );
-                    assert_eq!(forwarded, None, "{kind}: {event}");
                 }
             }
         }

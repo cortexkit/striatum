@@ -496,13 +496,6 @@ pub(super) fn account_observe(
     let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
     let ctx = account_ctx(deps, flags, &policy)?;
     let reply = account_selection::handle(ACCOUNT_OBSERVE_OP, &body, &authority.principal, &ctx);
-    // Rate-limit headers feed routing's quota view exactly as the older op's do.
-    if let (Some(shared), Some(observation)) = (
-        crate::USAGE_OBSERVE.get(),
-        account_selection::usage_observation(&body, &authority.principal, &ctx),
-    ) {
-        shared.record(observation);
-    }
     match reply {
         OpReply::Result(result) => observation_answer(&result),
         OpReply::Error {

@@ -51,30 +51,8 @@ enum ExemptItem {
 
 /// The only items the census does not read.
 const EXEMPTIONS: &[Exemption] = &[
-    // The Anthropic header path: these four functions parse and forward the raw
-    // `anthropic-ratelimit-unified-` headers runners send, provider-id checks
-    // included, and stay until runners send normalized readings.
-    Exemption {
-        file: "prefrontal-routing-module/src/usage_observe.rs",
-        item: ExemptItem::Function {
-            impl_type: None,
-            name: "observation_for_admission",
-        },
-    },
-    Exemption {
-        file: "prefrontal-routing-module/src/usage_observe.rs",
-        item: ExemptItem::Function {
-            impl_type: Some("HeaderSignature"),
-            name: "from_headers",
-        },
-    },
-    Exemption {
-        file: "prefrontal-routing-module/src/account_selection.rs",
-        item: ExemptItem::Function {
-            impl_type: None,
-            name: "usage_observation",
-        },
-    },
+    // Local exhaustion evidence still parses raw Anthropic header names until
+    // runners send normalized readings.
     Exemption {
         file: "prefrontal-routing-module/src/account_selection.rs",
         item: ExemptItem::Function {
@@ -896,7 +874,7 @@ fn a_planted_literal_of_each_class_fails() {
             "broca".to_string(),
         ),
         (
-            "prefrontal-routing-module/src/usage_observe.rs",
+            "prefrontal-routing-module/src/quota_consumer.rs",
             id_of_class(&ids, IdClass::VaultProvider),
         ),
         (
@@ -994,7 +972,6 @@ fn every_scanned_file_is_read_except_test_modules() {
     for required in [
         "prefrontal-routing-core/src/launch_policy.rs",
         "prefrontal-routing-module/src/config_convert.rs",
-        "prefrontal-routing-module/src/usage_observe.rs",
         "prefrontal-routing-module/src/main.rs",
     ] {
         assert!(flagged.contains(required), "the census reads {required}");
@@ -1005,17 +982,24 @@ fn every_scanned_file_is_read_except_test_modules() {
 fn test_code_exempt_functions_and_data_files_pass() {
     // Inside an exempt function, and beside one.
     let exempt = census(
-        &[(
-            "prefrontal-routing-module/src/usage_observe.rs".to_string(),
-            "fn observation_for_admission() { let _ = \"anthropic\"; }\n\
-             impl HeaderSignature { fn from_headers() { let _ = \"claude-code\"; } }\n\
-             fn other() { let _ = \"anthropic\"; }\n"
-                .to_string(),
-        )],
+        &[
+            (
+                "prefrontal-routing-module/src/account_selection.rs".to_string(),
+                "fn header_fences() { let _ = \"anthropic\"; }\n\
+                 fn other() { let _ = \"anthropic\"; }\n"
+                    .to_string(),
+            ),
+            (
+                "prefrontal-routing-core/src/model_facts.rs".to_string(),
+                "impl GrandFamily { fn as_str() { let _ = \"anthropic\"; } }\n\
+                 const GRAND_FAMILY_NORMALIZATIONS: &[&str] = &[\"anthropic\"];\n"
+                    .to_string(),
+            ),
+        ],
         &listed_ids(),
     );
     assert_eq!(exempt.len(), 1, "{exempt:?}");
-    assert_eq!(exempt[0].line, 3);
+    assert_eq!(exempt[0].line, 2);
 
     // Test-gated modules, items and #[test] functions.
     for planted in [

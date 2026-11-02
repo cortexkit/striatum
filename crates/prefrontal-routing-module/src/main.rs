@@ -50,7 +50,6 @@ mod substrate_policy;
 mod task_profile_refresh;
 #[cfg(test)]
 mod test_config;
-mod usage_observe;
 mod variant_policy;
 mod winner_ladder;
 mod work_model_pin;
@@ -288,7 +287,6 @@ fn quota_health(cache: &QuotaCache, now_ms: u64) -> (Option<String>, serde_json:
 /// `route.account_quota_status` operation reads it; `None` until boot restores it.
 static ACCOUNT_QUOTA: std::sync::OnceLock<account_quota::SharedAccountQuota> =
     std::sync::OnceLock::new();
-static USAGE_OBSERVE: OnceLock<usage_observe::SharedUsageObserve> = OnceLock::new();
 
 /// The route-state store, shared by the select handler (reader). Single-writer:
 /// this module holds the store's lease for its lifetime.
