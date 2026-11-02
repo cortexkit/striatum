@@ -257,17 +257,32 @@ impl ClassContext {
         registry: &crate::routing_v1::runners::Registry,
         priced: bool,
         sticky_credential: Option<&str>,
-    ) {
+    ) -> Vec<Value> {
         let mut allowed = BTreeMap::new();
+        let mut rejections = Vec::new();
         for fact in facts {
             let key = format!("{}/{}", fact.provider_id, fact.model_id);
             let class = self.class(fact, priced);
             let mut candidates = Vec::new();
+            let reject =
+                |check: &str, row: Option<&cortexkit_claustrum_client::ListedCredential>| {
+                    json!({
+                        "route": key,
+                        "check": check,
+                        "credential_id": row.map(|row| &row.id),
+                        "wire_family": row.and_then(|row| row.auth_method.as_deref())
+                            .and_then(|method| self.credentials.wire_api(fact, method)),
+                    })
+                };
             if crate::service_tiers::model_offers(&self.credentials, fact, tier) {
+                if class.rows.is_empty() {
+                    rejections.push(reject("account", None));
+                }
                 for row in class.rows {
                     if sticky_credential.is_some_and(|id| id != row.id)
                         || !self.usable_candidate(row, fact, true)
                     {
+                        rejections.push(reject("account", Some(row)));
                         continue;
                     }
                     if !runners.iter().any(|runner| {
@@ -275,14 +290,17 @@ impl ClassContext {
                             &runner.module,
                             &prefrontal_routing_core::fact_to_route(fact).route_key,
                             &key,
-                        ) && crate::service_tiers::runner_supports(
-                            &self.credentials,
-                            &runner.module,
-                            fact,
-                            row,
-                            tier,
-                        )
+                        ) && registry.get(&runner.module).is_some_and(|runner| {
+                            crate::service_tiers::runner_supports(
+                                &self.credentials,
+                                runner,
+                                fact,
+                                row,
+                                tier,
+                            )
+                        })
                     }) {
+                        rejections.push(reject("runner", Some(row)));
                         continue;
                     }
                     let account = row.account_id.as_deref().unwrap_or(&row.id);
@@ -306,8 +324,12 @@ impl ClassContext {
                         credits,
                     ) {
                         candidates.push((row.id.clone(), rate));
+                    } else {
+                        rejections.push(reject("plan", Some(row)));
                     }
                 }
+            } else {
+                rejections.push(reject("model", None));
             }
             // Accounts on one route share its standard prices. Keep only the
             // least expensive eligible draw, so later allocation cannot silently
@@ -333,6 +355,7 @@ impl ClassContext {
             allowed.insert(key, ids);
         }
         self.tier_accounts = Some(allowed);
+        rejections
     }
 
     pub(crate) fn service_tier_accounts(&self, provider: &str, model: &str) -> Vec<String> {
@@ -345,7 +368,7 @@ impl ClassContext {
 
     pub(crate) fn tier_runner_serves(
         &self,
-        module: &str,
+        runner: &crate::routing_v1::runners::EffectiveRunner,
         fact: &prefrontal_routing_core::ModelFact,
         tier: &str,
     ) -> bool {
@@ -359,7 +382,7 @@ impl ClassContext {
                     .is_some_and(|row| {
                         crate::service_tiers::runner_supports(
                             &self.credentials,
-                            module,
+                            runner,
                             fact,
                             row,
                             tier,
@@ -2984,6 +3007,14 @@ fn prepare_roster(
                     Ok(decision) => decision.map(|decision| decision.runner_module),
                     Err(error) => return Err(store_error(error)),
                 };
+                let registry = ctx.classes.as_ref().map(|classes| {
+                    crate::routing_v1::runners::Registry::build(
+                        classes.config.v1_runners(),
+                        &classes.credentials,
+                        &classes.facts,
+                        classes.now_ms.max(0) as u64,
+                    )
+                });
                 if let Some(roster) = &mut roster.roster {
                     for account in &mut roster.accounts {
                         account.credentials.retain(|credential| {
@@ -3012,13 +3043,19 @@ fn prepare_roster(
                                                 false,
                                             )
                                             .is_some()
-                                                && crate::service_tiers::runner_supports(
-                                                    &classes.credentials,
-                                                    runner,
-                                                    fact,
-                                                    row,
-                                                    &tier,
-                                                )
+                                                && (tier == "standard"
+                                                    || registry
+                                                        .as_ref()
+                                                        .and_then(|registry| registry.get(runner))
+                                                        .is_some_and(|runner| {
+                                                            crate::service_tiers::runner_supports(
+                                                                &classes.credentials,
+                                                                runner,
+                                                                fact,
+                                                                row,
+                                                                &tier,
+                                                            )
+                                                        }))
                                         }
                                         _ => false,
                                     }

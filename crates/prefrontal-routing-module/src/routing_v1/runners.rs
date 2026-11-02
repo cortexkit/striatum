@@ -327,9 +327,39 @@ pub(crate) fn service_tiers_from_describe(
     Some(tiers)
 }
 
+pub(crate) fn tier_discovery_modules(
+    modules: &serde_json::Value,
+    declarations: &std::collections::BTreeMap<String, RunnerDeclaration>,
+    policies: &[RunnerPolicy],
+) -> BTreeSet<String> {
+    modules
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            if entry
+                .get("nonce_verified")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return None;
+            }
+            let module = entry.get("module_id")?.as_str()?;
+            // A configured vault runner can serve accounts without a routing
+            // declaration. Its own role.describe must still advertise the tier.
+            (declarations.contains_key(module)
+                || policies
+                    .iter()
+                    .any(|policy| policy.module == module && policy.via_vault))
+            .then(|| module.to_owned())
+        })
+        .collect()
+}
+
 pub(crate) async fn refresh_loop(
     connection_file: std::path::PathBuf,
     credentials: crate::SharedBrocaCredentials,
+    config_path: std::path::PathBuf,
 ) {
     use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
     loop {
@@ -344,10 +374,12 @@ pub(crate) async fn refresh_loop(
             let modules =
                 serde_json::to_value(catalog.modules).map_err(|error| error.to_string())?;
             let declarations = declarations_from_catalog(&modules);
+            let policies = crate::config_overrides::live_config(&config_path).v1_runners();
+            let tier_modules = tier_discovery_modules(&modules, &declarations, &policies);
             let mut tiers = std::collections::BTreeMap::new();
             // The routing declaration describes reach, not tier application.
             // Only the runner's own role.describe can establish tier support.
-            for module in declarations.keys() {
+            for module in tier_modules {
                 let reply = consumer
                     .call(
                         subc_protocol::RouteTarget::ManagementSurface {
