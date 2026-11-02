@@ -116,6 +116,114 @@ fn select(tier: &str) -> Value {
 }
 
 #[tokio::test]
+async fn service_tier_pinned_variant_follow_up_steps_down_without_changing_model_or_account() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup(&["pro_200", "pro_500"], true, true);
+    credentials.runner_service_tiers.clear();
+    harness.set_credentials(credentials);
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut request = json!({
+        "consumer":"mason", "requirements":{"iq":30},
+        "pin":"openai/gpt-6.1-sol:xhigh", "task_ref":"wi-pinned-follow-up"
+    });
+    let launched = route.call("route.select", &request).await;
+    assert_eq!(launched.0, FrameType::Response, "{}", launched.1);
+    let first_account = runner
+        .call(
+            "route.account_for",
+            &json!({
+                "provider":"openai", "model":MODEL, "conversation_key":"pinned-session",
+                "admission_id":"launch", "decision_id":launched.1["result"]["decision_id"]
+            }),
+        )
+        .await;
+    assert_eq!(first_account.0, FrameType::Response, "{}", first_account.1);
+    assert_eq!(
+        first_account.1["result"]["account"]["credential_id"],
+        "oauth:0"
+    );
+
+    request["service_tier"] = json!("fast");
+    let follow_up = route.call("route.select", &request).await;
+    assert_eq!(follow_up.0, FrameType::Response, "{}", follow_up.1);
+    let chosen = &follow_up.1["result"];
+    assert_eq!(
+        chosen["route"],
+        json!({"provider":"openai", "model":MODEL, "variant":"xhigh"})
+    );
+    assert_eq!(chosen["runner"]["module"], RUNNER);
+    assert_eq!(chosen["pin_outcome"], "pinned");
+    assert_eq!(chosen["service_tier_chosen"], "standard");
+    let id = chosen["decision_id"].as_str().unwrap();
+    assert_eq!(
+        harness.store().decision_service_tier(id).unwrap(),
+        Some(("standard".into(), vec!["oauth:0".into(), "oauth:1".into()]))
+    );
+    let next_account = runner
+        .call(
+            "route.account_for",
+            &json!({
+                "provider":"openai", "model":MODEL, "conversation_key":"pinned-session",
+                "admission_id":"follow-up", "decision_id":id
+            }),
+        )
+        .await;
+    assert_eq!(next_account.0, FrameType::Response, "{}", next_account.1);
+    assert_eq!(
+        next_account.1["result"]["account"]["credential_id"],
+        first_account.1["result"]["account"]["credential_id"]
+    );
+}
+
+#[tokio::test]
+async fn service_tier_refused_pin_records_its_real_reason_once() {
+    use prefrontal_routing_store::DecisionListFilter;
+
+    let _clock = crate::InjectedClock::set(NOW);
+    for (pin, exclude, reason) in [
+        ("openai/absent:xhigh", json!([]), "unknown_model"),
+        ("openai/gpt-6.1-sol:xhigh", json!(["openai"]), "excluded"),
+    ] {
+        let (harness, mut credentials) = setup(&["pro_500"], true, true);
+        credentials.runner_service_tiers.clear();
+        harness.set_credentials(credentials);
+        let route = harness
+            .bind(reserved("tier-owner"), Some("pinned-project"))
+            .await;
+        let mut request = select("fast");
+        request["pin"] = json!(pin);
+        request["exclude_providers"] = exclude;
+        request["task_ref"] = json!("wi-refused-follow-up");
+        let refused = route.call("route.select", &request).await;
+        assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+        assert_eq!(refused.1["code"], "pin_unavailable", "{}", refused.1);
+        assert_eq!(refused.1["detail"]["reason"], reason, "{}", refused.1);
+        let rows = harness
+            .store()
+            .list_decisions(&DecisionListFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = harness
+            .store()
+            .get_decision_by_id(&rows[0].id)
+            .unwrap()
+            .unwrap();
+        assert!(row.selected_route_key.is_none(), "{row:?}");
+        assert_eq!(row.target_agent, "mason");
+        assert_eq!(row.project_id.as_deref(), Some("pinned-project"));
+        let explanation: Value =
+            serde_json::from_str(row.explanation_json.as_deref().unwrap()).unwrap();
+        assert_eq!(explanation["failureReason"], reason);
+        assert_eq!(explanation["refusal"]["code"], "pin_unavailable");
+        assert_eq!(explanation["pin"], pin);
+    }
+}
+
+#[tokio::test]
 async fn service_tier_ultrafast_pro_200_falls_back_to_fast() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup(&["pro_200"], true, true);
