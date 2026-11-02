@@ -342,6 +342,25 @@ mod account_fact_tests {
         assert_eq!(fences[0].decision_id, "first");
         assert_eq!(store.account_route_fence_latest_reports().unwrap()["c"], 30);
     }
+
+    #[test]
+    fn route_fence_reads_tolerate_a_preupgrade_store_without_the_table() {
+        let scratch = prefrontal_test_support::ScratchDir::new("route-fence-preupgrade");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "route-fence-preupgrade",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .store
+            .with_conn(|conn: &Connection| conn.execute_batch("DROP TABLE account_route_fence"))
+            .unwrap();
+        assert!(store.account_route_fences(100).unwrap().is_empty());
+        assert!(store
+            .account_route_fence_latest_reports()
+            .unwrap()
+            .is_empty());
+    }
 }
 
 /// An account/model fact, valid only for the credential listing it was read on.
@@ -628,6 +647,7 @@ impl SqliteRouteStateStore {
         &self,
     ) -> RouteStateResult<std::collections::BTreeMap<String, i64>> {
         self.store.with_conn(|conn: &Connection| {
+            if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(std::collections::BTreeMap::new()); }
             let mut statement = conn.prepare("SELECT credential_id,MAX(COALESCE(last_reported_at,recorded_at)) FROM account_route_fence GROUP BY credential_id")?;
             let rows = statement.query_map([], |row| Ok((row.get(0)?,row.get(1)?)))?;
             rows.collect()

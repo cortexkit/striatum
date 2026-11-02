@@ -2900,6 +2900,10 @@ async fn handle_set_decision_outcome(
         &params.decision_id,
         &outcome,
         provider_outcome.as_ref(),
+        params
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("account_limit_exhausted:")),
         observed_at_ms,
     ) {
         return send_route_error(
@@ -3009,6 +3013,7 @@ fn record_provider_reset_fence(
     decision_id: &str,
     outcome: &RouteOutcome,
     provider: Option<&prefrontal_routing_core::route_state_store::ProviderOutcome>,
+    account_exhausted: bool,
     now: i64,
 ) -> Result<(), String> {
     if *outcome == RouteOutcome::Completed {
@@ -3017,8 +3022,23 @@ fn record_provider_reset_fence(
     let Some(provider) = provider.filter(|p| p.credential_refusal.is_none()) else {
         return Ok(());
     };
-    let Some(reset) = provider.resets_at_ms.filter(|reset| *reset > now) else {
-        return Ok(());
+    // Unknown refill times need a finite recheck, not an effectively permanent
+    // fence. Keep the former eight-day safety bound only for missing or unreadable
+    // resets; a readable provider date, including a monthly reset, stands as given.
+    const UNKNOWN_RESET_RECHECK_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
+    let reset = match provider.resets_at_ms {
+        Some(reset)
+            if account_quota::parse_rfc3339_ms(&account_selection::rfc3339(reset)).is_some() =>
+        {
+            if reset <= now {
+                return Ok(());
+            }
+            reset
+        }
+        Some(_) => now.saturating_add(UNKNOWN_RESET_RECHECK_MS),
+        None if account_exhausted => now.saturating_add(UNKNOWN_RESET_RECHECK_MS),
+        // Provider identity on an ordinary interruption is not quota evidence.
+        None => return Ok(()),
     };
     let Some(decision) = store
         .get_decision_by_id(decision_id)
@@ -5096,6 +5116,7 @@ mod tests {
             &decision,
             &RouteOutcome::Interrupted,
             Some(&identity),
+            true,
             now,
         )
         .unwrap();

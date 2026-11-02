@@ -555,11 +555,33 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
     let now = 1_793_149_650_000;
     let _clock = crate::InjectedClock::set(now as u64);
     for v1 in [true, false] {
-        for (reset, sibling) in [
-            (now + 5 * 86_400_000, false),
-            (now - 6_000, false),
-            (i64::MAX, false),
-            (now + 5 * 86_400_000, true),
+        // Readable resets stand as reported, even beyond a week. Missing or
+        // unreadable account resets retain a finite recheck; a late report does
+        // not reopen its already-passed window, and an ordinary interruption is
+        // not evidence that the account ran out.
+        for (reset, expected_until, sibling, account_exhausted) in [
+            (
+                Some(now + 5 * 86_400_000),
+                Some(now + 5 * 86_400_000),
+                false,
+                true,
+            ),
+            (Some(now - 6_000), None, false, true),
+            (Some(i64::MAX), Some(now + 8 * 86_400_000), false, true),
+            (None, Some(now + 8 * 86_400_000), false, true),
+            (
+                Some(now + 20 * 86_400_000),
+                Some(now + 20 * 86_400_000),
+                false,
+                true,
+            ),
+            (
+                Some(now + 5 * 86_400_000),
+                Some(now + 5 * 86_400_000),
+                true,
+                true,
+            ),
+            (None, None, false, false),
         ] {
             let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
             harness.edit_config(|config| {
@@ -637,7 +659,7 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
                     &json!({
                         "decisionID": decision,
                         "outcome": "interrupted",
-                        "lastError": "account_limit_exhausted: Go usage limit exceeded",
+                        "lastError": if account_exhausted { "account_limit_exhausted: Go usage limit exceeded" } else { "caller stopped the run" },
                         "providerOutcome": {"accountRef": "apikey:cheap-provider",
                             "credentialId": "apikey:cheap-provider", "resetsAtMs": reset},
                     }),
@@ -645,7 +667,7 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
                 .await;
             assert_eq!(outcome.0, FrameType::Response, "{}", outcome.1);
             assert_eq!(outcome.1["result"]["ok"], true, "{}", outcome.1);
-            let blocked = reset > now && !sibling;
+            let blocked = expected_until.is_some() && !sibling;
             let expected = if blocked { DEAR } else { CHEAP };
             assert_eq!(
                 route_of(&route.call("route.select", &select("mason")).await),
@@ -672,18 +694,18 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
                 assert_eq!(no_alternative.1["detail"]["reason"], "accounts_blocked");
                 assert_eq!(
                     no_alternative.1["detail"]["reset_at_ms"],
-                    reset.min(now + 8 * 86_400_000),
+                    expected_until.unwrap(),
                 );
             } else {
                 assert_eq!(route_of(&pinned), CHEAP);
                 assert_eq!(legacy_route(&legacy_pin), CHEAP);
             }
             let fences = harness.store().account_route_fences(now).unwrap();
-            if reset > now {
+            if let Some(expected_until) = expected_until {
                 assert_eq!(fences.len(), 1);
                 assert_eq!(fences[0].credential_id, "apikey:cheap-provider");
                 assert_eq!(fences[0].model, "model-a");
-                assert_eq!(fences[0].until_ms, reset.min(now + 8 * 86_400_000));
+                assert_eq!(fences[0].until_ms, expected_until);
                 assert!(harness
                     .store()
                     .account_route_fences(fences[0].until_ms)
