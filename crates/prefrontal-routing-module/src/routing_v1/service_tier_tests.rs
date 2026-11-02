@@ -29,12 +29,28 @@ fn setup(
     model_ultrafast: bool,
     runner_ultrafast: bool,
 ) -> (Arc<Harness>, BrocaCredentials) {
+    setup_for_method(
+        plans,
+        model_ultrafast,
+        runner_ultrafast,
+        "oauth",
+        "openai.responses",
+    )
+}
+
+fn setup_for_method(
+    plans: &[&str],
+    model_ultrafast: bool,
+    runner_ultrafast: bool,
+    method: &str,
+    wire: &str,
+) -> (Arc<Harness>, BrocaCredentials) {
     let harness = Harness::new("service-tiers");
     let mut fact = crate::tests::fact("openai", MODEL);
-    fact.auth_methods = Some(vec!["oauth".into()]);
+    fact.auth_methods = Some(vec![method.into()]);
     fact.billing_plane = Some(BillingPlane {
         provider_id: "openai".into(),
-        auth_method: "oauth".into(),
+        auth_method: method.into(),
         kind: "quota_proxy".into(),
         selection_reason: "test account".into(),
         rates: [
@@ -52,7 +68,7 @@ fn setup(
             .unwrap()
             .retain(|key, _| !key.ends_with(".mode.ultrafast"));
     }
-    let wires = [(format!("openai/{MODEL}"), "openai.responses".into())]
+    let wires = [(format!("openai/{MODEL}"), wire.into())]
         .into_iter()
         .collect();
     let mut credentials = BrocaCredentials::default();
@@ -63,14 +79,14 @@ fn setup(
                 .iter()
                 .enumerate()
                 .map(|(index, plan)| ListedCredential {
-                    id: format!("oauth:{index}"),
+                    id: format!("{method}:{index}"),
                     account_id: Some(format!("account-{index}")),
                     state: "active".into(),
                     categories: vec!["llm-provider".into()],
                     provider_ids: vec!["openai".into()],
                     serves: vec!["openai".into()],
                     credential_type: "oauth".into(),
-                    auth_method: Some("oauth".into()),
+                    auth_method: Some(method.into()),
                     plan_tier: Some((*plan).into()),
                     ..Default::default()
                 })
@@ -89,7 +105,7 @@ fn setup(
     credentials.runner_declarations.insert(
         RUNNER.into(),
         runners::parse_declaration(&json!({"runner":{
-            "pairs":[{"wire_api":"openai.responses","auth_method":"oauth"}],
+            "pairs":[{"wire_api":wire,"auth_method":method}],
             "follows_account_choice":true
         }}))
         .unwrap()
@@ -101,7 +117,7 @@ fn setup(
         json!(["fast"])
     };
     credentials.runner_service_tiers.insert(RUNNER.into(), runners::service_tiers_from_describe(&json!({
-        "capabilities":["service_tier"], "service_tiers":{"openai.responses":{"levels":levels,"served":"reported"}}
+        "capabilities":["service_tier"], "service_tiers":{wire:{"levels":levels,"served":"reported"}}
     })).unwrap());
     harness.set_credentials(credentials.clone());
     harness.edit_config(|config| {
@@ -114,6 +130,199 @@ fn setup(
 
 fn select(tier: &str) -> Value {
     json!({"consumer":"mason","requirements":{"iq":30},"service_tier":tier})
+}
+
+fn select_sol(tier: &str) -> Value {
+    let mut request = select(tier);
+    request["pin"] = json!("openai/gpt-6.1-sol");
+    request
+}
+
+fn live_broca_credentials(credentials: &mut BrocaCredentials) {
+    let bytes =
+        include_bytes!("../../../../test-vectors/broca-service-tiers-v1/role-describe-live.json");
+    assert_eq!(bytes.len(), 2072);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(bytes)),
+        "dd0ef1d533f267ea3422e508c7e16f7ece51239fcc93580924572c610bf8e581"
+    );
+    let reply: Value = serde_json::from_slice(bytes).unwrap();
+    credentials.runner_declarations.clear();
+    credentials.runner_service_tiers.clear();
+    let modules = json!([{"module_id":RUNNER,"nonce_verified":true,"role_declarations":null}]);
+    let policies = vec![serde_json::from_value(json!({"module":RUNNER,"via_vault":true})).unwrap()];
+    for module in
+        runners::tier_discovery_modules(&modules, &credentials.runner_declarations, &policies)
+    {
+        if let Some(tiers) = runners::service_tiers_from_describe(&reply) {
+            credentials.runner_service_tiers.insert(module, tiers);
+        }
+    }
+}
+
+#[test]
+fn service_tier_discovery_polls_only_verified_declared_or_vault_runners() {
+    let modules = json!([
+        {"module_id":RUNNER,"nonce_verified":true,"role_declarations":null},
+        {"module_id":"unverified","nonce_verified":false,"role_declarations":null},
+        {"module_id":"not-vault","nonce_verified":true,"role_declarations":null},
+        {"module_id":"declared","nonce_verified":true,"role_declarations":{"routing/v1":{
+            "runner":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}],"follows_account_choice":true}
+        }}}
+    ]);
+    let policies: Vec<crate::config_policy::RunnerPolicy> = serde_json::from_value(json!([
+        {"module":RUNNER,"via_vault":true},
+        {"module":"unverified","via_vault":true},
+        {"module":"not-vault","via_vault":false},
+        {"module":"not-in-catalog","via_vault":true}
+    ]))
+    .unwrap();
+    let declarations = runners::declarations_from_catalog(&modules);
+    assert_eq!(
+        runners::tier_discovery_modules(&modules, &declarations, &policies),
+        [RUNNER.to_owned(), "declared".into()].into_iter().collect()
+    );
+    assert!(runners::tier_discovery_modules(&json!([]), &declarations, &policies).is_empty());
+}
+
+#[tokio::test]
+async fn service_tier_live_broca_pro_200_mason_selects_fast() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup_for_method(
+        &["pro_200"],
+        true,
+        true,
+        "chatgpt",
+        "openai.chatgpt_responses",
+    );
+    live_broca_credentials(&mut credentials);
+    harness.set_credentials(credentials);
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let reply = route.call("route.select", &select_sol("fast")).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(
+        reply.1["result"]["service_tier_chosen"],
+        "fast",
+        "{}",
+        stored_tier_fallback(&harness, &reply.1)
+    );
+    assert_eq!(
+        reply.1["result"]["route"],
+        json!({"provider":"openai","model":"gpt-6.1-sol"})
+    );
+    let id = reply.1["result"]["decision_id"].as_str().unwrap();
+    assert_eq!(
+        harness.store().decision_service_tier(id).unwrap(),
+        Some(("fast".into(), vec!["chatgpt:0".into()]))
+    );
+    assert!(stored_tier_fallback(&harness, &reply.1).is_null());
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let admitted = runner.call("route.account_for", &json!({
+        "provider":"openai", "model":MODEL, "conversation_key":"live-broca", "admission_id":"one",
+        "decision_id":id
+    })).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    assert_eq!(
+        admitted.1["result"]["account"]["credential_id"],
+        "chatgpt:0"
+    );
+}
+
+fn stored_tier_fallback(harness: &Harness, reply: &Value) -> Value {
+    let id = reply["result"]["decision_id"].as_str().unwrap();
+    let decision = harness.store().get_decision_by_id(id).unwrap().unwrap();
+    let input: Value = serde_json::from_str(&decision.requirements_json).unwrap();
+    input["service_tier_fallback"].clone()
+}
+
+fn sol_tier_rejections(fallback: &Value) -> Vec<Value> {
+    fallback["attempts"][0]["rejections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|rejection| rejection["route"] == "openai/gpt-6.1-sol")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn service_tier_live_broca_without_fast_records_runner_fallback() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup_for_method(
+        &["pro_200"],
+        true,
+        true,
+        "chatgpt",
+        "openai.chatgpt_responses",
+    );
+    live_broca_credentials(&mut credentials);
+    credentials
+        .runner_service_tiers
+        .get_mut(RUNNER)
+        .unwrap()
+        .get_mut("openai.chatgpt_responses")
+        .unwrap()
+        .levels
+        .retain(|tier| tier.as_str() != "fast");
+    harness.set_credentials(credentials);
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let reply = route.call("route.select", &select_sol("fast")).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(reply.1["result"]["service_tier_chosen"], "standard");
+    let fallback = stored_tier_fallback(&harness, &reply.1);
+    assert_eq!(fallback["requested"], "fast");
+    assert_eq!(fallback["chosen"], "standard");
+    assert_eq!(fallback["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(fallback["attempts"][0]["tier"], "fast");
+    assert_eq!(
+        sol_tier_rejections(&fallback),
+        vec![json!({
+            "route": "openai/gpt-6.1-sol", "check": "runner",
+            "credential_id": "chatgpt:0", "wire_family": "openai.chatgpt_responses"
+        })]
+    );
+}
+
+#[tokio::test]
+async fn service_tier_live_broca_unknown_plan_records_plan_fallback() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup_for_method(
+        &["unpublished"],
+        true,
+        true,
+        "chatgpt",
+        "openai.chatgpt_responses",
+    );
+    live_broca_credentials(&mut credentials);
+    harness.set_credentials(credentials);
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let reply = route.call("route.select", &select_sol("fast")).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(reply.1["result"]["service_tier_chosen"], "standard");
+    let fallback = stored_tier_fallback(&harness, &reply.1);
+    let rejections = sol_tier_rejections(&fallback);
+    assert_eq!(rejections[0]["check"], "plan");
+    assert_eq!(rejections[0]["credential_id"], "chatgpt:0");
+}
+
+#[tokio::test]
+async fn service_tier_declared_runner_account_choice_opt_out_is_respected() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup(&["pro_200"], true, true);
+    credentials
+        .runner_declarations
+        .get_mut(RUNNER)
+        .unwrap()
+        .follows_account_choice = false;
+    harness.set_credentials(credentials);
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let reply = route.call("route.select", &select("fast")).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(reply.1["result"]["service_tier_chosen"], "standard");
+    assert_eq!(
+        sol_tier_rejections(&stored_tier_fallback(&harness, &reply.1))[0]["check"],
+        "runner"
+    );
 }
 
 #[tokio::test]
@@ -401,6 +610,9 @@ async fn service_tier_affinity_keeps_fast_when_account_gains_ultrafast() {
     let second = route.call("route.select", &request).await;
     assert_eq!(second.0, FrameType::Response, "{}", second.1);
     assert_eq!(second.1["result"]["service_tier_chosen"], "fast");
+    let fallback = stored_tier_fallback(&harness, &second.1);
+    assert_eq!(fallback["affinity"], true);
+    assert_eq!(fallback["attempts"], json!([]));
 }
 
 #[tokio::test]

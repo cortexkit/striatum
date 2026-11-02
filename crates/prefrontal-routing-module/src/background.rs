@@ -138,6 +138,7 @@ pub(super) fn start(
         routing_v1::runners::refresh_loop(
             config.connection_file_path.clone(),
             Arc::clone(&broca_credentials),
+            config_overrides::config_path(),
         ),
     );
     // Restore credential serving methods from cached account identities before

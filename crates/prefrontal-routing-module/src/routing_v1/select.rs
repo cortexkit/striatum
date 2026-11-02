@@ -167,8 +167,9 @@ async fn select_with_tier_fallback(
     request: &SelectRequest,
 ) -> Result<Value, Refusal> {
     use cortexkit_role_routing::service_tier::ServiceTier;
+    let mut trace = TierTrace::default();
     let Some(requested) = request.service_tier else {
-        return select_at_tier(params, caller, deps, profile_lookup, None, None).await;
+        return select_at_tier(params, caller, deps, profile_lookup, None, None, &mut trace).await;
     };
     if let Some(previous) = request
         .affinity
@@ -192,18 +193,22 @@ async fn select_with_tier_fallback(
                     .decision_provider_identity(&previous.decision_id)
                     .map_err(store_refusal)?
                     .and_then(|identity| identity.credential_id);
-                if let Ok(answer) = select_at_tier(
+                trace.affinity = true;
+                match select_at_tier(
                     params,
                     caller,
                     deps,
                     profile_lookup,
                     Some(tier),
                     credential.as_deref(),
+                    &mut trace,
                 )
                 .await
                 {
-                    return Ok(answer);
+                    Ok(answer) => return Ok(answer),
+                    Err(error) => trace.record_failure(tier, &error),
                 }
+                trace.affinity = false;
             }
         }
     }
@@ -214,7 +219,17 @@ async fn select_with_tier_fallback(
         .copied()
         .filter(|tier| *tier <= requested)
     {
-        match select_at_tier(params, caller, deps, profile_lookup, Some(tier), None).await {
+        match select_at_tier(
+            params,
+            caller,
+            deps,
+            profile_lookup,
+            Some(tier),
+            None,
+            &mut trace,
+        )
+        .await
+        {
             Ok(answer) => return Ok(answer),
             Err(error)
                 if matches!(
@@ -226,12 +241,43 @@ async fn select_with_tier_fallback(
                         | "auth_required"
                 ) =>
             {
+                trace.record_failure(tier, &error);
                 last = Some(error);
             }
             Err(error) => return Err(error),
         }
     }
     Err(last.unwrap_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None)))
+}
+
+#[derive(Default)]
+struct TierTrace {
+    attempts: Vec<Value>,
+    rejections: Vec<Value>,
+    affinity: bool,
+}
+
+impl TierTrace {
+    fn record_failure(
+        &mut self,
+        tier: cortexkit_role_routing::service_tier::ServiceTier,
+        refusal: &Refusal,
+    ) {
+        if matches!(
+            refusal.code.as_str(),
+            "accounts_blocked" | "account_hold" | "auth_required"
+        ) {
+            self.rejections
+                .push(json!({"check": "account", "refusal_code": refusal.code}));
+        }
+        self.attempts.push(json!({
+            "tier": tier.as_str(),
+            "affinity": self.affinity,
+            "refusal_code": refusal.code,
+            "reason": refusal.detail.get("reason"),
+            "rejections": std::mem::take(&mut self.rejections),
+        }));
+    }
 }
 
 fn record_pinned_refusal(
@@ -275,7 +321,9 @@ async fn select_at_tier(
     profile_lookup: &ProfileLookup,
     service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     sticky_credential: Option<&str>,
+    tier_trace: &mut TierTrace,
 ) -> Result<Value, Refusal> {
+    tier_trace.rejections.clear();
     super::refuse_unknown_members(params, MEMBERS)?;
     // An omitted task_ref is valid, but a present value must be a string.
     // Reject null rather than letting the optional-string parser treat it as omitted.
@@ -463,9 +511,10 @@ async fn select_at_tier(
     };
     if let Some(tier) = service_tier {
         let Some(classes) = &mut priced.classes else {
+            tier_trace.rejections.push(json!({"check": "account"}));
             return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
         };
-        classes.apply_service_tier(
+        tier_trace.rejections = classes.apply_service_tier(
             &mut facts,
             tier.as_str(),
             &runners,
@@ -488,7 +537,9 @@ async fn select_at_tier(
                             // while registry.runs above still checks the exact route.
                             .find(|fact| fact_to_route(fact).capacity_key == capacity_key)
                             .is_some_and(|fact| {
-                                classes.tier_runner_serves(&runner.module, fact, tier.as_str())
+                                registry.get(&runner.module).is_some_and(|runner| {
+                                    classes.tier_runner_serves(runner, fact, tier.as_str())
+                                })
                             })
                     })
                 })
@@ -989,6 +1040,19 @@ async fn select_at_tier(
     );
     if let Some(requested) = requested_tier {
         input["service_tier_requested"] = json!(requested);
+    }
+    if let Some((requested, chosen)) = requested_tier
+        .zip(service_tier)
+        .filter(|(requested, chosen)| requested > chosen)
+    {
+        // Keep failed tier probes with the successful decision's input snapshot,
+        // so a downgrade does not require reconstructing earlier account state.
+        input["service_tier_fallback"] = json!({
+            "requested": requested.as_str(),
+            "chosen": chosen.as_str(),
+            "affinity": tier_trace.affinity,
+            "attempts": tier_trace.attempts,
+        });
     }
     decision.requirements_json = input.to_string();
     decision.allowed_account_class =

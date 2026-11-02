@@ -53,7 +53,7 @@ pub(crate) fn plan_rate(
 
 pub(crate) fn runner_supports(
     credentials: &BrocaCredentials,
-    module: &str,
+    runner: &crate::routing_v1::runners::EffectiveRunner,
     fact: &ModelFact,
     row: &ListedCredential,
     tier: &str,
@@ -68,22 +68,19 @@ pub(crate) fn runner_supports(
     else {
         return false;
     };
-    if !credentials
-        .runner_declarations
-        .get(module)
-        .is_some_and(|declaration| {
-            declaration.follows_account_choice
-                && declaration.pairs.iter().any(|pair| {
-                    pair.wire_api == wire
-                        && Some(pair.auth_method.as_str()) == row.auth_method.as_deref()
-                })
+    if !runner.follows_account_choice
+        || !runner.pairs.as_ref().is_none_or(|pairs| {
+            pairs.iter().any(|pair| {
+                pair.wire_api == wire
+                    && Some(pair.auth_method.as_str()) == row.auth_method.as_deref()
+            })
         })
     {
         return false;
     }
     credentials
         .runner_service_tiers
-        .get(module)
+        .get(&runner.policy.module)
         .and_then(|map| map.get(wire))
         .is_some_and(|support| support.levels.iter().any(|level| level.as_str() == tier))
 }
