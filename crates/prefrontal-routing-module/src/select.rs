@@ -32,6 +32,12 @@ pub(super) struct SelectBody {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SelectParams {
+    #[serde(default, rename = "service_tier")]
+    pub(super) service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+    #[serde(default, rename = "workspace_root", alias = "workspaceRoot")]
+    pub(super) workspace_root: Option<String>,
+    #[serde(default, rename = "tier_consumer")]
+    pub(super) tier_consumer: Option<String>,
     #[serde(default)]
     pub(super) consumer: Option<select_policy::Consumer>,
     #[serde(
@@ -105,7 +111,7 @@ pub(super) struct SelectParams {
     #[serde(default)]
     pub(super) harness: Option<String>,
     /// The caller's project directory, used to match the decision with recorded spend facts.
-    #[serde(default)]
+    #[serde(default, alias = "project_root")]
     pub(super) project_root: Option<String>,
     /// The caller may provide a launch attempt id before selection; otherwise it
     /// remains null because the router never invents a send correlation.
@@ -168,6 +174,10 @@ pub(super) struct SelectPanelBody {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SelectPanelParams {
+    #[serde(default, rename = "service_tier")]
+    pub(super) service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+    #[serde(default, rename = "workspace_root", alias = "workspaceRoot")]
+    pub(super) workspace_root: Option<String>,
     #[serde(default)]
     pub(super) package_tokens: Option<usize>,
     pub(super) panel_spec: panel_policy::PanelRequestSpec,
@@ -196,7 +206,7 @@ pub(super) struct SelectPanelParams {
     pub(super) parent_session_id: Option<String>,
     #[serde(default)]
     pub(super) harness: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "project_root")]
     pub(super) project_root: Option<String>,
     #[serde(default, rename = "sendID")]
     pub(super) send_id: Option<String>,
@@ -1668,6 +1678,46 @@ pub(super) async fn handle_select_request(
         .availability(&facts)
         .models
     };
+    let runner_registry = broca_credentials
+        .lock()
+        .map(|credentials| {
+            routing_v1::runners::Registry::build(
+                operator_config.v1_runners(),
+                &credentials,
+                &facts,
+                snapshot.now as u64,
+            )
+        })
+        .unwrap_or_default();
+    let configured_runners = runner_registry.policies();
+    let tier_settings = crate::tier_settings::Layers::new(
+        params.project_root.as_deref().filter(|_| !host_run),
+        params.workspace_root.as_deref().filter(|_| !host_run),
+    );
+    let configured_tiers = if !host_run {
+        classes
+            .as_mut()
+            .map(|classes| {
+                classes.apply_configured_service_tiers(
+                    &mut facts,
+                    |fact| {
+                        tier_settings.resolve(
+                            &operator_config,
+                            params.tier_consumer.as_deref().unwrap_or(consumer_id),
+                            &fact.provider_id,
+                            &fact.model_id,
+                            params.service_tier,
+                        )
+                    },
+                    &configured_runners,
+                    &runner_registry,
+                    priced_per_token,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
     let host_auth = params.provider_auth_types.clone().unwrap_or_default();
     if let Some(classes) = &classes {
         classes.apply_eligibility(
@@ -1716,20 +1766,21 @@ pub(super) async fn handle_select_request(
         models: candidates.available,
         rejected: candidates.rejected,
     };
-    let runner_registry = broca_credentials
-        .lock()
-        .map(|credentials| {
-            routing_v1::runners::Registry::build(
-                operator_config.v1_runners(),
-                &credentials,
-                &facts,
-                snapshot.now as u64,
-            )
-        })
-        .unwrap_or_default();
-    let configured_runners = runner_registry.policies();
     let runner_runs = |runner: &config_policy::RunnerPolicy, key: &str, capacity: &str| {
         runner_registry.runs(&runner.module, key, capacity)
+            && configured_tiers
+                .get(capacity)
+                .filter(|tier| !tier.is_standard())
+                .is_none_or(|tier| {
+                    classes.as_ref().is_some_and(|classes| {
+                        facts
+                            .iter()
+                            .find(|fact| fact_to_route(fact).capacity_key == capacity)
+                            .is_some_and(|fact| {
+                                classes.tier_runner_serves(&runner.module, fact, tier.as_str())
+                            })
+                    })
+                })
     };
     if !host_run {
         mapped_availability.models.retain(|key| {
@@ -2128,6 +2179,18 @@ pub(super) async fn handle_select_request(
                     prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
                         priced_per_token,
                     );
+                if !host_run {
+                    crate::tier_settings::record_requested(
+                        &mut decision.requirements_json,
+                        tier_settings.resolve(
+                            &operator_config,
+                            params.tier_consumer.as_deref().unwrap_or(consumer_id),
+                            &selected.model.provider_id,
+                            &selected.model.model_id,
+                            params.service_tier,
+                        ),
+                    );
+                }
                 let decision_id = store
                     .record_decision_with_selection(
                         &decision,
@@ -2169,6 +2232,13 @@ pub(super) async fn handle_select_request(
                 }
                 if !deferred_runner_pin {
                     complete_legacy_selection(&mut result, &selected, &facts, &module);
+                    record_legacy_tier(
+                        &mut result,
+                        &selected,
+                        &configured_tiers,
+                        classes.as_ref(),
+                        store,
+                    )?;
                 }
                 let body =
                     serde_json::to_vec(&json!({"result": result})).map_err(ModuleError::Json)?;
@@ -2427,6 +2497,18 @@ pub(super) async fn handle_select_request(
                 prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
                     priced_per_token,
                 );
+            if !host_run {
+                crate::tier_settings::record_requested(
+                    &mut decision.requirements_json,
+                    tier_settings.resolve(
+                        &operator_config,
+                        params.tier_consumer.as_deref().unwrap_or(consumer_id),
+                        &selected.model.provider_id,
+                        &selected.model.model_id,
+                        params.service_tier,
+                    ),
+                );
+            }
             let recorded = store.record_decision_with_selection(
                 &decision,
                 if host_run {
@@ -2529,6 +2611,13 @@ pub(super) async fn handle_select_request(
                     }
                     add_stage_ms(&timing.runner_ms, runner_started.elapsed());
                     complete_legacy_selection(&mut result, &selected, &facts, &module);
+                    record_legacy_tier(
+                        &mut result,
+                        &selected,
+                        &configured_tiers,
+                        classes.as_ref(),
+                        store,
+                    )?;
                     let finish_started = Instant::now();
                     let body = serde_json::to_vec(&json!({ "result": result }))
                         .map_err(ModuleError::Json)?;
@@ -2651,6 +2740,35 @@ fn host_runner(params: &SelectParams, selected: &SelectedModelRoute) -> serde_js
             variant: selected.prompt_params.variant.clone(),
         },
     ))
+}
+
+fn record_legacy_tier(
+    result: &mut serde_json::Value,
+    selected: &SelectedModelRoute,
+    tiers: &std::collections::BTreeMap<String, cortexkit_role_routing::service_tier::ServiceTier>,
+    classes: Option<&account_selection::ClassContext>,
+    store: &SharedStore,
+) -> Result<(), ModuleError> {
+    let Some(tier) = tiers.get(&format!(
+        "{}/{}",
+        selected.model.provider_id, selected.model.model_id
+    )) else {
+        return Ok(());
+    };
+    result["selected"]["promptParams"]["service_tier_chosen"] = json!(tier);
+    result["service_tier_chosen"] = json!(tier);
+    let accounts = classes
+        .map(|classes| {
+            classes.service_tier_accounts(&selected.model.provider_id, &selected.model.model_id)
+        })
+        .unwrap_or_default();
+    store
+        .record_service_tier(
+            result["decisionID"].as_str().unwrap(),
+            tier.as_str(),
+            &accounts,
+        )
+        .map_err(|err| ModuleError::Message(err.to_string()))
 }
 
 /// Add the common decision envelope without removing legacy launch fields
@@ -2985,7 +3103,7 @@ async fn handle_select_panel(
         } else {
             select_policy::Consumer::Athena
         };
-    let classes = account_selection::ClassContext::read(
+    let mut classes = account_selection::ClassContext::read(
         store,
         broca_credentials,
         live_config.clone(),
@@ -2994,6 +3112,36 @@ async fn handle_select_panel(
         now_ms() as i64,
     )
     .map_err(ModuleError::Message)?;
+    let registry = broca_credentials
+        .lock()
+        .map(|credentials| {
+            routing_v1::runners::Registry::build(
+                operator_config.v1_runners(),
+                &credentials,
+                &prepared.facts,
+                now_ms(),
+            )
+        })
+        .unwrap_or_default();
+    let tier_settings = crate::tier_settings::Layers::new(
+        params.project_root.as_deref(),
+        params.workspace_root.as_deref(),
+    );
+    let tiers = classes.apply_configured_service_tiers(
+        &mut prepared.facts,
+        |fact| {
+            tier_settings.resolve(
+                &operator_config,
+                variant_policy::consumer_group(Some(panel_consumer)).unwrap(),
+                &fact.provider_id,
+                &fact.model_id,
+                params.service_tier,
+            )
+        },
+        &registry.policies(),
+        &registry,
+        false,
+    );
     classes.apply_eligibility(&mut prepared.snapshot, &prepared.facts, false, false);
     classes.apply_legacy_route_fences(&mut prepared.snapshot, &prepared.facts, false, false);
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
@@ -3151,7 +3299,7 @@ async fn handle_select_panel(
         params.send_id.as_deref(),
         &format!("route.select_panel:{}", now_ms()),
     );
-    let panel = loop {
+    let mut panel = loop {
         let mut panel = match prefrontal_routing_core::panel::select_panel_with_availability(
             SelectPanelInput {
                 package_tokens: params.package_tokens,
@@ -3315,6 +3463,33 @@ async fn handle_select_panel(
             availability_rejections.insert(route.route_key, detail.clone());
         }
     };
+    for member in &mut panel.members {
+        let fact = prepared
+            .facts
+            .iter()
+            .find(|fact| fact_to_route(fact).route_key == member.route_key);
+        let key = fact
+            .map(|fact| fact_to_route(fact).capacity_key)
+            .unwrap_or_else(|| member.route_key.clone());
+        if let Some(tier) = tiers.get(&key) {
+            member
+                .prompt_params
+                .insert("service_tier_chosen".into(), json!(tier));
+        }
+        if let Some(requested) = fact.and_then(|fact| {
+            tier_settings.resolve(
+                &operator_config,
+                variant_policy::consumer_group(Some(panel_consumer)).unwrap(),
+                &fact.provider_id,
+                &fact.model_id,
+                params.service_tier,
+            )
+        }) {
+            member
+                .prompt_params
+                .insert("service_tier_requested".into(), json!(requested));
+        }
+    }
     let decision = panel_decision_input(
         &params,
         &panel,

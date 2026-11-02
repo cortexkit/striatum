@@ -249,6 +249,62 @@ pub(crate) fn resolve_class<'a>(
 }
 
 impl ClassContext {
+    pub(crate) fn apply_configured_service_tiers(
+        &mut self,
+        facts: &mut [prefrontal_routing_core::ModelFact],
+        resolve: impl Fn(
+            &prefrontal_routing_core::ModelFact,
+        ) -> Option<cortexkit_role_routing::service_tier::ServiceTier>,
+        runners: &[crate::config_policy::RunnerPolicy],
+        registry: &crate::routing_v1::runners::Registry,
+        priced: bool,
+    ) -> BTreeMap<String, cortexkit_role_routing::service_tier::ServiceTier> {
+        use cortexkit_role_routing::service_tier::ServiceTier;
+        let mut chosen = BTreeMap::new();
+        let mut accounts = BTreeMap::new();
+        for fact in facts {
+            self.tier_accounts = None;
+            let key = format!("{}/{}", fact.provider_id, fact.model_id);
+            let requested = resolve(fact);
+            let standard_accounts = self
+                .class(fact, priced)
+                .rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect();
+            accounts.insert(key.clone(), standard_accounts);
+            let Some(requested) = requested else { continue };
+            for tier in ServiceTier::ALL
+                .iter()
+                .rev()
+                .copied()
+                .filter(|tier| *tier <= requested)
+            {
+                self.tier_accounts = None;
+                if tier.is_standard() {
+                    chosen.insert(key.clone(), tier);
+                    break;
+                }
+                self.apply_service_tier(
+                    std::slice::from_mut(fact),
+                    tier.as_str(),
+                    runners,
+                    registry,
+                    priced,
+                    None,
+                );
+                let eligible = self.service_tier_accounts(&fact.provider_id, &fact.model_id);
+                if !eligible.is_empty() {
+                    accounts.insert(key.clone(), eligible);
+                    chosen.insert(key.clone(), tier);
+                    break;
+                }
+            }
+        }
+        self.tier_accounts = (!accounts.is_empty()).then_some(accounts);
+        chosen
+    }
+
     pub(crate) fn apply_service_tier(
         &mut self,
         facts: &mut [prefrontal_routing_core::ModelFact],

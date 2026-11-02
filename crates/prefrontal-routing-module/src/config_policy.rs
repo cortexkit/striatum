@@ -432,6 +432,7 @@ pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct EntityPolicy {
+    pub service_tier: Option<crate::tier_settings::Tier>,
     pub only_for: Option<Vec<String>>,
     pub not_for: Option<Vec<String>>,
     pub pin_only: Option<bool>,
@@ -527,6 +528,8 @@ pub struct ProjectPolicy {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConsumerPolicy {
+    pub service_tier: Option<crate::tier_settings::Tier>,
+    pub service_tiers: Option<BTreeMap<String, crate::tier_settings::Tier>>,
     pub mode: Option<ConsumerMode>,
     pub ladder: Option<Vec<String>>,
     pub variants: Option<BTreeMap<String, String>>,

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
 use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
+use prefrontal_routing_core::RouteStateStore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use subc_protocol::FrameType;
@@ -177,6 +178,83 @@ async fn service_tier_pinned_variant_follow_up_steps_down_without_changing_model
 }
 
 #[tokio::test]
+async fn service_tier_project_settings_change_the_next_routing_decision() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_500"], true, true);
+    harness.edit_config(|config| {
+        config["consumers"]["sidekick"] = json!({"owner":"tier-owner","mode":"demand"})
+    });
+    let project = harness.store_path().parent().unwrap().join("tier-project");
+    let path = project.join(".cortexkit/prefrontal-routing.jsonc");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"consumers":{"sidekick":{"service_tier":"fast"}}}"#,
+    )
+    .unwrap();
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let request = json!({"consumer":"sidekick", "requirements":{"iq":30}, "project_root":project});
+    let first = route.call("route.select", &request).await;
+    assert_eq!(first.0, FrameType::Response, "{}", first.1);
+    assert_eq!(first.1["result"]["service_tier_chosen"], "fast");
+    std::fs::write(
+        &path,
+        r#"{"consumers":{"sidekick":{"service_tier":"ultrafast"}}}"#,
+    )
+    .unwrap();
+    let second = route.call("route.select", &request).await;
+    assert_eq!(second.0, FrameType::Response, "{}", second.1);
+    assert_eq!(second.1["result"]["service_tier_chosen"], "ultrafast");
+    let mut pinned = request;
+    pinned["service_tier"] = json!("standard");
+    let standard = route.call("route.select", &pinned).await;
+    assert_eq!(standard.1["result"]["service_tier_chosen"], "standard");
+}
+
+#[tokio::test]
+async fn service_tier_project_settings_reach_legacy_pinned_selections() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_200"], true, true);
+    let project = harness
+        .store_path()
+        .parent()
+        .unwrap()
+        .join("legacy-tier-project");
+    let path = project.join(".cortexkit/prefrontal-routing.jsonc");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"consumers":{"sidekick":{"service_tier":"ultrafast"}}}"#,
+    )
+    .unwrap();
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let request = json!({"targetAgent":"explore", "consumer":"sidekick", "executor":"broca", "workload":"sidekick.gather", "substrate":"broca", "requirements":{"iq":30,"eq":0}, "projectRoot":project, "pin":{"model":format!("openai/{MODEL}")}, "pin_fallback":"none"});
+    let reply = route.call("route.select", &request).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(
+        reply.1["result"]["selected"]["promptParams"]["service_tier_chosen"],
+        "fast"
+    );
+    let id = reply.1["result"]["decisionID"].as_str().unwrap();
+    assert_eq!(
+        harness.store().decision_service_tier(id).unwrap(),
+        Some(("fast".into(), vec!["oauth:0".into()]))
+    );
+    let raw: String = rusqlite::Connection::open(harness.store_path())
+        .unwrap()
+        .query_row(
+            "SELECT requirements_json FROM model_route_decisions WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&raw).unwrap()["service_tier_requested"],
+        "ultrafast"
+    );
+}
+
+#[tokio::test]
 async fn service_tier_refused_pin_records_its_real_reason_once() {
     use prefrontal_routing_store::DecisionListFilter;
 
@@ -221,6 +299,35 @@ async fn service_tier_refused_pin_records_its_real_reason_once() {
         assert_eq!(explanation["refusal"]["code"], "pin_unavailable");
         assert_eq!(explanation["pin"], pin);
     }
+}
+
+#[tokio::test]
+async fn service_tier_project_settings_reach_legacy_panel_members() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_500"], true, true);
+    harness.edit_config(|config| config["panels"]["audit"] = json!({"topK":1,"by":"iq"}));
+    let project = harness
+        .store_path()
+        .parent()
+        .unwrap()
+        .join("panel-tier-project");
+    let path = project.join(".cortexkit/prefrontal-routing.jsonc");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"consumers":{"athena":{"service_tier":"fast"}}}"#).unwrap();
+    let excluded: Vec<_> = harness
+        .store()
+        .get_facts()
+        .unwrap()
+        .iter()
+        .filter(|fact| fact.provider_id != "openai" || fact.model_id != MODEL)
+        .map(|fact| prefrontal_routing_core::fact_to_route(fact).route_key)
+        .collect();
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let reply = route.call("route.select_panel", &json!({"taskId":"tier-panel","substrate":"broca","panelSpec":{"class":"AUDIT","diversity":"family"},"projectRoot":project,"excludeRouteKeys":excluded})).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    let members = reply.1["result"]["members"].as_array().unwrap();
+    assert_eq!(members.len(), 1, "{}", reply.1);
+    assert_eq!(members[0]["promptParams"]["service_tier_chosen"], "fast");
 }
 
 #[tokio::test]

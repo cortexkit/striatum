@@ -163,13 +163,15 @@ impl RoutingConfigFile {
             if is_slot(name) {
                 let mut rest = serde_json::to_value(policy).unwrap();
                 rest.as_object_mut().unwrap().remove("pin");
+                rest.as_object_mut().unwrap().remove("service_tier");
+                rest.as_object_mut().unwrap().remove("service_tiers");
                 if rest
                     .as_object()
                     .unwrap()
                     .values()
                     .any(|value| !value.is_null() && value != &serde_json::json!({}))
                 {
-                    return Err(format!("consumers.{name} is a slot and carries only pin"));
+                    return Err(format!("consumers.{name} is a pinned slot and accepts only pin, service_tier and service_tiers"));
                 }
                 if let Some(pin) = &policy.pin {
                     let mut value = serde_json::to_value(pin).unwrap();
