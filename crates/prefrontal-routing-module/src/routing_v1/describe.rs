@@ -18,6 +18,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::SELECT_EXCLUDE_PROVIDERS,
     cortexkit_role_routing::capabilities::SELECT_TASK_REF,
     "service_tier",
+    "service_tier_settings",
     cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
 ];
 

@@ -57,6 +57,9 @@ const MEMBERS: &[&str] = &[
     "pin_fallback",
     "prefer",
     "service_tier",
+    "project_root",
+    "workspace_root",
+    "tier_consumer",
 ];
 
 /// How long an answer stays current routing. A report after this is still
@@ -131,7 +134,10 @@ pub(super) async fn select_with_profile_lookup(
 ) -> Result<Value, Refusal> {
     use cortexkit_role_routing::service_tier::ServiceTier;
     super::refuse_unknown_members(params, MEMBERS)?;
-    let request = parse_select_request_serving(params, super::describe::CAPABILITIES)?;
+    let request = parse_select_request_serving(
+        &crate::tier_settings::without_context(params),
+        super::describe::CAPABILITIES,
+    )?;
     let Some(requested) = request.service_tier else {
         return select_at_tier(params, caller, deps, profile_lookup, None, None).await;
     };
@@ -222,14 +228,20 @@ async fn select_at_tier(
             "task_ref must be 1-128 bytes of printable ASCII (0x21-0x7E)",
         ));
     }
-    let request = parse_select_request_serving(params, super::describe::CAPABILITIES)?;
+    let request = parse_select_request_serving(
+        &crate::tier_settings::without_context(params),
+        super::describe::CAPABILITIES,
+    )?;
     let live_config = config_overrides::live_config(deps.routing_config_path);
     let operator_config = operator_config(deps);
     let consumer = request.consumer.clone();
     let consumers = super::consumers::effective(&operator_config);
     consumers.admit(&consumer, caller)?;
     let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
-    let request = parse_select_request_serving(&effective_params, super::describe::CAPABILITIES)?;
+    let request = parse_select_request_serving(
+        &crate::tier_settings::without_context(&effective_params),
+        super::describe::CAPABILITIES,
+    )?;
     if !crate::broca_credentials::wait_for_billing_catalog(deps.broca_credentials, BILLING_WAIT)
         .await
     {
@@ -354,6 +366,38 @@ async fn select_at_tier(
     if runners.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
+    let tier_settings = crate::tier_settings::Layers::new(
+        params.get("project_root").and_then(Value::as_str),
+        params.get("workspace_root").and_then(Value::as_str),
+    );
+    let configured_tiers = if service_tier.is_none() {
+        priced
+            .classes
+            .as_mut()
+            .map(|classes| {
+                classes.apply_configured_service_tiers(
+                    &mut facts,
+                    |fact| {
+                        tier_settings.resolve(
+                            &operator_config,
+                            params
+                                .get("tier_consumer")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&consumer),
+                            &fact.provider_id,
+                            &fact.model_id,
+                            None,
+                        )
+                    },
+                    &runners,
+                    &registry,
+                    priced_per_token,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
     if let Some(tier) = service_tier {
         let Some(classes) = &mut priced.classes else {
             return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
@@ -369,16 +413,19 @@ async fn select_at_tier(
     }
     let runs = |runner: &RunnerPolicy, route_key: &str, capacity_key: &str| -> bool {
         registry.runs(&runner.module, route_key, capacity_key)
-            && service_tier.is_none_or(|tier| {
-                priced.classes.as_ref().is_some_and(|classes| {
-                    facts
-                        .iter()
-                        .find(|fact| fact_to_route(fact).route_key == route_key)
-                        .is_some_and(|fact| {
-                            classes.tier_runner_serves(&runner.module, fact, tier.as_str())
-                        })
+            && service_tier
+                .or_else(|| configured_tiers.get(capacity_key).copied())
+                .filter(|tier| !tier.is_standard())
+                .is_none_or(|tier| {
+                    priced.classes.as_ref().is_some_and(|classes| {
+                        facts
+                            .iter()
+                            .find(|fact| fact_to_route(fact).route_key == route_key)
+                            .is_some_and(|fact| {
+                                classes.tier_runner_serves(&runner.module, fact, tier.as_str())
+                            })
+                    })
                 })
-            })
     };
 
     // The routes some eligible runner runs, then the requirements the scorer
@@ -864,6 +911,19 @@ async fn select_at_tier(
     let mut input: Value =
         serde_json::from_str(&decision.requirements_json).map_err(store_refusal)?;
     input["hold_wait_max_s"] = json!(hold_cap);
+    let requested_tier = tier_settings.resolve(
+        &operator_config,
+        params
+            .get("tier_consumer")
+            .and_then(Value::as_str)
+            .unwrap_or(&consumer),
+        &selected.model.provider_id,
+        &selected.model.model_id,
+        request.service_tier,
+    );
+    if let Some(requested) = requested_tier {
+        input["service_tier_requested"] = json!(requested);
+    }
     decision.requirements_json = input.to_string();
     decision.allowed_account_class =
         prefrontal_routing_core::accounts::AllowedAccountClass::from_pay_per_token(
@@ -878,6 +938,14 @@ async fn select_at_tier(
             request.task_ref.as_deref(),
         )
         .map_err(store_refusal)?;
+    let service_tier = service_tier.or_else(|| {
+        configured_tiers
+            .get(&format!(
+                "{}/{}",
+                selected.model.provider_id, selected.model.model_id
+            ))
+            .copied()
+    });
     if let Some(tier) = service_tier {
         let accounts = priced
             .classes

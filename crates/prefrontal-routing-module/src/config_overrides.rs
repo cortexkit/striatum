@@ -53,6 +53,34 @@ pub struct LiveConfig {
 }
 
 impl LiveConfig {
+    pub(crate) fn service_tier(
+        &self,
+        consumer: &str,
+        provider: &str,
+        model: &str,
+    ) -> Option<cortexkit_role_routing::service_tier::ServiceTier> {
+        crate::tier_settings::at_level(
+            consumer,
+            provider,
+            model,
+            self.config.consumers.iter().map(|(id, policy)| {
+                (
+                    id.clone(),
+                    policy.service_tier,
+                    policy.service_tiers.clone().unwrap_or_default(),
+                )
+            }),
+            self.config
+                .model_routing
+                .models
+                .get(&format!("{provider}/{model}"))
+                .and_then(|model| model.rules.service_tier),
+            self.config
+                .providers
+                .get(provider)
+                .and_then(|provider| provider.rules.service_tier),
+        )
+    }
     fn new(config: RoutingConfigFile, document: Option<String>) -> Self {
         let pricing = route_pricing(&config.model_routing);
         Self {

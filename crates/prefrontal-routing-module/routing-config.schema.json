@@ -337,6 +337,27 @@
           ],
           "default": null
         },
+        "service_tier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "service_tiers": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/Tier"
+          },
+          "default": null
+        },
         "tool_capabilities": {
           "type": [
             "array",
@@ -451,6 +472,17 @@
           "items": {
             "type": "string"
           }
+        },
+        "service_tier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "speed": {
           "type": [
@@ -988,6 +1020,17 @@
           ],
           "default": null
         },
+        "service_tier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "subscription": {
           "type": [
             "boolean",
@@ -1414,6 +1457,14 @@
       "required": [
         "model",
         "variant"
+      ]
+    },
+    "Tier": {
+      "type": "string",
+      "enum": [
+        "standard",
+        "fast",
+        "ultrafast"
       ]
     },
     "VendorPrefixConfig": {

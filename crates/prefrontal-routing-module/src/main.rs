@@ -50,6 +50,7 @@ mod substrate_policy;
 mod task_profile_refresh;
 #[cfg(test)]
 mod test_config;
+mod tier_settings;
 mod variant_policy;
 mod winner_ladder;
 mod work_model_pin;

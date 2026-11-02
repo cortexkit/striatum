@@ -165,6 +165,8 @@ impl RoutingConfigFile {
             if is_slot(name) {
                 let mut rest = serde_json::to_value(policy).unwrap();
                 rest.as_object_mut().unwrap().remove("pin");
+                rest.as_object_mut().unwrap().remove("service_tier");
+                rest.as_object_mut().unwrap().remove("service_tiers");
                 if rest
                     .as_object()
                     .unwrap()
