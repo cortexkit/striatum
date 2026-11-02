@@ -3,19 +3,6 @@ use crate::config_policy::{
     consumer_matches, is_slot, resolve_consumer_policy, slot_consumer, ConsumerPolicy, EntityPolicy,
 };
 
-impl ModelFactOverride {
-    pub(super) fn has_fact_override(&self) -> bool {
-        self.elo.is_some()
-            || self.eq.is_some()
-            || self.speed.is_some()
-            || self.cost_per_mtok_out.is_some()
-            || self.context_window.is_some()
-            || self.vision.is_some()
-            || self.speed_multiplier.is_some()
-            || self.subscription_multiplier.is_some()
-    }
-}
-
 impl RoutingConfigFile {
     /// Materialize the temporary interfaces used by the existing selection pass.
     /// Only the entity-shaped fields are read from disk; the grouped views are
@@ -102,6 +89,8 @@ impl RoutingConfigFile {
             exclusions
                 .sort_by_key(|key| (key.trim_start_matches('-').split('/').count(), key.clone()));
             exclusion_groups.insert(id.into(), serde_json::json!(exclusions));
+        }
+        for id in self.consumers.keys().filter(|id| !is_slot(id)) {
             let policy = resolve_consumer_policy(
                 id,
                 &self.consumers,
@@ -109,15 +98,24 @@ impl RoutingConfigFile {
                 &BTreeMap::new(),
             );
             variants.insert(
-                id.into(),
+                id.clone(),
                 serde_json::json!(policy.variants.unwrap_or_default()),
             );
         }
         self.model_routing.exclude =
             serde_json::from_value(serde_json::Value::Object(exclusion_groups))
                 .map_err(|error| error.to_string())?;
-        variants.insert("all".into(), serde_json::json!(self.default_variants));
-        self.model_routing.variants = serde_json::from_value(serde_json::Value::Object(variants))
+        let mut groups = serde_json::Map::new();
+        for consumer in crate::select_policy::Consumer::ALL {
+            if let Some(id) = crate::variant_policy::consumer_group(Some(consumer)) {
+                if let Some(entries) = variants.get(id) {
+                    groups.insert(id.into(), entries.clone());
+                }
+            }
+        }
+        groups.insert("all".into(), serde_json::json!(self.default_variants));
+        groups.insert("consumers".into(), serde_json::Value::Object(variants));
+        self.model_routing.variants = serde_json::from_value(serde_json::Value::Object(groups))
             .map_err(|error| error.to_string())?;
         let mut pins = serde_json::Map::new();
         for (name, policy) in &self.consumers {

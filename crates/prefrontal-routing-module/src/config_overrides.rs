@@ -2,7 +2,6 @@
 //! Each selection overlays one complete snapshot onto catalog facts; reloads
 //! never rewrite the catalog or replace an in-flight request's configuration.
 
-#[cfg(test)]
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -38,6 +37,7 @@ pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 mod contract_tests;
+mod dormant_models;
 mod new_shape;
 #[cfg(test)]
 mod new_shape_tests;
@@ -159,10 +159,10 @@ fn check_variants_with(
     catalog: &ReasoningCatalog,
 ) -> Result<Vec<String>, String> {
     let section = &config.model_routing;
-    let mut groups = serde_json::to_value(&section.variants).unwrap();
+    let mut groups = section.variants.clone();
     let mut warnings = Vec::new();
-    for entries in groups.as_object_mut().unwrap().values_mut() {
-        entries.as_object_mut().unwrap().retain(|key, _| {
+    for entries in groups.maps_mut() {
+        entries.retain(|key, _| {
             let provider = key.split('/').next().unwrap_or(key);
             if catalog.models_of(provider).next().is_some() {
                 true
@@ -174,7 +174,6 @@ fn check_variants_with(
             }
         });
     }
-    let groups = serde_json::from_value(groups).unwrap();
     warnings.extend(
         crate::variant_policy::check_against_catalog(&groups, &BTreeMap::new(), catalog)
             .map_err(|error| format!("variant_not_published: {error}"))?,
@@ -303,6 +302,12 @@ fn parse_config_with_reporter(
     }
     if value.get("model_families").is_some() {
         return Err("config_key_removed: model_families; families now come from Fusiform's model.lineage; delete this section".into());
+    }
+    if value.get("elo_overrides").is_some() {
+        return Err(
+            "config_key_removed: elo_overrides; [TODO(user): move each entry to models.<id>.elo]"
+                .into(),
+        );
     }
     if value
         .get("accounts")
@@ -488,13 +493,6 @@ fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
     }
     if config.catalog.poll_ms == Some(0) {
         return Err("catalog.poll_ms must be positive".into());
-    }
-    if section
-        .elo_overrides
-        .values()
-        .any(|value| !value.is_finite() || *value <= 0.0)
-    {
-        return Err("elo_overrides must be positive".into());
     }
     section.panels.validate()?;
     section.pins.validate()?;
@@ -766,78 +764,38 @@ impl LiveConfig {
     ) -> Vec<String> {
         self.config
             .model_routing
-            .elo_overrides
-            .keys()
-            .filter(|key| {
+            .models
+            .iter()
+            .filter(|(key, entry)| {
                 let (provider, model, _) = parse_model_key(key).expect("validated model key");
-                grades.contains_key(&format!("{provider}/{model}"))
+                (entry.elo.is_some() || entry.eq.is_some())
+                    && grades.contains_key(&format!("{provider}/{model}"))
             })
-            .cloned()
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
     pub fn apply(&self, facts: &mut Vec<ModelFact>) -> SelectionOverrideOutcome {
         let section = &self.config.model_routing;
-        for (key, model) in &section.models {
-            if !model.has_fact_override() {
-                continue;
-            }
-            let (provider, model, variant) = parse_model_key(key).expect("validated model key");
-            if !facts.iter().any(|fact| {
-                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()) == *key
-            }) {
-                facts.push(ModelFact {
-                    provider_id: provider,
-                    model_id: model,
-                    variant,
-                    family: None,
-                    billing_plane: None,
-                    auth_methods: None,
-                    scores: ModelScores::default(),
-                    context_window: None,
-                    max_output_tokens: None,
-                    cost_tier: None,
-                    cost_per_m_tok_out: None,
-                    input_rate: None,
-                    cache_read_rate: None,
-                    cache_write_rate: None,
-                    reasoning_rate: None,
-                    supports_vision: None,
-                    supports_tool_use: None,
-                    prompt_defaults: None,
-                    confidence: Confidence::Curated,
-                    notes: None,
-                    speed_multiplier: None,
-                    subscription_multiplier: None,
-                    speed_is_fleet_median: false,
-                    score_provenance: ScoreProvenance::Unscored,
-                    aa_index: None,
-                    review_by_ms: None,
-                    eq_source: None,
-                    class_vector: None,
-                    class_vector_is_overlay: false,
-                    upstream_status: None,
-                });
-            }
-        }
+        let mut unknown_keys = section.models.keys().cloned().collect::<HashSet<_>>();
+        let mut applied = 0;
         for fact in facts.iter_mut() {
             let key = make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
             if let Some(model) = section.models.get(&key) {
+                unknown_keys.remove(&key);
+                applied += 1;
                 let observed_speed = fact.scores.speed;
                 let quality = (fact.scores.elo, fact.scores.eq, fact.score_provenance);
-                let operator_grade = fact.eq_source.as_deref() == Some("operator_grade");
                 *fact = merge_override(fact, model);
-                if operator_grade {
-                    (fact.scores.elo, fact.scores.eq, fact.score_provenance) = quality;
-                } else {
-                    if model.elo.is_some()
-                        && (quality.2 != ScoreProvenance::Unscored || model.eq.is_some())
-                    {
-                        fact.score_provenance = ScoreProvenance::EloOverride;
-                    }
-                    if model.eq.is_some() {
-                        fact.eq_source = Some("override".into());
-                    }
+                if model.elo.is_some()
+                    && (quality.2 != ScoreProvenance::Unscored || model.eq.is_some())
+                {
+                    fact.score_provenance = ScoreProvenance::EloOverride;
+                } else if model.elo.is_none() {
+                    fact.score_provenance = quality.2;
+                }
+                if model.eq.is_some() {
+                    fact.eq_source = Some("override".into());
                 }
                 if let (Some(cost), Some(plane)) =
                     (model.cost_per_mtok_out, fact.billing_plane.as_mut())
@@ -853,18 +811,14 @@ impl LiveConfig {
                     fact.scores.speed = observed_speed;
                 }
             }
-            if let Some(elo) = section.elo_overrides.get(&key) {
-                fact.scores.elo = *elo;
-                if fact.score_provenance != ScoreProvenance::Unscored {
-                    fact.score_provenance = ScoreProvenance::EloOverride;
-                }
-            }
             fact.subscription_multiplier = self
                 .pricing
                 .subscription_multipliers
                 .get(&fact.provider_id)
                 .copied();
         }
+        let mut unknown_keys = unknown_keys.into_iter().collect::<Vec<_>>();
+        unknown_keys.sort();
         SelectionOverrideOutcome {
             routing_config: RoutingConfig {
                 demand_exponent: section.demand_exponent.unwrap_or(DEFAULT_DEMAND_EXPONENT),
@@ -873,8 +827,8 @@ impl LiveConfig {
                     .resolve()
                     .expect("validated config"),
             },
-            applied: section.models.len() + section.elo_overrides.len(),
-            unknown_keys: Vec::new(),
+            applied,
+            unknown_keys,
             policy_revision: self.policy_revision(),
         }
     }
@@ -1292,7 +1246,6 @@ impl ModelNamingConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
-#[schemars(transform = routing_schema_constraints)]
 struct ModelRoutingSection {
     /// Excluded providers or routes by consumer. The `all` list applies to every
     /// consumer; a negated entry in another list cannot remove its exclusions.
@@ -1322,10 +1275,6 @@ struct ModelRoutingSection {
     /// Keyed by "provider/model" or "provider/model/variant".
     #[serde(default)]
     models: HashMap<String, ModelFactOverride>,
-    /// Request-time capability overrides. Unknown keys are ignored and surfaced
-    /// to the caller for warning logs.
-    #[serde(default)]
-    elo_overrides: HashMap<String, f64>,
     /// Power-curve exponent mapping caller IQ demand to the request frontier.
     #[serde(default)]
     #[schemars(transform = positive_number)]
@@ -1374,15 +1323,6 @@ struct ModelRoutingSection {
     /// the pinned model when it can be served, and is routed as usual when not.
     #[serde(skip)]
     project_pins: BTreeMap<String, BTreeMap<String, String>>,
-}
-
-fn routing_schema_constraints(schema: &mut schemars::Schema) {
-    let properties = schema
-        .get_mut("properties")
-        .unwrap()
-        .as_object_mut()
-        .unwrap();
-    properties["elo_overrides"]["additionalProperties"]["exclusiveMinimum"] = serde_json::json!(0);
 }
 
 fn positive_number(schema: &mut schemars::Schema) {
@@ -1720,81 +1660,24 @@ fn policy_revision(document: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(document.as_bytes()))
 }
 
-/// Re-read request-time Elo settings and apply known route overrides to this
-/// selection's fact snapshot. Nothing is persisted, so removing an override
-/// restores the catalog Elo value on the next request.
+/// Re-read request-time quality settings and apply known model overrides to this
+/// selection's fact snapshot without persisting them.
 #[cfg(test)]
 pub fn apply_live_selection_config(
     path: &Path,
-    facts: &mut [ModelFact],
+    facts: &mut Vec<ModelFact>,
 ) -> Result<SelectionOverrideOutcome, String> {
-    let doc = match std::fs::read_to_string(path) {
-        Ok(doc) => doc,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SelectionOverrideOutcome {
-                routing_config: RoutingConfig::default(),
-                applied: 0,
-                unknown_keys: Vec::new(),
-                policy_revision: default_policy_revision(),
-            });
-        }
+    let document = match std::fs::read_to_string(path) {
+        Ok(document) => Some(document),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("reading {}: {error}", path.display())),
     };
-    let json = jsonc_to_json(&doc)
-        .map_err(|message| format!("invalid jsonc in {}: {message}", path.display()))?;
-    let config: RoutingConfigFile = serde_json::from_str(&json)
-        .map_err(|error| format!("invalid config in {}: {error}", path.display()))?;
-    let exponent = config
-        .model_routing
-        .demand_exponent
-        .unwrap_or(DEFAULT_DEMAND_EXPONENT);
-    if !exponent.is_finite() || exponent <= 0.0 {
-        return Err(format!(
-            "model_routing.demand_exponent must be finite and positive, got {exponent}"
-        ));
-    }
-    let overqualification = config.model_routing.overqualification.resolve()?;
-
-    let mut fact_indices = facts
-        .iter()
-        .enumerate()
-        .map(|(index, fact)| {
-            (
-                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()),
-                index,
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    let mut applied = 0;
-    let mut unknown_keys = Vec::new();
-    for (route_key, elo) in config.model_routing.elo_overrides {
-        let Some(index) = fact_indices.remove(&route_key) else {
-            eprintln!(
-                "[prefrontal-routing] unknown elo_overrides route key `{route_key}`; ignoring"
-            );
-            unknown_keys.push(route_key);
-            continue;
-        };
-        if !elo.is_finite() || elo <= 0.0 {
-            eprintln!(
-                "[prefrontal-routing] invalid Elo override for route `{route_key}`: {elo}; ignoring"
-            );
-            continue;
-        }
-        facts[index].scores.elo = elo;
-        applied += 1;
-    }
-    unknown_keys.sort();
-
-    Ok(SelectionOverrideOutcome {
-        routing_config: RoutingConfig {
-            demand_exponent: exponent,
-            overqualification,
-        },
-        applied,
-        unknown_keys,
-        policy_revision: policy_revision(&doc),
-    })
+    let config = document
+        .as_deref()
+        .map(parse_config)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(LiveConfig::new(config, document).apply(facts))
 }
 
 /// Read the cache capability deny-list for the gather-seat preference. The file

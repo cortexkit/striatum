@@ -62,11 +62,17 @@ fn quality_precedence_for_mapping(catalog_provider: &str, mapped_provider: &str)
     assert_eq!(store.operator_quality().unwrap()[&mapped_route], snapshot.grades[&catalog_route]);
     let config_path = rig.dir.join("routing.jsonc");
     crate::test_config::write(&config_path, &json!({"model_routing": {
-        "models": {(catalog_route.clone()): {"elo": 900, "eq": 950}},
-        "elo_overrides": {(mapped_route.clone()): 1400}
+        "models": {
+            (catalog_route.clone()): {"elo": 900, "eq": 950},
+            (mapped_route.clone()): {"elo": 1400}
+        }
     }}).to_string()).unwrap();
     let config = crate::config_overrides::settle_live_config(&config_path);
-    assert_eq!(config.shadowed_operator_grades(&store.operator_quality().unwrap()), [mapped_route.clone()]);
+    let mut shadowed = config.shadowed_operator_grades(&store.operator_quality().unwrap());
+    shadowed.sort();
+    let mut expected_shadowed = vec![catalog_route.clone(), mapped_route.clone()];
+    expected_shadowed.sort();
+    assert_eq!(shadowed, expected_shadowed);
     let mut facts = store.get_facts().unwrap();
     let targets = credentials.lock().unwrap().catalog_targets(&facts);
     prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
@@ -74,15 +80,16 @@ fn quality_precedence_for_mapping(catalog_provider: &str, mapped_provider: &str)
     config.apply(&mut facts);
     for provider in [catalog_provider, mapped_provider] {
         let fact = facts.iter().find(|f| f.provider_id == provider && f.model_id == "quality-test").unwrap();
-        assert_eq!(fact.scores.eq, 1599.8);
         if provider == catalog_provider {
-            assert_eq!(fact.scores.elo, 1284.0);
-            assert_eq!(fact.score_provenance, ScoreProvenance::OperatorGrade);
+            assert_eq!(fact.scores.elo, 900.0);
+            assert_eq!(fact.scores.eq, 950.0);
+            assert_eq!(fact.eq_source.as_deref(), Some("override"));
         } else {
             assert_eq!(fact.scores.elo, 1400.0);
-            assert_eq!(fact.score_provenance, ScoreProvenance::EloOverride);
+            assert_eq!(fact.scores.eq, 1599.8);
+            assert_eq!(fact.eq_source.as_deref(), Some("operator_grade"));
         }
-        assert_eq!(fact.eq_source.as_deref(), Some("operator_grade"));
+        assert_eq!(fact.score_provenance, ScoreProvenance::EloOverride);
     }
     facts.retain(|f| f.model_id == "quality-test" || f.provider_id == "synthetic");
     let requirements = prefrontal_routing_core::ModelRequirements { iq: 1.0, eq: 1.0 };
@@ -100,7 +107,7 @@ fn quality_precedence_for_mapping(catalog_provider: &str, mapped_provider: &str)
     let candidates = serde_json::to_value(&selected.score).unwrap()["candidates"].clone();
     let candidates = candidates.as_array().unwrap();
     for (route, elo_source, eq_source) in [
-        (catalog_route.as_str(), "operator_grade", "operator_grade"),
+        (catalog_route.as_str(), "override", "override"),
         (mapped_route.as_str(), "override", "operator_grade"),
         ("synthetic/ungraded", "curated", "curated"),
     ] {

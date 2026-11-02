@@ -78,15 +78,6 @@ pub(crate) fn consumer_group(consumer: Option<Consumer>) -> Option<&'static str>
     })
 }
 
-fn group<'a>(groups: &'a VariantGroups, name: &str) -> &'a BTreeMap<String, String> {
-    groups
-        .named()
-        .into_iter()
-        .find(|(group, _)| *group == name)
-        .map(|(_, entries)| entries)
-        .expect("every consumer group name is a variants group")
-}
-
 /// How specifically a spec names routes: a model (longer = narrower) beats a provider.
 fn specificity(spec: &ParsedSpec) -> (bool, usize) {
     (
@@ -149,7 +140,7 @@ pub(crate) struct VariantRequest<'a> {
     pub explicit: Option<&'a str>,
     /// The variant the route would run at with no override.
     pub curated: Option<&'a str>,
-    pub consumer: Option<Consumer>,
+    pub consumer: Option<&'a str>,
 }
 
 /// Choose the variant for one selected route. `catalog` is the live published
@@ -169,12 +160,22 @@ pub(crate) fn resolve(
         };
     }
     let mut fallbacks = Vec::new();
-    let levels = consumer_group(request.consumer)
-        .map(|name| (name, VariantSource::Consumer))
+    let levels = request
+        .consumer
+        .and_then(|consumer| {
+            groups
+                .consumer_groups()
+                .into_iter()
+                .filter(|(name, entries)| {
+                    !entries.is_empty() && crate::config_policy::consumer_matches(name, consumer)
+                })
+                .max_by_key(|(name, _)| name.len())
+        })
+        .map(|(name, entries)| (name, entries, VariantSource::Consumer))
         .into_iter()
-        .chain([("all", VariantSource::All)]);
-    for (name, source) in levels {
-        let Some((key, variant)) = matching_entry(group(groups, name), request.route_key) else {
+        .chain([("all", &groups.all, VariantSource::All)]);
+    for (name, entries, source) in levels {
+        let Some((key, variant)) = matching_entry(entries, request.route_key) else {
             continue;
         };
         match catalog
@@ -281,7 +282,7 @@ mod tests {
                 "athena" => &mut groups.athena,
                 "lab" => &mut groups.lab,
                 "core" => &mut groups.core,
-                other => panic!("unknown group {other}"),
+                other => groups.consumers.entry(other.into()).or_default(),
             };
             map.insert((*key).into(), (*variant).into());
         }
@@ -314,7 +315,7 @@ mod tests {
             model_id: "gpt-6.1-sol",
             explicit,
             curated: Some("medium"),
-            consumer,
+            consumer: consumer_group(consumer),
         }
     }
 
@@ -376,17 +377,54 @@ mod tests {
             model_id: "claude-opus-5-5",
             explicit: None,
             curated: Some("max"),
-            consumer: Some(Consumer::Athena),
+            consumer: Some("athena"),
         };
         let aliases = BTreeMap::new();
         let athena = resolve(&config, &aliases, Some(&published), &request);
-        request.consumer = Some(Consumer::Mason);
+        request.consumer = Some("mason");
         let mason = resolve(&config, &aliases, Some(&published), &request);
         assert_eq!(athena.variant.as_deref(), Some("xhigh"));
         assert_eq!(mason.variant.as_deref(), Some("high"));
         assert_eq!(
             (athena.source, mason.source),
             (VariantSource::Consumer, VariantSource::Consumer)
+        );
+    }
+
+    #[test]
+    fn nonlegacy_variants_obey_precedence_and_catalog_validation() {
+        let config = groups(&[
+            ("all", "openai/gpt-6.1-sol", "high"),
+            ("mc_summary", "openai/gpt-6.1-sol", "xhigh"),
+        ]);
+        let published = catalog(&[(
+            "openai/gpt-6.1-sol",
+            Some(&["low", "medium", "high", "xhigh"]),
+        )]);
+        let aliases = BTreeMap::new();
+        let mut request = VariantRequest {
+            consumer: Some("mc_summary.child"),
+            ..request(None, None)
+        };
+        assert!(check_against_catalog(&config, &aliases, &published).is_ok());
+        let choice = resolve(&config, &aliases, Some(&published), &request);
+        assert_eq!(choice.variant.as_deref(), Some("xhigh"));
+        assert_eq!(choice.source, VariantSource::Consumer);
+        request.explicit = Some("low");
+        assert_eq!(
+            resolve(&config, &aliases, Some(&published), &request).source,
+            VariantSource::Pin
+        );
+        request.explicit = None;
+        let changed = catalog(&[("openai/gpt-6.1-sol", Some(&["low", "medium", "high"]))]);
+        assert!(check_against_catalog(&config, &aliases, &changed).is_err());
+        let fallback = resolve(&config, &aliases, Some(&changed), &request);
+        assert_eq!(fallback.variant.as_deref(), Some("high"));
+        assert_eq!(fallback.source, VariantSource::All);
+        assert_eq!(fallback.fallbacks.len(), 1);
+        assert_eq!(
+            resolve(&VariantGroups::default(), &aliases, None, &request).source,
+            VariantSource::Curated
         );
     }
 

@@ -39,13 +39,19 @@ pub struct VariantGroups {
     pub core: BTreeMap<String, String>,
     pub codemode: BTreeMap<String, String>,
     pub flow: BTreeMap<String, String>,
+    pub consumers: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl VariantGroups {
     /// Every group with its config name, `all` first.
-    pub fn named(&self) -> [(&'static str, &BTreeMap<String, String>); 8] {
+    pub fn named(&self) -> Vec<(&str, &BTreeMap<String, String>)> {
+        std::iter::once(("all", &self.all))
+            .chain(self.consumer_groups())
+            .collect()
+    }
+
+    pub fn consumer_groups(&self) -> Vec<(&str, &BTreeMap<String, String>)> {
         [
-            ("all", &self.all),
             ("mason", &self.mason),
             ("sidekick", &self.sidekick),
             ("athena", &self.athena),
@@ -54,6 +60,30 @@ impl VariantGroups {
             ("codemode", &self.codemode),
             ("flow", &self.flow),
         ]
+        .into_iter()
+        .filter(|(name, _)| !self.consumers.contains_key(*name))
+        .chain(
+            self.consumers
+                .iter()
+                .map(|(name, entries)| (name.as_str(), entries)),
+        )
+        .collect()
+    }
+
+    pub fn maps_mut(&mut self) -> Vec<&mut BTreeMap<String, String>> {
+        [
+            &mut self.all,
+            &mut self.mason,
+            &mut self.sidekick,
+            &mut self.athena,
+            &mut self.lab,
+            &mut self.core,
+            &mut self.codemode,
+            &mut self.flow,
+        ]
+        .into_iter()
+        .chain(self.consumers.values_mut())
+        .collect()
     }
 
     pub fn is_empty(&self) -> bool {

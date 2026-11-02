@@ -78,6 +78,7 @@ const CHECK_ROUTE_BLOCKS: &str = "route_blocks";
 const CHECK_REFUSAL_RATE: &str = "refusal_rate";
 const CHECK_EMPTY_CANDIDATE_SETS: &str = "empty_candidate_sets";
 const CHECK_UNSCORED_ADMISSIBLE_MODEL: &str = "unscored_admissible_model";
+const CHECK_DORMANT_MODEL_CONFIG: &str = "dormant_model_config";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,6 +112,8 @@ pub(crate) struct Finding {
 
 /// Everything the checks read, gathered from the store in one pass.
 pub(crate) struct Evidence {
+    pub dormant_model_keys: Vec<String>,
+    pub catalog_version: Option<i64>,
     pub unscored_admissible_models: Vec<prefrontal_routing_store::UnscoredAdmissibleModel>,
     pub fences: Vec<CredentialEntitlementFence>,
     pub route_walls: Vec<DiagnosticRouteWall>,
@@ -150,6 +153,11 @@ impl Evidence {
             decisions
         };
         Ok(Self {
+            dormant_model_keys: Vec::new(),
+            catalog_version: store
+                .fusiform_catalog_cursor()
+                .map_err(text)?
+                .map(|cursor| cursor.catalog_version),
             unscored_admissible_models: store
                 .unscored_admissible_models(now_ms.saturating_sub(window_ms), now_ms)
                 .map_err(text)?,
@@ -189,6 +197,17 @@ pub(crate) fn report(evidence: &Evidence, now_ms: i64, window_ms: i64) -> Value 
     findings.extend(route_blocks(evidence, now_ms));
     findings.extend(refusal_rate(evidence));
     findings.extend(empty_candidate_sets(evidence));
+    findings.extend(evidence.dormant_model_keys.iter().map(|key| Finding {
+        check: CHECK_DORMANT_MODEL_CONFIG,
+        key: format!("models.{key}"),
+        severity: Severity::Warning,
+        count: 1,
+        first_seen_ms: now_ms,
+        last_seen_ms: now_ms,
+        summary: clip(&format!("[TODO(user): models.{key} is dormant because the catalog does not serve it]"), MAX_SUMMARY_CHARS),
+        samples: vec![json!({"config_key": format!("models.{key}"), "catalog_version": evidence.catalog_version})],
+        hint: "[TODO(user): check the model key or wait for the catalog to finish warming]".into(),
+    }));
     findings.extend(
         evidence
             .unscored_admissible_models
@@ -218,6 +237,7 @@ pub(crate) fn report(evidence: &Evidence, now_ms: i64, window_ms: i64) -> Value 
             CHECK_REFUSAL_RATE,
             CHECK_EMPTY_CANDIDATE_SETS,
             CHECK_UNSCORED_ADMISSIBLE_MODEL,
+            CHECK_DORMANT_MODEL_CONFIG,
         ]
         .iter()
         .position(|known| *known == check)
@@ -1113,6 +1133,8 @@ pub(crate) async fn handle(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
+    config_path: &std::path::Path,
+    credentials: &crate::broca_credentials::SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -1120,7 +1142,7 @@ pub(crate) async fn handle(
         frame.header.epoch,
         frame.header.corr,
     );
-    let reply = answer(&frame.body, channel, epoch, store);
+    let reply = answer(&frame.body, channel, epoch, store, config_path, credentials);
     let (ty, body) = match reply {
         Ok(result) => (
             FrameType::Response,
@@ -1144,7 +1166,14 @@ pub(crate) async fn handle(
     send(writer, response).await
 }
 
-fn answer(body: &[u8], channel: u16, epoch: u32, store: &SharedStore) -> Result<Value, ErrorBody> {
+fn answer(
+    body: &[u8],
+    channel: u16,
+    epoch: u32,
+    store: &SharedStore,
+    config_path: &std::path::Path,
+    credentials: &crate::broca_credentials::SharedBrocaCredentials,
+) -> Result<Value, ErrorBody> {
     admit(&routing_v1::Caller::for_route(channel, epoch))
         .map_err(|message| ErrorBody::new("not_permitted", message))?;
     let request =
@@ -1152,8 +1181,18 @@ fn answer(body: &[u8], channel: u16, epoch: u32, store: &SharedStore) -> Result<
     let window_ms =
         window_ms(&request).map_err(|message| ErrorBody::new("invalid_request", message))?;
     let now_ms = crate::now_ms() as i64;
-    let evidence = Evidence::gather(store, now_ms, window_ms)
+    let mut evidence = Evidence::gather(store, now_ms, window_ms)
         .map_err(|message| ErrorBody::new("store_error", format!("{OP}: {message}")))?;
+    let mut facts = store
+        .get_facts()
+        .map_err(|message| ErrorBody::new("store_error", format!("{OP}: {message}")))?;
+    let targets = credentials
+        .lock()
+        .map(|credentials| credentials.catalog_targets(&facts))
+        .unwrap_or_default();
+    prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
+    evidence.dormant_model_keys =
+        crate::config_overrides::live_config(config_path).dormant_model_keys(&facts);
     Ok(report(&evidence, now_ms, window_ms))
 }
 
@@ -1181,6 +1220,8 @@ mod tests {
 
     fn empty() -> Evidence {
         Evidence {
+            dormant_model_keys: Vec::new(),
+            catalog_version: None,
             unscored_admissible_models: Vec::new(),
             fences: Vec::new(),
             route_walls: Vec::new(),
@@ -1192,6 +1233,46 @@ mod tests {
             catalog_models: BTreeSet::new(),
             quota: crate::account_quota::AccountQuotaState::default(),
         }
+    }
+
+    #[test]
+    fn dormant_model_findings_name_config_keys_and_catalog_version() {
+        let scratch = prefrontal_test_support::ScratchDir::new("dormant-model-findings");
+        let path = scratch.join("routing.jsonc");
+        crate::test_config::write(
+            &path,
+            json!({"models": {
+                "p/stale": {"elo": 1500}, "p/policy-only": {"pin_only": true}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let config = crate::config_overrides::live_config(&path);
+        let mut evidence = empty();
+        evidence.catalog_version = Some(42);
+        evidence.dormant_model_keys = config.dormant_model_keys(&[]);
+        let rows = findings(&evidence, CHECK_DORMANT_MODEL_CONFIG);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["key"], "models.p/policy-only");
+        assert_eq!(rows[1]["key"], "models.p/stale");
+        for row in rows {
+            assert_eq!(row["severity"], "warning");
+            assert_eq!(row["samples"][0]["config_key"], row["key"]);
+            assert_eq!(row["samples"][0]["catalog_version"], 42);
+            assert!(row["summary"]
+                .as_str()
+                .unwrap()
+                .contains(row["key"].as_str().unwrap()));
+        }
+        let facts = ["stale", "policy-only"].map(|model| {
+            serde_json::from_value(json!({
+                "providerID": "p", "modelID": model,
+                "scores": {"elo": 1000, "eq": 1000, "speed": 0}, "confidence": "curated"
+            }))
+            .unwrap()
+        });
+        evidence.dormant_model_keys = config.dormant_model_keys(&facts);
+        assert!(findings(&evidence, CHECK_DORMANT_MODEL_CONFIG).is_empty());
     }
 
     fn findings(evidence: &Evidence, check: &str) -> Vec<Value> {

@@ -52,16 +52,6 @@
       "default": null,
       "exclusiveMinimum": 0
     },
-    "elo_overrides": {
-      "description": "Request-time capability overrides. Unknown keys are ignored and surfaced\nto the caller for warning logs.",
-      "type": "object",
-      "additionalProperties": {
-        "type": "number",
-        "format": "double",
-        "exclusiveMinimum": 0
-      },
-      "default": {}
-    },
     "head_agents": {
       "description": "Target agents that are heads: operator-facing sessions that may spend\na subscription's kept-free reserve. Matched case-insensitively.",
       "type": "array",

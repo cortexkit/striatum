@@ -240,8 +240,8 @@ async fn select_at_tier(
     }
 
     let operator_policy = operator_config.operator_policy();
-    // Legacy classes still identify variant/reset groups. Payment class comes
-    // only from the resolved consumer policy, not from the consumer's name.
+    // Payment class comes only from the resolved consumer policy, not from the
+    // consumer's name.
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
     let consumer_policy = operator_config.consumer_policy(
         &consumer,
@@ -825,7 +825,7 @@ async fn select_at_tier(
         &operator_config,
         deps.operator_config_path,
         &catalog_targets,
-        legacy_consumer,
+        Some(&consumer),
         explicit_variant.as_deref(),
     );
 
@@ -1086,7 +1086,7 @@ impl<'a> Selection<'a> {
                         .as_ref()
                         .and_then(|p| p.variant.as_deref())
                         .or(fact.variant.as_deref()),
-                    consumer: select_policy::Consumer::from_id(self.consumer),
+                    consumer: Some(self.consumer),
                 },
             );
             let mut served = fact.clone();

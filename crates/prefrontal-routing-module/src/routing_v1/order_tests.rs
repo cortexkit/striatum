@@ -493,6 +493,41 @@ async fn the_answer_carries_route_runner_variant_limits_decision_and_expiry() {
     );
 }
 
+#[tokio::test]
+async fn a_nonlegacy_consumer_runs_its_inherited_variant_in_scoring_and_launch() {
+    let harness = harness(&[(CHEAP, true, true, 200_000)]);
+    harness.edit_config(|config| {
+        config["variants"] = json!({ CHEAP: "low" });
+        config["consumers"]["mc_summary"]["variants"] = json!({ CHEAP: "xhigh" });
+        config["consumers"]["mc_summary.child"] = json!({});
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let profiles = super::profile_tests::lookup(
+        "mc_summary.child",
+        30.0,
+        &[(CHEAP, 1_000.0), ("cheap-provider/model-a/xhigh", 2_000.0)],
+    );
+    let result = route
+        .select_with_profiles(&select("mc_summary.child"), &profiles)
+        .await
+        .unwrap();
+    assert_eq!(result["route"]["variant"], "xhigh", "{result}");
+    assert_eq!(result["runner"]["model"]["variant"], "xhigh");
+    let decision = result["decision_id"].as_str().unwrap();
+    assert_eq!(
+        harness
+            .store()
+            .v1_decision(decision)
+            .unwrap()
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("xhigh")
+    );
+    let pricing = super::profile_tests::task_pricing(&harness, decision);
+    assert_eq!(pricing["tokens"]["outputExcludingReasoning"], 2_000.0);
+}
+
 /// A mason's reasoning variant comes from the consumer's `variants` config on
 /// both wire shapes. Core moves unpinned masons from the older select to the
 /// v1 one, so a v1 answer that dropped the variant would launch every such

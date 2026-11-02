@@ -1175,7 +1175,14 @@ pub(super) async fn handle_select_request(
         return handle_route_decisions_list(frame, writer, store).await;
     }
     if envelope.method == diagnostics_findings::OP {
-        return diagnostics_findings::handle(frame, writer, store).await;
+        return diagnostics_findings::handle(
+            frame,
+            writer,
+            store,
+            operator_config_path,
+            broca_credentials,
+        )
+        .await;
     }
     if envelope.method == ROUTE_RESOLVE_POLICY_OP {
         return handle_resolve_policy(frame, writer, operator_config_path).await;
@@ -2027,7 +2034,7 @@ pub(super) async fn handle_select_request(
                 &operator_config,
                 operator_config_path,
                 &catalog_targets,
-                params.consumer,
+                variant_policy::consumer_group(params.consumer),
                 explicit.as_deref(),
             );
             (selected, choice)
@@ -2381,7 +2388,7 @@ pub(super) async fn handle_select_request(
                 &operator_config,
                 operator_config_path,
                 &catalog_targets,
-                params.consumer,
+                variant_policy::consumer_group(params.consumer),
                 project_pin
                     .as_deref()
                     .and_then(|pin| cortexkit_role_routing::select::RouteRef::parse_pin(pin))
@@ -3376,7 +3383,7 @@ pub(super) fn apply_variant_policy(
     config: &config_overrides::LiveConfig,
     config_path: &Path,
     catalog_targets: &std::collections::BTreeMap<String, String>,
-    consumer: Option<select_policy::Consumer>,
+    consumer: Option<&str>,
     explicit: Option<&str>,
 ) -> variant_policy::VariantChoice {
     let groups = config.variant_groups();
@@ -3487,7 +3494,7 @@ fn apply_panel_variant_policy(
                 model_id: &model_id,
                 explicit: None,
                 curated: curated.as_deref(),
-                consumer: Some(consumer),
+                consumer: variant_policy::consumer_group(Some(consumer)),
             },
         );
         if choice.variant != curated {

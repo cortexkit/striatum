@@ -588,7 +588,7 @@ fn check_config_offline_reads_the_store_or_says_why_it_skipped() {
 }
 
 #[test]
-fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
+fn converted_keys_load_and_camel_case_spellings_are_refused() {
     let document = include_str!("../../fixtures/preserved-routing.jsonc");
     for camel in [
         document.replace(
@@ -635,7 +635,7 @@ fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
         let model = &section.models["openai/gpt-6/high"];
         assert_eq!(
             (model.elo, model.eq, model.speed),
-            (Some(1800.0), Some(1750.0), Some(90.0))
+            (Some(1900.0), Some(1750.0), Some(90.0))
         );
         assert_eq!(
             (model.cost_per_mtok_out, model.context_window),
@@ -649,7 +649,6 @@ fn preserved_keys_load_unchanged_and_camel_case_spellings_are_refused() {
             ),
             (Some(true), Some(1.5), None)
         );
-        assert_eq!(section.elo_overrides["openai/gpt-6/high"], 1900.0);
         assert_eq!(section.demand_exponent, Some(1.5));
         assert_eq!(
             (

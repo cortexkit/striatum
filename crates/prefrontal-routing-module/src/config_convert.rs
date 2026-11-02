@@ -35,6 +35,8 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
             .iter()
             .any(|key| root.contains_key(*key))
     {
+        move_elo_overrides(&mut root)?;
+        remove_empty_consumer_variants(&mut root);
         return Ok(Value::Object(root));
     }
     let data = defaults();
@@ -68,6 +70,10 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     if let Some(models) = old.remove("models") {
         root.insert("models".into(), models);
     }
+    if let Some(overrides) = old.remove("elo_overrides") {
+        root.insert("elo_overrides".into(), overrides);
+    }
+    move_elo_overrides(&mut root)?;
     let ids = old
         .remove("consumers")
         .unwrap_or_else(|| data["consumers"].clone());
@@ -225,7 +231,9 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
                             .clone(),
                     );
             }
-            entry(&mut root, "consumers", &id)["variants"] = variants;
+            if !variants.as_object().unwrap().is_empty() {
+                entry(&mut root, "consumers", &id)["variants"] = variants;
+            }
         }
     }
     if let Some(pins) = old.remove("pins") {
@@ -281,7 +289,46 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     }
     remove_account_model_families(&mut root);
     remove_account_flag(&mut root)?;
+    remove_empty_consumer_variants(&mut root);
     Ok(Value::Object(root))
+}
+
+fn remove_empty_consumer_variants(root: &mut Map<String, Value>) {
+    let Some(consumers) = root.get_mut("consumers").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for consumer in consumers.values_mut().filter_map(Value::as_object_mut) {
+        if consumer
+            .get("variants")
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
+            consumer.remove("variants");
+        }
+    }
+}
+
+fn move_elo_overrides(root: &mut Map<String, Value>) -> Result<(), String> {
+    let Some(overrides) = root.remove("elo_overrides") else {
+        return Ok(());
+    };
+    for (key, elo) in overrides
+        .as_object()
+        .ok_or("[TODO(user): elo_overrides must be an object]")?
+    {
+        let models = root
+            .entry("models")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or("[TODO(user): models must be an object]")?;
+        let model = models
+            .entry(key.clone())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or("[TODO(user): models entries must be objects]")?;
+        model.insert("elo".into(), elo.clone());
+    }
+    Ok(())
 }
 
 /// Drop the retired quota-family table without relaxing other unknown-key

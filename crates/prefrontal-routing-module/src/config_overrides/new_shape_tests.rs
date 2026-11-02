@@ -7,6 +7,156 @@ fn config(value: serde_json::Value) -> LiveConfig {
 }
 
 #[test]
+fn top_level_elo_overrides_is_refused_by_name() {
+    for value in [json!(null), json!({}), json!({"p/model": 1400})] {
+        let error = parse_config(&json!({"elo_overrides": value}).to_string()).unwrap_err();
+        assert!(
+            error.contains("config_key_removed: elo_overrides"),
+            "{error}"
+        );
+        assert!(error.contains("models.<id>.elo"), "{error}");
+    }
+}
+
+#[test]
+fn nested_quality_overrides_beat_operator_grades() {
+    let config = config(json!({"models": {"p/model": {"elo": 1400, "eq": 1500}}}));
+    let mut facts = vec![serde_json::from_value(json!({
+        "providerID": "p", "modelID": "model",
+        "scores": {"elo": 1284, "eq": 1599.8, "speed": 0},
+        "scoreProvenance": "operator_grade", "eqSource": "operator_grade",
+        "confidence": "curated"
+    }))
+    .unwrap()];
+    config.apply(&mut facts);
+    config.apply(&mut facts);
+    assert_eq!(facts[0].scores.elo, 1400.0);
+    assert_eq!(facts[0].scores.eq, 1500.0);
+    assert_eq!(facts[0].score_provenance, ScoreProvenance::EloOverride);
+    assert_eq!(facts[0].eq_source.as_deref(), Some("override"));
+}
+
+#[test]
+fn absent_model_config_is_dormant_and_reported_without_creating_candidates() {
+    let config = config(json!({"models": {
+        "p/stale": {"elo": 1500, "eq": 1500},
+        "p/policy-only": {"pin_only": true}
+    }}));
+    let mut facts = Vec::new();
+    let outcome = config.apply(&mut facts);
+    assert!(
+        facts.is_empty(),
+        "config must not add candidates: {facts:?}"
+    );
+    assert_eq!(outcome.applied, 0);
+    assert_eq!(outcome.unknown_keys, ["p/policy-only", "p/stale"]);
+    facts.push(
+        serde_json::from_value(json!({
+            "providerID": "p", "modelID": "stale",
+            "scores": {"elo": 1000, "eq": 1000, "speed": 0}, "confidence": "curated"
+        }))
+        .unwrap(),
+    );
+    let warmed = config.apply(&mut facts);
+    assert_eq!(warmed.unknown_keys, ["p/policy-only"]);
+    assert_eq!(warmed.applied, 1);
+    assert_eq!((facts[0].scores.elo, facts[0].scores.eq), (1500.0, 1500.0));
+}
+
+#[test]
+fn nonlegacy_consumer_variants_are_materialized_with_dotted_inheritance() {
+    let config = config(json!({
+        "variants": {"p/model": "low"},
+        "consumers": {
+            "mc_summary": {"variants": {"p/model": "high"}},
+            "mc_summary.child": {}
+        }
+    }));
+    let groups = serde_json::to_value(config.variant_groups()).unwrap();
+    assert_eq!(groups["consumers"]["mc_summary"]["p/model"], "high");
+    assert_eq!(groups["consumers"]["mc_summary.child"]["p/model"], "high");
+}
+
+#[test]
+fn a_consumer_named_all_does_not_replace_top_level_variants() {
+    let config = config(json!({
+        "variants": {"p/model": "low"},
+        "consumers": {"all": {"variants": {"p/model": "high"}}}
+    }));
+    let request = crate::variant_policy::VariantRequest {
+        route_key: "p/model",
+        provider_id: "p",
+        model_id: "model",
+        explicit: None,
+        curated: None,
+        consumer: Some("all"),
+    };
+    let choice =
+        crate::variant_policy::resolve(config.variant_groups(), &BTreeMap::new(), None, &request);
+    assert_eq!(choice.variant.as_deref(), Some("high"));
+    let other = crate::variant_policy::VariantRequest {
+        consumer: Some("other"),
+        ..request
+    };
+    let choice =
+        crate::variant_policy::resolve(config.variant_groups(), &BTreeMap::new(), None, &other);
+    assert_eq!(choice.variant.as_deref(), Some("low"));
+}
+
+#[test]
+fn converter_omits_empty_variants_but_keeps_consumer_registration() {
+    for variants in [json!({}), json!({"all": {}, "mason": {"p/model": "high"}})] {
+        let converted = crate::config_convert::convert_value(json!({"model_routing": {
+            "consumers": ["mason", "mc_summary"], "variants": variants
+        }}))
+        .unwrap();
+        let consumers = converted["consumers"].as_object().unwrap();
+        assert!(consumers.contains_key("mc_summary"));
+        for (name, consumer) in consumers {
+            if let Some(variants) = consumer.get("variants") {
+                assert!(
+                    !variants.as_object().unwrap().is_empty(),
+                    "{name}: {consumer}"
+                );
+            }
+        }
+    }
+    let converted = crate::config_convert::convert_value(json!({"consumers": {
+        "mc_summary": {"variants": {}}, "mason": {"variants": {"p/model": "high"}}
+    }}))
+    .unwrap();
+    assert_eq!(converted["consumers"]["mc_summary"], json!({}));
+    assert_eq!(
+        converted["consumers"]["mason"]["variants"],
+        json!({"p/model": "high"})
+    );
+}
+
+#[test]
+fn converter_moves_elo_overrides_to_models_with_their_original_precedence() {
+    for input in [
+        json!({"model_routing": {
+            "elo_overrides": {"p/model": 1400},
+            "models": {"p/model": {"elo": 900, "eq": 1200}}
+        }}),
+        json!({
+            "elo_overrides": {"p/model": 1400},
+            "models": {"p/model": {"elo": 900, "eq": 1200}}
+        }),
+    ] {
+        let converted = crate::config_convert::convert_value(input).unwrap();
+        assert!(converted.get("elo_overrides").is_none());
+        assert_eq!(converted["models"]["p/model"]["elo"], 1400);
+        assert_eq!(converted["models"]["p/model"]["eq"], 1200);
+        parse_config(&converted.to_string()).unwrap();
+        assert_eq!(
+            crate::config_convert::convert_value(converted.clone()).unwrap(),
+            converted
+        );
+    }
+}
+
+#[test]
 fn old_shape_is_refused_even_when_empty_or_null() {
     for value in [
         json!({"model_routing": {}}),
