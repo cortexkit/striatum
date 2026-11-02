@@ -321,7 +321,7 @@ mod tests {
     fn tier_settings_precedence_and_specificity_and_pin() {
         let root = root();
         let global_path = root.join("global.jsonc");
-        std::fs::write(&global_path, r#"{"consumers":{"sidekick":{"service_tier":"ultrafast"},"head":{"service_tier":"fast"}}}"#).unwrap();
+        std::fs::write(&global_path, r#"{"consumers":{"sidekick":{"service_tier":"ultrafast"},"head":{"service_tier":"fast"},"synthesizer":{"service_tier":"fast"},"lab_planner":{"service_tiers":{"openai":"fast"}},"spec_designer":{"service_tier":"ultrafast"}}}"#).unwrap();
         let global = crate::config_overrides::settle_live_config(&global_path);
         let workspace = root.join("workspace");
         let project = workspace.join("project");
@@ -372,6 +372,18 @@ mod tests {
         assert_eq!(
             global.service_tier("head", "openai", "other"),
             Some(ServiceTier::Fast)
+        );
+        assert_eq!(
+            global.service_tier("synthesizer", "openai", "other"),
+            Some(ServiceTier::Fast)
+        );
+        assert_eq!(
+            global.service_tier("lab_planner", "openai", "other"),
+            Some(ServiceTier::Fast)
+        );
+        assert_eq!(
+            global.service_tier("spec_designer", "openai", "other"),
+            Some(ServiceTier::Ultrafast)
         );
         std::fs::remove_dir_all(root).unwrap();
     }

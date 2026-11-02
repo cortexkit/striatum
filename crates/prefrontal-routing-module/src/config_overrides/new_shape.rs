@@ -173,7 +173,7 @@ impl RoutingConfigFile {
                     .values()
                     .any(|value| !value.is_null() && value != &serde_json::json!({}))
                 {
-                    return Err(format!("consumers.{name} is a slot and carries only pin"));
+                    return Err(format!("[TODO(user): consumers.{name} accepts only pin, service_tier and service_tiers]"));
                 }
                 if let Some(pin) = &policy.pin {
                     let mut value = serde_json::to_value(pin).unwrap();
