@@ -1777,7 +1777,9 @@ pub(super) async fn handle_select_request(
                             .iter()
                             .find(|fact| fact_to_route(fact).capacity_key == capacity)
                             .is_some_and(|fact| {
-                                classes.tier_runner_serves(&runner.module, fact, tier.as_str())
+                                runner_registry.get(&runner.module).is_some_and(|runner| {
+                                    classes.tier_runner_serves(runner, fact, tier.as_str())
+                                })
                             })
                     })
                 })
