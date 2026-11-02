@@ -70,8 +70,8 @@ const LEASE_MS: i64 = 2 * 60_000;
 const AFFINITY_IDLE_MS: i64 = 7 * 24 * 60 * 60_000;
 /// Accepted use renews affinity at most this often.
 const AFFINITY_TOUCH_MS: i64 = 60_000;
-/// The longest short hold a caller waits out when it does not say.
-const DEFAULT_HOLD_WAIT_S: u64 = 900;
+/// The longest hold a caller waits out when it does not say.
+pub(crate) const DEFAULT_HOLD_WAIT_S: u64 = 900;
 /// The principal a worker-launch preflight decides under. No caller can hold
 /// it, so a preflight never reads or touches a real conversation.
 const PREFLIGHT_PRINCIPAL: &str = "routing:preflight";
@@ -948,7 +948,6 @@ impl ClassContext {
         }
         let mut policy = self.config.allocator_policy(provider);
         policy.max_hold_s = i64::MAX as u64 / 1000;
-        policy.short_hold_max_ms = i64::MAX;
         policy.reserve_five_hour = 0.0;
         policy.reserve_seven_day = 0.0;
         policy.reserve_scoped = 0.0;

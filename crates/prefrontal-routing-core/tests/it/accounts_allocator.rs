@@ -446,8 +446,15 @@ fn confirmed_short_hold_returns_account_hold_within_the_callers_wait() {
         );
     }
 
-    // Past the 15-minute bound, or with only a Retry-After hint: migrate.
-    for reset in [ResetTime::At(NOW + 15 * MINUTE + 1), ResetTime::Missing] {
+    let decision = decide(&request(), &pool(ResetTime::At(NOW + 15 * MINUTE + 1)), NOW);
+    assert_eq!(admitted(&decision), "acct-b");
+    assert_eq!(
+        invalidated(&decision),
+        InvalidationReason::HoldExceedsWait { retry_after_s: 907 }
+    );
+
+    // A wait cap cannot supply a missing or unparseable reset.
+    for reset in [ResetTime::Missing, ResetTime::Unparsable] {
         let decision = decide(&request(), &pool(reset), NOW);
         assert_eq!(admitted(&decision), "acct-b");
         assert_eq!(
@@ -456,6 +463,88 @@ fn confirmed_short_hold_returns_account_hold_within_the_callers_wait() {
                 pool: Some(PoolKey::general(GeneralWindow::FiveHour))
             }
         );
+    }
+}
+
+#[test]
+fn blocked_affinity_uses_runner_wait_cap_and_provider_ceiling() {
+    use prefrontal_routing_core::accounts::{
+        decide_with_context, AccountStrategy, AllocationContext,
+    };
+
+    for proactive in [false, true] {
+        let mut quota = reading(10.0, 10.0);
+        if proactive {
+            quota.five_hour.as_mut().unwrap().used_percent = 100.0;
+            quota.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 40 * MINUTE);
+        }
+        let mut st = state(vec![
+            account("acct-a", Some(quota)),
+            account("acct-b", Some(reading(10.0, 10.0))),
+        ]);
+        st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
+        if !proactive {
+            st.fences
+                .push(five_hour_fence("acct-a", ResetTime::At(NOW + 40 * MINUTE)));
+        }
+        assert_eq!(st.policy.max_hold_s, 3600);
+        let mut req = request();
+        for (cap, holds) in [(3000, true), (900, false), (0, false)] {
+            req.hold_wait_max_s = cap;
+            let decision = decide(&req, &st, NOW);
+            if holds {
+                let hold = decision.hold().expect("40-minute reset fits runner cap");
+                assert_eq!(hold.reset_at_ms, NOW + 40 * MINUTE);
+                assert_eq!(hold.retry_after_s, 2406);
+            } else {
+                assert_eq!(admitted(&decision), "acct-b");
+                assert_eq!(
+                    invalidated(&decision),
+                    InvalidationReason::HoldExceedsWait {
+                        retry_after_s: 2406
+                    }
+                );
+            }
+        }
+        req.hold_wait_max_s = 10_000;
+        st.policy.max_hold_s = 2405;
+        assert_eq!(admitted(&decide(&req, &st, NOW)), "acct-b");
+        st.policy.max_hold_s = 2406;
+        assert_eq!(decide(&req, &st, NOW).hold().unwrap().retry_after_s, 2406);
+
+        let context = AllocationContext {
+            hold_ok: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            admitted(&decide_with_context(&req, &st, NOW, &context)),
+            "acct-b"
+        );
+        st.policy.strategy = AccountStrategy::Ordered;
+        assert_eq!(admitted(&decide(&req, &st, NOW)), "acct-b");
+    }
+}
+
+#[test]
+fn unknown_blocking_reset_outranks_known_resets_whatever_the_wait_cap() {
+    for reset in [ResetTime::Missing, ResetTime::Unparsable] {
+        for cap in [0, 900, 3000, u64::MAX] {
+            let mut st = state(vec![
+                account("acct-a", Some(reading(10.0, 10.0))),
+                account("acct-b", Some(reading(10.0, 10.0))),
+            ]);
+            st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
+            st.fences
+                .push(five_hour_fence("acct-a", ResetTime::At(NOW + 10 * MINUTE)));
+            st.fences.push(fence(
+                "acct-a",
+                FenceScope::General(GeneralWindow::SevenDay),
+                reset,
+            ));
+            let mut req = request();
+            req.hold_wait_max_s = cap;
+            assert_eq!(admitted(&decide(&req, &st, NOW)), "acct-b");
+        }
     }
 }
 
@@ -470,8 +559,6 @@ fn soft_proactive_hold_bounds_and_reevaluation() {
             account("acct-b", Some(reading(10.0, 10.0))),
         ]);
         st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
-        // This reset-boundary fixture also permits the jittered 906-second wait.
-        st.policy.max_hold_s = 906;
         st
     };
     let full_100 = |reset| {
@@ -491,8 +578,15 @@ fn soft_proactive_hold_bounds_and_reevaluation() {
     let hold = hold.hold().expect("+15 min holds");
     assert_eq!((hold.base_retry_after_s, hold.retry_after_s), (900, 906));
 
+    patient.hold_wait_max_s = 907;
+    let hold = decide(
+        &patient,
+        &pool(full_100(ResetTime::At(NOW + 15 * MINUTE + 1))),
+        NOW,
+    );
+    assert_eq!(hold.hold().expect("caller permits wait").retry_after_s, 907);
+
     for reset in [
-        ResetTime::At(NOW + 15 * MINUTE + 1),
         ResetTime::At(NOW),
         ResetTime::At(NOW - MINUTE),
         ResetTime::Unparsable,
@@ -540,9 +634,9 @@ fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
     fable_full.scoped = ScopedList::Listed(vec![fable_window(100.0)]);
     let mut seven_full = reading(100.0, 100.0);
     seven_full.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 14 * MINUTE);
-    for (model, quota, window) in [
-        ("claude-fable-5", fable_full, ApplicableWindow::FamilyScope),
-        ("claude-sonnet-5", seven_full, ApplicableWindow::SevenDay),
+    for (model, quota, retry_after_s) in [
+        ("claude-fable-5", fable_full, 345_606),
+        ("claude-sonnet-5", seven_full, 259_206),
     ] {
         let mut healthy = reading(10.0, 10.0);
         healthy.scoped = ScopedList::Listed(vec![fable_window(10.0)]);
@@ -555,7 +649,7 @@ fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
         let decision = decide(&with_model(request(), model), &st, NOW);
         assert_eq!(
             invalidated(&decision),
-            InvalidationReason::FreshFullReading { window }
+            InvalidationReason::HoldExceedsWait { retry_after_s }
         );
         assert_eq!(admitted(&decision), "acct-b");
         // Plus a confirmed 5h fence 14 minutes from reset.
@@ -564,7 +658,7 @@ fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
         let decision = decide(&with_model(request(), model), &st, NOW);
         assert_eq!(
             invalidated(&decision),
-            InvalidationReason::FreshFullReading { window }
+            InvalidationReason::HoldExceedsWait { retry_after_s }
         );
         assert_eq!(admitted(&decision), "acct-b");
     }
@@ -630,8 +724,8 @@ fn the_latest_blocking_reset_decides_between_a_block_and_a_fresh_reading() {
     assert_eq!(admitted(&decision), "acct-b");
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::ConfirmedExhaustion {
-            pool: Some(PoolKey::general(GeneralWindow::FiveHour))
+        InvalidationReason::HoldExceedsWait {
+            retry_after_s: 7206
         }
     );
     // Block resets in 14 min, reading says 2 h: the reading's window still
@@ -644,8 +738,8 @@ fn the_latest_blocking_reset_decides_between_a_block_and_a_fresh_reading() {
     assert_eq!(admitted(&decision), "acct-b");
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::FreshFullReading {
-            window: ApplicableWindow::FiveHour
+        InvalidationReason::HoldExceedsWait {
+            retry_after_s: 7206
         }
     );
     // Both 14 min away: a hold, on the confirmed block.
@@ -696,8 +790,8 @@ fn any_blocking_window_holds_within_the_bound_and_moves_beyond_it() {
     let decision = decide(&request(), &st, NOW);
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::ConfirmedExhaustion {
-            pool: Some(PoolKey::general(GeneralWindow::SevenDay))
+        InvalidationReason::HoldExceedsWait {
+            retry_after_s: 3606
         }
     );
 
@@ -712,8 +806,8 @@ fn any_blocking_window_holds_within_the_bound_and_moves_beyond_it() {
     let decision = decide(&with_model(request(), "claude-fable-5-1"), &st, NOW);
     assert_eq!(
         invalidated(&decision),
-        InvalidationReason::ConfirmedExhaustion {
-            pool: fable_fence.pool.clone()
+        InvalidationReason::HoldExceedsWait {
+            retry_after_s: 3606
         }
     );
     let mut st = pool("claude-opus-5-5");

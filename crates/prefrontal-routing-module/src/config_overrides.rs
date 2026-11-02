@@ -1060,12 +1060,6 @@ fn allocator_policy_from(
         if let Some(duration) = &source.max_hold {
             policy.max_hold_s = duration.seconds()?;
         }
-        if let Some(duration) = &source.hold_when_reset_within {
-            policy.short_hold_max_ms = i64::try_from(duration.seconds()?)
-                .ok()
-                .and_then(|seconds| seconds.checked_mul(1000))
-                .ok_or("hold_when_reset_within too large")?;
-        }
         if let Some(duration) = &source.unknown_reset_retry {
             policy.unknown_reset_retry_ms = i64::try_from(duration.seconds()?)
                 .ok()
@@ -1156,7 +1150,7 @@ mod account_policy_config_tests {
     #[test]
     fn provider_account_policy_overrides_defaults_without_weakening_the_schema() {
         let config=parse_config(r#"{
-            "accounts":{"max_hold":"90s","hold_when_reset_within":"15m"},
+            "accounts":{"max_hold":"90s"},
             "providers":{"synthetic":{"accounts":{"strategy":"hybrid","max_hold":"30s",
                 "soft_quota_remaining_percent":10,"floors":[{"pool":"pool-a","window_minutes":300,"remaining_percent":5}],
                 "spend_budget":20,"spend_budget_reset_at_ms":1800000600000,"paid_credits":true,"unknown_reset_retry":"2h"}}}
@@ -1171,7 +1165,6 @@ mod account_policy_config_tests {
             prefrontal_routing_core::accounts::AccountStrategy::Hybrid
         );
         assert_eq!(policy.max_hold_s, 30);
-        assert_eq!(policy.short_hold_max_ms, 900_000);
         assert_eq!(policy.unknown_reset_retry_ms, 7_200_000);
         assert_eq!(policy.pool_floors[0].key.name.as_deref(), Some("pool-a"));
         assert_eq!(policy.spend_budget, Some(20.0));
@@ -1180,6 +1173,7 @@ mod account_policy_config_tests {
             r#"{"providers":{"p":{"accounts":{"strategy":"random"}}}}"#,
             r#"{"providers":{"p":{"accounts":{"max_hold":"tomorrow"}}}}"#,
             r#"{"providers":{"p":{"accounts":{"unknown_policy":true}}}}"#,
+            r#"{"accounts":{"hold_when_reset_within":"15m"}}"#,
         ] {
             assert!(parse_config(invalid).is_err(), "{invalid}");
         }

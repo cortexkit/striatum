@@ -435,7 +435,6 @@ pub struct ProviderAccountsPolicy {
     pub soft_quota_remaining_percent: Option<f64>,
     pub floors: Option<Vec<AccountPoolFloor>>,
     pub max_hold: Option<AccountDuration>,
-    pub hold_when_reset_within: Option<AccountDuration>,
     pub unknown_reset_retry: Option<AccountDuration>,
     pub spend_budget: Option<f64>,
     pub spend_budget_reset_at_ms: Option<i64>,

@@ -859,7 +859,8 @@ async fn select_at_tier(
         .max_hold_s;
     let hold_cap = request
         .hold_wait_max_s
-        .map_or(max_hold_s, |cap| cap.min(max_hold_s));
+        .unwrap_or(account_selection::DEFAULT_HOLD_WAIT_S)
+        .min(max_hold_s);
     let mut input: Value =
         serde_json::from_str(&decision.requirements_json).map_err(store_refusal)?;
     input["hold_wait_max_s"] = json!(hold_cap);

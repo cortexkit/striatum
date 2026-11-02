@@ -14,9 +14,8 @@ use prefrontal_routing_core::accounts::evidence::{
     ResetSource, WindowEvidence,
 };
 use prefrontal_routing_core::accounts::{
-    decide, eligibility::scope_check, AllocatorPolicy, ConfirmationSource, FenceScope,
-    GeneralWindow, HoldBasis, ModelFamily, ObservationSource, PoolKey, PoolScope, ResetTime,
-    ScopedList, ScopedWindow,
+    decide, eligibility::scope_check, ConfirmationSource, FenceScope, GeneralWindow, HoldBasis,
+    ModelFamily, ObservationSource, PoolKey, PoolScope, ResetTime, ScopedList, ScopedWindow,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -201,19 +200,20 @@ fn scope_vectors_family_scope_and_absent_scope_predicate() {
     assert_ne!(missing.list_state, empty.list_state);
 }
 
-/// The reference's reset vectors against the hold rule's reset check. The
-/// reference applied them to the 5h window only; routing applies the same
-/// bounds to whichever window blocks continuation, so a vector the reference
-/// migrates is one the hold rule moves.
+/// The ANTAUTH fixture's 15-minute reset boundary is now a caller wait cap, not a
+/// reset-validity rule. The reset vectors give base waits, before jitter.
 #[test]
-fn reset_vectors_hold_exact_bounds() {
-    let policy = AllocatorPolicy::default();
+fn reset_vectors_known_future_and_legacy_base_wait_cap() {
     let value = vectors();
     let rows = value["resets"].as_array().unwrap();
     assert_eq!(rows.len(), 7);
     for row in rows {
         let id = row["id"].as_str().unwrap();
-        let held = hold_until(reset_from(&row["resetsAt"]), NOW, policy.short_hold_max_ms);
+        let reset = hold_until(reset_from(&row["resetsAt"]), NOW);
+        if id == "future15min+1ms" {
+            assert_eq!(reset, Some((NOW + 900_001, 901)));
+        }
+        let held = reset.filter(|(_, base_retry_after_s)| *base_retry_after_s <= 900);
         let expected = &row["decision"];
         match expected["action"].as_str().unwrap() {
             "hold" => {

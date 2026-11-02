@@ -324,7 +324,7 @@ async fn provider_strategy_and_pool_floors_are_readable_without_allocating() {
         config["providers"]["synthetic"]["accounts"] = json!({
             "strategy":"ordered","ordered":"fallback-first","order":["oauth-account","apikey-account"],
             "floors":[{"pool":"named-pool","window_minutes":300,"remaining_percent":8.0}],
-            "max_hold":"45s","hold_when_reset_within":"7m"
+            "max_hold":"45s"
         });
         config["providers"]["other"]["accounts"] = json!({"strategy":"round_robin"});
     });
@@ -334,7 +334,8 @@ async fn provider_strategy_and_pool_floors_are_readable_without_allocating() {
     assert_eq!(policies["synthetic"]["strategy"], "ordered");
     assert_eq!(policies["synthetic"]["fallback_first"], true);
     assert_eq!(policies["synthetic"]["max_hold_s"], 45);
-    assert_eq!(policies["synthetic"]["short_hold_max_ms"], 420_000);
+    assert!(policies["synthetic"].get("short_hold_max_ms").is_none());
+    assert_eq!(policies["other"]["max_hold_s"], 3600);
     assert_eq!(
         policies["synthetic"]["pool_floors"][0]["remaining_percent"],
         8.0

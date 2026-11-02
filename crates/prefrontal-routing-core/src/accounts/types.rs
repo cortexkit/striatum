@@ -496,9 +496,6 @@ pub struct AllocatorPolicy {
     pub account_request_principals: Vec<String>,
     /// Tie-break order, before account UUID byte order.
     pub account_order: Vec<String>,
-    /// Longest distance to the blocking window's reset that still holds,
-    /// whatever kind of window blocks.
-    pub short_hold_max_ms: i64,
     /// When a block has no known reset and no Retry-After hint, the next
     /// admission may try the account this long after confirmation.
     #[serde(default = "default_unknown_reset_retry_ms")]
@@ -535,7 +532,7 @@ fn default_unknown_reset_retry_ms() -> i64 {
 }
 
 fn default_max_hold_s() -> u64 {
-    900
+    3600
 }
 
 fn default_paid_credits() -> bool {
@@ -564,7 +561,6 @@ impl Default for AllocatorPolicy {
             requested_account_factor: 2.0,
             account_request_principals: Vec::new(),
             account_order: Vec::new(),
-            short_hold_max_ms: 15 * 60_000,
             unknown_reset_retry_ms: default_unknown_reset_retry_ms(),
             full_band_ms: 5 * 60_000,
             excluded_band_ms: 20 * 60_000,

@@ -379,20 +379,13 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
     }
 }
 
-/// The hold rule's reset check for the window that blocks continuation: it
-/// holds only when that window's reset is a known time strictly later than
-/// `now` and at most `hold_when_reset_within_ms` away, with no clock-skew
-/// tolerance. Returns the reset and the base Retry-After; `None` moves. A
-/// Retry-After hint is never a reset, so it never reaches this check.
-pub fn hold_until(
-    reset: ResetTime,
-    now: EpochMs,
-    hold_when_reset_within_ms: i64,
-) -> Option<(EpochMs, u64)> {
+/// Returns a known reset strictly later than `now` and its base Retry-After.
+/// The allocator compares the jittered Retry-After with the caller's wait cap
+/// and the provider's safety ceiling. A Retry-After hint is never a reset, so
+/// it never reaches this check.
+pub fn hold_until(reset: ResetTime, now: EpochMs) -> Option<(EpochMs, u64)> {
     match reset.at_ms() {
-        Some(at) if at > now && at - now <= hold_when_reset_within_ms => {
-            Some((at, base_retry_after_s(at - now)))
-        }
+        Some(at) if at > now => Some((at, base_retry_after_s(at - now))),
         _ => None,
     }
 }

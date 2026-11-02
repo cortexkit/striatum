@@ -370,13 +370,17 @@ fn assert_credential(reply: &(FrameType, Value), credential: &str) {
 }
 
 fn exhaust_oauth(harness: &Harness, provider: &str) {
+    exhaust_oauth_until(harness, provider, NOW as i64 + 600_000);
+}
+
+fn exhaust_oauth_until(harness: &Harness, provider: &str, reset_at_ms: i64) {
     let scope = FenceScope::General(GeneralWindow::FiveHour);
     let fence = Fence {
         account_id: "oauth-account".into(),
         pool: Some(scope.into()),
         recovery_set: Vec::new(),
         observed_at_ms: NOW as i64,
-        reset: ResetTime::At(NOW as i64 + 600_000),
+        reset: ResetTime::At(reset_at_ms),
         retry_hint_ms: None,
         source: ConfirmationSource::BrocaAccountLimit,
     };
@@ -384,7 +388,7 @@ fn exhaust_oauth(harness: &Harness, provider: &str) {
         .store()
         .account_transaction(|tx| {
             tx.insert_fence(&AccountFenceRow {
-                fence_id: "class-fence".into(),
+                fence_id: format!("class-fence-{reset_at_ms}"),
                 provider: provider.into(),
                 account_id: fence.account_id.clone(),
                 scope_json: serde_json::to_string(&scope).unwrap(),
@@ -1060,7 +1064,7 @@ async fn provider_strategies_never_escape_the_subscription_class() {
         oauth_reading(10.0);
         harness.edit_config(|config| config["providers"]["synthetic"]["accounts"] = json!({
             "strategy":strategy,"ordered":"fallback-first","order":["oauth-account","apikey-account"],
-            "max_hold":"30s","hold_when_reset_within":"15m","unknown_reset_retry":"2h"
+            "max_hold":"30s","unknown_reset_retry":"2h"
         }));
         let runner = harness.bind(reserved(RUNNER), None).await;
         for index in 0..10 {
@@ -1490,6 +1494,101 @@ async fn select_past_held_ladder_entry() -> (u64, u64) {
         crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get()) - loads,
         harness.store().account_write_transaction_count_for_test() - writes,
     )
+}
+
+#[tokio::test]
+async fn runner_hold_caps_default_to_900_and_survive_selection_and_admission() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    harness.edit_config(|config| {
+        config["consumers"]["mason"] = json!({
+            "owner":OWNER,"mode":"ladder","ladder":["synthetic/model"]
+        })
+    });
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let request = json!({"consumer":"mason","requirements":{"iq":30}});
+    let default_selected = caller.call("route.select", &request).await;
+    assert_eq!(
+        default_selected.0,
+        FrameType::Response,
+        "{}",
+        default_selected.1
+    );
+    let default_id = default_selected.1["result"]["decision_id"]
+        .as_str()
+        .unwrap();
+    let stored = harness
+        .store()
+        .get_decision_by_id(default_id)
+        .unwrap()
+        .unwrap();
+    let input: Value = serde_json::from_str(&stored.requirements_json).unwrap();
+    assert_eq!(input["hold_wait_max_s"], 900);
+
+    exhaust_oauth(&harness, "synthetic");
+    let ten_minutes = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "default-ten-minutes"),
+        )
+        .await;
+    assert_eq!(ten_minutes.1["code"], "account_hold", "{}", ten_minutes.1);
+
+    exhaust_oauth_until(&harness, "synthetic", NOW as i64 + 2_400_000);
+    let mut patient = request.clone();
+    patient["hold_wait_max_s"] = json!(3000);
+    let selected = caller.call("route.select", &patient).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let selected_id = selected.1["result"]["decision_id"].clone();
+    for cap in [None, Some(900), Some(0)] {
+        let mut limited = request.clone();
+        if let Some(cap) = cap {
+            limited["hold_wait_max_s"] = json!(cap);
+        }
+        let reply = caller.call("route.select", &limited).await;
+        assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    }
+    for linked in [false, true] {
+        for (index, cap) in [None, Some(900), Some(0), Some(3000)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut admission = account_request("synthetic", &format!("wait-{linked}-{index}"));
+            if linked {
+                admission["decision_id"] = selected_id.clone();
+            }
+            if let Some(cap) = cap {
+                admission["hold_wait_max_s"] = json!(cap);
+            }
+            let reply = runner.call("route.account_for", &admission).await;
+            if cap == Some(3000) {
+                assert_eq!(reply.1["code"], "account_hold", "{}", reply.1);
+            } else {
+                assert_eq!(reply.1["code"], "account_pool_exhausted", "{}", reply.1);
+            }
+        }
+    }
+    let mut admission = account_request("synthetic", "default-selection-cap");
+    admission["decision_id"] = json!(default_id);
+    admission["hold_wait_max_s"] = json!(3000);
+    let reply = runner.call("route.account_for", &admission).await;
+    assert_eq!(reply.1["code"], "account_pool_exhausted", "{}", reply.1);
+
+    patient["hold_wait_max_s"] = json!(10_000);
+    let selected = caller.call("route.select", &patient).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let id = selected.1["result"]["decision_id"].as_str().unwrap();
+    let stored = harness.store().get_decision_by_id(id).unwrap().unwrap();
+    let input: Value = serde_json::from_str(&stored.requirements_json).unwrap();
+    assert_eq!(input["hold_wait_max_s"], 3600);
+    harness.edit_config(|config| {
+        config["providers"]["synthetic"]["accounts"]["max_hold"] = json!(1800)
+    });
+    admission["admission_id"] = json!("current-provider-ceiling");
+    admission["decision_id"] = json!(id);
+    let reply = runner.call("route.account_for", &admission).await;
+    assert_eq!(reply.1["code"], "account_pool_exhausted", "{}", reply.1);
 }
 
 #[tokio::test]

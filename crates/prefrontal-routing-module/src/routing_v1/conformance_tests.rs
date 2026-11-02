@@ -931,8 +931,6 @@ impl RoutingSubject for KitSubject {
     ) -> Result<(), String> {
         self.harness().edit_config(|config| {
             config["providers"][provider]["accounts"]["max_hold"] = json!(limits.max_hold_s);
-            config["providers"][provider]["accounts"]["hold_when_reset_within"] =
-                json!(limits.hold_when_reset_within_s);
         });
         Ok(())
     }

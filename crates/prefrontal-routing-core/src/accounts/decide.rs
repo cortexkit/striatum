@@ -732,8 +732,7 @@ impl<'a> Allocator<'a> {
             {
                 return Leave(blocker.leave.clone());
             }
-            let Some((reset_at_ms, base_retry_after_s)) =
-                hold_until(blocker.reset, self.now, self.policy.short_hold_max_ms)
+            let Some((reset_at_ms, base_retry_after_s)) = hold_until(blocker.reset, self.now)
             else {
                 return Leave(blocker.leave.clone());
             };

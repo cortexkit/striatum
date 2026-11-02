@@ -162,7 +162,9 @@ pub(super) fn account_for(
         request.conversation_key = scope.reference.clone();
     }
     let principal = authority.recorded_principal();
-    let mut hold_wait_max_s = request.hold_wait_max_s;
+    let mut hold_wait_max_s = request
+        .hold_wait_max_s
+        .unwrap_or(account_selection::DEFAULT_HOLD_WAIT_S);
     // The whole body with defaults applied: two bodies that differ only in a
     // member left out versus sent with its default are the same admission.
     let body_json = serde_json::to_string(&request.normalized()).map_err(internal_unavailable)?;
@@ -195,7 +197,7 @@ pub(super) fn account_for(
             let input: Value =
                 serde_json::from_str(&input.requirements_json).map_err(store_unavailable)?;
             if let Some(cap) = input["hold_wait_max_s"].as_u64() {
-                hold_wait_max_s = Some(hold_wait_max_s.map_or(cap, |request| request.min(cap)));
+                hold_wait_max_s = hold_wait_max_s.min(cap);
             }
         }
     }
