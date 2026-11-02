@@ -1457,7 +1457,7 @@ fn apply_catalog_snapshot(
         );
         if !shadowed.is_empty() {
             eprintln!(
-                "[prefrontal-routing] [TODO(user): models quality overrides shadow Fusiform operator grades: {shadowed:?}]"
+                "[prefrontal-routing] these models entries set elo or eq over the grade Fusiform serves, and the settings win: {shadowed:?}"
             );
         }
         report_dormant_config_models(store, path, snapshot.cursor.catalog_version, credentials)?;
@@ -1483,7 +1483,7 @@ fn report_dormant_config_models(
         .model_config_presence(store, credentials)
         .map_err(|reason| {
             error(format!(
-                "[TODO(user): read catalog for dormant model keys: {reason}]"
+                "read the catalog to check models entries: {reason}"
             ))
         })?;
     config.report_dormant_models(path, version, presence);

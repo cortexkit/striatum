@@ -111,7 +111,7 @@ impl LiveConfig {
                 .iter()
                 .filter(|key| presence.manual_upsert_keys.contains(*key))
                 .collect::<Vec<_>>();
-            eprintln!("[prefrontal-routing] [TODO(user): models config keys not served by Fusiform in {} for catalog version {version}: {keys:?}; routes kept by manual upserts, with config overlays still active: {manual:?}]", path.display());
+            eprintln!("[prefrontal-routing] {} has models entries the catalog doesn't serve (catalog version {version}), so they do nothing: {keys:?}; of these, routes kept by a manual upsert, where the settings still apply: {manual:?}", path.display());
         }
     }
 }

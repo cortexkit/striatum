@@ -207,13 +207,13 @@ pub(crate) fn report(evidence: &Evidence, now_ms: i64, window_ms: i64) -> Value 
         first_seen_ms: now_ms,
         last_seen_ms: now_ms,
         summary: clip(&if evidence.manual_upsert_model_keys.contains(key) {
-            format!("[TODO(user): models.{key} is not served by Fusiform; the route exists as a manual upsert and config overlays still apply]")
+            format!("models.{key} names a model Fusiform doesn't serve; its route exists only as a manual upsert, so the settings still apply to it")
         } else {
-            format!("[TODO(user): models.{key} is dormant because the catalog does not serve it]")
+            format!("models.{key} names a model the catalog doesn't serve, so the setting does nothing")
         }, MAX_SUMMARY_CHARS),
         samples: vec![json!({"config_key": format!("models.{key}"), "catalog_version": evidence.catalog_version,
             "manual_upsert": evidence.manual_upsert_model_keys.contains(key)})],
-        hint: "[TODO(user): check the model key or wait for the catalog to finish warming]".into(),
+        hint: "Fix the model id or delete the entry from the routing settings file. Right after routing starts, the catalog may still be loading; if so, the finding clears on its own.".into(),
     }));
     findings.extend(
         evidence
@@ -1280,7 +1280,7 @@ mod tests {
         assert!(manual[1]["summary"]
             .as_str()
             .unwrap()
-            .contains("overlays still apply"));
+            .contains("the settings still apply to it"));
         let facts = ["stale", "policy-only"].map(|model| {
             serde_json::from_value(json!({
                 "providerID": "p", "modelID": model,

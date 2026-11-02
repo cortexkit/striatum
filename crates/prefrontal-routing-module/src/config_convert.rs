@@ -314,18 +314,18 @@ fn move_elo_overrides(root: &mut Map<String, Value>) -> Result<(), String> {
     };
     for (key, elo) in overrides
         .as_object()
-        .ok_or("[TODO(user): elo_overrides must be an object]")?
+        .ok_or("elo_overrides must be an object mapping model ids to Elo scores")?
     {
         let models = root
             .entry("models")
             .or_insert_with(|| json!({}))
             .as_object_mut()
-            .ok_or("[TODO(user): models must be an object]")?;
+            .ok_or("models must be an object keyed by model id")?;
         let model = models
             .entry(key.clone())
             .or_insert_with(|| json!({}))
             .as_object_mut()
-            .ok_or("[TODO(user): models entries must be objects]")?;
+            .ok_or("each models entry must be an object")?;
         model.insert("elo".into(), elo.clone());
     }
     Ok(())

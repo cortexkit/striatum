@@ -305,7 +305,7 @@ fn parse_config_with_reporter(
     }
     if value.get("elo_overrides").is_some() {
         return Err(
-            "config_key_removed: elo_overrides; [TODO(user): move each entry to models.<id>.elo]"
+            "config_key_removed: elo_overrides; move each entry to models.<id>.elo, or run `ck-prefrontal-routing config-convert`"
                 .into(),
         );
     }
