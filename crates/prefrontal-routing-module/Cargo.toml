@@ -46,6 +46,10 @@ cortexkit-bus-inmemory = { workspace = true }
 cortexkit-role-routing-conformance = { workspace = true }
 prefrontal-routing-store = { path = "../prefrontal-routing-store", features = ["test-support"] }
 cortexkit-test-support = "=0.1.12"
+# Daemon builds still need scoped Git trust for remote source snapshots and a
+# shared sibling cache outside per-test HOME; cortexkit-test-support 0.1.12
+# provides neither capability.
+prefrontal-test-support = { path = "../prefrontal-test-support" }
 rusqlite = { workspace = true, features = ["bundled"] }
 # The real-daemon e2e tests spawn the daemon and module binaries; nothing else in
 # this package's graph turns on tokio's process feature any more.

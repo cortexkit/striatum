@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use cortexkit_test_support::TestDaemon as Child;
+use prefrontal_test_support::TestDaemon as Child;
 
 use common::{
     catalog_list, connect_consumer, route_open, route_quota_status, route_select, unique_temp_dir,
@@ -80,12 +80,12 @@ fn sibling(rel: &str) -> PathBuf {
 }
 
 fn build_bin(repo: &Path, bin: &str) -> PathBuf {
-    cortexkit_test_support::build_sibling_binary(repo, "insula", bin, &["commons", "subconscious"])
+    prefrontal_test_support::build_sibling_binary(repo, "insula", bin)
 }
 
 /// Stand up a real subc-core daemon supervising BOTH modules from one subc.jsonc.
 async fn start_both_modules_daemon() -> RealDaemon {
-    let subc_core = cortexkit_test_support::SubcDaemonBinary::build(&["commons"]);
+    let subc_core = prefrontal_test_support::SubcDaemonBinary::build();
     let quota_module = build_bin(&sibling(QUOTA_REPO_REL), "ck-insula");
     let routing_module = cortexkit_test_support::stage_test_binary(Path::new(env!(
         "CARGO_BIN_EXE_ck-prefrontal-routing"
@@ -121,7 +121,6 @@ async fn start_both_modules_daemon() -> RealDaemon {
 
     let child = subc_core
         .command(&rig)
-        .fenced_root("PREFRONTAL_WORKTREE_ROOT", "worktree")
         .env("SUBC_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
