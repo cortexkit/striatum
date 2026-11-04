@@ -2932,6 +2932,17 @@ async fn handle_set_decision_outcome(
             .decision_provider_identity(&params.decision_id)
             .map_err(|e| ModuleError::Message(e.to_string()))?;
     }
+    let outcome = if outcome != RouteOutcome::Completed
+        && provider_outcome.as_ref().is_some_and(|provider| {
+            prefrontal_routing_core::account_wall::transient_provider_error(
+                provider.error_class.as_deref(),
+                provider.provider_code.as_deref(),
+            )
+        }) {
+        RouteOutcome::Interrupted
+    } else {
+        outcome
+    };
     let observed_at_ms = now_ms() as i64;
     if let Err(error) = record_provider_reset_fence(
         store,
@@ -5035,6 +5046,7 @@ mod tests {
                         credential_id: Some("catalog-credential-google-apikey".into()),
                         resets_at_ms: Some(i64::MAX),
                         credential_refusal: None,
+                        ..Default::default()
                     }),
                 },
             )
@@ -5086,6 +5098,7 @@ mod tests {
                     credential_id: Some("antigravity:google".into()),
                     resets_at_ms: None,
                     credential_refusal: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -5097,6 +5110,7 @@ mod tests {
                     credential_id: Some("antigravity:google".into()),
                     resets_at_ms: None,
                     credential_refusal: None,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -5171,6 +5185,7 @@ mod tests {
             credential_id: Some("apikey:opencode-go".into()),
             resets_at_ms: Some(1_795_357_028_612),
             credential_refusal: None,
+            ..Default::default()
         };
         store
             .set_decision_provider_identity(&decision, &identity)
@@ -8816,6 +8831,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_provider_report_classifies_without_reading_diagnostic_text() {
+        let rig = Rig::new("typed-provider-error-report");
+        let store = Arc::new(rig.open_store());
+        for (class, outcome, expected) in [
+            ("transient", "session_error", "interrupted"),
+            ("permanent", "session_error", "session_error"),
+            ("transient", "completed", "completed"),
+        ] {
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_route_key: Some("test/model".into()),
+                    selected_provider_id: Some("test".into()),
+                    selected_model_id: Some("model".into()),
+                    target_agent: "mason".into(),
+                    requirements_json: "{}".into(),
+                    score_json: "{}".into(),
+                    rejected_json: "[]".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let response = run_route_wire_request(&store, json!({
+                "method": ROUTE_SET_DECISION_OUTCOME_OP,
+                "params": {"decisionID": decision, "outcome": outcome,
+                    "lastError":"opaque diagnostic identical for both reports",
+                    "providerOutcome":{"accountRef":"account","errorClass":class,"providerCode":"server_is_overloaded"}}
+            })).await;
+            assert_eq!(response.header.ty, FrameType::Response);
+            assert_eq!(
+                store
+                    .get_decision_by_id(&decision)
+                    .unwrap()
+                    .unwrap()
+                    .outcome
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn clear_cooldown_accepts_stored_and_work_variant_keys_and_clears_base_variants() {
         const BASE: &str = "alibaba-token-plan/qwen3.8-max-preview";
         let rig = Rig::new("clear-variant-cooldown");
@@ -10627,6 +10682,7 @@ mod tests {
             credential_id: Some("oauth:p:frozen-account".into()),
             resets_at_ms: None,
             credential_refusal: None,
+            ..Default::default()
         };
         store
             .set_decision_provider_identity("dec-explain-send", &identity)
@@ -11500,6 +11556,7 @@ mod tests {
                             credential_id: Some("chatgpt:openai:live".into()),
                             resets_at_ms: Some(i64::MAX),
                             credential_refusal: None,
+                            ..Default::default()
                         },
                     ),
                 },

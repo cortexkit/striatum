@@ -4095,7 +4095,13 @@ impl RouteStateStore for SqliteRouteStateStore {
         // route's other credentials.
         let mut normalized = update.clone();
         let last_error = update.last_error.as_deref().unwrap_or("");
-        if prefrontal_routing_core::account_wall::transient_error(last_error)
+        if (update.outcome != prefrontal_routing_core::RouteOutcome::Completed
+            && update.provider_outcome.as_ref().is_some_and(|provider| {
+                prefrontal_routing_core::account_wall::transient_provider_error(
+                    provider.error_class.as_deref(),
+                    provider.provider_code.as_deref(),
+                )
+            }))
             || prefrontal_routing_core::account_wall::account_scoped_error(last_error)
             || prefrontal_routing_core::account_wall::credential_refusal_in(last_error).is_some()
             || update
