@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn unscored_admissible_first_seen_survives_passes_and_restarts_after_grading() {
-        let dir = prefrontal_test_support::scratch_root()
+        let dir = cortexkit_test_support::scratch_root()
             .join(format!("operator-quality-store-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("route.db");

@@ -81,7 +81,7 @@ impl World {
     async fn build_with(baseline: &Value, label: &str, config: &str) -> Self {
         let now = clock_ms(baseline);
         let n = NEXT_WORLD.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-baseline-{label}-{}-{n}",
             std::process::id()
         ));

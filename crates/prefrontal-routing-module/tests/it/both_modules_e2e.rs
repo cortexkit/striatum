@@ -87,9 +87,10 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
 async fn start_both_modules_daemon() -> RealDaemon {
     let subc_core = prefrontal_test_support::SubcDaemonBinary::build();
     let quota_module = build_bin(&sibling(QUOTA_REPO_REL), "ck-insula");
-    let routing_module = prefrontal_test_support::stage_test_binary(Path::new(env!(
+    let routing_module = cortexkit_test_support::stage_test_binary(Path::new(env!(
         "CARGO_BIN_EXE_ck-prefrontal-routing"
     )));
+    cortexkit_test_support::warm_exec_fenced(&routing_module);
     assert!(routing_module.exists());
 
     let rig = unique_temp_dir("both-modules-real-daemon");

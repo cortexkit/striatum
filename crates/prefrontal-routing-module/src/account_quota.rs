@@ -1775,8 +1775,7 @@ pub async fn account_quota_loop(
     routing_config_path: PathBuf,
 ) {
     use prefrontal_routing_core::RouteStateStore as _;
-    let project_root =
-        prefrontal_core_store::scratch_root().join("prefrontal-routing-account-quota");
+    let project_root = std::env::temp_dir().join("prefrontal-routing-account-quota");
     let _ = std::fs::create_dir_all(&project_root);
     loop {
         let listing = resolver.list_scoped().await;
@@ -2093,7 +2092,7 @@ mod tests {
 
     #[test]
     fn retained_windows_and_stale_disclosure_survive_store_restart() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-last-good-{}",
             std::process::id()
         ));
@@ -2314,7 +2313,7 @@ mod tests {
 
     #[test]
     fn readings_restore_after_restart_with_their_source_dates_and_survive_a_partial_first_poll() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-account-quota-restore-{}",
             std::process::id()
         ));

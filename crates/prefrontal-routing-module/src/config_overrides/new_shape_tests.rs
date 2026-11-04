@@ -237,7 +237,7 @@ fn conversion_round_trip_keeps_every_policy_and_materializes_data_defaults() {
     assert!(converted.get("score_alias").is_none());
     assert!(converted.get("pins").is_none());
     let in_memory = parse_config(&converted.to_string()).unwrap();
-    let scratch = prefrontal_test_support::ScratchDir::new("converted-round-trip");
+    let scratch = cortexkit_test_support::ScratchDir::new("converted-round-trip");
     let path = scratch.join("routing.jsonc");
     crate::test_config::write(&path, converted.to_string()).unwrap();
     initialize_config(&path).unwrap();

@@ -41,7 +41,7 @@ pub struct TestRoute {
 /// A process-unique path under the test scratch root (no collision across tests).
 pub fn unique_temp_dir(label: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    prefrontal_test_support::scratch_root().join(format!("{label}-{}-{n}", process::id()))
+    cortexkit_test_support::scratch_root().join(format!("{label}-{}-{n}", process::id()))
 }
 
 /// Connect to a daemon from its connection file and complete the client HMAC handshake.

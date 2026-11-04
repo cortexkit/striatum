@@ -102,11 +102,11 @@ impl Drop for RealDaemon {
 
 async fn start_real_daemon() -> RealDaemon {
     let subc_core = prefrontal_test_support::SubcDaemonBinary::build();
-    let module_bin = prefrontal_test_support::stage_test_binary(std::path::Path::new(env!(
+    let module_bin = cortexkit_test_support::stage_test_binary(std::path::Path::new(env!(
         "CARGO_BIN_EXE_ck-prefrontal-routing"
     )));
     // Warm-exec the freshly built module binary too (same assessment stall).
-    prefrontal_test_support::warm_exec_fenced(&module_bin);
+    cortexkit_test_support::warm_exec_fenced(&module_bin);
     assert!(module_bin.exists());
 
     let rig = unique_temp_dir("prefrontal-routing-real-daemon");

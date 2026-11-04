@@ -294,7 +294,7 @@ mod tests {
 
     fn root() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "tier-settings-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)

@@ -83,7 +83,7 @@ async fn scoped(harness: &Arc<Harness>, principal: &str, scope: Value) -> Route 
             json!({
                 "op":"route.bind", "route_channel":channel, "epoch":1,
                 "target":{"kind":"management_surface","module_id":crate::DEFAULT_MODULE_ID},
-                "identity":{"project_root":prefrontal_test_support::scratch_root(),
+                "identity":{"project_root":cortexkit_test_support::scratch_root(),
                             "harness":"diagnostics","session":format!("session-{channel}")},
                 "principal":reserved(principal),
                 "scope":scope,

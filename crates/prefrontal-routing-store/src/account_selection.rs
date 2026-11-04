@@ -38,7 +38,7 @@ mod account_fact_tests {
 
     #[test]
     fn stale_credential_probe_is_claimed_once_with_a_strict_cutoff() {
-        let scratch = prefrontal_test_support::ScratchDir::new("account-credential-probe");
+        let scratch = cortexkit_test_support::ScratchDir::new("account-credential-probe");
         let store = std::sync::Arc::new(
             SqliteRouteStateStore::open(&crate::dev_descriptor(
                 "account-credential-probe",
@@ -127,7 +127,7 @@ mod account_fact_tests {
 
     #[test]
     fn reconciliation_writes_once_and_rechecks_new_facts_with_the_same_listing() {
-        let scratch = prefrontal_test_support::ScratchDir::new("account-eligibility-single-flight");
+        let scratch = cortexkit_test_support::ScratchDir::new("account-eligibility-single-flight");
         let store = std::sync::Arc::new(
             SqliteRouteStateStore::open(&crate::dev_descriptor(
                 "account-eligibility-single-flight",
@@ -197,7 +197,7 @@ mod account_fact_tests {
 
     #[test]
     fn eligibility_survives_restart_and_clears_only_on_listing_change() {
-        let scratch = prefrontal_test_support::ScratchDir::new("account-eligibility-clear");
+        let scratch = cortexkit_test_support::ScratchDir::new("account-eligibility-clear");
         let descriptor = crate::dev_descriptor(
             "account-eligibility-clear",
             scratch.path().join("store.db").to_string_lossy(),
@@ -248,7 +248,7 @@ mod account_fact_tests {
 
     #[test]
     fn size_refusals_expire_or_clear_on_later_success_in_the_same_band() {
-        let scratch = prefrontal_test_support::ScratchDir::new("account-size-clear");
+        let scratch = cortexkit_test_support::ScratchDir::new("account-size-clear");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "account-size-clear",
             scratch.path().join("store.db").to_string_lossy(),
@@ -284,7 +284,7 @@ mod account_fact_tests {
 
     #[test]
     fn route_fences_keep_the_later_reset_and_end_at_it() {
-        let scratch = prefrontal_test_support::ScratchDir::new("account-route-fence");
+        let scratch = cortexkit_test_support::ScratchDir::new("account-route-fence");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "account-route-fence",
             scratch.path().join("store.db").to_string_lossy(),
@@ -316,7 +316,7 @@ mod account_fact_tests {
 
     #[test]
     fn route_fence_keeps_first_receipt_and_latest_evidence_separately() {
-        let scratch = prefrontal_test_support::ScratchDir::new("route-fence-receipts");
+        let scratch = cortexkit_test_support::ScratchDir::new("route-fence-receipts");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "route-fence-receipts",
             scratch.path().join("store.db").to_string_lossy(),
@@ -345,7 +345,7 @@ mod account_fact_tests {
 
     #[test]
     fn route_fence_reads_tolerate_a_preupgrade_store_without_the_table() {
-        let scratch = prefrontal_test_support::ScratchDir::new("route-fence-preupgrade");
+        let scratch = cortexkit_test_support::ScratchDir::new("route-fence-preupgrade");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "route-fence-preupgrade",
             scratch.path().join("store.db").to_string_lossy(),
@@ -1987,7 +1987,7 @@ mod transient_fence_tests {
         use prefrontal_routing_core::{
             DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore,
         };
-        let scratch = prefrontal_test_support::ScratchDir::new("transient-terminal-backoff");
+        let scratch = cortexkit_test_support::ScratchDir::new("transient-terminal-backoff");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "transient-terminal-backoff",
             scratch.path().join("routing.db").to_string_lossy(),
@@ -2038,7 +2038,7 @@ mod transient_fence_tests {
 
     #[test]
     fn transient_fences_never_replace_extend_or_soften_a_live_quota_fence() {
-        let scratch = prefrontal_test_support::ScratchDir::new("transient-quota-fence-merge");
+        let scratch = cortexkit_test_support::ScratchDir::new("transient-quota-fence-merge");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "transient-quota-fence-merge",
             scratch.path().join("routing.db").to_string_lossy(),

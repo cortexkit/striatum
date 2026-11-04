@@ -365,7 +365,7 @@ mod tests {
     use crate::dev_descriptor;
 
     fn store(label: &str) -> SqliteRouteStateStore {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "routing-v1-store-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

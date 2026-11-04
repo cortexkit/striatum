@@ -172,7 +172,7 @@ mod tests {
         backup_excluded.sort();
         assert_eq!(excluded, backup_excluded);
 
-        let scratch = prefrontal_core_store::ScratchDir::new("routing-engram-catalog-schema");
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-engram-catalog-schema");
         let database = scratch.path().join("store.db");
         let store = prefrontal_routing_store::SqliteRouteStateStore::open(
             &prefrontal_routing_store::dev_descriptor(
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn second_startup_preserves_committed_bytes_without_rewriting_the_file() {
-        let directory = prefrontal_core_store::scratch_root().join(format!(
+        let directory = cortexkit_test_support::scratch_root().join(format!(
             "routing-engram-catalog-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

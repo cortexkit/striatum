@@ -19,7 +19,7 @@ struct Rig {
 impl Rig {
     fn new(label: &str) -> Self {
         let id = NEXT_RIG.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-quota-reading-{label}-{}-{id}",
             std::process::id()
         ));

@@ -1086,8 +1086,7 @@ async fn account_quota_dry_run(
     connection_file_path: PathBuf,
     capture_dir: Option<PathBuf>,
 ) -> Result<(), ModuleError> {
-    let project_root =
-        prefrontal_core_store::scratch_root().join("prefrontal-routing-account-quota-dry-run");
+    let project_root = std::env::temp_dir().join("prefrontal-routing-account-quota-dry-run");
     let _ = std::fs::create_dir_all(&project_root);
     let mut consumer = QuotaConsumer::connect(&connection_file_path, &project_root)
         .await
@@ -4710,7 +4709,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn account_quota_capture_keeps_current_thread_worker_free() {
-        let scratch = prefrontal_test_support::ScratchDir::new("routing-quota-capture-blocked");
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-quota-capture-blocked");
         let path = scratch.join("usage-get-all.json");
         assert!(std::process::Command::new("mkfifo")
             .arg(&path)
@@ -4735,7 +4734,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn account_quota_capture_preserves_bytes_and_io_errors() {
-        let scratch = prefrontal_test_support::ScratchDir::new("routing-quota-capture-bytes");
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-quota-capture-bytes");
         let directory = scratch.join("capture");
         let path = directory.join("usage-get-all.json");
         let body = b"{ \"providers\": [] }\n\0unfiltered bytes".to_vec();
@@ -4773,16 +4772,16 @@ mod tests {
             parse_startup_mode([OsString::from("--check-config"), OsString::from("--subc=x")])
                 .is_err()
         );
-        let scratch = prefrontal_test_support::ScratchDir::new("routing-config-check");
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-config-check");
         let path = scratch.join("prefrontal-routing.jsonc");
         check_config_at(&path).unwrap();
-        let renamed = prefrontal_test_support::ScratchDir::new("routing-config-check-renamed");
+        let renamed = cortexkit_test_support::ScratchDir::new("routing-config-check-renamed");
         crate::test_config::write(renamed.join("alfonso-routing.jsonc"), "{}").unwrap();
         assert!(check_config_at(&renamed.join("prefrontal-routing.jsonc"))
             .unwrap_err()
             .to_string()
             .contains("config_renamed"));
-        let invalid = prefrontal_test_support::ScratchDir::new("routing-config-check-invalid");
+        let invalid = cortexkit_test_support::ScratchDir::new("routing-config-check-invalid");
         let invalid_path = invalid.join("prefrontal-routing.jsonc");
         crate::test_config::write(&invalid_path, "{\"not_a_routing_setting\":true}").unwrap();
         assert!(check_config_at(&invalid_path).is_err());
@@ -4790,7 +4789,7 @@ mod tests {
 
     #[test]
     fn config_check_refuses_old_shape_and_names_converter() {
-        let scratch = prefrontal_test_support::ScratchDir::new("routing-config-check-explicit");
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-config-check-explicit");
         let path = scratch.join("prefrontal-routing.jsonc");
         crate::test_config::write_raw(
             &path,
@@ -6235,7 +6234,7 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .subsec_nanos();
-            let dir = prefrontal_test_support::scratch_root().join(format!(
+            let dir = cortexkit_test_support::scratch_root().join(format!(
                 "prefrontal-routing-module-{label}-{}-{nanos}-{n}",
                 std::process::id()
             ));
@@ -6612,7 +6611,7 @@ mod tests {
             "epoch": 42,
             "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
             "identity": {
-                "project_root": prefrontal_test_support::scratch_root(),
+                "project_root": cortexkit_test_support::scratch_root(),
                 "harness": "control-tolerance-test",
                 "session": "session-1"
             }
@@ -6707,7 +6706,7 @@ mod tests {
                 "epoch": epoch,
                 "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
                 "identity": {
-                    "project_root": prefrontal_test_support::scratch_root(),
+                    "project_root": cortexkit_test_support::scratch_root(),
                     "harness": "epoch-rebind-test",
                     "session": "session-1"
                 }
@@ -6783,7 +6782,7 @@ mod tests {
     fn test_operator_config() -> PathBuf {
         static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         PATH.get_or_init(|| {
-            let path = prefrontal_test_support::scratch_root().join(format!(
+            let path = cortexkit_test_support::scratch_root().join(format!(
                 "prefrontal-routing-test-operator-{}.json",
                 std::process::id()
             ));
