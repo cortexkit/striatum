@@ -42,6 +42,8 @@ Routing decision: the durable selected route, request, candidate explanations, p
 
 ## Surfaces
 - Head model choices: the read-only query `route.head_choices {runner_module}` lists what the Alfonso apps' model and speed picker may offer a head on that runner. It returns `{catalog_version, runner_module, models: [{provider, model, variants, default_variant?, service_tiers}]}`, sorted by provider and then model, unranked. `provider` and `model` are the ids core's `runner_head.set_model` takes.
+  - [TODO(user): Describe `pin_only` as true when the head policy admits the route for an explicit pin but not for automatic selection.]
+  - [TODO(user): Describe `billing` as `subscription` when at least one reachable serving credential is subscription-billed under account selection's policy, including provider/model subscription settings, and `pay_per_token` otherwise.]
   - **Which models:** a model is listed when an account reachable through that runner can serve it and the head policy a pin uses admits it (`only_for`, `not_for`, provider model lists). `pin_only` models are listed, because a person picking a model is a pin. Models a pin can't reach (deprecated, unscored, unavailable, no serving account on this runner) are not.
   - **Levels and tiers:** `variants` are the reasoning levels routing admits for heads. `service_tiers` holds the tiers an account's plan includes and the runner can apply for that model's wire, and always includes `standard`.
   - **Side effects:** the query reserves, leases and records nothing.

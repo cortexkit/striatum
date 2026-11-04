@@ -11,6 +11,7 @@ use crate::{broca_credentials::BrocaCredentials, fusiform_catalog, tests::fact};
 const RUNNER: &str = "thalamus-harness";
 const LEGACY: &str = "legacy-runner";
 const NO_TIERS: &str = "no-tiers-runner";
+const API_KEY_RUNNER: &str = "api-key-runner";
 const WIRE: &str = "openai.responses";
 
 fn fixture() -> (Arc<Harness>, BrocaCredentials) {
@@ -96,6 +97,16 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
                     plan_tier: Some("pro".into()),
                     ..Default::default()
                 })
+                .chain([ListedCredential {
+                    id: "openai-key".into(),
+                    state: "active".into(),
+                    categories: vec!["llm-provider".into()],
+                    provider_ids: vec!["openai".into()],
+                    serves: vec!["openai".into()],
+                    credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
+                    ..Default::default()
+                }])
                 .collect(),
             ..Default::default()
         },
@@ -134,6 +145,9 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
             &json!({"runner":{"pairs":[{"wire_api":WIRE,"auth_method":"oauth"}],"follows_account_choice":true}})
         ).unwrap().unwrap());
     }
+    credentials.runner_declarations.insert(API_KEY_RUNNER.into(), super::runners::parse_declaration(
+        &json!({"runner":{"pairs":[{"wire_api":WIRE,"auth_method":"apikey"}],"follows_account_choice":true}})
+    ).unwrap().unwrap());
     credentials.runner_service_tiers.insert(RUNNER.into(), super::runners::service_tiers_from_describe(
         &json!({"capabilities":["service_tier"],"service_tiers":{WIRE:{"levels":["fast"],"served":"reported"}}})
     ).unwrap());
@@ -142,7 +156,8 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
             {"module":RUNNER,"via_vault":true}, {"module":NO_TIERS,"via_vault":true},
             {"module":LEGACY,"via_vault":true},
             {"module":"policy-runner","routes":["openai/a-head","openai/blocked"]},
-            {"module":"pin-runner","routes":["openai/pinned"]}
+            {"module":"pin-runner","routes":["openai/pinned"]},
+            {"module":API_KEY_RUNNER,"via_vault":true,"routes":["openai/pinned"]}
         ]);
         config["providers"] = json!({"openai":{"models":["a-head","pinned","blocked","only-mason","no-tools","deprecated","unscored"]}});
         config["models"] = json!({"openai/pinned":{"pin_only":true},
@@ -202,6 +217,101 @@ async fn policy_and_standing_pin_refusals_filter_but_pin_only_is_listed() {
         json!(["low", "medium", "high", "xhigh"])
     );
     assert!(reply["models"][1].get("default_variant").is_none());
+}
+
+#[tokio::test]
+async fn pin_only_distinguishes_pins_from_automatic_head_routes() {
+    let (harness, _) = fixture();
+    let reply = query(&harness, RUNNER).await;
+    assert_eq!(ids(&reply), ["openai/a-head", "openai/pinned"]);
+    assert_eq!(reply["models"][0]["pin_only"], false);
+    assert_eq!(reply["models"][1]["pin_only"], true);
+}
+
+#[tokio::test]
+async fn pin_only_uses_automatic_variants_reachable_on_the_runner() {
+    let (harness, _) = fixture();
+    harness.edit_config(|config| {
+        config["models"]["openai/a-head"] = json!({"pin_only_for":["head"]});
+        config["models"]["openai/a-head/high"] = json!({"pin_only_for":[]});
+        config["runners"][0]["routes"] = json!(["openai/a-head/low"]);
+    });
+    let reply = query(&harness, RUNNER).await;
+    assert_eq!(ids(&reply), ["openai/a-head"]);
+    assert_eq!(reply["models"][0]["pin_only"], true);
+    harness.edit_config(|config| {
+        config["runners"][0]["routes"] = json!(["openai/a-head/low", "openai/a-head/high"]);
+    });
+    assert_eq!(
+        query(&harness, RUNNER).await["models"][0]["pin_only"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn billing_distinguishes_reachable_subscriptions_from_per_token_keys() {
+    let (harness, _) = fixture();
+    let subscription = query(&harness, RUNNER).await;
+    assert_eq!(ids(&subscription), ["openai/a-head", "openai/pinned"]);
+    assert_eq!(subscription["models"][0]["billing"], "subscription");
+    assert_eq!(subscription["models"][1]["billing"], "subscription");
+
+    let metered = query(&harness, API_KEY_RUNNER).await;
+    assert_eq!(ids(&metered), ["openai/pinned"]);
+    assert_eq!(metered["models"][0]["billing"], "pay_per_token");
+    assert_eq!(metered["models"][0]["pin_only"], true);
+
+    let mixed = query(&harness, LEGACY).await;
+    assert_eq!(
+        ids(&mixed),
+        ["anthropic/claude", "openai/a-head", "openai/pinned"]
+    );
+    assert!(mixed["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|model| model["billing"] == "subscription"));
+}
+
+#[tokio::test]
+async fn billing_uses_account_selection_subscription_settings() {
+    let (harness, mut credentials) = fixture();
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.iter_mut()
+        .find(|row| row.id == "openai-key")
+        .unwrap()
+        .plan_tier = Some("go".into());
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "head-choices-named-plan".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        crate::now_ms(),
+    );
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["providers"]["openai"]["subscription"] = json!(true);
+    });
+    assert_eq!(
+        query(&harness, API_KEY_RUNNER).await["models"][0]["billing"],
+        "subscription"
+    );
+    harness.edit_config(|config| {
+        config["models"]["openai/pinned"]["subscription"] = json!(false);
+    });
+    assert_eq!(
+        query(&harness, API_KEY_RUNNER).await["models"][0]["billing"],
+        "pay_per_token"
+    );
+    harness.edit_config(|config| {
+        config["providers"]["openai"]["subscription"] = json!(false);
+        config["models"]["openai/pinned"]["subscription"] = json!(true);
+    });
+    assert_eq!(
+        query(&harness, API_KEY_RUNNER).await["models"][0]["billing"],
+        "subscription"
+    );
 }
 
 #[tokio::test]
@@ -453,6 +563,7 @@ async fn serving_bytes_match_tagged_vectors() {
         ("without-tiers.json", NO_TIERS),
         ("policy-excluded.json", "policy-runner"),
         ("pin-only.json", "pin-runner"),
+        ("pin-only-pay-per-token.json", API_KEY_RUNNER),
     ] {
         let request = json!({"method":"route.head_choices","params":{"runner_module":runner}});
         let (ty, bytes) = route

@@ -1,4 +1,5 @@
 use super::*;
+use cortexkit_role_routing::spellings::{AUTH_METHODS, WIRE_APIS};
 use prefrontal_routing_store::PublishedEfforts;
 
 #[derive(Deserialize)]
@@ -11,10 +12,49 @@ struct Params {
 struct ModelChoice {
     provider: String,
     model: String,
+    pin_only: bool,
+    billing: Billing,
     variants: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_variant: Option<String>,
     service_tiers: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Billing {
+    Subscription,
+    PayPerToken,
+}
+
+fn credential_reaches_runner(
+    credentials: &BrocaCredentials,
+    runner: &routing_v1::runners::EffectiveRunner,
+    fact: &ModelFact,
+    row: &cortexkit_claustrum_client::ListedCredential,
+) -> bool {
+    // Registry::runs establishes model reach through any account. Billing
+    // must use the accounts whose wire/auth pair this runner can actually use.
+    runner.pairs.as_ref().is_none_or(|pairs| {
+        runner
+            .standing_limits
+            .as_ref()
+            .and_then(|limits| limits.explicit_providers.as_ref())
+            .is_none_or(|providers| providers.contains(&fact.provider_id))
+            && row.auth_method.as_deref().is_some_and(|method| {
+                fact.billing_plane
+                    .as_ref()
+                    .is_none_or(|plane| plane.auth_method == method)
+                    && credentials.wire_api(fact, method).is_some_and(|wire| {
+                        pairs.iter().any(|pair| {
+                            WIRE_APIS.contains(&pair.wire_api.as_str())
+                                && AUTH_METHODS.contains(&pair.auth_method.as_str())
+                                && pair.wire_api == wire
+                                && pair.auth_method == method
+                        })
+                    })
+            })
+    })
 }
 
 static OPERATOR_BINDS: OnceLock<Mutex<HashMap<u16, (u32, bool)>>> = OnceLock::new();
@@ -113,6 +153,9 @@ fn choices(
     })?;
     let reasoning = store.reasoning_catalog().map_err(store_error)?;
     let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+    let subscription_specs = prefrontal_routing_core::provider_model_spec::parse_spec_list(
+        &config.operator_policy().subscription,
+    );
     let mut grouped: BTreeMap<(&str, &str), Vec<&ModelFact>> = BTreeMap::new();
     for fact in &facts {
         grouped
@@ -136,9 +179,9 @@ fn choices(
             continue;
         }
         let capacity = format!("{provider}/{model}");
-        let allowed = |variant: Option<&str>| {
+        let allowed = |variant: Option<&str>, pinned: bool| {
             let route = prefrontal_routing_core::make_route_key(provider, model, variant);
-            config.route_allowed("head", &route, true) && registry.runs(module, &route, &capacity)
+            config.route_allowed("head", &route, pinned) && registry.runs(module, &route, &capacity)
         };
         let published = variant_policy::published(&reasoning, &aliases, provider, model);
         let mut variants = match published {
@@ -164,17 +207,44 @@ fn choices(
             },
         )
         .variant
-        .filter(|variant| allowed(Some(variant)));
+        .filter(|variant| allowed(Some(variant), true));
         if !matches!(published, Some(PublishedEfforts::Published(_))) {
             variants.extend(default_variant.iter().cloned());
         }
-        variants.retain(|variant| allowed(Some(variant)));
+        variants.retain(|variant| allowed(Some(variant), true));
         let mut seen = std::collections::BTreeSet::new();
         variants.retain(|variant| seen.insert(variant.clone()));
         let default_variant = default_variant.filter(|variant| variants.contains(variant));
-        if !allowed(None) && variants.is_empty() {
+        if !allowed(None, true) && variants.is_empty() {
             continue;
         }
+        // A model entry can expose several routes; one automatic route is
+        // enough for the entry not to be pin-only on this runner.
+        let pin_only =
+            !allowed(None, false) && !variants.iter().any(|variant| allowed(Some(variant), false));
+        let reachable_credentials: Vec<_> = credentials
+            .listed_credentials()
+            .iter()
+            .filter(|row| credential_reaches_runner(credentials, runner, fact, row))
+            .cloned()
+            .collect();
+        // A picker pin can use any covered account, regardless of temporary
+        // quota or refusal fences; use account selection's coverage rule.
+        let class = account_selection::resolve_class(
+            &reachable_credentials,
+            fact,
+            &providers,
+            &subscription_specs,
+            aliases.contains_key(provider),
+            false,
+            false,
+            |_| true,
+        );
+        let billing = if class.subscription {
+            Billing::Subscription
+        } else {
+            Billing::PayPerToken
+        };
         let mut service_tiers = vec!["standard".into()];
         for tier in ["fast", "ultrafast"] {
             if service_tiers::model_offers(credentials, fact, tier)
@@ -200,6 +270,8 @@ fn choices(
         models.push(ModelChoice {
             provider: provider.into(),
             model: model.into(),
+            pin_only,
+            billing,
             variants,
             default_variant,
             service_tiers,

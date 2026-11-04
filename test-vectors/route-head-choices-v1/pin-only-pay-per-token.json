@@ -1,0 +1,1 @@
+{"reply":{"result":{"catalog_version":41,"models":[{"billing":"pay_per_token","model":"pinned","pin_only":true,"provider":"openai","service_tiers":["standard"],"variants":["low","medium","high","xhigh"]}],"runner_module":"api-key-runner"}},"request":{"method":"route.head_choices","params":{"runner_module":"api-key-runner"}}}
