@@ -204,7 +204,7 @@ pub(super) fn account_for(
             )
         }) {
             return Err(account_unavailable(
-                "[TODO(user): explain that the requested tier cannot change the bound decision's tier]",
+                "A request bound to an earlier routing decision keeps that decision's service tier. Send the same tier, or ask routing for a new decision to change it.",
             ));
         }
         if let Some(input) = deps
@@ -294,7 +294,7 @@ pub(super) fn account_for(
             .is_some_and(|tier| tier != "standard" && chosen != Some(tier))
     {
         return Err(account_unavailable(
-            "[TODO(user): explain that the bound service tier is no longer available]",
+            "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
         ));
     }
     let answer_json = serde_json::to_string(&answer).map_err(internal_unavailable)?;

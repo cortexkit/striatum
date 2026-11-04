@@ -3173,7 +3173,7 @@ fn prepare_service_tier(
         let tier = ServiceTier::parse(&tier).ok_or_else(|| {
             OpReply::error(
                 "account_selection_unavailable",
-                "[TODO(user): explain that the bound tier is not supported]",
+                "The service tier recorded on this routing decision isn't one routing knows, so it can't keep an account bound to it. Ask routing for a new decision.",
             )
         })?;
         return Ok((!tier.is_standard() || parsed.service_tier.is_some()).then_some(tier));
