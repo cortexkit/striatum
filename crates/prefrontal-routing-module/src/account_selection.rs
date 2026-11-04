@@ -1513,6 +1513,8 @@ fn conversation_hash(salt: &str, principal: &str, conversation_key: &str) -> Str
 /// - `hold_wait_max_s`: out; advisory wait budget, not admission identity.
 /// - `pool`: in when present; it decides which pool blocks apply. A body
 ///   without it hashes exactly as it did before the member existed.
+/// - `service_tier`: in when present; changing the requested service tier is a
+///   different admission. Omission preserves existing fingerprints.
 /// Unknown fields are ignored by parsing, so quota hints, digests and timestamps
 /// outside this schema cannot change identity either.
 ///
@@ -1540,6 +1542,8 @@ fn fingerprint(params: &AccountForParams) -> String {
         pool: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_conversation_key: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     }
     let identity = AdmissionIdentity {
         provider: normalize(&params.provider),
@@ -1559,6 +1563,7 @@ fn fingerprint(params: &AccountForParams) -> String {
             .and_then(AccountRefParams::to_ref),
         pool: params.pool.as_deref(),
         parent_conversation_key: params.parent_conversation_key.as_deref(),
+        service_tier: params.service_tier,
     };
     let encoded = serde_json::to_vec(&identity).expect("admission identity is serializable");
     hex(&Sha256::digest(&encoded))
@@ -2542,6 +2547,10 @@ impl AccountRefParams {
 #[derive(Debug, Clone, Deserialize)]
 struct AccountForParams {
     #[serde(default)]
+    service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+    #[serde(skip)]
+    service_tier_chosen: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+    #[serde(default)]
     parent_conversation_key: Option<String>,
     #[serde(default)]
     hold_ok: Option<bool>,
@@ -2942,7 +2951,7 @@ mod continuation;
 pub(crate) use continuation::continue_account;
 
 fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
-    let parsed = match parse_account_for(params) {
+    let mut parsed = match parse_account_for(params) {
         Ok(parsed) => parsed,
         Err(reply) => return reply,
     };
@@ -2957,8 +2966,12 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Ok(None) => {}
         Err(error) => return store_error(error),
     }
-    let (roster, route_fenced, class) = match prepare_roster(&parsed, ctx) {
+    let (mut roster, route_fenced, class) = match prepare_roster(&parsed, ctx) {
         Ok(prepared) => prepared,
+        Err(reply) => return reply,
+    };
+    parsed.service_tier_chosen = match prepare_service_tier(&parsed, ctx, &mut roster, class) {
+        Ok(tier) => tier,
         Err(reply) => return reply,
     };
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
@@ -3138,6 +3151,114 @@ fn prepare_roster(
         );
     }
     Ok((roster, route_fenced, class))
+}
+
+fn prepare_service_tier(
+    parsed: &AccountForParams,
+    ctx: &Ctx<'_>,
+    roster: &mut RosterBuild,
+    class: prefrontal_routing_core::accounts::AllowedAccountClass,
+) -> Result<Option<cortexkit_role_routing::service_tier::ServiceTier>, OpReply> {
+    use cortexkit_role_routing::service_tier::{fallback, ServiceTier};
+    let bound = parsed
+        .model_decision_id
+        .as_deref()
+        .map(|id| ctx.store.decision_service_tier(id))
+        .transpose()
+        .map_err(store_error)?
+        .flatten();
+    // prepare_roster already revalidated the decision's tier and allowed
+    // credentials. Do not step down or re-rank that stored credential set.
+    if let Some((tier, _)) = bound {
+        let tier = ServiceTier::parse(&tier).ok_or_else(|| {
+            OpReply::error(
+                "account_selection_unavailable",
+                "[TODO(user): explain that the bound tier is not supported]",
+            )
+        })?;
+        return Ok((!tier.is_standard() || parsed.service_tier.is_some()).then_some(tier));
+    }
+    let Some(requested) = parsed.service_tier else {
+        return Ok(None);
+    };
+    for tier in fallback(requested).filter(|tier| !tier.is_standard()) {
+        let Some(mut classes) = ctx.classes.clone() else {
+            continue;
+        };
+        let mut facts: Vec<_> = classes
+            .facts
+            .iter()
+            .filter(|fact| {
+                fact.provider_id == normalize(&parsed.provider)
+                    && fact.model_id == normalize(&parsed.model)
+            })
+            .cloned()
+            .collect();
+        let runners: Vec<_> = classes
+            .config
+            .v1_runners()
+            .into_iter()
+            .filter(|runner| runner.module == parsed.caller.runner)
+            .collect();
+        let registry = crate::routing_v1::runners::Registry::build(
+            classes.config.v1_runners(),
+            &classes.credentials,
+            &classes.facts,
+            classes.now_ms.max(0) as u64,
+        );
+        classes.apply_service_tier(
+            &mut facts,
+            tier.as_str(),
+            &runners,
+            &registry,
+            class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
+            None,
+        );
+        let allowed =
+            classes.service_tier_accounts(&normalize(&parsed.provider), &normalize(&parsed.model));
+        let eligible =
+            |account: &prefrontal_routing_core::accounts::AccountView,
+             credential: &prefrontal_routing_core::accounts::CredentialRecord| {
+                allowed.contains(&credential.credential_id)
+                    && parsed.candidates.as_ref().is_none_or(|candidates| {
+                        candidates.accounts.iter().any(|candidate| {
+                            candidate.account_id == account.account_id
+                                && candidate.credential_id == credential.credential_id
+                        })
+                    })
+                    && parsed.requested_account.as_ref().is_none_or(|pin| {
+                        pin.account_id.as_ref().map_or_else(
+                            || {
+                                pin.credential_id
+                                    .as_ref()
+                                    .is_none_or(|id| *id == credential.credential_id)
+                            },
+                            |id| *id == account.account_id,
+                        )
+                    })
+            };
+        if roster.roster.as_ref().is_some_and(|roster| {
+            roster.accounts.iter().any(|account| {
+                account
+                    .credentials
+                    .iter()
+                    .any(|credential| eligible(account, credential))
+            })
+        }) {
+            if let Some(roster) = &mut roster.roster {
+                for account in &mut roster.accounts {
+                    account
+                        .credentials
+                        .retain(|credential| allowed.contains(&credential.credential_id));
+                }
+                roster
+                    .accounts
+                    .retain(|account| !account.credentials.is_empty());
+            }
+            return Ok(Some(tier));
+        }
+    }
+    Ok(Some(ServiceTier::Standard))
 }
 
 /// The refusal for a request every account it could use is route-fenced on:
@@ -3594,6 +3715,13 @@ fn serve(
         context: json!({ "roster": roster.context }),
         now_ms: now,
     }))?;
+    if let Some(tier) = params.service_tier_chosen {
+        tx.record_account_service_tier(
+            &decision_id,
+            params.service_tier.map(|tier| tier.as_str()),
+            tier.as_str(),
+        )?;
+    }
     match &decision.outcome {
         Outcome::Admit(admission) => commit_admission(
             tx,
@@ -3944,6 +4072,9 @@ fn commit_admission(
             "quota_age_band": admission.quota_age_band.map(|band| wire(&band)),
         },
     });
+    if let Some(tier) = params.service_tier_chosen {
+        reply["service_tier_chosen"] = json!(tier);
+    }
     if let Some(note) = &decision.explanation.credential_fence_probe {
         reply["reason"]["fence_probe"] = json!(note);
     }

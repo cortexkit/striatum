@@ -9,8 +9,9 @@ use super::{operator_config, Deps};
 use crate::select_policy;
 
 /// The optional routing/v1 groups this provider serves, listed in
-/// `role.describe` as `capabilities` and passed to `parse_select_request_serving`,
-/// so the two always agree. Harnesses come from runner declarations.
+/// `role.describe` as `capabilities` and passed to the select and account request
+/// parsers, so declarations and accepted members agree. Harnesses come from
+/// runner declarations.
 pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::SELECT_HARNESS,
     "select_hold_control",

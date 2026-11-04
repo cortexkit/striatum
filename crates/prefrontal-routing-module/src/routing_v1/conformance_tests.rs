@@ -1002,6 +1002,7 @@ const NOT_YET_SERVED: &[&str] = &[];
 /// advertise the group; this provider serves `account_continue`, `select_harness`,
 /// `select_prefer` and `select_exclude_providers`.
 const NOT_APPLICABLE: &[&str] = &[
+    "account_for_tier_undeclared",
     "continue_undeclared_group_refuses_mode",
     "undeclared_harness_group_refuses_member",
     "undeclared_prefer_group_refuses_member",

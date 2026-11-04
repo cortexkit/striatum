@@ -8,13 +8,14 @@
 //! and its answer back.
 
 use cortexkit_role_routing::account::{
-    parse_account_for_request, Account, AccountForAnswer, AccountForRequest, AccountPin,
+    parse_account_for_request_serving, Account, AccountForAnswer, AccountForRequest, AccountPin,
     AccountReason, AccountReasonCode, Admission,
 };
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::observe::{
     parse_account_observe_request, AccountObserveAnswer, Observation,
 };
+use cortexkit_role_routing::service_tier::{check_chosen, ServiceTier};
 use prefrontal_routing_store::V1Recorded;
 use serde_json::{json, Value};
 
@@ -56,6 +57,7 @@ const FOR_MEMBERS: &[&str] = &[
     "pool",
     "hold_ok",
     "request_input_tokens",
+    "service_tier",
 ];
 
 const OBSERVE_MEMBERS: &[&str] = &[
@@ -157,7 +159,7 @@ pub(super) fn account_for(
         return continue_account(params, caller, &authority, deps);
     }
     super::refuse_unknown_members(params, FOR_MEMBERS)?;
-    let mut request = parse_account_for_request(params)?;
+    let mut request = parse_account_for_request_serving(params, super::describe::CAPABILITIES)?;
     if let Some(scope) = authority.session {
         request.conversation_key = scope.reference.clone();
     }
@@ -175,6 +177,7 @@ pub(super) fn account_for(
     {
         return standing_answer(first, &body_json);
     }
+    let mut bound_tier = None;
     if let Some(decision_id) = &request.decision_id {
         // Honoured only from the runner the decision named, for the model it
         // named; anything else is refused as if the decision never existed.
@@ -188,6 +191,21 @@ pub(super) fn account_for(
                 && same_name(&decision.model, &request.model)
         }) {
             return Err(Refusal::unknown_decision());
+        }
+        bound_tier = deps
+            .store
+            .decision_service_tier(decision_id)
+            .map_err(store_unavailable)?
+            .map(|(tier, _)| tier);
+        if bound_tier.as_deref().is_some_and(|tier| {
+            !check_chosen(
+                request.service_tier.or_else(|| ServiceTier::parse(tier)),
+                Some(tier),
+            )
+        }) {
+            return Err(account_unavailable(
+                "[TODO(user): explain that the requested tier cannot change the bound decision's tier]",
+            ));
         }
         if let Some(input) = deps
             .store
@@ -219,6 +237,7 @@ pub(super) fn account_for(
         ("requested_account", json!(request.requested_account)),
         ("hold_wait_max_s", json!(hold_wait_max_s)),
         ("model_decision_id", json!(request.decision_id)),
+        ("service_tier", json!(request.service_tier)),
         (
             "parent_conversation_key",
             params
@@ -261,6 +280,23 @@ pub(super) fn account_for(
             detail,
         } => return Err(account_refusal(&code, message, detail.as_ref())),
     };
+    let chosen = answer["service_tier_chosen"].as_str();
+    let effective_tier = bound_tier
+        .as_deref()
+        .filter(|tier| *tier != "standard")
+        .and_then(ServiceTier::parse)
+        .or(request.service_tier);
+    // A decision fixes the service tier; the general contract check permits a
+    // step-down, so decision-bound admissions must also require equality.
+    if !check_chosen(effective_tier, chosen)
+        || bound_tier
+            .as_deref()
+            .is_some_and(|tier| tier != "standard" && chosen != Some(tier))
+    {
+        return Err(account_unavailable(
+            "[TODO(user): explain that the bound service tier is no longer available]",
+        ));
+    }
     let answer_json = serde_json::to_string(&answer).map_err(internal_unavailable)?;
     let standing = deps
         .store
@@ -365,12 +401,12 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
             .unwrap_or_else(|| Value::Object(object.clone()).to_string()),
         other => other.to_string(),
     };
-    let answer = AccountForAnswer {
-        admission: Admission {
+    let mut answer = AccountForAnswer::new(
+        Admission {
             id: request.admission_id.clone(),
             state: text(&result["admission"]["state"]).ok_or_else(|| missing("admission state"))?,
         },
-        account: Account {
+        Account {
             provider: text(&result["account"]["provider"]).ok_or_else(|| missing("provider"))?,
             account_id: text(&result["account"]["account_id"])
                 .ok_or_else(|| missing("account id"))?,
@@ -378,20 +414,18 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
                 .ok_or_else(|| missing("credential id"))?,
             method: text(&result["account"]["method"]).unwrap_or_else(|| "oauth".into()),
         },
-        pin: AccountPin {
-            id: text(&result["pin"]["id"]).ok_or_else(|| missing("pin id"))?,
-            generation: result["pin"]["generation"]
+        AccountPin::new(
+            text(&result["pin"]["id"]).ok_or_else(|| missing("pin id"))?,
+            result["pin"]["generation"]
                 .as_u64()
                 .ok_or_else(|| missing("pin generation"))?,
-            affinity_expires_at_ms: ms(&result["pin"]["affinity_expires_at"])
-                .ok_or_else(|| missing("affinity expiry"))?,
-            admission_valid_until_ms: ms(&result["pin"]["admission_valid_until"])
+            ms(&result["pin"]["affinity_expires_at"]).ok_or_else(|| missing("affinity expiry"))?,
+            ms(&result["pin"]["admission_valid_until"])
                 .ok_or_else(|| missing("admission validity"))?,
-            lease_valid_until_ms: ms(&result["pin"]["lease_valid_until"])
-                .ok_or_else(|| missing("lease validity"))?,
-            mode: request.mode(),
-        },
-        reason: AccountReason {
+            ms(&result["pin"]["lease_valid_until"]).ok_or_else(|| missing("lease validity"))?,
+            request.mode(),
+        ),
+        AccountReason {
             code: AccountReasonCode::parse(&reason_code),
             decision_id: request
                 .decision_id
@@ -405,7 +439,13 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
             quota_fetched_at_ms: ms(&reason["quota_fetched_at"]),
             quota_age_band: text(&reason["quota_age_band"]).unwrap_or_else(|| "unknown".into()),
         },
-    };
+    );
+    if let Some(tier) = result["service_tier_chosen"]
+        .as_str()
+        .and_then(ServiceTier::parse)
+    {
+        answer = answer.with_service_tier_chosen(tier);
+    }
     serde_json::to_value(answer).map_err(internal_unavailable)
 }
 
@@ -561,6 +601,55 @@ pub(crate) fn account_refusal_for_test_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_service_tier_absent_preserves_legacy_answer_bytes() {
+        let mut params = json!({
+            "provider":"openai", "model":"model", "conversation_key":"conversation", "admission_id":"one"
+        });
+        let mut result = json!({
+            "admission":{"state":"reserved"},
+            "account":{"provider":"openai","account_id":"account-1","credential_id":"oauth:1","method":"oauth"},
+            "pin":{"id":"pin-1","generation":1,
+                "affinity_expires_at":"1970-01-01T00:00:01Z",
+                "admission_valid_until":"1970-01-01T00:00:02Z",
+                "lease_valid_until":"1970-01-01T00:00:03Z"},
+            "reason":{"code":"headroom","decision_id":"decision-1","policy_version":1}
+        });
+        let request =
+            parse_account_for_request_serving(&params, super::super::describe::CAPABILITIES)
+                .unwrap();
+        let answer = admission_answer(&result, &request).unwrap();
+        let baseline = json!({
+            "admission":{"id":"one","state":"reserved"},
+            "account":{"provider":"openai","account_id":"account-1","credential_id":"oauth:1","method":"oauth"},
+            "pin":{"id":"pin-1","generation":1,"affinity_expires_at_ms":1000,
+                "admission_valid_until_ms":2000,"lease_valid_until_ms":3000,"mode":"admit"},
+            "reason":{"code":"headroom","decision_id":"decision-1","policy_version":"1",
+                "quota_age_band":"unknown"}
+        });
+        assert_eq!(
+            serde_json::to_vec(&answer).unwrap(),
+            serde_json::to_vec(&baseline).unwrap()
+        );
+        params["service_tier"] = json!("standard");
+        result["service_tier_chosen"] = json!("standard");
+        let request =
+            parse_account_for_request_serving(&params, super::super::describe::CAPABILITIES)
+                .unwrap();
+        let mut explicit = admission_answer(&result, &request).unwrap();
+        assert_eq!(
+            explicit
+                .as_object_mut()
+                .unwrap()
+                .remove("service_tier_chosen"),
+            Some(json!("standard"))
+        );
+        assert_eq!(
+            serde_json::to_vec(&explicit).unwrap(),
+            serde_json::to_vec(&baseline).unwrap()
+        );
+    }
 
     #[test]
     fn a_repeated_observation_applies_nothing() {

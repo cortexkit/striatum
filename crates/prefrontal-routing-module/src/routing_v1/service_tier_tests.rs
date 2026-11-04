@@ -138,6 +138,177 @@ fn select_sol(tier: &str) -> Value {
     request
 }
 
+fn account_request(id: &str, tier: Option<&str>) -> Value {
+    let mut request = json!({
+        "provider":"openai", "model":MODEL, "conversation_key":id, "admission_id":id,
+    });
+    if let Some(tier) = tier {
+        request["service_tier"] = json!(tier);
+    }
+    request
+}
+
+#[tokio::test]
+async fn account_service_tier_fast_prefers_eligible_plan_and_records_tier() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["unknown", "pro_200"], true, true);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let request = account_request("fast-head", Some("fast"));
+    let reply = runner.call("route.account_for", &request).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    let answer = &reply.1["result"];
+    assert_eq!(answer["account"]["account_id"], "account-1");
+    assert_eq!(answer["service_tier_chosen"], "fast");
+    assert_eq!(
+        harness
+            .store()
+            .account_decision_service_tier(answer["reason"]["decision_id"].as_str().unwrap())
+            .unwrap(),
+        Some((Some("fast".into()), "fast".into()))
+    );
+    let replay = runner.call("route.account_for", &request).await;
+    assert_eq!(replay.1, reply.1);
+    let mut conflict = request;
+    conflict["service_tier"] = json!("standard");
+    let conflict = runner.call("route.account_for", &conflict).await;
+    assert_eq!(conflict.1["code"], "admission_conflict", "{}", conflict.1);
+}
+
+#[tokio::test]
+async fn account_service_tier_ultrafast_steps_down_to_fast_then_standard() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for (plan, expected) in [("pro_200", "fast"), ("unknown", "standard")] {
+        let (harness, _) = setup(&[plan], true, true);
+        let runner = harness.bind(reserved(RUNNER), None).await;
+        let reply = runner
+            .call(
+                "route.account_for",
+                &account_request("fallback", Some("ultrafast")),
+            )
+            .await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(reply.1["result"]["service_tier_chosen"], expected);
+        assert_eq!(
+            harness
+                .store()
+                .account_decision_service_tier(
+                    reply.1["result"]["reason"]["decision_id"].as_str().unwrap()
+                )
+                .unwrap(),
+            Some((Some("ultrafast".into()), expected.into()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_service_tier_bound_decision_keeps_exact_tier_or_refuses() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup(&["unknown", "pro_200"], true, true);
+    let owner = harness.bind(reserved("tier-owner"), None).await;
+    let selected = owner.call("route.select", &select("fast")).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let decision = selected.1["result"]["decision_id"].clone();
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    for (id, tier) in [
+        ("inherited", None),
+        ("repeated", Some("fast")),
+        ("higher-ceiling", Some("ultrafast")),
+    ] {
+        let mut request = account_request(id, tier);
+        request["decision_id"] = decision.clone();
+        let reply = runner.call("route.account_for", &request).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(reply.1["result"]["service_tier_chosen"], "fast");
+        assert_eq!(reply.1["result"]["account"]["account_id"], "account-1");
+    }
+    let mut lower = account_request("lower-ceiling", Some("standard"));
+    lower["decision_id"] = decision.clone();
+    let refused = runner.call("route.account_for", &lower).await;
+    assert_eq!(
+        refused.1["code"], "account_selection_unavailable",
+        "{}",
+        refused.1
+    );
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows[1].plan_tier = Some("unknown".into());
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "revoked-tier".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials);
+    let mut revoked = account_request("revoked", None);
+    revoked["decision_id"] = decision;
+    let refused = runner.call("route.account_for", &revoked).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert!(harness
+        .store()
+        .v1_admission(&format!("reserved:{RUNNER}"), "revoked")
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn account_service_tier_requires_calling_runner_and_model_support() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for missing in ["runner", "model"] {
+        let (harness, mut credentials) = setup(&["pro_200"], true, true);
+        if missing == "runner" {
+            credentials.runner_declarations.insert(
+                "other-tier-runner".into(),
+                credentials.runner_declarations[RUNNER].clone(),
+            );
+            credentials.runner_service_tiers.insert(
+                "other-tier-runner".into(),
+                credentials.runner_service_tiers[RUNNER].clone(),
+            );
+            credentials.runner_service_tiers.remove(RUNNER);
+            harness.edit_config(|config| {
+                config["runners"] = json!([
+                    {"module":RUNNER,"via_vault":true},
+                    {"module":"other-tier-runner","via_vault":true}
+                ]);
+            });
+        } else {
+            let mut catalog =
+                served()["catalog.get — provider default endpoint"]["response"].clone();
+            catalog["models"][format!("openai/{MODEL}")]
+                .as_object_mut()
+                .unwrap()
+                .retain(|key, _| !key.ends_with(".mode.fast"));
+            credentials.publish_billing_catalog(
+                credentials
+                    .billing_catalog
+                    .clone()
+                    .with_test_catalog(&serde_json::to_vec(&catalog).unwrap()),
+            );
+        }
+        harness.set_credentials(credentials);
+        let runner = harness.bind(reserved(RUNNER), None).await;
+        let reply = runner
+            .call("route.account_for", &account_request(missing, Some("fast")))
+            .await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(reply.1["result"]["service_tier_chosen"], "standard");
+    }
+}
+
+#[tokio::test]
+async fn account_service_tier_does_not_replace_a_pinned_account() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["unknown", "pro_200"], true, true);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut request = account_request("pinned", Some("fast"));
+    request["requested_account"] = json!({"account_id":"account-0"});
+    let reply = runner.call("route.account_for", &request).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(reply.1["result"]["account"]["account_id"], "account-0");
+    assert_eq!(reply.1["result"]["service_tier_chosen"], "standard");
+}
+
 fn live_broca_credentials(credentials: &mut BrocaCredentials) {
     let bytes =
         include_bytes!("../../../../test-vectors/broca-service-tiers-v1/role-describe-live.json");

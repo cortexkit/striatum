@@ -400,6 +400,23 @@ pub struct AccountRouteFence {
 }
 
 impl SqliteRouteStateStore {
+    pub fn account_decision_service_tier(
+        &self,
+        decision_id: &str,
+    ) -> RouteStateResult<Option<(Option<String>, String)>> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                conn.query_row(
+                    "SELECT service_tier_requested, service_tier_chosen FROM account_decision
+                 WHERE decision_id=?1 AND service_tier_chosen IS NOT NULL",
+                    params![decision_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
     /// A run outcome is an audit fact, not quota or model-health evidence.
     pub fn record_routing_outcome(
         &self,
@@ -423,6 +440,18 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    pub fn record_account_service_tier(
+        &self,
+        decision_id: &str,
+        requested: Option<&str>,
+        chosen: &str,
+    ) -> RouteStateResult<()> {
+        self.conn.execute(
+            "UPDATE account_decision SET service_tier_requested=?2, service_tier_chosen=?3 WHERE decision_id=?1",
+            params![decision_id, requested, chosen],
+        ).map(|_| ()).map_err(err)
+    }
+
     /// Reserve one stale credential probe in the same write transaction as
     /// its admission. The strict cutoff also rejects a concurrently renewed
     /// refusal or a probe already reserved from an older roster snapshot.
