@@ -1982,6 +1982,54 @@ mod transient_fence_tests {
     use super::*;
 
     #[test]
+    fn exhausted_transient_retries_never_install_a_model_failure_backoff() {
+        use prefrontal_routing_core::{
+            DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore,
+        };
+        let scratch = prefrontal_test_support::ScratchDir::new("transient-terminal-backoff");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "transient-terminal-backoff",
+            scratch.path().join("routing.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let error = "Broca run run-sid-gFDZWZSmQVugLiDUwUywV3: provider error: class transient; provider code server_is_overloaded; HTTP 503; Broca said: Responses websocket attempt failed (HttpError 503); code=server_is_overloaded type=service_unavailable_error; credential_id: chatgpt:openai:gmail; provider retries exhausted after 3 retries";
+        for _ in 0..3 {
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_route_key: Some("openai/gpt-6-astra/xhigh".into()),
+                    selected_provider_id: Some("openai".into()),
+                    selected_model_id: Some("gpt-6-astra".into()),
+                    target_agent: "mason".into(),
+                    requirements_json: "{}".into(),
+                    score_json: "{}".into(),
+                    rejected_json: "[]".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .set_decision_outcome(
+                    &decision,
+                    &DecisionOutcomeUpdate {
+                        provider_outcome: None,
+                        outcome: RouteOutcome::SessionError,
+                        last_error: Some(error.into()),
+                        observed_at_ms: 1_000,
+                        failure_backoff: Default::default(),
+                    },
+                )
+                .unwrap();
+        }
+        let snapshot = store.build_snapshot(1_000.0).unwrap();
+        assert_eq!(
+            snapshot
+                .by_route
+                .get("openai/gpt-6-astra/xhigh")
+                .and_then(|state| state.failure_backoff_until),
+            None
+        );
+    }
+
+    #[test]
     fn transient_fences_never_replace_extend_or_soften_a_live_quota_fence() {
         let scratch = prefrontal_test_support::ScratchDir::new("transient-quota-fence-merge");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
