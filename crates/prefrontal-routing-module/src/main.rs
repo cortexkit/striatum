@@ -747,9 +747,35 @@ fn record_quota_refresh_failure(cache: &mut QuotaCache, phase: &str, error: impl
 }
 
 fn record_cooldown_update(
-    store: &impl RouteStateStore,
+    store: &prefrontal_routing_store::SqliteRouteStateStore,
     params: &RecordCooldownParams,
 ) -> prefrontal_routing_core::RouteStateResult<()> {
+    if params.wall_class == Some(RouteWallClass::Transient) {
+        let Some(credential) = params
+            .credential_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        else {
+            // Missing account identity cannot justify walling every other account.
+            return Ok(());
+        };
+        let Some(until) = params.cooldown_until else {
+            return Ok(());
+        };
+        let Some((provider, model)) = params.capacity_key.split_once('/') else {
+            return Ok(());
+        };
+        return store.record_transient_account_route_fence(
+            &prefrontal_routing_store::AccountRouteFence {
+                provider: provider.into(),
+                model: model.into(),
+                credential_id: credential.into(),
+                until_ms: until as i64,
+                decision_id: String::new(),
+                recorded_at: now_ms() as i64,
+            },
+        );
+    }
     let update = prefrontal_routing_core::RouteStateUpdate {
         cooldown_until: params.cooldown_until,
         quota_exhausted_until: params.quota_exhausted_until,
@@ -2776,6 +2802,8 @@ struct RecordCooldownParams {
     route_key: String,
     capacity_key: String,
     #[serde(default)]
+    credential_id: Option<String>,
+    #[serde(default)]
     cooldown_until: Option<f64>,
     #[serde(default)]
     quota_exhausted_until: Option<f64>,
@@ -3693,7 +3721,7 @@ async fn handle_clear_cooldown(
         )
         .await;
     }
-    let prior = match store.clear_cooldown(&params.route_key) {
+    let prior = match store.clear_route_cooldowns(&params.route_key) {
         Ok(Some(prior)) => prior,
         Ok(None) => {
             return send_route_error(
@@ -3720,12 +3748,28 @@ async fn handle_clear_cooldown(
             .await;
         }
     };
-    eprintln!("[prefrontal-routing] route.clear_cooldown {}: previous cooldown_until={:?}, quota_exhausted_until={:?}",
-        params.route_key, prior.cooldown_until, prior.quota_exhausted_until);
+    let cooldown = prior
+        .routes
+        .iter()
+        .filter_map(|(_, row)| row.cooldown_until)
+        .max_by(f64::total_cmp);
+    let quota = prior
+        .routes
+        .iter()
+        .filter_map(|(_, row)| row.quota_exhausted_until)
+        .max_by(f64::total_cmp);
     let body = serde_json::to_vec(&json!({ "result": {
-        "routeKey": params.route_key,
-        "clearedCooldownUntil": prior.cooldown_until,
-        "clearedQuotaExhaustedUntil": prior.quota_exhausted_until,
+        "routeKey": prior.route_key,
+        "clearedCooldownUntil": cooldown,
+        "clearedQuotaExhaustedUntil": quota,
+        "clearedRoutes": prior.routes.iter().map(|(key, row)| json!({
+            "routeKey": key, "clearedCooldownUntil": row.cooldown_until,
+            "clearedQuotaExhaustedUntil": row.quota_exhausted_until,
+        })).collect::<Vec<_>>(),
+        "clearedAccountFences": prior.account_fences.iter().map(|fence| json!({
+            "provider": fence.provider, "model": fence.model,
+            "credentialId": fence.credential_id, "clearedUntil": fence.until_ms,
+        })).collect::<Vec<_>>(),
     } }))
     .map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
@@ -4770,6 +4814,7 @@ mod tests {
                 &RecordCooldownParams {
                     route_key: route_key.into(),
                     capacity_key: route_key.into(),
+                    credential_id: None,
                     cooldown_until: Some(5_000.0),
                     quota_exhausted_until: Some(5_000.0),
                     quota_pressure: None,
@@ -8059,6 +8104,7 @@ mod tests {
         let params = RecordCooldownParams {
             route_key: "p/a/high".into(),
             capacity_key: "p/a".into(),
+            credential_id: None,
             cooldown_until: Some(7_000.0),
             quota_exhausted_until: Some(9_000.0),
             quota_pressure: None,
@@ -8767,6 +8813,57 @@ mod tests {
         assert_eq!(response.header.ty, FrameType::Response);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["result"]["selected"]["routeKey"], ROUTE);
+    }
+
+    #[tokio::test]
+    async fn clear_cooldown_accepts_stored_and_work_variant_keys_and_clears_base_variants() {
+        const BASE: &str = "alibaba-token-plan/qwen3.8-max-preview";
+        let rig = Rig::new("clear-variant-cooldown");
+        let store = Arc::new(rig.open_store());
+        let variant = format!("{BASE}/xhigh");
+        let until = now_ms() as f64 + 1_800_000.0;
+        for key in [variant.clone(), format!("{BASE}:xhigh"), BASE.into()] {
+            for route in [BASE, variant.as_str()] {
+                store
+                    .update_route_state(
+                        route,
+                        BASE,
+                        &prefrontal_routing_core::RouteStateUpdate {
+                            cooldown_until: Some(until),
+                            wall_class: Some(RouteWallClass::Quota),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            let response = run_route_wire_request(
+                &store,
+                json!({
+                    "method": ROUTE_CLEAR_COOLDOWN_OP, "params": {"routeKey": key}
+                }),
+            )
+            .await;
+            assert_eq!(
+                response.header.ty,
+                FrameType::Response,
+                "{:?}",
+                response.body
+            );
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            let rows = body["result"]["clearedRoutes"].as_array().unwrap();
+            assert!(rows
+                .iter()
+                .any(|row| row["routeKey"] == variant && row["clearedCooldownUntil"] == until));
+            let snapshot = store.build_snapshot(now_ms() as f64).unwrap();
+            assert_eq!(snapshot.by_route[&variant].cooldown_until, None);
+            if key == BASE {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(snapshot.by_route[BASE].cooldown_until, None);
+            } else {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(snapshot.by_route[BASE].cooldown_until, Some(until));
+            }
+        }
     }
 
     #[tokio::test]
@@ -14986,6 +15083,7 @@ mod tests {
             &RecordCooldownParams {
                 route_key: incumbent.clone(),
                 capacity_key: incumbent.clone(),
+                credential_id: None,
                 cooldown_until: Some(far_future),
                 quota_exhausted_until: Some(far_future),
                 quota_pressure: Some(1.0),

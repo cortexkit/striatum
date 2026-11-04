@@ -385,16 +385,16 @@ pub struct AccountSizeRefusal {
     pub observed_at: i64,
 }
 
-/// One route closed on one account until `until_ms`, from a failed routing/v1
-/// report that named the provider's reset. The account is the one the
-/// credential belongs to.
+/// One provider/model closed on one account until `until_ms`, from a quota
+/// reset report or a transient provider failure. The credential identifies
+/// the serving account; the two classes have different admission policies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRouteFence {
     pub provider: String,
     pub credential_id: String,
     pub model: String,
     pub until_ms: i64,
-    /// The decision whose report set the fence, for diagnostics.
+    /// The decision whose report set the fence; empty for cooldown telemetry.
     pub decision_id: String,
     pub recorded_at: i64,
 }
@@ -532,6 +532,16 @@ impl AccountTx<'_> {
             .optional()
             .map_err(err)
     }
+
+    /// A reserved first send has no prompt cache yet. A started admission on
+    /// this pin establishes account affinity even after that run has finished.
+    pub fn pin_has_started(&self, affinity: &AccountAffinityRow) -> RouteStateResult<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_admission WHERE principal=?1 AND conversation_hash=?2 AND provider=?3 AND pin_id=?4 AND pin_generation=?5 AND started_at IS NOT NULL)",
+            params![affinity.principal, affinity.conversation_hash, affinity.provider, affinity.pin_id, affinity.pin_generation],
+            |row| row.get(0),
+        ).map_err(err)
+    }
 }
 
 impl SqliteRouteStateStore {
@@ -645,25 +655,50 @@ impl SqliteRouteStateStore {
         }).map_err(err)
     }
 
-    /// Record a route fence. Two reports on the same route and credential
+    /// Record a quota route fence. Two reports on the same route and credential
     /// keep the later reset: each report fences until its own reset, so the
     /// route stays closed until both have passed.
     pub fn record_account_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
+        self.record_classified_account_route_fence(fence, "quota")
+    }
+
+    pub fn record_transient_account_route_fence(
+        &self,
+        fence: &AccountRouteFence,
+    ) -> RouteStateResult<()> {
+        self.record_classified_account_route_fence(fence, "transient")
+    }
+
+    fn record_classified_account_route_fence(
+        &self,
+        fence: &AccountRouteFence,
+        class: &str,
+    ) -> RouteStateResult<()> {
         self.store
             .with_conn(|conn: &Connection| {
                 conn.execute(
-                    "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at) VALUES (?1,?2,?3,?4,?5,?6,?6) \
+                    "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES (?1,?2,?3,?4,?5,?6,?6,?7) \
                 ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
-                until_ms=MAX(account_route_fence.until_ms,excluded.until_ms), \
+                until_ms=CASE \
+                  WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.until_ms \
+                  WHEN account_route_fence.wall_class='quota' AND excluded.wall_class='transient' THEN account_route_fence.until_ms \
+                  WHEN account_route_fence.wall_class='transient' AND excluded.wall_class='quota' THEN excluded.until_ms \
+                  ELSE MAX(account_route_fence.until_ms,excluded.until_ms) END, \
+                wall_class=CASE WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.wall_class \
+                  WHEN account_route_fence.wall_class='quota' THEN 'quota' ELSE excluded.wall_class END, \
                 recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at), \
-                last_reported_at=MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at)",
+                last_reported_at=CASE \
+                  WHEN account_route_fence.wall_class='quota' AND excluded.wall_class='transient' AND account_route_fence.until_ms>excluded.recorded_at \
+                    THEN account_route_fence.last_reported_at \
+                  ELSE MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at) END",
                     params![
                         fence.provider,
                         fence.credential_id,
                         fence.model,
                         fence.until_ms,
                         fence.decision_id,
-                        fence.recorded_at
+                        fence.recorded_at,
+                        class
                     ],
                 )
                 .map(|_| ())
@@ -683,16 +718,31 @@ impl SqliteRouteStateStore {
         }).map_err(err)
     }
 
-    /// The route fences still standing at `now`. Ended fences are removed on
-    /// reads, not just ignored in memory.
+    /// The quota route fences still standing at `now`. Ended fences of either
+    /// class are removed on reads, not just ignored in memory.
     pub fn account_route_fences(&self, now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
+        self.classified_account_route_fences(now, "quota")
+    }
+
+    pub fn transient_account_route_fences(
+        &self,
+        now: i64,
+    ) -> RouteStateResult<Vec<AccountRouteFence>> {
+        self.classified_account_route_fences(now, "transient")
+    }
+
+    fn classified_account_route_fences(
+        &self,
+        now: i64,
+        class: &str,
+    ) -> RouteStateResult<Vec<AccountRouteFence>> {
         self.store.with_conn(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(Vec::new()); }
             if conn.query_row("SELECT EXISTS(SELECT 1 FROM account_route_fence WHERE until_ms<=?1)", [now], |row| row.get::<_, bool>(0))? {
                 conn.execute("DELETE FROM account_route_fence WHERE until_ms<=?1", [now])?;
             }
-            let mut statement = conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence ORDER BY provider,credential_id,model")?;
-            let rows = statement.query_map([], |row| Ok(AccountRouteFence {
+            let mut statement = conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE wall_class=?1 ORDER BY provider,credential_id,model")?;
+            let rows = statement.query_map([class], |row| Ok(AccountRouteFence {
                 provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,until_ms: row.get(3)?,decision_id: row.get(4)?,recorded_at: row.get(5)?,
             }))?;
             rows.collect()
@@ -1924,5 +1974,112 @@ impl SqliteRouteStateStore {
                 })
             })
             .map_err(err)
+    }
+}
+
+#[cfg(test)]
+mod transient_fence_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_transient_retries_never_install_a_model_failure_backoff() {
+        use prefrontal_routing_core::{
+            DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore,
+        };
+        let scratch = prefrontal_test_support::ScratchDir::new("transient-terminal-backoff");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "transient-terminal-backoff",
+            scratch.path().join("routing.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let error = "Broca run run-sid-gFDZWZSmQVugLiDUwUywV3: provider error: class transient; provider code server_is_overloaded; HTTP 503; Broca said: Responses websocket attempt failed (HttpError 503); code=server_is_overloaded type=service_unavailable_error; credential_id: chatgpt:openai:gmail; provider retries exhausted after 3 retries";
+        for _ in 0..3 {
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_route_key: Some("openai/gpt-6-astra/xhigh".into()),
+                    selected_provider_id: Some("openai".into()),
+                    selected_model_id: Some("gpt-6-astra".into()),
+                    target_agent: "mason".into(),
+                    requirements_json: "{}".into(),
+                    score_json: "{}".into(),
+                    rejected_json: "[]".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .set_decision_outcome(
+                    &decision,
+                    &DecisionOutcomeUpdate {
+                        provider_outcome: None,
+                        outcome: RouteOutcome::SessionError,
+                        last_error: Some(error.into()),
+                        observed_at_ms: 1_000,
+                        failure_backoff: Default::default(),
+                    },
+                )
+                .unwrap();
+        }
+        let snapshot = store.build_snapshot(1_000.0).unwrap();
+        assert_eq!(
+            snapshot
+                .by_route
+                .get("openai/gpt-6-astra/xhigh")
+                .and_then(|state| state.failure_backoff_until),
+            None
+        );
+    }
+
+    #[test]
+    fn transient_fences_never_replace_extend_or_soften_a_live_quota_fence() {
+        let scratch = prefrontal_test_support::ScratchDir::new("transient-quota-fence-merge");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "transient-quota-fence-merge",
+            scratch.path().join("routing.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let mut fence = AccountRouteFence {
+            provider: "openai".into(),
+            credential_id: "chatgpt:openai:gmail".into(),
+            model: "gpt-6-astra".into(),
+            until_ms: 10_000,
+            decision_id: "quota".into(),
+            recorded_at: 1_000,
+        };
+        store.record_account_route_fence(&fence).unwrap();
+        fence.until_ms = 20_000;
+        fence.recorded_at = 2_000;
+        store.record_transient_account_route_fence(&fence).unwrap();
+        assert_eq!(
+            store.account_route_fences(2_000).unwrap()[0].until_ms,
+            10_000
+        );
+        assert!(store
+            .transient_account_route_fences(2_000)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.account_route_fence_latest_reports().unwrap()["chatgpt:openai:gmail"],
+            1_000
+        );
+        fence.recorded_at = 11_000;
+        fence.until_ms = 16_000;
+        store.record_transient_account_route_fence(&fence).unwrap();
+        assert!(store.account_route_fences(11_000).unwrap().is_empty());
+        assert_eq!(
+            store.transient_account_route_fences(11_000).unwrap()[0].until_ms,
+            16_000
+        );
+        fence.recorded_at = 12_000;
+        fence.until_ms = 14_000;
+        store.record_account_route_fence(&fence).unwrap();
+        assert!(store
+            .transient_account_route_fences(12_000)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.account_route_fences(12_000).unwrap()[0].until_ms,
+            14_000
+        );
+        assert!(store.account_route_fences(14_000).unwrap().is_empty());
     }
 }

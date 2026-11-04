@@ -73,6 +73,12 @@ pub use account_selection::{
     AccountSizeRefusal, AccountTx, CredentialProbeClaim, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
 };
 
+pub struct ClearedRouteCooldowns {
+    pub route_key: String,
+    pub routes: Vec<(String, CooldownState)>,
+    pub account_fences: Vec<AccountRouteFence>,
+}
+
 const ROUTE_STATE_NAMESPACE: &str = "route_state";
 
 /// Migration 1: the route-owned schema + the curated 33-fact seed. FROZEN: a
@@ -290,7 +296,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 74] {
+fn route_state_migrations() -> [Migration; 75] {
     [
         Migration {
             version: 1,
@@ -588,7 +594,57 @@ fn route_state_migrations() -> [Migration; 74] {
             version: 75,
             statements: include_str!("../migrations/075_account_service_tiers.sql"),
         },
+        Migration {
+            version: 76,
+            statements: include_str!("../migrations/076_transient_account_route_fence.sql"),
+        },
     ]
+}
+
+impl SqliteRouteStateStore {
+    /// Clear a stored route, or every variant under a base model, atomically.
+    /// A known key is used as-is; otherwise its final colon-separated suffix
+    /// is parsed as a variant.
+    pub fn clear_route_cooldowns(
+        &self,
+        requested: &str,
+    ) -> RouteStateResult<Option<ClearedRouteCooldowns>> {
+        self.store.with_conn(|conn: &Connection| {
+            let tx = conn.unchecked_transaction()?;
+            let known = |key: &str| -> rusqlite::Result<bool> {
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM model_facts WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT 1 FROM model_route_state WHERE route_key=?1 OR capacity_key=?1)", [key], |row| row.get(0))
+            };
+            let requested = requested.trim();
+            let route_key = if known(requested)? {
+                requested.to_owned()
+            } else if let Some((base, variant)) = requested.rsplit_once(':') {
+                let key = format!("{base}/{variant}");
+                if !known(&key)? { return Ok(None); }
+                key
+            } else { return Ok(None); };
+            let identity: Option<(String, String, Option<String>)> = tx.query_row(
+                "SELECT provider_id,model_id,variant FROM model_facts WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT provider_id,model_id,variant FROM model_route_state WHERE route_key=?1 OR capacity_key=?1 LIMIT 1",
+                [&route_key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+            ).optional()?;
+            let Some((provider, model, _variant)) = identity else { return Ok(None); };
+            let capacity = prefrontal_routing_core::make_capacity_key(&provider, &model);
+            let base = route_key == capacity;
+            let routes = {
+                let mut statement = tx.prepare("SELECT route_key,cooldown_until,quota_exhausted_until FROM model_route_state WHERE route_key=?1 OR (?2 AND capacity_key=?3) ORDER BY route_key")?;
+                let rows = statement.query_map(params![route_key,base,capacity], |row| Ok((row.get(0)?, CooldownState { cooldown_until: row.get(1)?, quota_exhausted_until: row.get(2)? })))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            tx.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL,wall_class=NULL,updated_at=?4 WHERE route_key=?1 OR (?2 AND capacity_key=?3)", params![route_key,base,capacity,now_ms()])?;
+            let account_fences = {
+                let mut statement = tx.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE provider=?1 AND model=?2 ORDER BY credential_id")?;
+                let rows = statement.query_map(params![provider,model], |row| Ok(AccountRouteFence { provider:row.get(0)?,credential_id:row.get(1)?,model:row.get(2)?,until_ms:row.get(3)?,decision_id:row.get(4)?,recorded_at:row.get(5)? }))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            tx.execute("DELETE FROM account_route_fence WHERE provider=?1 AND model=?2", params![provider,model])?;
+            tx.commit()?;
+            Ok(Some(ClearedRouteCooldowns {route_key, routes, account_fences}))
+        }).map_err(err)
+    }
 }
 
 fn now_ms() -> i64 {
@@ -4039,7 +4095,8 @@ impl RouteStateStore for SqliteRouteStateStore {
         // route's other credentials.
         let mut normalized = update.clone();
         let last_error = update.last_error.as_deref().unwrap_or("");
-        if prefrontal_routing_core::account_wall::account_scoped_error(last_error)
+        if prefrontal_routing_core::account_wall::transient_error(last_error)
+            || prefrontal_routing_core::account_wall::account_scoped_error(last_error)
             || prefrontal_routing_core::account_wall::credential_refusal_in(last_error).is_some()
             || update
                 .provider_outcome
@@ -4282,45 +4339,17 @@ impl RouteStateStore for SqliteRouteStateStore {
     }
 
     fn clear_cooldown(&self, route_key: &str) -> RouteStateResult<Option<CooldownState>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
-                let known = tx
-                    .query_row(
-                        "SELECT 1 FROM model_facts WHERE route_key = ?1",
-                        [route_key],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                    .is_some();
-                if !known {
-                    return Ok(None);
-                }
-                let prior = tx
-                    .query_row(
-                        "SELECT cooldown_until, quota_exhausted_until
-                     FROM model_route_state WHERE route_key = ?1",
-                        [route_key],
-                        |row| {
-                            Ok(CooldownState {
-                                cooldown_until: row.get(0)?,
-                                quota_exhausted_until: row.get(1)?,
-                            })
-                        },
-                    )
-                    .optional()?
-                    .unwrap_or_default();
-                tx.execute(
-                    "UPDATE model_route_state
-                     SET cooldown_until = NULL, quota_exhausted_until = NULL,
-                         wall_class = NULL, updated_at = ?1
-                     WHERE route_key = ?2",
-                    params![now_ms(), route_key],
-                )?;
-                tx.commit()?;
-                Ok(Some(prior))
-            })
-            .map_err(err)
+        Ok(self.clear_route_cooldowns(route_key)?.map(|cleared| {
+            cleared
+                .routes
+                .into_iter()
+                .fold(CooldownState::default(), |mut total, (_, row)| {
+                    total.cooldown_until = max_defined(total.cooldown_until, row.cooldown_until);
+                    total.quota_exhausted_until =
+                        max_defined(total.quota_exhausted_until, row.quota_exhausted_until);
+                    total
+                })
+        }))
     }
 
     fn get_decisions_for_task(&self, task_id: &str) -> RouteStateResult<Vec<DecisionRow>> {
@@ -4630,6 +4659,12 @@ impl RouteStateStore for SqliteRouteStateStore {
                         state.cooldown_until = None;
                         state.quota_exhausted_until = None;
                         state.wall_class = None;
+                        if prefrontal_routing_core::account_wall::transient_error(
+                            state.last_error.as_deref().unwrap_or_default(),
+                        ) {
+                            state.failure_backoff_until = None;
+                            state.failure_backoff_reason = None;
+                        }
                     }
                     // Capacity-shared signals propagate across variants of the same
                     // provider/model. Soft pressure lives ONLY on the capacity key so a

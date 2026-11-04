@@ -564,11 +564,11 @@ fn whole_route_blocks(rows: &[DiagnosticRouteWall], now_ms: i64) -> Vec<Finding>
                 .iter()
                 .any(|wall| wall.row.wall_class == Some(RouteWallClass::Billing));
             let hint = if billing {
-                "A billing wall: the provider wants payment on this account. Top it up, then route.clear_cooldown {\"routeKey\":...} lifts the wall."
+                format!("[TODO(user): Explain the billing wall and payment remedy, then name route.clear_cooldown {} as the exact command to clear this model and its variants.]", json!({"routeKey": model}))
             } else if longest.reason == "backoff_active" {
-                "Repeated terminal failures backed this route off. Fix the cause the reason names, then route.clear_failure_backoff {\"routeKey\":...} lifts it."
+                format!("[TODO(user): Explain the terminal-failure backoff and fixing its cause, then name route.clear_failure_backoff {} as the exact command to clear it.]", json!({"routeKey": longest.row.route_key}))
             } else {
-                "Routing returns to the route when the wall expires. If the provider's quota view shows headroom, route.clear_cooldown {\"routeKey\":...} lifts the wall now."
+                format!("[TODO(user): Explain that the wall expires automatically; if quota has headroom, route.clear_cooldown {} clears this model and all its variants now.]", json!({"routeKey": model}))
             };
             Finding {
                 check: CHECK_ROUTE_BLOCKS,
@@ -1468,6 +1468,10 @@ mod tests {
         assert_eq!(mercury["samples"][0]["retry_after_ms"], 60 * MINUTE);
         assert_eq!(mercury["samples"][0]["expires_at_ms"], NOW + 60 * MINUTE);
         assert_eq!(mercury["samples"][1]["reason"], "cooldown_active");
+        assert!(mercury["hint"]
+            .as_str()
+            .unwrap()
+            .contains("route.clear_cooldown {\"routeKey\":\"inception/mercury-3\"}"));
         let gpt = found.last().unwrap();
         assert_eq!(gpt["severity"], "warning", "a five-minute backoff");
         assert_eq!(gpt["samples"][0]["reason"], "backoff_active");

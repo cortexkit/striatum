@@ -2,6 +2,73 @@
 use crate::RouteWallClass;
 use serde_json::Value;
 
+/// The worker's existing retry interval for a transient failure without a hint.
+pub const TRANSIENT_BACKOFF_MS: i64 = 5_000;
+
+/// The credential or account identity recorded in a structured provider error.
+pub fn credential_in_error(error: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(error).ok()?;
+    let provider = value.get("provider").unwrap_or(&value);
+    ["credential_id", "auth_selection", "account_ref"]
+        .iter()
+        .find_map(|key| {
+            provider
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+/// Typed transient evidence is not a quota or model-availability wall. Read
+/// structured errors or core's terminal diagnostic fields, never provider prose.
+pub fn transient_error(error: &str) -> bool {
+    serde_json::from_str::<Value>(error)
+        .ok()
+        .or_else(|| terminal_provider_fields(error))
+        .is_some_and(|value| {
+            let provider = value.get("provider").unwrap_or(&value);
+            provider
+                .get("class")
+                .and_then(Value::as_str)
+                .is_some_and(|class| class.eq_ignore_ascii_case("transient"))
+                && !matches!(
+                    provider.get("provider_code").and_then(Value::as_str),
+                    Some(
+                        "account_limit_exhausted"
+                            | "quota"
+                            | "quota_exhausted"
+                            | "provider_quota_error"
+                            | "usage_limit_reached"
+                            | "insufficient_quota"
+                            | "billing_exhausted"
+                            | "billing_error"
+                            | "insufficient_credits"
+                    )
+                )
+        })
+}
+
+/// Core renders exhausted worker retries as a diagnostic rather than JSON.
+/// Stop at the provider-message boundary so quoted text cannot supply a class.
+fn terminal_provider_fields(error: &str) -> Option<Value> {
+    let (run, diagnostic) = error
+        .strip_prefix("Broca run ")?
+        .split_once(": provider error: ")?;
+    if run.is_empty() || run.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let fields = diagnostic.split("; Broca said: ").next()?;
+    let class = fields
+        .split("; ")
+        .find_map(|field| field.strip_prefix("class "))?;
+    let code = fields
+        .split("; ")
+        .find_map(|field| field.strip_prefix("provider code "));
+    Some(serde_json::json!({"class": class, "provider_code": code}))
+}
+
 /// Recognize typed account exhaustion and the exact legacy runner summary core
 /// persisted before account scope was retained through terminalization. Do not
 /// infer scope from a provider's free-form message or from a generic HTTP 429.
@@ -106,15 +173,44 @@ pub fn credential_refusal_in(error: &str) -> Option<(String, String)> {
 /// scoped whatever its class, including billing: routing fences that credential
 /// instead, and rejects the route only once every credential serving it is fenced.
 pub fn account_scoped_wall(error: Option<&str>, class: Option<RouteWallClass>) -> bool {
+    if class == Some(RouteWallClass::Transient) {
+        return true;
+    }
     let Some(error) = error else {
         return false;
     };
-    (class != Some(RouteWallClass::Billing) && account_scoped_error(error))
+    transient_error(error)
+        || (class != Some(RouteWallClass::Billing) && account_scoped_error(error))
         || credential_refusal_in(error).is_some()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exhausted_worker_retry_fields_are_transient_but_quoted_messages_are_not() {
+        assert!(super::transient_error("Broca run run-sid-example: provider error: class transient; provider code server_is_overloaded; HTTP 503; Broca said: unavailable; provider retries exhausted after 3 retries"));
+        assert!(!super::transient_error("Broca run run-sid-example: provider error: class permanent; provider code request_invalid; HTTP 400; Broca said: class transient; provider code server_is_overloaded"));
+        assert!(!super::transient_error(
+            "class transient; provider code server_is_overloaded"
+        ));
+    }
+    #[test]
+    fn typed_quota_codes_remain_hard_even_with_a_transient_runner_class() {
+        for code in [
+            "quota",
+            "quota_exhausted",
+            "provider_quota_error",
+            "usage_limit_reached",
+            "billing_exhausted",
+        ] {
+            let error = serde_json::json!({"class":"transient", "provider_code":code}).to_string();
+            assert!(!super::transient_error(&error), "{code}");
+        }
+        let overload =
+            serde_json::json!({"class":"transient", "provider_code":"server_is_overloaded"})
+                .to_string();
+        assert!(super::transient_error(&overload));
+    }
     use super::*;
 
     #[test]

@@ -8,6 +8,7 @@ use prefrontal_routing_core::accounts::{
 };
 use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
 use prefrontal_routing_core::route_state_store::CredentialRefusal;
+use prefrontal_routing_core::RouteStateStore;
 use prefrontal_routing_store::AccountFenceRow;
 use serde_json::{json, Value};
 use subc_protocol::FrameType;
@@ -18,6 +19,238 @@ use crate::broca_credentials::BrocaCredentials;
 const NOW: u64 = 1_800_000_000_000;
 const RUNNER: &str = "class-runner";
 const OWNER: &str = "class-owner";
+
+#[tokio::test]
+async fn a_legacy_transient_wall_mislabeled_quota_never_refuses_a_model_pin() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    harness
+        .store()
+        .update_route_state(
+            "synthetic/model/xhigh",
+            "synthetic/model",
+            &prefrontal_routing_core::RouteStateUpdate {
+                cooldown_until: Some((NOW + 1_800_000) as f64),
+                wall_class: Some(prefrontal_routing_core::RouteWallClass::Quota),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    conn.execute(
+        "UPDATE model_route_state SET last_error=?1 WHERE route_key='synthetic/model/xhigh'",
+        [
+            json!({"class":"transient","status":503,"provider_code":"server_is_overloaded"})
+                .to_string(),
+        ],
+    )
+    .unwrap();
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let request =
+        json!({"consumer":"mason", "requirements":{"iq":30}, "pin":"synthetic/model:xhigh"});
+    let admitted = caller.call("route.select", &request).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    harness
+        .store()
+        .update_route_state(
+            "synthetic/model",
+            "synthetic/model",
+            &prefrontal_routing_core::RouteStateUpdate {
+                cooldown_until: Some((NOW + 1_800_000) as f64),
+                quota_exhausted_until: Some((NOW + 1_800_000) as f64),
+                wall_class: Some(prefrontal_routing_core::RouteWallClass::Quota),
+                last_error: Some("quota exhausted".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let refused = caller.call("route.select", &request).await;
+    assert_eq!(
+        refused.0,
+        FrameType::Error,
+        "a real quota wall still refuses the pin: {}",
+        refused.1
+    );
+    assert_eq!(refused.1["code"], "pin_unavailable", "{}", refused.1);
+    assert_eq!(refused.1["detail"]["reset_at_ms"], NOW + 1_800_000);
+}
+
+#[tokio::test]
+async fn transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_account_pool() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "three-subscription-accounts".into(),
+            credentials: ["first", "second", "third"]
+                .into_iter()
+                .map(|id| ListedCredential {
+                    id: format!("oauth:{id}"),
+                    account_id: Some(id.into()),
+                    state: "active".into(),
+                    categories: vec!["llm-provider".into()],
+                    provider_ids: vec!["synthetic".into()],
+                    serves: vec!["synthetic".into()],
+                    credential_type: "oauth".into(),
+                    auth_method: Some("oauth".into()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+        NOW,
+    );
+    let mut fact = crate::tests::fact("synthetic", "model");
+    fact.auth_methods = Some(vec!["oauth".into()]);
+    credentials.refresh_serving_methods(&Default::default(), &[fact], NOW as i64, &[]);
+    harness.set_credentials(credentials);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut started = account_request("synthetic", "already-running");
+    started["candidates"] = json!({"view_digest":"test","accounts":[{"account_id":"first","credential_id":"oauth:first"}]});
+    assert_credential(
+        &runner.call("route.account_for", &started).await,
+        "oauth:first",
+    );
+    let observed = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id":"already-running-started", "kind":"admission_started",
+                "admission_id":"already-running", "run_id":"running-before-overload"
+            }),
+        )
+        .await;
+    assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
+    let mut fresh = account_request("synthetic", "fresh-prefers-walled");
+    fresh["candidates"] = json!({"view_digest":"test","accounts":[{"account_id":"first","credential_id":"oauth:first"}]});
+    assert_credential(
+        &runner.call("route.account_for", &fresh).await,
+        "oauth:first",
+    );
+    let record =
+        |credential: &str, class: &str, until: u64| {
+            crate::record_cooldown_update(harness.store(), &serde_json::from_value(json!({
+            "routeKey":"synthetic/model/xhigh", "capacityKey":"synthetic/model",
+            "credentialId":credential, "wallClass":class, "cooldownUntil":until,
+            "lastError":"{\"class\":\"transient\",\"provider_code\":\"server_is_overloaded\"}"
+        })).unwrap()).unwrap();
+        };
+    record("oauth:first", "transient", NOW + 5_000);
+    let mut continued = account_request("synthetic", "already-running");
+    continued["admission_id"] = json!("already-running-next");
+    let held = runner.call("route.account_for", &continued).await;
+    assert_eq!(held.1["code"], "account_hold", "{}", held.1);
+    assert_eq!(held.1["detail"]["until_ms"], NOW + 5_000);
+    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let held_credential: String = conn
+        .query_row("SELECT credential_id FROM account_hold", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(held_credential, "oauth:first");
+    let fences = harness
+        .store()
+        .transient_account_route_fences(NOW as i64)
+        .unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].credential_id, "oauth:first");
+    assert_eq!(fences[0].until_ms, NOW as i64 + 5_000);
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"mason", "requirements":{"iq":30}, "pin":"synthetic/model:xhigh"
+            }),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let mut request = account_request("synthetic", "fresh-prefers-walled");
+    request["admission_id"] = json!("fresh-prefers-walled-next");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    assert!(
+        matches!(
+            admitted.1["result"]["account"]["credential_id"].as_str(),
+            Some("oauth:second" | "oauth:third")
+        ),
+        "{}",
+        admitted.1
+    );
+    for id in ["second", "third"] {
+        let mut request = account_request("synthetic", &format!("selectable-{id}"));
+        request["candidates"] = json!({"view_digest":"test","accounts":[{
+            "account_id":id,"credential_id":format!("oauth:{id}")
+        }]});
+        assert_credential(
+            &runner.call("route.account_for", &request).await,
+            &format!("oauth:{id}"),
+        );
+        record(&format!("oauth:{id}"), "transient", NOW + 5_000);
+    }
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"mason", "requirements":{"iq":30}, "pin":"synthetic/model"
+            }),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let mut request = account_request("synthetic", "all-transient-last-resort");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    assert!(
+        admitted.1["result"]["account"]["credential_id"].is_string(),
+        "{}",
+        admitted.1
+    );
+
+    harness
+        .store()
+        .update_route_state(
+            "synthetic/model",
+            "synthetic/model",
+            &prefrontal_routing_core::RouteStateUpdate {
+                cooldown_until: Some((NOW + 1_800_000) as f64),
+                quota_exhausted_until: Some((NOW + 1_800_000) as f64),
+                wall_class: Some(prefrontal_routing_core::RouteWallClass::Quota),
+                last_error: Some("quota exhausted".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    record("oauth:first", "transient", NOW + 5_000);
+    let refused = caller
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"mason", "requirements":{"iq":30}, "pin":"synthetic/model"
+            }),
+        )
+        .await;
+    assert_eq!(
+        refused.0,
+        FrameType::Error,
+        "a transient must not lift a quota wall: {}",
+        refused.1
+    );
+    assert_eq!(refused.1["code"], "pin_unavailable", "{}", refused.1);
+    assert_eq!(refused.1["detail"]["reset_at_ms"], NOW + 1_800_000);
+    let cleared = harness
+        .store()
+        .clear_route_cooldowns("synthetic/model")
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.account_fences.len(), 3);
+    assert!(harness
+        .store()
+        .transient_account_route_fences(NOW as i64)
+        .unwrap()
+        .is_empty());
+}
 
 #[tokio::test]
 async fn credential_probe_admission_is_single_and_completion_heals_its_credential() {
