@@ -94,6 +94,8 @@ pub type RouteStateResult<T> = Result<T, RouteStateStoreError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteWallClass {
+    /// An account-local retry interval, never a hard model-admission wall.
+    Transient,
     Quota,
     Billing,
 }
@@ -101,6 +103,7 @@ pub enum RouteWallClass {
 impl RouteWallClass {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Transient => "transient",
             Self::Quota => "quota",
             Self::Billing => "billing",
         }
@@ -108,6 +111,7 @@ impl RouteWallClass {
 
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
+            "transient" => Ok(Self::Transient),
             "quota" => Ok(Self::Quota),
             "billing" => Ok(Self::Billing),
             other => Err(format!("unknown route wall class {other:?}")),
@@ -524,7 +528,7 @@ pub trait RouteStateStore {
         Ok(None)
     }
 
-    /// Clear only route-local cooldown and quota walls for an exact catalog key.
+    /// Clear cooldown and quota walls for a route, including variants of a base key.
     /// `None` means the route is unknown; known routes without state return empty horizons.
     fn clear_cooldown(&self, _route_key: &str) -> RouteStateResult<Option<CooldownState>> {
         Ok(None)

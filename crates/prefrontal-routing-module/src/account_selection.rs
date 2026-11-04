@@ -182,6 +182,7 @@ pub(crate) struct ClassContext {
     eligibility: Vec<prefrontal_routing_store::AccountEligibilityFact>,
     size_refusals: Vec<prefrontal_routing_store::AccountSizeRefusal>,
     route_fences: Vec<prefrontal_routing_store::AccountRouteFence>,
+    transient_route_fences: Vec<prefrontal_routing_store::AccountRouteFence>,
     catalog: BTreeSet<String>,
     targets: BTreeMap<String, String>,
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
@@ -515,6 +516,9 @@ impl ClassContext {
         let latest_reports = store
             .account_route_fence_latest_reports()
             .map_err(|error| error.to_string())?;
+        let transient_route_fences = store
+            .transient_account_route_fences(now_ms)
+            .map_err(|error| error.to_string())?;
         let credentials_with_headroom: BTreeSet<_> = route_fences
             .iter()
             .filter_map(|fence| {
@@ -586,6 +590,7 @@ impl ClassContext {
             eligibility,
             size_refusals,
             route_fences,
+            transient_route_fences,
             catalog,
             targets,
             tier_accounts: None,
@@ -888,8 +893,28 @@ impl ClassContext {
     }
 
     fn roster_for(&self, provider: &str, model: &str, priced_per_token: bool) -> RosterBuild {
-        self.roster_and_fences_for(provider, model, priced_per_token)
-            .0
+        let mut roster = self
+            .roster_and_fences_for(provider, model, priced_per_token)
+            .0;
+        self.avoid_transient_accounts(&mut roster, provider, model);
+        roster
+    }
+
+    /// A new conversation has no cache to preserve. Prefer an open account,
+    /// but keep the roster intact when retrying a transient is the only option.
+    fn avoid_transient_accounts(&self, roster: &mut RosterBuild, provider: &str, model: &str) {
+        let fenced = self.accounts_fenced_by(&self.transient_route_fences, provider, model);
+        if let Some(roster) = &mut roster.roster {
+            if roster
+                .accounts
+                .iter()
+                .any(|account| !fenced.contains_key(&account.account_id))
+            {
+                roster
+                    .accounts
+                    .retain(|account| !fenced.contains_key(&account.account_id));
+            }
+        }
     }
 
     /// The roster for one route, and the accounts of its class left out of it
@@ -935,8 +960,17 @@ impl ClassContext {
     /// when the fence ends. A fence names the credential that served; the
     /// whole account it belongs to is closed for this route.
     fn route_fenced_accounts(&self, provider: &str, model: &str) -> BTreeMap<String, i64> {
+        self.accounts_fenced_by(&self.route_fences, provider, model)
+    }
+
+    fn accounts_fenced_by(
+        &self,
+        fences: &[prefrontal_routing_store::AccountRouteFence],
+        provider: &str,
+        model: &str,
+    ) -> BTreeMap<String, i64> {
         let mut fenced: BTreeMap<String, i64> = BTreeMap::new();
-        for fence in self.route_fences.iter().filter(|fence| {
+        for fence in fences.iter().filter(|fence| {
             fence.provider == provider && fence.model == model && fence.until_ms > self.now_ms
         }) {
             let account = self
@@ -3625,6 +3659,17 @@ fn serve(
     let salt = tx.salt(now, fresh_salt)?;
     let hash = conversation_hash(&salt, principal, &params.conversation_key);
     let affinity_row = tx.affinity(principal, &hash, provider)?;
+    let established = match affinity_row.as_ref() {
+        Some(affinity) => tx.pin_has_started(affinity)?,
+        None => false,
+    };
+    let mut roster = roster.clone();
+    if !established {
+        if let Some(classes) = &ctx.classes {
+            classes.avoid_transient_accounts(&mut roster, provider, &params.model);
+        }
+    }
+    let roster = &roster;
     if let Some(expected) = &params.expected_pin {
         let current = affinity_row
             .as_ref()
@@ -3671,7 +3716,7 @@ fn serve(
         policy,
     };
     let request = params.request(principal, affinity_row.is_none());
-    let decision = loop {
+    let mut decision = loop {
         let decision =
             prefrontal_routing_core::accounts::decide_with_context(&request, &state, now, &inputs);
         let Outcome::Admit(admission) = &decision.outcome else {
@@ -3703,6 +3748,39 @@ fn serve(
             }
         }
     };
+    if established {
+        if let (Some(affinity), Outcome::Admit(admitted), Some(classes)) = (
+            state.affinity.as_ref(),
+            &decision.outcome,
+            ctx.classes.as_ref(),
+        ) {
+            if admitted.account_id == affinity.account_id
+                && admitted.credential_id == affinity.credential_id
+            {
+                if let Some(until) = classes
+                    .accounts_fenced_by(&classes.transient_route_fences, provider, &params.model)
+                    .get(&affinity.account_id)
+                {
+                    let seconds = until.saturating_sub(now).max(0) as u64;
+                    let seconds = seconds.div_ceil(1_000);
+                    decision.outcome = Outcome::Hold(prefrontal_routing_core::accounts::Hold {
+                        account_id: affinity.account_id.clone(),
+                        credential_id: affinity.credential_id.clone(),
+                        pin_id: affinity.pin_id.clone(),
+                        pin_generation: affinity.pin_generation,
+                        reset_at_ms: *until,
+                        base_retry_after_s: seconds,
+                        retry_after_s: seconds,
+                        basis: prefrontal_routing_core::accounts::HoldBasis::ConfirmedFence,
+                    });
+                    decision.explanation.affinity =
+                        prefrontal_routing_core::accounts::AffinityNote::Held {
+                            account_id: affinity.account_id.clone(),
+                        };
+                }
+            }
+        }
+    }
     let decision_id = new_id("acd");
     tx.insert_decision(&decision_record(RecordInput {
         decision_id: &decision_id,
