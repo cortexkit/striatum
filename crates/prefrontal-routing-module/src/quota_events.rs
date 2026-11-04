@@ -597,8 +597,7 @@ pub(super) async fn run(
         store,
         snapshot_baseline: Default::default(),
     };
-    let project_root =
-        prefrontal_core_store::scratch_root().join("prefrontal-routing-quota-consumer");
+    let project_root = std::env::temp_dir().join("prefrontal-routing-quota-consumer");
     let _ = std::fs::create_dir_all(&project_root);
     let mut source = Insula::new(connection_file.clone(), project_root);
     let mut state = SequenceState::default();

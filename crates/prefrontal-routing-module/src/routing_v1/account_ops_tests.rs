@@ -25,7 +25,7 @@ async fn session(harness: &Arc<Harness>, owner: &str, reference: &str, kind: &st
     harness.bind_frame(json!({
         "op":"route.bind", "route_channel":channel,"epoch":1,
         "target":{"kind":"management_surface","module_id":crate::DEFAULT_MODULE_ID},
-        "identity":{"project_root":prefrontal_test_support::scratch_root(),"harness":"account-ops","session":format!("session-{channel}")},
+        "identity":{"project_root":cortexkit_test_support::scratch_root(),"harness":"account-ops","session":format!("session-{channel}")},
         "principal":reserved("bridge-relay"),
         "scope":{"owner":reserved(owner),"ref":reference,"scope_epoch":7,"kind":kind,"owner_authorized":true}
     }), channel, 1).await

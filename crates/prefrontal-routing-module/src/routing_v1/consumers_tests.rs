@@ -83,7 +83,7 @@ async fn scoped(
     harness.bind_frame(json!({
         "op": "route.bind", "route_channel": channel, "epoch": epoch,
         "target": { "kind": "management_surface", "module_id": crate::DEFAULT_MODULE_ID },
-        "identity": { "project_root": prefrontal_test_support::scratch_root(), "harness": "consumer-admission", "session": "session-1" },
+        "identity": { "project_root": cortexkit_test_support::scratch_root(), "harness": "consumer-admission", "session": "session-1" },
         "principal": reserved("broca"),
         "scope": { "owner": reserved(owner), "ref": "codemode-run", "kind": "ephemeral", "scope_epoch": 7, "project_id": "project-1", "owner_authorized": authorized }
     }), channel, epoch).await

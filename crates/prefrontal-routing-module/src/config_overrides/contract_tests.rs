@@ -10,7 +10,7 @@ struct Rig {
 impl Rig {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "routing-schema-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)

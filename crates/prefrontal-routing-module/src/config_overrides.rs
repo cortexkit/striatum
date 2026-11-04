@@ -884,7 +884,7 @@ mod live_snapshot_tests {
 
     #[test]
     fn changed_config_is_debounced_and_in_flight_snapshot_stays_immutable() {
-        let dir = prefrontal_test_support::scratch_root()
+        let dir = cortexkit_test_support::scratch_root()
             .join(format!("routing-config-debounce-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing.jsonc");
@@ -2159,7 +2159,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = prefrontal_test_support::scratch_root().join(format!(
+        let root = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-family-rules-{label}-{}-{timestamp}",
             std::process::id()
         ));
@@ -2346,7 +2346,7 @@ mod tests {
     #[test]
     fn unreadable_override_base_is_not_replaced_from_defaults() {
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-override-read-fault-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2393,7 +2393,7 @@ mod tests {
     #[test]
     fn unreadable_stale_override_base_is_not_reverted_from_seed() {
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-stale-override-read-fault-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2448,7 +2448,7 @@ mod tests {
         // arm erased fable-5/opus-5/opus-5-fast on 2026-08-10 when their stale
         // pre-Elo overrides were cleaned from the live config, and the loss
         // surfaced two layers away as a roster seat failing missing_fact.
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-demote-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2511,7 +2511,7 @@ mod tests {
 
     #[test]
     fn consecutive_terminal_failure_threshold_is_configurable_and_rejects_zero() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-failure-threshold-test-{}",
             std::process::id()
         ));
@@ -2544,7 +2544,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-min-band-read-test-{}-{n}",
             std::process::id()
         ));
@@ -2594,7 +2594,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-cache-policy-test-{}-{n}",
             std::process::id()
         ));
@@ -2634,7 +2634,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-cache-policy-mtime-test-{}-{n}",
             std::process::id()
         ));
@@ -2720,7 +2720,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-operator-policy-test-{}-{n}",
             std::process::id()
         ));
@@ -2815,7 +2815,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-operator-policy-broken-test-{}-{n}",
             std::process::id()
         ));
@@ -2893,7 +2893,7 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-elo-live-test-{}-{n}",
             std::process::id()
         ));
@@ -2941,7 +2941,7 @@ mod overqualification_config_tests {
     use super::*;
 
     fn apply(document: Option<&str>) -> Result<RoutingConfig, String> {
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-overqualification-{}-{}.jsonc",
             std::process::id(),
             document.map(|d| d.len()).unwrap_or(0)
@@ -3014,7 +3014,7 @@ mod catalog_poll_tests {
 
     #[test]
     fn catalog_poll_ms_defaults_reads_and_rejects_zero() {
-        let missing = prefrontal_test_support::scratch_root().join(format!(
+        let missing = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-missing-catalog-poll-{}",
             std::process::id()
         ));
@@ -3024,7 +3024,7 @@ mod catalog_poll_tests {
             DEFAULT_CATALOG_POLL_MS
         );
 
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-catalog-poll-{}.jsonc",
             std::process::id()
         ));
@@ -3103,7 +3103,7 @@ mod route_pricing_tests {
     /// later edits publish, are refused, or withdraw the file.
     #[test]
     fn published_pricing_belongs_to_its_snapshot_and_reloads_never_alter_it() {
-        let dir = prefrontal_test_support::scratch_root()
+        let dir = cortexkit_test_support::scratch_root()
             .join(format!("routing-pricing-snapshot-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("routing.jsonc");

@@ -1596,7 +1596,7 @@ pub(crate) async fn ingest_before_upsert(
     });
     let snapshot = if !cached {
         if let Some(connection) = connection {
-            let root = prefrontal_core_store::scratch_root().join("routing-upsert-catalog");
+            let root = std::env::temp_dir().join("routing-upsert-catalog");
             let mut client = FusiformCatalogConsumer::connect(&connection, &root).await?;
             let snapshot = client.catalog_get().await?;
             client.close().await?;
@@ -1838,7 +1838,7 @@ mod tests {
 
     impl Rig {
         fn new(label: &str) -> Self {
-            let dir = prefrontal_test_support::scratch_root().join(format!(
+            let dir = cortexkit_test_support::scratch_root().join(format!(
                 "prefrontal-fusiform-{label}-{}",
                 std::process::id()
             ));

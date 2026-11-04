@@ -55,7 +55,7 @@ async fn scoped(
         "epoch": epoch,
         "target": { "kind": "management_surface", "module_id": crate::DEFAULT_MODULE_ID },
         "identity": {
-            "project_root": prefrontal_test_support::scratch_root(),
+            "project_root": cortexkit_test_support::scratch_root(),
             "harness": "routing-scope-attribution",
             "session": format!("session-{channel}"),
         },

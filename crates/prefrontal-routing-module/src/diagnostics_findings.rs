@@ -1240,7 +1240,7 @@ mod tests {
 
     #[test]
     fn dormant_model_findings_name_config_keys_and_catalog_version() {
-        let scratch = prefrontal_test_support::ScratchDir::new("dormant-model-findings");
+        let scratch = cortexkit_test_support::ScratchDir::new("dormant-model-findings");
         let path = scratch.join("routing.jsonc");
         crate::test_config::write(
             &path,

@@ -412,7 +412,7 @@ mod tests {
     impl StoreRig {
         fn new(label: &str) -> Self {
             let sequence = TEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-            let directory = prefrontal_test_support::scratch_root().join(format!(
+            let directory = cortexkit_test_support::scratch_root().join(format!(
                 "available-models-text-{label}-{}-{sequence}",
                 std::process::id()
             ));

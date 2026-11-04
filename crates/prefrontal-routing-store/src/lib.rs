@@ -4853,7 +4853,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = prefrontal_test_support::scratch_root().join(format!(
+        let root = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-private-state-{}-{timestamp}",
             std::process::id()
         ));
@@ -4894,7 +4894,7 @@ mod tests {
     #[test]
     fn migration_065_preserves_062_evidence_and_freezes_historical_classes() {
         use prefrontal_routing_core::accounts::{AllowedAccountClass, ModelFamily, PoolScope};
-        let scratch = prefrontal_test_support::ScratchDir::new("routing-policy-065");
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-policy-065");
         let descriptor = dev_descriptor(
             "routing-policy-065",
             scratch.path().join("store.db").to_string_lossy(),
@@ -5067,7 +5067,7 @@ mod tests {
 
     #[test]
     fn migration_065_upgrades_a_deployed_064_database() {
-        let scratch = prefrontal_test_support::ScratchDir::new("routing-migration-064");
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-migration-064");
         let descriptor = dev_descriptor(
             "routing-migration-064",
             scratch.path().join("store.db").to_string_lossy(),
@@ -5094,7 +5094,7 @@ mod tests {
     #[test]
     fn whole_account_recovery_set_survives_restart() {
         use prefrontal_routing_core::accounts::{ModelFamily, PoolKey, PoolScope};
-        let scratch = prefrontal_test_support::ScratchDir::new("routing-pool-recovery");
+        let scratch = cortexkit_test_support::ScratchDir::new("routing-pool-recovery");
         let descriptor = dev_descriptor(
             "routing-pool-recovery",
             scratch.path().join("store.db").to_string_lossy(),
@@ -5166,7 +5166,7 @@ mod tests {
 
     #[test]
     fn legacy_account_wall_is_quarantined_without_erasing_evidence_or_real_walls() {
-        let scratch = prefrontal_test_support::ScratchDir::new("account-wall-quarantine");
+        let scratch = cortexkit_test_support::ScratchDir::new("account-wall-quarantine");
         let store = SqliteRouteStateStore::open(&dev_descriptor(
             "account-wall-quarantine",
             scratch.path().join("store.db").to_string_lossy(),
@@ -5228,7 +5228,7 @@ mod tests {
 
     #[test]
     fn route_state_writers_keep_account_exhaustion_out_of_model_health() {
-        let scratch = prefrontal_test_support::ScratchDir::new("account-wall-writers");
+        let scratch = cortexkit_test_support::ScratchDir::new("account-wall-writers");
         let store = SqliteRouteStateStore::open(&dev_descriptor(
             "account-wall-writers",
             scratch.path().join("store.db").to_string_lossy(),
@@ -5312,7 +5312,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-clear-failure-backoff-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -5401,7 +5401,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-catalog-generation-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -5450,7 +5450,7 @@ mod tests {
 
     #[test]
     fn migration_053_keeps_legacy_execution_identity_unknown() {
-        let scratch = prefrontal_test_support::scratch_root().join(format!(
+        let scratch = cortexkit_test_support::scratch_root().join(format!(
             "routing-selected-identity-{}-{}",
             std::process::id(),
             short_id()
@@ -5497,7 +5497,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-shadow-retirement-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -5636,7 +5636,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-aa-inferred-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -5697,7 +5697,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-family-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -5756,7 +5756,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-family-refusal-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -5806,7 +5806,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-observed-speed-{label}-{}-{timestamp}.sqlite",
             std::process::id()
         ));
@@ -6578,7 +6578,7 @@ mod tests {
 
     #[test]
     fn migration_054_copies_recent_failures_found_through_the_created_at_index() {
-        let scratch = prefrontal_test_support::scratch_root().join(format!(
+        let scratch = cortexkit_test_support::scratch_root().join(format!(
             "routing-parent-failures-{}-{}",
             std::process::id(),
             short_id()
@@ -6759,7 +6759,7 @@ mod tests {
     /// recent runner event's key.
     #[test]
     fn migration_058_rebuilds_the_account_tables_without_history_foreign_keys() {
-        let scratch = prefrontal_test_support::scratch_root().join(format!(
+        let scratch = cortexkit_test_support::scratch_root().join(format!(
             "routing-history-foreign-keys-{}-{}",
             std::process::id(),
             short_id()
@@ -6879,7 +6879,7 @@ mod tests {
     /// and their foreign keys as they were before that rebuild.
     #[test]
     fn migration_058_refuses_a_store_with_a_dangling_pin_reference() {
-        let scratch = prefrontal_test_support::scratch_root().join(format!(
+        let scratch = cortexkit_test_support::scratch_root().join(format!(
             "routing-history-foreign-keys-dangling-{}-{}",
             std::process::id(),
             short_id()
@@ -7026,7 +7026,7 @@ mod tests {
     }
 
     fn fingerprint_test_store(
-        scratch: &prefrontal_test_support::ScratchDir,
+        scratch: &cortexkit_test_support::ScratchDir,
         label: &str,
     ) -> SqliteRouteStateStore {
         SqliteRouteStateStore::open(&dev_descriptor(
@@ -7098,7 +7098,7 @@ mod tests {
 
     #[test]
     fn cached_catalog_fingerprint_equals_a_fresh_hash_after_every_kind_of_catalog_write() {
-        let scratch = prefrontal_test_support::ScratchDir::new("catalog-fingerprint-cache");
+        let scratch = cortexkit_test_support::ScratchDir::new("catalog-fingerprint-cache");
         let store = fingerprint_test_store(&scratch, "catalog-fingerprint-cache");
         let mut seen = Vec::new();
         assert_fingerprint_follows(&store, "seeded catalog", &mut seen);
@@ -7178,7 +7178,7 @@ mod tests {
 
     #[test]
     fn a_fingerprint_read_inside_a_rolled_back_catalog_write_is_never_reused() {
-        let scratch = prefrontal_test_support::ScratchDir::new("catalog-fingerprint-rollback");
+        let scratch = cortexkit_test_support::ScratchDir::new("catalog-fingerprint-rollback");
         let store = fingerprint_test_store(&scratch, "catalog-fingerprint-rollback");
         let committed = store.catalog_fingerprint().unwrap();
         let fact = store.get_facts().unwrap().remove(0);
@@ -7268,7 +7268,7 @@ mod tests {
 
     #[test]
     fn a_missing_change_counter_falls_back_to_a_fresh_fingerprint_and_tracking_returns() {
-        let scratch = prefrontal_test_support::ScratchDir::new("catalog-fingerprint-lost-counter");
+        let scratch = cortexkit_test_support::ScratchDir::new("catalog-fingerprint-lost-counter");
         let store = fingerprint_test_store(&scratch, "catalog-fingerprint-lost-counter");
         let route_key = first_route_key(&store);
         store.catalog_fingerprint().unwrap();
@@ -7298,7 +7298,7 @@ mod tests {
 
     #[test]
     fn a_reinstalled_change_counter_never_serves_a_fingerprint_cached_before_the_loss() {
-        let scratch = prefrontal_test_support::ScratchDir::new("catalog-fingerprint-reinstall");
+        let scratch = cortexkit_test_support::ScratchDir::new("catalog-fingerprint-reinstall");
         let store = fingerprint_test_store(&scratch, "catalog-fingerprint-reinstall");
         let route_key = first_route_key(&store);
         let start = facts_write_count(&store);

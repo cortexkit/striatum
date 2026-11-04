@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn known_route_capabilities_family_uses_catalog_lineage() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "routing-capabilities-lineage-{}",
             std::process::id()
         ));
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn unknown_route_keeps_an_empty_capabilities_snapshot() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "routing-capabilities-unknown-{}",
             std::process::id()
         ));
@@ -530,7 +530,7 @@ mod tests {
     /// caller can invalidate a cached answer after a catalog refresh.
     #[test]
     fn capabilities_reply_states_the_catalog_it_was_computed_against() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-capabilities-version-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

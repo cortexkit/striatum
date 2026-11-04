@@ -7,7 +7,7 @@ mod config_convert;
 mod test_config;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Home(PathBuf);
@@ -15,7 +15,7 @@ struct Home(PathBuf);
 impl Home {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "routing-startup-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -34,10 +34,10 @@ impl Home {
     }
 
     fn run(&self, xdg: bool) -> Output {
-        let binary = prefrontal_test_support::stage_test_binary(Path::new(env!(
+        let binary = cortexkit_test_support::stage_test_binary(Path::new(env!(
             "CARGO_BIN_EXE_ck-prefrontal-routing"
         )));
-        let mut command = Command::new(binary);
+        let mut command = cortexkit_test_support::fenced_command(&binary, &self.0);
         command.env("HOME", &self.0).env_remove("XDG_CONFIG_HOME");
         if xdg {
             command.env("XDG_CONFIG_HOME", self.0.join("xdg"));

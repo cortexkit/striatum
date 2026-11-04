@@ -306,7 +306,7 @@ mod tests {
 
     impl Rig {
         fn new(label: &str) -> Self {
-            let dir = prefrontal_test_support::scratch_root().join(format!(
+            let dir = cortexkit_test_support::scratch_root().join(format!(
                 "task-profile-{label}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()

@@ -22,7 +22,7 @@ tracing = { workspace = true }
 test-support = []
 
 [dev-dependencies]
-prefrontal-test-support = { path = "../prefrontal-test-support" }
+cortexkit-test-support = "=0.1.12"
 # Integration tests and examples compile the library as a dependency, without
 # cfg(test); this turns on the test-support modules they read.
 prefrontal-routing-store = { path = ".", features = ["test-support"] }

@@ -3,8 +3,8 @@ use prefrontal_routing_core::model_resolution::{
     build_speed_sample_observation, build_usage_observation, NativeUsageFacts,
 };
 
-fn test_store(label: &str) -> (prefrontal_test_support::ScratchDir, SqliteRouteStateStore) {
-    let scratch = prefrontal_test_support::ScratchDir::new(label);
+fn test_store(label: &str) -> (cortexkit_test_support::ScratchDir, SqliteRouteStateStore) {
+    let scratch = cortexkit_test_support::ScratchDir::new(label);
     let store = SqliteRouteStateStore::open(&dev_descriptor(
         label,
         scratch.path().join("routing.db").to_string_lossy(),
@@ -166,7 +166,7 @@ fn speed_samples_apply_window_limit_and_idempotency_per_population() {
 
 #[test]
 fn speed_sample_migration_preserves_existing_usage() {
-    let scratch = prefrontal_test_support::ScratchDir::new("speed-sample-migration");
+    let scratch = cortexkit_test_support::ScratchDir::new("speed-sample-migration");
     let descriptor = dev_descriptor(
         "speed-sample-migration",
         scratch.path().join("routing.db").to_string_lossy(),

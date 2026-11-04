@@ -36,7 +36,7 @@ impl Rig {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-store-{label}-{}-{nanos}-{n}",
             std::process::id()
         ));

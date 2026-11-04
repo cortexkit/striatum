@@ -541,7 +541,7 @@ mod tests {
 
     #[test]
     fn a_bad_retention_block_does_not_depend_on_the_rest_of_the_file() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-retention-config-{}",
             std::process::id()
         ));
@@ -588,7 +588,7 @@ mod tests {
 
     #[test]
     fn one_pass_purges_at_most_its_shadow_budget_and_the_next_continues() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-retention-pass-{}",
             std::process::id()
         ));
@@ -637,7 +637,7 @@ mod tests {
     /// decision a restore left out of the ledger, on the decision window.
     #[test]
     fn a_pass_prunes_old_event_keys_and_orphaned_parent_failures() {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-retention-keys-{}",
             std::process::id()
         ));

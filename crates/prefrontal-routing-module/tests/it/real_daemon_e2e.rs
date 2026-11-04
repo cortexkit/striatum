@@ -19,7 +19,7 @@ mod common;
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
-use prefrontal_test_support::TestDaemon as Child;
+use cortexkit_test_support::TestDaemon as Child;
 
 use common::{
     connect_consumer, control_rpc, raw_route_frame, route_close, route_open, route_select,
@@ -101,12 +101,12 @@ impl Drop for RealDaemon {
 }
 
 async fn start_real_daemon() -> RealDaemon {
-    let subc_core = prefrontal_test_support::SubcDaemonBinary::build();
-    let module_bin = prefrontal_test_support::stage_test_binary(std::path::Path::new(env!(
+    let subc_core = cortexkit_test_support::SubcDaemonBinary::build(&["commons"]);
+    let module_bin = cortexkit_test_support::stage_test_binary(std::path::Path::new(env!(
         "CARGO_BIN_EXE_ck-prefrontal-routing"
     )));
     // Warm-exec the freshly built module binary too (same assessment stall).
-    prefrontal_test_support::warm_exec_fenced(&module_bin);
+    cortexkit_test_support::warm_exec_fenced(&module_bin);
     assert!(module_bin.exists());
 
     let rig = unique_temp_dir("prefrontal-routing-real-daemon");
@@ -136,6 +136,7 @@ async fn start_real_daemon() -> RealDaemon {
 
     let child = subc_core
         .command(&rig)
+        .fenced_root("PREFRONTAL_WORKTREE_ROOT", "worktree")
         .env("SUBC_PORT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

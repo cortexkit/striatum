@@ -125,7 +125,7 @@ mod tests {
         use prefrontal_routing_store::{
             dev_descriptor, FusiformCatalogCursor, SqliteRouteStateStore,
         };
-        let scratch = prefrontal_test_support::ScratchDir::new("manual-upsert-config-presence");
+        let scratch = cortexkit_test_support::ScratchDir::new("manual-upsert-config-presence");
         let descriptor = dev_descriptor(
             "manual-upsert-config-presence",
             scratch.join("store.sqlite").to_string_lossy().into_owned(),

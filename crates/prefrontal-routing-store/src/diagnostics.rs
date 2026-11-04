@@ -317,7 +317,7 @@ mod tests {
     const NOW: i64 = 1_800_000_000_000;
 
     fn store(label: &str) -> SqliteRouteStateStore {
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "routing-diagnostics-store-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

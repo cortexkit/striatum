@@ -82,7 +82,7 @@ impl Harness {
     pub(super) fn new_at_version(label: &str, version: Option<u32>) -> Arc<Self> {
         super::consumers::replace_catalog(&json!([]));
         let n = NEXT_HARNESS.fetch_add(1, Ordering::Relaxed);
-        let dir = prefrontal_test_support::scratch_root().join(format!(
+        let dir = cortexkit_test_support::scratch_root().join(format!(
             "prefrontal-routing-v1-{label}-{}-{n}",
             std::process::id()
         ));
@@ -192,7 +192,7 @@ impl Harness {
             "epoch": epoch,
             "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
             "identity": {
-                "project_root": prefrontal_test_support::scratch_root(),
+                "project_root": cortexkit_test_support::scratch_root(),
                 "harness": "routing-v1-conformance",
                 "session": format!("session-{channel}"),
             },
@@ -981,7 +981,7 @@ impl RoutingSubject for KitSubject {
             let bind = json!({
                 "op": "route.bind", "route_channel": channel, "epoch": 1,
                 "target": { "kind": "management_surface", "module_id": DEFAULT_MODULE_ID },
-                "identity": { "project_root": prefrontal_test_support::scratch_root(), "harness": "routing-kit", "session": format!("session-{channel}") },
+                "identity": { "project_root": cortexkit_test_support::scratch_root(), "harness": "routing-kit", "session": format!("session-{channel}") },
                 "principal": reserved(&stamp.principal),
                 "scope": { "owner": reserved(&scope.owner), "ref": scope.scope_ref, "scope_epoch": scope.scope_epoch, "kind": "ephemeral", "project_id": stamp.project_id, "owner_authorized": true },
             });

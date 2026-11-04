@@ -285,7 +285,7 @@ async fn bind_operator(
     let mut bind = json!({
         "op":"route.bind", "route_channel":channel, "epoch":1,
         "target":{"kind":"management_surface","module_id":crate::DEFAULT_MODULE_ID},
-        "identity":{"project_root":prefrontal_test_support::scratch_root(),"harness":harness_id,"session":session},
+        "identity":{"project_root":cortexkit_test_support::scratch_root(),"harness":harness_id,"session":session},
         "principal":principal,
     });
     if scoped {

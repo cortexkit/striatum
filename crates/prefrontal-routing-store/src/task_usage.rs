@@ -180,7 +180,7 @@ mod tests {
     const NOW: i64 = 100 * DAY_MS;
 
     fn descriptor(label: &str) -> cortexkit_store_types::StorageDescriptor {
-        let path = prefrontal_test_support::scratch_root().join(format!(
+        let path = cortexkit_test_support::scratch_root().join(format!(
             "routing-task-usage-{label}-{}-{}.sqlite",
             std::process::id(),
             std::time::SystemTime::now()
