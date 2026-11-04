@@ -21,7 +21,8 @@ pub fn credential_in_error(error: &str) -> Option<String> {
         })
 }
 
-/// Typed transient evidence is not a quota or model-availability wall. Read
+/// A transient provider error is not evidence that an account's quota ran out
+/// or that a model is unavailable, so it never blocks the model. Read the
 /// structured provider fields, never diagnostic prose.
 pub fn transient_error(error: &str) -> bool {
     serde_json::from_str::<Value>(error)
