@@ -564,11 +564,11 @@ fn whole_route_blocks(rows: &[DiagnosticRouteWall], now_ms: i64) -> Vec<Finding>
                 .iter()
                 .any(|wall| wall.row.wall_class == Some(RouteWallClass::Billing));
             let hint = if billing {
-                format!("[TODO(user): Explain the billing wall and payment remedy, then name route.clear_cooldown {} as the exact command to clear this model and its variants.]", json!({"routeKey": model}))
+                format!("A billing wall: the provider wants payment on this account. Top it up, then route.clear_cooldown {} lifts the wall for this model and all its variants.", json!({"routeKey": model}))
             } else if longest.reason == "backoff_active" {
-                format!("[TODO(user): Explain the terminal-failure backoff and fixing its cause, then name route.clear_failure_backoff {} as the exact command to clear it.]", json!({"routeKey": longest.row.route_key}))
+                format!("Repeated terminal failures backed this route off. Fix the cause the reason names, then route.clear_failure_backoff {} lifts it.", json!({"routeKey": longest.row.route_key}))
             } else {
-                format!("[TODO(user): Explain that the wall expires automatically; if quota has headroom, route.clear_cooldown {} clears this model and all its variants now.]", json!({"routeKey": model}))
+                format!("Routing returns to the route when the wall expires. If the provider's quota view shows headroom, route.clear_cooldown {} lifts the wall for this model and all its variants now.", json!({"routeKey": model}))
             };
             Finding {
                 check: CHECK_ROUTE_BLOCKS,
