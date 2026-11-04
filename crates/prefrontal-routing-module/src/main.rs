@@ -29,6 +29,7 @@ mod credential_fences;
 mod diagnostics_findings;
 mod engram_catalog;
 mod fusiform_catalog;
+mod head_choices;
 mod key_pool;
 mod legacy_wire;
 #[cfg(test)]
@@ -149,6 +150,7 @@ const ROUTE_MODEL_FACT_OP: &str = "route.model_fact";
 /// Read the complete durable model catalog for display and observation consumers.
 const ROUTE_MODEL_FACTS_OP: &str = "route.model_facts";
 const ROUTE_CATALOG_TARGETS_OP: &str = "route.catalog_targets";
+const ROUTE_HEAD_CHOICES_OP: &str = "route.head_choices";
 /// Live catalog write: add a model or adjust its scores/metadata without a
 /// store migration or module deploy. Merge semantics against the stored fact;
 /// writes land as FactSource::Override so a re-seed never reverts them.
@@ -379,6 +381,7 @@ fn remember_route_scope(channel: u16, epoch: u32, scope: Option<DecisionScope>) 
 }
 
 fn clear_route_scope(channel: u16, epoch: u32) {
+    head_choices::forget_bind(channel, epoch);
     if let Ok(mut map) = route_scopes().lock() {
         if map.get(&channel).is_some_and(|(bound, _)| *bound == epoch) {
             map.remove(&channel);
@@ -1598,8 +1601,17 @@ async fn handle_control_request(
             epoch,
             principal,
             scope,
+            identity,
             ..
         } => {
+            head_choices::remember_bind(
+                route_channel,
+                epoch,
+                principal.as_ref(),
+                scope.is_some(),
+                &identity.harness,
+                &identity.session,
+            );
             if let Ok(mut map) = route_principals().lock() {
                 map.insert(
                     route_channel,
@@ -4125,6 +4137,7 @@ pub(crate) fn handles(method: &str) -> bool {
             | ROUTE_MODEL_FACT_OP
             | ROUTE_MODEL_FACTS_OP
             | ROUTE_CATALOG_TARGETS_OP
+            | ROUTE_HEAD_CHOICES_OP
             | model_resolution::RESOLVE_MODEL_OP
             | model_resolution::MODEL_CAPABILITIES_OP
             | model_resolution::AGENT_MODEL_REQUIREMENTS_OP
@@ -4197,6 +4210,11 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
         },
         ManagementOperation {
             name: ROUTE_CATALOG_TARGETS_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: None,
+        },
+        ManagementOperation {
+            name: ROUTE_HEAD_CHOICES_OP.to_string(),
             kind: ManagementOperationKind::Query,
             description: None,
         },

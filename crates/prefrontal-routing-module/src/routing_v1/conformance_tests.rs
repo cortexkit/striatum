@@ -271,7 +271,7 @@ impl Harness {
     }
 
     /// Hand one frame to the module's frame handler and wait for its reply.
-    async fn handle(&self, frame: Frame) -> Frame {
+    pub(super) async fn handle(&self, frame: Frame) -> Frame {
         let (writer, mut replies) = mpsc::channel(4);
         let config_path = self.config_path.lock().unwrap().clone();
         let broca_credentials = Arc::clone(&self.broca_credentials.lock().unwrap());

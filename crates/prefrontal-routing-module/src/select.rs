@@ -1047,6 +1047,16 @@ pub(super) async fn handle_select_request(
     if envelope.method == ROUTE_CATALOG_TARGETS_OP {
         return crate::catalog_targets::serve(frame, writer, broca_credentials).await;
     }
+    if envelope.method == ROUTE_HEAD_CHOICES_OP {
+        return crate::head_choices::serve(
+            frame,
+            writer,
+            store,
+            operator_config_path,
+            broca_credentials,
+        )
+        .await;
+    }
 
     if envelope.method == QUOTA_STATUS_OP {
         let consumer = quota_cache.lock().ok().map(|cache| cache.consumer.clone());
