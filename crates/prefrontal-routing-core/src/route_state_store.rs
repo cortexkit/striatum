@@ -198,7 +198,7 @@ pub struct DecisionOutcomeUpdate {
 /// Provider identity and optional absolute quota reset for one executed request.
 /// Kept separate from model health: a large request can exhaust an allowance while
 /// smaller requests on the same model and credential still succeed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderOutcome {
     pub account_ref: String,
@@ -211,6 +211,11 @@ pub struct ProviderOutcome {
     /// predates it never sends it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_refusal: Option<CredentialRefusal>,
+    /// Typed provider failure evidence, independent of the diagnostic message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
 }
 
 /// A provider's permanent refusal of one vault credential, as the run that hit it

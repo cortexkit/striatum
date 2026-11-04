@@ -677,6 +677,7 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
                             credential_id: None,
                             resets_at_ms: None,
                             credential_refusal: None,
+                            ..Default::default()
                         },
                     )
                     .unwrap();

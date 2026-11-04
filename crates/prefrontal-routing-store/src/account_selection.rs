@@ -490,6 +490,7 @@ impl AccountTx<'_> {
                 credential_id: Some(credential.into()),
                 resets_at_ms: None,
                 credential_refusal: None,
+                ..Default::default()
             },
         )
         .map_err(err)?;
@@ -1992,7 +1993,7 @@ mod transient_fence_tests {
             scratch.path().join("routing.db").to_string_lossy(),
         ))
         .unwrap();
-        let error = "Broca run run-sid-gFDZWZSmQVugLiDUwUywV3: provider error: class transient; provider code server_is_overloaded; HTTP 503; Broca said: Responses websocket attempt failed (HttpError 503); code=server_is_overloaded type=service_unavailable_error; credential_id: chatgpt:openai:gmail; provider retries exhausted after 3 retries";
+        let error = "provider retry budget exhausted";
         for _ in 0..3 {
             let decision = store
                 .record_decision(&DecisionInput {
@@ -2010,7 +2011,13 @@ mod transient_fence_tests {
                 .set_decision_outcome(
                     &decision,
                     &DecisionOutcomeUpdate {
-                        provider_outcome: None,
+                        provider_outcome: Some(
+                            prefrontal_routing_core::route_state_store::ProviderOutcome {
+                                error_class: Some("transient".into()),
+                                provider_code: Some("server_is_overloaded".into()),
+                                ..Default::default()
+                            },
+                        ),
                         outcome: RouteOutcome::SessionError,
                         last_error: Some(error.into()),
                         observed_at_ms: 1_000,

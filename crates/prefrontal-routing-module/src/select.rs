@@ -3637,6 +3637,7 @@ pub(super) fn remember_provider_identity(
                         credential_id: Some(credential.clone()),
                         resets_at_ms: None,
                         credential_refusal: None,
+                        ..Default::default()
                     },
                 )
                 .map_err(|e| ModuleError::Message(e.to_string()))?;
