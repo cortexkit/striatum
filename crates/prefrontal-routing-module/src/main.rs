@@ -3408,8 +3408,12 @@ async fn handle_route_explain(
             "error": decision.outcome_error,
         })
     });
+    let provider_identity = store
+        .decision_provider_identity(&decision.id)
+        .map_err(|error| ModuleError::Message(error.to_string()))?;
     let result = json!({
         "decisionID": decision.id,
+        "providerIdentity": provider_identity,
         "createdAtMs": decision.created_at,
         "decisionKind": decision.decision_kind,
         "selectedRoute": {
@@ -10503,6 +10507,16 @@ mod tests {
             })
             .unwrap();
 
+        let identity = prefrontal_routing_core::route_state_store::ProviderOutcome {
+            account_ref: "frozen-account".into(),
+            credential_id: Some("oauth:p:frozen-account".into()),
+            resets_at_ms: None,
+            credential_refusal: None,
+        };
+        store
+            .set_decision_provider_identity("dec-explain-send", &identity)
+            .unwrap();
+
         let response = run_route_wire_request(
             &store,
             json!({
@@ -10514,6 +10528,7 @@ mod tests {
         assert_eq!(response.header.ty, FrameType::Response);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["result"]["decisionID"], "dec-explain-send");
+        assert_eq!(body["result"]["providerIdentity"], json!(identity));
         assert_eq!(body["result"]["why"]["rejections"], rejections);
         assert_eq!(body["result"]["why"]["score"], score);
         assert_eq!(body["result"]["provenance"]["sendID"], "send-explain");
