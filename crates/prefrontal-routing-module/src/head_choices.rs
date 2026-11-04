@@ -71,7 +71,7 @@ fn not_ready() -> ErrorBody {
     ErrorBody {
         code: "routing_not_ready".into(),
         message:
-            "[TODO(user): say head choices await the catalog and credential listing; retry shortly]"
+            "Routing is still loading the model catalog and accounts, so it can't list a head's choices yet. Try again in a second."
                 .into(),
         detail: Some(json!({"retryable": true, "retry_after_ms": 1000})),
     }
@@ -80,7 +80,7 @@ fn not_ready() -> ErrorBody {
 fn store_error(_: impl fmt::Display) -> ErrorBody {
     ErrorBody::new(
         "store_error",
-        "[TODO(user): say head choices could not read routing's stored model facts]",
+        "Routing couldn't read its stored model facts, so it can't list a head's choices right now. Try again.",
     )
 }
 
@@ -107,7 +107,7 @@ fn choices(
     let runner = registry.get(module).ok_or_else(|| {
         ErrorBody::new(
             "unknown_runner",
-            "[TODO(user): say runner_module does not name a runner known to routing]",
+            "runner_module doesn't name a runner routing knows, so it has no choices to list for it.",
         )
         .with_detail(json!({"runner_module": module}))
     })?;
@@ -225,14 +225,14 @@ pub(super) async fn serve(
         if !admitted(channel, epoch) {
             return Err(ErrorBody::new(
                 "not_permitted",
-                "[TODO(user): say head choices require an operator route or reserved:occipital]",
+                "Only the Alfonso apps' operator routes and Occipital can list a head's model choices.",
             ));
         }
         let params = serde_json::from_slice::<MethodParamsBody<Params>>(&frame.body)
             .ok()
             .filter(|body| !body.params.runner_module.is_empty()
                 && !body.params.runner_module.chars().any(char::is_whitespace))
-            .ok_or_else(|| ErrorBody::new("invalid_request", "[TODO(user): say route.head_choices expects params {runner_module: nonempty module id} only]"))?;
+            .ok_or_else(|| ErrorBody::new("invalid_request", "Send exactly one field, runner_module, naming the head's runner, for example thalamus-harness."))?;
         let guard = credentials.lock().map_err(|_| not_ready())?;
         choices(
             store,
