@@ -1007,14 +1007,43 @@ impl RoutingSubject for KitSubject {
     }
 }
 
-/// Known failing checks, each waiting on an open question about the kit
-/// itself, raised with the kit's maintainers. None is open.
+/// Known failures among the checks that run for this provider.
 const NOT_YET_SERVED: &[&str] = &[];
 
-/// The undeclared-group refusal checks apply only to providers that do not
-/// advertise the group; this provider serves `account_continue`, `select_harness`,
-/// `select_prefer` and `select_exclude_providers`.
+/// Checks gated off by the provider's current group declarations: serving
+/// checks for undeclared groups and refusal checks for declared groups.
 const NOT_APPLICABLE: &[&str] = &[
+    "panel_full",
+    "panel_shortfall",
+    "panel_family_and_route_unique",
+    "panel_temperatures_by_slot",
+    "panel_same_seed",
+    "panel_replacement_preserves_slot",
+    "panel_foreign_replacement_unknown",
+    "panel_replacement_invalid_slot",
+    "budget_quote_matches_helper",
+    "budget_quote_foreign_unknown",
+    "explain_matches_selection",
+    "explain_foreign_unknown",
+    "account_status_blocked_limited",
+    "account_status_unknown",
+    "head_choices_valid",
+    "head_choices_runner_routes",
+    "head_choices_non_starting_empty",
+    "head_choices_billing_valid",
+    "consumer_models_valid",
+    "consumer_models_unknown_consumer",
+    "report_usage_run_id_repeat_accepted",
+    "report_usage_run_id_overlong_refused",
+    "pin_slot_configured_pinned",
+    "pin_slot_unknown_unavailable",
+    "available_routes_honoured",
+    "available_routes_empty_refused",
+    "prefer_prompt_cache_accepted",
+    "settings_unresolved_selects",
+    "settings_unknown_member_refused",
+    "backoff_with_admission_accepted",
+    "backoff_missing_retry_refused",
     "account_for_tier_undeclared",
     "continue_undeclared_group_refuses_mode",
     "undeclared_harness_group_refuses_member",

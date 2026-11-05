@@ -25,6 +25,7 @@ fn model(route_key: &str, tool_calls: bool, vision: bool, context: u64) -> Catal
     CatalogModel {
         provider: provider.into(),
         model: model.into(),
+        family: None,
         iq: 80,
         context_window: context,
         max_output_tokens: 32_000,

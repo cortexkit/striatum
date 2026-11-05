@@ -26,6 +26,7 @@ fn model(route_key: &str) -> CatalogModel {
     CatalogModel {
         provider: provider.into(),
         model: model.into(),
+        family: None,
         iq: 80,
         context_window: 200_000,
         max_output_tokens: 32_000,
