@@ -342,6 +342,50 @@ async fn account_service_tier_legacy_admission_continues_at_bound_fast_tier() {
     assert_eq!(conflict.1["code"], "admission_conflict", "{}", conflict.1);
 }
 
+/// Core's mason launches select through the older select, which records a
+/// tier but writes no v1 row naming the runner. Broca's admission for such a
+/// standard decision must still get an account; on 5 Nov every Anthropic run
+/// from Broca was refused `account_not_authorized` this way.
+#[tokio::test]
+async fn account_service_tier_legacy_standard_decision_without_v1_row_admits() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = legacy_broca_setup();
+    let owner = harness.bind(reserved("prefrontal-core"), None).await;
+    let selected = owner
+        .call(
+            "route.select",
+            &json!({
+                "targetAgent": "mason", "consumer": "mason", "substrate": "broca",
+                "requirements": {"iq": 10, "eq": 0}
+            }),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let decision_id = selected.1["result"]["decisionID"].as_str().unwrap();
+    // The live refused decision dec_c1e8aa40025f carries exactly this: tier
+    // `standard` (a fast project's tier stepped down for a model without fast)
+    // and every account allowed. This harness has no project tier setting, so
+    // record it the way the older select does for one.
+    harness
+        .store()
+        .record_service_tier(
+            decision_id,
+            "standard",
+            &["chatgpt:0".into(), "chatgpt:1".into()],
+        )
+        .unwrap();
+    assert!(
+        harness.store().v1_decision(decision_id).unwrap().is_none(),
+        "the older select writes no v1 row, which is the case under test"
+    );
+    let runner = harness.bind(reserved("broca"), None).await;
+    let mut request = legacy_broca_request("legacy-standard");
+    request["decision_id"] = json!(decision_id);
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    assert!(admitted.1["result"]["account"]["credential_id"].is_string());
+}
+
 #[tokio::test]
 async fn account_service_tier_legacy_bound_decision_refuses_an_ineligible_pin() {
     let _clock = crate::InjectedClock::set(NOW);

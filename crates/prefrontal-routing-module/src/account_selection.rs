@@ -3117,8 +3117,14 @@ fn prepare_roster(
     if let Some(id) = parsed.model_decision_id.as_deref() {
         match ctx.store.decision_service_tier(id) {
             Ok(Some((tier, allowed))) => {
+                // A decision made by the older select (every core mason launch)
+                // has no v1 row naming its runner. The runner asking is then the
+                // one that will serve the run, so its tier support is checked.
                 let runner = match ctx.store.v1_decision(id) {
-                    Ok(decision) => decision.map(|decision| decision.runner_module),
+                    Ok(decision) => Some(decision.map_or_else(
+                        || normalize(&parsed.caller.runner),
+                        |decision| decision.runner_module,
+                    )),
                     Err(error) => return Err(store_error(error)),
                 };
                 let registry = ctx.classes.as_ref().map(|classes| {
@@ -3131,19 +3137,22 @@ fn prepare_roster(
                 });
                 if let Some(roster) = &mut roster.roster {
                     for account in &mut roster.accounts {
+                        // The standard tier needs no plan, model or runner
+                        // support, so only the decision's allowed accounts apply.
                         account.credentials.retain(|credential| {
                             allowed.contains(&credential.credential_id)
-                                && ctx.classes.as_ref().is_some_and(|classes| {
-                                    let fact = classes.facts.iter().find(|fact| {
-                                        fact.provider_id == provider
-                                            && fact.model_id == normalize(&parsed.model)
-                                    });
-                                    let row = classes
-                                        .credentials
-                                        .listed_credentials()
-                                        .iter()
-                                        .find(|row| row.id == credential.credential_id);
-                                    match (fact, row, runner.as_deref()) {
+                                && (tier == "standard"
+                                    || ctx.classes.as_ref().is_some_and(|classes| {
+                                        let fact = classes.facts.iter().find(|fact| {
+                                            fact.provider_id == provider
+                                                && fact.model_id == normalize(&parsed.model)
+                                        });
+                                        let row = classes
+                                            .credentials
+                                            .listed_credentials()
+                                            .iter()
+                                            .find(|row| row.id == credential.credential_id);
+                                        match (fact, row, runner.as_deref()) {
                                         (Some(fact), Some(row), Some(runner)) => {
                                             crate::service_tiers::model_offers(
                                                 &classes.credentials,
@@ -3173,7 +3182,7 @@ fn prepare_roster(
                                         }
                                         _ => false,
                                     }
-                                })
+                                    }))
                         });
                     }
                     roster
