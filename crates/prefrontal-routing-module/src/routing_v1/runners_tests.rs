@@ -1042,3 +1042,38 @@ fn broca_contract_0748_routing_tier_discovery() {
         assert!(super::runners::service_tiers_from_describe(describe).is_none());
     }
 }
+
+#[test]
+fn broca_head_selection_v2_routing_tier_discovery() {
+    let expected = serde_json::json!({
+        "anthropic.messages": {"levels": ["fast"], "served": "reported"},
+        "google.generate_content": {"levels": ["fast"], "served": "reported"},
+        "openai.chat_completions": {"levels": ["fast", "ultrafast"], "served": "reported"},
+        "openai.chatgpt_responses": {"levels": ["fast", "ultrafast"], "served": "reported"},
+        "openai.responses": {"levels": ["fast", "ultrafast"], "served": "reported"}
+    });
+    for bytes in [
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/broca-head-selection-v2/before/role.describe.json"
+        ))
+        .as_slice(),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/broca-head-selection-v2/before-routed/role.describe.json"
+        ))
+        .as_slice(),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-vectors/broca-head-selection-v2/after/role.describe.json"
+        ))
+        .as_slice(),
+    ] {
+        let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        for reply in [&raw, &raw["result"]] {
+            let tiers = super::runners::service_tiers_from_describe(reply)
+                .expect("served role.describe must retain service-tier discovery");
+            assert_eq!(serde_json::to_value(tiers).unwrap(), expected);
+        }
+    }
+}
