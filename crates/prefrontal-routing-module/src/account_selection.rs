@@ -2584,6 +2584,8 @@ struct AccountForParams {
     service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     #[serde(skip)]
     service_tier_chosen: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+    #[serde(skip)]
+    service_tier_bound: bool,
     #[serde(default)]
     parent_conversation_key: Option<String>,
     #[serde(default)]
@@ -2607,7 +2609,8 @@ struct AccountForParams {
     initial_input_estimated: bool,
     /// Identifies the selection whose stored payment class constrains this
     /// admission, regardless of later edits to the consumer's pay_per_token flag.
-    #[serde(default)]
+    /// Broca's caller-bearing requests name the same binding `decision_id`.
+    #[serde(default, alias = "decision_id")]
     model_decision_id: Option<String>,
     #[serde(default)]
     candidates: Option<CandidatesParams>,
@@ -3004,7 +3007,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Ok(prepared) => prepared,
         Err(reply) => return reply,
     };
-    parsed.service_tier_chosen = match prepare_service_tier(&parsed, ctx, &mut roster, class) {
+    parsed.service_tier_chosen = match prepare_service_tier(&mut parsed, ctx, &mut roster, class) {
         Ok(tier) => tier,
         Err(reply) => return reply,
     };
@@ -3187,8 +3190,37 @@ fn prepare_roster(
     Ok((roster, route_fenced, class))
 }
 
-fn prepare_service_tier(
+fn tier_candidate_matches(
     parsed: &AccountForParams,
+    account: &AccountView,
+    credential: &CredentialRecord,
+) -> bool {
+    parsed.candidates.as_ref().is_none_or(|candidates| {
+        candidates.accounts.iter().any(|candidate| {
+            candidate.account_id == account.account_id
+                && candidate.credential_id == credential.credential_id
+        })
+    }) && parsed.requested_account.as_ref().is_none_or(|pin| {
+        pin.account_id.as_ref().map_or_else(
+            || {
+                pin.credential_id
+                    .as_ref()
+                    .is_none_or(|id| *id == credential.credential_id)
+            },
+            |id| *id == account.account_id,
+        )
+    })
+}
+
+fn bound_service_tier_refusal() -> OpReply {
+    OpReply::error(
+        "account_selection_unavailable",
+        "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
+    )
+}
+
+fn prepare_service_tier(
+    parsed: &mut AccountForParams,
     ctx: &Ctx<'_>,
     roster: &mut RosterBuild,
     class: prefrontal_routing_core::accounts::AllowedAccountClass,
@@ -3210,6 +3242,19 @@ fn prepare_service_tier(
                 "The service tier recorded on this routing decision isn't one routing knows, so it can't keep an account bound to it. Ask routing for a new decision.",
             )
         })?;
+        parsed.service_tier_bound = !tier.is_standard();
+        if parsed.service_tier_bound
+            && !roster.roster.as_ref().is_some_and(|roster| {
+                roster.accounts.iter().any(|account| {
+                    account
+                        .credentials
+                        .iter()
+                        .any(|credential| tier_candidate_matches(parsed, account, credential))
+                })
+            })
+        {
+            return Err(bound_service_tier_refusal());
+        }
         return Ok((!tier.is_standard() || parsed.service_tier.is_some()).then_some(tier));
     }
     let Some(requested) = parsed.service_tier else {
@@ -3250,27 +3295,10 @@ fn prepare_service_tier(
         );
         let allowed =
             classes.service_tier_accounts(&normalize(&parsed.provider), &normalize(&parsed.model));
-        let eligible =
-            |account: &prefrontal_routing_core::accounts::AccountView,
-             credential: &prefrontal_routing_core::accounts::CredentialRecord| {
-                allowed.contains(&credential.credential_id)
-                    && parsed.candidates.as_ref().is_none_or(|candidates| {
-                        candidates.accounts.iter().any(|candidate| {
-                            candidate.account_id == account.account_id
-                                && candidate.credential_id == credential.credential_id
-                        })
-                    })
-                    && parsed.requested_account.as_ref().is_none_or(|pin| {
-                        pin.account_id.as_ref().map_or_else(
-                            || {
-                                pin.credential_id
-                                    .as_ref()
-                                    .is_none_or(|id| *id == credential.credential_id)
-                            },
-                            |id| *id == account.account_id,
-                        )
-                    })
-            };
+        let eligible = |account: &AccountView, credential: &CredentialRecord| {
+            allowed.contains(&credential.credential_id)
+                && tier_candidate_matches(parsed, account, credential)
+        };
         if roster.roster.as_ref().is_some_and(|roster| {
             roster.accounts.iter().any(|account| {
                 account
@@ -3659,6 +3687,23 @@ fn serve(
     let salt = tx.salt(now, fresh_salt)?;
     let hash = conversation_hash(&salt, principal, &params.conversation_key);
     let affinity_row = tx.affinity(principal, &hash, provider)?;
+    // The tier-filtered roster must still contain the conversation's exact
+    // credential. A healthy sibling cannot replace a bound session's pin.
+    if params.service_tier_bound
+        && affinity_row.as_ref().is_some_and(|affinity| {
+            !roster.roster.as_ref().is_some_and(|roster| {
+                roster.accounts.iter().any(|account| {
+                    account.account_id == affinity.account_id
+                        && account.credentials.iter().any(|credential| {
+                            credential.credential_id == affinity.credential_id
+                                && tier_candidate_matches(params, account, credential)
+                        })
+                })
+            })
+        })
+    {
+        return Ok(bound_service_tier_refusal());
+    }
     let established = match affinity_row.as_ref() {
         Some(affinity) => tx.pin_has_started(affinity)?,
         None => false,

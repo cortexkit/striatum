@@ -148,6 +148,43 @@ fn account_request(id: &str, tier: Option<&str>) -> Value {
     request
 }
 
+fn legacy_broca_setup() -> (Arc<Harness>, BrocaCredentials) {
+    let (harness, mut credentials) = setup_for_method(
+        &["pro_200", "pro_200"],
+        true,
+        true,
+        "chatgpt",
+        "openai.chatgpt_responses",
+    );
+    live_broca_credentials(&mut credentials);
+    let tiers = credentials.runner_service_tiers.remove(RUNNER).unwrap();
+    credentials
+        .runner_service_tiers
+        .insert("broca".into(), tiers);
+    harness.set_credentials(credentials.clone());
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"broca","via_vault":true}]);
+    });
+    (harness, credentials)
+}
+
+fn legacy_broca_request(id: &str) -> Value {
+    json!({
+        "provider": "openai", "model": MODEL, "affinity_model": MODEL,
+        "conversation_key": "legacy-fast", "admission_id": id,
+        "caller": {"runner": "broca"}, "mode": "admit",
+        "initial_input_bytes": 12345, "initial_input_estimated": true,
+        "hold_wait_max_s": 300,
+        "candidates": {
+            "view_digest": "tier-accounts",
+            "accounts": [
+                {"account_id": "account-0", "credential_id": "chatgpt:0"},
+                {"account_id": "account-1", "credential_id": "chatgpt:1"}
+            ]
+        }
+    })
+}
+
 #[tokio::test]
 async fn account_service_tier_fast_prefers_eligible_plan_and_records_tier() {
     let _clock = crate::InjectedClock::set(NOW);
@@ -196,6 +233,223 @@ async fn account_service_tier_ultrafast_steps_down_to_fast_then_standard() {
                 )
                 .unwrap(),
             Some((Some("ultrafast".into()), expected.into()))
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_service_tier_legacy_admission_continues_at_bound_fast_tier() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = legacy_broca_setup();
+    let runner = harness.bind(reserved("broca"), None).await;
+    let mut request = legacy_broca_request("legacy-fast");
+    let initial = runner.call("route.account_for", &request).await;
+    assert_eq!(initial.0, FrameType::Response, "{}", initial.1);
+    assert!(initial.1["result"].get("service_tier_chosen").is_none());
+
+    let owner = harness.bind(reserved("tier-owner"), None).await;
+    let selected = owner.call("route.select", &select_sol("fast")).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let decision_id = selected.1["result"]["decision_id"].as_str().unwrap();
+    let (tier, allowed) = harness
+        .store()
+        .decision_service_tier(decision_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(tier, "fast");
+    assert!(allowed.contains(
+        &initial.1["result"]["account"]["credential_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    ));
+    // A bound decision keeps its allowed credentials even if their relative
+    // tier prices change; a retained account need not win a new price ranking.
+    let pinned = initial.1["result"]["account"]["credential_id"]
+        .as_str()
+        .unwrap();
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.iter_mut()
+        .find(|row| row.id == pinned)
+        .unwrap()
+        .plan_tier = Some("pro_500".into());
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    let mut prices = credentials.plan_prices.clone();
+    let plan = prices["prices"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["provider_id"] == "openai" && row["tier"] == "pro_500")
+        .unwrap();
+    plan["service_tiers"]["tiers"][0]["included_usage_rate"] = json!({"units": 3, "exponent": 0});
+    credentials.publish_plan_prices(&prices);
+    harness.set_credentials(credentials);
+    request["admission_id"] = json!("legacy-fast-follow-up");
+    request["decision_id"] = json!(decision_id);
+    request["service_tier"] = json!("fast");
+    request["pool"] = json!("pool-example");
+    request["requested_account"] = json!({
+        "credential_id": initial.1["result"]["account"]["credential_id"]
+    });
+    let continued = runner.call("route.account_for", &request).await;
+    let recorded = harness.store().account_decisions("serve", 10).unwrap();
+    let recorded_tiers: Vec<_> = recorded
+        .iter()
+        .map(|row| {
+            (
+                row.code.clone(),
+                harness
+                    .store()
+                    .account_decision_service_tier(&row.decision_id)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        continued.0,
+        FrameType::Response,
+        "answer: {}; recorded: {recorded_tiers:?}",
+        continued.1
+    );
+    assert_eq!(
+        continued.1["result"]["service_tier_chosen"], "fast",
+        "answer: {}; recorded: {recorded_tiers:?}",
+        continued.1
+    );
+    assert_eq!(
+        continued.1["result"]["account"],
+        initial.1["result"]["account"]
+    );
+    assert_eq!(
+        continued.1["result"]["pin"]["id"],
+        initial.1["result"]["pin"]["id"]
+    );
+    assert_eq!(
+        recorded_tiers[0].1,
+        Some((Some("fast".into()), "fast".into()))
+    );
+    let explanation: Value = serde_json::from_str(&recorded[0].decision_json).unwrap();
+    assert_eq!(explanation["explanation"]["affinity"]["kind"], "retained");
+    assert_eq!(runner.call("route.account_for", &request).await, continued);
+    request["service_tier"] = json!("standard");
+    let conflict = runner.call("route.account_for", &request).await;
+    assert_eq!(conflict.1["code"], "admission_conflict", "{}", conflict.1);
+}
+
+#[tokio::test]
+async fn account_service_tier_legacy_bound_decision_refuses_an_ineligible_pin() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for (failure, hint) in [
+        ("plan", true),
+        ("runner", true),
+        ("model", true),
+        ("allowed", true),
+        ("plan", false),
+        ("candidates", false),
+    ] {
+        let (harness, mut credentials) = legacy_broca_setup();
+        let runner = harness.bind(reserved("broca"), None).await;
+        let initial = runner
+            .call("route.account_for", &legacy_broca_request("initial"))
+            .await;
+        assert_eq!(initial.0, FrameType::Response, "{}", initial.1);
+        let pinned = initial.1["result"]["account"]["credential_id"]
+            .as_str()
+            .unwrap();
+        let sibling = credentials
+            .listed_credentials()
+            .iter()
+            .find(|row| row.id != pinned)
+            .unwrap()
+            .clone();
+        let owner = harness.bind(reserved("tier-owner"), None).await;
+        let selected = owner.call("route.select", &select_sol("fast")).await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        let decision_id = selected.1["result"]["decision_id"].as_str().unwrap();
+        assert_eq!(
+            harness.store().decision_service_tier(decision_id).unwrap(),
+            Some(("fast".into(), vec!["chatgpt:0".into(), "chatgpt:1".into()]))
+        );
+        let mut request = legacy_broca_request("unavailable");
+        request["decision_id"] = json!(decision_id);
+        request["service_tier"] = json!("fast");
+        request["pool"] = json!("pool-example");
+        if hint {
+            request["requested_account"] = json!({"credential_id": pinned});
+        }
+        match failure {
+            "plan" => {
+                let mut rows = credentials.listed_credentials().to_vec();
+                rows.iter_mut()
+                    .find(|row| row.id == pinned)
+                    .unwrap()
+                    .plan_tier = Some("unknown".into());
+                credentials.apply_listing(
+                    &ScopedCredentialListing {
+                        credentials: rows,
+                        ..Default::default()
+                    },
+                    NOW,
+                );
+            }
+            "runner" => credentials.runner_service_tiers.clear(),
+            "model" => {
+                let mut catalog =
+                    served()["catalog.get — provider default endpoint"]["response"].clone();
+                catalog["models"][format!("openai/{MODEL}")]
+                    .as_object_mut()
+                    .unwrap()
+                    .retain(|key, _| !key.ends_with(".mode.fast"));
+                credentials.publish_billing_catalog(
+                    credentials
+                        .billing_catalog
+                        .clone()
+                        .with_test_catalog(&serde_json::to_vec(&catalog).unwrap()),
+                );
+            }
+            "allowed" => harness
+                .store()
+                .record_service_tier(decision_id, "fast", &[sibling.id.clone()])
+                .unwrap(),
+            "candidates" => {
+                request["candidates"]["accounts"] = json!([{
+                    "account_id": sibling.account_id,
+                    "credential_id": sibling.id
+                }]);
+            }
+            _ => unreachable!(),
+        }
+        harness.set_credentials(credentials);
+        let refused = runner.call("route.account_for", &request).await;
+        assert_eq!(
+            refused.0,
+            FrameType::Error,
+            "{failure}, hint={hint}: {}",
+            refused.1
+        );
+        assert_eq!(refused.1["code"], "account_selection_unavailable");
+        assert_eq!(
+            refused.1["message"],
+            "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision."
+        );
+        assert!(harness
+            .store()
+            .account_transaction(|tx| tx.admission("reserved:broca", "unavailable"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            harness
+                .store()
+                .account_decisions("serve", 10)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }
