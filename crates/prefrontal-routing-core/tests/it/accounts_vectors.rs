@@ -599,6 +599,15 @@ fn broca_limit_windows_map_to_pool_keys_and_retry_after_is_not_a_reset() {
     )));
     assert_eq!(hinted.reset, ResetTime::Missing);
     assert_eq!(hinted.retry_hint_ms, Some(NOW + 10 * MINUTE));
+    // A reset the provider stated in the refusal body (a ChatGPT usage-limit
+    // refusal's `resets_at`) ends the block like a header's.
+    let stated = confirmed(confirm_exhaustion(&broca(
+        Some("five_hour"),
+        None,
+        Some(ResetSource::Body),
+    )));
+    assert_eq!(stated.reset, ResetTime::At(NOW + 10 * MINUTE));
+    assert_eq!(stated.retry_hint_ms, None);
     // A window routing has no length for is a named pool of unknown length,
     // scoped to the reported family; it is no longer left unclassified.
     let overage = confirmed(confirm_exhaustion(&broca(Some("overage"), None, None)));

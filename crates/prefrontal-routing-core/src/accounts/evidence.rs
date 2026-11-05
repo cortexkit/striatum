@@ -130,7 +130,13 @@ pub struct WindowEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResetSource {
+    /// The provider stated the reset time in a response header.
     Header,
+    /// The provider stated the reset time in the refusal's body, such as a
+    /// ChatGPT usage-limit refusal's `resets_at`. Applied like `Header`.
+    Body,
+    /// Worked out from a Retry-After or similar relative delay: a retry hint,
+    /// never the window's reset.
     RetryAfter,
 }
 
@@ -290,7 +296,9 @@ pub fn confirm_exhaustion(observation: &ExhaustionObservation) -> ConfirmationOu
             // A Retry-After-derived time is a retry hint, never a reset: it can
             // neither start a short hold nor end a fence.
             let (reset, retry_hint) = match (resets_at_ms, resets_at_source) {
-                (Some(at), Some(ResetSource::Header)) => (ResetTime::At(*at), None),
+                (Some(at), Some(ResetSource::Header | ResetSource::Body)) => {
+                    (ResetTime::At(*at), None)
+                }
                 (Some(at), _) => (ResetTime::Missing, Some(*at)),
                 (None, _) => (ResetTime::Missing, None),
             };
