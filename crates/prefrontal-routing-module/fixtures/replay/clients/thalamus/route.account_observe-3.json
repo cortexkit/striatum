@@ -1,0 +1,1 @@
+{"admission_id":"dbd4b9e2-cd19-4a07-af0c-162739afdbd1","event_id":"dbd4b9e2-cd19-4a07-af0c-162739afdbd1:2:account_limit_exhausted","kind":"account_limit_exhausted","limit_window":"five_hour","pool":"opus","resets_at_ms":1700000360000,"resets_at_source":"header"}

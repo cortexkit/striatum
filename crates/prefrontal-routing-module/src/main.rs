@@ -936,14 +936,15 @@ impl Drop for InjectedClock {
     }
 }
 
-/// The per-thread test state a route handler reads: the injected clock and
-/// the diagnostics buffer. Route handlers run on a blocking thread (see
+/// The per-thread test state a route handler reads: the injected clocks, ID
+/// sequence and diagnostics buffer. Route handlers run on a blocking thread (see
 /// [`run_route_handler_off_async_workers`]), so the state of the thread that
 /// dispatched the handler is installed there for the handler's lifetime.
 #[cfg(test)]
 struct TestThreadState {
     now_ms: Option<u64>,
     warnings: OperatorWarnings,
+    replay: Option<prefrontal_routing_store::replay::Inputs>,
 }
 
 #[cfg(test)]
@@ -952,6 +953,7 @@ impl TestThreadState {
         Self {
             now_ms: INJECTED_NOW_MS.with(std::cell::Cell::get),
             warnings: OPERATOR_WARNINGS.with(|sink| Arc::clone(&sink.borrow())),
+            replay: prefrontal_routing_store::replay::current(),
         }
     }
 
@@ -959,21 +961,29 @@ impl TestThreadState {
     /// which puts back what the thread had before. Blocking threads are reused,
     /// so a handler's state must not outlive it.
     fn install(self) -> InstalledTestThreadState {
-        InstalledTestThreadState(Some(TestThreadState {
-            now_ms: INJECTED_NOW_MS.with(|clock| clock.replace(self.now_ms)),
-            warnings: OPERATOR_WARNINGS.with(|sink| sink.replace(self.warnings)),
-        }))
+        let replay = self.replay.as_ref().map(|inputs| inputs.install());
+        InstalledTestThreadState {
+            previous: Some(TestThreadState {
+                now_ms: INJECTED_NOW_MS.with(|clock| clock.replace(self.now_ms)),
+                warnings: OPERATOR_WARNINGS.with(|sink| sink.replace(self.warnings)),
+                replay: None,
+            }),
+            _replay: replay,
+        }
     }
 }
 
 /// Holds the state a thread had before [`TestThreadState::install`].
 #[cfg(test)]
-struct InstalledTestThreadState(Option<TestThreadState>);
+struct InstalledTestThreadState {
+    previous: Option<TestThreadState>,
+    _replay: Option<prefrontal_routing_store::replay::Guard>,
+}
 
 #[cfg(test)]
 impl Drop for InstalledTestThreadState {
     fn drop(&mut self) {
-        if let Some(previous) = self.0.take() {
+        if let Some(previous) = self.previous.take() {
             INJECTED_NOW_MS.with(|clock| clock.set(previous.now_ms));
             OPERATOR_WARNINGS.with(|sink| *sink.borrow_mut() = previous.warnings);
         }
@@ -4696,6 +4706,7 @@ mod tests {
     }
     include!("select_policy_tests.rs");
     include!("panel_policy_tests.rs");
+    include!("replay_model_facts_tests.rs");
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

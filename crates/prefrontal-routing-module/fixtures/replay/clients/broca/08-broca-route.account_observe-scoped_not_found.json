@@ -1,0 +1,10 @@
+{
+  "admission_id": "run-sid-EXAMPLEadmission0000000",
+  "caller": {
+    "runner": "broca"
+  },
+  "credential_id": "oauth:anthropic:example-a",
+  "event_id": "11111111-2222-4333-8444-555555555555:42",
+  "kind": "scoped_not_found",
+  "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+}

@@ -1,0 +1,220 @@
+{
+  "sets": [
+    {
+      "client": "broca",
+      "status": "recorded",
+      "body_source": "clients/SOURCES.md: owner-supplied encoder output, collected 2026-11-05",
+      "bodies": [
+        {
+          "path": "broca/01-broca-route.account_for-admit.json",
+          "method": "route.account_for"
+        },
+        {
+          "path": "broca/02-broca-route.account_for-admit-decision-tier-pool-hint.json",
+          "method": "route.account_for"
+        },
+        {
+          "path": "broca/03-broca-route.account_observe-admission_started.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "broca/04-broca-route.account_observe-attempt.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "broca/05-broca-route.account_observe-attempt-transport-failure.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "broca/06-broca-route.account_observe-account_limit_exhausted.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "broca/07-broca-route.account_observe-run_finished.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "broca/08-broca-route.account_observe-scoped_not_found.json",
+          "method": "route.account_observe"
+        }
+      ]
+    },
+    {
+      "client": "thalamus-harness",
+      "status": "recorded",
+      "body_source": "clients/SOURCES.md: owner-supplied encoder output, collected 2026-11-05",
+      "bodies": [
+        {
+          "path": "thalamus/route.account_for-1.json",
+          "method": "route.account_for"
+        },
+        {
+          "path": "thalamus/route.account_for-2.json",
+          "method": "route.account_for"
+        },
+        {
+          "path": "thalamus/route.account_observe-1.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "thalamus/route.account_observe-2.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "thalamus/route.account_observe-3.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "thalamus/route.account_observe-4.json",
+          "method": "route.account_observe"
+        }
+      ]
+    },
+    {
+      "client": "thalamus-pi",
+      "status": "recorded",
+      "body_source": "clients/SOURCES.md: owner-supplied encoder output, collected 2026-11-05",
+      "bodies": [
+        {
+          "path": "thalamus/route.account_for-1.json",
+          "method": "route.account_for"
+        },
+        {
+          "path": "thalamus/route.account_for-2.json",
+          "method": "route.account_for"
+        },
+        {
+          "path": "thalamus/route.account_observe-1.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "thalamus/route.account_observe-2.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "thalamus/route.account_observe-3.json",
+          "method": "route.account_observe"
+        },
+        {
+          "path": "thalamus/route.account_observe-4.json",
+          "method": "route.account_observe"
+        }
+      ]
+    },
+    {
+      "client": "magic-context",
+      "status": "recorded",
+      "body_source": "clients/SOURCES.md: owner-supplied encoder output, collected 2026-11-05",
+      "bodies": [
+        {
+          "path": "magic-context/route.report-1.json",
+          "method": "route.report"
+        },
+        {
+          "path": "magic-context/route.report-2.json",
+          "method": "route.report"
+        },
+        {
+          "path": "magic-context/route.report-3.json",
+          "method": "route.report"
+        },
+        {
+          "path": "magic-context/route.select-1.json",
+          "method": "route.select"
+        },
+        {
+          "path": "magic-context/route.select-2.json",
+          "method": "route.select"
+        }
+      ]
+    },
+    {
+      "client": "occipital",
+      "status": "recorded",
+      "body_source": "clients/SOURCES.md: owner-supplied encoder output, collected 2026-11-05",
+      "bodies": [
+        {
+          "path": "occipital/route.catalog_targets-1.json",
+          "method": "route.catalog_targets"
+        }
+      ]
+    },
+    {
+      "client": "ckdesk",
+      "status": "built-not-live",
+      "body_source": "clients/SOURCES.md: owner-supplied encoder output, collected 2026-11-05",
+      "bodies": [
+        {
+          "path": "ckdesk/route.head_choices-1.json",
+          "method": "route.head_choices"
+        }
+      ]
+    },
+    {
+      "client": "basal",
+      "status": "no-calls-observed",
+      "body_source": "Task-giver read-only live-store census, 2026-11-05",
+      "bodies": []
+    },
+    {
+      "client": "routing-consumer",
+      "status": "recorded-with-blocked-methods",
+      "body_source": "packages/opencode/src/features/model-routing/routing-consumer.test.ts:38-279,281-337 at baseline 428d689f; undefined members omitted exactly as JSON.stringify",
+      "bodies": [
+        {
+          "path": "routing-consumer/route.model_facts-1.json",
+          "method": "route.model_facts"
+        },
+        {
+          "path": "routing-consumer/route.select-1.json",
+          "method": "route.select"
+        },
+        {
+          "path": "routing-consumer/route.select-2.json",
+          "method": "route.select"
+        },
+        {
+          "path": "routing-consumer/route.resolve_policy-1.json",
+          "method": "route.resolve_policy"
+        },
+        {
+          "path": "routing-consumer/route.record_usage-1.json",
+          "method": "route.record_usage"
+        },
+        {
+          "path": "routing-consumer/route.record_usage-2.json",
+          "method": "route.record_usage"
+        },
+        {
+          "path": "routing-consumer/route.record_cooldown-1.json",
+          "method": "route.record_cooldown"
+        },
+        {
+          "path": "routing-consumer/route.set_decision_outcome-1.json",
+          "method": "route.set_decision_outcome"
+        },
+        {
+          "path": "routing-consumer/route.model_capabilities-1.json",
+          "method": "route.model_capabilities"
+        }
+      ],
+      "blocked_methods": [
+        "route.resolve_model",
+        "route.agent_model_requirements",
+        "route.clear_failure_backoff"
+      ]
+    },
+    {
+      "client": "contract-0.5.7",
+      "status": "blocked",
+      "body_source": "No 0.5.7 fixture pack hydrated; Magic Context owner bytes are recorded separately",
+      "bodies": []
+    },
+    {
+      "client": "direct",
+      "status": "blocked",
+      "body_source": "One select in task-giver live-store census; no request body or sender identity supplied",
+      "bodies": []
+    }
+  ]
+}

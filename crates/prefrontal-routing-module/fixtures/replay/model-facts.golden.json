@@ -1,0 +1,148 @@
+{
+  "body_source": "main.rs::route_model_fact_reads_a_seed_absent_anthropic_fact_from_the_live_store",
+  "rows": [
+    {
+      "catalog_fact": {
+        "confidence": "curated",
+        "contextWindow": 200000.0,
+        "costPerMTokOut": 4.5,
+        "costTier": 2.0,
+        "family": "claude",
+        "maxOutputTokens": 32000,
+        "modelID": "ordinary",
+        "providerID": "replay",
+        "scores": {
+          "elo": 55.0,
+          "eq": 1700.0,
+          "speed": 90.0
+        },
+        "supportsToolUse": true,
+        "supportsVision": true
+      },
+      "reply": {
+        "result": {
+          "contextWindow": 200000,
+          "family": "claude",
+          "familySource": "curated",
+          "known": true,
+          "maxOutputTokens": 32000,
+          "supportsVision": true
+        }
+      },
+      "request": {
+        "method": "route.model_fact",
+        "params": {
+          "modelID": "ordinary",
+          "providerID": "replay"
+        }
+      }
+    },
+    {
+      "catalog_fact": {
+        "confidence": "curated",
+        "contextWindow": 200000.0,
+        "costPerMTokOut": 4.5,
+        "costTier": 2.0,
+        "family": "claude",
+        "maxOutputTokens": 0,
+        "modelID": "zero",
+        "providerID": "replay",
+        "scores": {
+          "elo": 55.0,
+          "eq": 1700.0,
+          "speed": 90.0
+        },
+        "supportsToolUse": true,
+        "supportsVision": true
+      },
+      "reply": {
+        "result": {
+          "contextWindow": 200000,
+          "family": "claude",
+          "familySource": "curated",
+          "known": true,
+          "maxOutputTokens": 0,
+          "supportsVision": true
+        }
+      },
+      "request": {
+        "method": "route.model_fact",
+        "params": {
+          "modelID": "zero",
+          "providerID": "replay"
+        }
+      }
+    },
+    {
+      "catalog_fact": {
+        "confidence": "curated",
+        "contextWindow": 200000.0,
+        "costPerMTokOut": 4.5,
+        "costTier": 2.0,
+        "family": "claude",
+        "maxOutputTokens": 200000,
+        "modelID": "placeholder",
+        "providerID": "replay",
+        "scores": {
+          "elo": 55.0,
+          "eq": 1700.0,
+          "speed": 90.0
+        },
+        "supportsToolUse": true,
+        "supportsVision": true
+      },
+      "reply": {
+        "result": {
+          "contextWindow": 200000,
+          "family": "claude",
+          "familySource": "curated",
+          "known": true,
+          "maxOutputTokens": 200000,
+          "supportsVision": true
+        }
+      },
+      "request": {
+        "method": "route.model_fact",
+        "params": {
+          "modelID": "placeholder",
+          "providerID": "replay"
+        }
+      }
+    },
+    {
+      "catalog_fact": {
+        "confidence": "curated",
+        "contextWindow": 200000.0,
+        "costPerMTokOut": 4.5,
+        "costTier": 2.0,
+        "family": "claude",
+        "modelID": "unknown",
+        "providerID": "replay",
+        "scores": {
+          "elo": 55.0,
+          "eq": 1700.0,
+          "speed": 90.0
+        },
+        "supportsToolUse": true,
+        "supportsVision": true
+      },
+      "reply": {
+        "result": {
+          "contextWindow": 200000,
+          "family": "claude",
+          "familySource": "curated",
+          "known": true,
+          "maxOutputTokens": null,
+          "supportsVision": true
+        }
+      },
+      "request": {
+        "method": "route.model_fact",
+        "params": {
+          "modelID": "unknown",
+          "providerID": "replay"
+        }
+      }
+    }
+  ]
+}

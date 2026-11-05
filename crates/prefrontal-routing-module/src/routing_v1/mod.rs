@@ -59,6 +59,8 @@ mod order_tests;
 #[cfg(test)]
 mod profile_tests;
 #[cfg(test)]
+pub(crate) mod replay_tests;
+#[cfg(test)]
 mod report_fence_tests;
 #[cfg(test)]
 mod runners_tests;

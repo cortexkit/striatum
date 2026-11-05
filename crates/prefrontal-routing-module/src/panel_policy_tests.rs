@@ -151,6 +151,36 @@ mod class_panel_policy {
     }
 
     #[tokio::test]
+    async fn replay_athena_and_spec_panels() {
+        let _clock = crate::InjectedClock::set(1_800_000_000_000);
+        let _inputs = prefrontal_routing_store::replay::Inputs::new(1_800_000_000_000).install();
+        let config = json!({"model_routing": {"variants": {
+            "athena": {"openai/gpt-6-astra": "xhigh", "anthropic/a": "high"}
+        }}});
+        let rig = PanelRig::new(config.clone());
+        let mut panels = Vec::new();
+        for (name, class) in [("Athena audit", "AUDIT"), ("Spec round zero", "SPEC")] {
+            let mut request = rig.params(class);
+            request["seed"] = json!("explicit-seed");
+            let reply = rig.select(request.clone()).await;
+            assert!(reply["result"]["members"].as_array().is_some_and(|members| !members.is_empty()), "{reply}");
+            let budgets: Vec<_> = reply["result"]["members"].as_array().unwrap().iter().map(|member| {
+                let key = member["routeKey"].as_str().unwrap();
+                let fact = rig.store.get_fact_by_route_key(key).unwrap().unwrap();
+                prefrontal_routing_core::package_ceiling::seat_package_ceiling(
+                    key, fact.context_window.map(|n| n as u64), fact.max_output_tokens,
+                )
+            }).collect();
+            panels.push(json!({"name": name, "request": request, "reply": reply, "budgets": budgets}));
+        }
+        crate::routing_v1::replay_tests::assert_or_record("panels", json!({
+            "body_source": "src/panel_policy_tests.rs::PanelRig::params; core consult/runtime.rs::round_zero_select_input uses AUDIT and SPEC",
+            "clock_ms": 1_800_000_000_000_u64, "policy": config,
+            "catalog": rig.store.get_facts().unwrap(), "panels": panels,
+        }));
+    }
+
+    #[tokio::test]
     async fn explicit_seed_and_lab_round_seeds_drive_golden_draws() {
         let rig = PanelRig::new(json!({"model_routing": {"panels": {"lab": {
             "topK": 2, "by": "iq", "extra": 1, "extraBy": "random", "floor": 80

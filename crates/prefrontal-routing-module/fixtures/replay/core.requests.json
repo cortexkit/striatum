@@ -1,0 +1,1403 @@
+{
+  "cases": [
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-outcome-completed",
+      "steps": [
+        {
+          "method": "role.describe",
+          "params": {}
+        },
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "completed",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-outcome-contract_error",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "contract_error",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-outcome-error",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "error",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-outcome-session_error",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "session_error",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-outcome-cancelled",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "cancelled",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-outcome-interrupted",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "interrupted",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-outcome-launch_failed",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "launch_failed",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-outcome-quota_exhausted",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "quota_exhausted",
+            "providerOutcome": null,
+            "retryAfterSecs": 600
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-provider-future-reset",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "interrupted",
+            "providerOutcome": {
+              "accountRef": "catalog-credential-example-provider-apikey",
+              "credentialId": "catalog-credential-example-provider-apikey",
+              "resetsAtMs": 1800000600000
+            },
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-provider-past-reset",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "interrupted",
+            "providerOutcome": {
+              "accountRef": "catalog-credential-example-provider-apikey",
+              "credentialId": "catalog-credential-example-provider-apikey",
+              "resetsAtMs": 1799999999999
+            },
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-provider-monthly-reset",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "interrupted",
+            "providerOutcome": {
+              "accountRef": "catalog-credential-example-provider-apikey",
+              "credentialId": "catalog-credential-example-provider-apikey",
+              "resetsAtMs": 1802592000000
+            },
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-provider-credential-refused",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "interrupted",
+            "providerOutcome": {
+              "accountRef": "catalog-credential-example-provider-apikey",
+              "credentialId": "catalog-credential-example-provider-apikey",
+              "credentialRefusal": {
+                "code": "ENTITLEMENT_ERROR",
+                "credentialId": "catalog-credential-example-provider-apikey",
+                "providerId": "example-provider"
+              },
+              "resetsAtMs": null
+            },
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-provider-second-run-reset",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "completed",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "interrupted",
+            "providerOutcome": {
+              "accountRef": "catalog-credential-example-provider-apikey",
+              "credentialId": "catalog-credential-example-provider-apikey",
+              "resetsAtMs": 1800000600000
+            },
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-provider-second-run-credential-refused",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "completed",
+            "providerOutcome": null,
+            "retryAfterSecs": null
+          }
+        },
+        {
+          "method": "route.set_decision_outcome",
+          "params": {
+            "decisionID": "$decision",
+            "lastError": null,
+            "outcome": "interrupted",
+            "providerOutcome": {
+              "accountRef": "catalog-credential-example-provider-apikey",
+              "credentialId": "catalog-credential-example-provider-apikey",
+              "credentialRefusal": {
+                "code": "billing_exhausted",
+                "credentialId": "catalog-credential-example-provider-apikey",
+                "providerId": "example-provider"
+              },
+              "resetsAtMs": null
+            },
+            "retryAfterSecs": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-cooldown-route-cooldown",
+      "steps": [
+        {
+          "method": "route.record_cooldown",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "cooldownUntil": 1800000600000.0,
+            "credentialId": null,
+            "incrementFailure": false,
+            "incrementQuotaError": false,
+            "lastError": null,
+            "providerWide": false,
+            "quotaExhaustedUntil": null,
+            "routeKey": "example-provider/model-b",
+            "wallClass": null
+          }
+        },
+        {
+          "method": "route.cooldown_status",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "now": 1800000000000,
+            "routeKey": "example-provider/model-b"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-cooldown-quota-wall",
+      "steps": [
+        {
+          "method": "route.record_cooldown",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "cooldownUntil": null,
+            "credentialId": null,
+            "incrementFailure": false,
+            "incrementQuotaError": true,
+            "lastError": null,
+            "providerWide": false,
+            "quotaExhaustedUntil": 1800000600000.0,
+            "routeKey": "example-provider/model-b",
+            "wallClass": "quota"
+          }
+        },
+        {
+          "method": "route.cooldown_status",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "now": 1800000000000,
+            "routeKey": "example-provider/model-b"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-cooldown-billing-wall",
+      "steps": [
+        {
+          "method": "route.record_cooldown",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "cooldownUntil": 1800000600000.0,
+            "credentialId": null,
+            "incrementFailure": false,
+            "incrementQuotaError": false,
+            "lastError": null,
+            "providerWide": false,
+            "quotaExhaustedUntil": 1800000600000.0,
+            "routeKey": "example-provider/model-b",
+            "wallClass": "billing"
+          }
+        },
+        {
+          "method": "route.cooldown_status",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "now": 1800000000000,
+            "routeKey": "example-provider/model-b"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-cooldown-provider-wall",
+      "steps": [
+        {
+          "method": "route.record_cooldown",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "cooldownUntil": 1800000600000.0,
+            "credentialId": null,
+            "incrementFailure": false,
+            "incrementQuotaError": false,
+            "lastError": null,
+            "providerWide": true,
+            "quotaExhaustedUntil": 1800000600000.0,
+            "routeKey": "example-provider/model-b",
+            "wallClass": "quota"
+          }
+        },
+        {
+          "method": "route.cooldown_status",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "now": 1800000000000,
+            "routeKey": "example-provider/model-b"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-cooldown-quota-error-increment",
+      "steps": [
+        {
+          "method": "route.record_cooldown",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "cooldownUntil": null,
+            "credentialId": null,
+            "incrementFailure": false,
+            "incrementQuotaError": true,
+            "lastError": null,
+            "providerWide": false,
+            "quotaExhaustedUntil": null,
+            "routeKey": "example-provider/model-b",
+            "wallClass": null
+          }
+        },
+        {
+          "method": "route.cooldown_status",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "now": 1800000000000,
+            "routeKey": "example-provider/model-b"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-cooldown-failure-increment",
+      "steps": [
+        {
+          "method": "route.record_cooldown",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "cooldownUntil": null,
+            "credentialId": null,
+            "incrementFailure": true,
+            "incrementQuotaError": false,
+            "lastError": null,
+            "providerWide": false,
+            "quotaExhaustedUntil": null,
+            "routeKey": "example-provider/model-b",
+            "wallClass": null
+          }
+        },
+        {
+          "method": "route.cooldown_status",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "now": 1800000000000,
+            "routeKey": "example-provider/model-b"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-cooldown-credential-transient",
+      "steps": [
+        {
+          "method": "route.record_cooldown",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "cooldownUntil": 1800000600000.0,
+            "credentialId": "fixture-credential",
+            "incrementFailure": false,
+            "incrementQuotaError": false,
+            "lastError": null,
+            "providerWide": false,
+            "quotaExhaustedUntil": null,
+            "routeKey": "example-provider/model-b",
+            "wallClass": "transient"
+          }
+        },
+        {
+          "method": "route.cooldown_status",
+          "params": {
+            "capacityKey": "example-provider/model-b",
+            "now": 1800000000000,
+            "routeKey": "example-provider/model-b"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "explicit-tier-consumer",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "excludeRouteKeys": [],
+            "parentSessionID": "ses_parent",
+            "pin": {
+              "slot": "lab_planner"
+            },
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "tier_consumer": "spec_designer",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "slot-tier-consumer",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "excludeRouteKeys": [],
+            "parentSessionID": "ses_parent",
+            "pin": {
+              "slot": "lab_planner"
+            },
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "tier_consumer": "lab_planner",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "consumer-tier-default",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "excludeRouteKeys": [],
+            "parentSessionID": "ses_parent",
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-pin-fallback-absent",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "excludeRouteKeys": [],
+            "parentSessionID": "ses_parent",
+            "pin": {
+              "model": "example-provider/model-b"
+            },
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-pin-fallback-none",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "excludeRouteKeys": [],
+            "parentSessionID": "ses_parent",
+            "pin": {
+              "model": "example-provider/model-b"
+            },
+            "pin_fallback": "none",
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-pin-fallback-route",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "excludeRouteKeys": [],
+            "parentSessionID": "ses_parent",
+            "pin": {
+              "model": "example-provider/model-b"
+            },
+            "pin_fallback": "route",
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-explicit-model-pin",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "excludeRouteKeys": [],
+            "modelPin": "example-provider/model-b",
+            "parentSessionID": "ses_parent",
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-retained-catalog-credential-example-provider-apikey",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "continuationCredentialId": "catalog-credential-example-provider-apikey",
+            "excludeRouteKeys": [],
+            "modelPin": "example-provider/model-b",
+            "parentSessionID": "ses_parent",
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-retained-missing-credential",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "availableModels": [],
+            "consumer": "athena",
+            "continuationCredentialId": "missing-credential",
+            "excludeRouteKeys": [],
+            "modelPin": "example-provider/model-b",
+            "parentSessionID": "ses_parent",
+            "preferPromptCache": false,
+            "requiredCapabilities": null,
+            "requirements": {
+              "eq": 0,
+              "iq": 50
+            },
+            "sendID": "send-1",
+            "service_tier": null,
+            "subscriptionKeys": [
+              "sub"
+            ],
+            "substrate": "broca",
+            "targetAgent": "athena",
+            "taskId": "consult-1",
+            "workload": "athena"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-pool-operations",
+      "steps": [
+        {
+          "method": "route.pool_acquire",
+          "params": {
+            "model": "model-b",
+            "provider": "example-provider",
+            "session": "replay-session",
+            "variant": null
+          }
+        },
+        {
+          "method": "route.pool_renew",
+          "params": {
+            "credentialId": "fixture-credential",
+            "leaseId": "fixture-lease",
+            "provider": "example-provider",
+            "session": "replay-session"
+          }
+        },
+        {
+          "method": "route.pool_wall",
+          "params": {
+            "credentialId": "fixture-credential",
+            "kind": "rate_limited",
+            "provider": "example-provider",
+            "reason": "fixture wall",
+            "untilMs": 1800000600000
+          }
+        },
+        {
+          "method": "route.pool_release",
+          "params": {
+            "endSession": true,
+            "provider": "example-provider",
+            "session": "replay-session"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-reads",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.model_fact",
+          "params": {
+            "modelID": "model-b",
+            "providerID": "example-provider"
+          }
+        },
+        {
+          "method": "route.model_facts",
+          "params": {}
+        },
+        {
+          "method": "routing.available_models_text",
+          "params": {
+            "include": "all"
+          }
+        },
+        {
+          "method": "route.account_status",
+          "params": {
+            "account_id": "account-1",
+            "provider": "example-subscription"
+          }
+        },
+        {
+          "method": "route.explain",
+          "params": {
+            "decisionID": "$decision"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-panel-AUDIT",
+      "steps": [
+        {
+          "method": "route.select_panel",
+          "params": {
+            "availableModels": [
+              "example-provider/model-a",
+              "example-provider/model-b",
+              "example-subscription/model-c",
+              "example-subscription/model-d"
+            ],
+            "excludeRouteKeys": [],
+            "packageTokens": 12000,
+            "panelSpec": {
+              "class": "AUDIT",
+              "temperatureSpread": [
+                0.1,
+                0.2,
+                0.3,
+                0.4
+              ]
+            },
+            "requiredCapabilities": null,
+            "seed": "explicit-seed",
+            "sendID": "send-AUDIT",
+            "subscriptionKeys": [],
+            "substrate": "broca",
+            "taskId": "replay-AUDIT"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-panel-SPEC",
+      "steps": [
+        {
+          "method": "route.select_panel",
+          "params": {
+            "availableModels": [
+              "example-provider/model-a",
+              "example-provider/model-b",
+              "example-subscription/model-c",
+              "example-subscription/model-d"
+            ],
+            "excludeRouteKeys": [],
+            "packageTokens": 12000,
+            "panelSpec": {
+              "class": "SPEC",
+              "temperatureSpread": [
+                0.1,
+                0.2,
+                0.3,
+                0.4
+              ]
+            },
+            "requiredCapabilities": null,
+            "seed": "explicit-seed",
+            "sendID": "send-SPEC",
+            "subscriptionKeys": [],
+            "substrate": "broca",
+            "taskId": "replay-SPEC"
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "config": {
+        "consumers": {
+          "athena": {
+            "projects": {
+              "project-A": {
+                "pin": "example-provider/model-a"
+              },
+              "project-B": {
+                "pin": "example-provider/model-b"
+              }
+            }
+          }
+        }
+      },
+      "core": true,
+      "name": "difference-14-core-A-task-B",
+      "project_id": "project-A",
+      "steps": [
+        {
+          "method": "route.select",
+          "params": {
+            "consumer": "athena",
+            "correlation_id": "send-1",
+            "project_root": "/replay/project-B",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "broca"
+            ]
+          }
+        },
+        {
+          "method": "route.record_usage",
+          "params": {
+            "accountKey": null,
+            "agent": "mason",
+            "cacheWriteTokens": null,
+            "cachedReadTokens": null,
+            "completedMs": 1800000000000.0,
+            "createdMs": 1800000000001.0,
+            "inputTokens": null,
+            "messageID": "broca-run:project-B-task",
+            "modelID": "model-a",
+            "outputTokens": 40.0,
+            "providerID": "example-provider",
+            "reasoningTokens": null,
+            "toolElapsedMs": null,
+            "variant": null,
+            "workloadClass": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-usage-mason",
+      "steps": [
+        {
+          "method": "route.record_usage",
+          "params": {
+            "accountKey": null,
+            "agent": "mason",
+            "cacheWriteTokens": null,
+            "cachedReadTokens": null,
+            "completedMs": 1800000000000.0,
+            "createdMs": 1800000000001.0,
+            "inputTokens": 120.0,
+            "messageID": "broca-run:replay-mason",
+            "modelID": "model-b",
+            "outputTokens": 40.0,
+            "providerID": "example-provider",
+            "reasoningTokens": 10.0,
+            "toolElapsedMs": null,
+            "variant": null,
+            "workloadClass": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-usage-sidekick-research",
+      "steps": [
+        {
+          "method": "route.record_usage",
+          "params": {
+            "accountKey": null,
+            "agent": "sidekick-research",
+            "cacheWriteTokens": null,
+            "cachedReadTokens": null,
+            "completedMs": 1800000000000.0,
+            "createdMs": 1800000000001.0,
+            "inputTokens": 120.0,
+            "messageID": "broca-run:replay-sidekick-research",
+            "modelID": "model-b",
+            "outputTokens": 40.0,
+            "providerID": "example-provider",
+            "reasoningTokens": 10.0,
+            "toolElapsedMs": null,
+            "variant": null,
+            "workloadClass": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-usage-athena",
+      "steps": [
+        {
+          "method": "route.record_usage",
+          "params": {
+            "accountKey": null,
+            "agent": "athena",
+            "cacheWriteTokens": null,
+            "cachedReadTokens": null,
+            "completedMs": 1800000000000.0,
+            "createdMs": 1800000000001.0,
+            "inputTokens": 120.0,
+            "messageID": "broca-run:replay-athena",
+            "modelID": "model-b",
+            "outputTokens": 40.0,
+            "providerID": "example-provider",
+            "reasoningTokens": 10.0,
+            "toolElapsedMs": null,
+            "variant": null,
+            "workloadClass": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-usage-spec",
+      "steps": [
+        {
+          "method": "route.record_usage",
+          "params": {
+            "accountKey": null,
+            "agent": "spec",
+            "cacheWriteTokens": null,
+            "cachedReadTokens": null,
+            "completedMs": 1800000000000.0,
+            "createdMs": 1800000000001.0,
+            "inputTokens": 120.0,
+            "messageID": "broca-run:replay-spec",
+            "modelID": "model-b",
+            "outputTokens": 40.0,
+            "providerID": "example-provider",
+            "reasoningTokens": 10.0,
+            "toolElapsedMs": null,
+            "variant": null,
+            "workloadClass": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-usage-lab",
+      "steps": [
+        {
+          "method": "route.record_usage",
+          "params": {
+            "accountKey": null,
+            "agent": "lab",
+            "cacheWriteTokens": null,
+            "cachedReadTokens": null,
+            "completedMs": 1800000000000.0,
+            "createdMs": 1800000000001.0,
+            "inputTokens": 120.0,
+            "messageID": "broca-run:replay-lab",
+            "modelID": "model-b",
+            "outputTokens": 40.0,
+            "providerID": "example-provider",
+            "reasoningTokens": 10.0,
+            "toolElapsedMs": null,
+            "variant": null,
+            "workloadClass": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-usage-oneshot",
+      "steps": [
+        {
+          "method": "route.record_usage",
+          "params": {
+            "accountKey": null,
+            "agent": "oneshot",
+            "cacheWriteTokens": null,
+            "cachedReadTokens": null,
+            "completedMs": 1800000000000.0,
+            "createdMs": 1800000000001.0,
+            "inputTokens": 120.0,
+            "messageID": "broca-run:replay-oneshot",
+            "modelID": "model-b",
+            "outputTokens": 40.0,
+            "providerID": "example-provider",
+            "reasoningTokens": 10.0,
+            "toolElapsedMs": null,
+            "variant": null,
+            "workloadClass": null
+          }
+        }
+      ]
+    },
+    {
+      "body_source": "crates/prefrontal-core-module/src/routing_replay_core_tests.rs::core_replay_requests_match_recording (actual LazyRoutingCooldownRecorder sends)",
+      "core": true,
+      "name": "core-usage-gather",
+      "steps": [
+        {
+          "method": "route.record_usage",
+          "params": {
+            "accountKey": null,
+            "agent": "gather",
+            "cacheWriteTokens": null,
+            "cachedReadTokens": null,
+            "completedMs": 1800000000000.0,
+            "createdMs": 1800000000001.0,
+            "inputTokens": 120.0,
+            "messageID": "broca-run:replay-gather",
+            "modelID": "model-b",
+            "outputTokens": 40.0,
+            "providerID": "example-provider",
+            "reasoningTokens": 10.0,
+            "toolElapsedMs": null,
+            "variant": null,
+            "workloadClass": null
+          }
+        }
+      ]
+    }
+  ]
+}

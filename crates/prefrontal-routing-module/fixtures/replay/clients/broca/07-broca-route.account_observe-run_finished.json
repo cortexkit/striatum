@@ -1,0 +1,15 @@
+{
+  "admission_id": "run-sid-EXAMPLEadmission0000000",
+  "caller": {
+    "runner": "broca"
+  },
+  "event_id": "11111111-2222-4333-8444-555555555555:42",
+  "headers": {
+    "anthropic-ratelimit-unified-5h-utilization": "0.42",
+    "anthropic-ratelimit-unified-status": "allowed"
+  },
+  "kind": "run_finished",
+  "run_id": "run-sid-EXAMPLEadmission0000000",
+  "terminal_reason": "completed",
+  "upstream_origin": "upstream"
+}
