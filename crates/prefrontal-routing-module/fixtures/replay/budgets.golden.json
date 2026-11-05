@@ -1,0 +1,89 @@
+{
+  "rows": [
+    {
+      "context_window": 200000,
+      "max_output_tokens": 32000,
+      "name": "ordinary",
+      "output_limit": "Send { tokens: 32000, catalog: 32000, suspect: false }",
+      "output_tokens": 32000,
+      "package": {
+        "contextWindow": 200000,
+        "contextWindowKnown": true,
+        "routeKey": "ordinary",
+        "tokens": 76000
+      },
+      "prompt_tokens": 40000
+    },
+    {
+      "context_window": 200000,
+      "max_output_tokens": 0,
+      "name": "zero-output",
+      "output_limit": "Unknown",
+      "output_tokens": null,
+      "package": {
+        "contextWindow": 200000,
+        "contextWindowKnown": true,
+        "routeKey": "zero-output",
+        "tokens": 92000
+      },
+      "prompt_tokens": 40000
+    },
+    {
+      "context_window": 200000,
+      "max_output_tokens": 200000,
+      "name": "placeholder-output",
+      "output_limit": "Unknown",
+      "output_tokens": null,
+      "package": {
+        "contextWindow": 200000,
+        "contextWindowKnown": true,
+        "routeKey": "placeholder-output",
+        "tokens": 60000
+      },
+      "prompt_tokens": 40000
+    },
+    {
+      "context_window": 200000,
+      "max_output_tokens": null,
+      "name": "missing-output",
+      "output_limit": "Unknown",
+      "output_tokens": null,
+      "package": {
+        "contextWindow": 200000,
+        "contextWindowKnown": true,
+        "routeKey": "missing-output",
+        "tokens": 76000
+      },
+      "prompt_tokens": 40000
+    },
+    {
+      "context_window": null,
+      "max_output_tokens": 32000,
+      "name": "missing-context",
+      "output_limit": "Unknown",
+      "output_tokens": null,
+      "package": {
+        "contextWindow": 128000,
+        "contextWindowKnown": false,
+        "routeKey": "missing-context",
+        "tokens": 40000
+      },
+      "prompt_tokens": 40000
+    },
+    {
+      "context_window": 200000,
+      "max_output_tokens": 32000,
+      "name": "prompt-fills-window",
+      "output_limit": "Unknown",
+      "output_tokens": null,
+      "package": {
+        "contextWindow": 200000,
+        "contextWindowKnown": true,
+        "routeKey": "prompt-fills-window",
+        "tokens": 76000
+      },
+      "prompt_tokens": 200000
+    }
+  ],
+  "source": "prefrontal-routing-core::package_ceiling::{seat_package_ceiling,route_output_limit}"
+}

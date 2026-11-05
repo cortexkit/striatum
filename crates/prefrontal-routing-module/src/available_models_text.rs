@@ -600,6 +600,43 @@ mod tests {
     }
 
     #[test]
+    fn replay_available_models_rendering() {
+        let _clock = crate::InjectedClock::set(1_800_000_000_000);
+        let _inputs = prefrontal_routing_store::replay::Inputs::new(1_800_000_000_000).install();
+        let rig = StoreRig::new("replay");
+        let mut deprecated = fact("p", "deprecated", 1700.0, 1600.0, 1.0, 200_000.0, true);
+        deprecated.upstream_status = Some("deprecated".into());
+        for row in [
+            fact("p", "excluded", 1800.0, 1700.0, 1.0, 200_000.0, true),
+            fact("p", "fractional", 1750.25, 1650.75, 2.0, 128_000.0, true),
+            fact("p", "unscored", 0.0, 0.0, 1.0, 1000.0, false),
+            deprecated,
+        ] {
+            rig.store.upsert_fact(&row, FactSource::Seed).unwrap();
+        }
+        let policy = ModelRoutingPolicyInput {
+            exclude: vec!["p/excluded".into()],
+            subscription: vec!["p/unscored".into()],
+            ..Default::default()
+        };
+        let mut request = params(
+            &["p/excluded", "p/fractional", "p/unscored", "p/deprecated"],
+            &["p/unscored"],
+        );
+        let scored = render_from_store(&request, &rig.store, &policy).unwrap();
+        request.include = Include::All;
+        let all = render_from_store(&request, &rig.store, &policy).unwrap();
+        crate::routing_v1::replay_tests::assert_or_record(
+            "available-models",
+            json!({
+                "body_source":"src/available_models_text.rs::params and available_models_filters_pages_queries_and_marks_all_reasons",
+                "catalog":rig.store.get_facts().unwrap(), "exclude":["p/excluded"],
+                "subscription":["p/unscored"], "scored":scored, "all":all,
+            }),
+        );
+    }
+
+    #[test]
     fn live_store_state_gates_available_models_render() {
         let rig = StoreRig::new("state-gate");
         let request = params(&["state/model"], &[]);

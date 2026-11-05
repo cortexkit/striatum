@@ -103,6 +103,19 @@ impl Harness {
             }
             .unwrap(),
         );
+        if let Some(inputs) = prefrontal_routing_store::replay::current() {
+            // Catalog migrations stamp their initial route-state rows with
+            // SQLite's wall clock. This is a fresh scratch store, before any
+            // request: give those seed rows the replay's creation time too.
+            // Request-time updates still go through the real effect writers.
+            rusqlite::Connection::open(dir.join("store.db"))
+                .unwrap()
+                .execute(
+                    "UPDATE model_route_state SET updated_at=?1 WHERE updated_at<>0",
+                    [inputs.now_ms],
+                )
+                .unwrap();
+        }
         let harness = Arc::new(Self {
             store,
             quota_cache: Arc::new(Mutex::new(QuotaCache::default())),

@@ -1,0 +1,27 @@
+{
+  "admission_id": "run-sid-EXAMPLEadmission0000000",
+  "affinity_model": "claude-opus-5",
+  "caller": {
+    "runner": "broca"
+  },
+  "candidates": {
+    "accounts": [
+      {
+        "account_id": "acct-example-a",
+        "credential_id": "oauth:anthropic:example-a"
+      },
+      {
+        "account_id": "acct-example-b",
+        "credential_id": "oauth:anthropic:example-b"
+      }
+    ],
+    "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "conversation_key": "core-session:0000000000000000000000000000000000000000000000000000000000000000",
+  "hold_wait_max_s": 300,
+  "initial_input_bytes": 12345,
+  "initial_input_estimated": true,
+  "mode": "admit",
+  "model": "claude-opus-5",
+  "provider": "anthropic"
+}

@@ -1,0 +1,16 @@
+{
+  "messageID": "msg_1",
+  "providerID": "openai",
+  "modelID": "gpt-5.5",
+  "variant": "high",
+  "agent": "mason",
+  "inputTokens": 400,
+  "outputTokens": 200,
+  "reasoningTokens": 25,
+  "cachedReadTokens": 300,
+  "cacheWriteTokens": 0,
+  "workloadClass": "ephemeral",
+  "accountKey": "openai/primary",
+  "createdMs": 1780000000000,
+  "completedMs": 1780000002000
+}

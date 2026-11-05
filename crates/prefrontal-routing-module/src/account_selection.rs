@@ -1490,6 +1490,16 @@ fn process_entropy() -> u64 {
 }
 
 fn unique_digest(parts: &[&str]) -> String {
+    #[cfg(test)]
+    if let Some(inputs) = prefrontal_routing_store::replay::current() {
+        let mut hasher = Sha256::new();
+        hasher.update(inputs.next_id().as_bytes());
+        for part in parts {
+            hasher.update(part.as_bytes());
+            hasher.update([0]);
+        }
+        return hex(&hasher.finalize());
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())

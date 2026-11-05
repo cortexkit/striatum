@@ -1,0 +1,69 @@
+{
+  "cases": [
+    {
+      "name": "completed-with-usage",
+      "body_source": "src/routing_v1/report_fence_tests.rs::served_decision; src/routing_v1/report.rs::record_usage (policy probe, not a captured client body)",
+      "steps": [
+        {"method": "route.select", "params": {"consumer": "$consumer", "requirements": {"iq": 50}, "pin": "example-subscription/model-c", "affinity": "replay-affinity"}},
+        {"method": "route.report", "params": {"decision_id": "$decision", "outcome": "completed", "usage": {"input_tokens": 120, "output_tokens": 50, "reasoning_tokens": 10}}}
+      ]
+    },
+    {
+      "name": "failed",
+      "body_source": "src/routing_v1/report_fence_tests.rs::report_failed (policy probe)",
+      "steps": [
+        {"method": "route.select", "params": {"consumer": "$consumer", "requirements": {"iq": 50}, "pin": "example-subscription/model-c", "affinity": "replay-affinity"}},
+        {"method": "route.report", "params": {"decision_id": "$decision", "outcome": "failed"}}
+      ]
+    },
+    {
+      "name": "cancelled",
+      "body_source": "src/routing_v1/report.rs::report_at outcome parser (policy probe)",
+      "steps": [
+        {"method": "route.select", "params": {"consumer": "$consumer", "requirements": {"iq": 50}, "pin": "example-subscription/model-c", "affinity": "replay-affinity"}},
+        {"method": "route.report", "params": {"decision_id": "$decision", "outcome": "cancelled"}}
+      ]
+    },
+    {
+      "name": "contract_error",
+      "body_source": "src/main.rs::parse_outcome; src/routing_v1/report.rs::report_at (difference-8 policy probe, not a captured client body)",
+      "steps": [
+        {"method": "route.select", "params": {"consumer": "$consumer", "requirements": {"iq": 50}, "pin": "example-subscription/model-c", "affinity": "replay-affinity"}},
+        {"method": "route.report", "params": {"decision_id": "$decision", "outcome": "contract_error"}}
+      ]
+    },
+    {
+      "name": "session_error",
+      "body_source": "src/main.rs::parse_outcome; src/routing_v1/report.rs::report_at (difference-8 policy probe, not a captured client body)",
+      "steps": [
+        {"method": "route.select", "params": {"consumer": "$consumer", "requirements": {"iq": 50}, "pin": "example-subscription/model-c", "affinity": "replay-affinity"}},
+        {"method": "route.report", "params": {"decision_id": "$decision", "outcome": "session_error"}}
+      ]
+    },
+    {
+      "name": "interrupted",
+      "body_source": "src/main.rs::parse_outcome; src/routing_v1/report.rs::report_at (difference-8 policy probe, not a captured client body)",
+      "steps": [
+        {"method": "route.select", "params": {"consumer": "$consumer", "requirements": {"iq": 50}, "pin": "example-subscription/model-c", "affinity": "replay-affinity"}},
+        {"method": "route.report", "params": {"decision_id": "$decision", "outcome": "interrupted"}}
+      ]
+    },
+    {
+      "name": "launch_failed",
+      "body_source": "src/main.rs::parse_outcome; src/routing_v1/report.rs::report_at (difference-8 policy probe, not a captured client body)",
+      "steps": [
+        {"method": "route.select", "params": {"consumer": "$consumer", "requirements": {"iq": 50}, "pin": "example-subscription/model-c", "affinity": "replay-affinity"}},
+        {"method": "route.report", "params": {"decision_id": "$decision", "outcome": "launch_failed"}}
+      ]
+    },
+    {
+      "name": "failed-future-reset",
+      "body_source": "src/routing_v1/report_fence_tests.rs::served_decision, report_failed",
+      "steps": [
+        {"method": "route.select", "params": {"consumer": "$consumer", "requirements": {"iq": 50}, "pin": "example-subscription/model-c", "affinity": "replay-affinity"}},
+        {"method": "route.account_for", "runner": true, "params": {"provider": "example-subscription", "model": "model-c", "conversation_key": "report-replay", "admission_id": "report-replay", "decision_id": "$decision"}},
+        {"method": "route.report", "params": {"decision_id": "$decision", "outcome": "failed", "credential_id": "$credential", "reset_at_ms": 1800000600000}}
+      ]
+    }
+  ]
+}

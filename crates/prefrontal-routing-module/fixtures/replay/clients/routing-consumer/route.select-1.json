@@ -1,0 +1,23 @@
+{
+  "targetAgent": "mason",
+  "requestedRequirements": {
+    "iq": 80,
+    "eq": 20,
+    "caps": {
+      "vision": true
+    }
+  },
+  "availableModels": [
+    "openai/gpt-5.5"
+  ],
+  "excludeRouteKeys": [
+    "x/y"
+  ],
+  "providerAuthTypes": {
+    "openai": "oauth"
+  },
+  "taskId": "bg_1",
+  "parentSessionID": "ses_parent",
+  "harness": "pi",
+  "projectRoot": "/repo/routing-provenance"
+}

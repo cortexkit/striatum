@@ -1280,3 +1280,48 @@ fn service_tier_prices_subscription_draw_and_api_mode_without_inheriting_base_di
         .rates
         .contains_key("rate.reasoning"));
 }
+
+#[tokio::test]
+async fn replay_tier_consumer_precedence() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let _inputs = prefrontal_routing_store::replay::Inputs::new(NOW as i64).install();
+    let (harness, _) = setup(&["pro_500"], true, true);
+    let project = harness.store_path().parent().unwrap().join("tier-project");
+    let path = project.join(".cortexkit/prefrontal-routing.jsonc");
+    let settings = json!({"consumers": {
+        "mason": {"service_tier":"standard"},
+        "lab_planner": {"service_tier":"fast"},
+        "spec_designer": {"service_tier":"ultrafast"},
+        "athena_synthesizer": {"service_tier":"ultrafast"}
+    }});
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+    let route = harness.bind(reserved("tier-owner"), None).await;
+    let mut rows = Vec::new();
+    for (name, tier_consumer) in [
+        ("Spec designer explicit", Some("spec_designer")),
+        ("consult synthesizer explicit", Some("athena_synthesizer")),
+        ("resolved pin slot", Some("lab_planner")),
+        ("consumer fallback", None),
+    ] {
+        let mut request =
+            json!({"consumer":"mason", "requirements":{"iq":30}, "project_root":project});
+        if let Some(consumer) = tier_consumer {
+            request["tier_consumer"] = json!(consumer);
+        }
+        let (ty, reply) = route.call("route.select", &request).await;
+        assert_eq!(ty, FrameType::Response, "{reply}");
+        rows.push(super::replay_tests::normalize_paths(
+            json!({"name":name, "request":request,
+            "reply":reply, "state":super::replay_tests::persistent_effects(&harness)}),
+            &harness,
+        ));
+    }
+    super::replay_tests::assert_or_record(
+        "tier-consumers",
+        json!({
+            "body_source":"service_tier_project_settings_change_the_next_routing_decision; core route_select_params resolves explicit tier consumer before pin.slot",
+            "clock_ms":NOW, "settings":settings, "rows":rows,
+        }),
+    );
+}

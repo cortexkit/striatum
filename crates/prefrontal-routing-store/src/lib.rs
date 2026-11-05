@@ -54,6 +54,9 @@ mod retention;
 mod routing_v1;
 mod task_usage;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod replay;
+
 pub use diagnostics::{
     DiagnosticAccountBlock, DiagnosticAccountHold, DiagnosticDecision, DiagnosticKeyWall,
     DiagnosticRouteWall,
@@ -648,6 +651,10 @@ impl SqliteRouteStateStore {
 }
 
 fn now_ms() -> i64 {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(now) = replay::current().map(|inputs| inputs.now_ms) {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -2562,10 +2569,7 @@ impl SqliteRouteStateStore {
         selected_workload: Option<&str>,
         task_ref: Option<&str>,
     ) -> RouteStateResult<String> {
-        let id = input
-            .decision_id
-            .clone()
-            .unwrap_or_else(|| format!("dec_{}", short_id()));
+        let id = input.decision_id.clone().unwrap_or_else(new_decision_id);
         let id_ret = id.clone();
         let created_at = now_ms();
         let rejected_json = bound_rejected_json(&input.rejected_json);
@@ -4826,9 +4830,21 @@ fn route_identity(
     Ok(split_route_key(route_key))
 }
 
+fn new_decision_id() -> String {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(id) = replay::current().and_then(|inputs| inputs.decision_id()) {
+        return id;
+    }
+    format!("dec_{}", short_id())
+}
+
 /// A short unique-ish id (12 hex chars), process-monotonic + time-seeded. Avoids a
 /// uuid dependency for decision ids (their uniqueness needs are local).
 fn short_id() -> String {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(inputs) = replay::current() {
+        return inputs.next_id();
+    }
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let t = std::time::SystemTime::now()
