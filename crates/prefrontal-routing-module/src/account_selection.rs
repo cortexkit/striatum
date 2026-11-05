@@ -2609,9 +2609,14 @@ struct AccountForParams {
     initial_input_estimated: bool,
     /// Identifies the selection whose stored payment class constrains this
     /// admission, regardless of later edits to the consumer's pay_per_token flag.
-    /// Broca's caller-bearing requests name the same binding `decision_id`.
-    #[serde(default, alias = "decision_id")]
+    #[serde(default)]
     model_decision_id: Option<String>,
+    /// Broca's caller-bearing requests name the same binding `decision_id`;
+    /// it fills `model_decision_id` when that is absent. Not a serde alias:
+    /// the v1 wrapper sends `model_decision_id` beside a continuation's own
+    /// `decision_id`, and an alias would refuse that body as a duplicate.
+    #[serde(default)]
+    decision_id: Option<String>,
     #[serde(default)]
     candidates: Option<CandidatesParams>,
     #[serde(default)]
@@ -2727,8 +2732,11 @@ fn decode_params(body: &[u8]) -> Result<Value, OpReply> {
 }
 
 fn parse_account_for(params: &Value) -> Result<AccountForParams, OpReply> {
-    let parsed: AccountForParams = serde_json::from_value(params.clone())
+    let mut parsed: AccountForParams = serde_json::from_value(params.clone())
         .map_err(|error| invalid(format!("invalid route.account_for params: {error}")))?;
+    if parsed.model_decision_id.is_none() {
+        parsed.model_decision_id = parsed.decision_id.take();
+    }
     parsed.validate()?;
     Ok(parsed)
 }
