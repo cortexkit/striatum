@@ -354,7 +354,7 @@ fn crash_before_commit_rolls_back_and_after_commit_replays_without_effects() {
         };
         let path = path.clone();
         drop(store);
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let status = std::process::Command::new(crate::test_exe::current_test_exe().unwrap())
             .args([
                 "--exact",
                 "report_delivery::tests::report_crash_child",

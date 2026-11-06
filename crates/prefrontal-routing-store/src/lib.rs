@@ -41,6 +41,8 @@ mod account_selection;
 mod call_counts;
 pub use call_counts::{RoutingCallCount, RoutingCallCounts};
 mod report_delivery;
+#[cfg(test)]
+mod test_exe;
 pub use report_delivery::{V1ReportEffects, V1ReportUsage};
 #[cfg(test)]
 mod speed_sample_tests;
