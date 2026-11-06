@@ -63,6 +63,9 @@ pub enum PoolWallKind {
 }
 
 fn lease_id(now_ms: i64) -> String {
+    // Replay recordings install fixed inputs so recorded lease ids don't carry
+    // this process's id; the replay module only exists in test builds.
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(inputs) = crate::replay::current() {
         return format!("pool_{}", inputs.next_id());
     }
