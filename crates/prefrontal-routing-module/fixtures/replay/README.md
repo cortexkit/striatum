@@ -76,6 +76,44 @@ client set is blocked; consult `recording-status.json`, not an inferred â€œnoneâ
 
 ## Re-recording
 
+### Public availability replies
+
+`availability-public.golden.json` contains the public `routing/v1` select
+requests and real-handler reply bodies for all 13 availability scenarios,
+with fallback, no-fallback and zero-wait probe launches for each scenario.
+The clock and generated IDs are controlled by the same recorder as the
+historical availability fixture; no reply is assembled by the test.
+
+`availability.golden.json` remains the historical recording.
+`availability-difference.json` declares exact before/after changes by row:
+
+- `credential-fence`: a failed report has blocked the route on every account;
+  public pin refusals retain the time when the first account's block expires.
+- `no-eligible-account`: the zero-wait probe retains the known quota reset.
+- `all-accounts-held`: the zero-wait probe retains the short quota reset;
+  selections whose wait limit permits the runner to wait for an account still
+  answer normally, with the wait happening later at `route.account_for`.
+- `unknown-reset`: the public pin refusal remains untimed.
+
+Those differences also record the newly persisted pin refusals and the
+account-limit reason on fallback answers. Other historical observations are
+still compared unchanged. As in the other replay tests, comparison omits
+newer delivery-identity tables and stored selection snapshots, which have
+dedicated persistence tests and are absent from the historical recording.
+
+To re-record only the public export, run:
+
+```sh
+PREFRONTAL_RECORD_ROUTING_PUBLIC_AVAILABILITY=1 cargo nextest run --locked -p prefrontal-routing-module --bin ck-prefrontal-routing -E 'test(=routing_v1::replay_tests::replay_availability_cases)'
+```
+
+For remote recording, return
+`crates/prefrontal-routing-module/fixtures/replay/availability-public.golden.json`.
+Without that variable the same test compares both the public export and the
+historical recording with its declared differences.
+
+### Historical recordings
+
 Set `PREFRONTAL_RECORD_ROUTING_REPLAY=1` only for intentional baseline generation.
 Run core's two `replay_core_*` / `core_replay_requests_match_recording` tests
 first, then routing's `replay_*` tests. A remote generation job must list each

@@ -1278,7 +1278,14 @@ async fn select_at_tier(
                 route.variant.as_deref(),
                 &session,
             )
-            .map_err(|refusal| provider_refusal(&refusal.code, refusal.message))?;
+            .map_err(|refusal| {
+                let pin = match basis {
+                    Basis::RequestPin => request.pin_slot.as_deref().or(request_pin.as_deref()),
+                    Basis::ProjectPin => project_pin.as_deref(),
+                    _ => None,
+                };
+                pool_select_refusal(refusal, pin)
+            })?;
             runner_ref.model.provider = grant.runner.provider;
             runner_ref.model.model = grant.runner.model;
             runner_ref.model.variant = grant.runner.variant;
@@ -1575,7 +1582,20 @@ impl<'a> Selection<'a> {
         selected.explanation.extend(priced.explanation);
         if let Err(refusal) = self.account_check(&selected) {
             if refusal.code.as_str() != "account_hold" {
-                return Err(refusal);
+                let mut pin_refusal = Refusal::pin_unavailable(
+                    pin,
+                    if refusal.detail.get("reason").and_then(Value::as_str)
+                        == Some("accounts_blocked")
+                    {
+                        PinUnavailableReason::QuotaExhausted
+                    } else {
+                        PinUnavailableReason::NotAvailable
+                    },
+                    refusal.wait_until_ms(),
+                );
+                pin_refusal.message =
+                    "[TODO(user): explain the pinned route's account unavailability]".into();
+                return Err(pin_refusal);
             }
         }
         Ok(selected)
@@ -1658,13 +1678,25 @@ impl<'a> Selection<'a> {
                 .map_or((self.now * 1000.0) as i64, |classes| classes.now_ms),
             classes: self.classes.cloned(),
         };
-        account_selection::preflight_model_for_class(
+        account_selection::preflight_model_for_class_with_reset(
             &ctx,
             &selected.model.provider_id,
             &selected.model.model_id,
             self.priced_per_token,
         )
-        .map_err(|(code, message)| provider_refusal(&code, message))
+        .map_err(|refusal| {
+            if matches!(
+                refusal.code.as_str(),
+                "no_eligible_account"
+                    | "quota_exhausted"
+                    | "account_pool_exhausted"
+                    | "account_pool_reserve_limited"
+            ) {
+                account_limit_refusal(None, refusal.reset_at_ms)
+            } else {
+                provider_refusal(&refusal.code, refusal.message)
+            }
+        })
     }
 
     /// Record a refused selection in the ledger, as every selection does.
@@ -1684,6 +1716,33 @@ impl<'a> Selection<'a> {
         );
         decision.consumer = Some(self.consumer.to_owned());
         crate::record_failed_selection_decision(self.deps.store.as_ref(), &decision);
+    }
+}
+
+/// Select exposes account limits as route refusals; account admission's private
+/// codes and diagnostic messages are not a retry protocol for select callers.
+fn account_limit_refusal(pin: Option<&str>, reset: Option<i64>) -> Refusal {
+    let reset = reset.and_then(|reset| u64::try_from(reset).ok());
+    let mut refusal = match pin {
+        Some(pin) => Refusal::pin_unavailable(pin, PinUnavailableReason::QuotaExhausted, reset),
+        None => Refusal::no_route(NoRouteReason::parse("accounts_blocked"), reset),
+    };
+    refusal.message =
+        "[TODO(user): explain the route's account limit and retry time when known]".into();
+    refusal
+}
+
+fn pool_select_refusal(refusal: key_pool::PoolRefusal, pin: Option<&str>) -> Refusal {
+    if refusal.code == prefrontal_routing_core::key_pool::EXPLICIT_PROVIDER_POOL_EXHAUSTED {
+        account_limit_refusal(
+            pin,
+            refusal
+                .detail
+                .as_ref()
+                .and_then(|detail| detail["earliestResetAtMs"].as_i64()),
+        )
+    } else {
+        provider_refusal(&refusal.code, refusal.message)
     }
 }
 
@@ -1884,5 +1943,35 @@ mod tests {
             explanation["blockingCauses"],
             reply.detail["blockingCauses"]
         );
+    }
+    #[test]
+    fn key_pool_acquire_refusals_preserve_only_known_resets() {
+        for pin in [Some("pool/model"), None] {
+            for reset in [Some(1_800_000_600_000_i64), None] {
+                let refusal = pool_select_refusal(
+                    key_pool::PoolRefusal {
+                        code: prefrontal_routing_core::key_pool::EXPLICIT_PROVIDER_POOL_EXHAUSTED
+                            .into(),
+                        message: "private message is not a retry protocol".into(),
+                        detail: Some(json!({"earliestResetAtMs":reset})),
+                    },
+                    pin,
+                );
+                assert_eq!(refusal.wait_until_ms(), reset.map(|reset| reset as u64));
+                let expected = match pin {
+                    Some(pin) => Refusal::pin_unavailable(
+                        pin,
+                        PinUnavailableReason::QuotaExhausted,
+                        reset.map(|reset| reset as u64),
+                    ),
+                    None => Refusal::no_route(
+                        NoRouteReason::parse("accounts_blocked"),
+                        reset.map(|reset| reset as u64),
+                    ),
+                };
+                assert_eq!(refusal.code, expected.code);
+                assert_eq!(refusal.detail, expected.detail);
+            }
+        }
     }
 }

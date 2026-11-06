@@ -1051,17 +1051,22 @@ impl ClassContext {
         model: &str,
         priced: bool,
     ) -> Option<Option<i64>> {
-        // `fenced` holds the accounts of this route's class that route fences
-        // left out of the roster. When none is left, every account the class
-        // has is fenced, so the route is blocked until the earliest fence ends.
+        // An empty roster may have lost accounts to route or credential
+        // fences. Reuse admission's classification so only a dated account
+        // limit, not missing credentials or policy exclusions, supplies a reset.
         let (roster, fenced) = self.roster_and_fences_for(provider, model, priced);
-        if !fenced.is_empty()
-            && roster
-                .roster
-                .as_ref()
-                .is_none_or(|roster| roster.accounts.is_empty())
+        if roster
+            .roster
+            .as_ref()
+            .is_some_and(|roster| roster.accounts.is_empty())
         {
-            return Some(fenced.values().min().copied());
+            if let OpReply::Error { code, detail, .. } =
+                empty_roster_refusal(self, provider, model, priced, &fenced, self.now_ms, None)
+            {
+                if code == "account_pool_exhausted" {
+                    return Some(detail.and_then(|detail| detail["reset_at_ms"].as_i64()));
+                }
+            }
         }
         let blocked = self.probe(provider, model, priced, false, None, "blocked-preflight");
         if !blocked.refusal().is_some_and(|refusal| {
@@ -3094,7 +3099,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
                 &route_fenced,
                 ctx.now_ms,
-                &parsed,
+                Some(&parsed),
             );
         }
         // Without class context the vault/quota roster names nothing usable
@@ -3475,7 +3480,7 @@ fn empty_roster_refusal(
     priced: bool,
     fenced: &BTreeMap<String, i64>,
     now: i64,
-    params: &AccountForParams,
+    params: Option<&AccountForParams>,
 ) -> OpReply {
     let untimed = |code: &str, message: String| {
         OpReply::typed(
@@ -3531,9 +3536,11 @@ fn empty_roster_refusal(
             format!("routing selects no accounts for provider `{provider}`"),
         );
     }
-    let tokens = params
-        .request_input_tokens
-        .unwrap_or_else(|| params.initial_input_bytes.div_ceil(4));
+    let tokens = params.map_or(0, |params| {
+        params
+            .request_input_tokens
+            .unwrap_or_else(|| params.initial_input_bytes.div_ceil(4))
+    });
     let size_class = prefrontal_routing_core::accounts::input_size_class(tokens);
     let mut fenced_cause = false;
     let mut row_resets: Vec<Option<i64>> = Vec::new();
@@ -3623,6 +3630,23 @@ pub(crate) fn preflight_model_for_class(
     model: &str,
     priced_per_token: bool,
 ) -> Result<(), (String, String)> {
+    preflight_model_for_class_with_reset(ctx, provider, model, priced_per_token)
+        .map_err(|refusal| (refusal.code, refusal.message))
+}
+
+pub(crate) struct PreflightRefusal {
+    pub code: String,
+    pub message: String,
+    pub reset_at_ms: Option<i64>,
+}
+
+/// Keep dated account evidence separate from the legacy diagnostic message.
+pub(crate) fn preflight_model_for_class_with_reset(
+    ctx: &Ctx<'_>,
+    provider: &str,
+    model: &str,
+    priced_per_token: bool,
+) -> Result<(), PreflightRefusal> {
     if !ctx.flags.enabled {
         return Ok(());
     }
@@ -3637,10 +3661,15 @@ pub(crate) fn preflight_model_for_class(
         .is_some_and(|roster| roster.accounts.is_empty())
     {
         if ctx.classes.is_some() {
-            return Err((
-                "no_eligible_account".into(),
-                format!("{provider}/{model}: no eligible account"),
-            ));
+            return Err(PreflightRefusal {
+                code: "no_eligible_account".into(),
+                message: format!("{provider}/{model}: no eligible account"),
+                reset_at_ms: ctx.classes.as_ref().and_then(|classes| {
+                    classes
+                        .blocked_reset(provider, model, priced_per_token)
+                        .flatten()
+                }),
+            });
         }
         return Ok(());
     }
@@ -3678,16 +3707,21 @@ pub(crate) fn preflight_model_for_class(
             );
             Ok((decision, fences))
         })
-        .map_err(|error| ("account_selection_unavailable".into(), error.to_string()))?;
+        .map_err(|error| PreflightRefusal {
+            code: "account_selection_unavailable".into(),
+            message: error.to_string(),
+            reset_at_ms: None,
+        })?;
     match decision.outcome {
         Outcome::Admit(_) => Ok(()),
-        Outcome::Hold(hold) => Err((
-            "quota_exhausted".into(),
-            format!(
+        Outcome::Hold(hold) => Err(PreflightRefusal {
+            code: "quota_exhausted".into(),
+            message: format!(
                 "{provider}/{model}: quota_exhausted until {}",
                 rfc3339(hold.reset_at_ms)
             ),
-        )),
+            reset_at_ms: Some(hold.reset_at_ms),
+        }),
         Outcome::Refuse(refusal) => {
             let code = refusal_code(refusal.code).to_string();
             // A retry includes jitter/margin and is not itself a provider reset.
@@ -3723,22 +3757,33 @@ pub(crate) fn preflight_model_for_class(
                         .filter(|fence| fence.applies_to(model, family, request.pool.as_deref()))
                         .filter_map(|fence| fence.reset.at_ms()),
                 );
+            let reset_at_ms = if matches!(
+                refusal.code,
+                RefusalCode::AccountPoolExhausted | RefusalCode::AccountPoolReserveLimited
+            ) {
+                resets.filter(|date| *date > ctx.now_ms).min()
+            } else {
+                None
+            };
             let clearing = if matches!(
                 refusal.code,
                 RefusalCode::AccountPoolExhausted | RefusalCode::AccountPoolReserveLimited
             ) {
-                resets
-                    .filter(|date| *date > ctx.now_ms)
-                    .min()
+                reset_at_ms
                     .map(|date| format!(" until {}", rfc3339(date)))
                     .unwrap_or_else(|| "; clearing time unknown".into())
             } else {
                 String::new()
             };
-            Err((
-                code.clone(),
-                format!("{provider}/{model}: {code}{clearing}"),
-            ))
+            Err(PreflightRefusal {
+                message: format!("{provider}/{model}: {code}{clearing}"),
+                code,
+                reset_at_ms: ctx.classes.as_ref().map_or(reset_at_ms, |classes| {
+                    classes
+                        .blocked_reset(provider, model, priced_per_token)
+                        .flatten()
+                }),
+            })
         }
     }
 }

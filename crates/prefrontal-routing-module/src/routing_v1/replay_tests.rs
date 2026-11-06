@@ -248,6 +248,8 @@ async fn replay(file: &str) {
 pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
     let golden = Path::new(ROOT).join(format!("{file}.golden.json"));
     if std::env::var_os("PREFRONTAL_RECORD_ROUTING_REPLAY").is_some()
+        || (file == "availability-public"
+            && std::env::var_os("PREFRONTAL_RECORD_ROUTING_PUBLIC_AVAILABILITY").is_some())
         || (file == "head-choices-difference-9"
             && std::env::var_os("PREFRONTAL_RECORD_SHAPE_DIFFERENCES").is_some())
     {
@@ -293,11 +295,46 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
         apply_report_outcome_difference(&mut expected);
         project_additive_shape_members(&mut observed);
         project_additive_shape_members(&mut expected);
+        if file == "availability" {
+            apply_availability_difference(&mut expected);
+        }
         assert!(
             observed == expected,
             "routing replay differs: {file}: {}",
             first_difference("$", &observed, &expected)
         );
+    }
+}
+
+/// Keep the historical availability observations intact while declaring each
+/// corrected public refusal and its persisted decision effects by row.
+fn apply_availability_difference(expected: &mut Value) {
+    let differences: Value = serde_json::from_str(include_str!(
+        "../../fixtures/replay/availability-difference.json"
+    ))
+    .unwrap();
+    for difference in differences.as_array().unwrap() {
+        let case = expected["cases"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|case| case["name"] == difference["row"])
+            .unwrap();
+        for patch in difference["changes"].as_array().unwrap() {
+            let value = case.pointer_mut(patch["path"].as_str().unwrap()).unwrap();
+            if patch["op"] == "append" {
+                let rows = value.as_array_mut().unwrap();
+                assert_eq!(rows.len(), patch["before"].as_u64().unwrap() as usize);
+                rows.extend(patch["after"].as_array().unwrap().iter().cloned());
+                continue;
+            }
+            assert_eq!(
+                *value, patch["before"],
+                "availability difference before: {}",
+                patch["path"]
+            );
+            *value = patch["after"].clone();
+        }
     }
 }
 
@@ -818,6 +855,16 @@ async fn replay_availability_cases() {
             "cooldown_status":{"params":status_params, "reply":status}, "launches":launches}),
             &harness,
         ));
+    }
+    assert_or_record(
+        "availability-public",
+        json!({"clock_ms":NOW, "body_source":"public routing/v1 route.select replies through the real frame handler; availability table scenarios",
+            "cases":cases.iter().map(|case| json!({"name":case["name"], "launches":case["launches"].as_array().unwrap().iter().map(|launch|
+                json!({"kind":launch["kind"],"params":launch["params"],"frame_type":launch["frame_type"],"reply":launch["reply"]})
+            ).collect::<Vec<_>>() })).collect::<Vec<_>>() }),
+    );
+    if std::env::var_os("PREFRONTAL_RECORD_ROUTING_PUBLIC_AVAILABILITY").is_some() {
+        return;
     }
     assert_or_record(
         "availability",
