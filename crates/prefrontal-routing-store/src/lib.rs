@@ -38,6 +38,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 mod account_selection;
+mod call_counts;
+pub use call_counts::{RoutingCallCount, RoutingCallCounts};
+mod report_delivery;
+pub use report_delivery::{V1ReportEffects, V1ReportUsage};
 #[cfg(test)]
 mod speed_sample_tests;
 // The backup table classification is a test oracle: the store's integration
@@ -299,7 +303,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 76] {
+fn route_state_migrations() -> [Migration; 77] {
     [
         Migration {
             version: 1,
@@ -604,6 +608,10 @@ fn route_state_migrations() -> [Migration; 76] {
         Migration {
             version: 77,
             statements: include_str!("../migrations/077_selection_snapshot.sql"),
+        },
+        Migration {
+            version: 78,
+            statements: include_str!("../migrations/078_report_runs_and_call_counts.sql"),
         },
     ]
 }

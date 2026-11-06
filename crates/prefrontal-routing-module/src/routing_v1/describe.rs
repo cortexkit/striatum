@@ -17,6 +17,8 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "budget_quote",
     "account_status",
     "head_choices",
+    "report_outcomes",
+    "report_usage_run_id",
     cortexkit_role_routing::capabilities::SELECT_HARNESS,
     "select_hold_control",
     cortexkit_role_routing::capabilities::SELECT_PREFER,

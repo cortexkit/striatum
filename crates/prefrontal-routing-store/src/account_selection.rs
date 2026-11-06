@@ -1135,7 +1135,7 @@ pub const ACCOUNT_DEMAND_SQL: &str =
 /// method reads or writes through the same transaction, so a whole admission
 /// commits or rolls back as one.
 pub struct AccountTx<'a> {
-    conn: &'a Connection,
+    pub(crate) conn: &'a Connection,
 }
 
 mod continuation;

@@ -290,6 +290,7 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
             let refusal = cortexkit_role_routing::errors::Refusal::unknown_decision();
             step["reply"] = json!({"code":refusal.code.as_str(),"message":refusal.message,"detail":refusal.detail});
         }
+        apply_report_outcome_difference(&mut expected);
         project_additive_shape_members(&mut observed);
         project_additive_shape_members(&mut expected);
         assert!(
@@ -300,12 +301,71 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
     }
 }
 
+/// The four declared caller-side outcomes keep affinity and no longer record
+/// a provider error. All other recorded replies and effects remain unchanged
+/// in the replay expectation.
+fn apply_report_outcome_difference(value: &mut Value) {
+    let differences: Value = serde_json::from_str(include_str!(
+        "../../fixtures/replay/report-outcomes-difference-8.json"
+    ))
+    .unwrap();
+    fn apply(value: &mut Value, differences: &Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(|v| apply(v, differences)),
+            Value::Object(object) => {
+                if object.get("method").and_then(Value::as_str) == Some("route.report") {
+                    let params = object.get("params").cloned().unwrap_or(Value::Null);
+                    if let Some(difference) = differences
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|d| d["outcome"] == params["outcome"])
+                    {
+                        if let Some(rows) = object
+                            .get_mut("state")
+                            .and_then(|s| s.get_mut("model_route_decisions"))
+                            .and_then(Value::as_array_mut)
+                        {
+                            for row in rows.iter_mut().filter(|r| r["id"] == params["decision_id"])
+                            {
+                                assert_eq!(row["outcome"], difference["before_ledger"]);
+                                row["outcome"] = difference["after_ledger"].clone();
+                                assert_eq!(row["outcome_error"], params["outcome"]);
+                                row["outcome_error"] = Value::Null;
+                            }
+                        }
+                        if let Some(rows) = object
+                            .get_mut("state")
+                            .and_then(|s| s.get_mut("routing_v1_affinity"))
+                            .and_then(Value::as_array_mut)
+                        {
+                            for row in rows
+                                .iter_mut()
+                                .filter(|r| r["decision_id"] == params["decision_id"])
+                            {
+                                assert!(row["ended_at_ms"].is_number());
+                                row["ended_at_ms"] = Value::Null;
+                            }
+                        }
+                    }
+                }
+                object.values_mut().for_each(|v| apply(v, differences));
+            }
+            _ => {}
+        }
+    }
+    apply(value, &differences);
+}
+
 /// Compare the golden response members; dedicated read tests check the new
 /// immutable snapshot and additive public status/discovery members.
 fn project_additive_shape_members(value: &mut Value) {
     match value {
         Value::Array(values) => values.iter_mut().for_each(project_additive_shape_members),
         Value::Object(object) => {
+            // Delivery identities are additive persistence, checked by the
+            // tests for usage deduplication and crash recovery, not the pre-add snapshot.
+            object.remove("routing_v1_report_delivery");
             if let Some(rows) = object
                 .get_mut("routing_v1_decision")
                 .and_then(Value::as_array_mut)
@@ -322,7 +382,14 @@ fn project_additive_shape_members(value: &mut Value) {
                     for (field, added) in [
                         (
                             "capabilities",
-                            &["explain", "budget_quote", "account_status", "head_choices"][..],
+                            &[
+                                "explain",
+                                "budget_quote",
+                                "account_status",
+                                "head_choices",
+                                "report_outcomes",
+                                "report_usage_run_id",
+                            ][..],
                         ),
                         (
                             "ops",

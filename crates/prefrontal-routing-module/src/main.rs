@@ -1446,6 +1446,7 @@ async fn handle_frame(
             tokio::spawn(async move {
                 answer_route_request(&writer, ver, channel, route_epoch, corr, |reply| {
                     run_route_handler_off_async_workers(async move {
+                        routing_v1::record_call(&frame.body, channel, route_epoch, &store)?;
                         // A flow-scoped route reaches only the ops in
                         // diagnostics_findings::FLOW_SCOPE_OPS.
                         if let Some(refusal) = diagnostics_findings::flow_route_refusal(

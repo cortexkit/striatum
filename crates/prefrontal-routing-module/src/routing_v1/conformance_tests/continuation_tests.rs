@@ -209,6 +209,91 @@ async fn continuation_first_usage_consumes_reservation_and_keeps_task_profile() 
 }
 
 #[tokio::test]
+async fn continuation_first_usageless_report_consumes_reservation_for_every_end_state() {
+    for outcome in ["completed", "interrupted", "timed_out"] {
+        let (subject, consumer, runner, request) = paused().await;
+        let offer = result(runner.call("route.account_for", &request).await);
+        assert_eq!(offer["kind"], "offer");
+        let report = json!({"decision_id":offer["decision_id"],"outcome":outcome});
+        let first = result(consumer.call("route.report", &report).await);
+        let harness = subject.harness();
+        let path = harness.store_path();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (principal, reservation, until, used): (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT principal,reservation_id,valid_until_ms,used_at_ms FROM account_continue",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        harness
+            .store()
+            .account_transaction(|tx| {
+                tx.release_expired_continuations(until + 1)?;
+                assert_eq!(
+                    tx.admission(&principal, &reservation)?.unwrap().state,
+                    "started"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(result(consumer.call("route.report", &report).await), first);
+        assert_eq!(
+            conn.query_row("SELECT used_at_ms FROM account_continue", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            used
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM model_route_usage", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let restart_path = cortexkit_test_support::scratch_root().join(format!(
+            "usageless-continue-{}-{}-{}.db",
+            std::process::id(),
+            outcome,
+            crate::account_selection::now_ms()
+        ));
+        conn.execute("VACUUM INTO ?1", [restart_path.to_str().unwrap()])
+            .unwrap();
+        if outcome == "completed" {
+            let mut next = request.clone();
+            next["previous_decision_id"] = offer["decision_id"].clone();
+            next["selection_id"] = json!("after-usageless-report");
+            next["exhausted"]["credential_id"] = offer["credential_id"].clone();
+            next["exhausted"]["account"] = offer["account"].clone();
+            let continued = result(runner.call("route.account_for", &next).await);
+            assert_eq!(continued["kind"], "offer", "{continued}");
+            assert_ne!(continued["account"], offer["account"]);
+        }
+        drop(conn);
+        drop(consumer);
+        drop(runner);
+        drop(harness);
+        drop(subject);
+        let reopened = prefrontal_routing_store::SqliteRouteStateStore::open(
+            &prefrontal_routing_store::dev_descriptor(
+                "prefrontal-routing",
+                restart_path.to_string_lossy().into_owned(),
+            ),
+        )
+        .unwrap();
+        reopened
+            .account_transaction(|tx| {
+                tx.release_expired_continuations(until + 2)?;
+                assert_eq!(
+                    tx.admission(&principal, &reservation)?.unwrap().state,
+                    "started"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn continuation_refuses_unbound_runs_and_disabled_selection() {
     let (subject, _, runner, request) = paused().await;
     for field in [
