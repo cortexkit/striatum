@@ -38,6 +38,45 @@ pub struct V1Recorded {
 }
 
 impl SqliteRouteStateStore {
+    pub fn v1_create_panel(
+        &self,
+        principal: &str,
+        state_json: &str,
+        now_ms: i64,
+    ) -> RouteStateResult<String> {
+        let id = super::new_decision_id();
+        self.store.with_conn(|c: &Connection| {
+            c.execute("INSERT INTO routing_v1_panel(panel_id, principal, state_json, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![id, principal, state_json, now_ms]).map(|_| ())
+        }).map_err(err)?;
+        Ok(id)
+    }
+
+    pub fn v1_panel(&self, id: &str, principal: &str) -> RouteStateResult<Option<String>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT state_json FROM routing_v1_panel WHERE panel_id=?1 AND principal=?2",
+                    params![id, principal],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .map_err(err)
+    }
+
+    pub fn v1_update_panel(&self, id: &str, state_json: &str) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.execute(
+                    "UPDATE routing_v1_panel SET state_json=?2 WHERE panel_id=?1",
+                    params![id, state_json],
+                )
+                .map(|_| ())
+            })
+            .map_err(err)
+    }
+
     pub fn record_service_tier(
         &self,
         decision_id: &str,

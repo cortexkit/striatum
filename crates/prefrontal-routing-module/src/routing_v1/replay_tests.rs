@@ -394,6 +394,8 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "select_prefer_prompt_cache",
                                 "select_settings",
                                 "observe_backoff",
+                                "select_panel",
+                                "consumer_models",
                             ][..],
                         ),
                         (
@@ -403,6 +405,8 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "route.budget_quote",
                                 "route.account_status",
                                 "route.head_choices",
+                                "route.select_panel",
+                                "route.consumer_models",
                             ][..],
                         ),
                     ] {

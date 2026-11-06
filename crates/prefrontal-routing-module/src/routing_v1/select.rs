@@ -104,6 +104,23 @@ pub(super) async fn select(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
+    select_kind(params, caller, deps, false).await
+}
+
+pub(super) async fn panel_seat(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
+    select_kind(params, caller, deps, true).await
+}
+
+async fn select_kind(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    panel_seat: bool,
+) -> Result<Value, Refusal> {
     let lookup = |workload: &str, iq: f64, facts: &[ModelFact]| {
         let complete = crate::select::task_profiles_for(workload, iq, facts);
         if !complete.profiles.is_empty() || facts.len() <= 1 {
@@ -124,7 +141,7 @@ pub(super) async fn select(
                 .clone(),
         }
     };
-    select_with_profile_lookup(params, caller, deps, &lookup).await
+    select_with_profile_lookup_kind(params, caller, deps, &lookup, panel_seat).await
 }
 
 pub(super) type ProfileLookup =
@@ -135,6 +152,16 @@ pub(super) async fn select_with_profile_lookup(
     caller: &Caller,
     deps: &Deps<'_>,
     profile_lookup: &ProfileLookup,
+) -> Result<Value, Refusal> {
+    select_with_profile_lookup_kind(params, caller, deps, profile_lookup, false).await
+}
+
+async fn select_with_profile_lookup_kind(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    profile_lookup: &ProfileLookup,
+    panel_seat: bool,
 ) -> Result<Value, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
     if super::shapes::NEW_SELECT
@@ -199,6 +226,7 @@ pub(super) async fn select_with_profile_lookup(
         &request,
         &settings_layers,
         project_settings,
+        panel_seat,
     )
     .await;
     if let (Err(refusal), Some(slot)) = (&mut result, &request.pin_slot) {
@@ -235,6 +263,7 @@ async fn select_with_tier_fallback(
     request: &SelectRequest,
     settings_layers: &crate::tier_settings::Layers,
     project_settings: Option<cortexkit_role_routing::select::ProjectSettings>,
+    panel_seat: bool,
 ) -> Result<Value, Refusal> {
     use cortexkit_role_routing::service_tier::ServiceTier;
     let mut trace = TierTrace {
@@ -251,6 +280,7 @@ async fn select_with_tier_fallback(
             None,
             &mut trace,
             settings_layers,
+            panel_seat,
         )
         .await;
     };
@@ -286,6 +316,7 @@ async fn select_with_tier_fallback(
                     credential.as_deref(),
                     &mut trace,
                     settings_layers,
+                    panel_seat,
                 )
                 .await
                 {
@@ -312,6 +343,7 @@ async fn select_with_tier_fallback(
             None,
             &mut trace,
             settings_layers,
+            panel_seat,
         )
         .await
         {
@@ -409,6 +441,7 @@ async fn select_at_tier(
     sticky_credential: Option<&str>,
     tier_trace: &mut TierTrace,
     tier_settings: &crate::tier_settings::Layers,
+    panel_seat: bool,
 ) -> Result<Value, Refusal> {
     tier_trace.rejections.clear();
     super::refuse_unknown_members(params, MEMBERS)?;
@@ -1289,8 +1322,12 @@ async fn select_at_tier(
     if let Some(detail) = detail {
         answer = answer.with_detail(detail);
     }
-    if let Some(outcome) = pin_outcome {
-        answer = answer.with_pin_outcome(outcome);
+    // A panel's policy chose this route. The internal pin fixes the scorer's
+    // candidate, but is not an operator/caller pin on the public panel request.
+    if !panel_seat {
+        if let Some(outcome) = pin_outcome {
+            answer = answer.with_pin_outcome(outcome);
+        }
     }
     if let Some(status) = &tier_trace.project_settings {
         answer = answer.with_project_settings(status.clone());

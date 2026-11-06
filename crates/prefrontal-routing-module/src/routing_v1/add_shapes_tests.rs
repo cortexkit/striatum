@@ -52,22 +52,30 @@ async fn explain_every_legacy_spelling_and_contract_marker_dispatch() {
 }
 
 #[tokio::test]
-async fn panel_shapes_validate_before_undeclared_group_refusal() {
+async fn panel_shapes_are_served_and_validate_unknown_members() {
     let (_harness, route) = configured().await;
     let describe = route.call("role.describe", &json!({})).await;
-    assert!(!describe.1["result"]["capabilities"]
+    assert!(describe.1["result"]["capabilities"]
         .as_array()
         .unwrap()
         .contains(&json!("select_panel")));
-    for request in [
-        json!({"class":"athena","consumer":fixture::SUMMARY}),
-        json!({"replace":{"panel_id":"p","slot":0}}),
-    ] {
-        assert_eq!(
-            field(&route.call("route.select_panel", &request).await),
-            ("invalid_request", "select_panel")
-        );
-    }
+    let panel = route
+        .call(
+            "route.select_panel",
+            &json!({"class":"audit","consumer":fixture::SUMMARY}),
+        )
+        .await;
+    assert_eq!(panel.0, FrameType::Response, "{panel:?}");
+    assert_eq!(
+        route
+            .call(
+                "route.select_panel",
+                &json!({"replace":{"panel_id":"p","slot":0}})
+            )
+            .await
+            .1["code"],
+        "unknown_decision"
+    );
     for (request, expected) in [
         (json!({}), "class"),
         (

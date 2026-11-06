@@ -1384,3 +1384,55 @@ async fn entorhinal_settings_tier_consumer_precedence_and_request_cap() {
     assert_eq!(reply.1["code"], "invalid_request");
     assert_eq!(reply.1["detail"]["field"], "service_tier");
 }
+
+#[tokio::test]
+async fn panel_settings_only_fast_passes_contract_checker_and_requested_tier_caps_it() {
+    use crate::project_settings::tests::{census, root, write, Fake, ID};
+    use cortexkit_role_routing::panel::{
+        check_panel_answer, parse_select_panel_request_serving, SelectPanelAnswer,
+    };
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_500"], true, true);
+    harness.edit_config(|config| config["panels"]["audit"] = json!({"topK":1,"by":"iq"}));
+    let project = root();
+    write(
+        &project,
+        r#"{"consumers":{"explicit":{"service_tier":"fast"}}}"#,
+    );
+    harness.settings_source(Fake::new(census(&[project], None)));
+    let route = harness.bind(reserved("tier-owner"), Some(ID)).await;
+    for (requested, expected) in [(None, "fast"), (Some("standard"), "standard")] {
+        let mut body = json!({"class":"audit","consumer":"mason","available_routes":[format!("openai/{MODEL}")],"settings":{"project_id":ID,"tier_consumer":"explicit"}});
+        if let Some(tier) = requested {
+            body["service_tier"] = json!(tier);
+        }
+        let reply = route.call("route.select_panel", &body).await;
+        assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+        let answer: SelectPanelAnswer = serde_json::from_value(reply.1["result"].clone()).unwrap();
+        assert_eq!(answer.seats.len(), 1, "{reply:?}");
+        assert_eq!(
+            answer.seats[0].answer.service_tier_chosen.as_deref(),
+            Some(expected)
+        );
+        assert!(answer.seats[0].answer.project_settings.is_some());
+        check_panel_answer(
+            &parse_select_panel_request_serving(&body, super::describe::CAPABILITIES).unwrap(),
+            &answer,
+        )
+        .unwrap();
+    }
+    let refused = route
+        .call(
+            "route.select_panel",
+            &json!({"class":"audit","consumer":"mason","service_tier":"unknown"}),
+        )
+        .await;
+    assert_eq!(refused.1["detail"]["field"], "service_tier");
+    let mismatched = route
+        .call(
+            "route.select_panel",
+            &json!({"class":"audit","consumer":"mason","settings":{"project_id":"other-project"}}),
+        )
+        .await;
+    assert_eq!(mismatched.1["detail"]["field"], "settings.project_id");
+}

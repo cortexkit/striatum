@@ -4453,6 +4453,11 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
         },
         // Operations exclusive to the routing/v1 surface.
         ManagementOperation {
+            name: cortexkit_role_routing::ops::ROUTE_CONSUMER_MODELS.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Stored model judgments for an admitted consumer".to_string()),
+        },
+        ManagementOperation {
             name: cortexkit_role_routing::ops::ROUTE_BUDGET_QUOTE.to_string(),
             kind: ManagementOperationKind::Query,
             description: Some("Quote the retained selection-time capacities".to_string()),

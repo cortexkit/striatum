@@ -4,8 +4,7 @@
 //! types and validators this module uses for every request and answer. It
 //! serves selection, reporting, account operations and public reads. Several
 //! names also have older shapes that core and Broca still send, so [`claims`]
-//! uses the per-operation table in `shapes` to choose their surface. Contract
-//! panels are parsed here but refused until their group is declared.
+//! uses the per-operation table in `shapes` to choose their surface.
 //!
 //! Every v1 op reads its caller from the route: the principal the daemon
 //! attested when it bound the route, and the project the route's scope stamp
@@ -26,6 +25,9 @@ use crate::{
 mod accounts;
 pub(crate) mod consumers;
 mod describe;
+mod panels;
+#[cfg(test)]
+mod panels_tests;
 mod reads;
 mod report;
 pub(crate) mod runners;
@@ -85,6 +87,7 @@ pub(crate) const V1_ONLY_OPS: &[&str] = &[
     ops::ROLE_DESCRIBE,
     ops::ROUTE_REPORT,
     ops::ROUTE_BUDGET_QUOTE,
+    ops::ROUTE_CONSUMER_MODELS,
 ];
 
 /// Whether the `routing/v1` surface answers this request body.
@@ -260,11 +263,12 @@ async fn answer(
         ops::ROUTE_REPORT => report::report(params, caller, deps),
         ops::ROUTE_ACCOUNT_FOR => accounts::account_for(params, caller, deps),
         ops::ROUTE_ACCOUNT_OBSERVE => accounts::account_observe(params, caller, deps),
-        ops::ROUTE_SELECT_PANEL => shapes::panel(params),
+        ops::ROUTE_SELECT_PANEL => panels::select_panel(params, caller, deps).await,
         ops::ROUTE_EXPLAIN => reads::explain(params, caller, deps),
         ops::ROUTE_BUDGET_QUOTE => reads::budget_quote(params, caller, deps),
         ops::ROUTE_ACCOUNT_STATUS => reads::account_status(params, caller, deps),
         ops::ROUTE_HEAD_CHOICES => reads::head_choices(params, deps),
+        ops::ROUTE_CONSUMER_MODELS => reads::consumer_models(params, caller, deps),
         other => Err(Refusal::new(
             RefusalCode::parse("unknown_method"),
             format!("unknown method '{other}'"),

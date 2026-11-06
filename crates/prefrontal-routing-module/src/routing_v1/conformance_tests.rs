@@ -711,6 +711,19 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
         .unwrap() = account_state(&catalog.accounts);
 }
 
+pub(super) fn install_panel_families(harness: &Harness, catalog: &Catalog) {
+    // Older replay fixtures installed no lineage on synthetic catalog rows.
+    // Panel fixtures exercise the public family member and install it explicitly.
+    for (rank, model) in catalog.models.iter().enumerate() {
+        let mut fact = catalog_fact(model, rank);
+        fact.family = model.family.clone();
+        harness
+            .store
+            .upsert_fact(&fact, FactSource::Override)
+            .unwrap();
+    }
+}
+
 /// Public choices require a ready catalog snapshot, unlike selection's fixture
 /// billing view. Install it only for checks that need that read surface.
 pub(super) fn install_head_snapshot(harness: &Harness) {
@@ -786,6 +799,7 @@ impl RoutingSubject for KitSubject {
     async fn configure_catalog(&self, catalog: &Catalog) -> Result<(), String> {
         let harness = self.harness();
         install_catalog(&harness, catalog);
+        install_panel_families(&harness, catalog);
         install_head_snapshot(&harness);
         Ok(())
     }
@@ -941,6 +955,26 @@ impl RoutingSubject for KitSubject {
         Ok(())
     }
 
+    async fn configure_panel_class(
+        &self,
+        class: &str,
+        size: u8,
+        top: u8,
+        extra: u8,
+    ) -> Result<(), String> {
+        if !(1..=8).contains(&size) || top + extra != size {
+            return Err("invalid panel counts".into());
+        }
+        self.harness().edit_config(|config| {
+            let mut policy = json!({"topK":top,"extra":extra,"by":"iq","floor":0});
+            if extra > 0 {
+                policy["extraBy"] = json!("random");
+            }
+            config["panels"][class] = policy;
+        });
+        Ok(())
+    }
+
     async fn cool_down(&self, route_key: &str, until_ms: u64) -> Result<(), String> {
         self.harness()
             .store()
@@ -1063,16 +1097,6 @@ const NOT_YET_SERVED: &[&str] = &[];
 /// Checks gated off by the provider's current group declarations: serving
 /// checks for undeclared groups and refusal checks for declared groups.
 const NOT_APPLICABLE: &[&str] = &[
-    "panel_full",
-    "panel_shortfall",
-    "panel_family_and_route_unique",
-    "panel_temperatures_by_slot",
-    "panel_same_seed",
-    "panel_replacement_preserves_slot",
-    "panel_foreign_replacement_unknown",
-    "panel_replacement_invalid_slot",
-    "consumer_models_valid",
-    "consumer_models_unknown_consumer",
     "undeclared_pin_slot_refused",
     "undeclared_available_routes_refused",
     "undeclared_prefer_prompt_cache_refused",
@@ -1093,6 +1117,12 @@ const NOT_APPLICABLE: &[&str] = &[
 /// contract rule it holds the provider to.
 #[tokio::test]
 async fn routing_v1_conformance_kit_matches_served_checks() {
+    for group in cortexkit_role_routing::capabilities::KNOWN {
+        assert!(
+            super::describe::CAPABILITIES.contains(group),
+            "undeclared group {group}"
+        );
+    }
     let subject = KitSubject {
         harness: Mutex::new(Harness::new("kit")),
     };

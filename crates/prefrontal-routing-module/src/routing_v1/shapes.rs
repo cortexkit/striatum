@@ -105,6 +105,7 @@ pub(super) fn census_shape(method: &str, params: &Value) -> &'static str {
         | ops::ROUTE_ACCOUNT_STATUS
         | ops::ROUTE_HEAD_CHOICES
         | ops::ROUTE_BUDGET_QUOTE
+        | ops::ROUTE_CONSUMER_MODELS
         | ops::ROLE_DESCRIBE => (false, true),
         _ => return "legacy",
     };
@@ -123,6 +124,7 @@ pub(super) fn claims(method: &str, params: &Value) -> bool {
         | ops::ROUTE_BUDGET_QUOTE
         | ops::ROUTE_ACCOUNT_STATUS
         | ops::ROUTE_HEAD_CHOICES => true,
+        ops::ROUTE_CONSUMER_MODELS => true,
         ops::ROUTE_SELECT => !has(params, &["targetAgent"]) || has(params, SELECT_MARKERS),
         ops::ROUTE_SELECT_PANEL => !has(params, PANEL_LEGACY) || has(params, PANEL_CONTRACT),
         ops::ROUTE_EXPLAIN => !has(params, EXPLAIN_LEGACY) || has(params, &["decision_id"]),
@@ -171,24 +173,4 @@ pub(super) fn closed_array(params: &Value, field: &str, known: &[&str]) -> Resul
 
 pub(super) fn settings(params: &Value) -> Result<(), Refusal> {
     closed(params, "settings", &["project_id", "tier_consumer"])
-}
-
-/// Panel policy and seat persistence are not served until select_panel is
-/// declared. Validate both wire forms before refusing the absent group.
-pub(super) fn panel(params: &Value) -> Result<Value, Refusal> {
-    settings(params)?;
-    if params.get("replace").is_some() {
-        closed(params, "replace", &["panel_id", "slot"])?;
-        cortexkit_role_routing::panel::parse_panel_replacement_request(params)?;
-    } else {
-        closed(params, "requirements", &["context_window", "modalities"])?;
-        cortexkit_role_routing::panel::parse_select_panel_request_serving(
-            params,
-            super::describe::CAPABILITIES,
-        )?;
-    }
-    Err(Refusal::invalid_request(
-        "select_panel",
-        "routing has not declared the select_panel group",
-    ))
 }

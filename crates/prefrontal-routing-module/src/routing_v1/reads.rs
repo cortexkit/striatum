@@ -1,8 +1,69 @@
-//! Read retained selections without re-resolving the catalog or runner policy.
+//! Public model inventory and reads of immutable selection-time facts.
 
 use super::{provider_refusal, refuse_unknown_members, store_refusal, Caller, Deps};
 use cortexkit_role_routing::{budget, errors::Refusal, explain, select::SelectAnswer};
 use serde_json::{json, Value};
+
+pub(super) fn consumer_models(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
+    use cortexkit_role_routing::consumer_models::{self, ConsumerModel, ConsumerModelsAnswer};
+    use prefrontal_routing_core::RouteStateStore;
+    refuse_unknown_members(params, &["consumer"])?;
+    let request = consumer_models::parse_consumer_models_request(params)?;
+    let config = super::operator_config(deps);
+    super::consumers::effective(&config).admit(&request.consumer, caller)?;
+    let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
+    let mut facts = deps.store.get_facts().map_err(store_refusal)?;
+    let aliases = credentials.catalog_targets(&facts);
+    prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &aliases);
+    config.apply(&mut facts);
+    let resolved = crate::resolve_routing_policy_with_catalog_targets(
+        facts
+            .iter()
+            .map(|fact| prefrontal_routing_core::fact_to_route(fact).route_key),
+        &config.operator_policy(),
+        &Default::default(),
+        &crate::provider_auth_types(None),
+        &aliases,
+    );
+    let subscriptions: std::collections::HashSet<_> =
+        resolved.subscription_keys.into_iter().collect();
+    // Inventory is model-level, like the available-models list: sibling variants
+    // contribute their best score without producing duplicate model rows.
+    let mut models = std::collections::BTreeMap::new();
+    for fact in &facts {
+        let key = (fact.provider_id.clone(), fact.model_id.clone());
+        let previous: Option<&&prefrontal_routing_core::ModelFact> = models.get(&key);
+        if previous.is_none_or(|old| fact.scores.elo.total_cmp(&old.scores.elo).is_gt()) {
+            models.insert(key, fact);
+        }
+    }
+    let mut answer = ConsumerModelsAnswer::new(
+        deps.store.catalog_fingerprint().map_err(store_refusal)?,
+        &request.consumer,
+    );
+    for ((provider, model), fact) in models {
+        let mut entry = ConsumerModel::new(
+            &provider,
+            &model,
+            !config.route_allowed(&request.consumer, &format!("{provider}/{model}"), false),
+        );
+        entry.elo = fact.scores.elo.is_finite().then_some(fact.scores.elo);
+        entry.eq = fact.scores.eq.is_finite().then_some(fact.scores.eq);
+        // This read describes standing subscription coverage, not whether an
+        // account has quota right now.
+        entry.billing = Some(if subscriptions.contains(&format!("{provider}/{model}")) {
+            consumer_models::Billing::Subscription
+        } else {
+            consumer_models::Billing::PerToken
+        });
+        answer.models.push(entry);
+    }
+    serde_json::to_value(answer).map_err(store_refusal)
+}
 
 fn retained(id: &str, caller: &Caller, deps: &Deps<'_>) -> Result<SelectAnswer, Refusal> {
     let unknown = Refusal::unknown_decision;

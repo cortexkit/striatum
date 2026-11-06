@@ -3649,7 +3649,7 @@ pub(super) fn remember_provider_identity(
 /// Apply the variant overrides to every seated member and runner-up of an
 /// automatic panel, recording each seat's variant and rule beside its entry in
 /// the policy's `seatedVariants`.
-fn apply_panel_variant_policy(
+pub(super) fn apply_panel_variant_policy(
     panel: &mut SelectedPanel,
     config: &config_overrides::LiveConfig,
     config_path: &Path,

@@ -33,6 +33,131 @@ fn select(consumer: &str) -> Value {
 }
 
 #[tokio::test]
+async fn consumer_models_checks_declaring_delegated_configured_and_foreign_owners() {
+    let harness = harness();
+    consumers::replace_catalog(&json!([entry(
+        "declaring-module",
+        true,
+        &["example.worker"]
+    )]));
+    for (module, consumer) in [
+        ("declaring-module", "example.worker"),
+        ("magic-context", "mc_dream_curate"),
+    ] {
+        let route = harness.bind(reserved(module), None).await;
+        let reply = route
+            .call("route.consumer_models", &json!({"consumer":consumer}))
+            .await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        let answer = serde_json::from_value(reply.1["result"].clone()).unwrap();
+        cortexkit_role_routing::consumer_models::check_consumer_models(
+            &cortexkit_role_routing::consumer_models::ConsumerModelsRequest::new(consumer),
+            &answer,
+        )
+        .unwrap();
+    }
+    let delegate = scoped(
+        &harness,
+        "declaring-module",
+        true,
+        harness.reserve_channel(),
+        1,
+    )
+    .await;
+    assert_eq!(
+        delegate
+            .call(
+                "route.consumer_models",
+                &json!({"consumer":"example.worker"})
+            )
+            .await
+            .0,
+        FrameType::Response
+    );
+    let stranger = scoped(&harness, "stranger", true, harness.reserve_channel(), 1).await;
+    refused(
+        stranger
+            .call(
+                "route.consumer_models",
+                &json!({"consumer":"example.worker"}),
+            )
+            .await,
+        "consumer_not_owned",
+        "example.worker",
+    );
+    refused(
+        stranger
+            .call("route.consumer_models", &json!({"consumer":"missing"}))
+            .await,
+        "unknown_consumer",
+        "missing",
+    );
+    let extra = delegate
+        .call(
+            "route.consumer_models",
+            &json!({"consumer":"example.worker","extra":1}),
+        )
+        .await;
+    assert_eq!(extra.1["code"], "invalid_request");
+    assert_eq!(extra.1["detail"]["field"], "extra");
+}
+
+#[tokio::test]
+async fn consumer_models_preserves_frozen_fractional_scores_exclusions_and_subscription_inventory()
+{
+    let h = harness();
+    let frozen: Value = serde_json::from_str(include_str!(
+        "../../fixtures/replay/available-models.golden.json"
+    ))
+    .unwrap();
+    let facts: Vec<prefrontal_routing_core::ModelFact> =
+        serde_json::from_value(frozen["catalog"].clone()).unwrap();
+    h.install_facts(&facts);
+    h.edit_config(|config| {
+        config["models"]["p/excluded"] = json!({"pin_only":true});
+        config["models"]["p/unscored"] = json!({"subscription":true});
+    });
+    let route = h.bind(reserved("prefrontal-core"), None).await;
+    let reply = route
+        .call("route.consumer_models", &json!({"consumer":"codemode"}))
+        .await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    let entries = reply.1["result"]["models"].as_array().unwrap();
+    for name in ["fractional", "excluded", "unscored", "deprecated"] {
+        let entry = entries
+            .iter()
+            .find(|m| m["provider"] == "p" && m["model"] == name)
+            .unwrap();
+        let fact = facts
+            .iter()
+            .find(|f| f.provider_id == "p" && f.model_id == name)
+            .unwrap();
+        assert_eq!(entry["elo"], json!(fact.scores.elo));
+        assert_eq!(entry["eq"], json!(fact.scores.eq));
+        assert_eq!(entry["excluded"], name == "excluded");
+        assert_eq!(
+            entry["billing"],
+            if name == "unscored" {
+                "subscription"
+            } else {
+                "per_token"
+            }
+        );
+    }
+    let stranger = h.bind(reserved("stranger"), None).await;
+    assert_eq!(
+        stranger
+            .call(
+                "route.consumer_models",
+                &json!({"consumer":"codemode","project_root":"/injected"})
+            )
+            .await
+            .1["detail"]["field"],
+        "project_root"
+    );
+}
+
+#[tokio::test]
 async fn ownerless_config_consumer_is_selectable_by_unrelated_callers() {
     let harness = harness();
     let consumer = "example.public";

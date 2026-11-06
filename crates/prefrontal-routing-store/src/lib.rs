@@ -304,7 +304,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 78] {
+fn route_state_migrations() -> [Migration; 79] {
     [
         Migration {
             version: 1,
@@ -617,6 +617,10 @@ fn route_state_migrations() -> [Migration; 78] {
         Migration {
             version: 79,
             statements: include_str!("../migrations/079_observation_backoff_index.sql"),
+        },
+        Migration {
+            version: 80,
+            statements: include_str!("../migrations/080_v1_panels.sql"),
         },
     ]
 }
@@ -4419,12 +4423,21 @@ impl RouteStateStore for SqliteRouteStateStore {
     ) -> RouteStateResult<usize> {
         self.store
             .with_conn(|c: &Connection| {
-                c.execute(
+                let tx = c.unchecked_transaction()?;
+                let panels = tx.execute(
+                    "DELETE FROM routing_v1_panel WHERE panel_id IN (
+                        SELECT panel_id FROM routing_v1_panel WHERE created_at_ms < ?1
+                        ORDER BY created_at_ms LIMIT ?2)",
+                    params![created_before_ms, i64::try_from(limit).unwrap_or(i64::MAX)],
+                )?;
+                let decisions = tx.execute(
                     "DELETE FROM model_route_decisions WHERE rowid IN ( \
                        SELECT rowid FROM model_route_decisions \
                        WHERE created_at < ?1 ORDER BY created_at LIMIT ?2)",
                     params![created_before_ms, i64::try_from(limit).unwrap_or(i64::MAX)],
-                )
+                )?;
+                tx.commit()?;
+                Ok(panels + decisions)
             })
             .map_err(err)
     }
