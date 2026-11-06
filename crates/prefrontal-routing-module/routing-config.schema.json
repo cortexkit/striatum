@@ -7,6 +7,7 @@
       "$ref": "#/$defs/ProviderAccountsPolicy",
       "default": {
         "floors": null,
+        "hold_when_reset_within": null,
         "max_hold": null,
         "metered_fallback": false,
         "order": null,
@@ -844,6 +845,17 @@
             "$ref": "#/$defs/AccountPoolFloor"
           }
         },
+        "hold_when_reset_within": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "max_hold": {
           "anyOf": [
             {
@@ -935,6 +947,7 @@
           "$ref": "#/$defs/ProviderAccountsPolicy",
           "default": {
             "floors": null,
+            "hold_when_reset_within": null,
             "max_hold": null,
             "metered_fallback": false,
             "order": null,

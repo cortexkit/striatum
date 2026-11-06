@@ -1068,7 +1068,9 @@ fn allocator_policy_from(
 }
 
 impl LiveConfig {
-    pub(crate) fn select_hold_threshold_s(&self, provider: &str) -> u64 {
+    /// With no operator threshold, selection keeps the request's
+    /// `hold_wait_max_s` budget, bounded only by the allocator's `max_hold_s`.
+    pub(crate) fn select_hold_threshold_s(&self, provider: &str) -> Option<u64> {
         self.config
             .providers
             .get(provider)
@@ -1079,7 +1081,6 @@ impl LiveConfig {
                     .seconds()
                     .expect("account durations were validated")
             })
-            .unwrap_or(900)
     }
 
     pub(crate) fn effective_account_policies(&self) -> serde_json::Value {
@@ -1179,12 +1180,12 @@ mod account_policy_config_tests {
     }
 
     #[test]
-    fn select_hold_threshold_uses_provider_then_global_then_contract_default() {
+    fn select_hold_threshold_is_an_explicit_provider_or_global_limit() {
         let config = parse_config(r#"{"accounts":{"hold_when_reset_within":"2m"},"providers":{"p":{"accounts":{"hold_when_reset_within":"30s"}}}}"#).unwrap();
         let live = LiveConfig::new(config, None);
-        assert_eq!(live.select_hold_threshold_s("p"), 30);
-        assert_eq!(live.select_hold_threshold_s("other"), 120);
-        assert_eq!(LiveConfig::default().select_hold_threshold_s("p"), 900);
+        assert_eq!(live.select_hold_threshold_s("p"), Some(30));
+        assert_eq!(live.select_hold_threshold_s("other"), Some(120));
+        assert_eq!(LiveConfig::default().select_hold_threshold_s("p"), None);
     }
 }
 

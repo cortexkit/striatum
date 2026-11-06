@@ -1586,12 +1586,12 @@ impl<'a> Selection<'a> {
         if let Some(classes) = self.classes {
             let wait_limit = self
                 .hold_wait_max_s
-                .unwrap_or(account_selection::DEFAULT_HOLD_WAIT_S)
-                .min(
-                    self.sources
-                        .operator_config
-                        .select_hold_threshold_s(&selected.model.provider_id),
-                );
+                .unwrap_or(account_selection::DEFAULT_HOLD_WAIT_S);
+            let wait_limit = self
+                .sources
+                .operator_config
+                .select_hold_threshold_s(&selected.model.provider_id)
+                .map_or(wait_limit, |threshold| wait_limit.min(threshold));
             match classes
                 .probe(
                     &selected.model.provider_id,
