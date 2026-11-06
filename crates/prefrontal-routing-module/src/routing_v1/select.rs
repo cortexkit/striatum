@@ -1593,8 +1593,9 @@ impl<'a> Selection<'a> {
                     },
                     refusal.wait_until_ms(),
                 );
-                pin_refusal.message =
-                    "[TODO(user): explain the pinned route's account unavailability]".into();
+                pin_refusal.message = "No account can serve the pinned route right now. \
+                    The detail gives the reason and, when known, the time to retry."
+                    .into();
                 return Err(pin_refusal);
             }
         }
@@ -1727,8 +1728,9 @@ fn account_limit_refusal(pin: Option<&str>, reset: Option<i64>) -> Refusal {
         Some(pin) => Refusal::pin_unavailable(pin, PinUnavailableReason::QuotaExhausted, reset),
         None => Refusal::no_route(NoRouteReason::parse("accounts_blocked"), reset),
     };
-    refusal.message =
-        "[TODO(user): explain the route's account limit and retry time when known]".into();
+    refusal.message = "Every account that can serve this route has reached its limit. \
+        The detail gives the time an account frees up, when routing knows it."
+        .into();
     refusal
 }
 

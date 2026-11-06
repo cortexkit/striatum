@@ -4474,7 +4474,7 @@ pub(crate) fn observe_authorized(
     if !ctx.flags.enabled {
         return OpReply::typed(
             DISABLED_CODE,
-            "[TODO(user): account selection is disabled]",
+            "route.account_observe is not served: account selection is disabled in routing policy",
             json!({"code":DISABLED_CODE}),
         );
     }
