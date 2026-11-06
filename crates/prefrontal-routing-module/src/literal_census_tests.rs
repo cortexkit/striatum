@@ -67,6 +67,13 @@ const EXEMPTIONS: &[Exemption] = &[
         file: "prefrontal-routing-module/src/legacy_wire.rs",
         item: ExemptItem::Module,
     },
+    // A test-only module (declared under `#[cfg(test)]`) that copies a test
+    // program off an external drive before a test runs it again; it names no
+    // provider or runner.
+    Exemption {
+        file: "prefrontal-routing-store/src/test_exe.rs",
+        item: ExemptItem::Module,
+    },
     // Model-family names, not provider references: the stored and wire
     // spellings of each grand family (some equal a provider id, such as
     // `deepseek`), and the historical store spellings (`anthropic`, `openai`)
