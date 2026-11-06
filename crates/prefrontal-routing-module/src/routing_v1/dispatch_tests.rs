@@ -47,6 +47,19 @@ fn the_older_shapes_are_recognised_by_their_marker_alone() {
 }
 
 #[test]
+fn legacy_detail_does_not_mark_a_contract_select() {
+    for detail in [json!(true), json!(false), json!(null)] {
+        let mut legacy = json!({
+            "consumer": "mason", "requirements": {"iq": 30, "eq": 0},
+            "detail": detail, "targetAgent": "mason", "executor": "broca", "substrate": "broca"
+        });
+        assert!(!claims(&body("route.select", legacy.clone())));
+        legacy.as_object_mut().unwrap().remove("targetAgent");
+        assert!(claims(&body("route.select", legacy)));
+    }
+}
+
+#[test]
 fn the_manifest_registers_one_selection_pass() {
     let operations = crate::served_operations();
     let selects: Vec<_> = operations

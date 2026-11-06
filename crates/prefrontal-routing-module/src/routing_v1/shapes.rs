@@ -2,7 +2,7 @@
 //!
 //! | Operation | Legacy marker | Contract marker | Markerless |
 //! | --- | --- | --- | --- |
-//! | select | targetAgent; injected roots/tier on v1 | settings, pin_slot, available_routes, prefer_prompt_cache and v1-only members | v1 |
+//! | select | targetAgent; project_root, workspace_root, tier_consumer on v1 | members in [`SELECT_MARKERS`]; never detail | v1 |
 //! | select_panel | panelSpec, selection, roster and camelCase launch members | class, consumer, replace and select's shared contract members | v1 |
 //! | explain | decisionID, decisionId, sendID, sendId, send_id | decision_id | v1 |
 //! | account_status | none (same provider/account_id request) | same request; additive answer | v1 |
@@ -12,6 +12,8 @@
 //! Legacy-only bodies retain the old handler. Contract-only and mixed bodies
 //! go to v1, whose closed-record checks refuse the legacy member by name.
 //! Injected select context remains supported only without a new contract marker.
+//! The legacy select accepts advisory `detail` too, so that member never
+//! overrides `targetAgent` when choosing the request's surface.
 
 use cortexkit_role_routing::{errors::Refusal, ops};
 use serde_json::Value;
@@ -30,7 +32,6 @@ const SELECT_MARKERS: &[&str] = &[
     "hold_ok",
     "hold_wait_max_s",
     "prefer",
-    "detail",
 ];
 pub(super) const INJECTED: &[&str] = &["project_root", "workspace_root", "tier_consumer"];
 pub(super) const NEW_SELECT: &[&str] = &[
