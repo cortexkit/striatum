@@ -576,7 +576,20 @@ fn registered_query_is_handled_and_in_the_manifest() {
 #[tokio::test]
 async fn serving_bytes_match_tagged_vectors() {
     use sha2::{Digest, Sha256};
-    let (harness, _) = fixture();
+    let (harness, mut credentials) = fixture();
+    let non_starting_runner = "non-starting-runner";
+    let mut declaration = credentials.runner_declarations[RUNNER].clone();
+    declaration.starts_sessions = false;
+    credentials
+        .runner_declarations
+        .insert(non_starting_runner.into(), declaration);
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["runners"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"module":non_starting_runner,"via_vault":true}));
+    });
     let route = harness.bind(reserved("occipital"), None).await;
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors/route-head-choices-v1");
@@ -588,6 +601,8 @@ async fn serving_bytes_match_tagged_vectors() {
         ("policy-excluded.json", "policy-runner"),
         ("pin-only.json", "pin-runner"),
         ("pin-only-pay-per-token.json", API_KEY_RUNNER),
+        ("unknown-runner.json", "missing"),
+        ("non-starting-runner.json", non_starting_runner),
     ] {
         let request = json!({"method":"route.head_choices","params":{"runner_module":runner}});
         let (ty, bytes) = route
@@ -601,33 +616,20 @@ async fn serving_bytes_match_tagged_vectors() {
         );
         let reply: Value = serde_json::from_slice(&bytes).unwrap();
         check_contract(runner, &reply["result"]);
+        if ["missing", non_starting_runner].contains(&runner) {
+            assert_eq!(reply["result"]["models"], json!([]), "{name}");
+        }
         let bytes = serde_json::to_vec(&json!({"request":request,"reply":reply})).unwrap();
         let path = directory.join(name);
-        assert!(
-            !update,
-            "the pre-cutover vectors are frozen; record new differences separately"
-        );
-        let original = std::fs::read(path).unwrap();
-        sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&original)));
-        let mut expected: Value = serde_json::from_slice(&original).unwrap();
-        // Public choices keep the old model membership, pins and defaults.
-        // The contract requires string catalog versions and bytewise ordering;
-        // per_token is the closed billing spelling, not pay_per_token.
-        let result = &mut expected["reply"]["result"];
-        result["catalog_version"] = json!(result["catalog_version"].to_string());
-        for model in result["models"].as_array_mut().unwrap() {
-            for field in ["variants", "service_tiers"] {
-                model[field]
-                    .as_array_mut()
-                    .unwrap()
-                    .sort_by_key(Value::to_string);
-            }
-            if model["billing"] == "pay_per_token" {
-                model["billing"] = json!("per_token");
-            }
+        if update {
+            std::fs::write(&path, &bytes).unwrap();
         }
-        assert_eq!(serde_json::to_vec(&expected).unwrap(), bytes, "{name}");
+        assert_eq!(std::fs::read(path).unwrap(), bytes, "{name}");
+        sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
     }
     let path = directory.join("SHA256SUMS");
+    if update {
+        std::fs::write(&path, &sums).unwrap();
+    }
     assert_eq!(std::fs::read_to_string(path).unwrap(), sums);
 }
