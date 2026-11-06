@@ -638,7 +638,7 @@ impl SqliteRouteStateStore {
         self.store.with_conn(|conn: &Connection| {
             let tx = conn.unchecked_transaction()?;
             let known = |key: &str| -> rusqlite::Result<bool> {
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM model_facts WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT 1 FROM model_route_state WHERE route_key=?1 OR capacity_key=?1)", [key], |row| row.get(0))
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM model_facts WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT 1 FROM model_route_state WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT 1 FROM routing_v1_decision WHERE provider||'/'||model=?1 OR provider||'/'||model||'/'||variant=?1 UNION ALL SELECT 1 FROM account_admission WHERE provider||'/'||model=?1)", [key], |row| row.get(0))
             };
             let requested = requested.trim();
             let route_key = if known(requested)? {
@@ -649,7 +649,7 @@ impl SqliteRouteStateStore {
                 key
             } else { return Ok(None); };
             let identity: Option<(String, String, Option<String>)> = tx.query_row(
-                "SELECT provider_id,model_id,variant FROM model_facts WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT provider_id,model_id,variant FROM model_route_state WHERE route_key=?1 OR capacity_key=?1 LIMIT 1",
+                "SELECT provider_id,model_id,variant FROM model_facts WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT provider_id,model_id,variant FROM model_route_state WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT provider,model,variant FROM routing_v1_decision WHERE provider||'/'||model=?1 OR provider||'/'||model||'/'||variant=?1 UNION ALL SELECT provider,model,NULL FROM account_admission WHERE provider||'/'||model=?1 LIMIT 1",
                 [&route_key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
             ).optional()?;
             let Some((provider, model, _variant)) = identity else { return Ok(None); };
@@ -667,6 +667,10 @@ impl SqliteRouteStateStore {
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
             tx.execute("DELETE FROM account_route_fence WHERE provider=?1 AND model=?2", params![provider,model])?;
+            // Credential walls cover every model served by the provider. An
+            // operator clearing one of its routes also permits an early retry.
+            tx.execute("UPDATE pool_key_state SET walled_until=NULL,wall_reason=NULL WHERE provider=?1", [&provider])?;
+            tx.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND code='credential_refused'", [&provider])?;
             tx.commit()?;
             Ok(Some(ClearedRouteCooldowns {route_key, routes, account_fences}))
         }).map_err(err)
@@ -2363,29 +2367,9 @@ impl SqliteRouteStateStore {
         if refusal.provider_id.trim().is_empty() || refusal.credential_id.trim().is_empty() {
             return Ok(());
         }
-        self.store
-            .with_conn(|c: &Connection| {
-                c.execute(
-                    "INSERT INTO credential_entitlement_fences
-                       (provider_id, credential_id, code, listing_fingerprint, observed_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(provider_id, credential_id) DO UPDATE SET
-                       code = excluded.code,
-                        observed_at_ms = MAX(credential_entitlement_fences.observed_at_ms, excluded.observed_at_ms),
-                       listing_fingerprint = COALESCE(
-                         credential_entitlement_fences.listing_fingerprint,
-                         excluded.listing_fingerprint)",
-                    params![
-                        refusal.provider_id,
-                        refusal.credential_id,
-                        refusal.code,
-                        listing_fingerprint,
-                        observed_at_ms
-                    ],
-                )
-                .map(|_| ())
-            })
-            .map_err(err)
+        self.account_transaction(|tx| {
+            tx.record_credential_refusal(refusal, listing_fingerprint, observed_at_ms)
+        })
     }
 
     /// Every stored credential entitlement fence.

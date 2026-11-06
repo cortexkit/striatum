@@ -46,7 +46,12 @@ use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 /// Billing fences use this interval only without a quota signal (see
 /// [`probe_allowed`]). A subscription's billing hold uses its quota reset and
 /// headroom readings instead; entitlement refusals always keep timed probes.
-pub(crate) const FENCE_PROBE_RECHECK_MS: i64 = 6 * 60 * 60 * 1000;
+pub(crate) const FENCE_PROBE_RECHECK_MS: i64 = CREDENTIAL_REFUSED_REPROBE_MS;
+
+/// The documented credential-refusal re-probe horizon: six hours, matching
+/// core's billing walls. Observations use this horizon for pooled key walls
+/// and the existing entitlement-fence probe path for other credentials.
+pub(crate) const CREDENTIAL_REFUSED_REPROBE_MS: i64 = 6 * 60 * 60_000;
 
 /// A window reading at or above this used percent counts as exhausted for
 /// turning a billing-class refusal into a quota hold. The
