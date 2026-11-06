@@ -63,12 +63,39 @@ pub enum PoolWallKind {
 }
 
 fn lease_id(now_ms: i64) -> String {
+    if let Some(inputs) = crate::replay::current() {
+        return format!("pool_{}", inputs.next_id());
+    }
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!(
         "pool_{now_ms:x}_{:x}_{:x}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+#[cfg(test)]
+mod lease_id_tests {
+    use super::lease_id;
+
+    #[test]
+    fn replay_inputs_control_pool_lease_ids() {
+        let _inputs = crate::replay::Inputs::new(1_800_000_000_000).install();
+        assert_eq!(lease_id(1_800_000_000_000), "pool_000000000000");
+        assert_eq!(lease_id(1_800_000_000_000), "pool_000000000001");
+    }
+
+    #[test]
+    fn production_pool_lease_ids_keep_timestamp_pid_counter_shape() {
+        assert!(crate::replay::current().is_none());
+        let id = lease_id(1_800_000_000_000);
+        let parts: Vec<_> = id.split('_').collect();
+        assert_eq!(parts.len(), 4, "{id}");
+        assert_eq!(parts[0], "pool");
+        assert_eq!(parts[1], "1a3185c5000");
+        assert_eq!(parts[2], format!("{:x}", std::process::id()));
+        assert!(u64::from_str_radix(parts[3], 16).is_ok(), "{id}");
+    }
 }
 
 fn key_states(

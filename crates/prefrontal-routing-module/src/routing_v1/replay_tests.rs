@@ -250,6 +250,8 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
     if std::env::var_os("PREFRONTAL_RECORD_ROUTING_REPLAY").is_some()
         || (file == "availability-public"
             && std::env::var_os("PREFRONTAL_RECORD_ROUTING_PUBLIC_AVAILABILITY").is_some())
+        || (file == "key-pool-public"
+            && std::env::var_os("PREFRONTAL_RECORD_ROUTING_PUBLIC_KEY_POOL").is_some())
         || (file == "head-choices-difference-9"
             && std::env::var_os("PREFRONTAL_RECORD_SHAPE_DIFFERENCES").is_some())
     {

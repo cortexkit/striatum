@@ -265,6 +265,216 @@ fn assert_pool_answer(reply: &(FrameType, Value), request: &Value) {
     );
 }
 
+/// Records runner-owned pool auth and admission, unlisted/missing-group fallback,
+/// pinned pools (including a key blocked by an entitlement refusal alongside a
+/// healthy key), and legacy launch identities, plus one vendor model on both
+/// subscription and pool routes.
+/// Pool providers borrow vendor rows; they are not ordinary catalog providers
+/// that happen to have API keys.
+#[tokio::test]
+async fn replay_key_pool_public_cases() {
+    use prefrontal_routing_core::route_state_store::CredentialRefusal;
+
+    const NOW: i64 = 1_800_000_000_000;
+    let mut cases = Vec::new();
+    for (name, methods, pinned, fenced) in [
+        (
+            "runner-owned-pool-auth",
+            Some(&["apikey"][..]),
+            false,
+            false,
+        ),
+        (
+            "unlisted-method-fallback",
+            Some(&["oauth"][..]),
+            false,
+            false,
+        ),
+        ("missing-group-fallback", None, false, false),
+        ("pinned-pool-route", Some(&["apikey"][..]), true, false),
+        (
+            "pinned-pool-fenced-sibling",
+            Some(&["oauth"][..]),
+            true,
+            true,
+        ),
+    ] {
+        let _clock = crate::InjectedClock::set(NOW as u64);
+        let _inputs = prefrontal_routing_store::replay::Inputs::new(NOW).install();
+        let sibling = key("apikey:pool-vendor:second", &[POOL], &[POOL_VENDOR]);
+        let additional = if fenced { vec![sibling] } else { Vec::new() };
+        let harness = harness_with_pool_keys(methods, &additional);
+        harness.edit_config(clear_pool_exclusions);
+        if fenced {
+            let mut credentials = BrocaCredentials::default();
+            credentials.apply_listing(
+                &ScopedCredentialListing {
+                    view: "key-pool-listing".into(),
+                    credentials: vec![key("apikey:pool-vendor:main", &[POOL], &[POOL_VENDOR])],
+                    ..Default::default()
+                },
+                NOW as u64,
+            );
+            crate::credential_fences::record(
+                harness.store(),
+                &Arc::new(std::sync::Mutex::new(credentials)),
+                &CredentialRefusal {
+                    provider_id: POOL.into(),
+                    credential_id: "apikey:pool-vendor:main".into(),
+                    code: "ENTITLEMENT_ERROR".into(),
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        let owner = harness.bind(reserved("example-consumer"), None).await;
+        let runner = harness.bind(reserved("zeta-runner"), None).await;
+        let pool_route = format!("{POOL}/{POOL_MODEL_SHORT}");
+        let mut request = select("mason");
+        if pinned {
+            request["pin"] = json!(pool_route);
+        }
+        let selected = owner.call("route.select", &request).await;
+        assert_eq!(answered_route(&selected), pool_route, "{name}");
+        let answer: SelectAnswer = serde_json::from_value(selected.1["result"].clone()).unwrap();
+        check_answer(&parse_select_request(&request).unwrap(), &answer).unwrap();
+        assert_eq!(answer.runner.model.provider, POOL_VENDOR);
+        assert_eq!(answer.runner.model.model, POOL_MODEL_SHORT);
+        let runner_owned = methods.is_some_and(|methods| methods.contains(&"apikey"));
+        let credential = if fenced {
+            "apikey:pool-vendor:second"
+        } else {
+            "apikey:pool-vendor:main"
+        };
+        let auth = if runner_owned {
+            json!({"pool":POOL})
+        } else {
+            json!({"pool":POOL,"credential_id":credential})
+        };
+        assert_eq!(selected.1["result"]["runner"]["auth"], auth, "{name}");
+        if pinned {
+            assert_eq!(selected.1["result"]["pin_outcome"], "pinned", "{name}");
+        }
+        let mut launches = vec![json!({
+            "kind":"routing-v1-select", "method":"route.select", "params":request,
+            "frame_type":format!("{:?}", selected.0), "reply":selected.1,
+        })];
+        if runner_owned {
+            let admit = json!({
+                "mode":"admit", "provider":answer.route.provider, "model":answer.route.model,
+                "pool":answer.runner.auth.as_ref().unwrap().pool,
+                "requested_account":{"credential_id":credential},
+                "conversation_key":"pooled-conversation", "admission_id":"pooled-admit",
+                "decision_id":answer.decision_id,
+            });
+            let admitted = runner.call("route.account_for", &admit).await;
+            assert_eq!(admitted.0, FrameType::Response, "{name}: {admitted:?}");
+            assert_eq!(admitted.1["result"]["account"]["provider"], POOL);
+            assert_eq!(admitted.1["result"]["account"]["credential_id"], credential);
+            launches.push(json!({
+                "kind":"routing-v1-account-for", "method":"route.account_for", "params":admit,
+                "frame_type":format!("{:?}", admitted.0), "reply":admitted.1,
+            }));
+        }
+        let mut legacy = legacy_select();
+        if pinned {
+            legacy["modelPin"] = json!(pool_route);
+        }
+        let selected = owner.call("route.select", &legacy).await;
+        assert_eq!(legacy_route(&selected), pool_route, "{name}");
+        launches.push(json!({
+            "kind":"legacy-select", "method":"route.select", "params":legacy,
+            "frame_type":format!("{:?}", selected.0), "reply":selected.1,
+        }));
+        cases.push(super::replay_tests::normalize_paths(
+            json!({"name":name,"launches":launches}),
+            &harness,
+        ));
+    }
+    {
+        let _clock = crate::InjectedClock::set(NOW as u64);
+        let _inputs = prefrontal_routing_store::replay::Inputs::new(NOW).install();
+        let (harness, mut credentials) = super::account_classes_tests::setup(POOL_VENDOR, false);
+        let mut rows = credentials.listed_credentials().to_vec();
+        rows.push(key("apikey:pool-vendor:main", &[POOL], &[POOL_VENDOR]));
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "subscription-and-pool".into(),
+                credentials: rows,
+                ..Default::default()
+            },
+            NOW as u64,
+        );
+        let mut fact = crate::tests::fact(POOL_VENDOR, "model");
+        fact.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
+        credentials.refresh_serving_methods(&Default::default(), &[fact], NOW, &[]);
+        harness.set_credentials(credentials);
+        let owner = harness.bind(reserved("class-owner"), None).await;
+        let runner = harness.bind(reserved("class-runner"), None).await;
+        let mut launches = Vec::new();
+        for (kind, provider) in [("subscription", POOL_VENDOR), ("pool", POOL)] {
+            let pin = format!("{provider}/model");
+            let mut request = select("mason");
+            request["pin"] = json!(pin);
+            let selected = owner.call("route.select", &request).await;
+            assert_eq!(answered_route(&selected), pin);
+            let answer: SelectAnswer =
+                serde_json::from_value(selected.1["result"].clone()).unwrap();
+            check_answer(&parse_select_request(&request).unwrap(), &answer).unwrap();
+            assert_eq!(answer.runner.model.provider, POOL_VENDOR);
+            assert_eq!(answer.runner.model.model, "model");
+            if provider == POOL {
+                assert_eq!(
+                    selected.1["result"]["runner"]["auth"],
+                    json!({"pool":POOL,"credential_id":"apikey:pool-vendor:main"})
+                );
+            } else {
+                assert!(answer.runner.auth.is_none());
+            }
+            launches.push(json!({
+                "kind":format!("{kind}-routing-v1-select"), "method":"route.select", "params":request,
+                "frame_type":format!("{:?}", selected.0), "reply":selected.1,
+            }));
+            if provider == POOL_VENDOR {
+                let admit = json!({
+                    "mode":"admit", "provider":provider, "model":"model",
+                    "conversation_key":"subscription-conversation", "admission_id":"subscription-admit",
+                    "decision_id":answer.decision_id,
+                });
+                let admitted = runner.call("route.account_for", &admit).await;
+                assert_eq!(admitted.0, FrameType::Response, "{admitted:?}");
+                assert_eq!(admitted.1["result"]["account"]["method"], "oauth");
+                assert_eq!(
+                    admitted.1["result"]["account"]["credential_id"],
+                    "oauth:test"
+                );
+                launches.push(json!({
+                    "kind":"subscription-routing-v1-account-for", "method":"route.account_for", "params":admit,
+                    "frame_type":format!("{:?}", admitted.0), "reply":admitted.1,
+                }));
+            }
+            let mut legacy = legacy_select();
+            legacy["modelPin"] = json!(pin);
+            let selected = owner.call("route.select", &legacy).await;
+            assert_eq!(legacy_route(&selected), pin);
+            launches.push(json!({
+                "kind":format!("{kind}-legacy-select"), "method":"route.select", "params":legacy,
+                "frame_type":format!("{:?}", selected.0), "reply":selected.1,
+            }));
+        }
+        cases.push(super::replay_tests::normalize_paths(
+            json!({"name":"same-vendor-model-subscription-and-pool", "launches":launches}),
+            &harness,
+        ));
+    }
+    super::replay_tests::assert_or_record(
+        "key-pool-public",
+        json!({"clock_ms":NOW,
+            "body_source":"public routing/v1 select and runner account_for replies plus legacy select replies through the real frame handler; synthetic alias-provider key pools",
+            "cases":cases}),
+    );
+}
+
 /// With no pin and no ladder, the key pool's route is the cheapest adequate
 /// one. Operator policy that keeps such a provider out of the automatic order
 /// is cleared first, so the only thing left that can keep it out of a v1 answer

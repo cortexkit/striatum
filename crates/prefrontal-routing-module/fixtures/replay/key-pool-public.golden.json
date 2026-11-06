@@ -1,0 +1,3304 @@
+{
+  "body_source": "public routing/v1 select and runner account_for replies plus legacy select replies through the real frame handler; synthetic alias-provider key pools",
+  "cases": [
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "routing-v1-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "requirements": {
+              "iq": 30
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000000",
+              "expires_at_ms": 1800000600000,
+              "explanation": "pool-provider/model-pool on zeta-runner for consumer mason, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 32000,
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "pool": "pool-provider"
+                },
+                "model": {
+                  "model": "model-pool",
+                  "provider": "pool-vendor"
+                },
+                "module": "zeta-runner"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "routing-v1-account-for",
+          "method": "route.account_for",
+          "params": {
+            "admission_id": "pooled-admit",
+            "conversation_key": "pooled-conversation",
+            "decision_id": "dec_000000000000",
+            "mode": "admit",
+            "model": "model-pool",
+            "pool": "pool-provider",
+            "provider": "pool-provider",
+            "requested_account": {
+              "credential_id": "apikey:pool-vendor:main"
+            }
+          },
+          "reply": {
+            "result": {
+              "account": {
+                "account_id": "apikey:pool-vendor:main",
+                "credential_id": "apikey:pool-vendor:main",
+                "method": "apikey",
+                "provider": "pool-provider"
+              },
+              "admission": {
+                "id": "pooled-admit",
+                "state": "reserved"
+              },
+              "pin": {
+                "admission_valid_until_ms": 1800000060000,
+                "affinity_expires_at_ms": 1800604800000,
+                "generation": 1,
+                "id": "pin_f5622ffb78ee799df2443cb7",
+                "lease_valid_until_ms": 1800000120000,
+                "mode": "admit"
+              },
+              "reason": {
+                "code": "cold_scored",
+                "decision_id": "dec_000000000000",
+                "policy_version": "2",
+                "quota_age_band": "unknown"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "legacy-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "executor": "broca",
+            "requirements": {
+              "eq": 0,
+              "iq": 30
+            },
+            "substrate": "broca",
+            "targetAgent": "mason"
+          },
+          "reply": {
+            "result": {
+              "billingPlanes": [
+                {
+                  "authMethod": "apikey",
+                  "dimensionRates": {
+                    "rate.cache_read": null,
+                    "rate.cache_write": null,
+                    "rate.input": null,
+                    "rate.output": 2.0,
+                    "rate.reasoning": 2.0
+                  },
+                  "kind": "upstream",
+                  "modelID": "model-a",
+                  "providerID": "catalog-provider",
+                  "servingMethod": "selected account class"
+                },
+                {
+                  "authMethod": "apikey",
+                  "dimensionRates": {
+                    "rate.cache_read": null,
+                    "rate.cache_write": null,
+                    "rate.input": null,
+                    "rate.output": 0.5,
+                    "rate.reasoning": 0.5
+                  },
+                  "kind": "upstream",
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider",
+                  "servingMethod": "selected account class"
+                }
+              ],
+              "context_window": 200000,
+              "decisionID": "dec_000000000004",
+              "decision_id": "dec_000000000004",
+              "expires_at_ms": 1800000600000,
+              "max_output_tokens": 32000,
+              "resolvedInput": {
+                "availableModels": [],
+                "requirements": {
+                  "eq": 0.0,
+                  "iq": 30.0
+                },
+                "subscriptionKeys": []
+              },
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "account": "main",
+                  "method": "apikey"
+                },
+                "model": "model-pool",
+                "module": "zeta-runner",
+                "pool": "pool-provider",
+                "pool_session": "dec_000000000004",
+                "provider": "pool-vendor",
+                "route": {
+                  "model": "model-pool",
+                  "provider": "pool-provider"
+                }
+              },
+              "selected": {
+                "belowFloor": null,
+                "capacityKey": "pool-provider/model-pool",
+                "explanation": [
+                  "route pool-provider/model-pool for agent mason",
+                  "elo: need 30/100 (bar 1312), have 2000 → clears",
+                  "clears bar: adequacy 1.00, selection cost 0.37",
+                  "cost +0.02 (output $/Mtok: effective $0.5/Mtok, list $0.5/Mtok, metered)",
+                  "overqualified +0.35 (surplus 70 over 30)",
+                  "billing plane: pool-vendor/apikey (upstream, serving method: selected account class)",
+                  "speed 0.27 (tiebreak)",
+                  "route pool-provider/model-pool: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":0.5,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":0.5,\"normalizedCost\":0.016666666666666666,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
+                  "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
+                  "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
+                  "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
+                  "policy sources: operator sha256:200b7b506b1b98b463841ec25c32c5cddf06a9bae31ef73213af104418b58cf0 (0 exclude entries)",
+                  "workload: none",
+                  "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
+                ],
+                "harness": "broca",
+                "model": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "pricedWithBasket": false,
+                "promptParams": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "rejected": [
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-7"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-8"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-sonnet-4-6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.1-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.5-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.4"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.4-mini"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-build-0.1"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-sol"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-sol-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-terra"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-terra-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-luna"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-luna-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/glm-5.2"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.7-code"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/glm-5.1"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m2.7"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m2.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/qwen3.5:397b"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/mistral-large-3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-fable-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "kimi-for-coding/k3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.7-max"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.6-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.8-max"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.7-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "pool-vendor/model-pool"
+                  }
+                ],
+                "routeKey": "pool-provider/model-pool",
+                "score": {
+                  "adequacy": 1.0,
+                  "alsoAdequate": [
+                    "catalog-provider/model-a"
+                  ],
+                  "candidates": [
+                    {
+                      "eligible": false,
+                      "elo": 1122.0,
+                      "eloSource": "curated",
+                      "eq": 1440.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.6-flash",
+                      "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1254.0,
+                      "eloSource": "curated",
+                      "eq": 1620.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.7-max",
+                      "routeKey": "alibaba-token-plan/qwen3.7-max"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 715.0,
+                      "eloSource": "curated",
+                      "eq": 1530.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.7-plus",
+                      "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1721.0,
+                      "eloSource": "curated",
+                      "eq": 1895.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.8-max",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1721.0,
+                      "eloSource": "curated",
+                      "eq": 1895.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.8-max-preview",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1911.0,
+                      "eloSource": "curated",
+                      "eq": 2160.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-fable-5",
+                      "routeKey": "anthropic/claude-fable-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 698.0,
+                      "eloSource": "curated",
+                      "eq": 1698.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-5",
+                      "routeKey": "anthropic/claude-opus-4-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1130.0,
+                      "eloSource": "curated",
+                      "eq": 1751.7,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-6",
+                      "routeKey": "anthropic/claude-opus-4-6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1635.0,
+                      "eloSource": "curated",
+                      "eq": 1949.8,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-7",
+                      "routeKey": "anthropic/claude-opus-4-7"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1728.0,
+                      "eloSource": "curated",
+                      "eq": 2115.5,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-8",
+                      "routeKey": "anthropic/claude-opus-4-8"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1905.0,
+                      "eloSource": "curated",
+                      "eq": 2160.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-5",
+                      "routeKey": "anthropic/claude-opus-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 637.0,
+                      "eloSource": "curated",
+                      "eq": 1752.4,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-sonnet-4-6",
+                      "routeKey": "anthropic/claude-sonnet-4-6"
+                    },
+                    {
+                      "eligible": true,
+                      "elo": 1300.0,
+                      "eloSource": "curated",
+                      "eq": 1300.0,
+                      "eqSource": "curated",
+                      "model": "catalog-provider/model-a",
+                      "routeKey": "catalog-provider/model-a"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1617.0,
+                      "eloSource": "curated",
+                      "eq": 1751.7,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-claude-opus-4-6-thinking",
+                      "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1584.0,
+                      "eloSource": "curated",
+                      "eq": 1752.4,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-claude-sonnet-4-6-thinking",
+                      "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1280.0,
+                      "eloSource": "curated",
+                      "eq": 1532.6,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.1-pro",
+                      "routeKey": "google/antigravity-gemini-3.1-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1345.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.5-flash",
+                      "routeKey": "google/antigravity-gemini-3.5-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1410.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.6-flash",
+                      "routeKey": "google/antigravity-gemini-3.6-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1410.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.7-flash",
+                      "routeKey": "google/antigravity-gemini-3.7-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1742.0,
+                      "eloSource": "curated",
+                      "eq": 1915.5,
+                      "eqSource": "curated",
+                      "model": "kimi-for-coding/k3",
+                      "routeKey": "kimi-for-coding/k3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1180.0,
+                      "eloSource": "curated",
+                      "eq": 1494.2,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-flash",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1610.0,
+                      "eloSource": "curated",
+                      "eq": 1494.2,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-flash:0731",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1284.0,
+                      "eloSource": "curated",
+                      "eq": 1599.8,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-pro",
+                      "routeKey": "ollama-cloud/deepseek-v4-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 988.0,
+                      "eloSource": "curated",
+                      "eq": 1557.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/glm-5.1",
+                      "routeKey": "ollama-cloud/glm-5.1"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1660.0,
+                      "eloSource": "curated",
+                      "eq": 1565.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/glm-5.2",
+                      "routeKey": "ollama-cloud/glm-5.2"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 599.0,
+                      "eloSource": "curated",
+                      "eq": 1541.7,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.5",
+                      "routeKey": "ollama-cloud/kimi-k2.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1215.0,
+                      "eloSource": "curated",
+                      "eq": 1575.8,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.6",
+                      "routeKey": "ollama-cloud/kimi-k2.6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1102.0,
+                      "eloSource": "curated",
+                      "eq": 1570.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.7-code",
+                      "routeKey": "ollama-cloud/kimi-k2.7-code"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1742.0,
+                      "eloSource": "curated",
+                      "eq": 1915.5,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k3",
+                      "routeKey": "ollama-cloud/kimi-k3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 520.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m2.5",
+                      "routeKey": "ollama-cloud/minimax-m2.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 984.0,
+                      "eloSource": "curated",
+                      "eq": 1510.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m2.7",
+                      "routeKey": "ollama-cloud/minimax-m2.7"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1311.0,
+                      "eloSource": "curated",
+                      "eq": 1520.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m3",
+                      "routeKey": "ollama-cloud/minimax-m3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 520.0,
+                      "eloSource": "curated",
+                      "eq": 1450.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/mistral-large-3",
+                      "routeKey": "ollama-cloud/mistral-large-3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1617.0,
+                      "eloSource": "curated",
+                      "eq": 1500.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/qwen3.5:397b",
+                      "routeKey": "ollama-cloud/qwen3.5:397b"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1589.0,
+                      "eloSource": "curated",
+                      "eq": 1585.7,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.4",
+                      "routeKey": "openai/gpt-5.4"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 956.0,
+                      "eloSource": "curated",
+                      "eq": 1430.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.4-mini",
+                      "routeKey": "openai/gpt-5.4-mini"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1690.0,
+                      "eloSource": "curated",
+                      "eq": 1596.5,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.5",
+                      "routeKey": "openai/gpt-5.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1621.0,
+                      "eloSource": "curated",
+                      "eq": 1555.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-luna",
+                      "routeKey": "openai/gpt-5.6-luna"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1621.0,
+                      "eloSource": "curated",
+                      "eq": 1555.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-luna-pro",
+                      "routeKey": "openai/gpt-5.6-luna-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1838.0,
+                      "eloSource": "curated",
+                      "eq": 1610.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-sol",
+                      "routeKey": "openai/gpt-5.6-sol"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1838.0,
+                      "eloSource": "curated",
+                      "eq": 1610.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-sol-pro",
+                      "routeKey": "openai/gpt-5.6-sol-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1685.0,
+                      "eloSource": "curated",
+                      "eq": 1590.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-terra",
+                      "routeKey": "openai/gpt-5.6-terra"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1685.0,
+                      "eloSource": "curated",
+                      "eq": 1590.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-terra-pro",
+                      "routeKey": "openai/gpt-5.6-terra-pro"
+                    },
+                    {
+                      "eligible": true,
+                      "elo": 2000.0,
+                      "eloSource": "curated",
+                      "eq": 2000.0,
+                      "eqSource": "curated",
+                      "model": "pool-provider/model-pool",
+                      "routeKey": "pool-provider/model-pool"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 2000.0,
+                      "eloSource": "curated",
+                      "eq": 2000.0,
+                      "eqSource": "curated",
+                      "model": "pool-vendor/model-pool",
+                      "routeKey": "pool-vendor/model-pool"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 659.0,
+                      "eloSource": "curated",
+                      "eq": 1480.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.3",
+                      "routeKey": "xai/grok-4.3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1649.0,
+                      "eloSource": "curated",
+                      "eq": 1550.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.5",
+                      "routeKey": "xai/grok-4.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1798.0,
+                      "eloSource": "curated",
+                      "eq": 1600.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.6",
+                      "routeKey": "xai/grok-4.6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1320.0,
+                      "eloSource": "curated",
+                      "eq": 1530.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-build-0.1",
+                      "routeKey": "xai/grok-build-0.1"
+                    }
+                  ],
+                  "metrics": {
+                    "elo": {
+                      "fact": 2000.0,
+                      "fit": 1.0,
+                      "requirement": 30.0,
+                      "target": 1312.2676864876835
+                    }
+                  },
+                  "objective": {
+                    "cost": 0.016666666666666666,
+                    "overqualification": 0.35000000000000003,
+                    "quota": 0.0,
+                    "selectionCost": 0.3666666666666667,
+                    "speedScore": 0.26666666666666666,
+                    "taskPricing": {
+                      "finalCostUsd": 0.5,
+                      "listCostUsd": 0.5,
+                      "normalizedCost": 0.016666666666666666,
+                      "omittedDimensions": [],
+                      "pressure": 1.0,
+                      "priceUnit": "million output tokens",
+                      "profile": null,
+                      "tokens": null,
+                      "unpricedDimensions": [],
+                      "valueMultiplier": 1.0,
+                      "valueSource": "cold-start effective rate"
+                    }
+                  },
+                  "pricingFallback": "catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
+                  "pricingMode": "output_only",
+                  "rawAdequacy": 1.0,
+                  "selectionCost": 0.3666666666666667
+                }
+              },
+              "variantSelection": {
+                "source": "curated",
+                "variant": null
+              }
+            }
+          }
+        }
+      ],
+      "name": "runner-owned-pool-auth"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "routing-v1-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "requirements": {
+              "iq": 30
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000000",
+              "expires_at_ms": 1800000600000,
+              "explanation": "pool-provider/model-pool on zeta-runner for consumer mason, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 32000,
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "credential_id": "apikey:pool-vendor:main",
+                  "pool": "pool-provider"
+                },
+                "model": {
+                  "model": "model-pool",
+                  "provider": "pool-vendor"
+                },
+                "module": "zeta-runner"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "legacy-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "executor": "broca",
+            "requirements": {
+              "eq": 0,
+              "iq": 30
+            },
+            "substrate": "broca",
+            "targetAgent": "mason"
+          },
+          "reply": {
+            "result": {
+              "billingPlanes": [
+                {
+                  "authMethod": "apikey",
+                  "dimensionRates": {
+                    "rate.cache_read": null,
+                    "rate.cache_write": null,
+                    "rate.input": null,
+                    "rate.output": 2.0,
+                    "rate.reasoning": 2.0
+                  },
+                  "kind": "upstream",
+                  "modelID": "model-a",
+                  "providerID": "catalog-provider",
+                  "servingMethod": "selected account class"
+                },
+                {
+                  "authMethod": "apikey",
+                  "dimensionRates": {
+                    "rate.cache_read": null,
+                    "rate.cache_write": null,
+                    "rate.input": null,
+                    "rate.output": 0.5,
+                    "rate.reasoning": 0.5
+                  },
+                  "kind": "upstream",
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider",
+                  "servingMethod": "selected account class"
+                }
+              ],
+              "context_window": 200000,
+              "decisionID": "dec_000000000002",
+              "decision_id": "dec_000000000002",
+              "expires_at_ms": 1800000600000,
+              "max_output_tokens": 32000,
+              "resolvedInput": {
+                "availableModels": [],
+                "requirements": {
+                  "eq": 0.0,
+                  "iq": 30.0
+                },
+                "subscriptionKeys": []
+              },
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "account": "main",
+                  "method": "apikey"
+                },
+                "model": "model-pool",
+                "module": "zeta-runner",
+                "pool": "pool-provider",
+                "pool_session": "dec_000000000002",
+                "provider": "pool-vendor",
+                "route": {
+                  "model": "model-pool",
+                  "provider": "pool-provider"
+                }
+              },
+              "selected": {
+                "belowFloor": null,
+                "capacityKey": "pool-provider/model-pool",
+                "explanation": [
+                  "route pool-provider/model-pool for agent mason",
+                  "elo: need 30/100 (bar 1312), have 2000 → clears",
+                  "clears bar: adequacy 1.00, selection cost 0.37",
+                  "cost +0.02 (output $/Mtok: effective $0.5/Mtok, list $0.5/Mtok, metered)",
+                  "overqualified +0.35 (surplus 70 over 30)",
+                  "billing plane: pool-vendor/apikey (upstream, serving method: selected account class)",
+                  "speed 0.27 (tiebreak)",
+                  "route pool-provider/model-pool: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":0.5,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":0.5,\"normalizedCost\":0.016666666666666666,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
+                  "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
+                  "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
+                  "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
+                  "policy sources: operator sha256:200b7b506b1b98b463841ec25c32c5cddf06a9bae31ef73213af104418b58cf0 (0 exclude entries)",
+                  "workload: none",
+                  "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
+                ],
+                "harness": "broca",
+                "model": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "pricedWithBasket": false,
+                "promptParams": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "rejected": [
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-7"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-8"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-sonnet-4-6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.1-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.5-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.4"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.4-mini"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-build-0.1"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-sol"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-sol-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-terra"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-terra-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-luna"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-luna-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/glm-5.2"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.7-code"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/glm-5.1"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m2.7"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m2.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/qwen3.5:397b"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/mistral-large-3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-fable-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "kimi-for-coding/k3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.7-max"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.6-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.8-max"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.7-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "pool-vendor/model-pool"
+                  }
+                ],
+                "routeKey": "pool-provider/model-pool",
+                "score": {
+                  "adequacy": 1.0,
+                  "alsoAdequate": [
+                    "catalog-provider/model-a"
+                  ],
+                  "candidates": [
+                    {
+                      "eligible": false,
+                      "elo": 1122.0,
+                      "eloSource": "curated",
+                      "eq": 1440.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.6-flash",
+                      "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1254.0,
+                      "eloSource": "curated",
+                      "eq": 1620.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.7-max",
+                      "routeKey": "alibaba-token-plan/qwen3.7-max"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 715.0,
+                      "eloSource": "curated",
+                      "eq": 1530.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.7-plus",
+                      "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1721.0,
+                      "eloSource": "curated",
+                      "eq": 1895.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.8-max",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1721.0,
+                      "eloSource": "curated",
+                      "eq": 1895.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.8-max-preview",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1911.0,
+                      "eloSource": "curated",
+                      "eq": 2160.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-fable-5",
+                      "routeKey": "anthropic/claude-fable-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 698.0,
+                      "eloSource": "curated",
+                      "eq": 1698.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-5",
+                      "routeKey": "anthropic/claude-opus-4-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1130.0,
+                      "eloSource": "curated",
+                      "eq": 1751.7,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-6",
+                      "routeKey": "anthropic/claude-opus-4-6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1635.0,
+                      "eloSource": "curated",
+                      "eq": 1949.8,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-7",
+                      "routeKey": "anthropic/claude-opus-4-7"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1728.0,
+                      "eloSource": "curated",
+                      "eq": 2115.5,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-8",
+                      "routeKey": "anthropic/claude-opus-4-8"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1905.0,
+                      "eloSource": "curated",
+                      "eq": 2160.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-5",
+                      "routeKey": "anthropic/claude-opus-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 637.0,
+                      "eloSource": "curated",
+                      "eq": 1752.4,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-sonnet-4-6",
+                      "routeKey": "anthropic/claude-sonnet-4-6"
+                    },
+                    {
+                      "eligible": true,
+                      "elo": 1300.0,
+                      "eloSource": "curated",
+                      "eq": 1300.0,
+                      "eqSource": "curated",
+                      "model": "catalog-provider/model-a",
+                      "routeKey": "catalog-provider/model-a"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1617.0,
+                      "eloSource": "curated",
+                      "eq": 1751.7,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-claude-opus-4-6-thinking",
+                      "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1584.0,
+                      "eloSource": "curated",
+                      "eq": 1752.4,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-claude-sonnet-4-6-thinking",
+                      "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1280.0,
+                      "eloSource": "curated",
+                      "eq": 1532.6,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.1-pro",
+                      "routeKey": "google/antigravity-gemini-3.1-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1345.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.5-flash",
+                      "routeKey": "google/antigravity-gemini-3.5-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1410.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.6-flash",
+                      "routeKey": "google/antigravity-gemini-3.6-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1410.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.7-flash",
+                      "routeKey": "google/antigravity-gemini-3.7-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1742.0,
+                      "eloSource": "curated",
+                      "eq": 1915.5,
+                      "eqSource": "curated",
+                      "model": "kimi-for-coding/k3",
+                      "routeKey": "kimi-for-coding/k3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1180.0,
+                      "eloSource": "curated",
+                      "eq": 1494.2,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-flash",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1610.0,
+                      "eloSource": "curated",
+                      "eq": 1494.2,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-flash:0731",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1284.0,
+                      "eloSource": "curated",
+                      "eq": 1599.8,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-pro",
+                      "routeKey": "ollama-cloud/deepseek-v4-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 988.0,
+                      "eloSource": "curated",
+                      "eq": 1557.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/glm-5.1",
+                      "routeKey": "ollama-cloud/glm-5.1"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1660.0,
+                      "eloSource": "curated",
+                      "eq": 1565.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/glm-5.2",
+                      "routeKey": "ollama-cloud/glm-5.2"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 599.0,
+                      "eloSource": "curated",
+                      "eq": 1541.7,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.5",
+                      "routeKey": "ollama-cloud/kimi-k2.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1215.0,
+                      "eloSource": "curated",
+                      "eq": 1575.8,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.6",
+                      "routeKey": "ollama-cloud/kimi-k2.6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1102.0,
+                      "eloSource": "curated",
+                      "eq": 1570.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.7-code",
+                      "routeKey": "ollama-cloud/kimi-k2.7-code"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1742.0,
+                      "eloSource": "curated",
+                      "eq": 1915.5,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k3",
+                      "routeKey": "ollama-cloud/kimi-k3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 520.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m2.5",
+                      "routeKey": "ollama-cloud/minimax-m2.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 984.0,
+                      "eloSource": "curated",
+                      "eq": 1510.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m2.7",
+                      "routeKey": "ollama-cloud/minimax-m2.7"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1311.0,
+                      "eloSource": "curated",
+                      "eq": 1520.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m3",
+                      "routeKey": "ollama-cloud/minimax-m3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 520.0,
+                      "eloSource": "curated",
+                      "eq": 1450.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/mistral-large-3",
+                      "routeKey": "ollama-cloud/mistral-large-3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1617.0,
+                      "eloSource": "curated",
+                      "eq": 1500.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/qwen3.5:397b",
+                      "routeKey": "ollama-cloud/qwen3.5:397b"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1589.0,
+                      "eloSource": "curated",
+                      "eq": 1585.7,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.4",
+                      "routeKey": "openai/gpt-5.4"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 956.0,
+                      "eloSource": "curated",
+                      "eq": 1430.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.4-mini",
+                      "routeKey": "openai/gpt-5.4-mini"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1690.0,
+                      "eloSource": "curated",
+                      "eq": 1596.5,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.5",
+                      "routeKey": "openai/gpt-5.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1621.0,
+                      "eloSource": "curated",
+                      "eq": 1555.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-luna",
+                      "routeKey": "openai/gpt-5.6-luna"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1621.0,
+                      "eloSource": "curated",
+                      "eq": 1555.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-luna-pro",
+                      "routeKey": "openai/gpt-5.6-luna-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1838.0,
+                      "eloSource": "curated",
+                      "eq": 1610.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-sol",
+                      "routeKey": "openai/gpt-5.6-sol"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1838.0,
+                      "eloSource": "curated",
+                      "eq": 1610.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-sol-pro",
+                      "routeKey": "openai/gpt-5.6-sol-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1685.0,
+                      "eloSource": "curated",
+                      "eq": 1590.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-terra",
+                      "routeKey": "openai/gpt-5.6-terra"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1685.0,
+                      "eloSource": "curated",
+                      "eq": 1590.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-terra-pro",
+                      "routeKey": "openai/gpt-5.6-terra-pro"
+                    },
+                    {
+                      "eligible": true,
+                      "elo": 2000.0,
+                      "eloSource": "curated",
+                      "eq": 2000.0,
+                      "eqSource": "curated",
+                      "model": "pool-provider/model-pool",
+                      "routeKey": "pool-provider/model-pool"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 2000.0,
+                      "eloSource": "curated",
+                      "eq": 2000.0,
+                      "eqSource": "curated",
+                      "model": "pool-vendor/model-pool",
+                      "routeKey": "pool-vendor/model-pool"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 659.0,
+                      "eloSource": "curated",
+                      "eq": 1480.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.3",
+                      "routeKey": "xai/grok-4.3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1649.0,
+                      "eloSource": "curated",
+                      "eq": 1550.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.5",
+                      "routeKey": "xai/grok-4.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1798.0,
+                      "eloSource": "curated",
+                      "eq": 1600.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.6",
+                      "routeKey": "xai/grok-4.6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1320.0,
+                      "eloSource": "curated",
+                      "eq": 1530.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-build-0.1",
+                      "routeKey": "xai/grok-build-0.1"
+                    }
+                  ],
+                  "metrics": {
+                    "elo": {
+                      "fact": 2000.0,
+                      "fit": 1.0,
+                      "requirement": 30.0,
+                      "target": 1312.2676864876835
+                    }
+                  },
+                  "objective": {
+                    "cost": 0.016666666666666666,
+                    "overqualification": 0.35000000000000003,
+                    "quota": 0.0,
+                    "selectionCost": 0.3666666666666667,
+                    "speedScore": 0.26666666666666666,
+                    "taskPricing": {
+                      "finalCostUsd": 0.5,
+                      "listCostUsd": 0.5,
+                      "normalizedCost": 0.016666666666666666,
+                      "omittedDimensions": [],
+                      "pressure": 1.0,
+                      "priceUnit": "million output tokens",
+                      "profile": null,
+                      "tokens": null,
+                      "unpricedDimensions": [],
+                      "valueMultiplier": 1.0,
+                      "valueSource": "cold-start effective rate"
+                    }
+                  },
+                  "pricingFallback": "catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
+                  "pricingMode": "output_only",
+                  "rawAdequacy": 1.0,
+                  "selectionCost": 0.3666666666666667
+                }
+              },
+              "variantSelection": {
+                "source": "curated",
+                "variant": null
+              }
+            }
+          }
+        }
+      ],
+      "name": "unlisted-method-fallback"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "routing-v1-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "requirements": {
+              "iq": 30
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000000",
+              "expires_at_ms": 1800000600000,
+              "explanation": "pool-provider/model-pool on zeta-runner for consumer mason, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 32000,
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "credential_id": "apikey:pool-vendor:main",
+                  "pool": "pool-provider"
+                },
+                "model": {
+                  "model": "model-pool",
+                  "provider": "pool-vendor"
+                },
+                "module": "zeta-runner"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "legacy-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "executor": "broca",
+            "requirements": {
+              "eq": 0,
+              "iq": 30
+            },
+            "substrate": "broca",
+            "targetAgent": "mason"
+          },
+          "reply": {
+            "result": {
+              "billingPlanes": [
+                {
+                  "authMethod": "apikey",
+                  "dimensionRates": {
+                    "rate.cache_read": null,
+                    "rate.cache_write": null,
+                    "rate.input": null,
+                    "rate.output": 2.0,
+                    "rate.reasoning": 2.0
+                  },
+                  "kind": "upstream",
+                  "modelID": "model-a",
+                  "providerID": "catalog-provider",
+                  "servingMethod": "selected account class"
+                },
+                {
+                  "authMethod": "apikey",
+                  "dimensionRates": {
+                    "rate.cache_read": null,
+                    "rate.cache_write": null,
+                    "rate.input": null,
+                    "rate.output": 0.5,
+                    "rate.reasoning": 0.5
+                  },
+                  "kind": "upstream",
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider",
+                  "servingMethod": "selected account class"
+                }
+              ],
+              "context_window": 200000,
+              "decisionID": "dec_000000000002",
+              "decision_id": "dec_000000000002",
+              "expires_at_ms": 1800000600000,
+              "max_output_tokens": 32000,
+              "resolvedInput": {
+                "availableModels": [],
+                "requirements": {
+                  "eq": 0.0,
+                  "iq": 30.0
+                },
+                "subscriptionKeys": []
+              },
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "account": "main",
+                  "method": "apikey"
+                },
+                "model": "model-pool",
+                "module": "zeta-runner",
+                "pool": "pool-provider",
+                "pool_session": "dec_000000000002",
+                "provider": "pool-vendor",
+                "route": {
+                  "model": "model-pool",
+                  "provider": "pool-provider"
+                }
+              },
+              "selected": {
+                "belowFloor": null,
+                "capacityKey": "pool-provider/model-pool",
+                "explanation": [
+                  "route pool-provider/model-pool for agent mason",
+                  "elo: need 30/100 (bar 1312), have 2000 → clears",
+                  "clears bar: adequacy 1.00, selection cost 0.37",
+                  "cost +0.02 (output $/Mtok: effective $0.5/Mtok, list $0.5/Mtok, metered)",
+                  "overqualified +0.35 (surplus 70 over 30)",
+                  "billing plane: pool-vendor/apikey (upstream, serving method: selected account class)",
+                  "speed 0.27 (tiebreak)",
+                  "route pool-provider/model-pool: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":0.5,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":0.5,\"normalizedCost\":0.016666666666666666,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
+                  "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
+                  "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
+                  "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
+                  "policy sources: operator sha256:200b7b506b1b98b463841ec25c32c5cddf06a9bae31ef73213af104418b58cf0 (0 exclude entries)",
+                  "workload: none",
+                  "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
+                ],
+                "harness": "broca",
+                "model": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "pricedWithBasket": false,
+                "promptParams": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "rejected": [
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-7"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-4-8"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-sonnet-4-6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.1-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.5-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.4"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.4-mini"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-build-0.1"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-sol"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-sol-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-terra"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-terra-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-luna"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "openai/gpt-5.6-luna-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/glm-5.2"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-pro"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.7-code"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/glm-5.1"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m2.7"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/minimax-m2.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k2.5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/qwen3.5:397b"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/mistral-large-3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-fable-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "kimi-for-coding/k3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.7-max"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.6-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "anthropic/claude-opus-5"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "alibaba-token-plan/qwen3.8-max"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "ollama-cloud/kimi-k3"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "xai/grok-4.6"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "google/antigravity-gemini-3.7-flash"
+                  },
+                  {
+                    "reason": "no_eligible_account",
+                    "routeKey": "pool-vendor/model-pool"
+                  }
+                ],
+                "routeKey": "pool-provider/model-pool",
+                "score": {
+                  "adequacy": 1.0,
+                  "alsoAdequate": [
+                    "catalog-provider/model-a"
+                  ],
+                  "candidates": [
+                    {
+                      "eligible": false,
+                      "elo": 1122.0,
+                      "eloSource": "curated",
+                      "eq": 1440.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.6-flash",
+                      "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1254.0,
+                      "eloSource": "curated",
+                      "eq": 1620.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.7-max",
+                      "routeKey": "alibaba-token-plan/qwen3.7-max"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 715.0,
+                      "eloSource": "curated",
+                      "eq": 1530.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.7-plus",
+                      "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1721.0,
+                      "eloSource": "curated",
+                      "eq": 1895.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.8-max",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1721.0,
+                      "eloSource": "curated",
+                      "eq": 1895.0,
+                      "eqSource": "curated",
+                      "model": "alibaba-token-plan/qwen3.8-max-preview",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1911.0,
+                      "eloSource": "curated",
+                      "eq": 2160.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-fable-5",
+                      "routeKey": "anthropic/claude-fable-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 698.0,
+                      "eloSource": "curated",
+                      "eq": 1698.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-5",
+                      "routeKey": "anthropic/claude-opus-4-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1130.0,
+                      "eloSource": "curated",
+                      "eq": 1751.7,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-6",
+                      "routeKey": "anthropic/claude-opus-4-6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1635.0,
+                      "eloSource": "curated",
+                      "eq": 1949.8,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-7",
+                      "routeKey": "anthropic/claude-opus-4-7"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1728.0,
+                      "eloSource": "curated",
+                      "eq": 2115.5,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-4-8",
+                      "routeKey": "anthropic/claude-opus-4-8"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1905.0,
+                      "eloSource": "curated",
+                      "eq": 2160.0,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-opus-5",
+                      "routeKey": "anthropic/claude-opus-5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 637.0,
+                      "eloSource": "curated",
+                      "eq": 1752.4,
+                      "eqSource": "curated",
+                      "model": "anthropic/claude-sonnet-4-6",
+                      "routeKey": "anthropic/claude-sonnet-4-6"
+                    },
+                    {
+                      "eligible": true,
+                      "elo": 1300.0,
+                      "eloSource": "curated",
+                      "eq": 1300.0,
+                      "eqSource": "curated",
+                      "model": "catalog-provider/model-a",
+                      "routeKey": "catalog-provider/model-a"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1617.0,
+                      "eloSource": "curated",
+                      "eq": 1751.7,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-claude-opus-4-6-thinking",
+                      "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1584.0,
+                      "eloSource": "curated",
+                      "eq": 1752.4,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-claude-sonnet-4-6-thinking",
+                      "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1280.0,
+                      "eloSource": "curated",
+                      "eq": 1532.6,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.1-pro",
+                      "routeKey": "google/antigravity-gemini-3.1-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1345.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.5-flash",
+                      "routeKey": "google/antigravity-gemini-3.5-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1410.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.6-flash",
+                      "routeKey": "google/antigravity-gemini-3.6-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1410.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "google/antigravity-gemini-3.7-flash",
+                      "routeKey": "google/antigravity-gemini-3.7-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1742.0,
+                      "eloSource": "curated",
+                      "eq": 1915.5,
+                      "eqSource": "curated",
+                      "model": "kimi-for-coding/k3",
+                      "routeKey": "kimi-for-coding/k3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1180.0,
+                      "eloSource": "curated",
+                      "eq": 1494.2,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-flash",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1610.0,
+                      "eloSource": "curated",
+                      "eq": 1494.2,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-flash:0731",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1284.0,
+                      "eloSource": "curated",
+                      "eq": 1599.8,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/deepseek-v4-pro",
+                      "routeKey": "ollama-cloud/deepseek-v4-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 988.0,
+                      "eloSource": "curated",
+                      "eq": 1557.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/glm-5.1",
+                      "routeKey": "ollama-cloud/glm-5.1"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1660.0,
+                      "eloSource": "curated",
+                      "eq": 1565.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/glm-5.2",
+                      "routeKey": "ollama-cloud/glm-5.2"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 599.0,
+                      "eloSource": "curated",
+                      "eq": 1541.7,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.5",
+                      "routeKey": "ollama-cloud/kimi-k2.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1215.0,
+                      "eloSource": "curated",
+                      "eq": 1575.8,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.6",
+                      "routeKey": "ollama-cloud/kimi-k2.6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1102.0,
+                      "eloSource": "curated",
+                      "eq": 1570.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k2.7-code",
+                      "routeKey": "ollama-cloud/kimi-k2.7-code"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1742.0,
+                      "eloSource": "curated",
+                      "eq": 1915.5,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/kimi-k3",
+                      "routeKey": "ollama-cloud/kimi-k3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 520.0,
+                      "eloSource": "curated",
+                      "eq": 1490.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m2.5",
+                      "routeKey": "ollama-cloud/minimax-m2.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 984.0,
+                      "eloSource": "curated",
+                      "eq": 1510.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m2.7",
+                      "routeKey": "ollama-cloud/minimax-m2.7"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1311.0,
+                      "eloSource": "curated",
+                      "eq": 1520.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/minimax-m3",
+                      "routeKey": "ollama-cloud/minimax-m3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 520.0,
+                      "eloSource": "curated",
+                      "eq": 1450.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/mistral-large-3",
+                      "routeKey": "ollama-cloud/mistral-large-3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1617.0,
+                      "eloSource": "curated",
+                      "eq": 1500.0,
+                      "eqSource": "curated",
+                      "model": "ollama-cloud/qwen3.5:397b",
+                      "routeKey": "ollama-cloud/qwen3.5:397b"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1589.0,
+                      "eloSource": "curated",
+                      "eq": 1585.7,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.4",
+                      "routeKey": "openai/gpt-5.4"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 956.0,
+                      "eloSource": "curated",
+                      "eq": 1430.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.4-mini",
+                      "routeKey": "openai/gpt-5.4-mini"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1690.0,
+                      "eloSource": "curated",
+                      "eq": 1596.5,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.5",
+                      "routeKey": "openai/gpt-5.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1621.0,
+                      "eloSource": "curated",
+                      "eq": 1555.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-luna",
+                      "routeKey": "openai/gpt-5.6-luna"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1621.0,
+                      "eloSource": "curated",
+                      "eq": 1555.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-luna-pro",
+                      "routeKey": "openai/gpt-5.6-luna-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1838.0,
+                      "eloSource": "curated",
+                      "eq": 1610.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-sol",
+                      "routeKey": "openai/gpt-5.6-sol"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1838.0,
+                      "eloSource": "curated",
+                      "eq": 1610.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-sol-pro",
+                      "routeKey": "openai/gpt-5.6-sol-pro"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1685.0,
+                      "eloSource": "curated",
+                      "eq": 1590.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-terra",
+                      "routeKey": "openai/gpt-5.6-terra"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1685.0,
+                      "eloSource": "curated",
+                      "eq": 1590.0,
+                      "eqSource": "curated",
+                      "model": "openai/gpt-5.6-terra-pro",
+                      "routeKey": "openai/gpt-5.6-terra-pro"
+                    },
+                    {
+                      "eligible": true,
+                      "elo": 2000.0,
+                      "eloSource": "curated",
+                      "eq": 2000.0,
+                      "eqSource": "curated",
+                      "model": "pool-provider/model-pool",
+                      "routeKey": "pool-provider/model-pool"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 2000.0,
+                      "eloSource": "curated",
+                      "eq": 2000.0,
+                      "eqSource": "curated",
+                      "model": "pool-vendor/model-pool",
+                      "routeKey": "pool-vendor/model-pool"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 659.0,
+                      "eloSource": "curated",
+                      "eq": 1480.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.3",
+                      "routeKey": "xai/grok-4.3"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1649.0,
+                      "eloSource": "curated",
+                      "eq": 1550.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.5",
+                      "routeKey": "xai/grok-4.5"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1798.0,
+                      "eloSource": "curated",
+                      "eq": 1600.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-4.6",
+                      "routeKey": "xai/grok-4.6"
+                    },
+                    {
+                      "eligible": false,
+                      "elo": 1320.0,
+                      "eloSource": "curated",
+                      "eq": 1530.0,
+                      "eqSource": "curated",
+                      "model": "xai/grok-build-0.1",
+                      "routeKey": "xai/grok-build-0.1"
+                    }
+                  ],
+                  "metrics": {
+                    "elo": {
+                      "fact": 2000.0,
+                      "fit": 1.0,
+                      "requirement": 30.0,
+                      "target": 1312.2676864876835
+                    }
+                  },
+                  "objective": {
+                    "cost": 0.016666666666666666,
+                    "overqualification": 0.35000000000000003,
+                    "quota": 0.0,
+                    "selectionCost": 0.3666666666666667,
+                    "speedScore": 0.26666666666666666,
+                    "taskPricing": {
+                      "finalCostUsd": 0.5,
+                      "listCostUsd": 0.5,
+                      "normalizedCost": 0.016666666666666666,
+                      "omittedDimensions": [],
+                      "pressure": 1.0,
+                      "priceUnit": "million output tokens",
+                      "profile": null,
+                      "tokens": null,
+                      "unpricedDimensions": [],
+                      "valueMultiplier": 1.0,
+                      "valueSource": "cold-start effective rate"
+                    }
+                  },
+                  "pricingFallback": "catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
+                  "pricingMode": "output_only",
+                  "rawAdequacy": 1.0,
+                  "selectionCost": 0.3666666666666667
+                }
+              },
+              "variantSelection": {
+                "source": "curated",
+                "variant": null
+              }
+            }
+          }
+        }
+      ],
+      "name": "missing-group-fallback"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "routing-v1-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "pin": "pool-provider/model-pool",
+            "requirements": {
+              "iq": 30
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000000",
+              "expires_at_ms": 1800000600000,
+              "explanation": "pool-provider/model-pool on zeta-runner for consumer mason, chosen by the request's pin.",
+              "max_output_tokens": 32000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "pool": "pool-provider"
+                },
+                "model": {
+                  "model": "model-pool",
+                  "provider": "pool-vendor"
+                },
+                "module": "zeta-runner"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "routing-v1-account-for",
+          "method": "route.account_for",
+          "params": {
+            "admission_id": "pooled-admit",
+            "conversation_key": "pooled-conversation",
+            "decision_id": "dec_000000000000",
+            "mode": "admit",
+            "model": "model-pool",
+            "pool": "pool-provider",
+            "provider": "pool-provider",
+            "requested_account": {
+              "credential_id": "apikey:pool-vendor:main"
+            }
+          },
+          "reply": {
+            "result": {
+              "account": {
+                "account_id": "apikey:pool-vendor:main",
+                "credential_id": "apikey:pool-vendor:main",
+                "method": "apikey",
+                "provider": "pool-provider"
+              },
+              "admission": {
+                "id": "pooled-admit",
+                "state": "reserved"
+              },
+              "pin": {
+                "admission_valid_until_ms": 1800000060000,
+                "affinity_expires_at_ms": 1800604800000,
+                "generation": 1,
+                "id": "pin_f5622ffb78ee799df2443cb7",
+                "lease_valid_until_ms": 1800000120000,
+                "mode": "admit"
+              },
+              "reason": {
+                "code": "cold_scored",
+                "decision_id": "dec_000000000000",
+                "policy_version": "2",
+                "quota_age_band": "unknown"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "legacy-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "executor": "broca",
+            "modelPin": "pool-provider/model-pool",
+            "requirements": {
+              "eq": 0,
+              "iq": 30
+            },
+            "substrate": "broca",
+            "targetAgent": "mason"
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decisionID": "dec_000000000005",
+              "decision_id": "dec_000000000005",
+              "expires_at_ms": 1800000600000,
+              "max_output_tokens": 32000,
+              "poolLease": {
+                "credentialId": "apikey:pool-vendor:main",
+                "leaseId": "pool_000000000004",
+                "validUntilMs": 1800000600000,
+                "workspace": "key:apikey:pool-vendor:main"
+              },
+              "resolvedInput": {
+                "availableModels": [],
+                "requiredCapabilities": null,
+                "requirements": {
+                  "eq": 0.0,
+                  "iq": 30.0
+                },
+                "subscriptionKeys": []
+              },
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "account": "main",
+                  "method": "apikey"
+                },
+                "model": "model-pool",
+                "module": "zeta-runner",
+                "pool": "pool-provider",
+                "pool_session": "route.select:1800000000000",
+                "provider": "pool-vendor",
+                "route": {
+                  "model": "model-pool",
+                  "provider": "pool-provider"
+                }
+              },
+              "selected": {
+                "belowFloor": null,
+                "capacityKey": "pool-provider/model-pool",
+                "explanation": [
+                  "model pinned by head: pool-provider/model-pool; hard admission only",
+                  "workload: none"
+                ],
+                "harness": "broca",
+                "model": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "pricedWithBasket": false,
+                "promptParams": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "rejected": [],
+                "routeKey": "pool-provider/model-pool",
+                "score": {
+                  "adequacy": 1.0,
+                  "alsoAdequate": [],
+                  "candidates": [
+                    {
+                      "eligible": true,
+                      "elo": 2000.0,
+                      "eloSource": "curated",
+                      "eq": 2000.0,
+                      "eqSource": "curated",
+                      "model": "pool-provider/model-pool",
+                      "routeKey": "pool-provider/model-pool"
+                    }
+                  ],
+                  "metrics": {
+                    "elo": {
+                      "fact": 2000.0,
+                      "fit": 1.0,
+                      "requirement": 30.0,
+                      "target": 1312.2676864876835
+                    }
+                  },
+                  "objective": {
+                    "cost": 0.016666666666666666,
+                    "quota": 0.0,
+                    "selectionCost": 0.016666666666666666,
+                    "speedScore": 0.26666666666666666,
+                    "taskPricing": {
+                      "finalCostUsd": 0.5,
+                      "listCostUsd": 0.5,
+                      "normalizedCost": 0.016666666666666666,
+                      "omittedDimensions": [],
+                      "pressure": 1.0,
+                      "priceUnit": "million output tokens",
+                      "profile": null,
+                      "tokens": null,
+                      "unpricedDimensions": [],
+                      "valueMultiplier": 1.0,
+                      "valueSource": "cold-start effective rate"
+                    }
+                  },
+                  "pricingFallback": "pool-provider/model-pool has no usable ephemeral vector of its own and no fleet ephemeral vector",
+                  "pricingMode": "output_only",
+                  "rawAdequacy": 1.0,
+                  "selectionCost": 0.016666666666666666
+                }
+              },
+              "variantSelection": {
+                "source": "curated",
+                "variant": null
+              }
+            }
+          }
+        }
+      ],
+      "name": "pinned-pool-route"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "routing-v1-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "pin": "pool-provider/model-pool",
+            "requirements": {
+              "iq": 30
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000000",
+              "expires_at_ms": 1800000600000,
+              "explanation": "pool-provider/model-pool on zeta-runner for consumer mason, chosen by the request's pin.",
+              "max_output_tokens": 32000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "credential_id": "apikey:pool-vendor:second",
+                  "pool": "pool-provider"
+                },
+                "model": {
+                  "model": "model-pool",
+                  "provider": "pool-vendor"
+                },
+                "module": "zeta-runner"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "legacy-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "executor": "broca",
+            "modelPin": "pool-provider/model-pool",
+            "requirements": {
+              "eq": 0,
+              "iq": 30
+            },
+            "substrate": "broca",
+            "targetAgent": "mason"
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decisionID": "dec_000000000003",
+              "decision_id": "dec_000000000003",
+              "expires_at_ms": 1800000600000,
+              "max_output_tokens": 32000,
+              "poolLease": {
+                "credentialId": "apikey:pool-vendor:second",
+                "leaseId": "pool_000000000002",
+                "validUntilMs": 1800000600000,
+                "workspace": "key:apikey:pool-vendor:second"
+              },
+              "resolvedInput": {
+                "availableModels": [],
+                "requiredCapabilities": null,
+                "requirements": {
+                  "eq": 0.0,
+                  "iq": 30.0
+                },
+                "subscriptionKeys": []
+              },
+              "route": {
+                "model": "model-pool",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "account": "second",
+                  "method": "apikey"
+                },
+                "model": "model-pool",
+                "module": "zeta-runner",
+                "pool": "pool-provider",
+                "pool_session": "route.select:1800000000000",
+                "provider": "pool-vendor",
+                "route": {
+                  "model": "model-pool",
+                  "provider": "pool-provider"
+                }
+              },
+              "selected": {
+                "belowFloor": null,
+                "capacityKey": "pool-provider/model-pool",
+                "explanation": [
+                  "model pinned by head: pool-provider/model-pool; hard admission only",
+                  "workload: none"
+                ],
+                "harness": "broca",
+                "model": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "pricedWithBasket": false,
+                "promptParams": {
+                  "modelID": "model-pool",
+                  "providerID": "pool-provider"
+                },
+                "rejected": [],
+                "routeKey": "pool-provider/model-pool",
+                "score": {
+                  "adequacy": 1.0,
+                  "alsoAdequate": [],
+                  "candidates": [
+                    {
+                      "eligible": true,
+                      "elo": 2000.0,
+                      "eloSource": "curated",
+                      "eq": 2000.0,
+                      "eqSource": "curated",
+                      "model": "pool-provider/model-pool",
+                      "routeKey": "pool-provider/model-pool"
+                    }
+                  ],
+                  "metrics": {
+                    "elo": {
+                      "fact": 2000.0,
+                      "fit": 1.0,
+                      "requirement": 30.0,
+                      "target": 1312.2676864876835
+                    }
+                  },
+                  "objective": {
+                    "cost": 0.016666666666666666,
+                    "quota": 0.0,
+                    "selectionCost": 0.016666666666666666,
+                    "speedScore": 0.26666666666666666,
+                    "taskPricing": {
+                      "finalCostUsd": 0.5,
+                      "listCostUsd": 0.5,
+                      "normalizedCost": 0.016666666666666666,
+                      "omittedDimensions": [],
+                      "pressure": 1.0,
+                      "priceUnit": "million output tokens",
+                      "profile": null,
+                      "tokens": null,
+                      "unpricedDimensions": [],
+                      "valueMultiplier": 1.0,
+                      "valueSource": "cold-start effective rate"
+                    }
+                  },
+                  "pricingFallback": "pool-provider/model-pool has no usable ephemeral vector of its own and no fleet ephemeral vector",
+                  "pricingMode": "output_only",
+                  "rawAdequacy": 1.0,
+                  "selectionCost": 0.016666666666666666
+                }
+              },
+              "variantSelection": {
+                "source": "curated",
+                "variant": null
+              }
+            }
+          }
+        }
+      ],
+      "name": "pinned-pool-fenced-sibling"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "subscription-routing-v1-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "pin": "pool-vendor/model",
+            "requirements": {
+              "iq": 30
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000000",
+              "expires_at_ms": 1800000600000,
+              "explanation": "pool-vendor/model on class-runner for consumer mason, chosen by the request's pin.",
+              "max_output_tokens": 0,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model",
+                "provider": "pool-vendor"
+              },
+              "runner": {
+                "model": {
+                  "model": "model",
+                  "provider": "pool-vendor"
+                },
+                "module": "class-runner"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "subscription-routing-v1-account-for",
+          "method": "route.account_for",
+          "params": {
+            "admission_id": "subscription-admit",
+            "conversation_key": "subscription-conversation",
+            "decision_id": "dec_000000000000",
+            "mode": "admit",
+            "model": "model",
+            "provider": "pool-vendor"
+          },
+          "reply": {
+            "result": {
+              "account": {
+                "account_id": "oauth-account",
+                "credential_id": "oauth:test",
+                "method": "oauth",
+                "provider": "pool-vendor"
+              },
+              "admission": {
+                "id": "subscription-admit",
+                "state": "reserved"
+              },
+              "pin": {
+                "admission_valid_until_ms": 1800000060000,
+                "affinity_expires_at_ms": 1800604800000,
+                "generation": 1,
+                "id": "pin_f5622ffb78ee799df2443cb7",
+                "lease_valid_until_ms": 1800000120000,
+                "mode": "admit"
+              },
+              "reason": {
+                "code": "cold_scored",
+                "decision_id": "dec_000000000000",
+                "policy_version": "2",
+                "quota_age_band": "unknown"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "subscription-legacy-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "executor": "broca",
+            "modelPin": "pool-vendor/model",
+            "requirements": {
+              "eq": 0,
+              "iq": 30
+            },
+            "substrate": "broca",
+            "targetAgent": "mason"
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decisionID": "dec_000000000004",
+              "decision_id": "dec_000000000004",
+              "expires_at_ms": 1800000600000,
+              "max_output_tokens": 0,
+              "resolvedInput": {
+                "availableModels": [],
+                "requiredCapabilities": null,
+                "requirements": {
+                  "eq": 0.0,
+                  "iq": 30.0
+                },
+                "subscriptionKeys": [
+                  "pool-vendor/model"
+                ]
+              },
+              "route": {
+                "model": "model",
+                "provider": "pool-vendor"
+              },
+              "runner": {
+                "model": "model",
+                "module": "class-runner",
+                "provider": "pool-vendor",
+                "route": {
+                  "model": "model",
+                  "provider": "pool-vendor"
+                }
+              },
+              "selected": {
+                "belowFloor": null,
+                "capacityKey": "pool-vendor/model",
+                "explanation": [
+                  "model pinned by head: pool-vendor/model; hard admission only",
+                  "workload: none"
+                ],
+                "harness": "broca",
+                "model": {
+                  "modelID": "model",
+                  "providerID": "pool-vendor"
+                },
+                "pricedWithBasket": false,
+                "promptParams": {
+                  "modelID": "model",
+                  "providerID": "pool-vendor"
+                },
+                "rejected": [],
+                "routeKey": "pool-vendor/model",
+                "score": {
+                  "adequacy": 1.0,
+                  "alsoAdequate": [],
+                  "candidates": [
+                    {
+                      "eligible": true,
+                      "elo": 55.0,
+                      "eloSource": "curated",
+                      "eq": 1700.0,
+                      "eqSource": "curated",
+                      "model": "pool-vendor/model",
+                      "routeKey": "pool-vendor/model"
+                    }
+                  ],
+                  "metrics": {
+                    "elo": {
+                      "fact": 55.0,
+                      "fit": 1.0,
+                      "requirement": 30.0,
+                      "target": 36.087361378411295
+                    }
+                  },
+                  "objective": {
+                    "cost": 0.03333333333333333,
+                    "quota": 0.0,
+                    "selectionCost": 0.03333333333333333,
+                    "speedScore": 0.26666666666666666,
+                    "subscriptionCovered": true,
+                    "subscriptionPricing": {
+                      "availablePoints": null,
+                      "bankedResetsApplied": 0,
+                      "keepFreePercent": 0.0,
+                      "listCostUsd": 1.0,
+                      "planPressure": 1.0,
+                      "planTier": null,
+                      "planValues": [
+                        {
+                          "plan": null,
+                          "planTier": null,
+                          "source": "default",
+                          "valueMultiplier": 1.0,
+                          "weight": 1.0
+                        }
+                      ],
+                      "priceUnit": "million output tokens",
+                      "valueMultiplier": 1.0,
+                      "valueSource": "unmeasured"
+                    },
+                    "taskPricing": {
+                      "finalCostUsd": 1.0,
+                      "listCostUsd": 1.0,
+                      "normalizedCost": 0.03333333333333333,
+                      "omittedDimensions": [],
+                      "pressure": 1.0,
+                      "priceUnit": "million output tokens",
+                      "profile": null,
+                      "tokens": null,
+                      "unpricedDimensions": [],
+                      "valueMultiplier": 1.0,
+                      "valueSource": "unmeasured"
+                    }
+                  },
+                  "pricingFallback": "pool-vendor/model has no usable ephemeral vector of its own and no fleet ephemeral vector",
+                  "pricingMode": "output_only",
+                  "rawAdequacy": 1.0,
+                  "selectionCost": 0.03333333333333333
+                }
+              },
+              "variantSelection": {
+                "source": "curated",
+                "variant": null
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "pool-routing-v1-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "pin": "pool-provider/model",
+            "requirements": {
+              "iq": 30
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000005",
+              "expires_at_ms": 1800000600000,
+              "explanation": "pool-provider/model on class-runner for consumer mason, chosen by the request's pin.",
+              "max_output_tokens": 0,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "credential_id": "apikey:pool-vendor:main",
+                  "pool": "pool-provider"
+                },
+                "model": {
+                  "model": "model",
+                  "provider": "pool-vendor"
+                },
+                "module": "class-runner"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "pool-legacy-select",
+          "method": "route.select",
+          "params": {
+            "consumer": "mason",
+            "executor": "broca",
+            "modelPin": "pool-provider/model",
+            "requirements": {
+              "eq": 0,
+              "iq": 30
+            },
+            "substrate": "broca",
+            "targetAgent": "mason"
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decisionID": "dec_000000000008",
+              "decision_id": "dec_000000000008",
+              "expires_at_ms": 1800000600000,
+              "max_output_tokens": 0,
+              "poolLease": {
+                "credentialId": "apikey:pool-vendor:main",
+                "leaseId": "pool_000000000007",
+                "validUntilMs": 1800000600000,
+                "workspace": "key:apikey:pool-vendor:main"
+              },
+              "resolvedInput": {
+                "availableModels": [],
+                "requiredCapabilities": null,
+                "requirements": {
+                  "eq": 0.0,
+                  "iq": 30.0
+                },
+                "subscriptionKeys": [
+                  "pool-vendor/model"
+                ]
+              },
+              "route": {
+                "model": "model",
+                "provider": "pool-provider"
+              },
+              "runner": {
+                "auth": {
+                  "account": "main",
+                  "method": "apikey"
+                },
+                "model": "model",
+                "module": "class-runner",
+                "pool": "pool-provider",
+                "pool_session": "route.select:1800000000000",
+                "provider": "pool-vendor",
+                "route": {
+                  "model": "model",
+                  "provider": "pool-provider"
+                }
+              },
+              "selected": {
+                "belowFloor": null,
+                "capacityKey": "pool-provider/model",
+                "explanation": [
+                  "model pinned by head: pool-provider/model; hard admission only",
+                  "workload: none"
+                ],
+                "harness": "broca",
+                "model": {
+                  "modelID": "model",
+                  "providerID": "pool-provider"
+                },
+                "pricedWithBasket": false,
+                "promptParams": {
+                  "modelID": "model",
+                  "providerID": "pool-provider"
+                },
+                "rejected": [],
+                "routeKey": "pool-provider/model",
+                "score": {
+                  "adequacy": 1.0,
+                  "alsoAdequate": [],
+                  "candidates": [
+                    {
+                      "eligible": true,
+                      "elo": 55.0,
+                      "eloSource": "curated",
+                      "eq": 1700.0,
+                      "eqSource": "curated",
+                      "model": "pool-provider/model",
+                      "routeKey": "pool-provider/model"
+                    }
+                  ],
+                  "metrics": {
+                    "elo": {
+                      "fact": 55.0,
+                      "fit": 1.0,
+                      "requirement": 30.0,
+                      "target": 36.087361378411295
+                    }
+                  },
+                  "objective": {
+                    "cost": 0.3,
+                    "quota": 0.0,
+                    "selectionCost": 0.3,
+                    "speedScore": 0.26666666666666666,
+                    "taskPricing": {
+                      "finalCostUsd": 9.0,
+                      "listCostUsd": 9.0,
+                      "normalizedCost": 0.3,
+                      "omittedDimensions": [],
+                      "pressure": 1.0,
+                      "priceUnit": "million output tokens",
+                      "profile": null,
+                      "tokens": null,
+                      "unpricedDimensions": [],
+                      "valueMultiplier": 1.0,
+                      "valueSource": "cold-start effective rate"
+                    }
+                  },
+                  "pricingFallback": "pool-provider/model has no usable ephemeral vector of its own and no fleet ephemeral vector",
+                  "pricingMode": "output_only",
+                  "rawAdequacy": 1.0,
+                  "selectionCost": 0.3
+                }
+              },
+              "variantSelection": {
+                "source": "curated",
+                "variant": null
+              }
+            }
+          }
+        }
+      ],
+      "name": "same-vendor-model-subscription-and-pool"
+    }
+  ],
+  "clock_ms": 1800000000000
+}
