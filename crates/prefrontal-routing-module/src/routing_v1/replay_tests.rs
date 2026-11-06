@@ -433,6 +433,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "select_prefer_prompt_cache",
                                 "select_settings",
                                 "observe_backoff",
+                                "observe_credential_refused",
                                 "select_panel",
                                 "consumer_models",
                             ][..],
