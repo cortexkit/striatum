@@ -36,6 +36,7 @@ mod legacy_wire;
 mod literal_census_tests;
 mod model_resolution;
 mod panel_policy;
+mod project_settings;
 mod quota_bus;
 mod quota_consumer;
 mod quota_events;
@@ -1157,6 +1158,10 @@ impl ModuleConfig {
 
 async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     check_config_at(&config_overrides::config_path())?;
+    project_settings::initialize(
+        &config.connection_file_path,
+        &std::env::current_dir().map_err(|error| ModuleError::Message(error.to_string()))?,
+    );
     runtime_lag::RuntimeLagProbe::default().start("routing runtime");
     let stream = connect_to_subc(&config.connection_file_path).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);

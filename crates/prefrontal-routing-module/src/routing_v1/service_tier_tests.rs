@@ -1325,3 +1325,62 @@ async fn replay_tier_consumer_precedence() {
         }),
     );
 }
+
+#[tokio::test]
+async fn entorhinal_settings_tier_consumer_precedence_and_request_cap() {
+    use crate::project_settings::tests::{census, root, write, Fake, ID};
+    use cortexkit_role_routing::select::{
+        check_answer, parse_select_request_serving, SelectAnswer,
+    };
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_500"], true, true);
+    harness.edit_config(|config| {
+        config["consumers"]["spec_designer"]["pin"] = json!({"model":format!("openai/{MODEL}")});
+    });
+    let project = root();
+    write(
+        &project,
+        r#"{"consumers":{"mason":{"service_tier":"standard"},"spec_designer":{"service_tier":"ultrafast"},"explicit":{"service_tier":"fast"}}}"#,
+    );
+    harness.settings_source(Fake::new(census(&[project], None)));
+    let route = harness.bind(reserved("tier-owner"), Some(ID)).await;
+    for (slot, explicit, requested, expected) in [
+        (true, true, None, "fast"),
+        (true, false, None, "ultrafast"),
+        (false, false, None, "standard"),
+        (true, true, Some("standard"), "standard"),
+    ] {
+        let mut body =
+            json!({"consumer":"mason","requirements":{"iq":30},"settings":{"project_id":ID}});
+        if slot {
+            body["pin_slot"] = json!("spec_designer");
+        }
+        if explicit {
+            body["settings"]["tier_consumer"] = json!("explicit");
+        }
+        if let Some(requested) = requested {
+            body["service_tier"] = json!(requested);
+        }
+        let reply = route.call("route.select", &body).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(
+            reply.1["result"]["service_tier_chosen"], expected,
+            "{}",
+            reply.1
+        );
+        let answer: SelectAnswer = serde_json::from_value(reply.1["result"].clone()).unwrap();
+        check_answer(
+            &parse_select_request_serving(&body, super::describe::CAPABILITIES).unwrap(),
+            &answer,
+        )
+        .unwrap();
+    }
+    let reply = route
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","service_tier":"unknown","settings":{"project_id":ID}}),
+        )
+        .await;
+    assert_eq!(reply.1["code"], "invalid_request");
+    assert_eq!(reply.1["detail"]["field"], "service_tier");
+}

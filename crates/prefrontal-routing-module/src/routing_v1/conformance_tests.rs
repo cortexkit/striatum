@@ -162,6 +162,10 @@ impl Harness {
         crate::config_overrides::live_config(&self.config_path.lock().unwrap())
     }
 
+    pub(crate) fn settings_source(&self, source: Arc<dyn crate::project_settings::Source>) {
+        crate::project_settings::set_test_source(&self.config_path.lock().unwrap(), source);
+    }
+
     /// Change the routing configuration and publish it as a new file.
     pub(super) fn edit_config(&self, edit: impl FnOnce(&mut Value)) {
         let mut config = self.config.lock().unwrap();
@@ -930,6 +934,13 @@ impl RoutingSubject for KitSubject {
         Ok(())
     }
 
+    async fn configure_pin_slot(&self, slot: &str, route_key: &str) -> Result<(), String> {
+        self.harness().edit_config(|config| {
+            config["consumers"][slot]["pin"] = json!({"model":route_key});
+        });
+        Ok(())
+    }
+
     async fn cool_down(&self, route_key: &str, until_ms: u64) -> Result<(), String> {
         self.harness()
             .store()
@@ -975,6 +986,8 @@ impl RoutingSubject for KitSubject {
     ) -> Result<(), String> {
         self.harness().edit_config(|config| {
             config["providers"][provider]["accounts"]["max_hold"] = json!(limits.max_hold_s);
+            config["providers"][provider]["accounts"]["hold_when_reset_within"] =
+                json!(limits.hold_when_reset_within_s);
         });
         Ok(())
     }
@@ -1060,15 +1073,13 @@ const NOT_APPLICABLE: &[&str] = &[
     "panel_replacement_invalid_slot",
     "consumer_models_valid",
     "consumer_models_unknown_consumer",
-    "pin_slot_configured_pinned",
-    "pin_slot_unknown_unavailable",
-    "available_routes_honoured",
-    "available_routes_empty_refused",
-    "prefer_prompt_cache_accepted",
-    "settings_unresolved_selects",
-    "settings_unknown_member_refused",
-    "backoff_with_admission_accepted",
-    "backoff_missing_retry_refused",
+    "undeclared_pin_slot_refused",
+    "undeclared_available_routes_refused",
+    "undeclared_prefer_prompt_cache_refused",
+    "undeclared_settings_refused",
+    "undeclared_observe_decision_id_refused",
+    "undeclared_observe_retry_at_ms_refused",
+    "undeclared_observe_provider_code_refused",
     "account_for_tier_undeclared",
     "continue_undeclared_group_refuses_mode",
     "undeclared_harness_group_refuses_member",

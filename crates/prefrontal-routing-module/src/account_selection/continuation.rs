@@ -183,7 +183,7 @@ pub(crate) fn continue_account(
             let provider = &previous.provider;
             let policy = ctx.provider_policy(provider);
             let scoped = Ctx { policy:&policy, ..Ctx {store:ctx.store,accounts:ctx.accounts,flags:ctx.flags,policy:ctx.policy,now_ms:ctx.now_ms,classes:ctx.classes.clone()} };
-            record_observation(tx,&scoped,principal,&observation,&raw,&roster_facts)?;
+            record_observation(tx,&scoped,principal,principal,false,&observation,&raw,&roster_facts)?;
             if !ctx.flags.enabled { return Ok(refuse("account_selection_disabled", "account selection is disabled")); }
             if original.get("requested_account").is_some_and(|value| !value.is_null()) {
                 return Ok(refuse("account_pinned", "the caller pinned an account"));

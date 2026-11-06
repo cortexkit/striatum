@@ -183,6 +183,7 @@ pub(crate) struct ClassContext {
     size_refusals: Vec<prefrontal_routing_store::AccountSizeRefusal>,
     route_fences: Vec<prefrontal_routing_store::AccountRouteFence>,
     transient_route_fences: Vec<prefrontal_routing_store::AccountRouteFence>,
+    observation_backoffs: Vec<(String, String, i64)>,
     catalog: BTreeSet<String>,
     targets: BTreeMap<String, String>,
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
@@ -519,6 +520,9 @@ impl ClassContext {
         let transient_route_fences = store
             .transient_account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
+        let observation_backoffs = store
+            .account_read(|tx| tx.observation_backoffs(now_ms))
+            .map_err(|error| error.to_string())?;
         let credentials_with_headroom: BTreeSet<_> = route_fences
             .iter()
             .filter_map(|fence| {
@@ -591,6 +595,7 @@ impl ClassContext {
             size_refusals,
             route_fences,
             transient_route_fences,
+            observation_backoffs,
             catalog,
             targets,
             tier_accounts: None,
@@ -956,11 +961,20 @@ impl ClassContext {
         )
     }
 
-    /// The accounts a failed report closed `provider`/`model` on, each with
-    /// when the fence ends. A fence names the credential that served; the
-    /// whole account it belongs to is closed for this route.
+    /// Accounts closed by a report for this route or by an account-wide
+    /// backoff observation, each with its deadline. Report fences name the
+    /// credential that served; observations already name the whole account.
     fn route_fenced_accounts(&self, provider: &str, model: &str) -> BTreeMap<String, i64> {
-        self.accounts_fenced_by(&self.route_fences, provider, model)
+        let mut fenced = self.accounts_fenced_by(&self.route_fences, provider, model);
+        for (named_provider, account, until) in &self.observation_backoffs {
+            if named_provider == provider && *until > self.now_ms {
+                fenced
+                    .entry(account.clone())
+                    .and_modify(|reset| *reset = (*reset).max(*until))
+                    .or_insert(*until);
+            }
+        }
+        fenced
     }
 
     fn accounts_fenced_by(
@@ -4375,6 +4389,8 @@ struct ObserveParams {
     /// member); absent means the account is one pool.
     #[serde(default)]
     pool: Option<String>,
+    #[serde(default)]
+    retry_at_ms: Option<u64>,
 }
 
 /// What `route.account_observe` reads from each tracked provider's roster
@@ -4398,6 +4414,25 @@ const OBSERVATION_KINDS: &[&str] = &[
 ];
 
 fn observe(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
+    observe_authorized(params, principal, principal, false, ctx)
+}
+
+/// `routing_v1::accounts::account_observe` may authorize a decision owner to
+/// report on its runner's admission. The event still belongs to the observer.
+pub(crate) fn observe_authorized(
+    params: &Value,
+    principal: &str,
+    admission_principal: &str,
+    allow_served_account: bool,
+    ctx: &Ctx<'_>,
+) -> OpReply {
+    if !ctx.flags.enabled {
+        return OpReply::typed(
+            DISABLED_CODE,
+            "[TODO(user): account selection is disabled]",
+            json!({"code":DISABLED_CODE}),
+        );
+    }
     let parsed: ObserveParams = match serde_json::from_value(params.clone()) {
         Ok(parsed) => parsed,
         Err(error) => return invalid(format!("invalid route.account_observe params: {error}")),
@@ -4438,7 +4473,16 @@ fn observe(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         .collect();
     ctx.store
         .account_transaction(|tx| {
-            record_observation(tx, ctx, principal, &parsed, params, &roster_digests)
+            record_observation(
+                tx,
+                ctx,
+                principal,
+                admission_principal,
+                allow_served_account,
+                &parsed,
+                params,
+                &roster_digests,
+            )
         })
         .unwrap_or_else(store_error)
 }
@@ -4447,13 +4491,20 @@ fn record_observation(
     tx: &AccountTx<'_>,
     ctx: &Ctx<'_>,
     principal: &str,
+    admission_principal: &str,
+    allow_served_account: bool,
     parsed: &ObserveParams,
     raw: &Value,
     roster_digests: &BTreeMap<String, ProviderRosterFacts>,
 ) -> RouteStateResult<OpReply> {
     let now = ctx.now_ms;
     let runner = normalize(&parsed.caller.runner);
-    if let Some(existing) = tx.observation_by_event(principal, &runner, &parsed.event_id)? {
+    let existing = if allow_served_account || admission_principal != principal {
+        tx.observation_by_principal_event(principal, &parsed.event_id)?
+    } else {
+        tx.observation_by_event(principal, &runner, &parsed.event_id)?
+    };
+    if let Some(existing) = existing {
         return Ok(OpReply::Result(json!({
             "observation": {
                 "id": existing.observation_id,
@@ -4464,10 +4515,10 @@ fn record_observation(
         })));
     }
     let observation_id = new_id("aco");
-    // Mutation authorization: only an admission this principal was issued
-    // binds the evidence, and only to the account that admission assigned.
+    // `routing_v1::accounts` resolves the admission's principal before the
+    // transaction; a decision owner's event stays under the owner's principal.
     let admission = match &parsed.admission_id {
-        Some(id) => tx.admission(principal, id)?,
+        Some(id) => tx.admission(admission_principal, id)?,
         None => None,
     };
     tx.insert_observation(&AccountObservationRow {
@@ -4484,11 +4535,33 @@ fn record_observation(
     })?;
     let mut effects: Vec<Value> = Vec::new();
     let mut bound = false;
+    let served_providers: BTreeSet<String> =
+        if allow_served_account && parsed.kind == "transient_backoff" {
+            ctx.classes
+                .as_ref()
+                .map(|classes| {
+                    classes
+                        .credentials
+                        .listed_credentials()
+                        .iter()
+                        .filter(|row| {
+                            parsed.served_account_id.as_deref()
+                                == Some(row.account_id.as_deref().unwrap_or(&row.id))
+                        })
+                        .flat_map(|row| row.serves.iter().chain(&row.provider_ids).cloned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
     match &admission {
-        None => effects.push(json!({
-            "effect": "advisory",
-            "why": "names no admission routing issued to this principal",
-        })),
+        None => {
+            bound = !served_providers.is_empty();
+            if !bound {
+                effects.push(json!({"effect":"advisory", "why":"names no admission routing issued to this principal"}));
+            }
+        }
         Some(row) => {
             let mismatch = parsed
                 .served_account_id
@@ -4512,7 +4585,23 @@ fn record_observation(
             }
         }
     }
-    if !OBSERVATION_KINDS.contains(&parsed.kind.as_str()) {
+    if parsed.kind == "transient_backoff" && parsed.retry_at_ms.is_some() && bound {
+        let until = parsed
+            .retry_at_ms
+            .unwrap()
+            .min((now.max(0) as u64).saturating_add(24 * 60 * 60_000));
+        if let Some(admission) = &admission {
+            effects.push(
+                json!({"effect":"transient_backoff", "provider":admission.provider,
+                "account_id":admission.account_id, "retry_at_ms":until}),
+            );
+        } else if let Some(account) = &parsed.served_account_id {
+            for provider in served_providers {
+                effects.push(json!({"effect":"transient_backoff", "provider":provider,
+                    "account_id":account, "retry_at_ms":until}));
+            }
+        }
+    } else if !OBSERVATION_KINDS.contains(&parsed.kind.as_str()) {
         effects.push(json!({ "effect": "advisory", "why": "unknown observation kind" }));
     } else if let (true, Some(row)) = (bound, admission.as_ref()) {
         let policy = ctx.provider_policy(&row.provider);

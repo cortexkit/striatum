@@ -25,6 +25,18 @@ use super::{err, SqliteRouteStateStore};
 /// retired shadow mode; retention purges those rows.)
 pub const DECISION_MODE_SERVE: &str = "serve";
 
+/// Read account-wide observation backoffs with `(now_ms, oldest_receipt_ms)`.
+/// The bound-kind predicates match migration 79's sparse partial index.
+pub const OBSERVATION_BACKOFFS_SQL: &str =
+    "SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),\
+     MAX(json_extract(e.value,'$.retry_at_ms')) \
+     FROM account_observation o,json_each(CASE WHEN o.kind='transient_backoff' AND o.bound=1 \
+     AND json_valid(o.effects_json) THEN o.effects_json ELSE '[]' END) e \
+     WHERE o.bound=1 AND o.kind='transient_backoff' AND o.received_at>?2 \
+     AND json_extract(e.value,'$.effect')='transient_backoff' \
+     AND json_extract(e.value,'$.retry_at_ms')>?1 \
+     GROUP BY json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id')";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialProbeClaim {
     Claimed,
@@ -35,6 +47,81 @@ pub enum CredentialProbeClaim {
 #[cfg(test)]
 mod account_fact_tests {
     use super::*;
+
+    #[test]
+    fn observation_backoffs_use_only_committed_bound_effects_and_expire() {
+        let scratch = cortexkit_test_support::ScratchDir::new("observation-backoffs");
+        let descriptor = crate::dev_descriptor(
+            "observation-backoffs",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let connection = Connection::open(scratch.path().join("store.db")).unwrap();
+        let mut plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {OBSERVATION_BACKOFFS_SQL}"))
+            .unwrap();
+        let plan: Vec<String> = plan
+            .query_map(params![200, -86_399_800], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("account_observation_backoff_by_received")),
+            "{plan:?}"
+        );
+        store.account_transaction(|tx| {
+            for (id, bound, kind, effects) in [
+                ("standing", true, "transient_backoff", r#"[{"effect":"transient_backoff","provider":"p","account_id":"a","retry_at_ms":300}]"#),
+                ("advisory", false, "transient_backoff", r#"[{"effect":"transient_backoff","provider":"p","account_id":"b","retry_at_ms":500}]"#),
+                ("historical", true, "attempt", "opaque legacy effects"),
+            ] {
+                tx.insert_observation(&AccountObservationRow {
+                    observation_id:id.into(),principal:"owner".into(),runner:"runner".into(),event_id:id.into(),
+                    kind:kind.into(),admission_id:None,bound,observation_json:"{}".into(),effects_json:effects.into(),received_at:100,
+                })?;
+            }
+            Ok(())
+        }).unwrap();
+        let writes = store.account_write_transaction_count_for_test();
+        assert_eq!(
+            store
+                .account_read(|tx| tx.observation_backoffs(200))
+                .unwrap(),
+            vec![("p".into(), "a".into(), 300)]
+        );
+        assert_eq!(store.account_write_transaction_count_for_test(), writes);
+        assert_eq!(
+            store
+                .account_read(|tx| tx.observation_by_principal_event("owner", "standing"))
+                .unwrap()
+                .unwrap()
+                .runner,
+            "runner"
+        );
+        assert_eq!(store.prune_account_observations(200, 10).unwrap(), 2);
+        assert_eq!(
+            store
+                .account_read(|tx| tx.observation_backoffs(200))
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        assert_eq!(
+            store
+                .account_read(|tx| tx.observation_backoffs(299))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .account_read(|tx| tx.observation_backoffs(300))
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.prune_account_observations(301, 10).unwrap(), 1);
+    }
 
     #[test]
     fn stale_credential_probe_is_claimed_once_with_a_strict_cutoff() {
@@ -440,6 +527,20 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Account-wide backoffs are derived from committed, bound observation
+    /// effects. Keeping the evidence and effect in one row makes event retries
+    /// and a restart preserve the same deadline without another write.
+    /// Returns `(provider, account_id, retry_at_ms)` for each blocked account.
+    pub fn observation_backoffs(&self, now: i64) -> RouteStateResult<Vec<(String, String, i64)>> {
+        let mut statement = self.conn.prepare(OBSERVATION_BACKOFFS_SQL).map_err(err)?;
+        let rows = statement
+            .query_map(params![now, now.saturating_sub(24 * 60 * 60_000)], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(err)?;
+        rows.collect::<Result<_, _>>().map_err(err)
+    }
+
     pub fn record_account_service_tier(
         &self,
         decision_id: &str,
@@ -1803,6 +1904,24 @@ impl AccountTx<'_> {
             )
             .optional()
             .map_err(err)
+    }
+
+    /// Observation event ids are unique within a principal, even when
+    /// different observations name different runners.
+    pub fn observation_by_principal_event(
+        &self,
+        principal: &str,
+        event_id: &str,
+    ) -> RouteStateResult<Option<AccountObservationRow>> {
+        let runner: Option<String> = self.conn.query_row(
+            "SELECT runner FROM account_observation WHERE principal=?1 AND event_id=?2 \
+             UNION ALL SELECT runner FROM account_observation_event WHERE principal=?1 AND event_id=?2 LIMIT 1",
+            params![principal, event_id], |row| row.get(0),
+        ).optional().map_err(err)?;
+        match runner {
+            Some(runner) => self.observation_by_event(principal, &runner, event_id),
+            None => Ok(None),
+        }
     }
 
     /// Record what an observation changed, once its effects are known.

@@ -78,6 +78,7 @@ pub use account_selection::{
     AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountHoldRow,
     AccountObservationRow, AccountPinRow, AccountPoolFenceRow, AccountRouteFence,
     AccountSizeRefusal, AccountTx, CredentialProbeClaim, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
+    OBSERVATION_BACKOFFS_SQL,
 };
 
 pub struct ClearedRouteCooldowns {
@@ -303,7 +304,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 77] {
+fn route_state_migrations() -> [Migration; 78] {
     [
         Migration {
             version: 1,
@@ -612,6 +613,10 @@ fn route_state_migrations() -> [Migration; 77] {
         Migration {
             version: 78,
             statements: include_str!("../migrations/078_report_runs_and_call_counts.sql"),
+        },
+        Migration {
+            version: 79,
+            statements: include_str!("../migrations/079_observation_backoff_index.sql"),
         },
     ]
 }

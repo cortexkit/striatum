@@ -2823,3 +2823,268 @@ async fn entitlement_finding_with_quota_reading_names_the_probe_and_hand_lift() 
         );
     }
 }
+
+fn backoff_fixture() -> Arc<Harness> {
+    let (harness, mut credentials) = setup("synthetic", false);
+    let facts: Vec<_> = ["model", "second"]
+        .into_iter()
+        .map(|model| {
+            let mut fact = crate::tests::fact("synthetic", model);
+            fact.auth_methods = Some(vec!["oauth".into()]);
+            fact.billing_plane = Some(BillingPlane {
+                provider_id: "synthetic".into(),
+                auth_method: "oauth".into(),
+                kind: "subscription".into(),
+                selection_reason: "test".into(),
+                rates: [("rate.output".into(), BillingRate::Priced { rate: 1.0 })]
+                    .into_iter()
+                    .collect(),
+            });
+            fact
+        })
+        .collect();
+    harness.install_facts(&facts);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "two-accounts".into(),
+            credentials: ["first", "other"]
+                .into_iter()
+                .map(|id| ListedCredential {
+                    id: format!("oauth:{id}"),
+                    account_id: Some(id.into()),
+                    state: "active".into(),
+                    categories: vec!["llm-provider".into()],
+                    provider_ids: vec!["synthetic".into()],
+                    serves: vec!["synthetic".into()],
+                    credential_type: "oauth".into(),
+                    auth_method: Some("oauth".into()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+        NOW,
+    );
+    credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
+    );
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["runners"] = json!([
+            {"module":"broca","via_vault":true},{"module":"thalamus-harness","via_vault":true},
+            {"module":"thalamus-pi","via_vault":true},{"module":RUNNER,"via_vault":true}
+        ]);
+    });
+    harness
+}
+
+fn chosen_account(id: &str, model: &str, account: &str) -> Value {
+    json!({"provider":"synthetic","model":model,"admission_id":id,"conversation_key":id,
+        "candidates":{"view_digest":"two-accounts", "accounts":[{"account_id":account,"credential_id":format!("oauth:{account}")}]},
+        "hold_wait_max_s":0})
+}
+
+#[tokio::test]
+async fn observe_backoff_fences_every_model_and_runner_and_survives_restart() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for client in ["broca", "thalamus-harness", "thalamus-pi"] {
+        let harness = backoff_fixture();
+        let runner = harness.bind(reserved(client), None).await;
+        assert_credential(
+            &runner
+                .call(
+                    "route.account_for",
+                    &chosen_account("admitted", "model", "first"),
+                )
+                .await,
+            "oauth:first",
+        );
+        let missing = runner
+            .call(
+                "route.account_observe",
+                &json!({"kind":"transient_backoff","event_id":"missing","admission_id":"admitted"}),
+            )
+            .await;
+        assert_eq!(
+            missing.1["code"], "invalid_request",
+            "{client}: {}",
+            missing.1
+        );
+        assert_eq!(missing.1["detail"]["field"], "retry_at_ms");
+        let body = json!({"kind":"transient_backoff","event_id":"retry","admission_id":"admitted", "retry_at_ms":NOW+30_000,
+            "served_account_id":"first", "provider_code":"overloaded"});
+        let observed = runner.call("route.account_observe", &body).await;
+        assert_eq!(observed.0, FrameType::Response, "{client}: {}", observed.1);
+        let mut duplicate = body.clone();
+        duplicate["retry_at_ms"] = json!(NOW + 90_000);
+        assert_eq!(
+            runner.call("route.account_observe", &duplicate).await.0,
+            FrameType::Response
+        );
+        assert_eq!(
+            harness
+                .store()
+                .account_read(|tx| tx.observation_backoffs(NOW as i64))
+                .unwrap(),
+            vec![("synthetic".into(), "first".into(), (NOW + 30_000) as i64)]
+        );
+        let other_runner = harness.bind(reserved(RUNNER), None).await;
+        let blocked = other_runner
+            .call(
+                "route.account_for",
+                &chosen_account("blocked", "second", "first"),
+            )
+            .await;
+        assert_eq!(blocked.0, FrameType::Error, "{client}: {}", blocked.1);
+        assert_credential(
+            &other_runner
+                .call(
+                    "route.account_for",
+                    &chosen_account("unaffected", "second", "other"),
+                )
+                .await,
+            "oauth:other",
+        );
+        drop(runner);
+        drop(other_runner);
+        let harness = super::conformance_tests::upgrade_harness(harness);
+        let runner = harness.bind(reserved(client), None).await;
+        assert_eq!(
+            runner
+                .call(
+                    "route.account_for",
+                    &chosen_account("restart", "second", "first")
+                )
+                .await
+                .0,
+            FrameType::Error
+        );
+        let _later = crate::InjectedClock::set(NOW + 30_001);
+        assert_credential(
+            &runner
+                .call(
+                    "route.account_for",
+                    &chosen_account("after-reset", "second", "first"),
+                )
+                .await,
+            "oauth:first",
+        );
+    }
+}
+
+#[tokio::test]
+async fn decision_owner_backoff_requires_the_admission_to_have_carried_its_decision() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = backoff_fixture();
+    let owner = harness.bind(reserved(OWNER), None).await;
+    let selected = owner
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","pin":"synthetic/model","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let decision = selected.1["result"]["decision_id"].clone();
+    let runner_id = selected.1["result"]["runner"]["module"].as_str().unwrap();
+    let runner = harness.bind(reserved(runner_id), None).await;
+    let mut request = chosen_account("carried", "model", "first");
+    request["decision_id"] = decision.clone();
+    assert_credential(
+        &runner.call("route.account_for", &request).await,
+        "oauth:first",
+    );
+    assert_credential(
+        &runner
+            .call(
+                "route.account_for",
+                &chosen_account("bare", "model", "first"),
+            )
+            .await,
+        "oauth:first",
+    );
+    let body = json!({"event_id":"owner-backoff","kind":"transient_backoff","decision_id":decision,
+        "admission_id":"carried","retry_at_ms":NOW+u64::MAX/2});
+    for patch in [
+        json!({"admission_id":"bare"}),
+        json!({"decision_id":"foreign"}),
+        json!({"kind":"run_finished"}),
+    ] {
+        let mut denied = body.clone();
+        for (key, value) in patch.as_object().unwrap() {
+            denied[key] = value.clone();
+        }
+        if denied["kind"] == "run_finished" {
+            denied.as_object_mut().unwrap().remove("retry_at_ms");
+        }
+        let reply = owner.call("route.account_observe", &denied).await;
+        assert_eq!(reply.1["code"], "account_not_authorized", "{}", reply.1);
+    }
+    assert_eq!(
+        owner.call("route.account_observe", &body).await.0,
+        FrameType::Response
+    );
+    assert_eq!(
+        harness
+            .store()
+            .account_read(|tx| tx.observation_backoffs(NOW as i64))
+            .unwrap()[0]
+            .2,
+        (NOW + 24 * 60 * 60_000) as i64
+    );
+}
+
+#[tokio::test]
+async fn runner_backoff_can_name_a_served_account_without_an_admission() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = backoff_fixture();
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let reply = runner
+        .call(
+            "route.account_observe",
+            &json!({"kind":"transient_backoff","event_id":"served-only",
+        "served_account_id":"first","retry_at_ms":NOW+10_000}),
+        )
+        .await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(
+        harness
+            .store()
+            .account_read(|tx| tx.observation_backoffs(NOW as i64))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        runner
+            .call(
+                "route.account_for",
+                &chosen_account("blocked-served", "second", "first")
+            )
+            .await
+            .0,
+        FrameType::Error
+    );
+}
+
+#[tokio::test]
+async fn select_hold_threshold_is_independent_of_the_runner_wait_cap() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    exhaust_oauth_until(&harness, "synthetic", (NOW + 60_000) as i64);
+    let owner = harness.bind(reserved(OWNER), None).await;
+    let body = json!({"consumer":"mason","pin":"synthetic/model","requirements":{"iq":30},
+        "hold_ok":true,"hold_wait_max_s":120});
+    harness.edit_config(|config| {
+        config["providers"]["synthetic"]["accounts"]["max_hold"] = json!(120);
+        config["providers"]["synthetic"]["accounts"]["hold_when_reset_within"] = json!(30);
+    });
+    let refused = owner.call("route.select", &body).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    harness.edit_config(|config| {
+        config["providers"]["synthetic"]["accounts"]["hold_when_reset_within"] = json!(120);
+    });
+    let held = owner.call("route.select", &body).await;
+    assert_eq!(held.0, FrameType::Response, "{}", held.1);
+    assert_eq!(held.1["result"]["pin_outcome"], "pinned");
+}

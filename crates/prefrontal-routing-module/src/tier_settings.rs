@@ -7,7 +7,7 @@ use cortexkit_role_routing::service_tier::ServiceTier;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     Standard,
@@ -25,20 +25,20 @@ impl Tier {
     }
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Consumer {
     service_tier: Option<Tier>,
     service_tiers: Option<BTreeMap<String, Tier>>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Entity {
     service_tier: Option<Tier>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Document {
     consumers: BTreeMap<String, Consumer>,
@@ -225,6 +225,40 @@ pub(crate) struct Layers {
 }
 
 impl Layers {
+    /// Roots belonging to the same project must agree on its settings document;
+    /// folder order is not authority to choose between conflicting documents.
+    pub(crate) fn from_roots(
+        projects: &[PathBuf],
+        workspace: Option<&Path>,
+    ) -> Result<(Self, bool), String> {
+        fn read(root: &Path) -> Result<Option<Arc<Document>>, String> {
+            let path = root.join(".cortexkit/prefrontal-routing.jsonc");
+            match std::fs::read_to_string(&path) {
+                Ok(raw) => parse(&path, &raw)
+                    .map(|doc| Some(Arc::new(doc)))
+                    .map_err(|err| err.to_string()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(format!("{}: {err}", path.display())),
+            }
+        }
+        let mut project = None;
+        for root in projects {
+            if let Some(document) = read(root)? {
+                if project
+                    .as_ref()
+                    .is_some_and(|previous| previous != &document)
+                {
+                    return Err("project routing documents differ".into());
+                }
+                project = Some(document);
+            }
+        }
+        let workspace = workspace.map(read).transpose()?.flatten();
+        let documents: Vec<_> = [project, workspace].into_iter().flatten().collect();
+        let applied = !documents.is_empty();
+        Ok((Self { documents }, applied))
+    }
+
     pub(crate) fn new(project: Option<&str>, workspace: Option<&str>) -> Self {
         Self {
             documents: [project, workspace]
@@ -318,6 +352,47 @@ mod tests {
             ))
             .unwrap();
         path
+    }
+
+    #[test]
+    fn identity_roots_layer_equal_documents_and_reject_conflicts() {
+        let a = root();
+        let b = root();
+        let workspace = root();
+        write(&a, r#"{"models":{"p/m":{"service_tier":"fast"}}}"#);
+        write(
+            &b,
+            r#"{ /* same document */ "models":{"p/m":{"service_tier":"fast"}}}"#,
+        );
+        write(
+            &workspace,
+            r#"{"providers":{"p":{"service_tier":"ultrafast"}}}"#,
+        );
+        let global = crate::config_overrides::LiveConfig::default();
+        let (layers, applied) =
+            Layers::from_roots(&[a.clone(), b.clone()], Some(&workspace)).unwrap();
+        assert!(applied);
+        assert_eq!(
+            layers.resolve(&global, "worker", "p", "m", None),
+            Some(ServiceTier::Fast)
+        );
+        assert_eq!(
+            layers.resolve(&global, "worker", "p", "other", None),
+            Some(ServiceTier::Ultrafast)
+        );
+        write(&b, r#"{"models":{"p/m":{"service_tier":"standard"}}}"#);
+        assert!(Layers::from_roots(&[a, b], Some(&workspace)).is_err());
+    }
+
+    #[test]
+    fn identity_roots_distinguish_missing_malformed_and_unreadable_files() {
+        let missing = root();
+        assert!(!Layers::from_roots(&[missing.clone()], None).unwrap().1);
+        let path = write(&missing, "not json");
+        assert!(Layers::from_roots(&[missing.clone()], None).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(Layers::from_roots(&[missing], None).is_err());
     }
 
     #[test]

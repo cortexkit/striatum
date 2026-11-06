@@ -201,7 +201,8 @@ impl SqliteRouteStateStore {
 
     /// Delete at most `limit` runner observations received before
     /// `received_before` (Unix milliseconds), oldest first. An observation a
-    /// fence or exclusion still names is kept.
+    /// fence or exclusion still names is kept, as is a bound backoff whose
+    /// deadline is later than the cutoff (even with a zero-day log window).
     pub fn prune_account_observations(
         &self,
         received_before: i64,
@@ -216,8 +217,12 @@ impl SqliteRouteStateStore {
                        WHERE received_at < ?1 \
                          AND NOT EXISTS (SELECT 1 FROM account_fence f \
                            WHERE f.observation_id = account_observation.observation_id) \
-                         AND NOT EXISTS (SELECT 1 FROM account_principal_exclusion x \
-                           WHERE x.observation_id = account_observation.observation_id) \
+                          AND NOT EXISTS (SELECT 1 FROM account_principal_exclusion x \
+                            WHERE x.observation_id = account_observation.observation_id) \
+                          AND NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN kind='transient_backoff' \
+                            AND bound=1 AND json_valid(effects_json) THEN effects_json ELSE '[]' END) e \
+                            WHERE json_extract(e.value,'$.effect')='transient_backoff' \
+                            AND json_extract(e.value,'$.retry_at_ms')>?1) \
                        ORDER BY received_at LIMIT ?2)",
                     params![received_before, limit_param(limit)],
                 )

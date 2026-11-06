@@ -1042,6 +1042,9 @@ fn allocator_policy_from(
         if let Some(duration) = &source.max_hold {
             policy.max_hold_s = duration.seconds()?;
         }
+        if let Some(duration) = &source.hold_when_reset_within {
+            duration.seconds()?;
+        }
         if let Some(duration) = &source.unknown_reset_retry {
             policy.unknown_reset_retry_ms = i64::try_from(duration.seconds()?)
                 .ok()
@@ -1065,6 +1068,20 @@ fn allocator_policy_from(
 }
 
 impl LiveConfig {
+    pub(crate) fn select_hold_threshold_s(&self, provider: &str) -> u64 {
+        self.config
+            .providers
+            .get(provider)
+            .and_then(|provider| provider.accounts.hold_when_reset_within.as_ref())
+            .or(self.config.accounts.hold_when_reset_within.as_ref())
+            .map(|duration| {
+                duration
+                    .seconds()
+                    .expect("account durations were validated")
+            })
+            .unwrap_or(900)
+    }
+
     pub(crate) fn effective_account_policies(&self) -> serde_json::Value {
         serde_json::Value::Object(
             self.config
@@ -1155,10 +1172,19 @@ mod account_policy_config_tests {
             r#"{"providers":{"p":{"accounts":{"strategy":"random"}}}}"#,
             r#"{"providers":{"p":{"accounts":{"max_hold":"tomorrow"}}}}"#,
             r#"{"providers":{"p":{"accounts":{"unknown_policy":true}}}}"#,
-            r#"{"accounts":{"hold_when_reset_within":"15m"}}"#,
+            r#"{"accounts":{"hold_when_reset_within":"tomorrow"}}"#,
         ] {
             assert!(parse_config(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn select_hold_threshold_uses_provider_then_global_then_contract_default() {
+        let config = parse_config(r#"{"accounts":{"hold_when_reset_within":"2m"},"providers":{"p":{"accounts":{"hold_when_reset_within":"30s"}}}}"#).unwrap();
+        let live = LiveConfig::new(config, None);
+        assert_eq!(live.select_hold_threshold_s("p"), 30);
+        assert_eq!(live.select_hold_threshold_s("other"), 120);
+        assert_eq!(LiveConfig::default().select_hold_threshold_s("p"), 900);
     }
 }
 

@@ -20,7 +20,7 @@ use prefrontal_routing_store::V1Recorded;
 use serde_json::{json, Value};
 
 use super::{account_ctx, now_ms, provider_refusal, Caller, Deps};
-use crate::account_selection::{self, OpReply, ACCOUNT_FOR_OP, ACCOUNT_OBSERVE_OP};
+use crate::account_selection::{self, OpReply, ACCOUNT_FOR_OP};
 use crate::{account_quota, config_overrides};
 
 /// A store or serialization failure inside `route.account_for`. The contract
@@ -61,6 +61,9 @@ const FOR_MEMBERS: &[&str] = &[
 ];
 
 const OBSERVE_MEMBERS: &[&str] = &[
+    "decision_id",
+    "retry_at_ms",
+    "provider_code",
     "event_id",
     "kind",
     "admission_id",
@@ -517,9 +520,64 @@ pub(super) fn account_observe(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
-    let authority = account_caller(caller, deps)?;
+    let runner_authority = account_caller(caller, deps);
+    if let Err(refusal) = &runner_authority {
+        if params["decision_id"].as_str().is_none() || params["admission_id"].as_str().is_none() {
+            return Err(refusal.clone());
+        }
+    }
     super::refuse_unknown_members(params, OBSERVE_MEMBERS)?;
     let request = parse_account_observe_request_serving(params, super::describe::CAPABILITIES)?;
+    let owner_decision;
+    let admission_principal;
+    let authority = match runner_authority {
+        Ok(authority) => {
+            admission_principal = authority.principal.clone();
+            authority
+        }
+        Err(refusal) => {
+            let (Some(decision_id), Some(admission_id)) =
+                (&request.decision_id, &request.admission_id)
+            else {
+                return Err(refusal);
+            };
+            owner_decision = deps
+                .store
+                .v1_decision(decision_id)
+                .map_err(store_unavailable)?;
+            let Some(decision) = owner_decision
+                .as_ref()
+                .filter(|decision| decision.principal == caller.principal)
+            else {
+                return Err(refusal);
+            };
+            super::consumers::effective(&super::operator_config(deps))
+                .admit(&decision.consumer, caller)?;
+            admission_principal = format!("reserved:{}", decision.runner_module);
+            let admission = deps
+                .store
+                .v1_admission(&admission_principal, admission_id)
+                .map_err(store_unavailable)?;
+            let admission_body = admission
+                .as_ref()
+                .and_then(|standing| serde_json::from_str::<Value>(&standing.body_json).ok());
+            cortexkit_role_routing::observe::check_observe_authorization(
+                cortexkit_role_routing::observe::ObserveArm::decision_owner(
+                    decision_id,
+                    admission_id,
+                    admission_body
+                        .as_ref()
+                        .and_then(|body| body["decision_id"].as_str()),
+                ),
+                &request,
+            )?;
+            AccountCaller {
+                module: &decision.runner_module,
+                principal: caller.principal.clone(),
+                session: None,
+            }
+        }
+    };
     // The allocator reads these two as closed sets of its own.
     if let Some(origin) = &request.upstream_origin {
         serde_json::from_value::<prefrontal_routing_core::accounts::evidence::FrameOrigin>(json!(
@@ -552,12 +610,16 @@ pub(super) fn account_observe(
             legacy["admission_id"] = json!(authority.admission_key(id));
         }
     }
-    let body = serde_json::to_vec(&json!({ "method": ACCOUNT_OBSERVE_OP, "params": legacy }))
-        .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
     let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
     let ctx = account_ctx(deps, flags, &policy)?;
-    let reply = account_selection::handle(ACCOUNT_OBSERVE_OP, &body, &authority.principal, &ctx);
+    let reply = account_selection::observe_authorized(
+        &legacy,
+        &authority.principal,
+        &admission_principal,
+        admission_principal == authority.principal,
+        &ctx,
+    );
     match reply {
         OpReply::Result(result) => observation_answer(&result),
         OpReply::Error {

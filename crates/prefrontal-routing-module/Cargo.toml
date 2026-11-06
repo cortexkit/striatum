@@ -22,6 +22,7 @@ cortexkit-bus-nats = { workspace = true }
 cortexkit-bus-trait = { workspace = true }
 # The routing/v1 role contract: wire shapes and validators for the v1 ops.
 cortexkit-role-routing = { workspace = true }
+cortexkit-project-identity = { workspace = true }
 cortexkit-role-llm-runner = { workspace = true }
 subc-client-rs = { workspace = true }
 cortexkit-claustrum-client = { workspace = true }

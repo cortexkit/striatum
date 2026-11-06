@@ -179,3 +179,153 @@ async fn a_pin_decides_before_prefer() {
     assert_eq!(route_key(&pinned), MODEL_A, "{pinned}");
     assert_eq!(pinned["pin_outcome"], "pinned", "{pinned}");
 }
+
+#[tokio::test]
+async fn slot_pin_answers_pinned_unknown_slot_and_unavailable_fallback() {
+    let (harness, route) = configured().await;
+    harness.edit_config(|config| {
+        config["consumers"]["spec_designer"]["pin"] = json!({"model":MODEL_A,"variant":"high"});
+    });
+    for fallback in [None, Some("route")] {
+        let mut extra = json!({"pin_slot":"spec_designer"});
+        if let Some(fallback) = fallback {
+            extra["pin_fallback"] = json!(fallback);
+        }
+        let answer = answered(&route, extra).await;
+        assert_eq!(answer["pin_outcome"], "pinned");
+        assert_eq!(route_key(&answer), MODEL_A);
+        assert_eq!(answer["route"]["variant"], "high");
+    }
+    let unknown = route
+        .call("route.select", &select_body(json!({"pin_slot":"unset"})))
+        .await;
+    assert_eq!(unknown.1["code"], "pin_unavailable");
+    assert_eq!(unknown.1["detail"]["pin"], "unset");
+    assert_eq!(unknown.1["detail"]["reason"], "unknown_slot");
+    let fallback = answered(&route, json!({"pin_slot":"unset","pin_fallback":"route"})).await;
+    assert_eq!(fallback["pin_outcome"], "fell_back");
+    assert_eq!(fallback["detail"]["pin_reason"], "unknown_slot");
+    harness.edit_config(|config| {
+        config["consumers"]["spec_designer"]["pin"] = json!({"model":"example-provider/missing"});
+    });
+    let fallback = answered(
+        &route,
+        json!({"pin_slot":"spec_designer","pin_fallback":"route"}),
+    )
+    .await;
+    assert_eq!(fallback["pin_outcome"], "fell_back");
+    assert_eq!(fallback["detail"]["pin_reason"], "unknown_model");
+    let unavailable = route
+        .call(
+            "route.select",
+            &select_body(json!({"pin_slot":"spec_designer"})),
+        )
+        .await;
+    assert_eq!(unavailable.1["detail"]["pin"], "spec_designer");
+}
+
+#[tokio::test]
+async fn available_routes_restricts_automatic_pinned_and_preferred_selection() {
+    let (_harness, route) = configured().await;
+    let answer = answered(
+        &route,
+        json!({"available_routes":[MODEL_A],"prefer":[MODEL_B]}),
+    )
+    .await;
+    assert_eq!(route_key(&answer), MODEL_A);
+    let request = select_body(json!({"pin":MODEL_B,"available_routes":[MODEL_A]}));
+    let refused = route.call("route.select", &request).await;
+    assert_eq!(refused.0, FrameType::Error);
+    let answer = answered(
+        &route,
+        json!({"pin":MODEL_B,"pin_fallback":"route","available_routes":[MODEL_A]}),
+    )
+    .await;
+    assert_eq!(route_key(&answer), MODEL_A);
+    assert_eq!(answer["pin_outcome"], "fell_back");
+    let empty = route
+        .call("route.select", &select_body(json!({"available_routes":[]})))
+        .await;
+    assert_eq!(empty.1["detail"]["field"], "available_routes");
+}
+
+#[tokio::test]
+async fn prompt_cache_preference_reaches_the_adequate_scorer_only() {
+    let (harness, route) = configured().await;
+    harness.edit_config(|config| {
+        config["providers"]["example-provider"]["prompt_cache"] = json!(false);
+    });
+    assert_eq!(
+        route_key(&answered(&route, json!({"prefer_prompt_cache":false})).await),
+        MODEL_B
+    );
+    let cached = answered(&route, json!({"prefer_prompt_cache":true})).await;
+    assert_eq!(cached["route"]["provider"], "example-subscription");
+    let excluded = answered(
+        &route,
+        json!({"prefer_prompt_cache":true,"exclude_providers":["example-subscription"]}),
+    )
+    .await;
+    assert_eq!(excluded["route"]["provider"], "example-provider");
+}
+
+#[tokio::test]
+async fn settings_results_are_answered_and_pass_the_contract_answer_check() {
+    use crate::project_settings::tests::{census, root, write, Fake, ID};
+    use cortexkit_role_routing::select::{
+        check_answer, parse_select_request_serving, SelectAnswer,
+    };
+    for status in ["applied", "none", "unresolved"] {
+        let (harness, route) = configured().await;
+        let project = root();
+        if status == "applied" {
+            write(&project, "{}");
+        }
+        let source = Fake::new(census(&[project], None));
+        source
+            .fail
+            .store(status == "unresolved", std::sync::atomic::Ordering::Relaxed);
+        harness.settings_source(source);
+        let request = select_body(json!({"settings":{"project_id":ID}}));
+        let result = route.call("route.select", &request).await;
+        assert_eq!(result.0, FrameType::Response, "{}", result.1);
+        assert_eq!(result.1["result"]["project_settings"], status);
+        let parsed = parse_select_request_serving(&request, super::describe::CAPABILITIES).unwrap();
+        let answer: SelectAnswer = serde_json::from_value(result.1["result"].clone()).unwrap();
+        check_answer(&parsed, &answer).unwrap();
+        let persisted = harness
+            .store()
+            .v1_selection_json(&answer.decision_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&persisted).unwrap()["project_settings"],
+            status
+        );
+    }
+}
+
+#[tokio::test]
+async fn empty_settings_is_global_only_and_a_mismatched_stamp_is_named() {
+    use super::conformance_tests::reserved;
+    let (harness, _route) = configured().await;
+    let project = crate::project_settings::tests::root();
+    crate::project_settings::tests::write(&project, "broken");
+    harness.edit_config(|config| {
+        config["consumers"][fixture::SUMMARY]["projects"]["project-a"] = json!({"pin":MODEL_A});
+    });
+    let route = harness
+        .bind(reserved(fixture::CONSUMER), Some("project-a"))
+        .await;
+    let answer = answered(&route, json!({"settings":{}})).await;
+    assert_eq!(route_key(&answer), MODEL_B);
+    assert!(answer.get("project_settings").is_none());
+    let refused = route
+        .call(
+            "route.select",
+            &select_body(json!({"settings":{"project_id":"project-b"}})),
+        )
+        .await;
+    assert_eq!(refused.1["code"], "invalid_request");
+    assert_eq!(refused.1["detail"]["field"], "settings.project_id");
+}

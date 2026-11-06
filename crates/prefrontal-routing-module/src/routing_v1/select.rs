@@ -161,9 +161,53 @@ pub(super) async fn select_with_profile_lookup(
         &crate::tier_settings::without_context(params),
         super::describe::CAPABILITIES,
     )?;
-    let result = select_with_tier_fallback(params, caller, deps, profile_lookup, &request).await;
+    let (settings_layers, project_settings) = if let Some(settings) = &request.settings {
+        settings.check_project_stamp(
+            caller
+                .scope_authority
+                .as_ref()
+                .and_then(|scope| scope.project_id.as_deref())
+                .or_else(|| {
+                    caller
+                        .scope
+                        .as_ref()
+                        .and_then(|scope| scope.project_id.as_deref())
+                }),
+        )?;
+        match settings.project_id.as_deref() {
+            Some(project) => {
+                let (layers, status) =
+                    crate::project_settings::layers(project, deps.routing_config_path).await;
+                (layers, Some(status))
+            }
+            None => (crate::tier_settings::Layers::new(None, None), None),
+        }
+    } else {
+        (
+            crate::tier_settings::Layers::new(
+                params.get("project_root").and_then(Value::as_str),
+                params.get("workspace_root").and_then(Value::as_str),
+            ),
+            None,
+        )
+    };
+    let mut result = select_with_tier_fallback(
+        params,
+        caller,
+        deps,
+        profile_lookup,
+        &request,
+        &settings_layers,
+        project_settings,
+    )
+    .await;
+    if let (Err(refusal), Some(slot)) = (&mut result, &request.pin_slot) {
+        if refusal.code.as_str() == "pin_unavailable" {
+            refusal.detail.insert("pin".into(), json!(slot));
+        }
+    }
     if let Err(refusal) = &result {
-        if request.pin.is_some()
+        if (request.pin.is_some() || request.pin_slot.is_some())
             && request.pin_fallback != Some(PinFallback::Route)
             && matches!(
                 refusal.code.as_str(),
@@ -189,11 +233,26 @@ async fn select_with_tier_fallback(
     deps: &Deps<'_>,
     profile_lookup: &ProfileLookup,
     request: &SelectRequest,
+    settings_layers: &crate::tier_settings::Layers,
+    project_settings: Option<cortexkit_role_routing::select::ProjectSettings>,
 ) -> Result<Value, Refusal> {
     use cortexkit_role_routing::service_tier::ServiceTier;
-    let mut trace = TierTrace::default();
+    let mut trace = TierTrace {
+        project_settings,
+        ..Default::default()
+    };
     let Some(requested) = request.service_tier else {
-        return select_at_tier(params, caller, deps, profile_lookup, None, None, &mut trace).await;
+        return select_at_tier(
+            params,
+            caller,
+            deps,
+            profile_lookup,
+            None,
+            None,
+            &mut trace,
+            settings_layers,
+        )
+        .await;
     };
     if let Some(previous) = request
         .affinity
@@ -226,6 +285,7 @@ async fn select_with_tier_fallback(
                     Some(tier),
                     credential.as_deref(),
                     &mut trace,
+                    settings_layers,
                 )
                 .await
                 {
@@ -251,6 +311,7 @@ async fn select_with_tier_fallback(
             Some(tier),
             None,
             &mut trace,
+            settings_layers,
         )
         .await
         {
@@ -276,6 +337,7 @@ async fn select_with_tier_fallback(
 
 #[derive(Default)]
 struct TierTrace {
+    project_settings: Option<cortexkit_role_routing::select::ProjectSettings>,
     attempts: Vec<Value>,
     rejections: Vec<Value>,
     affinity: bool,
@@ -346,6 +408,7 @@ async fn select_at_tier(
     service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     sticky_credential: Option<&str>,
     tier_trace: &mut TierTrace,
+    tier_settings: &crate::tier_settings::Layers,
 ) -> Result<Value, Refusal> {
     tier_trace.rejections.clear();
     super::refuse_unknown_members(params, MEMBERS)?;
@@ -501,10 +564,13 @@ async fn select_at_tier(
     if runners.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
-    let tier_settings = crate::tier_settings::Layers::new(
-        params.get("project_root").and_then(Value::as_str),
-        params.get("workspace_root").and_then(Value::as_str),
-    );
+    let tier_consumer = request
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.tier_consumer.as_deref())
+        .or_else(|| params.get("tier_consumer").and_then(Value::as_str))
+        .or(request.pin_slot.as_deref())
+        .unwrap_or(&consumer);
     let configured_tiers = if service_tier.is_none() {
         priced
             .classes
@@ -515,10 +581,7 @@ async fn select_at_tier(
                     |fact| {
                         tier_settings.resolve(
                             &operator_config,
-                            params
-                                .get("tier_consumer")
-                                .and_then(Value::as_str)
-                                .unwrap_or(&consumer),
+                            tier_consumer,
                             &fact.provider_id,
                             &fact.model_id,
                             None,
@@ -575,6 +638,11 @@ async fn select_at_tier(
     // none.
     let reachable: Vec<&ModelFact> = facts
         .iter()
+        .filter(|fact| {
+            request.available_routes.as_ref().is_none_or(|routes| {
+                routes.contains(&format!("{}/{}", fact.provider_id, fact.model_id))
+            })
+        })
         .filter(|fact| {
             let route = fact_to_route(fact);
             runners.iter().any(|runner| {
@@ -781,6 +849,7 @@ async fn select_at_tier(
         }))
     });
     let selection = Selection {
+        prefer_prompt_cache: request.prefer_prompt_cache.unwrap_or(false),
         consumer: &consumer,
         priced_per_token,
         demand,
@@ -813,12 +882,19 @@ async fn select_at_tier(
         conversation_key: request.affinity.as_deref().unwrap_or("select"),
     };
 
-    let project_pin = caller
-        .scope
+    let project_pin = request
+        .settings
         .as_ref()
-        .and_then(|scope| scope.project_id.as_deref())
-        .and_then(|project| operator_config.project_pin(project, &consumer))
-        .map(str::to_owned);
+        .is_none_or(|settings| settings.project_id.is_some())
+        .then(|| {
+            caller
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.project_id.as_deref())
+                .and_then(|project| operator_config.project_pin(project, &consumer))
+                .map(str::to_owned)
+        })
+        .flatten();
     let previous = match &request.affinity {
         Some(key) => deps
             .store
@@ -835,8 +911,24 @@ async fn select_at_tier(
     // before the order runs, and the order runs as for an unpinned request.
     // The continuing model falls through once it is no longer allowed. Legacy
     // targetAgent bodies never reach this surface.
-    let mut request_pin = request.pin.clone();
+    let mut request_pin = request.pin.clone().or_else(|| {
+        request
+            .pin_slot
+            .as_deref()
+            .and_then(|slot| operator_config.select_slot_pin(slot))
+    });
     let mut pin_reason = None;
+    if request.pin_slot.is_some() && request_pin.is_none() {
+        if request.pin_fallback == Some(PinFallback::Route) {
+            pin_reason = Some("unknown_slot".into());
+        } else {
+            return Err(Refusal::pin_unavailable(
+                request.pin_slot.as_deref().unwrap(),
+                PinUnavailableReason::parse("unknown_slot"),
+                None,
+            ));
+        }
+    }
     if request.pin_fallback == Some(PinFallback::Route) {
         if let Some(Err(refusal)) = request_pin
             .as_deref()
@@ -927,7 +1019,7 @@ async fn select_at_tier(
     });
     // `pin_outcome` is answered exactly when the request pinned: `fell_back`
     // when its pin was dropped above, `pinned` when the pin was served.
-    let pin_outcome = request.pin.as_ref().map(|_| {
+    let pin_outcome = request.pin.as_ref().or(request.pin_slot.as_ref()).map(|_| {
         if pin_reason.is_some() {
             PinOutcome::FellBack
         } else {
@@ -952,8 +1044,7 @@ async fn select_at_tier(
     let (mut selected, basis, explicit_variant) = match ordered {
         Ok((selected, order)) => {
             let explicit = match order {
-                select_policy::OrderBasis::RequestPin => request
-                    .pin
+                select_policy::OrderBasis::RequestPin => request_pin
                     .as_deref()
                     .and_then(RouteRef::parse_pin)
                     .and_then(|pin| pin.variant),
@@ -1054,10 +1145,7 @@ async fn select_at_tier(
     input["hold_wait_max_s"] = json!(hold_cap);
     let requested_tier = tier_settings.resolve(
         &operator_config,
-        params
-            .get("tier_consumer")
-            .and_then(Value::as_str)
-            .unwrap_or(&consumer),
+        tier_consumer,
         &selected.model.provider_id,
         &selected.model.model_id,
         request.service_tier,
@@ -1204,6 +1292,9 @@ async fn select_at_tier(
     if let Some(outcome) = pin_outcome {
         answer = answer.with_pin_outcome(outcome);
     }
+    if let Some(status) = &tier_trace.project_settings {
+        answer = answer.with_project_settings(status.clone());
+    }
     let value = serde_json::to_value(answer)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     deps.store
@@ -1214,6 +1305,7 @@ async fn select_at_tier(
 
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
+    prefer_prompt_cache: bool,
     hold_ok: bool,
     hold_wait_max_s: Option<u64>,
     conversation_key: &'a str,
@@ -1355,7 +1447,7 @@ impl<'a> Selection<'a> {
             subscription_keys: self.subscription_keys,
             priced_per_token: self.priced_per_token,
             min_band: self.min_band,
-            prefer_prompt_cache: false,
+            prefer_prompt_cache: self.prefer_prompt_cache,
             providers_without_prompt_cache: &self.providers_without_prompt_cache,
             consumer_exclude: self.consumer_exclude,
             rejections: self.rejections,
@@ -1492,13 +1584,21 @@ impl<'a> Selection<'a> {
             .operator_config
             .allocator_policy(&selected.model.provider_id);
         if let Some(classes) = self.classes {
+            let wait_limit = self
+                .hold_wait_max_s
+                .unwrap_or(account_selection::DEFAULT_HOLD_WAIT_S)
+                .min(
+                    self.sources
+                        .operator_config
+                        .select_hold_threshold_s(&selected.model.provider_id),
+                );
             match classes
                 .probe(
                     &selected.model.provider_id,
                     &selected.model.model_id,
                     self.priced_per_token,
                     true,
-                    self.hold_wait_max_s,
+                    Some(wait_limit),
                     self.conversation_key,
                 )
                 .outcome

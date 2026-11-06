@@ -299,7 +299,7 @@ impl QuotaConsumer {
         Ok(value.get("result").cloned().unwrap_or(value))
     }
 
-    async fn operation_body(
+    pub(crate) async fn operation_body(
         &mut self,
         body: serde_json::Value,
     ) -> Result<Vec<u8>, QuotaConsumerError> {

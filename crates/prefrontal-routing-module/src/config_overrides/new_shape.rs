@@ -225,6 +225,17 @@ impl RoutingConfigFile {
 }
 
 impl LiveConfig {
+    /// Contract slot names look up an operator-configured pin, not a caller's
+    /// consumer defaults. The older slot-pin reads still use `slot_pin` and
+    /// `config_policy::slot_consumer`'s reserved slot list.
+    pub(crate) fn select_slot_pin(&self, slot: &str) -> Option<String> {
+        let pin = self.config.consumers.get(slot)?.pin.as_ref()?;
+        Some(pin.variant.as_ref().map_or_else(
+            || pin.model.clone(),
+            |variant| format!("{}:{variant}", pin.model),
+        ))
+    }
+
     pub fn slot_pin(&self, slot: &str) -> Option<&crate::config_policy::SynthesizerPin> {
         is_slot(slot)
             .then(|| self.config.consumers.get(slot)?.pin.as_ref())
