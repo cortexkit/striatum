@@ -175,7 +175,16 @@ async fn query(harness: &Arc<Harness>, runner: &str) -> Value {
         .call("route.head_choices", &json!({"runner_module":runner}))
         .await;
     assert_eq!(ty, FrameType::Response, "{reply}");
+    check_contract(runner, &reply["result"]);
     reply["result"].clone()
+}
+
+fn check_contract(runner: &str, reply: &Value) {
+    use cortexkit_role_routing::head_choices::{
+        check_head_choices, HeadChoicesAnswer, HeadChoicesRequest,
+    };
+    let answer: HeadChoicesAnswer = serde_json::from_value(reply.clone()).unwrap();
+    check_head_choices(&HeadChoicesRequest::new(runner), &answer).unwrap();
 }
 
 fn ids(reply: &Value) -> Vec<String> {
@@ -207,6 +216,21 @@ async fn reachability_uses_declared_pairs_and_vault_fallback() {
 }
 
 #[tokio::test]
+async fn unknown_and_non_starting_runners_have_no_choices() {
+    let (harness, mut credentials) = fixture();
+    credentials
+        .runner_declarations
+        .get_mut(RUNNER)
+        .unwrap()
+        .starts_sessions = false;
+    harness.set_credentials(credentials);
+    for runner in [RUNNER, "missing", "two words"] {
+        let reply = query(&harness, runner).await;
+        assert_eq!(reply["models"], json!([]), "{reply}");
+    }
+}
+
+#[tokio::test]
 async fn policy_and_standing_pin_refusals_filter_but_pin_only_is_listed() {
     let (harness, _) = fixture();
     let reply = query(&harness, RUNNER).await;
@@ -214,7 +238,7 @@ async fn policy_and_standing_pin_refusals_filter_but_pin_only_is_listed() {
     assert_eq!(reply["models"][0]["default_variant"], "high");
     assert_eq!(
         reply["models"][0]["variants"],
-        json!(["low", "medium", "high", "xhigh"])
+        json!(["high", "low", "medium", "xhigh"])
     );
     assert!(reply["models"][1].get("default_variant").is_none());
 }
@@ -258,7 +282,7 @@ async fn billing_distinguishes_reachable_subscriptions_from_per_token_keys() {
 
     let metered = query(&harness, API_KEY_RUNNER).await;
     assert_eq!(ids(&metered), ["openai/pinned"]);
-    assert_eq!(metered["models"][0]["billing"], "pay_per_token");
+    assert_eq!(metered["models"][0]["billing"], "per_token");
     assert_eq!(metered["models"][0]["pin_only"], true);
 
     let mixed = query(&harness, LEGACY).await;
@@ -302,7 +326,7 @@ async fn billing_uses_account_selection_subscription_settings() {
     });
     assert_eq!(
         query(&harness, API_KEY_RUNNER).await["models"][0]["billing"],
-        "pay_per_token"
+        "per_token"
     );
     harness.edit_config(|config| {
         config["providers"]["openai"]["subscription"] = json!(false);
@@ -319,7 +343,7 @@ async fn tiers_require_model_plan_and_runner_wire_support() {
     let (harness, mut credentials) = fixture();
     assert_eq!(
         query(&harness, RUNNER).await["models"][0]["service_tiers"],
-        json!(["standard", "fast"])
+        json!(["fast", "standard"])
     );
     assert_eq!(
         query(&harness, NO_TIERS).await["models"][0]["service_tiers"],
@@ -405,7 +429,7 @@ async fn bind_operator(
 }
 
 #[tokio::test]
-async fn admission_matches_phone_and_desktop_operator_routes_not_request_claims() {
+async fn every_caller_can_read_choices_regardless_of_operator_claims() {
     let (harness, _) = fixture();
     let params = json!({"runner_module":RUNNER});
     for (principal, host, session) in [
@@ -438,13 +462,13 @@ async fn admission_matches_phone_and_desktop_operator_routes_not_request_claims(
         frame.body = serde_json::to_vec(&forged).unwrap();
         let frame = harness.handle(frame).await;
         let reply: Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(frame.header.ty, FrameType::Error, "{host}: {reply}");
-        assert_eq!(reply["code"], "not_permitted");
+        assert_eq!(frame.header.ty, FrameType::Response, "{host}: {reply}");
+        check_contract(RUNNER, &reply["result"]);
     }
 }
 
 #[tokio::test]
-async fn operator_admission_is_bound_to_the_current_epoch_and_removed_on_close() {
+async fn public_choices_do_not_depend_on_operator_bind_bookkeeping() {
     let (harness, _) = fixture();
     let route = bind_operator(
         &harness,
@@ -469,8 +493,8 @@ async fn operator_admission_is_bound_to_the_current_epoch_and_removed_on_close()
     let (ty, reply) = route
         .call("route.head_choices", &json!({"runner_module":RUNNER}))
         .await;
-    assert_eq!(ty, FrameType::Error);
-    assert_eq!(reply["code"], "not_permitted");
+    assert_eq!(ty, FrameType::Response);
+    check_contract(RUNNER, &reply["result"]);
     crate::head_choices::forget_bind(channel, epoch + 1);
 }
 
@@ -481,7 +505,6 @@ async fn warming_unknown_runner_and_invalid_params_are_typed() {
     for params in [
         json!({}),
         json!({"runner_module":""}),
-        json!({"runner_module":"two words"}),
         json!({"runner_module":RUNNER,"extra":true}),
         json!(null),
     ] {
@@ -492,8 +515,9 @@ async fn warming_unknown_runner_and_invalid_params_are_typed() {
     let (ty, reply) = route
         .call("route.head_choices", &json!({"runner_module":"unknown"}))
         .await;
-    assert_eq!(ty, FrameType::Error);
-    assert_eq!(reply["code"], "unknown_runner");
+    assert_eq!(ty, FrameType::Response);
+    assert_eq!(reply["result"]["models"], json!([]));
+    check_contract("unknown", &reply["result"]);
     for missing in ["listing", "snapshot"] {
         let mut warming = if missing == "listing" {
             BrocaCredentials::default()
@@ -531,7 +555,7 @@ async fn variants_obey_exact_head_policy_and_runner_routes() {
     });
     let reply = query(&harness, RUNNER).await;
     assert_eq!(ids(&reply), ["openai/a-head"]);
-    assert_eq!(reply["models"][0]["variants"], json!(["low", "high"]));
+    assert_eq!(reply["models"][0]["variants"], json!(["high", "low"]));
     assert_eq!(reply["models"][0]["default_variant"], "high");
 }
 
@@ -576,17 +600,34 @@ async fn serving_bytes_match_tagged_vectors() {
             String::from_utf8_lossy(&bytes)
         );
         let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        check_contract(runner, &reply["result"]);
         let bytes = serde_json::to_vec(&json!({"request":request,"reply":reply})).unwrap();
-        sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
         let path = directory.join(name);
-        if update {
-            std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            !update,
+            "the pre-cutover vectors are frozen; record new differences separately"
+        );
+        let original = std::fs::read(path).unwrap();
+        sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&original)));
+        let mut expected: Value = serde_json::from_slice(&original).unwrap();
+        // Public choices keep the old model membership, pins and defaults.
+        // The contract requires string catalog versions and bytewise ordering;
+        // per_token is the closed billing spelling, not pay_per_token.
+        let result = &mut expected["reply"]["result"];
+        result["catalog_version"] = json!(result["catalog_version"].to_string());
+        for model in result["models"].as_array_mut().unwrap() {
+            for field in ["variants", "service_tiers"] {
+                model[field]
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by_key(Value::to_string);
+            }
+            if model["billing"] == "pay_per_token" {
+                model["billing"] = json!("per_token");
+            }
         }
-        assert_eq!(std::fs::read(path).unwrap(), bytes, "{name}");
+        assert_eq!(serde_json::to_vec(&expected).unwrap(), bytes, "{name}");
     }
     let path = directory.join("SHA256SUMS");
-    if update {
-        std::fs::write(&path, &sums).unwrap();
-    }
     assert_eq!(std::fs::read_to_string(path).unwrap(), sums);
 }

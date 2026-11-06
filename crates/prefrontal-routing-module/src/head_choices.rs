@@ -24,6 +24,7 @@ struct ModelChoice {
 #[serde(rename_all = "snake_case")]
 enum Billing {
     Subscription,
+    #[serde(rename = "per_token")]
     PayPerToken,
 }
 
@@ -98,15 +99,6 @@ pub(super) fn forget_bind(channel: u16, epoch: u32) {
     }
 }
 
-fn admitted(channel: u16, epoch: u32) -> bool {
-    route_principal(channel, epoch) == "reserved:occipital"
-        || operator_binds().lock().is_ok_and(|binds| {
-            binds
-                .get(&channel)
-                .is_some_and(|(bound, operator)| *bound == epoch && *operator)
-        })
-}
-
 fn not_ready() -> ErrorBody {
     ErrorBody {
         code: "routing_not_ready".into(),
@@ -124,7 +116,7 @@ fn store_error(_: impl fmt::Display) -> ErrorBody {
     )
 }
 
-fn choices(
+pub(crate) fn choices(
     store: &SqliteRouteStateStore,
     config: &config_overrides::LiveConfig,
     credentials: &BrocaCredentials,
@@ -138,19 +130,18 @@ fn choices(
         .as_ref()
         .ok_or_else(not_ready)?;
     let (catalog_version, _) = snapshot.provider_index();
+    let catalog_version = catalog_version.to_string();
     let mut facts = store.get_facts().map_err(store_error)?;
     let aliases = credentials.catalog_targets(&facts);
     prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &aliases);
     config.apply(&mut facts);
     let registry =
         routing_v1::runners::Registry::build(config.v1_runners(), credentials, &facts, now_ms());
-    let runner = registry.get(module).ok_or_else(|| {
-        ErrorBody::new(
-            "unknown_runner",
-            "runner_module doesn't name a runner routing knows, so it has no choices to list for it.",
-        )
-        .with_detail(json!({"runner_module": module}))
-    })?;
+    let Some(runner) = registry.get(module).filter(|runner| runner.starts_sessions) else {
+        return Ok(
+            json!({"catalog_version": catalog_version, "runner_module": module, "models": []}),
+        );
+    };
     let reasoning = store.reasoning_catalog().map_err(store_error)?;
     let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
     let subscription_specs = prefrontal_routing_core::provider_model_spec::parse_spec_list(
@@ -214,6 +205,7 @@ fn choices(
         variants.retain(|variant| allowed(Some(variant), true));
         let mut seen = std::collections::BTreeSet::new();
         variants.retain(|variant| seen.insert(variant.clone()));
+        variants.sort();
         let default_variant = default_variant.filter(|variant| variants.contains(variant));
         if !allowed(None, true) && variants.is_empty() {
             continue;
@@ -267,6 +259,7 @@ fn choices(
                 service_tiers.push(tier.into());
             }
         }
+        service_tiers.sort();
         models.push(ModelChoice {
             provider: provider.into(),
             model: model.into(),
@@ -294,12 +287,6 @@ pub(super) async fn serve(
         frame.header.corr,
     );
     let result = (|| {
-        if !admitted(channel, epoch) {
-            return Err(ErrorBody::new(
-                "not_permitted",
-                "Only the Alfonso apps' operator routes and Occipital can list a head's model choices.",
-            ));
-        }
         let params = serde_json::from_slice::<MethodParamsBody<Params>>(&frame.body)
             .ok()
             .filter(|body| !body.params.runner_module.is_empty()

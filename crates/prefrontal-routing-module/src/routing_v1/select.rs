@@ -40,6 +40,10 @@ use crate::{
 
 /// The members a v1 select may carry.
 const MEMBERS: &[&str] = &[
+    "settings",
+    "pin_slot",
+    "available_routes",
+    "prefer_prompt_cache",
     "consumer",
     "requirements",
     "pin",
@@ -133,6 +137,26 @@ pub(super) async fn select_with_profile_lookup(
     profile_lookup: &ProfileLookup,
 ) -> Result<Value, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
+    if super::shapes::NEW_SELECT
+        .iter()
+        .any(|field| params.get(*field).is_some())
+    {
+        if let Some(field) = super::shapes::INJECTED
+            .iter()
+            .find(|field| params.get(**field).is_some())
+        {
+            return Err(Refusal::invalid_request(
+                *field,
+                "injected context cannot accompany a contract selection",
+            ));
+        }
+    }
+    super::shapes::settings(params)?;
+    super::shapes::closed_array(
+        params,
+        "concurrency_slots",
+        &["key", "running", "limit", "queued"],
+    )?;
     let request = parse_select_request_serving(
         &crate::tier_settings::without_context(params),
         super::describe::CAPABILITIES,
@@ -1113,25 +1137,23 @@ async fn select_at_tier(
         model: selected.model.model_id.clone(),
         variant: selected.prompt_params.variant.clone(),
     };
-    deps.store
-        .v1_record_decision(&V1Decision {
-            decision_id: decision_id.clone(),
-            principal: caller.principal.clone(),
-            consumer: consumer.clone(),
-            allowed_account_class: decision.allowed_account_class,
-            project_id: caller
-                .scope
-                .as_ref()
-                .and_then(|scope| scope.project_id.clone()),
-            provider: route.provider.clone(),
-            model: route.model.clone(),
-            variant: route.variant.clone(),
-            runner_module: runner.module.clone(),
-            affinity: request.affinity.clone(),
-            created_at_ms: now_ms as i64,
-            expires_at_ms: expires_at_ms as i64,
-        })
-        .map_err(store_refusal)?;
+    let binding = V1Decision {
+        decision_id: decision_id.clone(),
+        principal: caller.principal.clone(),
+        consumer: consumer.clone(),
+        allowed_account_class: decision.allowed_account_class,
+        project_id: caller
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.project_id.clone()),
+        provider: route.provider.clone(),
+        model: route.model.clone(),
+        variant: route.variant.clone(),
+        runner_module: runner.module.clone(),
+        affinity: request.affinity.clone(),
+        created_at_ms: now_ms as i64,
+        expires_at_ms: expires_at_ms as i64,
+    };
 
     let fact = facts
         .iter()
@@ -1182,8 +1204,12 @@ async fn select_at_tier(
     if let Some(outcome) = pin_outcome {
         answer = answer.with_pin_outcome(outcome);
     }
-    serde_json::to_value(answer)
-        .map_err(|error| provider_refusal("internal_error", error.to_string()))
+    let value = serde_json::to_value(answer)
+        .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
+    deps.store
+        .v1_record_selection(&binding, Some(&value.to_string()))
+        .map_err(store_refusal)?;
+    Ok(value)
 }
 
 /// Everything one select's automatic and pinned attempts share.

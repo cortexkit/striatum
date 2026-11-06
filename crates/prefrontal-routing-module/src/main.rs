@@ -4436,7 +4436,12 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
                 "Release an unstarted admission or end a conversation lease".to_string(),
             ),
         },
-        // The ops only routing/v1 serves; its other three share the names above.
+        // Operations exclusive to the routing/v1 surface.
+        ManagementOperation {
+            name: cortexkit_role_routing::ops::ROUTE_BUDGET_QUOTE.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Quote the retained selection-time capacities".to_string()),
+        },
         ManagementOperation {
             name: cortexkit_role_routing::ops::ROLE_DESCRIBE.to_string(),
             kind: ManagementOperationKind::Query,

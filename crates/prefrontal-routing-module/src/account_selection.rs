@@ -2843,7 +2843,7 @@ fn status_window(
     }
 }
 
-fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
+pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
     let parsed: AccountStatusParams = match serde_json::from_value(params.clone()) {
         Ok(parsed) => parsed,
         Err(error) => return invalid(format!("invalid route.account_status params: {error}")),

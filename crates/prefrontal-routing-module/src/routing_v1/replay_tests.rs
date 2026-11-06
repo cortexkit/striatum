@@ -245,21 +245,115 @@ async fn replay(file: &str) {
     assert_or_record(file, observed);
 }
 
-pub(crate) fn assert_or_record(file: &str, observed: Value) {
+pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
     let golden = Path::new(ROOT).join(format!("{file}.golden.json"));
-    if std::env::var_os("PREFRONTAL_RECORD_ROUTING_REPLAY").is_some() {
+    if std::env::var_os("PREFRONTAL_RECORD_ROUTING_REPLAY").is_some()
+        || (file == "head-choices-difference-9"
+            && std::env::var_os("PREFRONTAL_RECORD_SHAPE_DIFFERENCES").is_some())
+    {
         std::fs::write(
             &golden,
             format!("{}\n", serde_json::to_string_pretty(&observed).unwrap()),
         )
         .unwrap();
     } else {
-        let expected: Value = serde_json::from_slice(&std::fs::read(&golden).unwrap()).unwrap();
+        let mut expected: Value = serde_json::from_slice(&std::fs::read(&golden).unwrap()).unwrap();
+        if file == "client-shapes" {
+            let differences: Value = serde_json::from_slice(
+                &std::fs::read(Path::new(ROOT).join("head-choices-difference-9.golden.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            for set in expected["sets"].as_array_mut().unwrap() {
+                for body in set["bodies"].as_array_mut().unwrap() {
+                    if body["method"] == "route.head_choices" {
+                        let difference = differences
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|entry| entry["source"] == body["source"])
+                            .unwrap();
+                        assert_eq!(body["reply"]["code"], "not_permitted");
+                        body["reply"] = difference["reply"].clone();
+                        body["frame_type"] = difference["frame_type"].clone();
+                    }
+                }
+            }
+        }
+        if file == "explain-spellings" {
+            // This is a spelling probe, not captured client traffic. Bare
+            // decision_id now names the public read, which cannot read an
+            // older-surface decision. Keep the other five frozen spellings.
+            let step = &mut expected["cases"][0]["steps"][3];
+            assert!(step["params"]["decision_id"].is_string());
+            step["frame_type"] = json!("Error");
+            let refusal = cortexkit_role_routing::errors::Refusal::unknown_decision();
+            step["reply"] = json!({"code":refusal.code.as_str(),"message":refusal.message,"detail":refusal.detail});
+        }
+        project_additive_shape_members(&mut observed);
+        project_additive_shape_members(&mut expected);
         assert!(
             observed == expected,
             "routing replay differs: {file}: {}",
             first_difference("$", &observed, &expected)
         );
+    }
+}
+
+/// Compare the golden response members; dedicated read tests check the new
+/// immutable snapshot and additive public status/discovery members.
+fn project_additive_shape_members(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(project_additive_shape_members),
+        Value::Object(object) => {
+            if let Some(rows) = object
+                .get_mut("routing_v1_decision")
+                .and_then(Value::as_array_mut)
+            {
+                for row in rows {
+                    row.as_object_mut().unwrap().remove("selection_json");
+                }
+            }
+            if object.get("method").and_then(Value::as_str) == Some("role.describe") {
+                if let Some(result) = object
+                    .get_mut("reply")
+                    .and_then(|reply| reply.get_mut("result"))
+                {
+                    for (field, added) in [
+                        (
+                            "capabilities",
+                            &["explain", "budget_quote", "account_status", "head_choices"][..],
+                        ),
+                        (
+                            "ops",
+                            &[
+                                "route.explain",
+                                "route.budget_quote",
+                                "route.account_status",
+                                "route.head_choices",
+                            ][..],
+                        ),
+                    ] {
+                        result[field]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|entry| !added.contains(&entry.as_str().unwrap_or("")));
+                    }
+                }
+            }
+            if object.get("method").and_then(Value::as_str) == Some("route.account_status") {
+                if let Some(result) = object
+                    .get_mut("reply")
+                    .and_then(|reply| reply.get_mut("result"))
+                    .and_then(Value::as_object_mut)
+                {
+                    result.remove("limit_state");
+                    result.remove("reset_at_ms");
+                }
+            }
+            object.values_mut().for_each(project_additive_shape_members);
+        }
+        _ => {}
     }
 }
 
@@ -317,6 +411,7 @@ async fn replay_client_shapes() {
             .unwrap();
     let mut sets = Vec::new();
     let mut count = 0;
+    let mut head_choices = Vec::new();
     for set in manifest["sets"].as_array().unwrap() {
         let client = set["client"].as_str().unwrap();
         let mut bodies = Vec::new();
@@ -396,6 +491,16 @@ async fn replay_client_shapes() {
                 setup.push(json!({"method":"route.account_for", "params":seed, "reply":reply}));
             }
             let (ty, reply) = route.call(method, &params).await;
+            if method == "route.head_choices" {
+                use cortexkit_role_routing::head_choices::{
+                    check_head_choices, parse_head_choices_request,
+                };
+                let answer = serde_json::from_value(reply["result"].clone()).unwrap();
+                check_head_choices(&parse_head_choices_request(&params).unwrap(), &answer).unwrap();
+                head_choices.push(
+                    json!({"source":body["path"], "frame_type":format!("{ty:?}"), "reply":reply}),
+                );
+            }
             use sha2::Digest;
             let sha = format!("{:x}", sha2::Sha256::digest(&bytes));
             bodies.push(normalize_paths(
@@ -412,6 +517,12 @@ async fn replay_client_shapes() {
         );
     }
     assert!(count >= 27, "owner corpus must not silently become empty");
+    assert_eq!(
+        head_choices.len(),
+        1,
+        "every changed public-choice reply needs its own frozen difference"
+    );
+    assert_or_record("head-choices-difference-9", json!(head_choices));
     assert_or_record("client-shapes", json!({"clock_ms":NOW, "sets":sets}));
 }
 
@@ -461,6 +572,9 @@ fn install_client_catalog(harness: &Harness, client: &str) {
         })
         .collect();
     install_catalog(harness, &catalog);
+    if client == "ckdesk" {
+        super::conformance_tests::install_head_snapshot(harness);
+    }
 }
 
 #[test]

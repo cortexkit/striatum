@@ -49,6 +49,47 @@ async fn paused_in_scope(pinned: bool, scope: Option<&str>) -> (KitSubject, Rout
 }
 
 #[tokio::test]
+async fn public_reads_reject_continuation_offers_before_and_after_settlement() {
+    let (_subject, consumer, runner, request) = paused().await;
+    let explained = result(
+        consumer
+            .call(
+                "route.explain",
+                &json!({"decision_id":request["previous_decision_id"]}),
+            )
+            .await,
+    );
+    assert_eq!(
+        explained["serving"]["account_id"],
+        request["exhausted"]["account"]
+    );
+    assert_eq!(
+        explained["serving"]["credential_id"],
+        request["exhausted"]["credential_id"]
+    );
+    let offer = result(runner.call("route.account_for", &request).await);
+    assert_eq!(offer["kind"], "offer", "{offer}");
+    for settled in [false, true] {
+        if settled {
+            result(consumer.call("route.report", &json!({
+                "decision_id":offer["decision_id"],"outcome":"completed", "usage":{"input_tokens":100,"output_tokens":20}
+            })).await);
+        }
+        for (method, params) in [
+            ("route.explain", json!({"decision_id":offer["decision_id"]})),
+            (
+                "route.budget_quote",
+                json!({"decisions":[offer["decision_id"]]}),
+            ),
+        ] {
+            let reply = consumer.call(method, &params).await;
+            assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+            assert_eq!(reply.1["code"], "unknown_decision");
+        }
+    }
+}
+
+#[tokio::test]
 async fn continuation_offer_is_durable_idempotent_linked_and_releases_unused_demand() {
     let (subject, _, runner, request) = paused().await;
     let first = result(runner.call("route.account_for", &request).await);

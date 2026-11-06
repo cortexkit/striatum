@@ -1,0 +1,139 @@
+//! Read retained selections without re-resolving the catalog or runner policy.
+
+use super::{provider_refusal, refuse_unknown_members, store_refusal, Caller, Deps};
+use cortexkit_role_routing::{budget, errors::Refusal, explain, select::SelectAnswer};
+use serde_json::{json, Value};
+
+fn retained(id: &str, caller: &Caller, deps: &Deps<'_>) -> Result<SelectAnswer, Refusal> {
+    let unknown = Refusal::unknown_decision;
+    deps.store
+        .v1_decision(id)
+        .map_err(store_refusal)?
+        .filter(|decision| decision.principal == caller.principal && caller.binding_is_current())
+        .ok_or_else(unknown)?;
+    let snapshot = deps
+        .store
+        .v1_selection_json(id)
+        .map_err(store_refusal)?
+        .ok_or_else(unknown)?;
+    serde_json::from_str(&snapshot).map_err(store_refusal)
+}
+
+pub(super) fn budget_quote(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
+    refuse_unknown_members(params, &["decisions", "prompt_tokens"])?;
+    let request = budget::parse_budget_quote_request(params)?;
+    let seats = request
+        .decisions
+        .iter()
+        .map(|id| {
+            retained(id, caller, deps).map(|answer| budget::BudgetSeat::from_select_answer(&answer))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    serde_json::to_value(budget::quote(&seats, request.prompt_tokens)?).map_err(store_refusal)
+}
+
+pub(super) fn explain(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
+    refuse_unknown_members(params, &["decision_id"])?;
+    let request = explain::parse_explain_request(params)?;
+    let selection = retained(&request.decision_id, caller, deps)?;
+    let mut serving = explain::Serving::new(&selection.route.provider);
+    serving.credential_id = selection
+        .runner
+        .auth
+        .as_ref()
+        .and_then(|auth| auth.credential_id.clone());
+    if let Some(admission) = deps
+        .store
+        .v1_selection_admission(&selection.decision_id)
+        .map_err(store_refusal)?
+    {
+        let admission: cortexkit_role_routing::account::AccountForAnswer =
+            serde_json::from_str(&admission).map_err(store_refusal)?;
+        serving.account_id = Some(admission.account.account_id);
+        serving.credential_id = Some(admission.account.credential_id);
+    }
+    let answer = explain::ExplainAnswer::new(
+        request.decision_id,
+        selection.route,
+        selection.runner,
+        serving,
+        "routing/v1",
+        explain::ReasonCode::parse("selected"),
+    );
+    serde_json::to_value(answer).map_err(store_refusal)
+}
+
+pub(super) fn head_choices(params: &Value, deps: &Deps<'_>) -> Result<Value, Refusal> {
+    refuse_unknown_members(params, &["runner_module"])?;
+    let request = cortexkit_role_routing::head_choices::parse_head_choices_request(params)?;
+    let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
+    crate::head_choices::choices(
+        deps.store,
+        &super::operator_config(deps),
+        &credentials,
+        &request.runner_module,
+    )
+    .map_err(|error| {
+        let mut refusal = provider_refusal(&error.code, error.message);
+        if let Some(Value::Object(detail)) = error.detail {
+            refusal.detail = detail;
+        }
+        refusal
+    })
+}
+
+/// The old status request is identical to the public request. Keep its warming
+/// diagnostics and add the public limit state, so neither caller is reclassified.
+pub(super) fn account_status(
+    params: &Value,
+    _caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
+    refuse_unknown_members(params, &["provider", "account_id"])?;
+    let request = cortexkit_role_routing::account_status::parse_account_status_request(params)?;
+    let config = crate::config_overrides::live_config(deps.routing_config_path);
+    let policy = config.allocator_policy(&request.provider);
+    let ctx = crate::account_selection::Ctx {
+        store: deps.store,
+        accounts: crate::ACCOUNT_QUOTA.get(),
+        flags: config.account_flags(),
+        policy: &policy,
+        now_ms: super::now_ms() as i64,
+        classes: None,
+    };
+    let crate::account_selection::OpReply::Result(mut answer) =
+        crate::account_selection::account_status(params, &ctx)
+    else {
+        return Err(provider_refusal(
+            "internal_error",
+            "account status could not be read",
+        ));
+    };
+    let limited = answer["reason"]["code"] == "within_reserve";
+    answer["limit_state"] = json!(if answer["warm_ok"] == true {
+        "available"
+    } else if limited {
+        "limited"
+    } else {
+        "unknown"
+    });
+    if limited {
+        if let Some(reset) = answer["windows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|window| window["kind"] == answer["reason"]["window"])
+            .filter_map(|window| window["resets_at"].as_str())
+            .filter_map(crate::account_quota::parse_rfc3339_ms)
+            .filter(|reset| *reset > ctx.now_ms)
+            .max()
+        {
+            answer["reset_at_ms"] = json!(reset);
+        }
+    }
+    Ok(answer)
+}

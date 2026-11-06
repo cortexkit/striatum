@@ -30,15 +30,18 @@ fn the_older_shapes_are_recognised_by_their_marker_alone() {
             "{method}"
         );
     }
-    for method in ["role.describe", "route.report"] {
-        assert!(claims(&body(method, json!({}))), "{method}");
-    }
     for method in [
+        "role.describe",
+        "route.report",
         "route.select_panel",
         "route.account_status",
-        "route.model_facts",
-        "route.catalog_targets",
+        "route.explain",
+        "route.budget_quote",
+        "route.head_choices",
     ] {
+        assert!(claims(&body(method, json!({}))), "{method}");
+    }
+    for method in ["route.model_facts", "route.catalog_targets"] {
         assert!(!claims(&body(method, json!({}))), "{method}");
     }
 }

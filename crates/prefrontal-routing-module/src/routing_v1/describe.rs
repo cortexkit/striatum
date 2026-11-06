@@ -13,6 +13,10 @@ use crate::select_policy;
 /// parsers, so declarations and accepted members agree. Harnesses come from
 /// runner declarations.
 pub(super) const CAPABILITIES: &[&str] = &[
+    "explain",
+    "budget_quote",
+    "account_status",
+    "head_choices",
     cortexkit_role_routing::capabilities::SELECT_HARNESS,
     "select_hold_control",
     cortexkit_role_routing::capabilities::SELECT_PREFER,
@@ -44,10 +48,15 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         .collect();
     // A `detail: true` select is answered with the selection's explanation
     // lines, rejections and score.
-    let describe = CAPABILITIES.iter().fold(
+    let mut describe = CAPABILITIES.iter().fold(
         RoleDescribe::new(consumers, true),
         |describe, capability| describe.with_capability(*capability),
     );
+    for &(op, group) in cortexkit_role_routing::capabilities::OP_GROUPS {
+        if CAPABILITIES.contains(&group) && !describe.ops.iter().any(|name| name == op) {
+            describe.ops.push(op.into());
+        }
+    }
     let mut value = serde_json::to_value(describe)
         .map_err(|error| super::provider_refusal("internal_error", error.to_string()))?;
     value["runners"] = serde_json::to_value(super::runners::effective(deps).entries)

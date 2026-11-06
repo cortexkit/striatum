@@ -118,13 +118,23 @@ impl SqliteRouteStateStore {
     /// Bind a decision and, when it carries an affinity key, make it the key's
     /// previous decision, in one transaction.
     pub fn v1_record_decision(&self, decision: &V1Decision) -> RouteStateResult<()> {
+        self.v1_record_selection(decision, None)
+    }
+
+    /// Persist the immutable selection answer with its decision binding.
+    /// Account allocations deliberately have no selection snapshot.
+    pub fn v1_record_selection(
+        &self,
+        decision: &V1Decision,
+        selection_json: Option<&str>,
+    ) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
                 let tx = c.unchecked_transaction()?;
                 tx.execute(
                     "INSERT INTO routing_v1_decision
                        (decision_id, principal, consumer, project_id, provider, model, variant,
-                        runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class)
+                         runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         decision.decision_id,
@@ -141,6 +151,10 @@ impl SqliteRouteStateStore {
                         decision.allowed_account_class.as_str(),
                     ],
                 )?;
+                if let Some(selection_json) = selection_json {
+                    tx.execute("UPDATE routing_v1_decision SET selection_json=?2 WHERE decision_id=?1",
+                        params![decision.decision_id, selection_json])?;
+                }
                 if let Some(affinity) = &decision.affinity {
                     tx.execute(
                         "INSERT INTO routing_v1_affinity
@@ -160,6 +174,38 @@ impl SqliteRouteStateStore {
                     )?;
                 }
                 tx.commit()
+            })
+            .map_err(err)
+    }
+
+    /// Return selection-time facts, never a reconstruction from today's catalog.
+    pub fn v1_selection_json(&self, decision_id: &str) -> RouteStateResult<Option<String>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT selection_json FROM routing_v1_decision WHERE decision_id = ?1",
+                    params![decision_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(Option::flatten)
+            })
+            .map_err(err)
+    }
+
+    /// Latest admitted serving identity under a selection. Continuation offers
+    /// carry previous_decision_id instead and do not move this binding.
+    pub fn v1_selection_admission(&self, decision_id: &str) -> RouteStateResult<Option<String>> {
+        self.store
+            .with_conn(|c: &Connection| {
+                c.query_row(
+                    "SELECT answer_json FROM routing_v1_admission
+                 WHERE json_extract(body_json, '$.decision_id') = ?1
+                 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                    params![decision_id],
+                    |row| row.get(0),
+                )
+                .optional()
             })
             .map_err(err)
     }
@@ -396,6 +442,43 @@ mod tests {
             created_at_ms: 1,
             expires_at_ms: 2,
         }
+    }
+
+    #[test]
+    fn selection_snapshot_migrates_without_inventing_old_capacities_and_survives_reopen() {
+        let path = cortexkit_test_support::scratch_root().join(format!(
+            "routing-selection-migration-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let descriptor = dev_descriptor("selection-migration", path.to_string_lossy().into_owned());
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 76).unwrap();
+        old.v1_record_decision(&decision("old", None)).unwrap();
+        drop(old);
+        let upgraded = SqliteRouteStateStore::open(&descriptor).unwrap();
+        assert!(upgraded.v1_decision("old").unwrap().is_some());
+        assert_eq!(upgraded.v1_selection_json("old").unwrap(), None);
+        let snapshot = r#"{"context_window":100000,"max_output_tokens":20000,"runner":{"module":"runner","harness":"program","auth":{"credential_id":"public-key-id"}}}"#;
+        upgraded
+            .v1_record_selection(&decision("new", Some("affinity")), Some(snapshot))
+            .unwrap();
+        upgraded
+            .v1_record_decision(&decision("account-allocation", None))
+            .unwrap();
+        drop(upgraded);
+        let reopened = SqliteRouteStateStore::open(&descriptor).unwrap();
+        assert_eq!(
+            reopened.v1_selection_json("new").unwrap().as_deref(),
+            Some(snapshot)
+        );
+        assert_eq!(reopened.v1_selection_json("old").unwrap(), None);
+        assert_eq!(
+            reopened.v1_selection_json("account-allocation").unwrap(),
+            None
+        );
     }
 
     #[test]

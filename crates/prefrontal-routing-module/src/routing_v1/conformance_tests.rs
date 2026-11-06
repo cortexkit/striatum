@@ -707,6 +707,35 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
         .unwrap() = account_state(&catalog.accounts);
 }
 
+/// Public choices require a ready catalog snapshot, unlike selection's fixture
+/// billing view. Install it only for checks that need that read surface.
+pub(super) fn install_head_snapshot(harness: &Harness) {
+    let models: serde_json::Map<_, _> = harness
+        .store()
+        .get_facts()
+        .unwrap()
+        .iter()
+        .map(|fact| {
+            (
+                format!("{}/{}", fact.provider_id, fact.model_id),
+                json!({"existence":"present", "capability.tool_call":true}),
+            )
+        })
+        .collect();
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({"catalog_version":1,"resolved_at_ms":123,"models":models}))
+            .unwrap(),
+    )
+    .unwrap();
+    harness
+        .broca_credentials
+        .lock()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .catalog_snapshot = Some(Arc::new(snapshot));
+}
+
 /// The kit's subject: a fresh [`Harness`] per check.
 struct KitSubject {
     harness: Mutex<Arc<Harness>>,
@@ -751,7 +780,9 @@ impl RoutingSubject for KitSubject {
     }
 
     async fn configure_catalog(&self, catalog: &Catalog) -> Result<(), String> {
-        install_catalog(&self.harness(), catalog);
+        let harness = self.harness();
+        install_catalog(&harness, catalog);
+        install_head_snapshot(&harness);
         Ok(())
     }
 
@@ -956,7 +987,13 @@ impl RoutingSubject for KitSubject {
         let reset = reset_at_ms
             .map(|ms| {
                 i64::try_from(ms)
-                    .map(account_selection::rfc3339)
+                    .map(|ms| {
+                        format!(
+                            "{}.{:03}Z",
+                            account_selection::rfc3339(ms).trim_end_matches('Z'),
+                            ms.rem_euclid(1000)
+                        )
+                    })
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
@@ -1021,16 +1058,6 @@ const NOT_APPLICABLE: &[&str] = &[
     "panel_replacement_preserves_slot",
     "panel_foreign_replacement_unknown",
     "panel_replacement_invalid_slot",
-    "budget_quote_matches_helper",
-    "budget_quote_foreign_unknown",
-    "explain_matches_selection",
-    "explain_foreign_unknown",
-    "account_status_blocked_limited",
-    "account_status_unknown",
-    "head_choices_valid",
-    "head_choices_runner_routes",
-    "head_choices_non_starting_empty",
-    "head_choices_billing_valid",
     "consumer_models_valid",
     "consumer_models_unknown_consumer",
     "report_usage_run_id_repeat_accepted",

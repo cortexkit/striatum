@@ -2,11 +2,10 @@
 //!
 //! The contract is `CONTRACT.md` in the `cortexkit-role-routing` crate, whose
 //! types and validators this module uses for every request and answer. It
-//! serves `role.describe`, `route.select`, `route.report`,
-//! `route.account_for` and `route.account_observe`. Three of those names
-//! were already served with older shapes that core and Broca still send, so
-//! [`claims`] decides which surface answers a request on those names; see it
-//! for the rule.
+//! serves selection, reporting, account operations and public reads. Several
+//! names also have older shapes that core and Broca still send, so [`claims`]
+//! uses the per-operation table in `shapes` to choose their surface. Contract
+//! panels are parsed here but refused until their group is declared.
 //!
 //! Every v1 op reads its caller from the route: the principal the daemon
 //! attested when it bound the route, and the project the route's scope stamp
@@ -27,11 +26,13 @@ use crate::{
 mod accounts;
 pub(crate) mod consumers;
 mod describe;
+mod reads;
 mod report;
 pub(crate) mod runners;
 mod select;
 #[cfg(test)]
 mod service_tier_tests;
+mod shapes;
 
 #[cfg(test)]
 mod account_classes_tests;
@@ -39,6 +40,8 @@ mod account_classes_tests;
 mod account_ops_tests;
 #[cfg(test)]
 mod account_refusal_codes_tests;
+#[cfg(test)]
+mod add_shapes_tests;
 #[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
@@ -74,24 +77,18 @@ mod task_ref_tests;
 /// The `routing/v1` capability a routing provider lists in its manifest.
 pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;
 
-/// The ops only `routing/v1` serves. The other three v1 ops share their
-/// names with older ops and are listed with those.
-pub(crate) const V1_ONLY_OPS: &[&str] = &[ops::ROLE_DESCRIBE, ops::ROUTE_REPORT];
+/// Operations exclusive to `routing/v1`; shared names are registered with
+/// the older operations in the module manifest.
+pub(crate) const V1_ONLY_OPS: &[&str] = &[
+    ops::ROLE_DESCRIBE,
+    ops::ROUTE_REPORT,
+    ops::ROUTE_BUDGET_QUOTE,
+];
 
 /// Whether the `routing/v1` surface answers this request body.
 ///
-/// `role.describe` and `route.report` exist only in v1. `route.select`,
-/// `route.account_for` and `route.account_observe` are also the names of
-/// older ops that core and Broca still call, and each older shape carries a
-/// member v1 never defines: an older `route.select` always names its
-/// `targetAgent`, and the older account ops always name their `caller`. A
-/// body carrying that member is answered by the older op exactly as before;
-/// any other body on those names is a v1 request, and the v1 surface refuses
-/// a member it does not define by name, so an older body that left out its
-/// marker fails loudly instead of being misread.
-///
-/// The older branch exists only until core and Broca send v1; it is deleted
-/// then, and these names belong to v1 alone.
+/// The per-operation discriminator is documented in `shapes`. Mixed bodies
+/// go to v1 for a named refusal, never to a permissive legacy decoder.
 pub(crate) fn claims(body: &[u8]) -> bool {
     let Ok(Value::Object(request)) = serde_json::from_slice::<Value>(body) else {
         return false;
@@ -99,18 +96,7 @@ pub(crate) fn claims(body: &[u8]) -> bool {
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return false;
     };
-    let carries = |member: &str| {
-        request
-            .get("params")
-            .and_then(Value::as_object)
-            .is_some_and(|params| params.contains_key(member))
-    };
-    match method {
-        ops::ROLE_DESCRIBE | ops::ROUTE_REPORT => true,
-        ops::ROUTE_SELECT => !carries("targetAgent"),
-        ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE => !carries("caller"),
-        _ => false,
-    }
+    shapes::claims(method, request.get("params").unwrap_or(&Value::Null))
 }
 
 /// Everything a v1 op reads besides its request and its caller.
@@ -250,6 +236,11 @@ async fn answer(
         ops::ROUTE_REPORT => report::report(params, caller, deps),
         ops::ROUTE_ACCOUNT_FOR => accounts::account_for(params, caller, deps),
         ops::ROUTE_ACCOUNT_OBSERVE => accounts::account_observe(params, caller, deps),
+        ops::ROUTE_SELECT_PANEL => shapes::panel(params),
+        ops::ROUTE_EXPLAIN => reads::explain(params, caller, deps),
+        ops::ROUTE_BUDGET_QUOTE => reads::budget_quote(params, caller, deps),
+        ops::ROUTE_ACCOUNT_STATUS => reads::account_status(params, caller, deps),
+        ops::ROUTE_HEAD_CHOICES => reads::head_choices(params, deps),
         other => Err(Refusal::new(
             RefusalCode::parse("unknown_method"),
             format!("unknown method '{other}'"),

@@ -13,7 +13,7 @@
 
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::report::{
-    parse_report_request, Outcome, ReportAnswer, ReportRequest, RESET_FENCE_CAP_MS,
+    parse_report_request_serving, Outcome, ReportAnswer, ReportRequest, RESET_FENCE_CAP_MS,
 };
 use prefrontal_routing_core::{RouteOutcome, RouteStateStore};
 use prefrontal_routing_store::V1Recorded;
@@ -44,7 +44,8 @@ pub(super) fn report_at(
     now: u64,
 ) -> Result<Value, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
-    let request = parse_report_request(params)?;
+    super::shapes::closed(params, "eligibility", &["scope", "code"])?;
+    let request = parse_report_request_serving(params, super::describe::CAPABILITIES)?;
     let decision = deps
         .store
         .v1_decision(&request.decision_id)

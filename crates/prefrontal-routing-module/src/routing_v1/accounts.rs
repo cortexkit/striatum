@@ -13,7 +13,7 @@ use cortexkit_role_routing::account::{
 };
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::observe::{
-    parse_account_observe_request, AccountObserveAnswer, Observation,
+    parse_account_observe_request_serving, AccountObserveAnswer, Observation,
 };
 use cortexkit_role_routing::service_tier::{check_chosen, ServiceTier};
 use prefrontal_routing_store::V1Recorded;
@@ -159,6 +159,25 @@ pub(super) fn account_for(
         return continue_account(params, caller, &authority, deps);
     }
     super::refuse_unknown_members(params, FOR_MEMBERS)?;
+    super::shapes::closed(params, "expected_pin", &["id", "generation"])?;
+    super::shapes::closed(
+        params,
+        "requested_account",
+        &["account_id", "credential_id"],
+    )?;
+    super::shapes::closed(params, "candidates", &["view_digest", "accounts"])?;
+    super::shapes::closed_array(
+        &params["candidates"],
+        "accounts",
+        &["account_id", "credential_id"],
+    )
+    .map_err(|mut refusal| {
+        if let Some(field) = refusal.detail.get("field").and_then(Value::as_str) {
+            let field = format!("candidates.{field}");
+            refusal.detail.insert("field".into(), json!(field));
+        }
+        refusal
+    })?;
     let mut request = parse_account_for_request_serving(params, super::describe::CAPABILITIES)?;
     if let Some(scope) = authority.session {
         request.conversation_key = scope.reference.clone();
@@ -331,8 +350,9 @@ fn continue_account(
             "selection_id",
         ],
     )?;
-    super::refuse_unknown_members(
-        &params["exhausted"],
+    super::shapes::closed(
+        params,
+        "exhausted",
         &[
             "credential_id",
             "account",
@@ -499,7 +519,7 @@ pub(super) fn account_observe(
 ) -> Result<Value, Refusal> {
     let authority = account_caller(caller, deps)?;
     super::refuse_unknown_members(params, OBSERVE_MEMBERS)?;
-    let request = parse_account_observe_request(params)?;
+    let request = parse_account_observe_request_serving(params, super::describe::CAPABILITIES)?;
     // The allocator reads these two as closed sets of its own.
     if let Some(origin) = &request.upstream_origin {
         serde_json::from_value::<prefrontal_routing_core::accounts::evidence::FrameOrigin>(json!(
