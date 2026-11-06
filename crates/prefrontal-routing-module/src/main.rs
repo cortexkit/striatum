@@ -15,6 +15,7 @@
 //! module runs the pure `prefrontal-routing-core` scorer and returns the selection.
 
 mod account_quota;
+mod account_refusal_log;
 mod account_selection;
 mod available_models_text;
 mod background;
@@ -1468,6 +1469,21 @@ async fn handle_frame(
                             channel,
                             route_epoch,
                         ) {
+                            if let Ok(request) =
+                                serde_json::from_slice::<serde_json::Value>(&frame.body)
+                            {
+                                let op = request["method"].as_str().unwrap_or_default();
+                                if matches!(op, "route.account_for" | "route.account_observe") {
+                                    account_refusal_log::emit(
+                                        op,
+                                        &route_principal(channel, route_epoch),
+                                        &request["params"],
+                                        &refusal.code,
+                                        "flow_scope",
+                                        "",
+                                    );
+                                }
+                            }
                             return send_route_error_body(
                                 &reply,
                                 ver,

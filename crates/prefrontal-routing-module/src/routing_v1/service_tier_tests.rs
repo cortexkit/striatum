@@ -238,6 +238,50 @@ async fn account_service_tier_ultrafast_steps_down_to_fast_then_standard() {
 }
 
 #[tokio::test]
+async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = legacy_broca_setup();
+    let modules = json!([{"module_id":"broca","nonce_verified":true}]);
+    let policies = serde_json::from_value::<Vec<crate::config_policy::RunnerPolicy>>(
+        json!([{"module":"broca","via_vault":true}]),
+    )
+    .unwrap();
+    let describe: Value = serde_json::from_slice(include_bytes!(
+        "../../../../test-vectors/broca-service-tiers-v1/role-describe-live.json"
+    ))
+    .unwrap();
+    let mut cache = runners::DescribeCache::default();
+    cache.catalog(&modules, &policies, &mut credentials, NOW as i64);
+    cache.reply("broca", Some(&describe), &mut credentials, NOW as i64);
+    harness.set_credentials(credentials.clone());
+    let owner = harness.bind(reserved("tier-owner"), None).await;
+    let selected = owner.call("route.select", &select_sol("fast")).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let runner = harness.bind(reserved("broca"), None).await;
+    let mut request = legacy_broca_request("fast-before-missed-poll");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    request["service_tier"] = json!("fast");
+    let initial = runner.call("route.account_for", &request).await;
+    assert_eq!(initial.0, FrameType::Response, "{}", initial.1);
+
+    let _later = crate::InjectedClock::set(NOW + 30_000);
+    cache.reply("broca", None, &mut credentials, (NOW + 30_000) as i64);
+    harness.set_credentials(credentials);
+    request["admission_id"] = json!("fast-after-missed-poll");
+    let resumed = runner.call("route.account_for", &request).await;
+    assert_eq!(resumed.0, FrameType::Response, "{}", resumed.1);
+    assert_eq!(resumed.1["result"]["service_tier_chosen"], "fast");
+    assert_eq!(
+        resumed.1["result"]["account"],
+        initial.1["result"]["account"]
+    );
+    assert_eq!(
+        resumed.1["result"]["pin"]["id"],
+        initial.1["result"]["pin"]["id"]
+    );
+}
+
+#[tokio::test]
 async fn account_service_tier_legacy_admission_continues_at_bound_fast_tier() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = legacy_broca_setup();

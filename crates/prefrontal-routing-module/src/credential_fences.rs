@@ -48,9 +48,11 @@ use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 /// headroom readings instead; entitlement refusals always keep timed probes.
 pub(crate) const FENCE_PROBE_RECHECK_MS: i64 = CREDENTIAL_REFUSED_REPROBE_MS;
 
-/// The documented credential-refusal re-probe horizon: six hours, matching
-/// core's billing walls. Observations use this horizon for pooled key walls
-/// and the existing entitlement-fence probe path for other credentials.
+/// A refused credential is blocked for six hours, the same interval core waits
+/// before retrying an account whose credit ran out. A pooled API key gets this
+/// block in the key pool. Any other credential gets routing's credential
+/// refusal fence, which lets one probe request through after the six hours.
+/// This interval is routing's documented credential-refusal re-probe horizon.
 pub(crate) const CREDENTIAL_REFUSED_REPROBE_MS: i64 = 6 * 60 * 60_000;
 
 /// A window reading at or above this used percent counts as exhausted for

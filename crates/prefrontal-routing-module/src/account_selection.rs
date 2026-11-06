@@ -43,6 +43,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::account_quota::{self, AccountEntry, AccountQuotaState, SharedAccountQuota};
+use crate::account_refusal_log::{because, checking};
 use crate::config_overrides::AccountSelectionFlags;
 
 /// Choose the account for one admission, renewal or reassignment.
@@ -1080,7 +1081,7 @@ impl ClassContext {
             .as_ref()
             .is_some_and(|roster| roster.accounts.is_empty())
         {
-            if let OpReply::Error { code, detail, .. } =
+            if let Some(OpReply::Error { code, detail, .. }) =
                 empty_roster_refusal(self, provider, model, priced, &fenced, self.now_ms, None)
             {
                 if code == "account_pool_exhausted" {
@@ -2719,18 +2720,28 @@ struct AccountForParams {
 impl AccountForParams {
     fn validate(&self) -> Result<(), OpReply> {
         if self.admission_id.trim().is_empty() {
-            return Err(invalid("`admission_id` is required and must not be empty"));
+            return Err(because(
+                "admission_id_required",
+                invalid("`admission_id` is required and must not be empty"),
+            ));
         }
         if self.conversation_key.trim().is_empty() {
-            return Err(invalid("`conversation_key` must not be empty"));
+            return Err(because(
+                "conversation_key_required",
+                invalid("`conversation_key` must not be empty"),
+            ));
         }
         if self.provider.trim().is_empty() || self.model.trim().is_empty() {
-            return Err(invalid("`provider` and `model` must not be empty"));
+            return Err(because(
+                "provider_model_required",
+                invalid("`provider` and `model` must not be empty"),
+            ));
         }
         if let Some(reply) = invalid_pool(self.pool.as_deref()) {
-            return Err(reply);
+            return Err(because("pool_name", reply));
         }
         if self.mode != RequestMode::Admit && self.expected_pin.is_none() {
+            checking("expected_pin_required");
             return Err(invalid(format!(
                 "mode `{}` requires `expected_pin` as {{id, generation}}",
                 self.mode.as_str()
@@ -2828,6 +2839,7 @@ fn parse_account_for(params: &Value) -> Result<AccountForParams, OpReply> {
 /// Handle one account-selection operation. `body` is the whole request
 /// (`{"method", "params"}`); `principal` is the route's attested principal.
 pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpReply {
+    checking("account_selection_enabled");
     // This query bypasses the serving transactions and answers even while
     // serving is off. A warming check never reserves or charges quota.
     if method == ACCOUNT_STATUS_OP {
@@ -2843,6 +2855,7 @@ pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpRe
             json!({ "code": DISABLED_CODE }),
         );
     }
+    checking("request_decode");
     let params = match decode_params(body) {
         Ok(params) => params,
         Err(reply) => return reply,
@@ -3080,12 +3093,14 @@ mod continuation;
 pub(crate) use continuation::continue_account;
 
 fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
+    checking("account_for_parse");
     let mut parsed = match parse_account_for(params) {
         Ok(parsed) => parsed,
         Err(reply) => return reply,
     };
     let provider = normalize(&parsed.provider);
     let request_fingerprint = fingerprint(&parsed);
+    checking("admission_replay");
     match ctx.store.account_transaction(|tx| {
         tx.admission(principal, &parsed.admission_id)?
             .map(|row| replay(tx, principal, row, &request_fingerprint, ctx.now_ms))
@@ -3095,29 +3110,34 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Ok(None) => {}
         Err(error) => return store_error(error),
     }
+    checking("roster_prepare");
     let (mut roster, route_fenced, class) = match prepare_roster(&parsed, ctx) {
         Ok(prepared) => prepared,
         Err(reply) => return reply,
     };
+    checking("service_tier");
     parsed.service_tier_chosen = match prepare_service_tier(&mut parsed, ctx, &mut roster, class) {
         Ok(tier) => tier,
         Err(reply) => return reply,
     };
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
-        return reply;
+        return because("route_fence", reply);
     }
     if !roster.roster.as_ref().is_some_and(|roster| {
         roster.accounts.iter().any(|account| {
             parsed.candidates.as_ref().is_none_or(|candidates| {
-                candidates
-                    .accounts
-                    .iter()
-                    .any(|candidate| candidate.account_id == account.account_id)
+                candidates.accounts.iter().any(|candidate| {
+                    candidate.account_id == account.account_id
+                        && account
+                            .credentials
+                            .iter()
+                            .any(|credential| credential.credential_id == candidate.credential_id)
+                })
             })
         })
     }) {
         if let Some(classes) = ctx.classes.as_ref() {
-            return empty_roster_refusal(
+            if let Some(reply) = empty_roster_refusal(
                 classes,
                 &provider,
                 &normalize(&parsed.model),
@@ -3125,23 +3145,51 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 &route_fenced,
                 ctx.now_ms,
                 Some(&parsed),
+            ) {
+                return reply;
+            }
+            if roster
+                .roster
+                .as_ref()
+                .is_none_or(|roster| roster.accounts.is_empty())
+            {
+                let accounts: BTreeSet<_> = classes.facts.iter()
+                    .filter(|fact| fact.provider_id == provider && fact.model_id == normalize(&parsed.model))
+                    .flat_map(|fact| classes.class(fact, class == prefrontal_routing_core::accounts::AllowedAccountClass::PricedPerTokenOnly).rows)
+                    .map(|row| row.account_id.clone().unwrap_or_else(|| row.id.clone()))
+                    .collect();
+                return because(
+                    "candidates_filter",
+                    OpReply::typed(
+                        "account_selection_unavailable",
+                        "[TODO(user): runner candidates exclude every serving account]",
+                        json!({"code":"account_selection_unavailable", "retry_after_s":null, "decision_id":null,
+                        "exclusions":accounts.into_iter().map(|account| json!({"account_id":account,"reason":"not_in_runner_candidates"})).collect::<Vec<_>>()}),
+                    ),
+                );
+            }
+        } else if roster
+            .roster
+            .as_ref()
+            .is_none_or(|roster| roster.accounts.is_empty())
+        {
+            // Without class context the vault/quota roster names nothing usable
+            // for this provider/model: no filtering by eligibility, size or
+            // candidates happens here, so an empty roster means no credential
+            // of the right kind serves it. That is `auth_required`, untimed:
+            // the runner needs a login it does not have.
+            checking("missing_model_credentials");
+            return OpReply::typed(
+                "auth_required",
+                format!("routing selects no accounts for provider `{provider}`"),
+                json!({
+                    "code": "auth_required",
+                    "retry_after_s": null,
+                    "decision_id": null,
+                    "exclusions": [],
+                }),
             );
         }
-        // Without class context the vault/quota roster names nothing usable
-        // for this provider/model: no filtering by eligibility, size or
-        // candidates happens here, so an empty roster means no credential
-        // of the right kind serves it. That is `auth_required`, untimed:
-        // the runner needs a login it does not have.
-        return OpReply::typed(
-            "auth_required",
-            format!("routing selects no accounts for provider `{provider}`"),
-            json!({
-                "code": "auth_required",
-                "retry_after_s": null,
-                "decision_id": null,
-                "exclusions": [],
-            }),
-        );
     }
     // The roster is read before the transaction: no lock or fetch happens
     // while the selection transaction is open.
@@ -3180,10 +3228,11 @@ fn prepare_roster(
             Ok(None) => match ctx.store.decision_account_class(id) {
                 Ok(Some(class)) => class,
                 Ok(None) => {
+                    checking("unknown_decision");
                     return Err(OpReply::error(
                         "unknown_decision",
                         "selection decision does not exist",
-                    ))
+                    ));
                 }
                 Err(error) => return Err(store_error(error)),
             },
@@ -3319,6 +3368,7 @@ fn tier_candidate_matches(
 }
 
 fn bound_service_tier_refusal() -> OpReply {
+    checking("bound_service_tier");
     OpReply::error(
         "account_selection_unavailable",
         "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
@@ -3498,6 +3548,10 @@ fn route_fence_refusal(
 ///   not use (`account_not_authorized`).
 /// When causes mix, the most recoverable wins: `account_pool_exhausted`
 /// beats `account_not_authorized`.
+/// Return `None` when serving credentials exist but the calling model-execution
+/// module offers none of them in its candidate list. The allocator preserves
+/// that disagreement as unavailable with `not_in_runner_candidates` exclusions,
+/// rather than requiring sign-in.
 fn empty_roster_refusal(
     classes: &ClassContext,
     provider: &str,
@@ -3506,9 +3560,9 @@ fn empty_roster_refusal(
     fenced: &BTreeMap<String, i64>,
     now: i64,
     params: Option<&AccountForParams>,
-) -> OpReply {
+) -> Option<OpReply> {
     let untimed = |code: &str, message: String| {
-        OpReply::typed(
+        Some(OpReply::typed(
             code,
             message,
             json!({
@@ -3517,7 +3571,7 @@ fn empty_roster_refusal(
                 "decision_id": null,
                 "exclusions": [],
             }),
-        )
+        ))
     };
     let exhausted = |until: Option<i64>| {
         let (retry_after_s, reset_at_ms, suffix) = match until.filter(|until| *until > now) {
@@ -3532,7 +3586,7 @@ fn empty_roster_refusal(
             ),
             None => (None, None, String::new()),
         };
-        OpReply::typed(
+        Some(OpReply::typed(
             "account_pool_exhausted",
             format!("routing selects no accounts for provider `{provider}`{suffix}"),
             json!({
@@ -3542,21 +3596,28 @@ fn empty_roster_refusal(
                 "exclusions": [],
                 "reset_at_ms": reset_at_ms,
             }),
-        )
+        ))
     };
     let fact = classes
         .facts
         .iter()
         .find(|fact| fact.provider_id == provider && fact.model_id == model);
     let Some(fact) = fact else {
+        checking("missing_model_credentials");
         return untimed(
             "auth_required",
             format!("routing selects no accounts for provider `{provider}`"),
         );
     };
-    let rows: Vec<_> = classes
-        .class(fact, priced)
-        .rows
+    let rows = classes.class(fact, priced).rows;
+    if rows.is_empty() {
+        checking("missing_class_credentials");
+        return untimed(
+            "auth_required",
+            format!("routing selects no accounts for provider `{provider}`"),
+        );
+    }
+    let rows: Vec<_> = rows
         .into_iter()
         .filter(|row| {
             params
@@ -3570,10 +3631,7 @@ fn empty_roster_refusal(
         })
         .collect();
     if rows.is_empty() {
-        return untimed(
-            "auth_required",
-            format!("routing selects no accounts for provider `{provider}`"),
-        );
+        return None;
     }
     let tokens = params.map_or(0, |params| {
         params
@@ -3649,11 +3707,13 @@ fn empty_roster_refusal(
         // filter cannot silently become a timed pool refusal.
     }
     if fenced_cause {
+        checking("credential_or_quota_block");
         // Retry when the first known hold ends; accounts with unknown
         // resets remain excluded while another account can recover.
         let earliest = row_resets.into_iter().flatten().min();
         return exhausted(earliest);
     }
+    checking("account_policy_filter");
     untimed(
         "account_not_authorized",
         format!("routing selects no accounts for provider `{provider}`"),
@@ -3847,6 +3907,7 @@ fn serve(
     roster: &RosterBuild,
     request_fingerprint: &str,
 ) -> RouteStateResult<OpReply> {
+    checking("admission_transaction");
     let now = ctx.now_ms;
     let policy = ctx.provider_policy(provider);
     if let Some(existing) = tx.admission(principal, &params.admission_id)? {
@@ -4069,6 +4130,7 @@ fn serve(
             ))
         }
         Outcome::Refuse(refusal) => {
+            checking("allocator_filters");
             // The caller sees the allocator's own contract code. The store
             // keeps that code too (`outcome_columns`), so this mapping must
             // not change the recorded decision, only the reply. The contract
@@ -4174,6 +4236,7 @@ fn replay(
     now: i64,
 ) -> RouteStateResult<OpReply> {
     if existing.request_fingerprint != request_fingerprint {
+        checking("admission_fingerprint");
         return Ok(OpReply::typed(
             "admission_conflict",
             format!(
@@ -4201,6 +4264,7 @@ fn replay(
 }
 
 fn pin_conflict(current: Option<&AccountAffinityRow>, expected: &PinRef) -> OpReply {
+    checking("pin_mismatch");
     OpReply::typed(
         "pin_generation_conflict",
         format!(
@@ -4448,7 +4512,7 @@ struct ObserveParams {
     caller: CallerParams,
     /// `admission_started`, `run_finished`, `attempt`, `scoped_not_found`,
     /// `account_limit_exhausted`, `transient_backoff` or `credential_refused`.
-    /// Any other kind is kept as advisory.
+    /// An unlisted kind is stored and answered but changes no routing state.
     kind: String,
     #[serde(default)]
     admission_id: Option<String>,
@@ -4521,6 +4585,7 @@ pub(crate) fn observe_authorized(
     allow_served_account: bool,
     ctx: &Ctx<'_>,
 ) -> OpReply {
+    checking("account_selection_enabled");
     if !ctx.flags.enabled {
         return OpReply::typed(
             DISABLED_CODE,
@@ -4528,15 +4593,19 @@ pub(crate) fn observe_authorized(
             json!({"code":DISABLED_CODE}),
         );
     }
+    checking("account_observe_parse");
     let parsed: ObserveParams = match serde_json::from_value(params.clone()) {
         Ok(parsed) => parsed,
         Err(error) => return invalid(format!("invalid route.account_observe params: {error}")),
     };
     if parsed.event_id.trim().is_empty() {
-        return invalid("`event_id` must not be empty");
+        return because(
+            "observation_event_id",
+            invalid("`event_id` must not be empty"),
+        );
     }
     if let Some(reply) = invalid_pool(parsed.pool.as_deref()) {
-        return reply;
+        return because("observation_pool", reply);
     }
     let roster_digests: BTreeMap<String, ProviderRosterFacts> = tracked_providers(ctx)
         .into_iter()
@@ -4566,6 +4635,7 @@ pub(crate) fn observe_authorized(
             )
         })
         .collect();
+    checking("observation_transaction");
     ctx.store
         .account_transaction(|tx| {
             record_observation(
@@ -4740,6 +4810,7 @@ fn apply_credential_refused(
     admission: Option<&AccountAdmissionRow>,
     effects: &mut Vec<Value>,
 ) -> RouteStateResult<()> {
+    checking("credential_refused_target");
     let credential = parsed
         .credential_id
         .as_deref()

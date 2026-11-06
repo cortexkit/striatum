@@ -1119,44 +1119,52 @@ pub(super) async fn handle_select_request(
 
     if account_selection::handles(&envelope.method) {
         let principal = route_principal(channel, epoch);
-        let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
-            model_pools: live_config.quota_model_pools(),
-            ..Default::default()
-        };
-        // The contract has no `store_error` or `internal_error` for
-        // `route.account_for`; a context that cannot load is transient
-        // unavailability, not a transport failure.
-        let classes = match account_selection::ClassContext::load(
-            store,
-            broca_credentials,
-            config_overrides::live_config(operator_config_path),
-            ACCOUNT_QUOTA.get(),
-            account_selection::now_ms(),
-        ) {
-            Ok(classes) => classes,
-            Err(error) => {
-                let reply = account_selection::OpReply::Error {
-                    code: "account_selection_unavailable".to_string(),
-                    message: format!("routing could not load account context: {error}"),
-                    detail: Some(json!({
-                        "code": "account_selection_unavailable",
-                        "retry_after_s": null,
-                        "decision_id": null,
-                        "exclusions": [],
-                    })),
+        let request: serde_json::Value = serde_json::from_slice(&frame.body).unwrap_or_default();
+        let reply = crate::account_refusal_log::record(
+            &envelope.method,
+            &principal,
+            &request["params"],
+            || {
+                let policy = prefrontal_routing_core::accounts::AllocatorPolicy {
+                    model_pools: live_config.quota_model_pools(),
+                    ..Default::default()
                 };
-                return send_account_reply(writer, ver, channel, epoch, corr, reply).await;
-            }
-        };
-        let ctx = account_selection::Ctx {
-            store: store.as_ref(),
-            accounts: ACCOUNT_QUOTA.get(),
-            flags: live_config.account_flags(),
-            policy: &policy,
-            now_ms: account_selection::now_ms(),
-            classes: Some(classes),
-        };
-        let reply = account_selection::handle(&envelope.method, &frame.body, &principal, &ctx);
+                // The contract has no `store_error` or `internal_error` for
+                // `route.account_for`; a context that cannot load is transient
+                // unavailability, not a transport failure.
+                let classes = match account_selection::ClassContext::load(
+                    store,
+                    broca_credentials,
+                    config_overrides::live_config(operator_config_path),
+                    ACCOUNT_QUOTA.get(),
+                    account_selection::now_ms(),
+                ) {
+                    Ok(classes) => classes,
+                    Err(error) => {
+                        let reply = account_selection::OpReply::Error {
+                            code: "account_selection_unavailable".to_string(),
+                            message: format!("routing could not load account context: {error}"),
+                            detail: Some(json!({
+                                "code": "account_selection_unavailable",
+                                "retry_after_s": null,
+                                "decision_id": null,
+                                "exclusions": [],
+                            })),
+                        };
+                        return reply;
+                    }
+                };
+                let ctx = account_selection::Ctx {
+                    store: store.as_ref(),
+                    accounts: ACCOUNT_QUOTA.get(),
+                    flags: live_config.account_flags(),
+                    policy: &policy,
+                    now_ms: account_selection::now_ms(),
+                    classes: Some(classes),
+                };
+                account_selection::handle(&envelope.method, &frame.body, &principal, &ctx)
+            },
+        );
         return send_account_reply(writer, ver, channel, epoch, corr, reply).await;
     }
 
