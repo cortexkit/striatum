@@ -137,6 +137,12 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "salt for conversation keys; a new salt changes every affinity",
     ),
     ("account_affinity", "current account pin per conversation"),
+    (
+        "routing_v1_panel",
+        "panel ownership, request and seat history; restored empty, a consult running across \
+         the restore has every seat replacement refused as an unknown panel. Small, and \
+         pruned with the decision window",
+    ),
     ("account_pin", "pin generations; admissions reference them"),
     (
         "account_admission",
