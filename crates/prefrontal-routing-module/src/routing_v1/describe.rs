@@ -26,6 +26,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "select_prefer_prompt_cache",
     "select_settings",
     "observe_backoff",
+    "observe_credential_refused",
     cortexkit_role_routing::capabilities::SELECT_HARNESS,
     "select_hold_control",
     cortexkit_role_routing::capabilities::SELECT_PREFER,

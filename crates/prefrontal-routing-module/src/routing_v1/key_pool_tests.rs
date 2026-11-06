@@ -22,6 +22,8 @@ use subc_protocol::FrameType;
 use super::conformance_tests::{catalog_fact, reserved, Harness};
 use crate::broca_credentials::BrocaCredentials;
 
+mod credential_refused_tests;
+
 /// The catalog provider whose rows the key pool borrows.
 const BORROWED: &str = "catalog-provider";
 /// The key-pool provider: no catalog rows of its own.

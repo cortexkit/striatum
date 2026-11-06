@@ -184,6 +184,7 @@ pub(crate) struct ClassContext {
     route_fences: Vec<prefrontal_routing_store::AccountRouteFence>,
     transient_route_fences: Vec<prefrontal_routing_store::AccountRouteFence>,
     observation_backoffs: Vec<(String, String, i64)>,
+    pool_walls: BTreeSet<(String, String)>,
     catalog: BTreeSet<String>,
     targets: BTreeMap<String, String>,
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
@@ -507,6 +508,19 @@ impl ClassContext {
             .map_err(|error| error.to_string())?;
         let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
         let targets = credentials.catalog_targets(&facts);
+        let mut pool_walls = BTreeSet::new();
+        for provider in targets.keys() {
+            for (credential, state) in store
+                .pool_key_states(provider, now_ms)
+                .map_err(|error| error.to_string())?
+            {
+                if state.walled_until_ms.is_some_and(|until| until > now_ms)
+                    || state.cooldown_until_ms.is_some_and(|until| until > now_ms)
+                {
+                    pool_walls.insert((provider.clone(), credential));
+                }
+            }
+        }
         prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
         let quota = accounts
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
@@ -596,6 +610,7 @@ impl ClassContext {
             route_fences,
             transient_route_fences,
             observation_backoffs,
+            pool_walls,
             catalog,
             targets,
             tier_accounts: None,
@@ -729,24 +744,29 @@ impl ClassContext {
         row: &cortexkit_claustrum_client::ListedCredential,
         fact: &prefrontal_routing_core::ModelFact,
     ) -> bool {
-        self.tier_accounts.as_ref().is_none_or(|accounts| {
-            accounts
-                .get(&format!("{}/{}", fact.provider_id, fact.model_id))
-                .is_some_and(|ids| ids.contains(&row.id))
-        }) && !self.eligibility.iter().any(|fact_| {
-            fact_.provider == fact.provider_id
-                && fact_.credential_id == row.id
-                && (fact_.model.is_empty() || fact_.model == fact.model_id)
-        }) && !self.refusals.iter().any(|fence| {
-            fence.provider_id == fact.provider_id
-                && fence.credential_id == row.id
-                && (self.targets.contains_key(&fact.provider_id)
-                    || !crate::credential_fences::probe_allowed(
-                        &fence.code,
-                        self.has_quota_signal(&fact.provider_id, &row.id),
-                        self.now_ms.saturating_sub(fence.observed_at_ms),
-                    ))
-        })
+        !self
+            .pool_walls
+            .contains(&(fact.provider_id.clone(), row.id.clone()))
+            && self.tier_accounts.as_ref().is_none_or(|accounts| {
+                accounts
+                    .get(&format!("{}/{}", fact.provider_id, fact.model_id))
+                    .is_some_and(|ids| ids.contains(&row.id))
+            })
+            && !self.eligibility.iter().any(|fact_| {
+                fact_.provider == fact.provider_id
+                    && fact_.credential_id == row.id
+                    && (fact_.model.is_empty() || fact_.model == fact.model_id)
+            })
+            && !self.refusals.iter().any(|fence| {
+                fence.provider_id == fact.provider_id
+                    && fence.credential_id == row.id
+                    && (self.targets.contains_key(&fact.provider_id)
+                        || !crate::credential_fences::probe_allowed(
+                            &fence.code,
+                            self.has_quota_signal(&fact.provider_id, &row.id),
+                            self.now_ms.saturating_sub(fence.observed_at_ms),
+                        ))
+            })
     }
 
     fn probe_eligible(&self, provider: &str, credential: &str) -> bool {
@@ -3086,11 +3106,16 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
         return reply;
     }
-    if !roster
-        .roster
-        .as_ref()
-        .is_some_and(|roster| !roster.accounts.is_empty())
-    {
+    if !roster.roster.as_ref().is_some_and(|roster| {
+        roster.accounts.iter().any(|account| {
+            parsed.candidates.as_ref().is_none_or(|candidates| {
+                candidates
+                    .accounts
+                    .iter()
+                    .any(|candidate| candidate.account_id == account.account_id)
+            })
+        })
+    }) {
         if let Some(classes) = ctx.classes.as_ref() {
             return empty_roster_refusal(
                 classes,
@@ -3529,7 +3554,21 @@ fn empty_roster_refusal(
             format!("routing selects no accounts for provider `{provider}`"),
         );
     };
-    let rows = classes.class(fact, priced).rows;
+    let rows: Vec<_> = classes
+        .class(fact, priced)
+        .rows
+        .into_iter()
+        .filter(|row| {
+            params
+                .and_then(|params| params.candidates.as_ref())
+                .is_none_or(|candidates| {
+                    candidates.accounts.iter().any(|candidate| {
+                        candidate.credential_id == row.id
+                            && candidate.account_id == row.account_id.as_deref().unwrap_or(&row.id)
+                    })
+                })
+        })
+        .collect();
     if rows.is_empty() {
         return untimed(
             "auth_required",
@@ -3545,6 +3584,14 @@ fn empty_roster_refusal(
     let mut fenced_cause = false;
     let mut row_resets: Vec<Option<i64>> = Vec::new();
     for row in &rows {
+        if classes
+            .pool_walls
+            .contains(&(provider.to_owned(), row.id.clone()))
+        {
+            fenced_cause = true;
+            row_resets.push(None);
+            continue;
+        }
         let account = row.account_id.clone().unwrap_or_else(|| row.id.clone());
         let route_reset = fenced.get(&account).copied();
         if route_reset.is_some() {
@@ -4399,8 +4446,9 @@ struct ObserveParams {
     /// and principal is recognized and changes nothing.
     event_id: String,
     caller: CallerParams,
-    /// `admission_started`, `run_finished`, `attempt`, `scoped_not_found` or
-    /// `account_limit_exhausted`. Any other kind is kept as advisory.
+    /// `admission_started`, `run_finished`, `attempt`, `scoped_not_found`,
+    /// `account_limit_exhausted`, `transient_backoff` or `credential_refused`.
+    /// Any other kind is kept as advisory.
     kind: String,
     #[serde(default)]
     admission_id: Option<String>,
@@ -4436,6 +4484,8 @@ struct ObserveParams {
     pool: Option<String>,
     #[serde(default)]
     retry_at_ms: Option<u64>,
+    #[serde(default)]
+    provider_code: Option<String>,
 }
 
 /// What `route.account_observe` reads from each tracked provider's roster
@@ -4603,7 +4653,7 @@ fn record_observation(
     match &admission {
         None => {
             bound = !served_providers.is_empty();
-            if !bound {
+            if !bound && parsed.kind != "credential_refused" {
                 effects.push(json!({"effect":"advisory", "why":"names no admission routing issued to this principal"}));
             }
         }
@@ -4630,7 +4680,9 @@ fn record_observation(
             }
         }
     }
-    if parsed.kind == "transient_backoff" && parsed.retry_at_ms.is_some() && bound {
+    if parsed.kind == "credential_refused" {
+        apply_credential_refused(tx, ctx, parsed, admission.as_ref(), &mut effects)?;
+    } else if parsed.kind == "transient_backoff" && parsed.retry_at_ms.is_some() && bound {
         let until = parsed
             .retry_at_ms
             .unwrap()
@@ -4679,6 +4731,87 @@ fn record_observation(
             "effects": effects_value,
         }
     })))
+}
+
+fn apply_credential_refused(
+    tx: &AccountTx<'_>,
+    ctx: &Ctx<'_>,
+    parsed: &ObserveParams,
+    admission: Option<&AccountAdmissionRow>,
+    effects: &mut Vec<Value>,
+) -> RouteStateResult<()> {
+    let credential = parsed
+        .credential_id
+        .as_deref()
+        .or_else(|| admission.map(|row| row.credential_id.as_str()));
+    let (Some(credential), Some(classes)) = (credential, &ctx.classes) else {
+        return Ok(());
+    };
+    // Resolve membership even if the vault already marked the credential
+    // invalid. Its current usability must not erase the provider's refusal.
+    let mut providers: BTreeSet<String> = classes
+        .credentials
+        .listed_credentials()
+        .iter()
+        .filter(|row| row.id == credential)
+        .flat_map(|row| crate::broca_credentials::credential_providers(row, &classes.catalog))
+        .collect();
+    if let Some(row) = admission.filter(|row| row.credential_id == credential) {
+        providers.insert(row.provider.clone());
+    }
+    let fingerprint = match classes.credentials.listing_fingerprint(credential) {
+        crate::broca_credentials::ListingLookup::Listed(fingerprint) => Some(fingerprint),
+        _ => None,
+    };
+    let until = ctx
+        .now_ms
+        .saturating_add(crate::credential_fences::CREDENTIAL_REFUSED_REPROBE_MS);
+    for provider in providers {
+        // A provider with no catalog rows borrows a vendor's rows through its
+        // active API keys. Even if the refused key is now invalid and no longer
+        // supplies that mapping, record its refusal in the pooled-key wall.
+        let pool = classes.targets.contains_key(&provider)
+            || (!classes.catalog.contains(&provider)
+                && classes.credentials.listed_credentials().iter().any(|row| {
+                    row.id == credential
+                        && row.credential_type == "apikey"
+                        && row
+                            .serves
+                            .iter()
+                            .filter(|vendor| classes.catalog.contains(*vendor))
+                            .count()
+                            == 1
+                }));
+        if pool {
+            tx.pool_wall(
+                &provider,
+                credential,
+                prefrontal_routing_store::PoolWallKind::Billing,
+                until,
+                parsed
+                    .provider_code
+                    .as_deref()
+                    .unwrap_or("credential_refused"),
+                ctx.now_ms,
+            )?;
+        } else {
+            // Keep the wall independent of quota readings: an empty balance or
+            // a revoked key is not a resettable usage window. The provider's
+            // verbatim code remains in the stored observation.
+            tx.record_credential_refusal(
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: provider.clone(),
+                    credential_id: credential.into(),
+                    code: "credential_refused".into(),
+                },
+                fingerprint.as_deref(),
+                ctx.now_ms,
+            )?;
+        }
+        effects.push(json!({"effect":"credential_refused", "provider":provider,
+            "credential_id":credential}));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

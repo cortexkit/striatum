@@ -1129,6 +1129,18 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let report = run_suite(&subject).await;
     eprintln!("{}", report.render());
     assert_eq!(report.checks.len(), CHECKS.len());
+    for check in [
+        "observe_credential_refused_requires_backoff",
+        "credential_refused_blocks_credential",
+        "credential_refused_retry_at_ms_refused",
+    ] {
+        assert_eq!(
+            report.outcome(check),
+            Some(&cortexkit_role_routing_conformance::CheckOutcome::Passed),
+            "{}",
+            report.render()
+        );
+    }
     assert_eq!(report.failing(), NOT_YET_SERVED, "{}", report.render());
     assert_eq!(
         report.not_applicable(),

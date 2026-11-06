@@ -377,6 +377,34 @@ impl SqliteRouteStateStore {
         reason: &str,
         now_ms: i64,
     ) -> RouteStateResult<()> {
+        self.account_transaction(|tx| {
+            tx.pool_wall(provider, credential_id, kind, until_ms, reason, now_ms)
+        })
+    }
+
+    /// Every key state routing holds for `provider`, with live leases counted.
+    pub fn pool_key_states(
+        &self,
+        provider: &str,
+        now_ms: i64,
+    ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
+        self.store
+            .with_conn(|conn: &Connection| key_states(conn, provider, now_ms, None))
+            .map_err(err)
+    }
+}
+
+impl crate::AccountTx<'_> {
+    /// Wall a key atomically with the observation that reported the refusal.
+    pub fn pool_wall(
+        &self,
+        provider: &str,
+        credential_id: &str,
+        kind: PoolWallKind,
+        until_ms: i64,
+        reason: &str,
+        now_ms: i64,
+    ) -> RouteStateResult<()> {
         let statement = match kind {
             PoolWallKind::Billing => {
                 "INSERT INTO pool_key_state (provider, credential_id, walled_until, wall_reason, updated_at)
@@ -393,23 +421,12 @@ impl SqliteRouteStateStore {
                    cooldown_reason = excluded.cooldown_reason, updated_at = excluded.updated_at"
             }
         };
-        self.pool_transaction(|conn| {
-            conn.execute(
+        self.conn
+            .execute(
                 statement,
                 params![provider, credential_id, until_ms, reason, now_ms],
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Every key state routing holds for `provider`, with live leases counted.
-    pub fn pool_key_states(
-        &self,
-        provider: &str,
-        now_ms: i64,
-    ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
-        self.store
-            .with_conn(|conn: &Connection| key_states(conn, provider, now_ms, None))
+            )
+            .map(|_| ())
             .map_err(err)
     }
 }

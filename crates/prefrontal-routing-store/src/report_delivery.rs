@@ -96,6 +96,20 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Record a credential refusal in the same transaction as its observation.
+    pub fn record_credential_refusal(
+        &self,
+        refusal: &prefrontal_routing_core::route_state_store::CredentialRefusal,
+        fingerprint: Option<&str>,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        let effects = V1ReportEffects {
+            credential_refusal: Some((refusal.clone(), fingerprint.map(str::to_owned))),
+            ..Default::default()
+        };
+        apply_account_effects(self, &effects, now).map_err(err)
+    }
+
     pub fn clear_credential_entitlement_fence(
         &self,
         provider: &str,
