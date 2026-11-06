@@ -195,7 +195,7 @@ pub(crate) fn emit(
         "hold_wait_max_s":params["hold_wait_max_s"].as_u64(),
         "exclusions":exclusions, "suppressed":suppressed,
     });
-    crate::warn_operator(format!("[TODO(user): account operation refused] {fields}"));
+    crate::warn_operator(format!("routing refused an account call: {fields}"));
 }
 
 #[cfg(test)]

@@ -3162,7 +3162,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                     "candidates_filter",
                     OpReply::typed(
                         "account_selection_unavailable",
-                        "[TODO(user): runner candidates exclude every serving account]",
+                        "The runner's candidate list leaves out every account that can serve this model, so routing admitted none. Each exclusion names an account the runner didn't offer. Offer those accounts as candidates, or send no candidate list to let routing choose.",
                         json!({"code":"account_selection_unavailable", "retry_after_s":null, "decision_id":null,
                         "exclusions":accounts.into_iter().map(|account| json!({"account_id":account,"reason":"not_in_runner_candidates"})).collect::<Vec<_>>()}),
                     ),

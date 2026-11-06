@@ -689,7 +689,7 @@ async fn broca_foreign_candidates_keep_unavailable_with_exclusions() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     let fields: Value = serde_json::from_str(
         lines[0]
-            .strip_prefix("[TODO(user): account operation refused] ")
+            .strip_prefix("routing refused an account call: ")
             .unwrap(),
     )
     .unwrap();

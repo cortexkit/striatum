@@ -81,7 +81,7 @@ impl DescribeCache {
         }
         if self.failed.remove(module) {
             if let Some(suppressed) = self.logs.admit(module, "runner_poll_recovered", now) {
-                crate::warn_operator(format!("[TODO(user): runner describe poll recovered] module={module:?} suppressed={suppressed}"));
+                crate::warn_operator(format!("runner role.describe poll answered again; its tier and account view is current module={module:?} suppressed={suppressed}"));
             }
         }
     }
@@ -96,7 +96,7 @@ impl DescribeCache {
     fn missed(&mut self, module: &str, stage: &str, now: i64) {
         self.failed.insert(module.to_owned());
         if let Some(suppressed) = self.logs.admit(module, "runner_poll_failed", now) {
-            crate::warn_operator(format!("[TODO(user): runner describe poll failed] module={module:?} stage={stage} suppressed={suppressed}"));
+            crate::warn_operator(format!("runner role.describe poll failed; routing keeps the runner's last tier and account view for up to 5 minutes module={module:?} stage={stage} suppressed={suppressed}"));
         }
     }
 
