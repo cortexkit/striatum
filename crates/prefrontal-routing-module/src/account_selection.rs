@@ -2172,13 +2172,48 @@ pub(crate) fn refresh_credential_quota_holds(
     route_fences: &[prefrontal_routing_store::AccountRouteFence],
     now: EpochMs,
 ) -> Result<Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>, String> {
+    store
+        .account_transaction(|tx| {
+            refresh_credential_quota_holds_in(
+                tx,
+                credentials,
+                quota,
+                config,
+                refusals,
+                route_fences,
+                now,
+            )
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Reconcile both newly reported and persisted credential refusals. Once an
+/// exhausted subscription reading supplies a reset for a billing refusal,
+/// store an ordinary pool block so the hold survives stale readings and uses
+/// normal block recovery.
+/// The credential row remains as refusal evidence and also excludes paid-credit
+/// placement: a billing refusal must not be bypassed by switching payment class.
+pub(crate) fn refresh_credential_quota_holds_in(
+    tx: &AccountTx<'_>,
+    credentials: &crate::broca_credentials::BrocaCredentials,
+    quota: &AccountQuotaState,
+    config: &crate::config_overrides::LiveConfig,
+    refusals: Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>,
+    route_fences: &[prefrontal_routing_store::AccountRouteFence],
+    now: EpochMs,
+) -> RouteStateResult<Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>> {
     let mut kept = Vec::new();
     for refusal in refusals {
         if !crate::credential_fences::is_billing_code(&refusal.code) {
             // Quota utilization cannot establish entitlement. Remove quota
             // blocks left by older reconciliation, but retain the refusal so
             // a timed probe can discover a provider-side reversal.
-            crate::credential_fences::clear_quota_holds(store, &refusal, "entitlement_not_quota")?;
+            let prefix = crate::credential_fences::quota_hold_prefix(&refusal);
+            for block in tx.active_pool_fences(&refusal.provider_id)? {
+                if block.evidence.fence_id.starts_with(&prefix) {
+                    tx.clear_fence(&block.evidence.fence_id, now, "entitlement_not_quota")?;
+                }
+            }
             kept.push(refusal);
             continue;
         }
@@ -2194,109 +2229,104 @@ pub(crate) fn refresh_credential_quota_holds(
             .and_then(|reading| quota_reading_for_model(&reading.entry, &account, None, &[]));
         let reading_reset =
             crate::credential_fences::exhausted_quota_reset_for_account(quota, &account, now);
-        let lifted = store
-            .account_transaction(|tx| {
-                let blocks: Vec<_> = tx
-                    .active_pool_fences(&refusal.provider_id)?
-                    .into_iter()
-                    .filter(|block| block.evidence.fence_id.starts_with(&prefix))
-                    .collect();
-                let prior = blocks
-                    .iter()
-                    .filter_map(|block| {
-                        let mut fence =
-                            serde_json::from_str::<Fence>(&block.evidence.fence_json).ok()?;
-                        fence.recovery_set = block.recovery_set.clone();
-                        Some(fence)
-                    })
-                    .max_by_key(|fence| match fence.reset {
-                        ResetTime::At(reset) => reset,
-                        _ => 0,
-                    });
-                let reset = reading_reset
-                    .into_iter()
-                    .chain(prior.iter().filter_map(|fence| match fence.reset {
-                        ResetTime::At(reset) if reset > refusal.observed_at_ms => Some(reset),
-                        _ => None,
-                    }))
-                    .max();
-                let Some(mut reset) = reset else {
-                    return Ok(crate::credential_fences::fresh_headroom_after_for_account(
-                        quota,
-                        &account,
-                        refusal.observed_at_ms,
-                        now,
-                    ));
-                };
-                // A run and a reading may name different windows. Neither
-                // known reset may shorten the other's hold on the account.
-                for route in route_fences.iter().filter(|route| {
-                    route.provider == refusal.provider_id
-                        && crate::credential_fences::credential_account_id(
-                            credentials,
-                            &route.credential_id,
-                        )
-                        .as_deref()
-                            == Some(account.as_str())
-                }) {
-                    reset = reset.max(route.until_ms);
-                }
-                let mut fence = prior.unwrap_or_else(|| Fence {
-                    account_id: account.clone(),
-                    pool: None,
-                    recovery_set: recovery_set_from(reading.as_ref(), now, &policy),
-                    observed_at_ms: refusal.observed_at_ms,
-                    reset: ResetTime::At(reset),
-                    retry_hint_ms: None,
-                    source:
-                        prefrontal_routing_core::accounts::ConfirmationSource::BrocaAccountLimit,
+        let lifted = (|| -> RouteStateResult<bool> {
+            let blocks: Vec<_> = tx
+                .active_pool_fences(&refusal.provider_id)?
+                .into_iter()
+                .filter(|block| block.evidence.fence_id.starts_with(&prefix))
+                .collect();
+            let prior = blocks
+                .iter()
+                .filter_map(|block| {
+                    let mut fence =
+                        serde_json::from_str::<Fence>(&block.evidence.fence_json).ok()?;
+                    fence.recovery_set = block.recovery_set.clone();
+                    Some(fence)
+                })
+                .max_by_key(|fence| match fence.reset {
+                    ResetTime::At(reset) => reset,
+                    _ => 0,
                 });
-                fence.reset = ResetTime::At(reset);
-                fence.observed_at_ms = fence.observed_at_ms.max(refusal.observed_at_ms);
-                for key in blocks.iter().flat_map(|block| &block.recovery_set) {
-                    if !fence.recovery_set.contains(key) {
-                        fence.recovery_set.push(key.clone());
-                    }
+            let reset = reading_reset
+                .into_iter()
+                .chain(prior.iter().filter_map(|fence| match fence.reset {
+                    ResetTime::At(reset) if reset > refusal.observed_at_ms => Some(reset),
+                    _ => None,
+                }))
+                .max();
+            let Some(mut reset) = reset else {
+                return Ok(crate::credential_fences::fresh_headroom_after_for_account(
+                    quota,
+                    &account,
+                    refusal.observed_at_ms,
+                    now,
+                ));
+            };
+            // A run and a reading may name different windows. Neither
+            // known reset may shorten the other's hold on the account.
+            for route in route_fences.iter().filter(|route| {
+                route.provider == refusal.provider_id
+                    && crate::credential_fences::credential_account_id(
+                        credentials,
+                        &route.credential_id,
+                    )
+                    .as_deref()
+                        == Some(account.as_str())
+            }) {
+                reset = reset.max(route.until_ms);
+            }
+            let mut fence = prior.unwrap_or_else(|| Fence {
+                account_id: account.clone(),
+                pool: None,
+                recovery_set: recovery_set_from(reading.as_ref(), now, &policy),
+                observed_at_ms: refusal.observed_at_ms,
+                reset: ResetTime::At(reset),
+                retry_hint_ms: None,
+                source: prefrontal_routing_core::accounts::ConfirmationSource::BrocaAccountLimit,
+            });
+            fence.reset = ResetTime::At(reset);
+            fence.observed_at_ms = fence.observed_at_ms.max(refusal.observed_at_ms);
+            for key in blocks.iter().flat_map(|block| &block.recovery_set) {
+                if !fence.recovery_set.contains(key) {
+                    fence.recovery_set.push(key.clone());
                 }
-                if let Some(end) = block_end(&fence, reading.as_ref(), now, &policy) {
-                    for block in &blocks {
-                        tx.clear_fence(&block.evidence.fence_id, now, &wire_str(&end))?;
-                    }
-                    return Ok(true);
+            }
+            if let Some(end) = block_end(&fence, reading.as_ref(), now, &policy) {
+                for block in &blocks {
+                    tx.clear_fence(&block.evidence.fence_id, now, &wire_str(&end))?;
                 }
-                if !blocks.iter().any(|block| {
-                    serde_json::from_str::<Fence>(&block.evidence.fence_json).is_ok_and(|fence| {
-                        fence.reset == ResetTime::At(reset)
-                            && fence.observed_at_ms == refusal.observed_at_ms
-                    })
-                }) {
-                    tx.insert_pool_fence(&AccountPoolFenceRow {
-                        evidence: AccountFenceRow {
-                            fence_id: format!("{prefix}{}", new_id("hold")),
-                            provider: refusal.provider_id.clone(),
-                            account_id: account.clone(),
-                            scope_json: wire(&fence.pool).to_string(),
-                            fence_json: wire(&fence).to_string(),
-                            source: wire_str(&fence.source),
-                            observed_at: refusal.observed_at_ms,
-                            principal: "routing".into(),
-                            admission_id: None,
-                            observation_id: None,
-                            created_at: now,
-                            cleared_at: None,
-                            cleared_reason: None,
-                        },
-                        pool_key: None,
-                        recovery_set: fence.recovery_set,
-                    })?;
-                }
-                Ok(false)
-            })
-            .map_err(|error| error.to_string())?;
+                return Ok(true);
+            }
+            if !blocks.iter().any(|block| {
+                serde_json::from_str::<Fence>(&block.evidence.fence_json).is_ok_and(|fence| {
+                    fence.reset == ResetTime::At(reset)
+                        && fence.observed_at_ms == refusal.observed_at_ms
+                })
+            }) {
+                tx.insert_pool_fence(&AccountPoolFenceRow {
+                    evidence: AccountFenceRow {
+                        fence_id: format!("{prefix}{}", new_id("hold")),
+                        provider: refusal.provider_id.clone(),
+                        account_id: account.clone(),
+                        scope_json: wire(&fence.pool).to_string(),
+                        fence_json: wire(&fence).to_string(),
+                        source: wire_str(&fence.source),
+                        observed_at: refusal.observed_at_ms,
+                        principal: "routing".into(),
+                        admission_id: None,
+                        observation_id: None,
+                        created_at: now,
+                        cleared_at: None,
+                        cleared_reason: None,
+                    },
+                    pool_key: None,
+                    recovery_set: fence.recovery_set,
+                })?;
+            }
+            Ok(false)
+        })()?;
         if lifted {
-            store
-                .clear_credential_entitlement_fence(&refusal.provider_id, &refusal.credential_id)
-                .map_err(|error| error.to_string())?;
+            tx.clear_credential_entitlement_fence(&refusal.provider_id, &refusal.credential_id)?;
         } else {
             kept.push(refusal);
         }

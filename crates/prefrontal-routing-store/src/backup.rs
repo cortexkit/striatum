@@ -57,6 +57,18 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
 /// Tables every backup must carry, each with the reason.
 pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     (
+        "routing_v1_report_delivery",
+        "first-delivery answers and per-run usage identities prevent counting retries twice",
+    ),
+    (
+        "routing_call_window",
+        "counter deployment time bounds the observation window used before deleting handlers",
+    ),
+    (
+        "routing_call_count",
+        "persisted calls by method, shape and principal prevent an unsafe handler deletion",
+    ),
+    (
         "model_route_speed_samples",
         "per-generation timing history supplies observed speeds by served tier; no smaller \
          summary is retained, so losing it resets those speeds to cold-start values",

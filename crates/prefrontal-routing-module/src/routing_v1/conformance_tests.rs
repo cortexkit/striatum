@@ -1060,8 +1060,6 @@ const NOT_APPLICABLE: &[&str] = &[
     "panel_replacement_invalid_slot",
     "consumer_models_valid",
     "consumer_models_unknown_consumer",
-    "report_usage_run_id_repeat_accepted",
-    "report_usage_run_id_overlong_refused",
     "pin_slot_configured_pinned",
     "pin_slot_unknown_unavailable",
     "available_routes_honoured",

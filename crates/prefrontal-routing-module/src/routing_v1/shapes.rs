@@ -80,6 +80,42 @@ fn has(params: &Value, names: &[&str]) -> bool {
         .is_some_and(|object| names.iter().any(|name| object.contains_key(*name)))
 }
 
+/// Persist the discriminator, not the selected handler: mixed requests must
+/// remain visible even though the contract handler refuses them.
+pub(super) fn census_shape(method: &str, params: &Value) -> &'static str {
+    let (legacy, contract) = match method {
+        ops::ROUTE_SELECT => {
+            let injected = has(params, INJECTED);
+            let target = has(params, &["targetAgent"]);
+            (
+                target || injected,
+                has(params, NEW_SELECT)
+                    || (!injected && has(params, &["consumer"]))
+                    || (target && has(params, SELECT_MARKERS)),
+            )
+        }
+        ops::ROUTE_SELECT_PANEL => (has(params, PANEL_LEGACY), has(params, PANEL_CONTRACT)),
+        ops::ROUTE_EXPLAIN => (has(params, EXPLAIN_LEGACY), has(params, &["decision_id"])),
+        ops::ROUTE_ACCOUNT_FOR => (has(params, &["caller"]), params["mode"] == "continue"),
+        ops::ROUTE_ACCOUNT_OBSERVE => (
+            has(params, &["caller"]),
+            has(params, &["decision_id", "retry_at_ms", "provider_code"]),
+        ),
+        ops::ROUTE_REPORT
+        | ops::ROUTE_ACCOUNT_STATUS
+        | ops::ROUTE_HEAD_CHOICES
+        | ops::ROUTE_BUDGET_QUOTE
+        | ops::ROLE_DESCRIBE => (false, true),
+        _ => return "legacy",
+    };
+    match (legacy, contract) {
+        (true, true) => "mixed",
+        (true, false) => "legacy",
+        (false, true) => "contract",
+        (false, false) => "markerless",
+    }
+}
+
 pub(super) fn claims(method: &str, params: &Value) -> bool {
     match method {
         ops::ROLE_DESCRIBE

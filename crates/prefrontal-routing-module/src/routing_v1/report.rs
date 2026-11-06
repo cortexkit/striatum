@@ -2,8 +2,10 @@
 //!
 //! Only the principal that selected a decision may report it; any other
 //! caller is answered exactly as for a decision that never existed. The
-//! first report on a decision stands: the same body again returns its
-//! answer, and a different body is `report_conflict`. Outcomes are audit
+//! first report owns a decision's effects. Usage is counted once per
+//! decision and run; a repeated pair returns its first answer even if the
+//! body differs. Reports without run attribution retain body idempotency.
+//! Outcomes are audit
 //! facts, not evidence that quota is exhausted. Eligibility and explicitly
 //! size-shaped refusals restrict only the account that actually served, and
 //! a failure with a future reset closes only the decision's route on that
@@ -31,6 +33,7 @@ const MEMBERS: &[&str] = &[
     "pool",
     "eligibility",
     "request_input_tokens",
+    "refusal_class",
 ];
 
 pub(super) fn report(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
@@ -62,31 +65,76 @@ pub(super) fn report_at(
     // and null members out alike and fixes the member order.
     let body_json = serde_json::to_string(&request)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
-    if let Some(first) = deps
-        .store
-        .v1_report(&request.decision_id)
-        .map_err(store_refusal)?
-    {
-        return standing_answer(first, &body_json);
+    let mut effects = prepare_account_facts(params, &decision, deps, now as i64)?;
+    let usage = request
+        .usage
+        .as_ref()
+        .map(|usage| {
+            prepare_usage(
+                usage,
+                &decision,
+                request.credential_id.as_deref(),
+                deps,
+                now,
+            )
+        })
+        .transpose()?
+        .flatten();
+    // Only success lifts the credential fence, never a neutral cancellation.
+    if request.outcome == Outcome::Completed {
+        let credential = deps
+            .store
+            .decision_provider_identity(&request.decision_id)
+            .map_err(store_refusal)?
+            .and_then(|identity| identity.credential_id)
+            .or_else(|| request.credential_id.clone());
+        if let Some(credential) = credential {
+            effects.lift_credential = Some((decision.provider.clone(), credential));
+        }
     }
 
-    record_account_facts(params, &decision, deps, now as i64)?;
-    if let Some(usage) = &request.usage {
-        deps.store
-            .account_transaction(|tx| tx.use_continuation(&request.decision_id, now as i64))
-            .map_err(store_refusal)?;
-        record_usage(
-            usage,
-            &decision,
-            request.credential_id.as_deref(),
-            deps,
-            now,
-        )?;
-    }
-    deps.store
-        .record_routing_outcome(
+    let delivery_key = match &request.usage {
+        Some(usage) => usage
+            .run_id
+            .as_ref()
+            .map(|run| format!("run:{run}"))
+            .unwrap_or_else(|| "usage".into()),
+        None => "outcome".into(),
+    };
+    let report_id = if delivery_key.starts_with("run:") {
+        format!("report:{}:{delivery_key}", request.decision_id)
+    } else {
+        format!("report:{}", request.decision_id)
+    };
+    let answer = ReportAnswer {
+        decision_id: request.decision_id.clone(),
+        report_id: report_id.clone(),
+        outcome: request.outcome.clone(),
+    };
+    let answer_json = serde_json::to_string(&answer)
+        .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
+    let reconcile = effects.credential_refusal.is_some();
+    let credentials = deps
+        .broca_credentials
+        .lock()
+        .map_err(store_refusal)?
+        .clone();
+    let quota = crate::ACCOUNT_QUOTA
+        .get()
+        .and_then(|q| q.lock().ok().map(|q| q.clone()))
+        .unwrap_or_default();
+    let config = super::operator_config(deps);
+    let standing = deps
+        .store
+        .v1_commit_report(
             &request.decision_id,
-            &ledger_outcome(&request, now),
+            &delivery_key,
+            &report_id,
+            &V1Recorded {
+                body_json: body_json.clone(),
+                answer_json,
+            },
+            ledger_outcome(&request, now),
             request
                 .outcome
                 .is_failure()
@@ -97,66 +145,43 @@ pub(super) fn report_at(
                         .unwrap_or_else(|| request.outcome.to_string())
                 })
                 .as_deref(),
-            now as i64,
-        )
-        .map_err(store_refusal)?;
-    // A completed run proves the credential it launched on serves again: lift
-    // the fence on that pair, if any. The remembered serving identity names
-    // the credential; the report's own claim is the fallback.
-    if request.outcome == Outcome::Completed {
-        let credential = deps
-            .store
-            .decision_provider_identity(&request.decision_id)
-            .map_err(store_refusal)?
-            .and_then(|identity| identity.credential_id)
-            .or_else(|| request.credential_id.clone());
-        if let Some(credential) = credential {
-            let decision = deps
-                .store
-                .v1_decision(&request.decision_id)
-                .map_err(store_refusal)?;
-            if let Some(decision) = decision {
-                crate::credential_fences::lift_after_success(
-                    deps.store,
-                    &decision.provider,
-                    &credential,
-                )
-                .map_err(store_refusal)?;
-            }
-        }
-    }
-
-    // One report per decision, so the decision names its report.
-    let report_id = format!("report:{}", request.decision_id);
-    let answer = ReportAnswer {
-        decision_id: request.decision_id.clone(),
-        report_id: report_id.clone(),
-        outcome: request.outcome.clone(),
-    };
-    let answer_json = serde_json::to_string(&answer)
-        .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
-    let standing = deps
-        .store
-        .v1_record_report(
-            &request.decision_id,
-            &report_id,
-            &V1Recorded {
-                body_json: body_json.clone(),
-                answer_json,
-            },
             request.outcome.is_failure(),
+            &effects,
+            usage.as_ref(),
+            |tx| {
+                if reconcile {
+                    crate::account_selection::refresh_credential_quota_holds_in(
+                        tx,
+                        &credentials,
+                        &quota,
+                        &config,
+                        tx.report_credential_refusals()?,
+                        &tx.report_route_fences(now as i64)?,
+                        now as i64,
+                    )?;
+                }
+                Ok(())
+            },
             now as i64,
         )
         .map_err(store_refusal)?;
-    standing_answer(standing, &body_json)
+    match standing {
+        Some(first) => serde_json::from_str(&first.answer_json)
+            .map_err(|error| store_refusal(format!("stored report answer undecodable: {error}"))),
+        None => Err(Refusal::new(
+            RefusalCode::ReportConflict,
+            "a report with a different body was already recorded for this decision",
+        )),
+    }
 }
 
-fn record_account_facts(
+fn prepare_account_facts(
     params: &Value,
     decision: &prefrontal_routing_store::V1Decision,
     deps: &Deps<'_>,
     now: i64,
-) -> Result<(), Refusal> {
+) -> Result<prefrontal_routing_store::V1ReportEffects, Refusal> {
+    let mut effects = prefrontal_routing_store::V1ReportEffects::default();
     let identity = deps
         .store
         .decision_provider_identity(&decision.decision_id)
@@ -170,31 +195,28 @@ fn record_account_facts(
                 .and_then(|identity| identity.credential_id.as_deref())
         });
     let Some(credential) = credential else {
-        return Ok(());
+        return Ok(effects);
     };
-    let classes = crate::account_selection::ClassContext::load(
-        deps.store,
-        deps.broca_credentials,
-        super::operator_config(deps),
-        crate::ACCOUNT_QUOTA.get(),
-        now,
-    )
-    .map_err(store_refusal)?;
-    let Some(fact) = classes
-        .facts
+    // Prepare from read-only snapshots. ClassContext::load also releases
+    // reservations and reconciles fences, which must not run for a losing claim.
+    let mut facts = deps.store.get_facts().map_err(store_refusal)?;
+    let credentials = deps
+        .broca_credentials
+        .lock()
+        .map_err(store_refusal)?
+        .clone();
+    let targets = credentials.catalog_targets(&facts);
+    prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &targets);
+    let Some(fact) = facts
         .iter()
         .find(|fact| fact.provider_id == decision.provider && fact.model_id == decision.model)
     else {
-        return Ok(());
+        return Ok(effects);
     };
     // Reports cannot turn an arbitrary credential into an account fact.
-    let catalog = classes
-        .facts
-        .iter()
-        .map(|fact| fact.provider_id.clone())
-        .collect();
+    let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
     let serves = |credential: &str| {
-        classes.credentials.listed_credentials().iter().any(|row| {
+        credentials.listed_credentials().iter().any(|row| {
             row.id == credential
                 && crate::broca_credentials::credential_serves_fact(row, fact, &catalog)
         })
@@ -216,42 +238,38 @@ fn record_account_facts(
                 .or(Some(credential))
                 .filter(|served| serves(served));
             if let Some(served) = served {
-                deps.store
-                    .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
-                        provider: decision.provider.clone(),
-                        credential_id: served.into(),
-                        model: decision.model.clone(),
-                        until_ms: reset.min(now.saturating_add(RESET_FENCE_CAP_MS as i64)),
-                        decision_id: decision.decision_id.clone(),
-                        recorded_at: now,
-                    })
-                    .map_err(store_refusal)?;
+                effects.route_fence = Some(prefrontal_routing_store::AccountRouteFence {
+                    provider: decision.provider.clone(),
+                    credential_id: served.into(),
+                    model: decision.model.clone(),
+                    until_ms: reset.min(now.saturating_add(RESET_FENCE_CAP_MS as i64)),
+                    decision_id: decision.decision_id.clone(),
+                    recorded_at: now,
+                });
             }
         }
     }
     if !serves(credential) {
-        return Ok(());
+        return Ok(effects);
     }
-    let fingerprint = match classes.credentials.listing_fingerprint(credential) {
+    let fingerprint = match credentials.listing_fingerprint(credential) {
         crate::broca_credentials::ListingLookup::Listed(fingerprint) => Some(fingerprint),
         _ => None,
     };
     if let Some(eligibility) = params.get("eligibility").filter(|value| !value.is_null()) {
-        deps.store
-            .record_account_eligibility(&prefrontal_routing_store::AccountEligibilityFact {
-                provider: decision.provider.clone(),
-                credential_id: credential.into(),
-                model: if eligibility["scope"] == "account" {
-                    String::new()
-                } else {
-                    decision.model.clone()
-                },
-                listing_fingerprint: fingerprint,
-                code: eligibility["code"].as_str().unwrap_or("ineligible").into(),
-                observed_at: now,
-            })
-            .map_err(store_refusal)?;
-        return Ok(());
+        effects.eligibility = Some(prefrontal_routing_store::AccountEligibilityFact {
+            provider: decision.provider.clone(),
+            credential_id: credential.into(),
+            model: if eligibility["scope"] == "account" {
+                String::new()
+            } else {
+                decision.model.clone()
+            },
+            listing_fingerprint: fingerprint,
+            code: eligibility["code"].as_str().unwrap_or("ineligible").into(),
+            observed_at: now,
+        });
+        return Ok(effects);
     }
     let code = params
         .get("runner_code")
@@ -264,68 +282,59 @@ fn record_account_facts(
             | "billing_exhausted"
             | "credit_insufficient"
             | "insufficient_quota"
-    ) {
-        crate::credential_fences::record(
-            deps.store,
-            deps.broca_credentials,
-            &prefrontal_routing_core::route_state_store::CredentialRefusal {
+    ) || params["refusal_class"] == "credential_refused"
+    {
+        effects.credential_refusal = Some((
+            prefrontal_routing_core::route_state_store::CredentialRefusal {
                 provider_id: decision.provider.clone(),
                 credential_id: credential.into(),
-                code: code.into(),
+                code: if code.is_empty() {
+                    "credential_refused".into()
+                } else {
+                    code.into()
+                },
             },
-            now,
-        )
-        .map_err(store_refusal)?;
-        crate::account_selection::ClassContext::load(
-            deps.store,
-            deps.broca_credentials,
-            super::operator_config(deps),
-            crate::ACCOUNT_QUOTA.get(),
-            now,
-        )
-        .map_err(store_refusal)?;
+            fingerprint,
+        ));
     }
     if let Some(tokens) = params.get("request_input_tokens").and_then(Value::as_u64) {
         let class = prefrontal_routing_core::accounts::input_size_class(tokens);
         if params["outcome"] == "completed" {
-            deps.store
-                .clear_account_size_refusal(
-                    &decision.provider,
-                    credential,
-                    &decision.model,
-                    class,
-                    now,
-                )
-                .map_err(store_refusal)?;
+            effects.clear_size = Some((
+                decision.provider.clone(),
+                credential.into(),
+                decision.model.clone(),
+                class,
+            ));
         } else if code.to_ascii_lowercase().contains("size")
             && (code.contains("429") || code.contains("exhaust") || code.contains("quota"))
         {
-            deps.store
-                .record_account_size_refusal(&prefrontal_routing_store::AccountSizeRefusal {
-                    provider: decision.provider.clone(),
-                    credential_id: credential.into(),
-                    model: decision.model.clone(),
-                    size_class: class,
-                    expires_at: params
-                        .get("reset_at_ms")
-                        .and_then(Value::as_i64)
-                        .filter(|reset| *reset > now)
-                        .unwrap_or(now.saturating_add(6 * 60 * 60_000)),
-                    observed_at: now,
-                })
-                .map_err(store_refusal)?;
+            effects.size_refusal = Some(prefrontal_routing_store::AccountSizeRefusal {
+                provider: decision.provider.clone(),
+                credential_id: credential.into(),
+                model: decision.model.clone(),
+                size_class: class,
+                expires_at: params
+                    .get("reset_at_ms")
+                    .and_then(Value::as_i64)
+                    .filter(|reset| *reset > now)
+                    .unwrap_or(now.saturating_add(6 * 60 * 60_000)),
+                observed_at: now,
+            });
         }
     }
-    Ok(())
+    Ok(effects)
 }
 
-/// The usage-history row id of a v1 decision's report. One report stands per
-/// decision, and the row is keyed by this id, so usage is counted once.
-fn usage_row_id(decision_id: &str) -> String {
-    format!("routing-v1-report:{decision_id}")
+/// Usage retries share an identity only within their decision and run.
+fn usage_row_id(decision_id: &str, run_id: Option<&str>) -> String {
+    match run_id {
+        Some(run) => format!("routing-v1-report:{decision_id}:run:{run}"),
+        None => format!("routing-v1-report:{decision_id}"),
+    }
 }
 
-/// Add a report's usage to the route's usage history, the table
+/// Prepare usage for the atomic report write into the history table that
 /// `route.record_usage` writes. A count the report leaves out stays unknown
 /// (NULL), never zero. The history's output count cannot be unknown, so a
 /// report without `output_tokens` adds no row: its counts stay only in the
@@ -335,20 +344,20 @@ fn usage_row_id(decision_id: &str) -> String {
 /// tool time on an agentic run, so the row is recorded untimed: it has no
 /// duration and is never a speed sample. The timing members stay in the
 /// stored report body.
-fn record_usage(
+fn prepare_usage(
     usage: &cortexkit_role_routing::report::Usage,
     decision: &prefrontal_routing_store::V1Decision,
     reported_credential: Option<&str>,
     deps: &Deps<'_>,
     now: u64,
-) -> Result<(), Refusal> {
+) -> Result<Option<prefrontal_routing_store::V1ReportUsage>, Refusal> {
     let Some(output) = usage.output_tokens else {
-        return Ok(());
+        return Ok(None);
     };
     let reasoning = usage.reasoning_tokens;
     let observed_ms = now as f64;
     let facts = prefrontal_routing_core::NativeUsageFacts {
-        message_id: usage_row_id(&decision.decision_id),
+        message_id: usage_row_id(&decision.decision_id, usage.run_id.as_deref()),
         provider_id: decision.provider.clone(),
         model_id: decision.model.clone(),
         variant: decision.variant.clone(),
@@ -367,11 +376,8 @@ fn record_usage(
         crate::model_resolution::usage_observation_from_store(facts, deps.store)
             .map_err(store_refusal)?
     else {
-        return Ok(());
+        return Ok(None);
     };
-    deps.store
-        .record_usage_delivery_for_decision(&observation, &decision.decision_id)
-        .map_err(store_refusal)?;
     let cost = usage
         .service_tier_served
         .as_deref()
@@ -431,27 +437,12 @@ fn record_usage(
             );
             crate::service_tiers::usage_cost(&fact, usage)
         });
-    deps.store
-        .record_usage_service_tier(
-            &observation.id,
-            usage.service_tier_applied.as_deref(),
-            usage.service_tier_served.as_deref(),
-            cost,
-        )
-        .map_err(store_refusal)
-}
-
-/// The recorded first report's answer when `body_json` is the same body, and
-/// `report_conflict` when it is not.
-fn standing_answer(first: V1Recorded, body_json: &str) -> Result<Value, Refusal> {
-    if first.body_json != body_json {
-        return Err(Refusal::new(
-            RefusalCode::ReportConflict,
-            "a report with a different body was already recorded for this decision",
-        ));
-    }
-    serde_json::from_str(&first.answer_json)
-        .map_err(|error| store_refusal(format!("stored report answer undecodable: {error}")))
+    Ok(Some(prefrontal_routing_store::V1ReportUsage {
+        observation,
+        tier_applied: usage.service_tier_applied.clone(),
+        tier_served: usage.service_tier_served.clone(),
+        cost,
+    }))
 }
 
 /// A timed failure is still only an error. Confirmed exhaustion belongs to
@@ -460,6 +451,7 @@ fn ledger_outcome(request: &ReportRequest, _now_ms: u64) -> RouteOutcome {
     match &request.outcome {
         Outcome::Completed => RouteOutcome::Completed,
         Outcome::Cancelled => RouteOutcome::Cancelled,
+        _ if !request.outcome.is_failure() => RouteOutcome::Interrupted,
         _ => RouteOutcome::Error,
     }
 }
@@ -477,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn only_completed_and_cancelled_are_not_failures_in_the_ledger() {
+    fn declared_outcomes_follow_the_contract_penalty_matrix_in_the_ledger() {
         assert_eq!(
             ledger_outcome(&request("completed", None), 0),
             RouteOutcome::Completed
@@ -486,6 +478,17 @@ mod tests {
             ledger_outcome(&request("cancelled", None), 0),
             RouteOutcome::Cancelled
         );
+        for outcome in [
+            "contract_error",
+            "session_error",
+            "interrupted",
+            "launch_failed",
+        ] {
+            assert_eq!(
+                ledger_outcome(&request(outcome, None), 0),
+                RouteOutcome::Interrupted
+            );
+        }
         for outcome in ["failed", "refused", "timed_out", "vanished"] {
             assert_eq!(
                 ledger_outcome(&request(outcome, None), 0),

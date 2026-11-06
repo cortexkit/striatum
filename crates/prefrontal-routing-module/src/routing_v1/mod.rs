@@ -64,6 +64,8 @@ mod profile_tests;
 #[cfg(test)]
 pub(crate) mod replay_tests;
 #[cfg(test)]
+mod report_delivery_tests;
+#[cfg(test)]
 mod report_fence_tests;
 #[cfg(test)]
 mod runners_tests;
@@ -222,6 +224,28 @@ pub(crate) async fn serve(
     )
     .map_err(|error| ModuleError::Message(error.to_string()))?;
     send(writer, reply).await
+}
+
+pub(crate) fn record_call(
+    body: &[u8],
+    channel: u16,
+    epoch: u32,
+    store: &prefrontal_routing_store::SqliteRouteStateStore,
+) -> Result<(), ModuleError> {
+    if let Ok(request) = serde_json::from_slice::<Value>(body) {
+        if let Some(method) = request.get("method").and_then(Value::as_str) {
+            let params = request.get("params").unwrap_or(&Value::Null);
+            let caller = Caller::for_route(channel, epoch);
+            store
+                .record_routing_call(
+                    method,
+                    shapes::census_shape(method, params),
+                    &caller.principal,
+                )
+                .map_err(|error| ModuleError::Message(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 async fn answer(
