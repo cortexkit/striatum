@@ -20,6 +20,7 @@ use prefrontal_routing_store::V1Recorded;
 use serde_json::{json, Value};
 
 use super::{account_ctx, now_ms, provider_refusal, Caller, Deps};
+use crate::account_refusal_log::{because, checking};
 use crate::account_selection::{self, OpReply, ACCOUNT_FOR_OP};
 use crate::{account_quota, config_overrides};
 
@@ -111,6 +112,7 @@ impl AccountCaller<'_> {
 /// allocator hashes the stamped conversation ref within that namespace, so a
 /// child can look up its parent's reported use without sharing admission ids.
 fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCaller<'a>, Refusal> {
+    checking("caller_check");
     let runners = super::runners::effective(deps);
     if caller.binding_is_current() {
         if let Some(module) = caller
@@ -157,10 +159,17 @@ pub(super) fn account_for(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
+    crate::account_refusal_log::record("route.account_for", &caller.principal, params, || {
+        account_for_inner(params, caller, deps)
+    })
+}
+
+fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
     let authority = account_caller(caller, deps)?;
     if params["mode"] == "continue" {
         return continue_account(params, caller, &authority, deps);
     }
+    checking("account_for_shape");
     super::refuse_unknown_members(params, FOR_MEMBERS)?;
     super::shapes::closed(params, "expected_pin", &["id", "generation"])?;
     super::shapes::closed(
@@ -181,6 +190,7 @@ pub(super) fn account_for(
         }
         refusal
     })?;
+    checking("account_for_parse");
     let mut request = parse_account_for_request_serving(params, super::describe::CAPABILITIES)?;
     if let Some(scope) = authority.session {
         request.conversation_key = scope.reference.clone();
@@ -192,6 +202,7 @@ pub(super) fn account_for(
     // The whole body with defaults applied: two bodies that differ only in a
     // member left out versus sent with its default are the same admission.
     let body_json = serde_json::to_string(&request.normalized()).map_err(internal_unavailable)?;
+    checking("admission_replay");
     if let Some(first) = deps
         .store
         .v1_admission(&principal, &request.admission_id)
@@ -201,6 +212,7 @@ pub(super) fn account_for(
     }
     let mut bound_tier = None;
     if let Some(decision_id) = &request.decision_id {
+        checking("decision_binding");
         // Honoured only from the runner the decision named, for the model it
         // named; anything else is refused as if the decision never existed.
         let decision = deps
@@ -212,7 +224,7 @@ pub(super) fn account_for(
                 && same_name(&decision.provider, &request.provider)
                 && same_name(&decision.model, &request.model)
         }) {
-            return Err(Refusal::unknown_decision());
+            return Err(because("unknown_decision", Refusal::unknown_decision()));
         }
         bound_tier = deps
             .store
@@ -225,6 +237,7 @@ pub(super) fn account_for(
                 Some(tier),
             )
         }) {
+            checking("bound_service_tier");
             return Err(account_unavailable(
                 "A request bound to an earlier routing decision keeps that decision's service tier. Send the same tier, or ask routing for a new decision to change it.",
             ));
@@ -291,6 +304,7 @@ pub(super) fn account_for(
         config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
     // The shared context reports a store failure; for `account_for` that is
     // transient unavailability, not the open `store_error` code.
+    checking("account_context");
     let ctx = account_ctx(deps, flags, &policy)
         .map_err(|refusal| account_unavailable(refusal.message))?;
     let answer = match account_selection::handle(ACCOUNT_FOR_OP, &body, &authority.principal, &ctx)
@@ -315,11 +329,13 @@ pub(super) fn account_for(
             .as_deref()
             .is_some_and(|tier| tier != "standard" && chosen != Some(tier))
     {
+        checking("chosen_service_tier");
         return Err(account_unavailable(
             "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
         ));
     }
     let answer_json = serde_json::to_string(&answer).map_err(internal_unavailable)?;
+    checking("admission_record");
     let standing = deps
         .store
         .v1_record_admission(
@@ -341,6 +357,7 @@ fn continue_account(
     authority: &AccountCaller<'_>,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
+    checking("continuation_parse");
     super::refuse_unknown_members(
         params,
         &[
@@ -372,7 +389,9 @@ fn continue_account(
         cortexkit_role_routing::account_continue::parse_continue_request(params, &describe)?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
     let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
+    checking("account_context");
     let ctx = account_ctx(deps, flags, &policy).map_err(|r| account_unavailable(r.message))?;
+    checking("continuation_allocation");
     account_selection::continue_account(
         &request,
         &authority.principal,
@@ -388,6 +407,7 @@ fn continue_account(
 /// The first admission's answer when `body_json` is the same body, and
 /// `admission_conflict` when it is not.
 fn standing_answer(first: V1Recorded, body_json: &str) -> Result<Value, Refusal> {
+    checking("admission_replay");
     if first.body_json != body_json {
         return Err(Refusal::new(
             RefusalCode::AdmissionConflict,
@@ -484,6 +504,9 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
 /// so it becomes the untimed `auth_required`, never a transient retry.
 /// This arm is the backstop.
 fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refusal {
+    if let Some(detail) = detail {
+        crate::account_refusal_log::allocator_refusal(detail);
+    }
     let wait_until = || {
         detail
             .and_then(|detail| detail.get("retry_after_s"))
@@ -520,12 +543,23 @@ pub(super) fn account_observe(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
+    crate::account_refusal_log::record("route.account_observe", &caller.principal, params, || {
+        account_observe_inner(params, caller, deps)
+    })
+}
+
+fn account_observe_inner(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
     let runner_authority = account_caller(caller, deps);
     if let Err(refusal) = &runner_authority {
         if params["decision_id"].as_str().is_none() || params["admission_id"].as_str().is_none() {
             return Err(refusal.clone());
         }
     }
+    checking("account_observe_parse");
     super::refuse_unknown_members(params, OBSERVE_MEMBERS)?;
     let request = parse_account_observe_request_serving(params, super::describe::CAPABILITIES)?;
     let owner_decision;
@@ -536,6 +570,7 @@ pub(super) fn account_observe(
             authority
         }
         Err(refusal) => {
+            checking("observation_owner_authorization");
             let (Some(decision_id), Some(admission_id)) =
                 (&request.decision_id, &request.admission_id)
             else {
@@ -551,6 +586,7 @@ pub(super) fn account_observe(
             else {
                 return Err(refusal);
             };
+            checking("observation_consumer_authorization");
             super::consumers::effective(&super::operator_config(deps))
                 .admit(&decision.consumer, caller)?;
             admission_principal = format!("reserved:{}", decision.runner_module);
@@ -561,6 +597,7 @@ pub(super) fn account_observe(
             let admission_body = admission
                 .as_ref()
                 .and_then(|standing| serde_json::from_str::<Value>(&standing.body_json).ok());
+            checking("observation_admission_authorization");
             cortexkit_role_routing::observe::check_observe_authorization(
                 cortexkit_role_routing::observe::ObserveArm::decision_owner(
                     decision_id,
@@ -580,6 +617,7 @@ pub(super) fn account_observe(
     };
     // The allocator reads these two as closed sets of its own.
     if let Some(origin) = &request.upstream_origin {
+        checking("observation_origin");
         serde_json::from_value::<prefrontal_routing_core::accounts::evidence::FrameOrigin>(json!(
             origin
         ))
@@ -591,6 +629,7 @@ pub(super) fn account_observe(
         })?;
     }
     if let Some(source) = &request.resets_at_source {
+        checking("observation_reset_source");
         serde_json::from_value::<prefrontal_routing_core::accounts::evidence::ResetSource>(json!(
             source
         ))
@@ -612,6 +651,7 @@ pub(super) fn account_observe(
     }
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
     let policy = config_overrides::live_config(deps.routing_config_path).allocator_policy("");
+    checking("account_context");
     let ctx = account_ctx(deps, flags, &policy)?;
     let reply = account_selection::observe_authorized(
         &legacy,

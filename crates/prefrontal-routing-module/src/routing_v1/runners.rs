@@ -18,6 +18,9 @@ use crate::{
     config_policy::RunnerPolicy,
 };
 
+mod describe_cache;
+pub(crate) use describe_cache::DescribeCache;
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveRunner {
     #[serde(flatten)]
@@ -386,6 +389,7 @@ pub(crate) async fn refresh_loop(
     config_path: std::path::PathBuf,
 ) {
     use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
+    let mut cache = DescribeCache::default();
     loop {
         let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
@@ -397,11 +401,22 @@ pub(crate) async fn refresh_loop(
                 .map_err(|error| error.to_string())?;
             let modules =
                 serde_json::to_value(catalog.modules).map_err(|error| error.to_string())?;
-            let declarations = declarations_from_catalog(&modules);
+            Ok::<_, String>((consumer, modules))
+        })
+        .await;
+        if let Ok(Ok((consumer, modules))) = result {
+            super::consumers::replace_catalog(&modules);
             let policies = crate::config_overrides::live_config(&config_path).v1_runners();
-            let tier_modules = tier_discovery_modules(&modules, &declarations, &policies);
-            let mut tiers = std::collections::BTreeMap::new();
-            let mut routed_accounts = std::collections::BTreeMap::new();
+            let tier_modules = if let Ok(mut credentials) = credentials.lock() {
+                cache.catalog(
+                    &modules,
+                    &policies,
+                    &mut credentials,
+                    crate::now_ms() as i64,
+                )
+            } else {
+                BTreeSet::new()
+            };
             // The routing declaration describes reach, not tier application.
             // Only the runner's own role.describe can establish tier support.
             for module in tier_modules {
@@ -417,40 +432,27 @@ pub(crate) async fn refresh_loop(
                             "prefrontal-routing",
                             "runner-service-tiers",
                         ),
-                        serde_json::to_vec(
-                            &serde_json::json!({"method":"role.describe", "params":{}}),
-                        )
-                        .map_err(|error| error.to_string())?,
+                        br#"{"method":"role.describe","params":{}}"#.to_vec(),
                         CallOptions {
                             timeout: std::time::Duration::from_secs(1),
                             ..Default::default()
                         },
                     )
                     .await;
-                if let Ok(bytes) = reply {
-                    if let Ok(describe) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        if let Some(support) = service_tiers_from_describe(&describe) {
-                            tiers.insert(module.clone(), support);
-                        }
-                        if let Some(methods) = routed_accounts_from_describe(&describe) {
-                            routed_accounts.insert(module.clone(), methods);
-                        }
-                    }
+                let describe = reply
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                if let Ok(mut credentials) = credentials.lock() {
+                    cache.reply(
+                        &module,
+                        describe.as_ref(),
+                        &mut credentials,
+                        crate::now_ms() as i64,
+                    );
                 }
             }
-            Ok::<_, String>((modules, declarations, tiers, routed_accounts))
-        })
-        .await;
-        if let Ok(Ok((modules, declarations, tiers, routed_accounts))) = result {
-            super::consumers::replace_catalog(&modules);
-            if let Ok(mut credentials) = credentials.lock() {
-                credentials.runner_declarations = declarations;
-                credentials.runner_service_tiers = tiers;
-                credentials.runner_routed_accounts = routed_accounts;
-            }
         } else if let Ok(mut credentials) = credentials.lock() {
-            credentials.runner_service_tiers.clear();
-            credentials.runner_routed_accounts.clear();
+            cache.missed_all(&mut credentials, crate::now_ms() as i64);
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }

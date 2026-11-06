@@ -10,7 +10,7 @@ use rusqlite::types::ValueRef;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::conformance_tests::{install_catalog, reserved, Harness};
+use super::conformance_tests::{install_catalog, reserved, Harness, Route};
 use super::dispatch_tests::configured;
 
 const NOW: i64 = 1_800_000_000_000;
@@ -431,6 +431,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "select_prefer_prompt_cache",
                                 "select_settings",
                                 "observe_backoff",
+                                "observe_credential_refused",
                                 "select_panel",
                                 "consumer_models",
                             ][..],
@@ -637,6 +638,153 @@ async fn replay_client_shapes() {
     );
     assert_or_record("head-choices-difference-9", json!(head_choices));
     assert_or_record("client-shapes", json!({"clock_ms":NOW, "sets":sets}));
+}
+
+async fn broca_decision_tier_pool_admit() -> (std::sync::Arc<Harness>, Route, Value) {
+    let mut params: Value =
+        serde_json::from_slice(
+            &std::fs::read(Path::new(ROOT).join(
+                "clients/broca/02-broca-route.account_for-admit-decision-tier-pool-hint.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+    let harness = Harness::new("broca-candidate-refusal");
+    install_client_catalog(&harness, "broca");
+    harness.edit_config(|config| {
+        config["consumers"]["core"] = json!({"owner":"prefrontal-core"});
+    });
+    let owner = harness.bind(reserved("prefrontal-core"), None).await;
+    let (ty, selected) = owner
+        .call(
+            "route.select",
+            &json!({"consumer":"core", "requirements":{"iq":50},
+                "pin":"openai/gpt-6.1-sol", "runners":["broca"]}),
+        )
+        .await;
+    assert_eq!(ty, subc_protocol::FrameType::Response, "{selected}");
+    params["decision_id"] = selected["result"]["decision_id"].clone();
+    let runner = harness.bind(reserved("broca"), None).await;
+    (harness, runner, params)
+}
+
+#[tokio::test]
+async fn broca_foreign_candidates_keep_unavailable_with_exclusions() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let (_harness, runner, params) = broca_decision_tier_pool_admit().await;
+    crate::take_operator_warnings();
+    let (ty, reply) = runner.call("route.account_for", &params).await;
+    assert_eq!(ty, subc_protocol::FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "account_selection_unavailable", "{reply}");
+    assert_eq!(
+        reply["detail"]["exclusions"],
+        json!([{
+            "account_id":"acct-openai-a", "reason":"not_in_runner_candidates",
+        }]),
+        "{reply}"
+    );
+    let lines = crate::take_operator_warnings();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let fields: Value = serde_json::from_str(
+        lines[0]
+            .strip_prefix("[TODO(user): account operation refused] ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fields["reason"], "candidates_filter");
+    assert_eq!(
+        fields["exclusions"],
+        "acct-openai-a:not_in_runner_candidates"
+    );
+    assert_eq!(fields["op"], "route.account_for");
+    assert_eq!(fields["principal"], "reserved:broca");
+    assert_eq!(fields["provider"], "openai");
+    assert_eq!(fields["model"], "gpt-6.1-sol");
+    assert_eq!(fields["hold_wait_max_s"], 300);
+    for field in [
+        "decision_id_present",
+        "candidates_present",
+        "requested_account_present",
+        "conversation_key_present",
+    ] {
+        assert_eq!(fields[field], true, "{fields}");
+    }
+    assert!(!lines[0].contains("core-session:"));
+    assert!(!lines[0].contains("chatgpt:openai:example-a"));
+}
+
+#[tokio::test]
+async fn refused_observation_logs_one_reason_without_header_or_credential_material() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let (_harness, runner, _) = broca_decision_tier_pool_admit().await;
+    crate::take_operator_warnings();
+    let (ty, reply) = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "caller":{"runner":"broca"}, "event_id":"", "kind":"attempt",
+                "headers":{"authorization":"Bearer secret-header-value"},
+                "unexpected_secret":"secret-request-value",
+            }),
+        )
+        .await;
+    assert_eq!(ty, subc_protocol::FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "invalid_request");
+    let lines = crate::take_operator_warnings();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("observation_event_id"), "{lines:?}");
+    assert!(!lines[0].contains("secret-header-value"));
+    assert!(!lines[0].contains("secret-request-value"));
+    assert!(!lines[0].contains("authorization"));
+}
+
+#[tokio::test]
+async fn broca_existing_credential_refused_candidate_is_exhausted() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let (_harness, runner, mut params) = broca_decision_tier_pool_admit().await;
+    params["candidates"]["accounts"] = json!([{
+        "account_id":"acct-openai-a", "credential_id":"oauth:openai:example-a",
+    }]);
+    params["requested_account"] = json!({"credential_id":"oauth:openai:example-a"});
+    let (ty, observed) = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id":"broca-key-refused", "kind":"credential_refused",
+                "credential_id":"oauth:openai:example-a",
+            }),
+        )
+        .await;
+    assert_eq!(ty, subc_protocol::FrameType::Response, "{observed}");
+    let (ty, reply) = runner.call("route.account_for", &params).await;
+    assert_eq!(ty, subc_protocol::FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "account_pool_exhausted", "{reply}");
+}
+
+#[tokio::test]
+async fn broca_foreign_candidates_do_not_require_login_when_real_account_is_blocked() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let (_harness, runner, params) = broca_decision_tier_pool_admit().await;
+    let (ty, observed) = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id":"broca-key-refused", "kind":"credential_refused",
+                "credential_id":"oauth:openai:example-a",
+            }),
+        )
+        .await;
+    assert_eq!(ty, subc_protocol::FrameType::Response, "{observed}");
+    let (ty, reply) = runner.call("route.account_for", &params).await;
+    assert_eq!(ty, subc_protocol::FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "account_selection_unavailable", "{reply}");
+    assert_eq!(
+        reply["detail"]["exclusions"],
+        json!([{
+            "account_id":"acct-openai-a", "reason":"not_in_runner_candidates",
+        }]),
+        "{reply}"
+    );
 }
 
 fn install_client_catalog(harness: &Harness, client: &str) {
