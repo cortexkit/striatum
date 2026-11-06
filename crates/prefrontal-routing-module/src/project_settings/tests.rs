@@ -354,3 +354,152 @@ async fn concurrent_requests_share_one_refresh_and_cache_reuse() {
     );
     assert_eq!(source.count("enumerate"), 1);
 }
+
+struct HangingSource {
+    inner: Arc<Fake>,
+    hang: std::sync::atomic::AtomicBool,
+    calls: AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl Source for HangingSource {
+    async fn request(&self, body: Value) -> Result<Value, String> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if self.hang.load(Ordering::Relaxed) {
+            std::future::pending().await
+        } else {
+            self.inner.request(body).await
+        }
+    }
+}
+
+struct WarningCounter(Arc<AtomicU64>);
+
+impl tracing::Subscriber for WarningCounter {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[tokio::test]
+async fn never_answering_source_and_concurrent_waiter_have_independent_two_second_deadlines() {
+    assert_eq!(SETTINGS_DEADLINE, Duration::from_secs(2));
+    let warnings = Arc::new(AtomicU64::new(0));
+    let _subscriber = tracing::subscriber::set_default(WarningCounter(warnings.clone()));
+    let source = Arc::new(HangingSource {
+        inner: Fake::new(census(&[], None)),
+        hang: true.into(),
+        calls: AtomicU64::new(0),
+    });
+    let resolver = Resolver::new(source.clone());
+    let read = || async {
+        let started = Instant::now();
+        let result = resolver.layers(ID, 1).await;
+        (result, started.elapsed())
+    };
+    let limit = Duration::from_millis(2500);
+    let (first, second) = tokio::time::timeout(limit, async { tokio::join!(read(), read()) })
+        .await
+        .expect("a stalled source must not outlive each caller's settings deadline");
+    for ((layers, status), elapsed) in [first, second] {
+        assert_eq!(status, ProjectSettings::Unresolved);
+        assert_eq!(tier(&layers, "m"), None);
+        assert!(elapsed <= limit, "caller waited {elapsed:?}");
+    }
+    assert_eq!(
+        source.calls.load(Ordering::Relaxed),
+        1,
+        "waiters must share the timed-out flight"
+    );
+    assert_eq!(
+        warnings.load(Ordering::Relaxed),
+        1,
+        "one warning for this project outage"
+    );
+}
+
+#[tokio::test]
+async fn timed_out_refresh_returns_empty_layers_even_with_a_warm_cache() {
+    let project = root();
+    write(&project, r#"{"providers":{"p":{"service_tier":"fast"}}}"#);
+    let source = Arc::new(HangingSource {
+        inner: Fake::new(census(&[project], None)),
+        hang: false.into(),
+        calls: AtomicU64::new(0),
+    });
+    let resolver = Resolver::new(source.clone());
+    assert_eq!(resolver.layers(ID, 1).await.1, ProjectSettings::Applied);
+    source.hang.store(true, Ordering::Relaxed);
+    let limit = Duration::from_millis(2500);
+    let ((layers, status), (_, waiter_status)) = tokio::time::timeout(limit, async {
+        tokio::join!(
+            resolver.layers(ID, REFRESH_MS + 1),
+            resolver.layers(ID, REFRESH_MS + 1)
+        )
+    })
+    .await
+    .expect("a warm-cache refresh and its waiter have bounded latency");
+    assert_eq!(status, ProjectSettings::Unresolved);
+    assert_eq!(waiter_status, ProjectSettings::Unresolved);
+    assert_eq!(tier(&layers, "m"), None);
+    assert_eq!(
+        source.calls.load(Ordering::Relaxed),
+        3,
+        "one initial resolve/enumerate pair and one shared refresh"
+    );
+}
+
+#[tokio::test]
+async fn registry_errors_log_once_per_project_outage_and_rearm_after_recovery() {
+    let warnings = Arc::new(AtomicU64::new(0));
+    let _subscriber = tracing::subscriber::set_default(WarningCounter(warnings.clone()));
+    let source = Fake::new(census(&[], None));
+    let resolver = Resolver::new(source.clone());
+    source.fail.store(true, Ordering::Relaxed);
+    for now in [1, 2] {
+        assert_eq!(
+            resolver.layers(ID, now).await.1,
+            ProjectSettings::Unresolved
+        );
+    }
+    assert_eq!(warnings.load(Ordering::Relaxed), 1);
+    source.fail.store(false, Ordering::Relaxed);
+    assert_eq!(resolver.layers(ID, 3).await.1, ProjectSettings::None);
+    source.fail.store(true, Ordering::Relaxed);
+    for now in [REFRESH_MS + 3, 2 * REFRESH_MS + 3] {
+        assert_eq!(resolver.layers(ID, now).await.1, ProjectSettings::None);
+    }
+    assert_eq!(
+        warnings.load(Ordering::Relaxed),
+        2,
+        "warm-cache fallback must not rearm warnings while the registry is still unavailable"
+    );
+}
+
+#[tokio::test]
+async fn a_cache_waiter_has_its_own_deadline_before_any_request_can_start() {
+    let source = Fake::new(census(&[], None));
+    let resolver = Resolver::new(source.clone());
+    let _held = resolver.cache.lock().await;
+    let started = Instant::now();
+    let (layers, status) =
+        tokio::time::timeout(Duration::from_millis(2500), resolver.layers(ID, 1))
+            .await
+            .expect("cache contention must not outlive the waiting caller's deadline");
+    assert_eq!(status, ProjectSettings::Unresolved);
+    assert_eq!(tier(&layers, "m"), None);
+    assert!(started.elapsed() <= Duration::from_millis(2500));
+    assert!(source.calls.lock().unwrap().is_empty());
+}

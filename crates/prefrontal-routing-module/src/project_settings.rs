@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use cortexkit_project_identity::{
     EnumerateParams, EnumerateReply, Outcome, Request, ResolveProjectIdReply,
@@ -10,11 +11,39 @@ use cortexkit_project_identity::{
 use cortexkit_role_routing::select::ProjectSettings;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
+use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::tier_settings::Layers;
 
 const REFRESH_MS: u64 = 60_000;
 const MAX_STALE_MS: u64 = 10 * 60_000;
+const SETTINGS_DEADLINE: Duration = Duration::from_secs(2);
+
+enum ReadError {
+    Timeout,
+    Unavailable(String),
+}
+
+impl From<String> for ReadError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<&str> for ReadError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.into())
+    }
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => out.write_str("Entorhinal settings deadline exceeded"),
+            Self::Unavailable(error) => out.write_str(error),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 pub(crate) trait Source: Send + Sync {
@@ -113,6 +142,8 @@ struct Cache {
     last_success: Option<u64>,
     resolved: HashMap<String, Option<String>>,
     missed: HashSet<String>,
+    last_timeout: Option<Instant>,
+    registry_unavailable: bool,
 }
 
 pub(crate) struct Resolver {
@@ -120,6 +151,7 @@ pub(crate) struct Resolver {
     // The lock covers registry reads and publication. Concurrent requests share
     // one refresh rather than racing separate census/alias snapshots.
     cache: Mutex<Cache>,
+    warned_projects: std::sync::Mutex<HashSet<String>>,
 }
 
 impl Resolver {
@@ -127,14 +159,48 @@ impl Resolver {
         Self {
             source,
             cache: Mutex::new(Cache::default()),
+            warned_projects: Default::default(),
         }
     }
 
-    async fn refresh(&self, cache: &mut Cache, now: u64) -> Result<(), String> {
+    async fn request(&self, body: Value) -> Result<Value, ReadError> {
+        // Source::request includes connection setup, so its timeout also covers
+        // a stall before the Entorhinal operation can be sent.
+        timeout(SETTINGS_DEADLINE, self.source.request(body))
+            .await
+            .map_err(|_| ReadError::Timeout)?
+            .map_err(ReadError::Unavailable)
+    }
+
+    fn warn_once(&self, project_id: &str, error: &ReadError) {
+        let first_warning = self
+            .warned_projects
+            .lock()
+            .unwrap()
+            .insert(project_id.into());
+        if first_warning {
+            tracing::warn!(project_id, %error, "project settings unresolved");
+        }
+    }
+
+    fn unresolved(&self, project_id: &str, error: &ReadError) -> (Layers, ProjectSettings) {
+        self.warn_once(project_id, error);
+        (Layers::new(None, None), ProjectSettings::Unresolved)
+    }
+
+    async fn refresh(&self, cache: &mut Cache, now: u64) -> Result<(), ReadError> {
         cache.last_attempt = Some(now);
         let body = serde_json::to_value(Request::new("enumerate", EnumerateParams::new(None)))
             .map_err(|error| error.to_string())?;
-        let census = Census::decode(self.source.request(body).await?)?;
+        let result =
+            async { Census::decode(self.request(body).await?).map_err(ReadError::from) }.await;
+        let census = match result {
+            Ok(census) => census,
+            Err(error) => {
+                cache.registry_unavailable = true;
+                return Err(error);
+            }
+        };
         if cache
             .census
             .as_ref()
@@ -147,6 +213,7 @@ impl Resolver {
         // machine-local facts and can change without a generation bump.
         cache.census = Some(census);
         cache.last_success = Some(now);
+        cache.registry_unavailable = false;
         Ok(())
     }
 
@@ -155,14 +222,20 @@ impl Resolver {
         cache: &mut Cache,
         id: &str,
         now: u64,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>, ReadError> {
         if let Some(id) = cache.resolved.get(id) {
             return Ok(id.clone());
         }
-        let value = self
-            .source
+        let value = match self
             .request(json!({"method":"resolve_project_id", "params":{"projectId":id}}))
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                cache.registry_unavailable = true;
+                return Err(error);
+            }
+        };
         let outcome: Outcome<ResolveProjectIdReply> =
             serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
         let Outcome::Success(success) = outcome else {
@@ -195,25 +268,74 @@ impl Resolver {
     }
 
     pub(crate) async fn layers(&self, project_id: &str, now: u64) -> (Layers, ProjectSettings) {
-        let mut cache = self.cache.lock().await;
+        let started = Instant::now();
+        let deadline = started + SETTINGS_DEADLINE;
+        let mut cache = match timeout_at(deadline, self.cache.lock()).await {
+            Ok(cache) => cache,
+            Err(_) => return self.unresolved(project_id, &ReadError::Timeout),
+        };
+        // Waiters share the timed-out flight's result instead of starting a
+        // fresh two-second request when its owner releases the cache lock.
+        if cache.last_timeout.is_some_and(|at| at >= started) {
+            return self.unresolved(project_id, &ReadError::Timeout);
+        }
+        match timeout_at(deadline, self.layers_cached(&mut cache, project_id, now)).await {
+            Ok(Ok((layers, applied))) => {
+                if !cache.registry_unavailable {
+                    self.warned_projects.lock().unwrap().remove(project_id);
+                }
+                (
+                    layers,
+                    if applied {
+                        ProjectSettings::Applied
+                    } else {
+                        ProjectSettings::None
+                    },
+                )
+            }
+            Ok(Err(ReadError::Unavailable(error))) => {
+                if error != "project id is gone" {
+                    self.warn_once(project_id, &ReadError::Unavailable(error));
+                }
+                (Layers::new(None, None), ProjectSettings::Unresolved)
+            }
+            Ok(Err(ReadError::Timeout)) | Err(_) => {
+                // Publish failure before unlocking, including when cancelling
+                // layers_cached at its overall (rather than per-request) limit.
+                cache.last_timeout = Some(Instant::now());
+                cache.registry_unavailable = true;
+                self.unresolved(project_id, &ReadError::Timeout)
+            }
+        }
+    }
+
+    async fn layers_cached(
+        &self,
+        cache: &mut Cache,
+        project_id: &str,
+        now: u64,
+    ) -> Result<(Layers, bool), ReadError> {
         if cache.census.is_some()
             && cache
                 .last_attempt
                 .is_none_or(|at| now.saturating_sub(at) >= REFRESH_MS)
         {
-            if let Err(error) = self.refresh(&mut cache, now).await {
-                tracing::warn!(project_id, %error, "project settings census unavailable");
+            if let Err(error) = self.refresh(cache, now).await {
+                if matches!(error, ReadError::Timeout) {
+                    return Err(error);
+                }
+                self.warn_once(project_id, &error);
             }
         }
         let result = async {
-            let Some(canonical) = self.canonical_id(&mut cache, project_id, now).await? else {
+            let Some(canonical) = self.canonical_id(cache, project_id, now).await? else {
                 return Err("project id is gone".into());
             };
             if !cache
                 .last_success
                 .is_some_and(|at| now.saturating_sub(at) <= MAX_STALE_MS)
             {
-                return Err("project settings census expired".to_owned());
+                return Err("project settings census expired".into());
             }
             if cache
                 .census
@@ -222,7 +344,7 @@ impl Resolver {
                 .is_none()
                 && cache.missed.insert(canonical.clone())
             {
-                self.refresh(&mut cache, now).await?;
+                self.refresh(cache, now).await?;
                 cache.missed.insert(canonical.clone());
             }
             let (projects, workspace) = cache
@@ -230,25 +352,10 @@ impl Resolver {
                 .as_ref()
                 .and_then(|census| census.roots(&canonical))
                 .ok_or_else(|| "project id is absent from census".to_owned())?;
-            Layers::from_roots(&projects, workspace.as_deref())
+            Layers::from_roots(&projects, workspace.as_deref()).map_err(ReadError::from)
         }
         .await;
-        match result {
-            Ok((layers, applied)) => (
-                layers,
-                if applied {
-                    ProjectSettings::Applied
-                } else {
-                    ProjectSettings::None
-                },
-            ),
-            Err(error) => {
-                if error != "project id is gone" {
-                    tracing::warn!(project_id, %error, "project settings unresolved");
-                }
-                (Layers::new(None, None), ProjectSettings::Unresolved)
-            }
-        }
+        result
     }
 }
 
