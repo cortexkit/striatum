@@ -405,6 +405,105 @@ async fn a_v1_pin_on_a_key_pool_route_is_served() {
 }
 
 #[tokio::test]
+async fn pooled_pins_skip_a_fenced_key_but_refuse_when_every_key_is_fenced() {
+    use prefrontal_routing_core::route_state_store::CredentialRefusal;
+    const NOW: u64 = 1_800_000_000_000;
+    let _clock = crate::InjectedClock::set(NOW);
+    for pin_kind in ["explicit", "slot", "project"] {
+        let sibling = key("apikey:pool-vendor:second", &[POOL], &[POOL_VENDOR]);
+        let harness = harness_with_pool_keys(None, &[sibling.clone()]);
+        let mut credentials = BrocaCredentials::default();
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "key-pool-listing".into(),
+                credentials: vec![
+                    key("apikey:catalog:main", &[BORROWED], &[BORROWED]),
+                    key("apikey:pool-vendor:main", &[POOL], &[POOL_VENDOR]),
+                    sibling,
+                ],
+                ..Default::default()
+            },
+            NOW,
+        );
+        let credentials = Arc::new(std::sync::Mutex::new(credentials));
+        crate::credential_fences::record(
+            harness.store(),
+            &credentials,
+            &CredentialRefusal {
+                provider_id: POOL.into(),
+                credential_id: "apikey:pool-vendor:main".into(),
+                code: "ENTITLEMENT_ERROR".into(),
+            },
+            NOW as i64,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::credential_fences::live(harness.store(), &credentials)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut request = select("mason");
+        let pin = format!("{POOL}/{POOL_MODEL_SHORT}");
+        match pin_kind {
+            "explicit" => request["pin"] = json!(pin),
+            "slot" => {
+                request["pin_slot"] = json!("synthesizer");
+                harness.edit_config(|config| {
+                    config["consumers"]["synthesizer"]["pin"] = json!({"model":pin})
+                });
+            }
+            "project" => harness.edit_config(|config| {
+                config["consumers"]["mason"]["projects"]["pool-project"] = json!({"pin":pin})
+            }),
+            _ => unreachable!(),
+        }
+        let route = harness
+            .bind(reserved("example-consumer"), Some("pool-project"))
+            .await;
+        let mut legacy = legacy_select();
+        legacy["modelPin"] = json!(pin);
+        let legacy = route.call("route.select", &legacy).await;
+        assert_eq!(legacy_route(&legacy), pin, "{pin_kind}");
+        let reply = route.call("route.select", &request).await;
+        assert_eq!(answered_route(&reply), pin, "{pin_kind}");
+        assert_eq!(
+            reply.1["result"]["runner"]["auth"]["credential_id"], "apikey:pool-vendor:second",
+            "{pin_kind}: {reply:?}"
+        );
+        let answer: SelectAnswer = serde_json::from_value(reply.1["result"].clone()).unwrap();
+        let request =
+            cortexkit_role_routing_conformance::wire::select::parse_select_request_serving(
+                &request,
+                super::describe::CAPABILITIES,
+            )
+            .unwrap();
+        check_answer(&request, &answer).unwrap();
+        crate::credential_fences::record(
+            harness.store(),
+            &credentials,
+            &CredentialRefusal {
+                provider_id: POOL.into(),
+                credential_id: "apikey:pool-vendor:second".into(),
+                code: "ENTITLEMENT_ERROR".into(),
+            },
+            NOW as i64,
+        )
+        .unwrap();
+        let mut legacy = legacy_select();
+        legacy["modelPin"] = json!(pin);
+        let legacy = route.call("route.select", &legacy).await;
+        assert_eq!(legacy.0, FrameType::Error, "all keys fenced: {legacy:?}");
+        assert_eq!(legacy.1["code"], "explicit_provider_pool_exhausted");
+        let mut request = select("mason");
+        request["pin"] = json!(pin);
+        let refused = route.call("route.select", &request).await;
+        assert_eq!(refused.0, FrameType::Error, "all keys fenced: {refused:?}");
+        assert_eq!(refused.1["code"], "pin_unavailable");
+    }
+}
+
+#[tokio::test]
 async fn a_non_pool_provider_never_gets_runner_auth() {
     let harness = harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
