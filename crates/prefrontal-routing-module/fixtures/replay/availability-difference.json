@@ -33,7 +33,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000600000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -88,7 +88,7 @@
         "op": "replace",
         "path": "/launches/1/reply/message",
         "before": "example-subscription/model-c: no eligible account",
-        "after": "[TODO(user): explain the pinned route's account unavailability]"
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
       },
       {
         "op": "append",
@@ -114,7 +114,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000600000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -173,7 +173,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000600000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -225,7 +225,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000600000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -280,7 +280,7 @@
         "op": "replace",
         "path": "/launches/2/reply/message",
         "before": "example-subscription/model-c: no eligible account",
-        "after": "[TODO(user): explain the pinned route's account unavailability]"
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
       },
       {
         "op": "append",
@@ -306,7 +306,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000600000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -358,7 +358,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000600000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -423,7 +423,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000600000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -478,7 +478,7 @@
         "op": "replace",
         "path": "/launches/2/reply/message",
         "before": "example-subscription/model-c: quota_exhausted until 2027-01-15T08:10:00Z",
-        "after": "[TODO(user): explain the pinned route's account unavailability]"
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
       },
       {
         "op": "append",
@@ -504,7 +504,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000600000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -569,7 +569,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000005000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -624,7 +624,7 @@
         "op": "replace",
         "path": "/launches/2/reply/message",
         "before": "example-subscription/model-c: quota_exhausted until 2027-01-15T08:00:05Z",
-        "after": "[TODO(user): explain the pinned route's account unavailability]"
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
       },
       {
         "op": "append",
@@ -650,7 +650,7 @@
                   "reason": "quota_exhausted",
                   "reset_at_ms": 1800000005000
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -720,7 +720,7 @@
                   "pin": "example-subscription/model-c",
                   "reason": "quota_exhausted"
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -774,7 +774,7 @@
         "op": "replace",
         "path": "/launches/1/reply/message",
         "before": "example-subscription/model-c: account_pool_reserve_limited; clearing time unknown",
-        "after": "[TODO(user): explain the pinned route's account unavailability]"
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
       },
       {
         "op": "append",
@@ -799,7 +799,7 @@
                   "pin": "example-subscription/model-c",
                   "reason": "quota_exhausted"
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -857,7 +857,7 @@
                   "pin": "example-subscription/model-c",
                   "reason": "quota_exhausted"
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -908,7 +908,7 @@
                   "pin": "example-subscription/model-c",
                   "reason": "quota_exhausted"
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -962,7 +962,7 @@
         "op": "replace",
         "path": "/launches/2/reply/message",
         "before": "example-subscription/model-c: account_pool_reserve_limited; clearing time unknown",
-        "after": "[TODO(user): explain the pinned route's account unavailability]"
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
       },
       {
         "op": "append",
@@ -987,7 +987,7 @@
                   "pin": "example-subscription/model-c",
                   "reason": "quota_exhausted"
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,
@@ -1038,7 +1038,7 @@
                   "pin": "example-subscription/model-c",
                   "reason": "quota_exhausted"
                 },
-                "message": "[TODO(user): explain the pinned route's account unavailability]"
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               }
             },
             "harness": null,

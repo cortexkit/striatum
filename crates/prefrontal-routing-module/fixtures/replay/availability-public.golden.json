@@ -416,7 +416,7 @@
               "reason": "quota_exhausted",
               "reset_at_ms": 1800000600000
             },
-            "message": "[TODO(user): explain the pinned route's account unavailability]"
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
           }
         },
         {
@@ -438,7 +438,7 @@
               "reason": "quota_exhausted",
               "reset_at_ms": 1800000600000
             },
-            "message": "[TODO(user): explain the pinned route's account unavailability]"
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
           }
         }
       ],
@@ -532,7 +532,7 @@
               "reason": "quota_exhausted",
               "reset_at_ms": 1800000600000
             },
-            "message": "[TODO(user): explain the pinned route's account unavailability]"
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
           }
         }
       ],
@@ -626,7 +626,7 @@
               "reason": "quota_exhausted",
               "reset_at_ms": 1800000005000
             },
-            "message": "[TODO(user): explain the pinned route's account unavailability]"
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
           }
         }
       ],
@@ -963,7 +963,7 @@
               "pin": "example-subscription/model-c",
               "reason": "quota_exhausted"
             },
-            "message": "[TODO(user): explain the pinned route's account unavailability]"
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
           }
         },
         {
@@ -984,7 +984,7 @@
               "pin": "example-subscription/model-c",
               "reason": "quota_exhausted"
             },
-            "message": "[TODO(user): explain the pinned route's account unavailability]"
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
           }
         }
       ],
