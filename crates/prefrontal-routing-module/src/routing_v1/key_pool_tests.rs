@@ -2,15 +2,16 @@
 //!
 //! A key-pool provider (`key_pool`) is one an API key names but the catalog
 //! does not: its routes are the rows it borrows from the one catalog provider
-//! its active keys `serves`, and the key a send runs on is leased per send. A
-//! `routing/v1` answer cannot name that leased key yet, so v1 leaves such
-//! routes out of its answers while the legacy `route.select` still selects and
-//! leases them.
+//! its active keys `serves`. Legacy and routing/v1 select admit those routes;
+//! v1 names the pool and credential by public id in the runner's auth hint.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+use cortexkit_role_routing_conformance::wire::select::{
+    check_answer, parse_select_request, SelectAnswer,
+};
 use cortexkit_role_routing_conformance::CatalogModel;
 use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
 use prefrontal_routing_core::ModelFact;
@@ -103,7 +104,7 @@ fn routing_facts() -> Vec<ModelFact> {
 fn key(id: &str, providers: &[&str], serves: &[&str]) -> ListedCredential {
     ListedCredential {
         id: id.into(),
-        account_id: Some(format!("{id}-workspace")),
+        account_id: (!providers.contains(&POOL)).then(|| format!("{id}-workspace")),
         categories: vec!["llm-provider".into()],
         credential_type: "apikey".into(),
         auth_method: Some("apikey".into()),
@@ -118,6 +119,17 @@ fn key(id: &str, providers: &[&str], serves: &[&str]) -> ListedCredential {
 /// names the pool provider and `serves` the catalog provider whose rows the
 /// pool borrows.
 fn harness() -> Arc<Harness> {
+    harness_with_routed_accounts(None)
+}
+
+fn harness_with_routed_accounts(methods: Option<&[&str]>) -> Arc<Harness> {
+    harness_with_pool_keys(methods, &[])
+}
+
+fn harness_with_pool_keys(
+    methods: Option<&[&str]>,
+    additional_keys: &[ListedCredential],
+) -> Arc<Harness> {
     let harness = Harness::new("key-pool");
     let facts = routing_facts();
     harness.install_facts(&facts);
@@ -158,10 +170,14 @@ fn harness() -> Arc<Harness> {
     credentials.apply_listing(
         &ScopedCredentialListing {
             view: "key-pool-listing".into(),
-            credentials: vec![
-                key("apikey:catalog:main", &[BORROWED], &[BORROWED]),
-                key("apikey:pool-vendor:main", &[POOL], &[POOL_VENDOR]),
-            ],
+            credentials: [
+                vec![
+                    key("apikey:catalog:main", &[BORROWED], &[BORROWED]),
+                    key("apikey:pool-vendor:main", &[POOL], &[POOL_VENDOR]),
+                ],
+                additional_keys.to_vec(),
+            ]
+            .concat(),
             ..Default::default()
         },
         crate::now_ms(),
@@ -171,6 +187,34 @@ fn harness() -> Arc<Harness> {
         crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
     );
     credentials.publish_plan_prices(&json!({ "prices": [] }));
+    if let Some(methods) = methods {
+        credentials.runner_declarations.insert(
+            "zeta-runner".into(),
+            super::runners::parse_declaration(&json!({"runner": {
+                "pairs": [{"wire_api":"anthropic.messages", "auth_method":"apikey"}],
+                "follows_account_choice": true
+            }}))
+            .unwrap()
+            .unwrap(),
+        );
+        credentials.runner_routed_accounts.insert(
+            "zeta-runner".into(),
+            methods.iter().map(|method| (*method).into()).collect(),
+        );
+        credentials.wire_apis = facts
+            .iter()
+            .map(|fact| {
+                (
+                    format!("{}/{}", fact.provider_id, fact.model_id),
+                    "anthropic.messages".into(),
+                )
+            })
+            .collect();
+        credentials.publish_billing_catalog(
+            crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts)
+                .with_wire_apis(&credentials.wire_apis),
+        );
+    }
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{ "module": "zeta-runner" }]);
@@ -207,12 +251,26 @@ fn legacy_route(reply: &(FrameType, Value)) -> String {
         .to_owned()
 }
 
+fn assert_pool_answer(reply: &(FrameType, Value), request: &Value) {
+    assert_eq!(answered_route(reply), format!("{POOL}/{POOL_MODEL_SHORT}"));
+    let answer: SelectAnswer = serde_json::from_value(reply.1["result"].clone()).unwrap();
+    check_answer(&parse_select_request(request).unwrap(), &answer).unwrap();
+    assert_eq!(answer.runner.model.provider, POOL_VENDOR);
+    assert_eq!(answer.runner.model.model, POOL_MODEL_SHORT);
+    assert_eq!(
+        reply.1["result"]["runner"]["auth"],
+        json!({
+            "pool": POOL, "credential_id": "apikey:pool-vendor:main"
+        })
+    );
+}
+
 /// With no pin and no ladder, the key pool's route is the cheapest adequate
 /// one. Operator policy that keeps such a provider out of the automatic order
 /// is cleared first, so the only thing left that can keep it out of a v1 answer
-/// is the key-pool exclusion itself. The legacy surface still answers it.
+/// is the pool's standing policy. Legacy and routing/v1 select answer the same route.
 #[tokio::test]
-async fn the_automatic_order_skips_a_cheaper_key_pool_route_on_v1_but_not_on_legacy() {
+async fn the_automatic_order_answers_the_same_cheaper_pool_route_on_both_surfaces() {
     let harness = harness();
     // Clear every exclusion naming the key-pool provider, so its borrowed
     // route is a normal automatic candidate.
@@ -220,7 +278,7 @@ async fn the_automatic_order_skips_a_cheaper_key_pool_route_on_v1_but_not_on_leg
     let route = harness.bind(reserved("example-consumer"), None).await;
 
     let v1 = route.call("route.select", &select("mason")).await;
-    assert_eq!(answered_route(&v1), PLAIN, "{}", v1.1);
+    assert_pool_answer(&v1, &select("mason"));
 
     let legacy = route.call("route.select", &legacy_select()).await;
     assert_eq!(
@@ -259,11 +317,9 @@ fn clear_pool_exclusions(value: &mut Value) {
     }
 }
 
-/// A ladder that names a key-pool route first, then a plain one, answers the
-/// plain entry: the key-pool entry is skipped, not allowed to refuse the whole
-/// select.
+/// The first adequate ladder entry wins, including a key-pool route.
 #[tokio::test]
-async fn a_ladder_skips_a_key_pool_entry_and_answers_the_next_one() {
+async fn a_ladder_answers_its_first_key_pool_entry() {
     let harness = harness();
     harness.edit_config(|config| {
         config["consumers"]["mason"]["mode"] = json!("ladder");
@@ -272,13 +328,11 @@ async fn a_ladder_skips_a_key_pool_entry_and_answers_the_next_one() {
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let v1 = route.call("route.select", &select("mason")).await;
-    assert_eq!(answered_route(&v1), PLAIN, "{}", v1.1);
+    assert_pool_answer(&v1, &select("mason"));
 }
 
-/// Only a ladder with nothing else to answer refuses by naming the key-pool
-/// lease, rather than falling through to the automatic order.
 #[tokio::test]
-async fn a_ladder_of_only_key_pool_entries_refuses_by_name_on_v1() {
+async fn a_ladder_of_only_key_pool_entries_answers_on_v1() {
     let harness = harness();
     harness.edit_config(|config| {
         config["consumers"]["mason"]["mode"] = json!("ladder");
@@ -286,23 +340,12 @@ async fn a_ladder_of_only_key_pool_entries_refuses_by_name_on_v1() {
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
     let v1 = route.call("route.select", &select("mason")).await;
-    assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
-    assert_eq!(v1.1["code"], "no_route", "{}", v1.1);
-    assert!(
-        v1.1["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("key-pool")),
-        "the refusal names the key-pool lease: {}",
-        v1.1
-    );
+    assert_pool_answer(&v1, &select("mason"));
 }
 
-/// When the key pool's route is the only one that meets the demand, v1 answers
-/// the typed refusal and says why. The demand picks it by ability, not by a pin
-/// or a ladder, and the operator pin-only rule is cleared first so the automatic
-/// order is what meets the pool route.
+/// A pool route can be the only adequate automatic candidate.
 #[tokio::test]
-async fn only_a_key_pool_route_adequate_answers_the_typed_refusal_on_v1() {
+async fn only_a_key_pool_route_adequate_answers_on_v1() {
     let harness = harness();
     harness.edit_config(|config| {
         clear_pool_exclusions(config);
@@ -313,20 +356,7 @@ async fn only_a_key_pool_route_adequate_answers_the_typed_refusal_on_v1() {
     let route = harness.bind(reserved("example-consumer"), None).await;
 
     let v1 = route.call("route.select", &select("mason")).await;
-    assert_eq!(v1.0, FrameType::Error, "{}", v1.1);
-    assert_eq!(v1.1["code"], "no_route", "{}", v1.1);
-    assert_eq!(v1.1["detail"]["reason"], "no_available_model", "{}", v1.1);
-    // The only route left is the key pool's, and the refusal lists it among the
-    // routes v1 turned down rather than answering it.
-    let rejected = v1.1["detail"]["rejected"].as_array().unwrap();
-    let pool_route = format!("{POOL}/{POOL_MODEL_SHORT}");
-    assert!(
-        rejected
-            .iter()
-            .any(|row| row["routeKey"] == json!(pool_route)),
-        "the refusal names the key-pool route it will not serve: {}",
-        v1.1
-    );
+    assert_pool_answer(&v1, &select("mason"));
 
     // The same demand on the legacy shape still gets the key-pool route.
     let legacy = route
@@ -364,19 +394,234 @@ async fn the_legacy_surface_answers_the_key_pool_route() {
 }
 
 #[tokio::test]
-async fn a_v1_pin_on_a_key_pool_route_is_not_served() {
+async fn a_v1_pin_on_a_key_pool_route_is_served() {
     let harness = harness();
     let route = harness.bind(reserved("example-consumer"), None).await;
     let mut pinned = select("mason");
     pinned["pin"] = json!(format!("{POOL}/model-pool"));
     let reply = route.call("route.select", &pinned).await;
-    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert!(
-        reply.1["message"].as_str().unwrap().contains("key-pool")
-            || reply.1["code"] == "pin_unavailable",
-        "a pin on a key-pool route is never served: {}",
-        reply.1
+    assert_pool_answer(&reply, &pinned);
+    assert_eq!(reply.1["result"]["pin_outcome"], "pinned");
+}
+
+#[tokio::test]
+async fn a_non_pool_provider_never_gets_runner_auth() {
+    let harness = harness();
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let mut request = select("mason");
+    request["pin"] = json!(PLAIN);
+    let reply = route.call("route.select", &request).await;
+    assert_eq!(answered_route(&reply), PLAIN);
+    let answer: SelectAnswer = serde_json::from_value(reply.1["result"].clone()).unwrap();
+    check_answer(&parse_select_request(&request).unwrap(), &answer).unwrap();
+    assert!(answer.runner.auth.is_none());
+    assert!(reply.1["result"]["runner"].get("auth").is_none());
+}
+
+#[tokio::test]
+async fn an_unlisted_sign_in_method_still_requires_the_select_credential() {
+    let harness = harness_with_routed_accounts(Some(&["oauth"]));
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let mut request = select("mason");
+    request["pin"] = json!(format!("{POOL}/{POOL_MODEL_SHORT}"));
+    let reply = route.call("route.select", &request).await;
+    assert_pool_answer(&reply, &request);
+}
+
+#[tokio::test]
+async fn a_routed_apikey_runner_admits_renews_and_releases_the_pool_credential() {
+    use cortexkit_role_routing_conformance::wire::{
+        account::AccountForAnswer, observe::AccountObserveAnswer, wire::read_reply,
+    };
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    let owner = harness.bind(reserved("example-consumer"), None).await;
+    let runner = harness.bind(reserved("zeta-runner"), None).await;
+    let mut request = select("mason");
+    request["pin"] = json!(format!("{POOL}/{POOL_MODEL_SHORT}"));
+    let selected = owner.call("route.select", &request).await;
+    assert_eq!(
+        answered_route(&selected),
+        format!("{POOL}/{POOL_MODEL_SHORT}")
     );
+    let answer: SelectAnswer = serde_json::from_value(selected.1["result"].clone()).unwrap();
+    check_answer(&parse_select_request(&request).unwrap(), &answer).unwrap();
+    assert_eq!(answer.runner.model.provider, POOL_VENDOR);
+    assert_eq!(selected.1["result"]["runner"]["auth"], json!({"pool":POOL}));
+
+    // Under §§5.2 and 9.1, account_for names the decision's routing route;
+    // runner.model names only the vendor send and never owns its accounts.
+    let mut admit = json!({
+        "mode":"admit", "provider":answer.route.provider, "model":answer.route.model,
+        "pool":answer.runner.auth.as_ref().unwrap().pool,
+        "requested_account":{"credential_id":"apikey:pool-vendor:main"},
+        "conversation_key":"pooled-conversation", "admission_id":"pooled-admit",
+        "decision_id":answer.decision_id,
+    });
+    for (field, value) in [("provider", POOL_VENDOR), ("model", "vendor-only-model")] {
+        let mut wrong_route = admit.clone();
+        wrong_route[field] = json!(value);
+        let refused = runner.call("route.account_for", &wrong_route).await;
+        assert_eq!(refused.0, FrameType::Error, "{refused:?}");
+        assert_eq!(refused.1["code"], "unknown_decision", "{refused:?}");
+    }
+    let first = runner.call("route.account_for", &admit).await;
+    assert_eq!(first.0, FrameType::Response, "{first:?}");
+    let typed: AccountForAnswer = read_reply(&serde_json::to_vec(&first.1).unwrap()).unwrap();
+    assert_eq!(first.1["result"]["account"]["provider"], POOL);
+    assert_eq!(
+        first.1["result"]["account"]["account_id"],
+        "apikey:pool-vendor:main"
+    );
+    assert_eq!(first.1["result"]["account"]["method"], "apikey");
+    assert_eq!(
+        first.1["result"]["account"]["credential_id"],
+        "apikey:pool-vendor:main"
+    );
+    assert_eq!(runner.call("route.account_for", &admit).await, first);
+    assert!(!typed.pin.id.is_empty());
+    admit["mode"] = json!("renew");
+    admit.as_object_mut().unwrap().remove("requested_account");
+    admit["admission_id"] = json!("pooled-renew");
+    admit["expected_pin"] = json!({"id":typed.pin.id, "generation":typed.pin.generation});
+    let renewed = runner.call("route.account_for", &admit).await;
+    assert_eq!(renewed.0, FrameType::Response, "{renewed:?}");
+    let _: AccountForAnswer = read_reply(&serde_json::to_vec(&renewed.1).unwrap()).unwrap();
+    for member in ["id", "generation"] {
+        assert_eq!(
+            renewed.1["result"]["pin"][member],
+            first.1["result"]["pin"][member]
+        );
+    }
+    assert_eq!(renewed.1["result"]["account"], first.1["result"]["account"]);
+    let released = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id":"pooled-finished", "kind":"run_finished", "admission_id":"pooled-renew"
+            }),
+        )
+        .await;
+    assert_eq!(released.0, FrameType::Response, "{released:?}");
+    let _: AccountObserveAnswer = read_reply(&serde_json::to_vec(&released.1).unwrap()).unwrap();
+    assert_eq!(released.1["result"]["observation"]["bound"], true);
+    harness
+        .store()
+        .account_transaction(|tx| {
+            let row = tx
+                .admission("reserved:zeta-runner", "pooled-renew")?
+                .unwrap();
+            assert_eq!(row.state, "finished");
+            let affinity = tx
+                .affinity(&row.principal, &row.conversation_hash, POOL)?
+                .unwrap();
+            assert!(affinity
+                .lease_valid_until
+                .is_none_or(|until| until <= crate::now_ms() as i64));
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_pooled_apikey_backoff_blocks_new_admissions_without_releasing_the_pin() {
+    const NOW: u64 = 1_800_000_000_000;
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    let runner = harness.bind(reserved("zeta-runner"), None).await;
+    let admit = json!({
+        "mode":"admit", "provider":POOL, "model":POOL_MODEL_SHORT, "pool":POOL,
+        "conversation_key":"first", "admission_id":"first",
+    });
+    let first = runner.call("route.account_for", &admit).await;
+    assert_eq!(first.0, FrameType::Response, "{first:?}");
+    let backoff = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id":"pool-backoff", "kind":"transient_backoff", "admission_id":"first",
+                "retry_at_ms":NOW + 3_600_000,
+            }),
+        )
+        .await;
+    assert_eq!(backoff.0, FrameType::Response, "{backoff:?}");
+    assert_eq!(backoff.1["result"]["observation"]["bound"], true);
+    let mut next = admit;
+    next["admission_id"] = json!("next");
+    next["conversation_key"] = json!("next");
+    let refused = runner.call("route.account_for", &next).await;
+    assert_eq!(refused.0, FrameType::Error, "{refused:?}");
+    assert_eq!(refused.1["code"], "account_pool_exhausted", "{refused:?}");
+    assert_eq!(refused.1["detail"]["reset_at_ms"], NOW + 3_600_000);
+    harness
+        .store()
+        .account_transaction(|tx| {
+            let row = tx.admission("reserved:zeta-runner", "first")?.unwrap();
+            let affinity = tx
+                .affinity(&row.principal, &row.conversation_hash, POOL)?
+                .unwrap();
+            assert_eq!(
+                affinity.pin_id,
+                first.1["result"]["pin"]["id"].as_str().unwrap()
+            );
+            assert!(affinity.lease_valid_until.unwrap() > NOW as i64);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pooled_keys_without_account_ids_support_optional_runner_candidates() {
+    use cortexkit_role_routing_conformance::wire::{account::AccountForAnswer, wire::read_reply};
+    let harness = harness_with_pool_keys(
+        Some(&["apikey"]),
+        &[key("apikey:pool-vendor:second", &[POOL], &[POOL_VENDOR])],
+    );
+    let owner = harness.bind(reserved("example-consumer"), None).await;
+    let runner = harness.bind(reserved("zeta-runner"), None).await;
+    let mut selection = select("mason");
+    selection["pin"] = json!(format!("{POOL}/{POOL_MODEL_SHORT}"));
+    let selected = owner.call("route.select", &selection).await;
+    assert_eq!(selected.0, FrameType::Response, "{selected:?}");
+    let mut request = json!({
+        "mode":"admit", "provider":POOL, "model":POOL_MODEL_SHORT, "pool":POOL,
+        "conversation_key":"no-candidates", "admission_id":"no-candidates",
+        "decision_id":selected.1["result"]["decision_id"],
+    });
+    let first = runner.call("route.account_for", &request).await;
+    assert_eq!(first.0, FrameType::Response, "{first:?}");
+    let _: AccountForAnswer = read_reply(&serde_json::to_vec(&first.1).unwrap()).unwrap();
+    let credential = first.1["result"]["account"]["credential_id"]
+        .as_str()
+        .unwrap();
+    assert!(["apikey:pool-vendor:main", "apikey:pool-vendor:second"].contains(&credential));
+    assert_eq!(first.1["result"]["account"]["account_id"], credential);
+
+    let offered = if credential == "apikey:pool-vendor:main" {
+        "apikey:pool-vendor:second"
+    } else {
+        "apikey:pool-vendor:main"
+    };
+    request["admission_id"] = json!("offered-key");
+    request["conversation_key"] = json!("offered-key");
+    request["candidates"] = json!({
+        "view_digest":"runner-readable-keys",
+        "accounts":[{"account_id":offered, "credential_id":offered}]
+    });
+    let narrowed = runner.call("route.account_for", &request).await;
+    assert_eq!(narrowed.0, FrameType::Response, "{narrowed:?}");
+    let _: AccountForAnswer = read_reply(&serde_json::to_vec(&narrowed.1).unwrap()).unwrap();
+    assert_eq!(narrowed.1["result"]["account"]["account_id"], offered);
+    assert_eq!(narrowed.1["result"]["account"]["credential_id"], offered);
+
+    // A runner's candidates can narrow the pool's available credentials, but
+    // cannot add a credential absent from the pool.
+    request["admission_id"] = json!("unlisted-key");
+    request["conversation_key"] = json!("unlisted-key");
+    request["candidates"]["accounts"] = json!([{
+        "account_id":"apikey:pool-vendor:absent", "credential_id":"apikey:pool-vendor:absent"
+    }]);
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{refused:?}");
 }
 
 #[tokio::test]

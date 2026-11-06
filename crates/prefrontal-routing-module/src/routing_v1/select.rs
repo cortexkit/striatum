@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal};
 use cortexkit_role_routing::select::{
-    parse_select_request_serving, Modality, PinFallback, PinOutcome, RouteRef, RunnerRef,
-    SelectAnswer, SelectRequest, ToolsRequirement, EXPLANATION_MAX_CHARS,
+    parse_select_request_serving, Modality, PinFallback, PinOutcome, RouteRef, RunnerAuth,
+    RunnerRef, SelectAnswer, SelectRequest, ToolsRequirement, EXPLANATION_MAX_CHARS,
 };
 use prefrontal_routing_core::model_router::{
     ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
@@ -729,36 +729,8 @@ async fn select_at_tier(
     if capable.is_empty() && !reachable.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
-    // A key-pool provider's keys are leased per send (`route.pool_acquire`),
-    // and a v1 answer cannot yet name the leased key the way `runner.auth`
-    // will. Answering such a route would send the work with the wrong
-    // credential or none, so it is not a v1 candidate until the answer can
-    // carry its key.
-    // Every route that could serve this request is a key-pool one: if any other
-    // route were adequate, the filter below would keep it.
-    let currently_capable: Vec<_> = capable
-        .iter()
-        .filter(|fact| {
-            let route = fact_to_route(fact);
-            runners
-                .iter()
-                .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
-        })
-        .collect();
-    let key_pool_only = !currently_capable.is_empty()
-        && currently_capable
-            .iter()
-            .all(|fact| key_pool::is_pool_provider(&catalog_targets, &fact.provider_id));
-    let capable: Vec<&ModelFact> = capable
-        .into_iter()
-        .filter(|fact| !key_pool::is_pool_provider(&catalog_targets, &fact.provider_id))
-        .collect();
     if capable.is_empty() && pair_rejections.is_empty() {
-        return Err(if key_pool_only {
-            key_pool_route_refusal()
-        } else {
-            Refusal::no_route(NoRouteReason::MissingCapability, None)
-        });
+        return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
 
     let statically_available: HashSet<String> = capable
@@ -776,11 +748,7 @@ async fn select_at_tier(
         })
         .collect();
     if available.is_empty() && pair_rejections.is_empty() {
-        return Err(if key_pool_only {
-            key_pool_route_refusal()
-        } else {
-            Refusal::no_route(NoRouteReason::MissingCapability, None)
-        });
+        return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
     if let Some(classes) = &priced.classes {
         classes.apply_eligibility(&mut snapshot, &facts, priced_per_token, false);
@@ -978,18 +946,10 @@ async fn select_at_tier(
     {
         let mut result = None;
         let mut fallback_hold = None;
-        let mut skipped_key_pool = false;
         for entry in consumer_policy.ladder.iter().flatten() {
             let Some(route) = RouteRef::parse_pin(entry) else {
                 continue;
             };
-            // A ladder entry on a key-pool provider cannot be answered here, but
-            // a later entry can be, so skip it and remember why: only a ladder
-            // that ends with nothing answered for this reason says so.
-            if key_pool::is_pool_provider(&catalog_targets, &route.provider) {
-                skipped_key_pool = true;
-                continue;
-            }
             let subset = available
                 .iter()
                 .filter(|key| {
@@ -1022,16 +982,9 @@ async fn select_at_tier(
                 }
             }
         }
-        result
-            .or_else(|| {
-                fallback_hold.map(|(selected, _)| Ok((selected, select_policy::OrderBasis::Mode)))
-            })
-            // A ladder whose only admissible entries were key-pool routes says so,
-            // rather than falling through to the automatic order.
-            .or_else(|| {
-                skipped_key_pool
-                    .then(|| Err(select_policy::OrderFailure::Pin(key_pool_route_refusal())))
-            })
+        result.or_else(|| {
+            fallback_hold.map(|(selected, _)| Ok((selected, select_policy::OrderBasis::Mode)))
+        })
     } else {
         None
     };
@@ -1287,6 +1240,52 @@ async fn select_at_tier(
         basis.as_str()
     ));
     let mut runner_ref = RunnerRef::new(runner.module.clone(), route.clone());
+    if key_pool::is_pool_provider(&catalog_targets, &route.provider) {
+        let runner_admits_keys = registry.get(&runner.module).is_some_and(|runner| {
+            runner
+                .routed_accounts
+                .iter()
+                .any(|method| method == "apikey")
+        });
+        let mut auth = RunnerAuth {
+            pool: Some(route.provider.clone()),
+            credential_id: None,
+        };
+        if runner_admits_keys {
+            // The account admission owns the lease. Select supplies only the
+            // pool hint, so selecting work never counts as a second active run.
+            runner_ref.model.provider = catalog_targets[&route.provider].clone();
+        } else {
+            let session = format!(
+                "v1:{}:{}:{}",
+                caller.principal.len(),
+                caller.principal,
+                request
+                    .affinity
+                    .as_deref()
+                    .or(request.task_ref.as_deref())
+                    .unwrap_or(&decision_id),
+            );
+            let grant = key_pool::acquire(
+                &key_pool::PoolCtx {
+                    store: deps.store,
+                    credentials: deps.broca_credentials,
+                    catalog_targets: &catalog_targets,
+                    now_ms: now_ms as i64,
+                },
+                &route.provider,
+                &route.model,
+                route.variant.as_deref(),
+                &session,
+            )
+            .map_err(|refusal| provider_refusal(&refusal.code, refusal.message))?;
+            runner_ref.model.provider = grant.runner.provider;
+            runner_ref.model.model = grant.runner.model;
+            runner_ref.model.variant = grant.runner.variant;
+            auth.credential_id = Some(grant.credential_id);
+        }
+        runner_ref = runner_ref.with_auth(auth);
+    }
     if let Some(harness) = registry
         .get(&runner.module)
         .and_then(|runner| runner.selection_harness(request.harness.as_deref()))
@@ -1611,11 +1610,6 @@ impl<'a> Selection<'a> {
     }
 
     fn account_check(&self, selected: &SelectedModelRoute) -> Result<(), Refusal> {
-        // See the key-pool filter before the candidates: a pin can name such a
-        // route without the automatic order ever reaching it.
-        if key_pool::is_pool_provider(self.sources.catalog_targets, &selected.model.provider_id) {
-            return Err(key_pool_route_refusal());
-        }
         let policy = self
             .sources
             .operator_config
@@ -1780,19 +1774,6 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
     refusal
         .detail
         .insert("blockingCauses".into(), json!(no_route.blocking_causes()));
-    refusal
-}
-
-/// The refusal for work only a key-pool route could serve. A key-pool provider
-/// is a provider Broca reaches only through an API key leased for each send
-/// (`key_pool`), and a v1 answer does not name that key yet, so nothing this
-/// answer can carry would run the work.
-fn key_pool_route_refusal() -> Refusal {
-    let mut refusal = Refusal::no_route(NoRouteReason::NoAvailableModel, None);
-    refusal.message = format!(
-        "{}: every route that meets the request is served through a routing key-pool lease, which a routing/v1 answer cannot name yet",
-        refusal.message
-    );
     refusal
 }
 

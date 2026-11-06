@@ -23,6 +23,8 @@ pub(crate) struct EffectiveRunner {
     #[serde(flatten)]
     pub policy: RunnerPolicy,
     pub follows_account_choice: bool,
+    #[serde(skip)]
+    pub routed_accounts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub standing_limits: Option<StandingLimits>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,12 +166,19 @@ impl Registry {
                 let follows_account_choice =
                     declaration.map_or(policy.via_vault, |d| d.follows_account_choice);
                 let standing_limits = declaration.and_then(|d| d.standing_limits.clone());
+                let routed_accounts = credentials
+                    .runner_routed_accounts
+                    .get(&policy.module)
+                    .filter(|_| declaration.is_some_and(|d| d.follows_account_choice))
+                    .cloned()
+                    .unwrap_or_default();
                 if let Some(declaration) = declaration {
                     policy.tool_capabilities = declaration.tool_capabilities.clone();
                 }
                 EffectiveRunner {
                     policy,
                     follows_account_choice,
+                    routed_accounts,
                     standing_limits,
                     pairs: declaration.map(|declaration| declaration.pairs.clone()),
                     harnesses: declaration
@@ -327,6 +336,21 @@ pub(crate) fn service_tiers_from_describe(
     Some(tiers)
 }
 
+pub(crate) fn routed_accounts_from_describe(value: &serde_json::Value) -> Option<Vec<String>> {
+    let value = value.get("result").unwrap_or(value);
+    if !value["capabilities"]
+        .as_array()?
+        .iter()
+        .any(|capability| capability == "routed_accounts")
+    {
+        return None;
+    }
+    let methods: Vec<String> =
+        serde_json::from_value(value.get("routed_accounts")?.clone()).ok()?;
+    cortexkit_role_llm_runner::describe::check_routed_accounts(&methods).ok()?;
+    Some(methods)
+}
+
 pub(crate) fn tier_discovery_modules(
     modules: &serde_json::Value,
     declarations: &std::collections::BTreeMap<String, RunnerDeclaration>,
@@ -377,6 +401,7 @@ pub(crate) async fn refresh_loop(
             let policies = crate::config_overrides::live_config(&config_path).v1_runners();
             let tier_modules = tier_discovery_modules(&modules, &declarations, &policies);
             let mut tiers = std::collections::BTreeMap::new();
+            let mut routed_accounts = std::collections::BTreeMap::new();
             // The routing declaration describes reach, not tier application.
             // Only the runner's own role.describe can establish tier support.
             for module in tier_modules {
@@ -403,26 +428,29 @@ pub(crate) async fn refresh_loop(
                     )
                     .await;
                 if let Ok(bytes) = reply {
-                    if let Some(support) = serde_json::from_slice(&bytes)
-                        .ok()
-                        .as_ref()
-                        .and_then(service_tiers_from_describe)
-                    {
-                        tiers.insert(module.clone(), support);
+                    if let Ok(describe) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                        if let Some(support) = service_tiers_from_describe(&describe) {
+                            tiers.insert(module.clone(), support);
+                        }
+                        if let Some(methods) = routed_accounts_from_describe(&describe) {
+                            routed_accounts.insert(module.clone(), methods);
+                        }
                     }
                 }
             }
-            Ok::<_, String>((modules, declarations, tiers))
+            Ok::<_, String>((modules, declarations, tiers, routed_accounts))
         })
         .await;
-        if let Ok(Ok((modules, declarations, tiers))) = result {
+        if let Ok(Ok((modules, declarations, tiers, routed_accounts))) = result {
             super::consumers::replace_catalog(&modules);
             if let Ok(mut credentials) = credentials.lock() {
                 credentials.runner_declarations = declarations;
                 credentials.runner_service_tiers = tiers;
+                credentials.runner_routed_accounts = routed_accounts;
             }
         } else if let Ok(mut credentials) = credentials.lock() {
             credentials.runner_service_tiers.clear();
+            credentials.runner_routed_accounts.clear();
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }

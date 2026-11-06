@@ -1044,6 +1044,57 @@ fn broca_contract_0748_routing_tier_discovery() {
 }
 
 #[test]
+fn routed_account_discovery_requires_the_group_and_valid_unique_methods() {
+    assert_eq!(
+        runners::routed_accounts_from_describe(&json!({
+            "result":{"capabilities":["routed_accounts"], "routed_accounts":["apikey"]}
+        })),
+        Some(vec!["apikey".into()])
+    );
+    for describe in [
+        json!({"capabilities":[], "routed_accounts":["apikey"]}),
+        json!({"capabilities":["routed_accounts"]}),
+        json!({"capabilities":["routed_accounts"], "routed_accounts":[]}),
+        json!({"capabilities":["routed_accounts"], "routed_accounts":["apikey","apikey"]}),
+        json!({"capabilities":["routed_accounts"], "routed_accounts":["bad method"]}),
+    ] {
+        assert!(runners::routed_accounts_from_describe(&describe).is_none());
+    }
+}
+
+#[test]
+fn routed_account_methods_require_follows_account_choice() {
+    let facts = [fact("anthropic", "model", Some(&["apikey"]))];
+    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("apikey")), NOW);
+    credentials
+        .runner_routed_accounts
+        .insert("fixture-runner".into(), vec!["apikey".into()]);
+    let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
+    assert!(registry
+        .get("fixture-runner")
+        .unwrap()
+        .routed_accounts
+        .is_empty());
+    for follows in [false, true] {
+        let mut declared =
+            declaration(json!([{"wire_api":"anthropic.messages", "auth_method":"apikey"}]));
+        declared.follows_account_choice = follows;
+        credentials
+            .runner_declarations
+            .insert("fixture-runner".into(), declared);
+        let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
+        assert_eq!(
+            registry
+                .get("fixture-runner")
+                .unwrap()
+                .routed_accounts
+                .contains(&"apikey".into()),
+            follows
+        );
+    }
+}
+
+#[test]
 fn broca_head_selection_v2_routing_tier_discovery() {
     let expected = serde_json::json!({
         "anthropic.messages": {"levels": ["fast"], "served": "reported"},
