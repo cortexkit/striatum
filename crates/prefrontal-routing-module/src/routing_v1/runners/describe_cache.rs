@@ -182,8 +182,8 @@ mod tests {
         assert!(credentials.runner_routed_accounts.is_empty());
         let lines = crate::take_operator_warnings();
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].contains("runner describe poll failed"));
-        assert!(lines[1].contains("runner describe poll recovered"));
+        assert!(lines[0].contains("runner role.describe poll failed"));
+        assert!(lines[1].contains("runner role.describe poll answered again"));
         assert!(lines.iter().all(|line| line.contains("runner-a")));
     }
 }
