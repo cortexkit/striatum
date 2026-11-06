@@ -40,16 +40,15 @@ pub struct V1Recorded {
 impl SqliteRouteStateStore {
     pub fn v1_create_panel(
         &self,
+        id: &str,
         principal: &str,
         state_json: &str,
         now_ms: i64,
-    ) -> RouteStateResult<String> {
-        let id = super::new_decision_id();
+    ) -> RouteStateResult<()> {
         self.store.with_conn(|c: &Connection| {
             c.execute("INSERT INTO routing_v1_panel(panel_id, principal, state_json, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
                 params![id, principal, state_json, now_ms]).map(|_| ())
-        }).map_err(err)?;
-        Ok(id)
+        }).map_err(err)
     }
 
     pub fn v1_panel(&self, id: &str, principal: &str) -> RouteStateResult<Option<String>> {

@@ -4862,7 +4862,8 @@ fn route_identity(
     Ok(split_route_key(route_key))
 }
 
-fn new_decision_id() -> String {
+/// Mint a decision ID before constructing the state that will retain it.
+pub fn new_decision_id() -> String {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(id) = replay::current().and_then(|inputs| inputs.decision_id()) {
         return id;

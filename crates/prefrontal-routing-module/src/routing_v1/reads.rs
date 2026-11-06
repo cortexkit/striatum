@@ -15,9 +15,11 @@ pub(super) fn consumer_models(
     let request = consumer_models::parse_consumer_models_request(params)?;
     let config = super::operator_config(deps);
     super::consumers::effective(&config).admit(&request.consumer, caller)?;
-    let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
     let mut facts = deps.store.get_facts().map_err(store_refusal)?;
-    let aliases = credentials.catalog_targets(&facts);
+    let aliases = {
+        let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
+        credentials.catalog_targets(&facts)
+    };
     prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &aliases);
     config.apply(&mut facts);
     let resolved = crate::resolve_routing_policy_with_catalog_targets(

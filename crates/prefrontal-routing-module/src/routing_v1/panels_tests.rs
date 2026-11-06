@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cortexkit_role_routing::{budget, panel::*};
 use cortexkit_role_routing_conformance::fixture;
@@ -51,6 +52,142 @@ async fn panel(route: &Route, request: &Value) -> SelectPanelAnswer {
         parse_select_panel_request_serving(request, super::describe::CAPABILITIES).unwrap();
     check_panel_answer(&request, &answer).unwrap();
     answer
+}
+
+#[tokio::test]
+async fn new_panel_inserts_final_state_without_update() {
+    let (h, route, request) = configured().await;
+    let connection = rusqlite::Connection::open(h.store_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE panel_writes(kind TEXT NOT NULL);
+         CREATE TRIGGER panel_insert AFTER INSERT ON routing_v1_panel BEGIN
+           INSERT INTO panel_writes VALUES ('insert'); END;
+         CREATE TRIGGER panel_update AFTER UPDATE ON routing_v1_panel BEGIN
+           INSERT INTO panel_writes VALUES ('update'); END;",
+        )
+        .unwrap();
+    let answer = panel(&route, &request).await;
+    let writes: Vec<String> = connection
+        .prepare("SELECT kind FROM panel_writes ORDER BY rowid")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(writes, ["insert"]);
+    let retained: Value = serde_json::from_str(
+        &h.store()
+            .v1_panel(&answer.panel_id, "reserved:prefrontal-core")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retained["answer"], serde_json::to_value(&answer).unwrap());
+}
+
+#[tokio::test]
+async fn same_panel_replacements_serialize_and_consume_each_others_history() {
+    let (h, route, body) = configured().await;
+    let answer = panel(&route, &body).await;
+    let lock = super::panels::replacement_lock(&answer.panel_id).unwrap();
+    let guard = lock.lock().await;
+    let request = PanelReplacementRequest::new(&answer.panel_id, 0);
+    let params = serde_json::to_value(&request).unwrap();
+    let calls = async {
+        tokio::join!(
+            route.call("route.select_panel", &params),
+            route.call("route.select_panel", &params)
+        )
+    };
+    tokio::pin!(calls);
+    // Both handlers must reach the same held lock before either can read the
+    // standing seats. Their strong references keep the weak registry entry live.
+    tokio::select! {
+        biased;
+        _ = &mut calls => panic!("replacements completed while their panel lock was held"),
+        result = tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&lock) < 3 { tokio::task::yield_now().await; }
+        }) => result.expect("both replacements should queue on their panel lock"),
+    }
+    drop(guard);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), calls)
+        .await
+        .unwrap();
+    let mut replacements: Vec<PanelReplacement> = [first, second]
+        .into_iter()
+        .map(|reply| {
+            assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+            serde_json::from_value(reply.1["result"].clone()).unwrap()
+        })
+        .collect();
+    let first_seat = replacements[0].seat.as_ref().unwrap();
+    let second_seat = replacements[1].seat.as_ref().unwrap();
+    assert_ne!(
+        first_seat.answer.route.route_key(),
+        second_seat.answer.route.route_key()
+    );
+    assert_ne!(
+        first_seat.answer.decision_id,
+        second_seat.answer.decision_id
+    );
+    let retained: Value = serde_json::from_str(
+        &h.store()
+            .v1_panel(&answer.panel_id, "reserved:prefrontal-core")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let standing = retained["answer"]["seats"][0]["answer"]["decision_id"]
+        .as_str()
+        .unwrap();
+    // Handler scheduling may choose either request first; the final standing
+    // decision identifies the replacement that must validate against new history.
+    replacements.sort_by_key(|replacement| {
+        replacement.seat.as_ref().unwrap().answer.decision_id == standing
+    });
+    let mut state = PanelState::new(
+        parse_select_panel_request_serving(&body, super::describe::CAPABILITIES).unwrap(),
+        answer,
+    );
+    for replacement in replacements {
+        check_panel_replacement(&state, &request, &replacement).unwrap();
+        assert!(retained["history"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(replacement
+                .seat
+                .as_ref()
+                .unwrap()
+                .answer
+                .route
+                .route_key())));
+        state.apply(&replacement);
+    }
+}
+
+#[tokio::test]
+async fn unrelated_panel_replacement_and_creation_do_not_wait_for_a_held_panel_lock() {
+    let (_h, route, request) = configured().await;
+    let a = panel(&route, &request).await;
+    let b = panel(&route, &request).await;
+    let lock = super::panels::replacement_lock(&b.panel_id).unwrap();
+    let _guard = lock.lock().await;
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        route.call(
+            "route.select_panel",
+            &json!({"replace":{"panel_id":a.panel_id,"slot":0}}),
+        ),
+    )
+    .await
+    .expect("panel A must not wait for panel B");
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    let replacement: PanelReplacement = serde_json::from_value(reply.1["result"].clone()).unwrap();
+    assert!(replacement.seat.is_some());
+    tokio::time::timeout(Duration::from_secs(5), panel(&route, &request))
+        .await
+        .expect("creation must not wait for a replacement lock");
 }
 
 #[tokio::test]

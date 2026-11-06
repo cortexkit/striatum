@@ -1,6 +1,7 @@
 //! Class-policy panels reuse the scorer, while each seat is a retained v1 select.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use cortexkit_role_routing::{errors::Refusal, panel::*, select::SelectAnswer};
 use prefrontal_routing_core::{fact_to_route, panel as scoring};
@@ -9,9 +10,23 @@ use serde_json::{json, Value};
 
 use super::{operator_config, store_refusal, Caller, Deps};
 
-// Replacement reads and writes the whole history. Serialize panel operations so
-// concurrent requests cannot both replace a slot from the same old history.
-static PANEL_WRITER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Replacement reads and writes the whole history. Only replacements of the
+// same panel must wait for one another; creation and unrelated panels proceed.
+static REPLACEMENT_LOCKS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(super) fn replacement_lock(id: &str) -> Result<Arc<tokio::sync::Mutex<()>>, Refusal> {
+    let mut locks = REPLACEMENT_LOCKS.lock().map_err(store_refusal)?;
+    if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    // Idle panels own no lock. Reclaim their weak entries when another panel
+    // first needs a lock, rather than retaining every panel id indefinitely.
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(id.to_owned(), Arc::downgrade(&lock));
+    Ok(lock)
+}
 
 #[derive(Serialize, Deserialize)]
 struct StoredPanel {
@@ -25,7 +40,6 @@ pub(super) async fn select_panel(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
-    let _writer = PANEL_WRITER.lock().await;
     if params.get("replace").is_some() {
         super::shapes::closed(params, "replace", &["panel_id", "slot"])?;
         let request = parse_panel_replacement_request(params)?;
@@ -66,7 +80,7 @@ pub(super) async fn select_panel(
     }
     seats.sort_by_key(|seat| seat.slot);
     let mut answer = SelectPanelAnswer::new(
-        "pending",
+        prefrontal_routing_store::new_decision_id(),
         PanelPolicy::new(
             policy.width() as u64,
             policy.top_k as u64,
@@ -93,7 +107,7 @@ pub(super) async fn select_panel(
             .unwrap_or(ShortfallCode::DiversityUnmeetable);
         answer.shortfall = Some(PanelShortfall::new(code));
     }
-    let mut state = StoredPanel {
+    let state = StoredPanel {
         request,
         history: answer
             .seats
@@ -102,17 +116,13 @@ pub(super) async fn select_panel(
             .collect(),
         answer,
     };
-    let id = deps
-        .store
+    deps.store
         .v1_create_panel(
+            &state.answer.panel_id,
             &caller.principal,
             &serde_json::to_string(&state).map_err(store_refusal)?,
             super::now_ms() as i64,
         )
-        .map_err(store_refusal)?;
-    state.answer.panel_id = id.clone();
-    deps.store
-        .v1_update_panel(&id, &serde_json::to_string(&state).map_err(store_refusal)?)
         .map_err(store_refusal)?;
     serde_json::to_value(state.answer).map_err(store_refusal)
 }
@@ -215,10 +225,12 @@ async fn replace(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
+    let id = &request.replace.panel_id;
+    let lock = replacement_lock(id)?;
+    let _writer = lock.lock().await;
     if !caller.binding_is_current() {
         return Err(Refusal::unknown_decision());
     }
-    let id = &request.replace.panel_id;
     let raw = deps
         .store
         .v1_panel(id, &caller.principal)
@@ -528,4 +540,29 @@ fn prepared_models(panel: &scoring::SelectedPanel) -> HashMap<String, (String, S
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_lock_registry_reuses_live_locks_and_prunes_dead_entries_on_insert() {
+        let first = replacement_lock("lock-registry-first").unwrap();
+        let same = replacement_lock("lock-registry-first").unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        drop(same);
+        assert!(weak.upgrade().is_none());
+        let second = replacement_lock("lock-registry-second").unwrap();
+        assert!(!REPLACEMENT_LOCKS
+            .lock()
+            .unwrap()
+            .contains_key("lock-registry-first"));
+        assert!(Arc::ptr_eq(
+            &second,
+            &replacement_lock("lock-registry-second").unwrap()
+        ));
+    }
 }
