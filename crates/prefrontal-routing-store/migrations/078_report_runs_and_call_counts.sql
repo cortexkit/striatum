@@ -8,9 +8,13 @@ CREATE TABLE routing_v1_report_delivery (
     PRIMARY KEY (decision_id, delivery_key)
 );
 
+-- Historical report bodies are opaque evidence, even if they are not JSON.
+-- Classify valid bodies without rewriting either their bytes or their answers.
 INSERT INTO routing_v1_report_delivery
     SELECT decision_id,
-           CASE WHEN json_type(body_json, '$.usage') = 'object' THEN 'usage' ELSE 'outcome' END,
+           CASE WHEN json_valid(body_json) THEN
+               CASE WHEN json_type(body_json, '$.usage') = 'object' THEN 'usage' ELSE 'outcome' END
+               ELSE 'outcome' END,
            report_id, body_json, answer_json, created_at_ms
     FROM routing_v1_report
     WHERE decision_id IN (SELECT decision_id FROM routing_v1_decision);

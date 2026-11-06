@@ -114,6 +114,10 @@ pub(super) fn start(
     // rows from the routing file's `retention` block.
     let mut loops = BackgroundLoops::default();
     loops.spawn(
+        "routing call counts",
+        flush_call_counts_loop(Arc::clone(store), std::time::Duration::from_secs(30)),
+    );
+    loops.spawn(
         "retention",
         retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
     );
@@ -231,4 +235,79 @@ pub(super) fn start(
         override_path,
         operator_config_path,
     })
+}
+
+async fn flush_call_counts_loop(store: SharedStore, period: std::time::Duration) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticks.tick().await;
+        flush_call_counts(Arc::clone(&store)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn call_counts_flush_on_the_timer_and_at_clean_shutdown() {
+        let path = cortexkit_test_support::scratch_root().join(format!(
+            "call-flush-timer-{}-{}.db",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let store = Arc::new(
+            prefrontal_routing_store::SqliteRouteStateStore::open(
+                &prefrontal_routing_store::dev_descriptor(
+                    "call-flush-timer",
+                    path.to_string_lossy().into_owned(),
+                ),
+            )
+            .unwrap(),
+        );
+        let observer = rusqlite::Connection::open(&path).unwrap();
+        let persisted = || {
+            observer
+                .query_row(
+                    "SELECT COALESCE(sum(calls),0) FROM routing_call_count",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        store
+            .record_routing_call("route.head_choices", "contract", "app")
+            .unwrap();
+        assert_eq!(persisted(), 0);
+        let timer = tokio::spawn(flush_call_counts_loop(
+            Arc::clone(&store),
+            std::time::Duration::from_millis(10),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while persisted() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        timer.abort();
+        let _ = timer.await;
+        assert_eq!(persisted(), 1);
+        store
+            .record_routing_call("route.head_choices", "contract", "app")
+            .unwrap();
+        flush_call_counts(Arc::clone(&store)).await;
+        assert_eq!(persisted(), 2);
+    }
+}
+
+pub(super) async fn flush_call_counts(store: SharedStore) {
+    match tokio::task::spawn_blocking(move || store.flush_routing_calls()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "routing call count flush failed; the next tick will retry")
+        }
+        Err(error) => tracing::warn!(%error, "routing call count flush worker failed"),
+    }
 }

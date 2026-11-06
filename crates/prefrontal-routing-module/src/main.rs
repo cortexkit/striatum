@@ -1184,6 +1184,15 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
     let writer_result = writer
         .await
         .map_err(|e| ModuleError::Message(e.to_string()));
+    // The writer closes only after the in-flight request handlers have dropped
+    // their reply senders. Flush their final diagnostic increments together.
+    let loop_result = match loop_result {
+        Ok(store) => {
+            background::flush_call_counts(store).await;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    };
     match (loop_result, writer_result) {
         (Err(loop_err), _) => Err(loop_err),
         (Ok(()), Ok(Ok(()))) => Ok(()),
@@ -1215,7 +1224,7 @@ async fn module_loop<R>(
     config: &ModuleConfig,
     quota_cache: SharedQuotaCache,
     catalog_health: SharedCatalogHealth,
-) -> Result<(), ModuleError>
+) -> Result<SharedStore, ModuleError>
 where
     R: AsyncRead + Unpin,
 {
@@ -1268,7 +1277,7 @@ where
     let mut profiles_started = false;
     loop {
         let Some(frame) = next_frame_or_loop_stop(read_half, &mut loops).await? else {
-            return Ok(()); // clean EOF: subc closed the connection.
+            return Ok(store); // clean EOF: subc closed the connection.
         };
         if !handle_frame(
             frame,
@@ -1284,7 +1293,7 @@ where
         )
         .await?
         {
-            return Ok(());
+            return Ok(store);
         }
         if !profiles_started && !route_epochs.is_empty() {
             // Start only after the first bind ACK is queued, never during store open.

@@ -1051,6 +1051,7 @@ pub fn dev_descriptor(module_id: &str, sqlite_path: impl Into<String>) -> Storag
 /// and applies the `route_state` migration set (run-once, including the seed).
 pub struct SqliteRouteStateStore {
     store: SqliteStore,
+    call_counts: call_counts::RoutingCallBuffer,
     /// Class vectors are means over every complete token profile in a seven-day
     /// window, recomputed from the whole population on every route selection
     /// before this cache existed (Loop R184: 1.9 million VM steps per selection
@@ -1355,6 +1356,7 @@ impl SqliteRouteStateStore {
         }
         Ok(Self {
             store,
+            call_counts: Default::default(),
             class_vectors: Mutex::new(HashMap::new()),
             usage_generation: AtomicU64::new(0),
             reported_score_conflicts: Mutex::new(HashSet::new()),
@@ -6839,7 +6841,10 @@ mod tests {
                 );
                 assert_eq!(
                     history_foreign_keys(c),
-                    ["account_admission -> account_pin"]
+                    [
+                        "account_admission -> account_pin",
+                        "routing_v1_report_delivery -> routing_v1_decision",
+                    ]
                 );
                 // Later migrations add the fence's pool columns and (068)
                 // rekey the demand index by account; the demand query-plan

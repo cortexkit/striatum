@@ -438,3 +438,35 @@ fn report_delivery_migration_preserves_legacy_answers_and_usage_mode() {
     );
     assert!(commit(&upgraded, "d", "run:r", 20).unwrap().is_none());
 }
+
+#[test]
+fn report_delivery_migration_preserves_opaque_legacy_evidence() {
+    let descriptor = descriptor();
+    let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 77).unwrap();
+    seed(&old, "d", "owner");
+    let first = V1Recorded {
+        body_json: "opaque legacy report body".into(),
+        answer_json: "opaque legacy report answer".into(),
+    };
+    old.v1_record_report("d", "report:d", &first, false, 10)
+        .unwrap();
+    drop(old);
+    let upgraded = SqliteRouteStateStore::open(&descriptor).unwrap();
+    assert_eq!(upgraded.v1_report("d").unwrap(), Some(first.clone()));
+    let standing = upgraded
+        .v1_commit_report(
+            "d",
+            "outcome",
+            "report:d",
+            &first,
+            RouteOutcome::Completed,
+            None,
+            false,
+            &V1ReportEffects::default(),
+            None,
+            |_| Ok(()),
+            20,
+        )
+        .unwrap();
+    assert_eq!(standing, Some(first));
+}

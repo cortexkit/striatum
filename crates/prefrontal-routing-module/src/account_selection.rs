@@ -2172,6 +2172,11 @@ pub(crate) fn refresh_credential_quota_holds(
     route_fences: &[prefrontal_routing_store::AccountRouteFence],
     now: EpochMs,
 ) -> Result<Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>, String> {
+    // With no refusal evidence there is nothing to reconcile; ordinary reads
+    // must not reserve SQLite's writer just to iterate an empty list.
+    if refusals.is_empty() {
+        return Ok(refusals);
+    }
     store
         .account_transaction(|tx| {
             refresh_credential_quota_holds_in(
