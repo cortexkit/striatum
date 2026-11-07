@@ -156,7 +156,7 @@ impl DescribeCache {
             self.last_good.insert(module.to_owned(), now);
         } else if let Some(suppressed) = self.logs.admit(module, "classifier_describe_failed", now)
         {
-            crate::warn_operator(format!("[TODO(user): classifier description unavailable; retaining the last description for up to five minutes] module={module:?} suppressed={suppressed}"));
+            crate::warn_operator(format!("couldn't read the classifier model list; keeping the last good list for up to five minutes, then offering none module={module:?} suppressed={suppressed}"));
         }
         self.expire(credentials, now);
     }
@@ -179,7 +179,7 @@ fn dropped(module: &str, model: &str, reason: &'static str, now: i64) {
         return;
     };
     if let Some(suppressed) = logs.admit(&format!("{module}/{model}"), reason, now) {
-        crate::warn_operator(format!("[TODO(user): classifier route or model cannot be used; explain the missing role forwarding, catalog row, or question limit] module={module:?} model={model:?} reason={reason} suppressed={suppressed}"));
+        crate::warn_operator(format!("left a classifier model out of selection (daemon_role_versions_unavailable: the daemon can't open a classifier route; wrong_describe_role: the reply wasn't classifier/v1; missing_catalog_row: Fusiform has no row for it; missing_question_limit: its listing states no max_questions) module={module:?} model={model:?} reason={reason} suppressed={suppressed}"));
     }
 }
 
