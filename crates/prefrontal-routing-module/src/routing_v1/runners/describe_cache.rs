@@ -190,7 +190,7 @@ impl DescribeCache {
 fn view_event(credentials: &mut BrocaCredentials, module: &str, cause: &str, now: i64) {
     if let Some(suppressed) = credentials.runner_describe_logs.admit(module, cause, now) {
         let last_observed_at_ms = credentials.runner_describe_observed.get(module);
-        crate::warn_operator(format!("[TODO(user): runner service-tier view changed] module={module:?} cause={cause} last_observed_at_ms={last_observed_at_ms:?} suppressed={suppressed}"));
+        crate::warn_operator(format!("runner service-tier view changed: module={module:?} cause={cause} last_observed_at_ms={last_observed_at_ms:?} suppressed={suppressed}"));
     }
 }
 
@@ -324,7 +324,7 @@ mod tests {
             "cleared_catalog_unverified",
         ]) {
             assert!(
-                line.contains("[TODO(user): runner service-tier view changed]"),
+                line.contains("runner service-tier view changed: "),
                 "{line}"
             );
             assert!(line.contains(&format!("cause={cause}")), "{line}");

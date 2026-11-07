@@ -3131,7 +3131,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             "runner_tier_unobserved",
             OpReply::typed(
                 "account_selection_unavailable",
-                "[TODO(user): runner service-tier support is not yet observed; retry admission shortly]",
+                "Routing hasn't yet seen which service tiers this runner serves, because routing or the runner just restarted, so it can't confirm this decision's fast tier. Retry in a few seconds: the decision stays valid and never steps down to a lower tier.",
                 service_tier_refusal_detail(&parsed, "runner_service_tiers_unobserved", Some(3_000)),
             ),
         );
