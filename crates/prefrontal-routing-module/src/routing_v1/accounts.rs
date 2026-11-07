@@ -339,9 +339,19 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
             .is_some_and(|tier| tier != "standard" && chosen != Some(tier))
     {
         checking("chosen_service_tier");
-        return Err(account_unavailable(
+        let mut refusal = account_unavailable(
             "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
-        ));
+        );
+        let detail = json!({
+            "code": "account_selection_unavailable",
+            "retry_after_s": null,
+            "decision_id": request.decision_id,
+            "exclusions": request.candidates.iter().flat_map(|candidates| &candidates.accounts)
+                .map(|candidate| json!({"account_id":candidate.account_id,"reason":"bound_service_tier_unavailable"}))
+                .collect::<Vec<_>>(),
+        });
+        refusal.detail.extend(detail.as_object().unwrap().clone());
+        return Err(refusal);
     }
     let answer_json = serde_json::to_string(&answer).map_err(internal_unavailable)?;
     checking("admission_record");
@@ -502,8 +512,9 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
 }
 
 /// The allocator's refusal in v1 shape. A hold and an exhausted pool are
-/// timed by the wait the allocator states; every other refusal carries no
-/// detail. Legacy codes the contract does not declare (`store_error`,
+/// timed by the wait the allocator states. Account-selection unavailability
+/// also preserves candidate exclusions and an optional short retry delay.
+/// Legacy codes the contract does not declare (`store_error`,
 /// `internal_error`, `no_eligible_account`, `unscoped_caller`) become the
 /// transient `account_selection_unavailable`. `account_selection_disabled`
 /// is preserved verbatim so it stays distinguishable from quota or
@@ -540,8 +551,18 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
         "account_selection_unsupported" => Refusal::new(RefusalCode::AuthRequired, message.clone()),
         "account_selection_unavailable" => {
             let mut refusal = account_unavailable(message.clone());
-            if let Some(wait) = detail.and_then(|detail| detail["retry_after_ms"].as_u64()) {
-                refusal.detail.insert("retry_after_ms".into(), json!(wait));
+            if let Some(detail) = detail.and_then(Value::as_object) {
+                for key in [
+                    "code",
+                    "retry_after_s",
+                    "decision_id",
+                    "exclusions",
+                    "retry_after_ms",
+                ] {
+                    if let Some(value) = detail.get(key) {
+                        refusal.detail.insert(key.into(), value.clone());
+                    }
+                }
             }
             refusal
         }
@@ -809,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hold_is_timed_and_other_account_refusals_carry_no_detail() {
+    fn a_hold_is_timed_and_admission_conflict_carries_no_detail() {
         let hold = account_refusal(
             "account_hold",
             "held".into(),
@@ -823,5 +844,32 @@ mod tests {
         );
         assert_eq!(conflict.code, RefusalCode::AdmissionConflict);
         assert!(conflict.detail.is_empty());
+    }
+
+    #[test]
+    fn account_unavailable_preserves_candidate_reasons_and_retry_delay_only() {
+        let detail = json!({
+            "code":"account_selection_unavailable", "retry_after_s":3, "retry_after_ms":3_000,
+            "decision_id":"decision-1",
+            "exclusions":[{"account_id":"account-1","reason":"runner_service_tiers_unobserved"}],
+            "unrelated_internal_field":"not public"
+        });
+        let refusal = account_refusal(
+            "account_selection_unavailable",
+            "[TODO(user): retry]".into(),
+            Some(&detail),
+        );
+        assert_eq!(refusal.detail.get("exclusions"), detail.get("exclusions"));
+        assert_eq!(
+            refusal.detail.get("decision_id"),
+            Some(&json!("decision-1"))
+        );
+        assert_eq!(
+            refusal.detail.get("code"),
+            Some(&json!("account_selection_unavailable"))
+        );
+        assert_eq!(refusal.detail.get("retry_after_s"), Some(&json!(3)));
+        assert_eq!(refusal.detail.get("retry_after_ms"), Some(&json!(3_000)));
+        assert!(!refusal.detail.contains_key("unrelated_internal_field"));
     }
 }

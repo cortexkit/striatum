@@ -151,6 +151,21 @@ fn live_describe() -> Value {
     reply["result"].clone()
 }
 
+fn assert_candidate_detail(reply: &Value, request: &Value, reason: &str) {
+    let detail = &reply["detail"];
+    assert_eq!(detail["code"], "account_selection_unavailable", "{reply}");
+    assert_eq!(detail["decision_id"], request["decision_id"], "{reply}");
+    assert_eq!(
+        detail["exclusions"],
+        json!([
+            {"account_id":"account-0","reason":reason},
+            {"account_id":"account-1","reason":reason},
+            {"account_id":"account-2","reason":reason},
+        ]),
+        "{reply}"
+    );
+}
+
 async fn bound_request(harness: &Arc<Harness>, id: &str, legacy: bool) -> Value {
     let owner = harness.bind(reserved("tier-owner"), None).await;
     let selected = owner.call("route.select", &select_sol("fast")).await;
@@ -162,6 +177,12 @@ async fn bound_request(harness: &Arc<Harness>, id: &str, legacy: bool) -> Value 
     request["decision_id"] = selected.1["result"]["decision_id"].clone();
     request["service_tier"] = json!("fast");
     request["hold_wait_max_s"] = json!(0);
+    request["candidates"]["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "account_id":"account-2", "credential_id":"chatgpt:2"
+        }));
     request
 }
 
@@ -187,6 +208,34 @@ async fn empty_view_fast_admission_describes_synchronously_after_routing_restart
             .starts_with("chatgpt:"));
         peer.finish().await;
         assert_eq!(runner.call("route.account_for", &request).await, admitted);
+    }
+}
+
+#[tokio::test]
+async fn unknown_view_does_not_block_unbound_fast_or_bound_standard_admission() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [false, true] {
+        for bound in [false, true] {
+            let (harness, mut credentials) = legacy_broca_setup();
+            let mut request = legacy_broca_request("unknown-optional-tier");
+            if !legacy {
+                request.as_object_mut().unwrap().remove("caller");
+            }
+            if bound {
+                let owner = harness.bind(reserved("tier-owner"), None).await;
+                let selected = owner.call("route.select", &select_sol("standard")).await;
+                assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+                request["decision_id"] = selected.1["result"]["decision_id"].clone();
+            }
+            request["service_tier"] = json!(if bound { "standard" } else { "fast" });
+            credentials.runner_service_tiers.clear();
+            credentials.runner_describe_observed.clear();
+            harness.set_credentials(credentials);
+            let runner = harness.bind(reserved("broca"), None).await;
+            let admitted = runner.call("route.account_for", &request).await;
+            assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+            assert_eq!(admitted.1["result"]["service_tier_chosen"], "standard");
+        }
     }
 }
 
@@ -219,6 +268,8 @@ async fn failed_describe_fast_admission_is_timed_transient_without_tier_downgrad
                 "{}",
                 refused.1
             );
+            assert_eq!(refused.1["detail"]["retry_after_s"], 3);
+            assert_candidate_detail(&refused.1, &request, "runner_service_tiers_unobserved");
             assert!(!refused.1["message"]
                 .as_str()
                 .unwrap()
@@ -289,27 +340,31 @@ async fn draining_runner_failed_fresh_describe_open_and_catalog_gap_keep_fast_ad
 #[tokio::test]
 async fn current_positive_withdrawal_refuses_bound_fast_without_a_retry_or_step_down() {
     let _clock = crate::InjectedClock::set(NOW);
-    let (harness, mut credentials) = legacy_broca_setup();
-    let request = bound_request(&harness, "withdrawn-fast", false).await;
-    runners::DescribeCache::default().reply(
-        "broca",
-        Some(&json!({"capabilities":[]})),
-        &mut credentials,
-        NOW as i64,
-    );
-    harness.set_credentials(credentials);
-    let runner = harness.bind(reserved("broca"), None).await;
-    let refused = runner.call("route.account_for", &request).await;
-    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
-    assert_eq!(refused.1["code"], "account_selection_unavailable");
-    assert!(
-        refused.1["detail"].get("retry_after_ms").is_none(),
-        "{}",
-        refused.1
-    );
-    assert!(harness
-        .store()
-        .account_decisions("serve", 10)
-        .unwrap()
-        .is_empty());
+    for legacy in [false, true] {
+        let (harness, mut credentials) = legacy_broca_setup();
+        let request = bound_request(&harness, "withdrawn-fast", legacy).await;
+        runners::DescribeCache::default().reply(
+            "broca",
+            Some(&json!({"capabilities":[]})),
+            &mut credentials,
+            NOW as i64,
+        );
+        harness.set_credentials(credentials);
+        let runner = harness.bind(reserved("broca"), None).await;
+        let refused = runner.call("route.account_for", &request).await;
+        assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+        assert_eq!(refused.1["code"], "account_selection_unavailable");
+        assert!(refused.1["detail"]["retry_after_s"].is_null());
+        assert_candidate_detail(&refused.1, &request, "bound_service_tier_unavailable");
+        assert!(
+            refused.1["detail"].get("retry_after_ms").is_none(),
+            "{}",
+            refused.1
+        );
+        assert!(harness
+            .store()
+            .account_decisions("serve", 10)
+            .unwrap()
+            .is_empty());
+    }
 }

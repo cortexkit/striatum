@@ -3118,7 +3118,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         },
         None => None,
     };
-    if bound_tier.as_deref().is_some_and(|tier| tier != "standard")
+    if bound_tier.as_deref() == Some("fast")
         && ctx.classes.as_ref().is_some_and(|classes| {
             crate::routing_v1::runners::tier_view_unknown(
                 &classes.credentials,
@@ -3132,7 +3132,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             OpReply::typed(
                 "account_selection_unavailable",
                 "[TODO(user): runner service-tier support is not yet observed; retry admission shortly]",
-                json!({"retry_after_ms": 3_000}),
+                service_tier_refusal_detail(&parsed, "runner_service_tiers_unobserved", Some(3_000)),
             ),
         );
     }
@@ -3392,11 +3392,35 @@ fn tier_candidate_matches(
     })
 }
 
-fn bound_service_tier_refusal() -> OpReply {
+fn service_tier_refusal_detail(
+    params: &AccountForParams,
+    reason: &str,
+    retry_after_ms: Option<u64>,
+) -> Value {
+    let exclusions: Vec<_> = params
+        .candidates
+        .iter()
+        .flat_map(|candidates| &candidates.accounts)
+        .map(|candidate| json!({"account_id": candidate.account_id, "reason": reason}))
+        .collect();
+    let mut detail = json!({
+        "code": "account_selection_unavailable",
+        "retry_after_s": retry_after_ms.map(|ms| ms.div_ceil(1_000)),
+        "decision_id": params.model_decision_id,
+        "exclusions": exclusions,
+    });
+    if let Some(wait) = retry_after_ms {
+        detail["retry_after_ms"] = json!(wait);
+    }
+    detail
+}
+
+fn bound_service_tier_refusal(params: &AccountForParams) -> OpReply {
     checking("bound_service_tier");
-    OpReply::error(
+    OpReply::typed(
         "account_selection_unavailable",
         "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
+        service_tier_refusal_detail(params, "bound_service_tier_unavailable", None),
     )
 }
 
@@ -3434,7 +3458,7 @@ fn prepare_service_tier(
                 })
             })
         {
-            return Err(bound_service_tier_refusal());
+            return Err(bound_service_tier_refusal(parsed));
         }
         return Ok((!tier.is_standard() || parsed.service_tier.is_some()).then_some(tier));
     }
@@ -3956,7 +3980,7 @@ fn serve(
             })
         })
     {
-        return Ok(bound_service_tier_refusal());
+        return Ok(bound_service_tier_refusal(params));
     }
     let established = match affinity_row.as_ref() {
         Some(affinity) => tx.pin_has_started(affinity)?,

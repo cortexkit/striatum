@@ -44,7 +44,7 @@ pub(crate) async fn fetch_describe(
 
 /// A bound decision cannot step down its tier. After a restart, poll once on
 /// admission rather than treating the empty cache as evidence that the bound
-/// non-standard service tier is unsupported.
+/// fast service tier is unsupported.
 pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: &Deps<'_>) {
     let Ok(request) = serde_json::from_slice::<Value>(body) else {
         return;
@@ -58,7 +58,7 @@ pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: 
         .or_else(|| params["model_decision_id"].as_str())
         .and_then(|id| deps.store.decision_service_tier(id).ok().flatten());
     let tier = bound.as_ref().map(|(tier, _)| tier.as_str());
-    if tier.is_none_or(|tier| tier == "standard") {
+    if tier != Some("fast") {
         return;
     }
     let Some(module) = accounts::admission_runner(caller, deps) else {

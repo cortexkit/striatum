@@ -334,9 +334,8 @@ async fn route_fence_is_exhausted_with_its_reset_on_both_entrypoints() {
 
 #[test]
 fn contract_codes_map_with_contract_detail() {
-    // Timed codes carry their time; every other contract code carries no
-    // detail. Untimed codes are never timed, even with a reset in the legacy
-    // detail.
+    // Hold and pool exhaustion carry their wait. Unavailability can also carry
+    // a short retry delay and candidate reasons; other codes drop legacy detail.
     let hold = super::accounts::account_refusal_for_test_detail(
         "account_hold",
         Some(&json!({"retry_after_s": 30})),
@@ -349,8 +348,8 @@ fn contract_codes_map_with_contract_detail() {
     );
     assert_eq!(exhausted.code, RefusalCode::AccountPoolExhausted);
     assert_eq!(exhausted.wait_until_ms(), Some(NOW + 1));
-    // `invalid_request` names its field; every other untimed code carries no
-    // detail.
+    // `invalid_request` names its field. With no allocator detail supplied,
+    // the remaining codes below still have no detail or wait.
     let invalid = super::accounts::account_refusal_for_test("invalid_request");
     assert!(invalid.wait_until_ms().is_none());
     assert_eq!(
