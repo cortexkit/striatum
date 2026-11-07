@@ -39,6 +39,10 @@ pub struct BrocaCredentials {
     pub(crate) runner_service_tiers:
         BTreeMap<String, cortexkit_role_llm_runner::service_tier::ServiceTiers>,
     pub(crate) runner_routed_accounts: BTreeMap<String, Vec<String>>,
+    /// Successful describes, including explicit withdrawals of tier support.
+    /// Shared timestamps let admission-time refreshes renew the poller's view.
+    pub(crate) runner_describe_observed: BTreeMap<String, i64>,
+    pub(crate) runner_describe_logs: crate::account_refusal_log::LogLimiter,
     pub(crate) classifier_models: BTreeMap<String, Vec<crate::routing_v1::classifier::ServedModel>>,
     pub(crate) plan_prices: serde_json::Value,
     pub(crate) wire_apis: BTreeMap<String, String>,

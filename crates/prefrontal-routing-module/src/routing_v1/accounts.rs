@@ -153,6 +153,12 @@ fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCall
     ))
 }
 
+pub(super) fn admission_runner(caller: &Caller, deps: &Deps<'_>) -> Option<String> {
+    account_caller(caller, deps)
+        .ok()
+        .map(|authority| authority.module.to_owned())
+}
+
 fn same_name(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
@@ -532,6 +538,13 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
             Refusal::new(RefusalCode::AccountSelectionDisabled, message.clone())
         }
         "account_selection_unsupported" => Refusal::new(RefusalCode::AuthRequired, message.clone()),
+        "account_selection_unavailable" => {
+            let mut refusal = account_unavailable(message.clone());
+            if let Some(wait) = detail.and_then(|detail| detail["retry_after_ms"].as_u64()) {
+                refusal.detail.insert("retry_after_ms".into(), json!(wait));
+            }
+            refusal
+        }
         "store_error" | "internal_error" | "no_eligible_account" | "unscoped_caller" => {
             account_unavailable(message.clone())
         }

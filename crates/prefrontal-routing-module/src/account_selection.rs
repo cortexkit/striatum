@@ -3111,6 +3111,31 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Err(error) => return store_error(error),
     }
     checking("roster_prepare");
+    let bound_tier = match parsed.model_decision_id.as_deref() {
+        Some(id) => match ctx.store.decision_service_tier(id) {
+            Ok(tier) => tier.map(|(tier, _)| tier),
+            Err(error) => return store_error(error),
+        },
+        None => None,
+    };
+    if bound_tier.as_deref().is_some_and(|tier| tier != "standard")
+        && ctx.classes.as_ref().is_some_and(|classes| {
+            crate::routing_v1::runners::tier_view_unknown(
+                &classes.credentials,
+                &parsed.caller.runner,
+                ctx.now_ms,
+            )
+        })
+    {
+        return because(
+            "runner_tier_unobserved",
+            OpReply::typed(
+                "account_selection_unavailable",
+                "[TODO(user): runner service-tier support is not yet observed; retry admission shortly]",
+                json!({"retry_after_ms": 3_000}),
+            ),
+        );
+    }
     let (mut roster, route_fenced, class) = match prepare_roster(&parsed, ctx) {
         Ok(prepared) => prepared,
         Err(reply) => return reply,

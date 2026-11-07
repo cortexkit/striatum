@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 const INTERVAL_MS: i64 = 60_000;
 const MAX_KEYS: usize = 4096;
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct LogLimiter {
     entries: BTreeMap<(String, String), (i64, u64)>,
 }

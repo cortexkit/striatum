@@ -1496,6 +1496,18 @@ async fn handle_frame(
                         }
                         // Both wire shapes are answered by one selection pass.
                         // claims() only chooses which request body that pass reads.
+                        routing_v1::runners::refresh_admission_tiers(
+                            &frame.body,
+                            &routing_v1::Caller::for_route(channel, route_epoch),
+                            &routing_v1::Deps {
+                                quota_cache: &quota_cache,
+                                store: &store,
+                                routing_config_path: &routing_config_path,
+                                operator_config_path: &operator_config_path,
+                                broca_credentials: &broca_credentials,
+                            },
+                        )
+                        .await;
                         if routing_v1::claims(&frame.body) {
                             return routing_v1::serve(
                                 frame,

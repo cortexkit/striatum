@@ -17,6 +17,8 @@ const NOW: u64 = 1_800_000_000_000;
 const MODEL: &str = "gpt-6.1-sol";
 const RUNNER: &str = "tier-runner";
 
+mod observation_tests;
+
 fn served() -> Value {
     serde_json::from_str(include_str!(
         "../../fixtures/service-tier-v1/fusiform-served-payloads.json"
@@ -568,7 +570,14 @@ async fn account_service_tier_legacy_bound_decision_refuses_an_ineligible_pin() 
                     NOW,
                 );
             }
-            "runner" => credentials.runner_service_tiers.clear(),
+            "runner" => {
+                runners::DescribeCache::default().reply(
+                    "broca",
+                    Some(&json!({"capabilities":[]})),
+                    &mut credentials,
+                    NOW as i64,
+                );
+            }
             "model" => {
                 let mut catalog =
                     served()["catalog.get — provider default endpoint"]["response"].clone();
@@ -689,7 +698,12 @@ async fn account_service_tier_requires_calling_runner_and_model_support() {
                 "other-tier-runner".into(),
                 credentials.runner_service_tiers[RUNNER].clone(),
             );
-            credentials.runner_service_tiers.remove(RUNNER);
+            runners::DescribeCache::default().reply(
+                RUNNER,
+                Some(&json!({"capabilities":[]})),
+                &mut credentials,
+                NOW as i64,
+            );
             harness.edit_config(|config| {
                 config["runners"] = json!([
                     {"module":RUNNER,"via_vault":true},

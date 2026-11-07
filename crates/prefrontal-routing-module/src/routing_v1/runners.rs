@@ -18,7 +18,9 @@ use crate::{
     config_policy::RunnerPolicy,
 };
 
+mod admission;
 mod describe_cache;
+pub(crate) use admission::{fetch_describe, refresh_admission_tiers, tier_view_unknown};
 pub(crate) use describe_cache::DescribeCache;
 
 #[derive(Debug, Clone, Serialize)]
@@ -439,7 +441,7 @@ pub(crate) async fn refresh_loop(
     credentials: crate::SharedBrocaCredentials,
     config_path: std::path::PathBuf,
 ) {
-    use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
+    use subc_client_rs::{ConsumerOptions, SubcConsumer};
     let mut cache = DescribeCache::default();
     let mut classifiers = super::classifier::DescribeCache::default();
     loop {
@@ -493,28 +495,7 @@ pub(crate) async fn refresh_loop(
             // The routing declaration describes reach, not tier application.
             // Only the runner's own role.describe can establish tier support.
             for module in tier_modules {
-                let reply = consumer
-                    .call(
-                        subc_protocol::RouteTarget::ManagementSurface {
-                            module_id: module.clone(),
-                        },
-                        subc_protocol::BindIdentity::new(
-                            connection_file
-                                .parent()
-                                .unwrap_or(std::path::Path::new(".")),
-                            "prefrontal-routing",
-                            "runner-service-tiers",
-                        ),
-                        br#"{"method":"role.describe","params":{}}"#.to_vec(),
-                        CallOptions {
-                            timeout: std::time::Duration::from_secs(1),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let describe = reply
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                let describe = fetch_describe(&consumer, &connection_file, &module).await;
                 if let Ok(mut credentials) = credentials.lock() {
                     cache.reply(
                         &module,
