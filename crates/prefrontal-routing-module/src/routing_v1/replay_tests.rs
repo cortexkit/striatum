@@ -449,6 +449,11 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "route.consumer_models",
                             ][..],
                         ),
+                        // Classifier selection (routing 0.7.4) reads these.
+                        (
+                            "requirement_fields",
+                            &["questions", "input_tokens", "max_cost_usd"][..],
+                        ),
                     ] {
                         result[field]
                             .as_array_mut()
