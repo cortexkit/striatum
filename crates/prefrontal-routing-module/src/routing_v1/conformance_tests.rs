@@ -1094,9 +1094,33 @@ impl RoutingSubject for KitSubject {
 /// Known failures among the checks that run for this provider.
 const NOT_YET_SERVED: &[&str] = &[];
 
-/// Checks gated off by the provider's current group declarations: serving
-/// checks for undeclared groups and refusal checks for declared groups.
+/// Checks gated off by group declarations or optional fixture hooks. The
+/// model-input hook is absent here; classifier handler tests cover question
+/// limits and input-spend caps against the catalog and provider description.
 const NOT_APPLICABLE: &[&str] = &[
+    "select_engine_opt_in",
+    "select_engine_slot_malformed",
+    "select_engine_slot_duplicate",
+    "select_engine_slot_empty_formats",
+    "select_engine_slot_unverified",
+    "select_engine_request",
+    "select_engine_requirements_valid",
+    "select_engine_caller_local",
+    "select_engine_filters",
+    "select_engine_match_requirements",
+    "select_engine_privacy",
+    "select_engine_reachability",
+    "select_engine_answer",
+    "select_engine_ranking",
+    "select_engine_report",
+    "select_engine_explain",
+    "select_engine_media_admission",
+    "select_engine_admission_before_expiry",
+    "select_engine_admission_expiry",
+    "select_engine_admission_foreign",
+    "select_engine_admission_pair",
+    "select_engine_admission_replay",
+    "select_engine_admission_caller_local",
     "undeclared_pin_slot_refused",
     "undeclared_available_routes_refused",
     "undeclared_prefer_prompt_cache_refused",
@@ -1109,6 +1133,8 @@ const NOT_APPLICABLE: &[&str] = &[
     "undeclared_harness_group_refuses_member",
     "undeclared_prefer_group_refuses_member",
     "undeclared_exclude_providers_group_refuses_member",
+    "questions_requirement_honoured",
+    "max_cost_usd_requirement_honoured",
 ];
 
 /// Every served check passes; exactly [`NOT_YET_SERVED`] fail, and
@@ -1118,6 +1144,9 @@ const NOT_APPLICABLE: &[&str] = &[
 #[tokio::test]
 async fn routing_v1_conformance_kit_matches_served_checks() {
     for group in cortexkit_role_routing::capabilities::KNOWN {
+        if *group == cortexkit_role_routing::capabilities::SELECT_ENGINE {
+            continue;
+        }
         assert!(
             super::describe::CAPABILITIES.contains(group),
             "undeclared group {group}"

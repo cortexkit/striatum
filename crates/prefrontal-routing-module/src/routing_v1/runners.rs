@@ -76,6 +76,57 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
+    pub(crate) fn classifier(
+        module: &str,
+        credentials: &BrocaCredentials,
+        facts: &[ModelFact],
+        now_ms: u64,
+    ) -> Self {
+        if !credentials.classifier_models.contains_key(module) {
+            return Self::default();
+        }
+        super::classifier::report_missing_rows(credentials, module, now_ms as i64);
+        let models: BTreeSet<String> = facts
+            .iter()
+            .filter(|fact| {
+                super::classifier::eligible(
+                    credentials,
+                    module,
+                    fact,
+                    &cortexkit_role_routing::select::Requirements::iq(0),
+                    now_ms as i64,
+                )
+            })
+            .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
+            .collect();
+        let reachable = if credentials.listing_is_fresh(now_ms) {
+            models.clone()
+        } else {
+            BTreeSet::new()
+        };
+        Self {
+            entries: vec![EffectiveRunner {
+                policy: RunnerPolicy {
+                    module: module.into(),
+                    routes: Some(reachable.iter().cloned().collect()),
+                    tool_capabilities: Vec::new(),
+                    via_vault: true,
+                },
+                follows_account_choice: true,
+                routed_accounts: vec!["apikey".into()],
+                standing_limits: None,
+                pairs: None,
+                harnesses: Vec::new(),
+                default_harness: None,
+                starts_sessions: true,
+                route_policy: None,
+                reachable_models: reachable,
+                statically_reachable_models: models,
+                unverified_wire_models: BTreeSet::new(),
+            }],
+        }
+    }
+
     pub(crate) fn build(
         policies: Vec<RunnerPolicy>,
         credentials: &BrocaCredentials,
@@ -390,6 +441,7 @@ pub(crate) async fn refresh_loop(
 ) {
     use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
     let mut cache = DescribeCache::default();
+    let mut classifiers = super::classifier::DescribeCache::default();
     loop {
         let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
@@ -407,6 +459,27 @@ pub(crate) async fn refresh_loop(
         if let Ok(Ok((consumer, modules))) = result {
             super::consumers::replace_catalog(&modules);
             let policies = crate::config_overrides::live_config(&config_path).v1_runners();
+            let classifier_modules = credentials
+                .lock()
+                .map(|mut credentials| {
+                    classifiers.catalog(&modules, &mut credentials, crate::now_ms() as i64)
+                })
+                .unwrap_or_default();
+            for module in classifier_modules {
+                let result =
+                    super::classifier::fetch_describe(&consumer, &connection_file, &module).await;
+                if let Ok(mut credentials) = credentials.lock() {
+                    if matches!(result, Ok(None)) {
+                        classifiers.revoke(&module, &mut credentials);
+                    }
+                    classifiers.reply(
+                        &module,
+                        result.as_ref().ok().and_then(Option::as_ref),
+                        &mut credentials,
+                        crate::now_ms() as i64,
+                    );
+                }
+            }
             let tier_modules = if let Ok(mut credentials) = credentials.lock() {
                 cache.catalog(
                     &modules,
@@ -453,6 +526,7 @@ pub(crate) async fn refresh_loop(
             }
         } else if let Ok(mut credentials) = credentials.lock() {
             cache.missed_all(&mut credentials, crate::now_ms() as i64);
+            classifiers.expire(&mut credentials, crate::now_ms() as i64);
         }
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }

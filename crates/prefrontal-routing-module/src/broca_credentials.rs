@@ -39,6 +39,7 @@ pub struct BrocaCredentials {
     pub(crate) runner_service_tiers:
         BTreeMap<String, cortexkit_role_llm_runner::service_tier::ServiceTiers>,
     pub(crate) runner_routed_accounts: BTreeMap<String, Vec<String>>,
+    pub(crate) classifier_models: BTreeMap<String, Vec<crate::routing_v1::classifier::ServedModel>>,
     pub(crate) plan_prices: serde_json::Value,
     pub(crate) wire_apis: BTreeMap<String, String>,
     serving: BTreeMap<String, ServingMethod>,

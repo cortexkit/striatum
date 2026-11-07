@@ -69,6 +69,13 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
     }
     let mut value = serde_json::to_value(describe)
         .map_err(|error| super::provider_refusal("internal_error", error.to_string()))?;
+    if let Some(fields) = value["requirement_fields"].as_array_mut() {
+        fields.extend(
+            cortexkit_role_routing::select::OPTIONAL_REQUIREMENT_FIELDS
+                .iter()
+                .map(|field| Value::String((*field).into())),
+        );
+    }
     value["runners"] = serde_json::to_value(super::runners::effective(deps).entries)
         .map_err(|error| super::provider_refusal("internal_error", error.to_string()))?;
     value["account_policies"] = config.effective_account_policies();

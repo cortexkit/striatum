@@ -115,10 +115,13 @@ fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCall
     checking("caller_check");
     let runners = super::runners::effective(deps);
     if caller.binding_is_current() {
-        if let Some(module) = caller
-            .attested_module()
-            .filter(|module| runners.get(module).is_some())
-        {
+        if let Some(module) = caller.attested_module().filter(|module| {
+            runners.get(module).is_some()
+                || deps
+                    .broca_credentials
+                    .lock()
+                    .is_ok_and(|credentials| credentials.classifier_models.contains_key(*module))
+        }) {
             return Ok(AccountCaller {
                 module,
                 principal: caller.principal.clone(),

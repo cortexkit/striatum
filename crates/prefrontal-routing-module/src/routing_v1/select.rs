@@ -540,10 +540,25 @@ async fn select_at_tier(
         .tool_capabilities
         .clone()
         .unwrap_or_default();
+    let classifier = consumer == "classifier";
     let registry = deps
         .broca_credentials
         .lock()
         .map(|credentials| {
+            if classifier {
+                return caller
+                    .attested_module()
+                    .filter(|_| caller.binding_is_current())
+                    .map(|module| {
+                        super::runners::Registry::classifier(
+                            module,
+                            &credentials,
+                            &facts,
+                            now as u64,
+                        )
+                    })
+                    .unwrap_or_default();
+            }
             super::runners::Registry::build(
                 operator_config.v1_runners(),
                 &credentials,
@@ -716,6 +731,34 @@ async fn select_at_tier(
         .iter()
         .copied()
         .filter(|_| !unconfirmable)
+        .filter(|_| classifier || requirements.questions.is_none())
+        .filter(|fact| {
+            classifier
+                || requirements.max_cost_usd.as_ref().is_none_or(|cap| {
+                    deps.broca_credentials.lock().is_ok_and(|credentials| {
+                        super::classifier::input_price(&credentials, fact)
+                            .zip(cap.as_f64())
+                            .is_some_and(|(price, cap)| {
+                                price * requirements.input_tokens.unwrap_or(0) as f64 / 1_000_000.0
+                                    <= cap
+                            })
+                    })
+                })
+        })
+        .filter(|fact| {
+            !classifier
+                || deps.broca_credentials.lock().is_ok_and(|credentials| {
+                    caller.attested_module().is_some_and(|module| {
+                        super::classifier::eligible(
+                            &credentials,
+                            module,
+                            fact,
+                            requirements,
+                            now as i64,
+                        )
+                    })
+                })
+        })
         .filter(|fact| {
             requirements.tools != Some(ToolsRequirement::Required)
                 || fact.supports_tool_use == Some(true)
@@ -817,23 +860,34 @@ async fn select_at_tier(
     // rather than sending them through the integer-only request validator.
     let operator_demand =
         operator_config.consumer_policy(&consumer, &Default::default(), &Default::default());
-    let demand = ModelRequirements {
-        iq: operator_demand
-            .iq
-            .unwrap_or_else(|| f64::from(requirements.iq)),
-        eq: operator_demand
-            .eq
-            .unwrap_or_else(|| f64::from(requirements.eq.unwrap_or(0))),
+    let demand = if classifier {
+        ModelRequirements { iq: 0.0, eq: 0.0 }
+    } else {
+        ModelRequirements {
+            iq: operator_demand
+                .iq
+                .unwrap_or_else(|| f64::from(requirements.iq)),
+            eq: operator_demand
+                .eq
+                .unwrap_or_else(|| f64::from(requirements.eq.unwrap_or(0))),
+        }
     };
     let vision = modalities.contains(&Modality::Image);
-    let required_capabilities = match (vision, requirements.context_window) {
-        (false, None) if demand.iq > 0.0 || demand.eq > 0.0 => None,
-        // The scorer refuses an all-zero demand that names no capability; a
-        // zero context floor states "no demand" without adding a constraint.
-        (vision, context) => Some(RequiredCapabilities {
-            vision: vision.then_some(true),
-            min_context: Some(context.map_or(0.0, |floor| floor as f64)),
-        }),
+    let required_capabilities = if classifier {
+        Some(RequiredCapabilities {
+            vision: None,
+            min_context: Some(0.0),
+        })
+    } else {
+        match (vision, requirements.context_window) {
+            (false, None) if demand.iq > 0.0 || demand.eq > 0.0 => None,
+            // The scorer refuses an all-zero demand that names no capability; a
+            // zero context floor states "no demand" without adding a constraint.
+            (vision, context) => Some(RequiredCapabilities {
+                vision: vision.then_some(true),
+                min_context: Some(context.map_or(0.0, |floor| floor as f64)),
+            }),
+        }
     };
     // The selection's exclusion matcher reads a bare provider id as every
     // route of that provider, so `exclude_providers` joins the request's
@@ -849,7 +903,27 @@ async fn select_at_tier(
             queued: u32::try_from(slot.queued.unwrap_or(0)).unwrap_or(u32::MAX),
         }))
     });
+    let classifier_order = classifier.then(|| {
+        let mut order: Vec<String> = consumer_policy.ladder.iter().flatten().cloned().collect();
+        let eligible: Vec<_> = facts
+            .iter()
+            .filter(|fact| available.contains(&fact_to_route(fact).route_key))
+            .cloned()
+            .collect();
+        let prices = deps
+            .broca_credentials
+            .lock()
+            .map(|credentials| super::classifier::ordered_routes(&credentials, &eligible))
+            .unwrap_or_default();
+        for route in prices {
+            if !order.contains(&route) {
+                order.push(route);
+            }
+        }
+        order
+    });
     let selection = Selection {
+        classifier_order,
         prefer_prompt_cache: request.prefer_prompt_cache.unwrap_or(false),
         consumer: &consumer,
         priced_per_token,
@@ -940,6 +1014,7 @@ async fn select_at_tier(
         }
     }
     let ladder_choice = if request_pin.is_none()
+        && !classifier
         && project_pin.is_none()
         && continuing.is_none()
         && consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
@@ -997,6 +1072,9 @@ async fn select_at_tier(
             |pin| selection.pin(pin, &available),
             |only| selection.score(only),
             || {
+                if classifier {
+                    return selection.score(&usable);
+                }
                 select_policy::select_in_order(&usable, &consumer_policy, |only| {
                     selection.score(only)
                 })
@@ -1018,7 +1096,8 @@ async fn select_at_tier(
     // request, so the preference never admits a route the request would not
     // otherwise get.
     let mut preferred = false;
-    let laddered = consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder);
+    let laddered =
+        classifier || consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder);
     if let (Ok((normal, select_policy::OrderBasis::Mode)), Some(prefer), false) =
         (&ordered, &request.prefer, laddered)
     {
@@ -1348,6 +1427,7 @@ async fn select_at_tier(
 
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
+    classifier_order: Option<Vec<String>>,
     prefer_prompt_cache: bool,
     hold_ok: bool,
     hold_wait_max_s: Option<u64>,
@@ -1383,6 +1463,31 @@ struct Selection<'a> {
 
 impl<'a> Selection<'a> {
     fn score(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
+        if let Some(order) = &self.classifier_order {
+            // Classifier order uses input price, not chat workload profiles or
+            // output price. The ordinary scorer still admits each candidate,
+            // preserving exclusions, quotas and account fences.
+            for route in order {
+                let only = available
+                    .iter()
+                    .filter(|key| *key == route || key.starts_with(&format!("{route}/")))
+                    .cloned()
+                    .collect();
+                if let Ok(selected) = self.score_candidates(&only) {
+                    if self.account_check(&selected).is_ok() {
+                        return Ok(selected);
+                    }
+                }
+            }
+            return self.score_candidates(&HashSet::new());
+        }
+        self.score_candidates(available)
+    }
+
+    fn score_candidates(
+        &self,
+        available: &HashSet<String>,
+    ) -> Result<SelectedModelRoute, NoRouteError> {
         let allowed = available
             .iter()
             .filter(|route| {

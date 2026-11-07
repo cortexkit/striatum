@@ -305,6 +305,7 @@ pub(crate) struct CatalogSnapshot {
     facts: Vec<FusiformFactUpdate>,
     rates: BTreeMap<String, ModelRates>,
     pub(crate) wire_apis: BTreeMap<String, String>,
+    pub(crate) model_kinds: BTreeMap<String, String>,
     quality_scores: Option<QualityScores>,
     grades: BTreeMap<String, prefrontal_routing_store::OperatorQuality>,
     /// `(provider_id, model_id)` of entries served under a well-formed
@@ -315,6 +316,16 @@ pub(crate) struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    pub(crate) fn input_price(&self, model: &str) -> Option<f64> {
+        self.model(model).and_then(|fact| fact.input_rate)
+    }
+
+    pub(crate) fn model(&self, model: &str) -> Option<&FusiformFactUpdate> {
+        self.facts
+            .iter()
+            .find(|fact| model == format!("{}/{}", fact.provider_id, fact.model_id))
+    }
+
     /// Keep the provider index tied to the version of the catalog that supplied it.
     pub(crate) fn provider_index(&self) -> (i64, BTreeSet<String>) {
         let providers = self
@@ -848,6 +859,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut rates = BTreeMap::new();
     let mut retained = BTreeSet::new();
     let mut wire_apis = BTreeMap::new();
+    let mut model_kinds = BTreeMap::new();
     let mut grades = BTreeMap::new();
     // (served key, reason) for every entry left out of this snapshot.
     let mut unreadable: Vec<(String, String)> = Vec::new();
@@ -891,6 +903,9 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
             entry_auth_methods,
         ) {
             Ok((fact, model_rates)) => {
+                if let Some(kind) = entry.get("model.kind").and_then(Value::as_str) {
+                    model_kinds.insert(served_key.clone(), kind.to_owned());
+                }
                 facts.push(fact);
                 if let Some(api) = entry.get("wire.family").and_then(Value::as_str) {
                     wire_apis.insert(served_key.clone(), api.to_owned());
@@ -913,6 +928,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         rates,
         retained,
         wire_apis,
+        model_kinds,
         quality_scores: reply.quality_scores,
         grades,
     })
