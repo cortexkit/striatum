@@ -4292,7 +4292,7 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
         ManagementOperation {
             name: cortexkit_role_routing::ops::ROUTE_SELECT_ENGINE.to_string(),
             kind: ManagementOperationKind::Mutate,
-            description: Some("[TODO(user): Describe media engine selection]".to_string()),
+            description: Some("Choose the engine for one media job (transcription, synthesis, image, video, realtime) and record the decision: privacy and reachability filters first, then measured accuracy, then cost from Fusiform's prices.".to_string()),
         },
         // route.select is one selection pass for both wire shapes. The older
         // body is recognised by targetAgent; every other body is routing/v1.

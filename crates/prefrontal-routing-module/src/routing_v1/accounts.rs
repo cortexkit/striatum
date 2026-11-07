@@ -180,7 +180,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         if super::consumers::is_media_provider(authority.module) {
             return Err(super::provider_refusal(
                 "account_selection_unavailable",
-                "[TODO(user): Media account continuation unavailable]",
+                "Media engine jobs don't continue an earlier admission. Admit each job with its own engine decision (mode admit).",
             ));
         }
         return continue_account(params, caller, &authority, deps);
@@ -214,7 +214,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
     {
         return Err(super::provider_refusal(
             "account_not_authorized",
-            "[TODO(user): Pair is not a remote engine in the verified media slot]",
+            "This provider and model aren't a remote engine your module declared in its verified media slot, so routing won't choose an account for it.",
         ));
     }
     if let Some(scope) = authority.session {
@@ -341,7 +341,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         if !credentials.media_listing_ready(now_ms()) {
             return Err(super::provider_refusal(
                 "account_selection_unavailable",
-                "[TODO(user): Media credential listing or category list grant unavailable]",
+                "Routing can't read the media-provider credential list right now: its listing grant is missing or the last listing is stale or failed. Retry shortly; if it persists, the vault's media-provider list grant for routing needs checking.",
             ));
         }
         if !credentials
@@ -351,13 +351,13 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         {
             return Err(super::provider_refusal(
                 "auth_required",
-                "[TODO(user): No eligible media-provider API key for engine provider]",
+                "No active API key in the vault's media-provider category serves this engine's provider. Add or enable one before using this engine.",
             ));
         }
         drop(credentials);
         ctx.classes
             .as_mut()
-            .ok_or_else(|| account_unavailable("[TODO(user): Media account context unavailable]"))?
+            .ok_or_else(|| account_unavailable("Routing's account context isn't loaded yet, so it can't choose a media account. Retry shortly."))?
             .for_engine(&request.provider, &request.model)
             .map_err(store_unavailable)?;
     }

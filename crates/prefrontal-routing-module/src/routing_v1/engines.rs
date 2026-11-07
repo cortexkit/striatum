@@ -52,11 +52,11 @@ pub(super) fn is_decision(deps: &Deps<'_>, id: &str) -> Result<bool, String> {
         .map(|value| value.unwrap_or(false))
 }
 
+/// Refusals keep the message the failing check wrote: a `no_engine` answer
+/// names the filter that emptied the candidate set, which a single generic
+/// message would hide.
 pub(super) fn select(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
-    select_inner(params, caller, deps).map_err(|mut refusal| {
-        refusal.message = "[TODO(user): Explain media engine selection refusal]".into();
-        refusal
-    })
+    select_inner(params, caller, deps)
 }
 
 fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
