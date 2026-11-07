@@ -34,6 +34,7 @@ pub struct BrocaCredentials {
     unreadable: usize,
     last_error: Option<String>,
     listed: Vec<ListedCredential>,
+    media_list_granted: bool,
     catalog_providers: BTreeSet<String>,
     pub(crate) runner_declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
     pub(crate) runner_service_tiers:
@@ -61,6 +62,10 @@ pub struct BrocaCredentials {
     priced_targets: BTreeMap<String, String>,
     #[cfg(test)]
     pub(crate) legacy_pricing_baseline: bool,
+    #[cfg(test)]
+    pub(crate) engine_clock_offset_ms: u64,
+    #[cfg(test)]
+    pub(crate) engine_test_facts: BTreeMap<(String, String), (Option<f64>, Option<f64>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +440,11 @@ impl BrocaCredentials {
     pub fn apply_listing(&mut self, listing: &ScopedCredentialListing, at_ms: u64) -> bool {
         self.reached_at_ms = Some(at_ms);
         self.last_error = None;
+        self.media_list_granted = listing.grant_tuples.iter().any(|grant| {
+            grant.selector_kind == "category"
+                && grant.selector == "media-provider"
+                && grant.operation == "list"
+        });
         if self.view.as_deref() == Some(&listing.view) {
             return false;
         }
@@ -465,6 +475,14 @@ impl BrocaCredentials {
         }
         self.catalog_wake.notify_one();
         true
+    }
+
+    pub(crate) fn media_listing_ready(&self, at_ms: u64) -> bool {
+        self.media_list_granted
+            && self.last_error.is_none()
+            && self
+                .reached_at_ms
+                .is_some_and(|at| at_ms.saturating_sub(at) <= MAX_AGE_MS)
     }
 
     pub(crate) fn mapped_providers(&self) -> HashSet<String> {

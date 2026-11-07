@@ -13,6 +13,7 @@ use crate::select_policy;
 /// parsers, so declarations and accepted members agree. Harnesses come from
 /// runner declarations.
 pub(super) const CAPABILITIES: &[&str] = &[
+    "select_engine",
     "select_panel",
     "consumer_models",
     "explain",

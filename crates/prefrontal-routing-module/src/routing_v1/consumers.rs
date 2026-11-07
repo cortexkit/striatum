@@ -17,6 +17,7 @@ use super::Caller;
 #[derive(Clone, Default)]
 pub(crate) struct Catalog {
     modules: BTreeMap<String, BTreeMap<String, DemandDefaults>>,
+    engines: BTreeMap<String, cortexkit_role_routing::EngineDeclarations>,
     agent_hosts: BTreeSet<String>,
     issues: Vec<String>,
 }
@@ -26,6 +27,33 @@ static CATALOG: OnceLock<RwLock<Catalog>> = OnceLock::new();
 pub(crate) fn replace_catalog(modules: &Value) {
     let snapshot = Catalog::from_catalog(modules);
     *CATALOG.get_or_init(Default::default).write().unwrap() = snapshot;
+}
+
+pub(crate) fn engine_declarations() -> BTreeMap<String, cortexkit_role_routing::EngineDeclarations>
+{
+    CATALOG
+        .get_or_init(Default::default)
+        .read()
+        .unwrap()
+        .engines
+        .clone()
+}
+
+pub(crate) fn is_media_provider(module: &str) -> bool {
+    CATALOG
+        .get_or_init(Default::default)
+        .read()
+        .unwrap()
+        .engines
+        .contains_key(module)
+}
+
+pub(crate) fn media_pair(module: &str, provider: &str, model: &str) -> bool {
+    engine_declarations().get(module).is_some_and(|slot| {
+        slot.engines
+            .iter()
+            .any(|engine| !engine.local && engine.provider == provider && engine.model == model)
+    })
 }
 
 pub(crate) struct Registry {
@@ -41,7 +69,11 @@ impl Catalog {
             if entry.get("nonce_verified").and_then(Value::as_bool) != Some(true) {
                 if entry
                     .get("role_declarations")
-                    .and_then(|roles| roles.get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY))
+                    .and_then(|roles| {
+                        roles
+                            .get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)
+                            .or_else(|| roles.get("media-provider/v1"))
+                    })
                     .is_some()
                 {
                     catalog.issues.push(format!(
@@ -54,6 +86,19 @@ impl Catalog {
             let Some(module) = entry.get("module_id").and_then(Value::as_str) else {
                 continue;
             };
+            if let Some(slot) = entry
+                .get("role_declarations")
+                .and_then(|roles| roles.get("media-provider/v1"))
+            {
+                match cortexkit_role_routing::parse_engine_declarations(slot) {
+                    Ok(declarations) => {
+                        catalog.engines.insert(module.to_owned(), declarations);
+                    }
+                    Err(error) => catalog.issues.push(format!(
+                        "[TODO(user): Invalid media engine declaration] {module}: {error}"
+                    )),
+                }
+            }
             if entry
                 .get("provides")
                 .and_then(Value::as_array)

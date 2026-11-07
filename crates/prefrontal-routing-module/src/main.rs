@@ -4289,6 +4289,11 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
         description: None,
     });
     let mut operations = vec![
+        ManagementOperation {
+            name: cortexkit_role_routing::ops::ROUTE_SELECT_ENGINE.to_string(),
+            kind: ManagementOperationKind::Mutate,
+            description: Some("[TODO(user): Describe media engine selection]".to_string()),
+        },
         // route.select is one selection pass for both wire shapes. The older
         // body is recognised by targetAgent; every other body is routing/v1.
         // The pass records the decision it returns, so the op is a mutation.

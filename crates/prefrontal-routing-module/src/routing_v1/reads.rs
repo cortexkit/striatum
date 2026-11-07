@@ -102,6 +102,9 @@ pub(super) fn budget_quote(
 pub(super) fn explain(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
     refuse_unknown_members(params, &["decision_id"])?;
     let request = explain::parse_explain_request(params)?;
+    if super::engines::is_decision(deps, &request.decision_id).map_err(store_refusal)? {
+        return Err(Refusal::unknown_decision());
+    }
     let selection = retained(&request.decision_id, caller, deps)?;
     let mut serving = explain::Serving::new(&selection.route.provider);
     serving.credential_id = selection

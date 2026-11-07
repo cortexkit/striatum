@@ -60,7 +60,10 @@ pub(super) fn report_at(
         return Err(Refusal::unknown_decision());
     }
     let decision = decision.unwrap();
-    super::consumers::effective(&super::operator_config(deps)).admit(&decision.consumer, caller)?;
+    if !super::engines::is_decision(deps, &request.decision_id).map_err(store_refusal)? {
+        super::consumers::effective(&super::operator_config(deps))
+            .admit(&decision.consumer, caller)?;
+    }
     // Bodies are compared as decoded: the canonical encoding leaves absent
     // and null members out alike and fixes the member order.
     let body_json = serde_json::to_string(&request)
