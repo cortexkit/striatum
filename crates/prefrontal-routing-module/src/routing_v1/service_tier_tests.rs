@@ -266,7 +266,7 @@ async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
 
     let _later = crate::InjectedClock::set(NOW + 30_000);
     cache.reply("broca", None, &mut credentials, (NOW + 30_000) as i64);
-    harness.set_credentials(credentials);
+    harness.set_credentials(credentials.clone());
     request["admission_id"] = json!("fast-after-missed-poll");
     let resumed = runner.call("route.account_for", &request).await;
     assert_eq!(resumed.0, FrameType::Response, "{}", resumed.1);
@@ -279,6 +279,88 @@ async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
         resumed.1["result"]["pin"]["id"],
         initial.1["result"]["pin"]["id"]
     );
+
+    cache.reply(
+        "broca",
+        Some(&json!({"capabilities":[]})),
+        &mut credentials,
+        (NOW + 30_000) as i64,
+    );
+    harness.set_credentials(credentials);
+    request["admission_id"] = json!("fast-after-settled-tier-removal");
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_selection_unavailable");
+}
+
+#[tokio::test]
+async fn bound_fast_resume_survives_a_restart_catalog_gap_until_describe_expires() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = legacy_broca_setup();
+    let modules = json!([{"module_id":"broca","nonce_verified":true}]);
+    let policies = serde_json::from_value::<Vec<crate::config_policy::RunnerPolicy>>(
+        json!([{"module":"broca","via_vault":true}]),
+    )
+    .unwrap();
+    let describe: Value = serde_json::from_slice(include_bytes!(
+        "../../../../test-vectors/broca-service-tiers-v1/role-describe-live.json"
+    ))
+    .unwrap();
+    let mut cache = runners::DescribeCache::default();
+    cache.catalog(&modules, &policies, &mut credentials, NOW as i64);
+    cache.reply("broca", Some(&describe), &mut credentials, NOW as i64);
+    harness.set_credentials(credentials.clone());
+    let owner = harness.bind(reserved("tier-owner"), None).await;
+    let selected = owner.call("route.select", &select_sol("fast")).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let runner = harness.bind(reserved("broca"), None).await;
+    let mut request = legacy_broca_request("fast-before-catalog-gap");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    request["service_tier"] = json!("fast");
+    let initial = runner.call("route.account_for", &request).await;
+    assert_eq!(initial.0, FrameType::Response, "{}", initial.1);
+
+    cache.reply("broca", None, &mut credentials, (NOW + 30_000) as i64);
+    let _later = crate::InjectedClock::set(NOW + 60_000);
+    cache.catalog(
+        &json!([]),
+        &policies,
+        &mut credentials,
+        (NOW + 60_000) as i64,
+    );
+    harness.set_credentials(credentials.clone());
+    request["admission_id"] = json!("fast-during-catalog-gap");
+    let resumed = runner.call("route.account_for", &request).await;
+    assert_eq!(resumed.0, FrameType::Response, "{}", resumed.1);
+    assert_eq!(resumed.1["result"]["service_tier_chosen"], "fast");
+    assert_eq!(
+        resumed.1["result"]["account"],
+        initial.1["result"]["account"]
+    );
+    for field in ["id", "generation"] {
+        assert_eq!(
+            resumed.1["result"]["pin"][field],
+            initial.1["result"]["pin"][field]
+        );
+    }
+
+    let _expired = crate::InjectedClock::set(NOW + 300_000);
+    cache.catalog(
+        &json!([]),
+        &policies,
+        &mut credentials,
+        (NOW + 300_000) as i64,
+    );
+    harness.set_credentials(credentials);
+    request["admission_id"] = json!("fast-after-catalog-gap-expiry");
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_selection_unavailable");
+    assert!(harness
+        .store()
+        .v1_admission("reserved:broca", "fast-after-catalog-gap-expiry")
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

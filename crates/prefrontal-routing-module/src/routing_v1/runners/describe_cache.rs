@@ -29,17 +29,24 @@ impl DescribeCache {
         credentials.runner_declarations = super::declarations_from_catalog(modules);
         self.modules =
             super::tier_discovery_modules(modules, &credentials.runner_declarations, policies);
-        self.last_good
-            .retain(|module, _| self.modules.contains(module));
-        self.failed.retain(|module| self.modules.contains(module));
-        // A successful catalog read is authoritative about removal, even while
-        // a runner's last successful description would otherwise still be fresh.
-        credentials
-            .runner_service_tiers
-            .retain(|module, _| self.modules.contains(module));
-        credentials
-            .runner_routed_accounts
-            .retain(|module, _| self.modules.contains(module));
+        let present: BTreeSet<_> = modules
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["module_id"].as_str())
+            .collect();
+        // The catalog lists live connections, so a configured runner can vanish
+        // during a restart without losing tier support. Keep its last answer
+        // until the original deadline, but do not trust an unverified replacement
+        // or keep an absent runner after its routing policy has been removed.
+        self.last_good.retain(|module, at| {
+            now.saturating_sub(*at) < LAST_GOOD_MS
+                && (self.modules.contains(module)
+                    || (!present.contains(module.as_str())
+                        && policies.iter().any(|policy| policy.module == *module)))
+        });
+        self.failed
+            .retain(|module| self.modules.contains(module) || self.last_good.contains_key(module));
         self.expire(credentials, now);
         self.modules.clone()
     }
@@ -152,12 +159,39 @@ mod tests {
     }
 
     #[test]
-    fn catalog_removal_drops_both_views_immediately() {
+    fn catalog_gap_retains_both_views_without_extending_the_deadline() {
         let (mut cache, mut credentials, policies, _) = setup();
-        cache.catalog(&json!([]), &policies, &mut credentials, 1);
+        assert!(cache
+            .catalog(&json!([]), &policies, &mut credentials, 1)
+            .is_empty());
+        cache.catalog(&json!([]), &policies, &mut credentials, LAST_GOOD_MS - 1);
+        assert!(credentials.runner_service_tiers.contains_key("runner-a"));
+        assert_eq!(credentials.runner_routed_accounts["runner-a"], ["oauth"]);
+        assert_eq!(cache.last_good["runner-a"], 0);
+        cache.catalog(&json!([]), &policies, &mut credentials, LAST_GOOD_MS);
         assert!(credentials.runner_service_tiers.is_empty());
         assert!(credentials.runner_routed_accounts.is_empty());
         assert!(cache.last_good.is_empty());
+    }
+
+    #[test]
+    fn removed_policy_or_unverified_replacement_drops_both_views_immediately() {
+        for unverified in [false, true] {
+            let (mut cache, mut credentials, policies, _) = setup();
+            if unverified {
+                cache.catalog(
+                    &json!([{"module_id":"runner-a","nonce_verified":false}]),
+                    &policies,
+                    &mut credentials,
+                    1,
+                );
+            } else {
+                cache.catalog(&json!([]), &[], &mut credentials, 1);
+            }
+            assert!(credentials.runner_service_tiers.is_empty());
+            assert!(credentials.runner_routed_accounts.is_empty());
+            assert!(cache.last_good.is_empty());
+        }
     }
 
     #[test]
