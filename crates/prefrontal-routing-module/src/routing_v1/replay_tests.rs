@@ -436,6 +436,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "observe_credential_refused",
                                 "select_panel",
                                 "consumer_models",
+                                "select_engine",
                             ][..],
                         ),
                         (
@@ -447,6 +448,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "route.head_choices",
                                 "route.select_panel",
                                 "route.consumer_models",
+                                "route.select_engine",
                             ][..],
                         ),
                         // Classifier selection (routing 0.7.4) reads these.

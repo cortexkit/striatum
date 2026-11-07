@@ -190,6 +190,7 @@ pub(crate) struct ClassContext {
     targets: BTreeMap<String, String>,
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
     continuation_credential: Option<String>,
+    media_route: bool,
 }
 
 #[cfg(test)]
@@ -200,6 +201,23 @@ thread_local! {
 pub(crate) struct RouteClass<'a> {
     pub rows: Vec<&'a cortexkit_claustrum_client::ListedCredential>,
     pub subscription: bool,
+}
+
+pub(crate) fn media_credential_serves(
+    row: &cortexkit_claustrum_client::ListedCredential,
+    provider: &str,
+) -> bool {
+    row.state == "active"
+        && row
+            .categories
+            .iter()
+            .any(|category| category == "media-provider")
+        && row
+            .refresh_adapter
+            .as_deref()
+            .unwrap_or(&row.credential_type)
+            == "api_key"
+        && row.provider_ids.iter().any(|id| id == provider)
 }
 
 /// Coverage is established before eligibility. A refusal cannot turn an OAuth
@@ -253,6 +271,22 @@ pub(crate) fn resolve_class<'a>(
 }
 
 impl ClassContext {
+    /// A media admission uses only media vault metadata, even when its provider
+    /// also serves language models. A neutral model fact lets the allocator
+    /// look up quota readings by provider/model without inventing LLM scores
+    /// or token prices for engine selection.
+    pub(crate) fn for_engine(&mut self, provider: &str, model: &str) -> Result<(), String> {
+        let fact = serde_json::from_value(json!({
+            "providerID": provider, "modelID": model,
+            "scores": {"elo": 0, "eq": 0, "speed": 0}, "confidence": "unknown"
+        }))
+        .map_err(|error| error.to_string())?;
+        self.facts
+            .retain(|fact| fact.provider_id != provider || fact.model_id != model);
+        self.facts.push(fact);
+        self.media_route = true;
+        Ok(())
+    }
     pub(crate) fn apply_configured_service_tiers(
         &mut self,
         facts: &mut [prefrontal_routing_core::ModelFact],
@@ -616,6 +650,7 @@ impl ClassContext {
             targets,
             tier_accounts: None,
             continuation_credential: None,
+            media_route: false,
         })
     }
 
@@ -624,6 +659,17 @@ impl ClassContext {
         fact: &prefrontal_routing_core::ModelFact,
         priced_per_token: bool,
     ) -> RouteClass<'_> {
+        if self.media_route {
+            return RouteClass {
+                rows: self
+                    .credentials
+                    .listed_credentials()
+                    .iter()
+                    .filter(|row| media_credential_serves(row, &fact.provider_id))
+                    .collect(),
+                subscription: false,
+            };
+        }
         let specs = prefrontal_routing_core::provider_model_spec::parse_spec_list(
             &self.config.operator_policy().subscription,
         );
@@ -1035,6 +1081,19 @@ impl ClassContext {
     }
 
     fn method(&self, credential: &str) -> &str {
+        if self.media_route {
+            return self
+                .credentials
+                .listed_credentials()
+                .iter()
+                .find(|row| row.id == credential)
+                .map(|row| {
+                    row.refresh_adapter
+                        .as_deref()
+                        .unwrap_or(&row.credential_type)
+                })
+                .unwrap_or("unknown");
+        }
         self.credentials
             .listed_credentials()
             .iter()

@@ -781,6 +781,7 @@ impl RoutingSubject for KitSubject {
                     (
                         consumer.id.clone(),
                         json!({
+                            "owner": (consumer.id == fixture::SUMMARY).then_some(fixture::CONSUMER),
                             "pay_per_token": consumer.priced_only,
                             "iq": consumer.requirements.iq,
                             "eq": consumer.requirements.defaults.eq,
@@ -933,6 +934,80 @@ impl RoutingSubject for KitSubject {
                 })
                 .collect(),
         ));
+        // Engine fixtures need a metadata-only media key as well as the kit's
+        // LLM accounts. Synthetic ids deliberately carry no auth-method prefix.
+        let shared = self.harness().broca_credentials.lock().unwrap().clone();
+        let mut credentials = shared.lock().unwrap();
+        let mut rows = credentials.listed_credentials().to_vec();
+        rows.retain(|row| !row.id.starts_with("synthetic-media-"));
+        let providers: std::collections::BTreeSet<_> = super::consumers::engine_declarations()
+            .values()
+            .flat_map(|slot| slot.engines.iter().map(|engine| engine.provider.clone()))
+            .collect();
+        rows.extend(providers.into_iter().map(|provider| ListedCredential {
+            id: format!("synthetic-media-{provider}"),
+            categories: vec!["media-provider".into()],
+            credential_type: "api_key".into(),
+            provider_ids: vec![provider],
+            state: "active".into(),
+            ..Default::default()
+        }));
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: format!(
+                    "media-fixture-{}",
+                    serde_json::to_string(&rows.iter().map(|row| &row.id).collect::<Vec<_>>())
+                        .unwrap()
+                ),
+                credentials: rows,
+                grant_tuples: vec![cortexkit_claustrum_client::ListedGrant {
+                    selector_kind: "category".into(),
+                    selector: "media-provider".into(),
+                    operation: "list".into(),
+                }],
+                ..Default::default()
+            },
+            crate::now_ms(),
+        );
+        Ok(())
+    }
+
+    async fn configure_engine_facts(
+        &self,
+        facts: &[cortexkit_role_routing_conformance::EngineFacts],
+    ) -> Result<(), String> {
+        self.harness()
+            .broca_credentials
+            .lock()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .engine_test_facts = facts
+            .iter()
+            .map(|fact| {
+                (
+                    (
+                        format!("{}/{}", fact.provider, fact.model),
+                        fact.kind.as_str().to_owned(),
+                    ),
+                    (
+                        fact.accuracy.map(|value| value as f64),
+                        fact.cost.map(|value| value as f64),
+                    ),
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
+    async fn advance_clock(&self, ms: u64) -> Result<(), String> {
+        self.harness()
+            .broca_credentials
+            .lock()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .engine_clock_offset_ms += ms;
         Ok(())
     }
 
@@ -1091,36 +1166,20 @@ impl RoutingSubject for KitSubject {
     }
 }
 
-/// Known failures among the checks that run for this provider.
-const NOT_YET_SERVED: &[&str] = &[];
+/// cortexkit-role-routing-conformance 0.10.6's select_engine::admitted check
+/// requires `admitted`; account_selection::commit_admission returns `reserved`
+/// until admission_started. CONTRACT.md §9.1 does not pin that state vocabulary.
+const NOT_YET_SERVED: &[&str] = &[
+    "select_engine_media_admission",
+    "select_engine_admission_before_expiry",
+    "select_engine_admission_expiry",
+    "select_engine_admission_replay",
+];
 
 /// Checks gated off by group declarations or optional fixture hooks. The
 /// model-input hook is absent here; classifier handler tests cover question
 /// limits and input-spend caps against the catalog and provider description.
 const NOT_APPLICABLE: &[&str] = &[
-    "select_engine_opt_in",
-    "select_engine_slot_malformed",
-    "select_engine_slot_duplicate",
-    "select_engine_slot_empty_formats",
-    "select_engine_slot_unverified",
-    "select_engine_request",
-    "select_engine_requirements_valid",
-    "select_engine_caller_local",
-    "select_engine_filters",
-    "select_engine_match_requirements",
-    "select_engine_privacy",
-    "select_engine_reachability",
-    "select_engine_answer",
-    "select_engine_ranking",
-    "select_engine_report",
-    "select_engine_explain",
-    "select_engine_media_admission",
-    "select_engine_admission_before_expiry",
-    "select_engine_admission_expiry",
-    "select_engine_admission_foreign",
-    "select_engine_admission_pair",
-    "select_engine_admission_replay",
-    "select_engine_admission_caller_local",
     "undeclared_pin_slot_refused",
     "undeclared_available_routes_refused",
     "undeclared_prefer_prompt_cache_refused",
@@ -1144,9 +1203,6 @@ const NOT_APPLICABLE: &[&str] = &[
 #[tokio::test]
 async fn routing_v1_conformance_kit_matches_served_checks() {
     for group in cortexkit_role_routing::capabilities::KNOWN {
-        if *group == cortexkit_role_routing::capabilities::SELECT_ENGINE {
-            continue;
-        }
         assert!(
             super::describe::CAPABILITIES.contains(group),
             "undeclared group {group}"
@@ -1171,6 +1227,18 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         );
     }
     assert_eq!(report.failing(), NOT_YET_SERVED, "{}", report.render());
+    for check in NOT_YET_SERVED {
+        assert!(
+            matches!(
+                report.outcome(check),
+                Some(cortexkit_role_routing_conformance::CheckOutcome::Failed { reason })
+                    if reason.starts_with("media admission did not honour the request:")
+                        && reason.contains("state: \"reserved\"")
+            ),
+            "unexpected failure for {check}: {}",
+            report.render()
+        );
+    }
     assert_eq!(
         report.not_applicable(),
         NOT_APPLICABLE,

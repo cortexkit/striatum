@@ -306,6 +306,7 @@ pub(crate) struct CatalogSnapshot {
     rates: BTreeMap<String, ModelRates>,
     pub(crate) wire_apis: BTreeMap<String, String>,
     pub(crate) model_kinds: BTreeMap<String, String>,
+    audio_input_prices: BTreeMap<String, AudioInputPrice>,
     quality_scores: Option<QualityScores>,
     grades: BTreeMap<String, prefrontal_routing_store::OperatorQuality>,
     /// `(provider_id, model_id)` of entries served under a well-formed
@@ -316,6 +317,29 @@ pub(crate) struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    pub(crate) fn engine_cost(
+        &self,
+        request: &cortexkit_role_routing::select_engine::SelectEngineRequest,
+        provider: &str,
+        model: &str,
+    ) -> Option<f64> {
+        use cortexkit_role_routing::select_engine::Kind;
+        if !matches!(request.kind, Kind::Transcribe | Kind::StreamTranscribe) {
+            return None;
+        }
+        let seconds = request.requirements.duration_ms? as f64 / 1000.0;
+        let price = self
+            .audio_input_prices
+            .get(&format!("{provider}/{model}"))?;
+        // Transcript length belongs to the speech, not the model. Output-token
+        // prices therefore do not enter the transcription ranking estimate.
+        let cost = if let Some((amount, per)) = price.per_second {
+            amount * seconds / per as f64
+        } else {
+            seconds * price.tokens_per_second? * price.per_million_tokens? / 1_000_000.0
+        };
+        cost.is_finite().then_some(cost)
+    }
     pub(crate) fn input_price(&self, model: &str) -> Option<f64> {
         self.model(model).and_then(|fact| fact.input_rate)
     }
@@ -342,6 +366,36 @@ impl CatalogSnapshot {
     #[cfg(test)]
     pub(crate) fn parts(&self) -> (&[FusiformFactUpdate], FusiformCatalogCursor) {
         (&self.facts, self.cursor)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+struct AudioInputPrice {
+    per_second: Option<(f64, u64)>,
+    per_million_tokens: Option<f64>,
+    tokens_per_second: Option<f64>,
+}
+
+impl AudioInputPrice {
+    fn decode(model: &str, entry: &Value) -> Self {
+        let decode = |key: &str| {
+            let value = entry.get(key)?;
+            let rate: CatalogRate = serde_json::from_value(value.clone()).ok()?;
+            decoded_rate(model, key, Some(&rate))
+        };
+        Self {
+            per_second: entry["rate.input_audio.per_second"]["per"]
+                .as_u64()
+                .filter(|per| *per > 0)
+                .and_then(|per| decode("rate.input_audio.per_second").map(|rate| (rate, per))),
+            per_million_tokens: entry
+                .get("rate.input_audio")
+                .filter(|rate| rate.get("per").is_none())
+                .and_then(|_| decode("rate.input_audio")),
+            tokens_per_second: entry["limit.audio_tokens_per_second"]
+                .as_f64()
+                .filter(|value| value.is_finite() && *value > 0.0),
+        }
     }
 }
 
@@ -860,6 +914,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut retained = BTreeSet::new();
     let mut wire_apis = BTreeMap::new();
     let mut model_kinds = BTreeMap::new();
+    let mut audio_input_prices = BTreeMap::new();
     let mut grades = BTreeMap::new();
     // (served key, reason) for every entry left out of this snapshot.
     let mut unreadable: Vec<(String, String)> = Vec::new();
@@ -903,6 +958,10 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
             entry_auth_methods,
         ) {
             Ok((fact, model_rates)) => {
+                audio_input_prices.insert(
+                    served_key.clone(),
+                    AudioInputPrice::decode(&served_key, &entry),
+                );
                 if let Some(kind) = entry.get("model.kind").and_then(Value::as_str) {
                     model_kinds.insert(served_key.clone(), kind.to_owned());
                 }
@@ -929,6 +988,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         retained,
         wire_apis,
         model_kinds,
+        audio_input_prices,
         quality_scores: reply.quality_scores,
         grades,
     })

@@ -33,6 +33,9 @@ pub(crate) mod classifier;
 mod classifier_tests;
 pub(crate) mod consumers;
 mod describe;
+mod engines;
+#[cfg(test)]
+mod engines_tests;
 mod panels;
 #[cfg(test)]
 mod panels_tests;
@@ -95,6 +98,7 @@ pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;
 /// the older operations in the module manifest.
 pub(crate) const V1_ONLY_OPS: &[&str] = &[
     ops::ROLE_DESCRIBE,
+    ops::ROUTE_SELECT_ENGINE,
     ops::ROUTE_REPORT,
     ops::ROUTE_BUDGET_QUOTE,
     ops::ROUTE_CONSUMER_MODELS,
@@ -270,6 +274,7 @@ async fn answer(
     match method {
         ops::ROLE_DESCRIBE => describe::describe(deps),
         ops::ROUTE_SELECT => select::select(params, caller, deps).await,
+        ops::ROUTE_SELECT_ENGINE => engines::select(params, caller, deps),
         ops::ROUTE_REPORT => report::report(params, caller, deps),
         ops::ROUTE_ACCOUNT_FOR => accounts::account_for(params, caller, deps),
         ops::ROUTE_ACCOUNT_OBSERVE => accounts::account_observe(params, caller, deps),

@@ -117,6 +117,7 @@ fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCall
     if caller.binding_is_current() {
         if let Some(module) = caller.attested_module().filter(|module| {
             runners.get(module).is_some()
+                || super::consumers::is_media_provider(module)
                 || deps
                     .broca_credentials
                     .lock()
@@ -170,6 +171,12 @@ pub(super) fn account_for(
 fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
     let authority = account_caller(caller, deps)?;
     if params["mode"] == "continue" {
+        if super::consumers::is_media_provider(authority.module) {
+            return Err(super::provider_refusal(
+                "account_selection_unavailable",
+                "[TODO(user): Media account continuation unavailable]",
+            ));
+        }
         return continue_account(params, caller, &authority, deps);
     }
     checking("account_for_shape");
@@ -195,6 +202,15 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
     })?;
     checking("account_for_parse");
     let mut request = parse_account_for_request_serving(params, super::describe::CAPABILITIES)?;
+    let media_caller = super::consumers::is_media_provider(authority.module);
+    if media_caller
+        && !super::consumers::media_pair(authority.module, &request.provider, &request.model)
+    {
+        return Err(super::provider_refusal(
+            "account_not_authorized",
+            "[TODO(user): Pair is not a remote engine in the verified media slot]",
+        ));
+    }
     if let Some(scope) = authority.session {
         request.conversation_key = scope.reference.clone();
     }
@@ -214,6 +230,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         return standing_answer(first, &body_json);
     }
     let mut bound_tier = None;
+    let mut engine_decision = false;
     if let Some(decision_id) = &request.decision_id {
         checking("decision_binding");
         // Honoured only from the runner the decision named, for the model it
@@ -222,10 +239,13 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
             .store
             .v1_decision(decision_id)
             .map_err(store_unavailable)?;
+        engine_decision =
+            super::engines::is_decision(deps, decision_id).map_err(store_unavailable)?;
         if !decision.is_some_and(|decision| {
             caller.attested_module() == Some(decision.runner_module.as_str())
                 && same_name(&decision.provider, &request.provider)
                 && same_name(&decision.model, &request.model)
+                && (!engine_decision || super::engines::now(deps) < decision.expires_at_ms as u64)
         }) {
             return Err(because("unknown_decision", Refusal::unknown_decision()));
         }
@@ -308,8 +328,33 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
     // The shared context reports a store failure; for `account_for` that is
     // transient unavailability, not the open `store_error` code.
     checking("account_context");
-    let ctx = account_ctx(deps, flags, &policy)
+    let mut ctx = account_ctx(deps, flags, &policy)
         .map_err(|refusal| account_unavailable(refusal.message))?;
+    if engine_decision || media_caller {
+        let credentials = deps.broca_credentials.lock().map_err(store_unavailable)?;
+        if !credentials.media_listing_ready(now_ms()) {
+            return Err(super::provider_refusal(
+                "account_selection_unavailable",
+                "[TODO(user): Media credential listing or category list grant unavailable]",
+            ));
+        }
+        if !credentials
+            .listed_credentials()
+            .iter()
+            .any(|row| crate::account_selection::media_credential_serves(row, &request.provider))
+        {
+            return Err(super::provider_refusal(
+                "auth_required",
+                "[TODO(user): No eligible media-provider API key for engine provider]",
+            ));
+        }
+        drop(credentials);
+        ctx.classes
+            .as_mut()
+            .ok_or_else(|| account_unavailable("[TODO(user): Media account context unavailable]"))?
+            .for_engine(&request.provider, &request.model)
+            .map_err(store_unavailable)?;
+    }
     let answer = match account_selection::handle(ACCOUNT_FOR_OP, &body, &authority.principal, &ctx)
     {
         OpReply::Result(result) => admission_answer(&result, &request)?,

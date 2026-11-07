@@ -120,6 +120,7 @@ pub(super) fn census_shape(method: &str, params: &Value) -> &'static str {
 pub(super) fn claims(method: &str, params: &Value) -> bool {
     match method {
         ops::ROLE_DESCRIBE
+        | ops::ROUTE_SELECT_ENGINE
         | ops::ROUTE_REPORT
         | ops::ROUTE_BUDGET_QUOTE
         | ops::ROUTE_ACCOUNT_STATUS
