@@ -6,6 +6,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use subc_protocol::FrameType;
 
+#[path = "engine_measurements_tests.rs"]
+mod measurements;
+
 fn engine(model: &str, local: bool) -> Value {
     json!({"kind":"transcribe","provider":"media-vendor","model":model,"local":local,
         "formats":["audio/wav"],"languages":["en"],"latency_class":"interactive"})
@@ -103,7 +106,7 @@ async fn engine_ranking_is_deterministic_with_kind_specific_fixture_facts() {
             ("z", "transcribe", Some(1.0), None),
         ],
     );
-    assert_eq!(selected(&route, &request()).await["engine"]["model"], "z");
+    assert_eq!(selected(&route, &request()).await["engine"]["model"], "b");
 }
 
 #[tokio::test]

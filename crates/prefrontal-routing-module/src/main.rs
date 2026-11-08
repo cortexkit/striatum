@@ -2575,8 +2575,27 @@ async fn handle_model_facts(
         );
         fact.excluded = exclusions.excludes(&route_key);
     }
-    let body =
-        serde_json::to_vec(&json!({ "result": { "facts": facts } })).map_err(ModuleError::Json)?;
+    let engine_speed_samples = match store.engine_speed_samples() {
+        Ok(samples) => samples,
+        Err(_) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                "[TODO(user): Explain why routing's engine speed samples could not be read.]",
+            )
+            .await;
+        }
+    };
+    let body = serde_json::to_vec(&json!({ "result": {
+        "facts": facts,
+        "engine_speed_samples": engine_speed_samples,
+        "engine_speed_sample_limit": prefrontal_routing_store::ENGINE_SPEED_SAMPLE_LIMIT,
+    } }))
+    .map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
         ver,
         FrameType::Response,
@@ -8074,6 +8093,40 @@ mod tests {
             }),
             "the reply carries the catalog's own output ceiling and context window so a caller can size its send and its evidence package to this route"
         );
+    }
+
+    #[tokio::test]
+    async fn route_model_facts_exposes_bounded_engine_speed_samples_separately() {
+        let rig = Rig::new("engine-speed-inspection");
+        let store = Arc::new(rig.open_store());
+        rusqlite::Connection::open(rig.dir.join("store.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO routing_engine_speed
+             (kind, provider, model, outcome, duration_ms, wall_ms, first_output_ms)
+             VALUES ('transcribe','media','engine','done','1000','250','10')",
+                [],
+            )
+            .unwrap();
+        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        crate::test_config::write(&operator_config, "{}").unwrap();
+        let response = run_route_wire_request_with_operator_config(
+            &store,
+            json!({"method":ROUTE_MODEL_FACTS_OP,"params":{}}),
+            &operator_config,
+        )
+        .await;
+        assert_eq!(response.header.ty, FrameType::Response);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["result"]["engine_speed_sample_limit"], 20);
+        assert_eq!(
+            body["result"]["engine_speed_samples"],
+            json!([{
+                "kind":"transcribe","provider":"media","model":"engine","outcome":"done",
+                "duration_ms":1000,"wall_ms":250,"first_output_ms":10
+            }])
+        );
+        assert!(body["result"]["facts"].is_array());
     }
 
     #[tokio::test]

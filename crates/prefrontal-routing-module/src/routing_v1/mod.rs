@@ -99,6 +99,8 @@ pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;
 pub(crate) const V1_ONLY_OPS: &[&str] = &[
     ops::ROLE_DESCRIBE,
     ops::ROUTE_SELECT_ENGINE,
+    ops::ROUTE_ENGINE_REPORT,
+    ops::ROUTE_ENGINE_EVAL,
     ops::ROUTE_REPORT,
     ops::ROUTE_BUDGET_QUOTE,
     ops::ROUTE_CONSUMER_MODELS,
@@ -275,6 +277,8 @@ async fn answer(
         ops::ROLE_DESCRIBE => describe::describe(deps),
         ops::ROUTE_SELECT => select::select(params, caller, deps).await,
         ops::ROUTE_SELECT_ENGINE => engines::select(params, caller, deps),
+        ops::ROUTE_ENGINE_REPORT => engines::report(params, caller, deps),
+        ops::ROUTE_ENGINE_EVAL => engines::evaluate(params, caller, deps),
         ops::ROUTE_REPORT => report::report(params, caller, deps),
         ops::ROUTE_ACCOUNT_FOR => accounts::account_for(params, caller, deps),
         ops::ROUTE_ACCOUNT_OBSERVE => accounts::account_observe(params, caller, deps),

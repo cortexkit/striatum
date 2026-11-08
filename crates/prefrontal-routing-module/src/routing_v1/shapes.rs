@@ -101,7 +101,10 @@ pub(super) fn census_shape(method: &str, params: &Value) -> &'static str {
             has(params, &["caller"]),
             has(params, &["decision_id", "retry_at_ms", "provider_code"]),
         ),
-        ops::ROUTE_REPORT
+        ops::ROUTE_SELECT_ENGINE
+        | ops::ROUTE_ENGINE_REPORT
+        | ops::ROUTE_ENGINE_EVAL
+        | ops::ROUTE_REPORT
         | ops::ROUTE_ACCOUNT_STATUS
         | ops::ROUTE_HEAD_CHOICES
         | ops::ROUTE_BUDGET_QUOTE
@@ -121,6 +124,8 @@ pub(super) fn claims(method: &str, params: &Value) -> bool {
     match method {
         ops::ROLE_DESCRIBE
         | ops::ROUTE_SELECT_ENGINE
+        | ops::ROUTE_ENGINE_REPORT
+        | ops::ROUTE_ENGINE_EVAL
         | ops::ROUTE_REPORT
         | ops::ROUTE_BUDGET_QUOTE
         | ops::ROUTE_ACCOUNT_STATUS

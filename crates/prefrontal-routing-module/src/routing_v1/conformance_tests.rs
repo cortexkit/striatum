@@ -1166,16 +1166,6 @@ impl RoutingSubject for KitSubject {
     }
 }
 
-/// cortexkit-role-routing-conformance 0.10.6's select_engine::admitted check
-/// requires `admitted`; account_selection::commit_admission returns `reserved`
-/// until admission_started. CONTRACT.md §9.1 does not pin that state vocabulary.
-const NOT_YET_SERVED: &[&str] = &[
-    "select_engine_media_admission",
-    "select_engine_admission_before_expiry",
-    "select_engine_admission_expiry",
-    "select_engine_admission_replay",
-];
-
 /// Checks gated off by group declarations or optional fixture hooks. The
 /// model-input hook is absent here; classifier handler tests cover question
 /// limits and input-spend caps against the catalog and provider description.
@@ -1196,10 +1186,8 @@ const NOT_APPLICABLE: &[&str] = &[
     "max_cost_usd_requirement_honoured",
 ];
 
-/// Every served check passes; exactly [`NOT_YET_SERVED`] fail, and
-/// [`NOT_APPLICABLE`] are inapplicable: a newly failing check, or a listed
-/// check that now passes or runs, breaks the test. A failing check names the
-/// contract rule it holds the provider to.
+/// Every served check passes, and exactly [`NOT_APPLICABLE`] are inapplicable.
+/// A failing check names the contract rule it holds the provider to.
 #[tokio::test]
 async fn routing_v1_conformance_kit_matches_served_checks() {
     for group in cortexkit_role_routing::capabilities::KNOWN {
@@ -1226,19 +1214,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
             report.render()
         );
     }
-    assert_eq!(report.failing(), NOT_YET_SERVED, "{}", report.render());
-    for check in NOT_YET_SERVED {
-        assert!(
-            matches!(
-                report.outcome(check),
-                Some(cortexkit_role_routing_conformance::CheckOutcome::Failed { reason })
-                    if reason.starts_with("media admission did not honour the request:")
-                        && reason.contains("state: \"reserved\"")
-            ),
-            "unexpected failure for {check}: {}",
-            report.render()
-        );
-    }
+    assert!(report.failing().is_empty(), "{}", report.render());
     assert_eq!(
         report.not_applicable(),
         NOT_APPLICABLE,

@@ -14,6 +14,8 @@ use crate::select_policy;
 /// runner declarations.
 pub(super) const CAPABILITIES: &[&str] = &[
     "select_engine",
+    "engine_reports",
+    "engine_evals",
     "select_panel",
     "consumer_models",
     "explain",
