@@ -54,6 +54,15 @@ fn fusiform_fixture_serves_pinned_first_page_and_terminal_continuation() {
     assert_eq!(first["result"], golden["response"]);
     request["arguments"]["page_token"] = first["result"]["next_page_token"].clone();
     let last = FusiformCatalog::reply(&request);
+    let mut seeded = serde_json::Map::new();
+    for fact in prefrontal_routing_core::model_facts_seed() {
+        let mut model = serde_json::json!({"existence":"present","limit.context":fact.context_window.map(|n|n as u64),"limit.output":fact.max_output_tokens,"capability.attachment":fact.supports_vision,"capability.tool_call":fact.supports_tool_use});
+        if let Some(cost) = fact.cost_per_m_tok_out {
+            model["rate.output"] = serde_json::json!({"state":"priced","currency":"USD","units":(cost*1_000_000_000.0).round() as i64,"exponent":9});
+        }
+        seeded.insert(format!("{}/{}", fact.provider_id, fact.model_id), model);
+    }
+    assert_eq!(last["result"]["models"], serde_json::Value::Object(seeded));
     assert!(last["result"].get("next_page_token").is_none());
     assert!(last["result"]["models"].get("000-page/m").is_none());
     assert_eq!(

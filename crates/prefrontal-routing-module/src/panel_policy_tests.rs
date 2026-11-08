@@ -484,4 +484,101 @@ mod class_panel_policy {
             .unwrap()
             .is_empty());
     }
+
+    #[test]
+    fn core_panel_replacement_fixtures_keep_recorded_seats_spares_and_policy() {
+        use prefrontal_routing_core as routing;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../prefrontal-core-module/fixtures/routing-wire/panels.json");
+        let corpus: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let cases = corpus["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let input = &case["input"];
+            let request = &input["request"];
+            let facts: Vec<routing::ModelFact> =
+                serde_json::from_value(input["facts"].clone()).unwrap();
+            // Match the original core test adapter, which called the scorer
+            // directly: class policy replaces the size and floor placeholders.
+            let mut spec = request["panelSpec"].clone();
+            spec["size"] = json!(1);
+            spec["iqFloor"] = json!(0.0);
+            let panel_spec: routing::PanelSpec = serde_json::from_value(spec).unwrap();
+            let recorded = &input["policy"];
+            let policy = if recorded.is_null() {
+                routing::ClassPanelPolicy::default_for_class(panel_spec.class)
+            } else {
+                routing::ClassPanelPolicy {
+                    top_k: recorded["topK"].as_u64().unwrap() as usize,
+                    by: match recorded["by"].as_str().unwrap() {
+                        "iq" => routing::PanelOrder::Iq,
+                        "eq" => routing::PanelOrder::Eq,
+                        "cost" => routing::PanelOrder::Cost,
+                        other => panic!("unknown panel order {other}"),
+                    },
+                    extra: recorded["extra"].as_u64().unwrap() as usize,
+                    extra_by: recorded["extraBy"].as_str().map(|order| match order {
+                        "random" => routing::PanelExtraOrder::Random,
+                        "iq" => routing::PanelExtraOrder::Iq,
+                        "eq" => routing::PanelExtraOrder::Eq,
+                        "cost" => routing::PanelExtraOrder::Cost,
+                        other => panic!("unknown extra order {other}"),
+                    }),
+                    floor: serde_json::from_value(recorded["floor"].clone()).unwrap(),
+                }
+            };
+            let context = routing::panel::PanelSelectionContext {
+                seed: request["seed"]
+                    .as_str()
+                    .unwrap_or_else(|| request["taskId"].as_str().unwrap())
+                    .into(),
+                pins: routing::PanelPins {
+                    synthesizer: input["synthesizer_pin"].as_object().map(|pin| {
+                        routing::PanelSynthesizerPin {
+                            model: pin["model"].as_str().unwrap().into(),
+                            variant: pin["variant"].as_str().map(str::to_owned),
+                        }
+                    }),
+                },
+                canonical_ids: Default::default(),
+            };
+            let panel = routing::panel::select_panel_with_policy_context(
+                routing::SelectPanelInput {
+                    package_tokens: serde_json::from_value(request["packageTokens"].clone()).unwrap(),
+                    panel_spec,
+                    selection: serde_json::from_value(json!("n_pick")).unwrap(),
+                    roster: Vec::new(),
+                    available_models: facts
+                        .iter()
+                        .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
+                        .collect(),
+                    facts,
+                    runtime_snapshot: None,
+                    exclude_route_keys: serde_json::from_value(request["excludeRouteKeys"].clone())
+                        .unwrap(),
+                    operator_exclude_keys: Vec::new(),
+                    required_capabilities: None,
+                    availability_substrate: routing::AvailabilitySubstrate::Broca,
+                    availability_label: "served".into(),
+                    is_subscription_route: None,
+                },
+                &routing::DEFAULT_ROUTING_CONFIG,
+                &policy,
+                &context,
+            );
+            match panel {
+                Ok(panel) => {
+                    let mut actual = serde_json::to_value(panel).unwrap();
+                    actual["decisionID"] = json!("live-test-panel");
+                    let expected = case["result"]["Ok"]
+                        .as_object()
+                        .expect("recorded successful scorer reply");
+                    for (key, value) in expected {
+                        assert_eq!(&actual[key], value, "{key}: {request}");
+                    }
+                }
+                Err(error) => assert_eq!(case["result"]["Err"], json!(error.0), "{request}"),
+            }
+        }
+    }
 }

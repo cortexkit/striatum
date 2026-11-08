@@ -94,21 +94,11 @@ pub const FIXTURE_PROVIDERS: &[&str] = &["anthropic", "openai", "xai", "ollama-c
 
 impl FusiformCatalog {
     fn seed_models() -> serde_json::Value {
-        let mut models = serde_json::Map::new();
-        for fact in prefrontal_routing_core::model_facts_seed() {
-            let mut model = serde_json::json!({
-                "existence":"present", "limit.context":fact.context_window.map(|n| n as u64),
-                "limit.output":fact.max_output_tokens, "capability.attachment":fact.supports_vision,
-                "capability.tool_call":fact.supports_tool_use,
-            });
-            if let Some(cost) = fact.cost_per_m_tok_out {
-                model["rate.output"] = serde_json::json!({
-                    "state":"priced", "currency":"USD", "units":(cost * 1_000_000_000.0).round() as i64, "exponent":9,
-                });
-            }
-            models.insert(format!("{}/{}", fact.provider_id, fact.model_id), model);
-        }
-        serde_json::Value::Object(models)
+        // Both daemon rigs read the same captured continuation page. Routing's
+        // integration test compares every served row with its bundled seed facts.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../prefrontal-core-module/fixtures/routing-wire/catalog-seed.json");
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
     pub fn reply(request: &serde_json::Value) -> serde_json::Value {

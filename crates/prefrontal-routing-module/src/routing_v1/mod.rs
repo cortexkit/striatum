@@ -60,6 +60,8 @@ mod conformance_tests;
 #[cfg(test)]
 mod consumers_tests;
 #[cfg(test)]
+mod core_wire_fixture_tests;
+#[cfg(test)]
 mod diagnostics_tests;
 #[cfg(test)]
 mod dispatch_tests;
