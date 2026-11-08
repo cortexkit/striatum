@@ -512,6 +512,44 @@ pub(super) struct DecisionProvenance {
     pub(super) policy_revision: String,
 }
 
+impl DecisionProvenance {
+    /// Account eligibility is resolved after the shared quota cache. Persist the
+    /// request-local walls too, rather than logging the pre-eligibility view.
+    pub(super) fn with_account_snapshot(&self, snapshot: &ModelRouteStateSnapshot) -> Self {
+        let mut result = self.clone();
+        if let Ok(mut signal) = serde_json::from_str::<serde_json::Value>(&result.quota_signal_json)
+        {
+            signal["signals"] = json!(quota_signals(snapshot));
+            result.quota_signal_json = signal.to_string();
+        }
+        result
+    }
+}
+
+fn quota_signals(snapshot: &ModelRouteStateSnapshot) -> Vec<serde_json::Value> {
+    let mut signals: Vec<serde_json::Value> = snapshot
+        .by_capacity
+        .iter()
+        .filter(|(_, state)| {
+            state.quota_pressure.is_some() || state.quota_exhausted_until.is_some()
+        })
+        .map(|(capacity_key, state)| {
+            json!({
+                "capacityKey": capacity_key,
+                "pressure": state.quota_pressure,
+                "windowModel": state.quota_window_model,
+                "exhaustedUntil": state.quota_exhausted_until,
+            })
+        })
+        .collect();
+    signals.sort_by(|left, right| {
+        left["capacityKey"]
+            .as_str()
+            .cmp(&right["capacityKey"].as_str())
+    });
+    signals
+}
+
 /// The cache facts a decision's quota signal summary is built from.
 pub(super) struct QuotaSignalView<'a> {
     pub(super) windows: &'a [ProviderUsage],
@@ -541,26 +579,7 @@ pub(super) fn quota_signal_json(
         restored_from_ms,
         stale_age_ms,
     } = *view;
-    let mut signals: Vec<serde_json::Value> = snapshot
-        .by_capacity
-        .iter()
-        .filter(|(_, state)| {
-            state.quota_pressure.is_some() || state.quota_exhausted_until.is_some()
-        })
-        .map(|(capacity_key, state)| {
-            json!({
-                "capacityKey": capacity_key,
-                "pressure": state.quota_pressure,
-                "windowModel": state.quota_window_model,
-                "exhaustedUntil": state.quota_exhausted_until,
-            })
-        })
-        .collect();
-    signals.sort_by(|left, right| {
-        left["capacityKey"]
-            .as_str()
-            .cmp(&right["capacityKey"].as_str())
-    });
+    let signals = quota_signals(snapshot);
 
     let healthy_provider_count = windows.iter().filter(|window| window.is_healthy()).count();
     let mut summary = if let Some(age_ms) = stale_age_ms.filter(|_| healthy_provider_count > 0) {
@@ -1850,6 +1869,7 @@ pub(super) async fn handle_select_request(
         }
     }
     let available = mapped_availability.models.clone();
+    let provenance = provenance.with_account_snapshot(&snapshot);
     let runner_module = |selected: &SelectedModelRoute| -> Option<String> {
         if host_run {
             Some(

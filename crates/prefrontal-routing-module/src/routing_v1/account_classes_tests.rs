@@ -1235,7 +1235,7 @@ async fn assert_account_unavailability_keeps_frontier(block: &str) {
     assert_eq!(blocked.1["code"], "no_route", "{block}: {}", blocked.1);
     assert_eq!(
         blocked.1["detail"]["reason"],
-        if block != "exhausted" {
+        if !matches!(block, "exhausted" | "reserve") {
             json!(cortexkit_role_routing::errors::NoRouteReason::AllInadequate)
         } else {
             json!("accounts_blocked")
@@ -2082,15 +2082,21 @@ async fn absent_readings_admit_without_fabricated_quota_and_known_headroom_order
             &account_request("synthetic", "only-known-exhausted"),
         )
         .await;
-    // The only subscription account sits within its reserve, so the allocator
-    // answers `account_pool_reserve_limited` (untimed).
+    // The only subscription account sits within its reserve; the public
+    // refusal retains the allocator's known reset and retry delay.
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     assert_eq!(
         reply.1["code"], "account_pool_reserve_limited",
         "{}",
         reply.1
     );
-    assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
+    assert_eq!(
+        reply.1["detail"]["reset_at_ms"],
+        NOW + 3_600_000,
+        "{}",
+        reply.1
+    );
+    assert!(reply.1["detail"]["retry_after_s"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]
@@ -3087,4 +3093,231 @@ async fn select_hold_threshold_is_independent_of_the_runner_wait_cap() {
     let held = owner.call("route.select", &body).await;
     assert_eq!(held.0, FrameType::Response, "{}", held.1);
     assert_eq!(held.1["result"]["pin_outcome"], "pinned");
+}
+
+fn codex_pool(used: [f64; 3]) -> Arc<Harness> {
+    let (harness, mut credentials) = setup("openai", false);
+    let mut luna = crate::tests::fact("openai", "gpt-6-luna");
+    luna.auth_methods = Some(vec!["oauth".into()]);
+    luna.billing_plane = Some(BillingPlane {
+        provider_id: "openai".into(),
+        auth_method: "oauth".into(),
+        kind: "subscription".into(),
+        selection_reason: "test subscription".into(),
+        rates: [("rate.output".into(), BillingRate::Priced { rate: 1.0 })]
+            .into_iter()
+            .collect(),
+    });
+    let mut fallback = luna.clone();
+    fallback.provider_id = "fallback".into();
+    fallback.model_id = "adequate".into();
+    fallback.auth_methods = Some(vec!["apikey".into()]);
+    let plane = fallback.billing_plane.as_mut().unwrap();
+    plane.provider_id = "fallback".into();
+    plane.auth_method = "apikey".into();
+    plane.kind = "upstream".into();
+    plane
+        .rates
+        .insert("rate.output".into(), BillingRate::Priced { rate: 20.0 });
+    let facts = vec![luna, fallback];
+    harness.install_facts(&facts);
+    for fact in &facts {
+        catalog_fact(&harness, fact);
+    }
+    let mut rows: Vec<_> = (0..3)
+        .map(|index| ListedCredential {
+            id: format!("chatgpt:{index}"),
+            account_id: Some(format!("codex-{index}")),
+            state: "active".into(),
+            categories: vec!["llm-provider".into()],
+            provider_ids: vec!["openai".into()],
+            serves: vec!["openai".into()],
+            credential_type: "oauth".into(),
+            auth_method: Some("oauth".into()),
+            ..Default::default()
+        })
+        .collect();
+    rows.push(ListedCredential {
+        id: "apikey:fallback".into(),
+        account_id: Some("fallback-account".into()),
+        state: "active".into(),
+        categories: vec!["llm-provider".into()],
+        provider_ids: vec!["fallback".into()],
+        serves: vec!["fallback".into()],
+        credential_type: "apikey".into(),
+        auth_method: Some("apikey".into()),
+        ..Default::default()
+    });
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "codex-pool".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
+    );
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["consumers"]["sidekick"] = json!({"owner":OWNER,"mode":"demand"});
+        config["runners"] = json!([{"module":RUNNER,"via_vault":true,"routes":["openai/gpt-6-luna","fallback/adequate"]}]);
+    });
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    // Codex usage here has a weekly primary window, not a five-hour
+    // primary plus weekly secondary. Dates are shifted to the injected clock.
+    let entries: Vec<_> = used.into_iter().enumerate().map(|(index, used)| json!({
+        "provider":"codex", "apiProvider":"openai", "account":format!("codex-{index}"),
+        "source":"vault", "fetchedAt":crate::account_selection::rfc3339(NOW as i64),
+        "savedResets":{"availableCount":2}, "spend":[],
+        "usage":{"primary":{"usedPercent":used,"windowMinutes":10080,
+            "resetsAt":crate::account_selection::rfc3339(NOW as i64 + (index as i64 + 1) * 86_400_000)}}
+    })).collect();
+    crate::account_quota::apply_provider_reply(
+        &mut state,
+        "codex",
+        &serde_json::to_vec(&json!({"result":entries,"completeProviders":["codex"]})).unwrap(),
+        NOW as i64,
+    )
+    .unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+    harness
+}
+
+async fn codex_selected_provider(used: [f64; 3], legacy: bool) -> String {
+    let harness = codex_pool(used);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let mut request = json!({"consumer":"sidekick","requirements":{"iq":1,"eq":0}});
+    if legacy {
+        request["targetAgent"] = json!("explore");
+        request["taskId"] = json!("codex-availability");
+        request["executor"] = json!("broca");
+        request["substrate"] = json!("broca");
+    }
+    let reply = caller.call("route.select", &request).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    let result = &reply.1["result"];
+    if legacy {
+        if used[2] >= 98.0 {
+            assert_eq!(
+                result["selected"]["routeKey"], "fallback/adequate",
+                "{}",
+                reply.1
+            );
+        }
+        let rows = harness
+            .store()
+            .get_decisions_for_task("codex-availability")
+            .unwrap();
+        let signals: Value =
+            serde_json::from_str(rows.last().unwrap().quota_signal_json.as_deref().unwrap())
+                .unwrap();
+        let luna = signals["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["capacityKey"] == "openai/gpt-6-luna");
+        if used[2] >= 98.0 {
+            assert_eq!(
+                luna.unwrap()["exhaustedUntil"],
+                json!((NOW + 86_400_000) as f64)
+            );
+        } else {
+            assert!(luna.is_none_or(|signal| signal["exhaustedUntil"].is_null()));
+        }
+        result["selected"]["routeKey"]
+            .as_str()
+            .expect(&format!("{}", reply.1))
+            .split('/')
+            .next()
+            .unwrap()
+            .into()
+    } else {
+        result["route"]["provider"].as_str().unwrap().into()
+    }
+}
+
+#[tokio::test]
+async fn codex_three_exhausted_accounts_select_an_adequate_fallback() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [true, false] {
+        assert_eq!(
+            codex_selected_provider([100.0, 100.0, 98.0], legacy).await,
+            "fallback"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_one_account_with_headroom_keeps_luna() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [true, false] {
+        assert_eq!(
+            codex_selected_provider([100.0, 100.0, 10.0], legacy).await,
+            "openai"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_reserve_limited_refusal_carries_earliest_reset() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = codex_pool([100.0, 100.0, 99.0]);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let reply = runner.call("route.account_for", &json!({
+        "provider":"openai", "model":"gpt-6-luna", "conversation_key":"codex-cold", "admission_id":"codex-cold"
+    })).await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(
+        reply.1["code"], "account_pool_reserve_limited",
+        "{}",
+        reply.1
+    );
+    assert_eq!(
+        reply.1["detail"]["reset_at_ms"],
+        NOW + 86_400_000,
+        "{}",
+        reply.1
+    );
+}
+
+#[tokio::test]
+async fn codex_reserve_held_last_account_is_unavailable_to_sidekicks() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [true, false] {
+        assert_eq!(
+            codex_selected_provider([100.0, 100.0, 99.0], legacy).await,
+            "fallback"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_runtime_wall_on_last_headroom_account_reaches_legacy_selection() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = codex_pool([100.0, 100.0, 10.0]);
+    harness
+        .store()
+        .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+            provider: "openai".into(),
+            model: "gpt-6-luna".into(),
+            credential_id: "chatgpt:2".into(),
+            until_ms: NOW as i64 + 600_000,
+            recorded_at: NOW as i64,
+            decision_id: "previous".into(),
+        })
+        .unwrap();
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let reply = caller.call("route.select", &json!({
+        "consumer":"sidekick", "targetAgent":"explore", "executor":"broca", "substrate":"broca",
+        "requirements":{"iq":1,"eq":0}
+    })).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(
+        reply.1["result"]["selected"]["routeKey"], "fallback/adequate",
+        "{}",
+        reply.1
+    );
 }

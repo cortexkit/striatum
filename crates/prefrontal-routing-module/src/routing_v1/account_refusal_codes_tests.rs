@@ -334,8 +334,8 @@ async fn route_fence_is_exhausted_with_its_reset_on_both_entrypoints() {
 
 #[test]
 fn contract_codes_map_with_contract_detail() {
-    // Hold and pool exhaustion carry their wait. Unavailability can also carry
-    // a short retry delay and candidate reasons; other codes drop legacy detail.
+    // Quota pool refusals carry known resets, including policy reserves.
+    // Unavailability can also carry a short retry delay and candidate reasons.
     let hold = super::accounts::account_refusal_for_test_detail(
         "account_hold",
         Some(&json!({"retry_after_s": 30})),
@@ -348,6 +348,11 @@ fn contract_codes_map_with_contract_detail() {
     );
     assert_eq!(exhausted.code, RefusalCode::AccountPoolExhausted);
     assert_eq!(exhausted.wait_until_ms(), Some(NOW + 1));
+    let reserve = super::accounts::account_refusal_for_test_detail(
+        "account_pool_reserve_limited",
+        Some(&json!({"reset_at_ms":NOW + 2,"retry_after_s":5})),
+    );
+    assert_eq!(reserve.detail["reset_at_ms"], json!(NOW + 2));
     // `invalid_request` names its field. With no allocator detail supplied,
     // the remaining codes below still have no detail or wait.
     let invalid = super::accounts::account_refusal_for_test("invalid_request");
