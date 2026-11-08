@@ -54,6 +54,7 @@ pub mod backup;
 mod diagnostics;
 mod operator_quality;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
+mod engine_measurements;
 mod key_pool;
 mod reasoning_catalog;
 mod retention;
@@ -67,6 +68,7 @@ pub use diagnostics::{
     DiagnosticAccountBlock, DiagnosticAccountHold, DiagnosticDecision, DiagnosticKeyWall,
     DiagnosticRouteWall,
 };
+pub use engine_measurements::{EngineEvaluation, EngineSpeedSample, ENGINE_SPEED_SAMPLE_LIMIT};
 pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
 pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
 pub use retention::AffinityRetentionBatch;
@@ -306,7 +308,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 79] {
+fn route_state_migrations() -> [Migration; 80] {
     [
         Migration {
             version: 1,
@@ -623,6 +625,10 @@ fn route_state_migrations() -> [Migration; 79] {
         Migration {
             version: 80,
             statements: include_str!("../migrations/080_v1_panels.sql"),
+        },
+        Migration {
+            version: 81,
+            statements: include_str!("../migrations/081_engine_measurements.sql"),
         },
     ]
 }

@@ -1,11 +1,12 @@
 //! Media selection shares the decision ledger, never the language-model scorer.
 
 use cortexkit_role_routing::{
-    errors::Refusal,
+    engine_measurements::{self as measurements, EngineIdentity, EvalScore, EvaluationSet},
+    errors::{Refusal, RefusalCode},
     select_engine::{self as wire, EngineCandidate, SelectEngineAnswer},
 };
 use prefrontal_routing_core::{accounts::AllowedAccountClass, route_state_store::DecisionInput};
-use prefrontal_routing_store::V1Decision;
+use prefrontal_routing_store::{EngineEvaluation, EngineSpeedSample, V1Decision};
 use serde_json::Value;
 
 use super::{store_refusal, Caller, Deps};
@@ -71,7 +72,7 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
         &config.quota_model_pools(),
     )
     .map_err(store_refusal)?;
-    let mut candidates: Vec<EngineCandidate<FactNumber, FactNumber>> = Vec::new();
+    let mut candidates: Vec<EngineCandidate<EvalScore, FactNumber>> = Vec::new();
     let catalog = deps
         .broca_credentials
         .lock()
@@ -102,9 +103,6 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
         );
     }
     for candidate in &mut candidates {
-        // routing/v1 has no engine accuracy or speed measurement report yet.
-        // Missing measurements remain unknown; LLM scores cannot stand in for
-        // accuracy on a media kind.
         candidate.cost = catalog
             .as_ref()
             .and_then(|catalog| {
@@ -135,11 +133,82 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
         #[cfg(test)]
         let facts = media_facts.get(&(key, candidate.engine.kind.as_str().to_owned()));
         #[cfg(test)]
-        if let Some((accuracy, cost)) = facts {
-            candidate.accuracy = accuracy.filter(|value| value.is_finite()).map(FactNumber);
+        if let Some((_, cost)) = facts {
             candidate.cost = cost.filter(|value| value.is_finite()).map(FactNumber);
         }
     }
+    let identities: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.selected.caller_local && candidate.engine.kind == request.kind
+        })
+        .map(|candidate| {
+            (
+                candidate.engine.provider.as_str(),
+                candidate.engine.model.as_str(),
+            )
+        })
+        .collect();
+    let metric = request
+        .requirements
+        .metric
+        .as_deref()
+        .or(match request.kind {
+            wire::Kind::Transcribe => Some("wer"),
+            _ => None,
+        });
+    let (evaluations, samples) = deps
+        .store
+        .engine_measurements(
+            request.kind.as_str(),
+            metric,
+            &identities.into_iter().collect::<Vec<_>>(),
+        )
+        .map_err(store_refusal)?;
+    if request.requirements.latency_class == Some(wire::LatencyClass::Realtime) {
+        for candidate in &mut candidates {
+            if candidate.selected.caller_local {
+                continue;
+            }
+            let mut factors: Vec<_> = samples
+                .iter()
+                .filter(|sample| {
+                    sample.kind == candidate.engine.kind.as_str()
+                        && sample.provider == candidate.engine.provider
+                        && sample.model == candidate.engine.model
+                })
+                .filter_map(EngineSpeedSample::successful_realtime_factor)
+                .collect();
+            factors.sort_by(f64::total_cmp);
+            if !factors.is_empty() {
+                let middle = factors.len() / 2;
+                let median = if factors.len() % 2 == 0 {
+                    (factors[middle - 1] + factors[middle]) / 2.0
+                } else {
+                    factors[middle]
+                };
+                // A measured slower-than-realtime engine fails the requirements
+                // stage. With no successful duration samples, its declaration wins.
+                if median > 1.0 {
+                    candidate.engine.latency_class = wire::LatencyClass::Batch;
+                }
+            }
+        }
+    }
+    let evaluations: Vec<_> = evaluations
+        .into_iter()
+        .map(|eval| {
+            measurements::EngineEvalRequest::new(
+                wire::Kind::new(eval.kind),
+                EngineIdentity::new(eval.provider, eval.model),
+                eval.metric,
+                eval.score,
+                EvaluationSet::new(eval.set_id, 0),
+                eval.measured_at_ms,
+            )
+        })
+        .collect();
+    measurements::apply_evaluations(&request, &mut candidates, &evaluations);
     let winner = wire::select_engine(&request, &candidates)?;
     let scope = caller.scope.as_ref();
     let decision = DecisionInput {
@@ -148,7 +217,7 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
         workdir: scope.and_then(|scope| scope.workdir.clone()),
         requirements_json: params.to_string(), selected_route_key: Some(prefrontal_routing_core::make_route_key(&winner.engine.provider, &winner.engine.model, None)),
         selected_provider_id: Some(winner.engine.provider.clone()), selected_model_id: Some(winner.engine.model.clone()),
-        score_json: serde_json::json!({"accuracy": winner.accuracy.map(|value| value.0), "cost": winner.cost.map(|value| value.0)}).to_string(),
+        score_json: serde_json::json!({"accuracy": winner.accuracy.map(EvalScore::get), "cost": winner.cost.map(|value| value.0)}).to_string(),
         rejected_json: "[]".into(), allowed_account_class: AllowedAccountClass::PricedPerTokenOnly,
         quota_signal_json: Some(inputs.quota_signal_json), ..Default::default()
     };
@@ -178,4 +247,103 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
         )
         .map_err(store_refusal)?;
     Ok(value)
+}
+
+fn measurement_refusal(mut refusal: Refusal) -> Refusal {
+    let message = match refusal.code.as_str() {
+        "engine_not_declared_by_caller" => "Only the module that declares this engine for this kind in its role description may report measurements for it, and the calling module doesn't. Nothing was recorded.",
+        "unknown_decision" => "The report names no engine decision routing made for this caller, engine and kind, so it can't count as that job's speed. Nothing was recorded.",
+        // A request-parsing refusal already names the field it rejected.
+        _ if !refusal.message.is_empty() => return refusal,
+        _ => "Routing couldn't record this engine measurement. Nothing was recorded.",
+    };
+    refusal.message = message.into();
+    refusal
+}
+
+fn measurement_store_refusal(error: impl std::fmt::Display) -> Refusal {
+    let mut refusal = store_refusal(error);
+    refusal.message = "Routing couldn't store this engine measurement just now. Nothing was recorded; send it again.".into();
+    refusal
+}
+
+fn authorize(caller: &Caller, kind: &wire::Kind, engine: &EngineIdentity) -> Result<(), Refusal> {
+    let declarations = super::consumers::engine_declarations();
+    let module = caller
+        .attested_module()
+        .filter(|_| caller.binding_is_current());
+    let Some(module) = module else {
+        return Err(measurement_refusal(Refusal::new(
+            RefusalCode::EngineNotDeclaredByCaller,
+            "",
+        )));
+    };
+    measurements::check_engine_authorization(
+        module,
+        kind,
+        engine,
+        declarations.iter().flat_map(|(module, slot)| {
+            slot.engines
+                .iter()
+                .map(move |engine| (module.as_str(), engine))
+        }),
+    )
+    .map_err(measurement_refusal)
+}
+
+pub(super) fn report(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
+    let report = measurements::parse_engine_report_request(params).map_err(measurement_refusal)?;
+    authorize(caller, &report.kind, &report.engine)?;
+    let binding = deps
+        .store
+        .v1_decision(&report.decision_id)
+        .map_err(measurement_store_refusal)?;
+    let ledger = deps
+        .store
+        .get_decision_by_id(&report.decision_id)
+        .map_err(measurement_store_refusal)?;
+    if !binding.is_some_and(|decision| {
+        caller.attested_module() == Some(decision.runner_module.as_str())
+            && decision.provider == report.engine.provider
+            && decision.model == report.engine.model
+    }) || !ledger.is_some_and(|decision| {
+        decision.decision_kind == "engine"
+            && serde_json::from_str::<Value>(&decision.requirements_json)
+                .ok()
+                .is_some_and(|request| request["kind"] == report.kind.as_str())
+    }) {
+        return Err(measurement_refusal(Refusal::unknown_decision()));
+    }
+    deps.store
+        .record_engine_speed(
+            &report.decision_id,
+            &EngineSpeedSample {
+                kind: report.kind.as_str().into(),
+                provider: report.engine.provider,
+                model: report.engine.model,
+                outcome: report.outcome,
+                duration_ms: report.input.duration_ms,
+                wall_ms: report.wall_ms,
+                first_output_ms: report.first_output_ms,
+            },
+        )
+        .map_err(measurement_store_refusal)?;
+    Ok(serde_json::json!({}))
+}
+
+pub(super) fn evaluate(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
+    let eval = measurements::parse_engine_eval_request(params).map_err(measurement_refusal)?;
+    authorize(caller, &eval.kind, &eval.engine)?;
+    deps.store
+        .record_engine_evaluation(&EngineEvaluation {
+            kind: eval.kind.as_str().into(),
+            provider: eval.engine.provider,
+            model: eval.engine.model,
+            metric: eval.metric,
+            set_id: eval.set.id,
+            score: eval.score,
+            measured_at_ms: eval.measured_at_ms,
+        })
+        .map_err(measurement_store_refusal)?;
+    Ok(serde_json::json!({}))
 }

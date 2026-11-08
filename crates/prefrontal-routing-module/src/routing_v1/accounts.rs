@@ -868,6 +868,12 @@ mod tests {
             serde_json::to_vec(&explicit).unwrap(),
             serde_json::to_vec(&baseline).unwrap()
         );
+        for state in ["reserved", "future_admission_state"] {
+            result["admission"]["state"] = json!(state);
+            let answer = admission_answer(&result, &request).unwrap();
+            let decoded: AccountForAnswer = serde_json::from_value(answer).unwrap();
+            assert_eq!(decoded.admission.state, state);
+        }
     }
 
     #[test]
