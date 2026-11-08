@@ -1245,6 +1245,14 @@ async fn select_at_tier(
             request.task_ref.as_deref(),
         )
         .map_err(store_refusal)?;
+    if let Some(classes) = &priced.classes {
+        classes.bind_selected_probe(
+            &selected.model.provider_id,
+            &selected.model.model_id,
+            priced_per_token,
+            &decision_id,
+        );
+    }
     let service_tier = service_tier.or_else(|| {
         configured_tiers
             .get(&format!(

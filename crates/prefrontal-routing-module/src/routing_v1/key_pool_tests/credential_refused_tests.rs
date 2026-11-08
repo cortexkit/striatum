@@ -7,6 +7,43 @@ const POOL_KEY: &str = "apikey:pool-vendor:main";
 const PLAIN_KEY: &str = "apikey:catalog:main";
 const SIX_HOURS: i64 = 21_600_000;
 
+#[tokio::test]
+async fn pool_credential_entitlement_fence_explains_its_untimed_recovery() {
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &CredentialRefusal {
+                provider_id: POOL.into(),
+                credential_id: POOL_KEY.into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            crate::now_ms() as i64,
+        )
+        .unwrap();
+    let runner = harness.bind(reserved("zeta-runner"), None).await;
+    let refused = runner
+        .call(
+            "route.account_for",
+            &admit("fenced-pool", POOL, POOL_MODEL_SHORT, POOL_KEY),
+        )
+        .await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+    assert_eq!(refused.1["detail"]["reset_at_ms"], Value::Null);
+    let exclusion = &refused.1["detail"]["exclusions"][0];
+    assert_eq!(exclusion["credential_id"], POOL_KEY);
+    assert_eq!(exclusion["reason"], "billing_exhausted");
+    assert_eq!(exclusion["reset_at_ms"], Value::Null);
+    assert!(exclusion["message"].as_str().unwrap().contains("operator"));
+    assert!(exclusion["message"]
+        .as_str()
+        .unwrap()
+        .contains("vault listing"));
+}
+
 fn result(reply: (FrameType, Value)) -> Value {
     assert_eq!(reply.0, FrameType::Response, "{reply:?}");
     reply.1["result"].clone()

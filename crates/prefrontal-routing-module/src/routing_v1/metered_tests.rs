@@ -131,6 +131,243 @@ fn route_key(reply: &(FrameType, Value)) -> String {
     )
 }
 
+const BROCA_ROUTES: &[&str] = &["inception/mercury-3", "muse/model", "cline-pass/model"];
+const FENCE_NOW: u64 = 1_800_000_000_000;
+
+fn broca_fence_harness() -> Arc<Harness> {
+    let harness = harness_of(BROCA_ROUTES, json!({"prices":[]}));
+    let mut credentials = BrocaCredentials::api_test_credentials(&facts(BROCA_ROUTES));
+    credentials.apply_listing(
+        &cortexkit_claustrum_client::ScopedCredentialListing {
+            view: "broca-loadable-api-keys".into(),
+            credentials: ["cline-pass", "inception", "muse"]
+                .into_iter()
+                .map(|provider| cortexkit_claustrum_client::ListedCredential {
+                    id: format!("apikey:{provider}"),
+                    provider_ids: vec![provider.into()],
+                    state: "active".into(),
+                    categories: vec!["llm-provider".into()],
+                    credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+        FENCE_NOW,
+    );
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"broca"}]);
+        config["consumers"]["mason"]["mode"] = json!("ladder");
+        config["consumers"]["mason"]["ladder"] = json!(BROCA_ROUTES);
+    });
+    harness
+}
+
+fn broca_account_request(decision: &Value, id: &str, legacy: bool) -> Value {
+    let mut params = json!({
+        "provider":"inception", "model":"mercury-3", "mode":"admit",
+        "conversation_key":format!("broca:{id}"), "admission_id":id,
+        "decision_id":decision,
+        "candidates":{"view_digest":"broca-loadable-api-keys", "accounts":[
+            {"account_id":"apikey:cline-pass", "credential_id":"apikey:cline-pass"},
+            {"account_id":"apikey:inception", "credential_id":"apikey:inception"},
+            {"account_id":"apikey:muse", "credential_id":"apikey:muse"}
+        ]}
+    });
+    if legacy {
+        params["caller"] = json!({"runner":"broca"});
+    }
+    params
+}
+
+fn fence_inception(harness: &Harness, observed: i64) {
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                provider_id: "inception".into(),
+                credential_id: "apikey:inception".into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            observed,
+        )
+        .unwrap();
+}
+
+async fn broca_select(harness: &Arc<Harness>, legacy: bool) -> (FrameType, Value) {
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let mut params = select("mason");
+    params["detail"] = json!(true);
+    if legacy {
+        params["targetAgent"] = json!("mason");
+        params["executor"] = json!("broca");
+        params["substrate"] = json!("broca");
+        params["requirements"]["eq"] = json!(0);
+    }
+    route.call("route.select", &params).await
+}
+
+fn broca_selected_route(reply: &(FrameType, Value), legacy: bool) -> String {
+    if legacy {
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        reply.1["result"]["selected"]["routeKey"]
+            .as_str()
+            .unwrap()
+            .into()
+    } else {
+        route_key(reply)
+    }
+}
+
+#[tokio::test]
+async fn broca_fresh_billing_fence_skips_the_route_on_both_select_surfaces() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    for legacy in [false, true] {
+        let harness = broca_fence_harness();
+        let before = broca_select(&harness, legacy).await;
+        assert_eq!(broca_selected_route(&before, legacy), "inception/mercury-3");
+        let runner = harness.bind(reserved("broca"), None).await;
+        let unfenced =
+            broca_account_request(&before.1["result"]["decision_id"], "unfenced", legacy);
+        let admitted = runner.call("route.account_for", &unfenced).await;
+        assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+        assert_eq!(
+            admitted.1["result"]["account"]["credential_id"],
+            "apikey:inception"
+        );
+        fence_inception(&harness, FENCE_NOW as i64);
+        let after = broca_select(&harness, legacy).await;
+        assert_eq!(broca_selected_route(&after, legacy), "muse/model");
+
+        let request = broca_account_request(&before.1["result"]["decision_id"], "fenced", legacy);
+        let refused = runner.call("route.account_for", &request).await;
+        assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+        assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+        let exclusions = refused.1["detail"]["exclusions"].as_array().unwrap();
+        assert_eq!(exclusions.len(), 3, "{}", refused.1);
+        for (credential, reason) in [
+            ("apikey:cline-pass", "wrong_provider"),
+            ("apikey:inception", "billing_exhausted"),
+            ("apikey:muse", "wrong_provider"),
+        ] {
+            let exclusion = exclusions
+                .iter()
+                .find(|entry| entry["credential_id"] == credential)
+                .unwrap();
+            assert_eq!(exclusion["reason"], reason, "{exclusion}");
+        }
+        assert_eq!(
+            refused.1["detail"]["reset_at_ms"],
+            FENCE_NOW + crate::credential_fences::FENCE_PROBE_RECHECK_MS as u64 + 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn broca_selected_six_hour_probe_admits_only_once_on_both_surfaces() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    for legacy in [false, true] {
+        let harness = broca_fence_harness();
+        fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+        let selected = broca_select(&harness, legacy).await;
+        assert_eq!(
+            broca_selected_route(&selected, legacy),
+            "inception/mercury-3"
+        );
+        let runner = harness.bind(reserved("broca"), None).await;
+        let request = broca_account_request(&selected.1["result"]["decision_id"], "probe", legacy);
+        let admitted = runner.call("route.account_for", &request).await;
+        assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+        assert_eq!(
+            admitted.1["result"]["account"]["credential_id"],
+            "apikey:inception"
+        );
+        assert_eq!(
+            admitted.1["result"]["reason"]["code"],
+            "credential_fence_probe"
+        );
+        let replayed = runner.call("route.account_for", &request).await;
+        assert_eq!(replayed.0, FrameType::Response, "{}", replayed.1);
+        let after = broca_select(&harness, legacy).await;
+        assert_eq!(broca_selected_route(&after, legacy), "muse/model");
+        let duplicate =
+            broca_account_request(&selected.1["result"]["decision_id"], "second-probe", legacy);
+        let refused = runner.call("route.account_for", &duplicate).await;
+        assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+        assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+    }
+}
+
+#[tokio::test]
+async fn broca_concurrent_selects_reserve_one_probe_and_admit_its_decision() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    for legacy in [false, true] {
+        let harness = broca_fence_harness();
+        fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+        let (a, b) = tokio::join!(
+            broca_select(&harness, legacy),
+            broca_select(&harness, legacy)
+        );
+        let mut selected = [a, b];
+        selected.sort_by_key(|reply| broca_selected_route(reply, legacy));
+        assert_eq!(
+            broca_selected_route(&selected[0], legacy),
+            "inception/mercury-3"
+        );
+        assert_eq!(broca_selected_route(&selected[1], legacy), "muse/model");
+
+        let runner = harness.bind(reserved("broca"), None).await;
+        let unbound = broca_account_request(&Value::Null, "unbound-probe", legacy);
+        let refused = runner.call("route.account_for", &unbound).await;
+        assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+        assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+        assert_eq!(refused.1["detail"]["reset_at_ms"], FENCE_NOW + 120_000);
+
+        let request = broca_account_request(
+            &selected[0].1["result"]["decision_id"],
+            "reserved-probe",
+            legacy,
+        );
+        let admitted = runner.call("route.account_for", &request).await;
+        assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+        assert_eq!(
+            admitted.1["result"]["account"]["credential_id"],
+            "apikey:inception"
+        );
+        assert_eq!(
+            admitted.1["result"]["reason"]["code"],
+            "credential_fence_probe"
+        );
+    }
+}
+
+#[tokio::test]
+async fn broca_abandoned_probe_selection_expires_after_two_minutes() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    assert_eq!(
+        broca_selected_route(&broca_select(&harness, false).await, false),
+        "inception/mercury-3"
+    );
+    let _later = crate::InjectedClock::set(FENCE_NOW + 120_000);
+    let selected = broca_select(&harness, false).await;
+    assert_eq!(
+        broca_selected_route(&selected, false),
+        "inception/mercury-3"
+    );
+    let runner = harness.bind(reserved("broca"), None).await;
+    let request =
+        broca_account_request(&selected.1["result"]["decision_id"], "after-expiry", false);
+    assert_eq!(
+        runner.call("route.account_for", &request).await.0,
+        FrameType::Response
+    );
+}
+
 #[tokio::test]
 async fn credentialed_ladders_skip_an_unentitled_entry_on_both_wire_shapes() {
     let _clock = crate::InjectedClock::set(1_800_000_000_000);

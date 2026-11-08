@@ -616,6 +616,21 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
         }
         other => Refusal::new(RefusalCode::parse(other), message.clone()),
     };
+    if code == "account_pool_exhausted" {
+        if let Some(detail) = detail.and_then(Value::as_object) {
+            for key in [
+                "code",
+                "retry_after_s",
+                "decision_id",
+                "exclusions",
+                "reset_at_ms",
+            ] {
+                if let Some(value) = detail.get(key) {
+                    refusal.detail.insert(key.into(), value.clone());
+                }
+            }
+        }
+    }
     refusal.message = message;
     refusal
 }

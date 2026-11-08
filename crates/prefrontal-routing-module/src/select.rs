@@ -730,7 +730,7 @@ pub(super) fn price_selection_inputs(
     credentialed: bool,
     priced_per_token: bool,
 ) -> Result<PricedSelection, ModuleError> {
-    let classes = if credentialed {
+    let mut classes = if credentialed {
         Some(
             account_selection::ClassContext::read(
                 store,
@@ -745,6 +745,11 @@ pub(super) fn price_selection_inputs(
     } else {
         None
     };
+    if let Some(classes) = &mut classes {
+        classes
+            .reserve_selection_probes(store, broca_credentials)
+            .map_err(ModuleError::Message)?;
+    }
     let outcome = sources.live_config.apply(facts);
     let provenance = DecisionProvenance {
         quota_signal_json,
@@ -2225,6 +2230,14 @@ pub(super) async fn handle_select_request(
                 if pin_harness == Some(substrate_policy::Harness::Broca) {
                     remember_provider_identity(store, &decision_id, &selected, broca_credentials)?;
                 }
+                if let Some(classes) = &classes {
+                    classes.bind_selected_probe(
+                        &selected.model.provider_id,
+                        &selected.model.model_id,
+                        priced_per_token,
+                        &decision_id,
+                    );
+                }
                 add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
                 let finish_started = Instant::now();
                 let mut result = json!({
@@ -2541,6 +2554,14 @@ pub(super) async fn handle_select_request(
             add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
             match recorded {
                 Ok(decision_id) => {
+                    if let Some(classes) = &classes {
+                        classes.bind_selected_probe(
+                            &selected.model.provider_id,
+                            &selected.model.model_id,
+                            priced_per_token,
+                            &decision_id,
+                        );
+                    }
                     if selected_harness == Some(substrate_policy::Harness::Broca) {
                         // The decision row has committed, so the selection stands
                         // without the identity. Failing the call here would make

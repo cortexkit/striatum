@@ -271,12 +271,12 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
             &account_request("synthetic", "exactly-six-hours"),
         )
         .await;
-    // Every serving credential for the subscription class is fenced and no
-    // reset is known: an account limit, not an auth problem.
+    // The fence opens for one probe just after six hours. It remains an
+    // account limit, not an auth problem, until that boundary passes.
     assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
     assert_eq!(
         blocked.1["detail"]["reset_at_ms"],
-        json!(null),
+        json!(NOW + 1),
         "{}",
         blocked.1
     );
@@ -465,7 +465,7 @@ async fn a_credential_probe_is_a_fallback_and_an_entitlement_failure_renews_it()
     assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
     assert_eq!(
         blocked.1["detail"]["reset_at_ms"],
-        json!(null),
+        json!(NOW + 21_600_001),
         "{}",
         blocked.1
     );
@@ -2739,8 +2739,8 @@ async fn entitlement_refusals_never_convert_to_quota_blocks() {
         assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
         assert_eq!(
             blocked.1["detail"]["reset_at_ms"],
-            json!(null),
-            "entitlement has no quota reset: {}",
+            json!(NOW + 21_600_001),
+            "entitlement names its probe window, not the quota reset: {}",
             blocked.1
         );
         assert!(

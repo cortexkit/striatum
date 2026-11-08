@@ -191,7 +191,12 @@ pub(crate) struct ClassContext {
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
     continuation_credential: Option<String>,
     media_route: bool,
+    probe_scope: std::sync::Weak<std::sync::Mutex<crate::broca_credentials::BrocaCredentials>>,
+    probe_owner: Option<String>,
+    selection_probes: Option<std::sync::Arc<probe_reservations::Selection>>,
 }
+
+mod probe_reservations;
 
 #[cfg(test)]
 thread_local! {
@@ -516,6 +521,7 @@ impl ClassContext {
                 .map_err(|error| error.to_string())?;
         }
         let refusals = crate::credential_fences::live(store, credentials)?;
+        let probe_scope = std::sync::Arc::downgrade(credentials);
         let credentials = credentials
             .lock()
             .map_err(|error| error.to_string())?
@@ -651,7 +657,63 @@ impl ClassContext {
             tier_accounts: None,
             continuation_credential: None,
             media_route: false,
+            probe_scope,
+            probe_owner: None,
+            selection_probes: None,
         })
+    }
+
+    pub(crate) fn reserve_selection_probes(
+        &mut self,
+        store: &SqliteRouteStateStore,
+        credentials: &crate::broca_credentials::SharedBrocaCredentials,
+    ) -> Result<(), String> {
+        let probes = self
+            .refusals
+            .iter()
+            .filter(|fence| self.probe_eligible(&fence.provider_id, &fence.credential_id))
+            .map(|fence| (fence.provider_id.clone(), fence.credential_id.clone()))
+            .collect::<Vec<_>>();
+        if probes.is_empty() {
+            return Ok(());
+        }
+        let hold = probe_reservations::Selection::new(credentials, probes, self.now_ms);
+        self.probe_owner = Some(hold.owner.clone());
+        self.selection_probes = Some(std::sync::Arc::new(hold));
+        // A direct admission can claim a probe between the first store read
+        // and reservation. Read after taking the hold so its renewed fence
+        // cannot remain probe-eligible in this scoring snapshot.
+        self.refusals = refresh_credential_quota_holds(
+            store,
+            &self.credentials,
+            &self.quota,
+            &self.config,
+            crate::credential_fences::live(store, credentials)?,
+            &self.route_fences,
+            self.now_ms,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn bind_selected_probe(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        decision: &str,
+    ) {
+        let Some(hold) = &self.selection_probes else {
+            return;
+        };
+        let Outcome::Admit(admission) = self
+            .probe(provider, model, priced, false, None, "probe-reservation")
+            .outcome
+        else {
+            return;
+        };
+        if self.probe_eligible(provider, &admission.credential_id) {
+            hold.bind(provider, &admission.credential_id, decision, self.now_ms);
+        }
     }
 
     pub(crate) fn class(
@@ -794,6 +856,15 @@ impl ClassContext {
         !self
             .pool_walls
             .contains(&(fact.provider_id.clone(), row.id.clone()))
+            && (!self.probe_eligible(&fact.provider_id, &row.id)
+                || probe_reservations::blocked_until(
+                    &self.probe_scope,
+                    &fact.provider_id,
+                    &row.id,
+                    self.probe_owner.as_deref(),
+                    self.now_ms,
+                )
+                .is_none())
             && self.tier_accounts.as_ref().is_none_or(|accounts| {
                 accounts
                     .get(&format!("{}/{}", fact.provider_id, fact.model_id))
@@ -1022,7 +1093,8 @@ impl ClassContext {
         (
             RosterBuild {
                 roster: Some(self.roster(accounts.into_values().collect())),
-                context: json!({"provider": provider, "account_classes": true}),
+                context: json!({"provider": provider, "account_classes": true,
+                    "priced_per_token": priced_per_token}),
             },
             skipped,
         )
@@ -3158,6 +3230,18 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Err(reply) => return reply,
     };
     let provider = normalize(&parsed.provider);
+    let mut classes = ctx.classes.clone();
+    if let Some(classes) = &mut classes {
+        classes.probe_owner = parsed.model_decision_id.clone();
+    }
+    let ctx = &Ctx {
+        store: ctx.store,
+        accounts: ctx.accounts,
+        flags: ctx.flags.clone(),
+        policy: ctx.policy,
+        now_ms: ctx.now_ms,
+        classes,
+    };
     let request_fingerprint = fingerprint(&parsed);
     checking("admission_replay");
     match ctx.store.account_transaction(|tx| {
@@ -3669,7 +3753,7 @@ fn empty_roster_refusal(
     now: i64,
     params: Option<&AccountForParams>,
 ) -> Option<OpReply> {
-    let untimed = |code: &str, message: String| {
+    let untimed = |code: &str, message: String, exclusions: &[Value]| {
         Some(OpReply::typed(
             code,
             message,
@@ -3677,12 +3761,12 @@ fn empty_roster_refusal(
                 "code": code,
                 "retry_after_s": null,
                 "decision_id": null,
-                "exclusions": [],
+                "exclusions": exclusions,
             }),
         ))
     };
-    let exhausted = |until: Option<i64>| {
-        let (retry_after_s, reset_at_ms, suffix) = match until.filter(|until| *until > now) {
+    let exhausted = |until: Option<i64>, exclusions: &[Value]| {
+        let (retry_after_s, reset_at_ms) = match until.filter(|until| *until > now) {
             Some(until) => (
                 Some(
                     u64::try_from(until.saturating_sub(now))
@@ -3690,18 +3774,17 @@ fn empty_roster_refusal(
                         .div_ceil(1000),
                 ),
                 Some(until),
-                format!(" until {}", rfc3339(until)),
             ),
-            None => (None, None, String::new()),
+            None => (None, None),
         };
         Some(OpReply::typed(
             "account_pool_exhausted",
-            format!("routing selects no accounts for provider `{provider}`{suffix}"),
+            "[TODO(user): Explain that every offered credential was excluded; inspect exclusions for recovery and retry timing.]",
             json!({
                 "code": "account_pool_exhausted",
                 "retry_after_s": retry_after_s,
                 "decision_id": null,
-                "exclusions": [],
+                "exclusions": exclusions,
                 "reset_at_ms": reset_at_ms,
             }),
         ))
@@ -3710,19 +3793,55 @@ fn empty_roster_refusal(
         .facts
         .iter()
         .find(|fact| fact.provider_id == provider && fact.model_id == model);
-    let Some(fact) = fact else {
+    let class_rows = fact.map_or_else(Vec::new, |fact| classes.class(fact, priced).rows);
+    let mut exclusions = Vec::new();
+    if let Some(candidates) = params.and_then(|params| params.candidates.as_ref()) {
+        for candidate in &candidates.accounts {
+            let row = classes
+                .credentials
+                .listed_credentials()
+                .iter()
+                .find(|row| row.id == candidate.credential_id);
+            let reason = match row {
+                None => Some("unknown_credential"),
+                Some(row)
+                    if !crate::broca_credentials::credential_providers(row, &classes.catalog)
+                        .iter()
+                        .any(|mapped| mapped == provider) =>
+                {
+                    Some("wrong_provider")
+                }
+                Some(row)
+                    if row.account_id.as_deref().unwrap_or(&row.id) != candidate.account_id =>
+                {
+                    Some("account_id_mismatch")
+                }
+                Some(row) if !class_rows.iter().any(|allowed| allowed.id == row.id) => {
+                    Some("not_in_account_class")
+                }
+                Some(_) => None,
+            };
+            if let Some(reason) = reason {
+                exclusions.push(json!({"account_id":candidate.account_id,
+                    "credential_id":candidate.credential_id, "reason":reason}));
+            }
+        }
+    }
+    if fact.is_none() {
         checking("missing_model_credentials");
         return untimed(
             "auth_required",
             format!("routing selects no accounts for provider `{provider}`"),
+            &exclusions,
         );
-    };
-    let rows = classes.class(fact, priced).rows;
+    }
+    let rows = class_rows;
     if rows.is_empty() {
         checking("missing_class_credentials");
         return untimed(
             "auth_required",
             format!("routing selects no accounts for provider `{provider}`"),
+            &exclusions,
         );
     }
     let rows: Vec<_> = rows
@@ -3750,12 +3869,42 @@ fn empty_roster_refusal(
     let mut fenced_cause = false;
     let mut row_resets: Vec<Option<i64>> = Vec::new();
     for row in &rows {
+        if let Some(until) = classes
+            .probe_eligible(provider, &row.id)
+            .then(|| {
+                probe_reservations::blocked_until(
+                    &classes.probe_scope,
+                    provider,
+                    &row.id,
+                    classes.probe_owner.as_deref(),
+                    now,
+                )
+            })
+            .flatten()
+        {
+            fenced_cause = true;
+            row_resets.push(Some(until));
+            let code = classes
+                .refusals
+                .iter()
+                .find(|fence| fence.provider_id == provider && fence.credential_id == row.id)
+                .map(|fence| fence.code.as_str())
+                .unwrap_or("probe_reserved");
+            exclusions.push(json!({"account_id":row.account_id.as_deref().unwrap_or(&row.id),
+                "credential_id":row.id, "reason":code, "reset_at_ms":until,
+                "message":"[TODO(user): Explain that another selection reserved this credential's single probe; retry after its reservation expires.]"}));
+            continue;
+        }
         if classes
             .pool_walls
             .contains(&(provider.to_owned(), row.id.clone()))
         {
             fenced_cause = true;
             row_resets.push(None);
+            exclusions.push(
+                json!({"account_id":row.account_id.as_deref().unwrap_or(&row.id),
+                "credential_id":row.id, "reason":"pool_backoff", "reset_at_ms":null}),
+            );
             continue;
         }
         let account = row.account_id.clone().unwrap_or_else(|| row.id.clone());
@@ -3773,6 +3922,8 @@ fn empty_roster_refusal(
                 (None, None) => None,
             };
             row_resets.push(row_reset);
+            exclusions.push(json!({"account_id":account, "credential_id":row.id,
+                "reason":"route_fenced", "reset_at_ms":row_reset}));
             continue;
         }
         if let Some(refusal) = classes.refusals.iter().find(|fence| {
@@ -3788,11 +3939,27 @@ fn empty_roster_refusal(
             fenced_cause = true;
             // Only a billing refusal can inherit a quota reset. Entitlement
             // recovery depends on a successful request, not utilization.
-            row_resets.push(
-                crate::credential_fences::is_billing_code(&refusal.code)
-                    .then(|| classes.quota_hold_reset(provider, &row.id))
-                    .flatten(),
-            );
+            let quota_reset = crate::credential_fences::is_billing_code(&refusal.code)
+                .then(|| classes.quota_hold_reset(provider, &row.id))
+                .flatten();
+            let probe_reset = (!classes.targets.contains_key(provider)
+                && (!crate::credential_fences::is_billing_code(&refusal.code)
+                    || !classes.has_quota_signal(provider, &row.id)))
+            .then(|| {
+                refusal
+                    .observed_at_ms
+                    .saturating_add(crate::credential_fences::FENCE_PROBE_RECHECK_MS)
+                    .saturating_add(1)
+            });
+            let reset = quota_reset.or(probe_reset).filter(|reset| *reset > now);
+            row_resets.push(reset);
+            exclusions.push(json!({"account_id":account, "credential_id":row.id,
+                "reason":refusal.code, "reset_at_ms":reset,
+                "message":if reset.is_some() {
+                    "[TODO(user): Explain that this credential is fenced until its quota reset or next single-probe window.]"
+                } else {
+                    "[TODO(user): Explain that this credential fence has no timed reset; an operator must clear it or its vault listing must change.]"
+                }}));
             continue;
         }
         if classes.eligibility.iter().any(|fact_| {
@@ -3800,6 +3967,8 @@ fn empty_roster_refusal(
                 && fact_.credential_id == row.id
                 && (fact_.model.is_empty() || fact_.model == model)
         }) {
+            exclusions.push(json!({"account_id":account, "credential_id":row.id,
+                "reason":"account_not_authorized"}));
             continue;
         }
         if classes.size_refusals.iter().any(|fact_| {
@@ -3808,23 +3977,28 @@ fn empty_roster_refusal(
                 && fact_.credential_id == row.id
                 && fact_.size_class == size_class
         }) {
+            exclusions.push(json!({"account_id":account, "credential_id":row.id,
+                "reason":"input_size"}));
             continue;
         }
         // A row none of the filters excludes would have left the roster
         // non-empty; treat an unclassified row as policy-filtered so a new
         // filter cannot silently become a timed pool refusal.
+        exclusions.push(json!({"account_id":account, "credential_id":row.id,
+            "reason":"account_policy_filter"}));
     }
     if fenced_cause {
         checking("credential_or_quota_block");
         // Retry when the first known hold ends; accounts with unknown
         // resets remain excluded while another account can recover.
         let earliest = row_resets.into_iter().flatten().min();
-        return exhausted(earliest);
+        return exhausted(earliest, &exclusions);
     }
     checking("account_policy_filter");
     untimed(
         "account_not_authorized",
         format!("routing selects no accounts for provider `{provider}`"),
+        &exclusions,
     )
 }
 
@@ -4098,6 +4272,7 @@ fn serve(
         policy,
     };
     let request = params.request(principal, affinity_row.is_none());
+    let mut reserved_probe = false;
     let mut decision = loop {
         let decision =
             prefrontal_routing_core::accounts::decide_with_context(&request, &state, now, &inputs);
@@ -4108,12 +4283,39 @@ fn serve(
         if !inputs.credential_probe_notes.contains_key(&credential) {
             break decision;
         }
-        match tx.claim_credential_probe(
-            provider,
-            &credential,
-            now.saturating_sub(crate::credential_fences::FENCE_PROBE_RECHECK_MS),
-            now,
-        )? {
+        let claim = || {
+            tx.claim_credential_probe(
+                provider,
+                &credential,
+                now.saturating_sub(crate::credential_fences::FENCE_PROBE_RECHECK_MS),
+                now,
+            )
+        };
+        let claimed = if let Some(classes) = &ctx.classes {
+            probe_reservations::claim(
+                &classes.probe_scope,
+                provider,
+                &credential,
+                classes.probe_owner.as_deref(),
+                now,
+                claim,
+            )?
+        } else {
+            Some(claim()?)
+        };
+        let Some(claimed) = claimed else {
+            reserved_probe = true;
+            inputs.credential_probe_notes.remove(&credential);
+            if let Some(roster) = &mut state.roster {
+                for account in &mut roster.accounts {
+                    account
+                        .credentials
+                        .retain(|record| record.credential_id != credential);
+                }
+            }
+            continue;
+        };
+        match claimed {
             prefrontal_routing_store::CredentialProbeClaim::Claimed => break decision,
             prefrontal_routing_store::CredentialProbeClaim::Unfenced => {
                 inputs.credential_probe_notes.remove(&credential);
@@ -4130,6 +4332,23 @@ fn serve(
             }
         }
     };
+    if reserved_probe && !matches!(decision.outcome, Outcome::Admit(_)) {
+        if let Some(classes) = &ctx.classes {
+            if let Some(reply) = empty_roster_refusal(
+                classes,
+                provider,
+                &params.model,
+                roster.context["priced_per_token"]
+                    .as_bool()
+                    .unwrap_or(false),
+                &BTreeMap::new(),
+                now,
+                Some(params),
+            ) {
+                return Ok(reply);
+            }
+        }
+    }
     if established {
         if let (Some(affinity), Outcome::Admit(admitted), Some(classes)) = (
             state.affinity.as_ref(),

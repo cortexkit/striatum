@@ -207,9 +207,9 @@ async fn unscoped_caller_is_not_authorized() {
 }
 
 #[tokio::test]
-async fn fenced_class_is_exhausted_without_a_reset_on_both_entrypoints() {
-    // A billing/entitlement fence is an account limit, not an auth problem:
-    // `account_pool_exhausted` without a reset when none is known.
+async fn fenced_class_is_exhausted_until_its_probe_window_on_both_entrypoints() {
+    // A credential fence is an account limit, not an auth problem. Its
+    // next probe window is a retry boundary, not a quota replenishment.
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, credentials) = setup("synthetic", false);
     let shared = Arc::new(std::sync::Mutex::new(credentials));
@@ -232,13 +232,13 @@ async fn fenced_class_is_exhausted_without_a_reset_on_both_entrypoints() {
     assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
     assert_eq!(
         refused.1["detail"]["reset_at_ms"],
-        json!(null),
+        json!(NOW + 21_600_001),
         "{}",
         refused.1
     );
     let refusal: cortexkit_role_routing::errors::Refusal =
         serde_json::from_value(refused.1.clone()).unwrap();
-    assert_eq!(refusal.wait_until_ms(), None);
+    assert_eq!(refusal.wait_until_ms(), Some(NOW + 21_600_001));
 }
 
 #[tokio::test]
@@ -404,7 +404,7 @@ fn undeclared_legacy_codes_become_unavailable() {
 #[tokio::test]
 async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
     let _clock = crate::InjectedClock::set(NOW);
-    // Fenced without a reset: an account limit on both entrypoints.
+    // A credential fence names its next probe window on both entrypoints.
     {
         let (harness, credentials) = setup("synthetic", false);
         let shared = Arc::new(std::sync::Mutex::new(credentials));
@@ -429,7 +429,7 @@ async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
         assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
         assert_eq!(
             refused.1["detail"]["reset_at_ms"],
-            json!(null),
+            json!(NOW + 21_600_001),
             "{}",
             refused.1
         );
@@ -603,7 +603,7 @@ async fn mixed_fence_and_policy_is_exhausted_on_both_entrypoints() {
     assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
     assert_eq!(
         refused.1["detail"]["reset_at_ms"],
-        json!(null),
+        json!(NOW + 21_600_001),
         "{}",
         refused.1
     );
