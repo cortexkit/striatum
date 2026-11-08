@@ -1093,8 +1093,13 @@ impl ClassContext {
         (
             RosterBuild {
                 roster: Some(self.roster(accounts.into_values().collect())),
-                context: json!({"provider": provider, "account_classes": true,
-                    "priced_per_token": priced_per_token}),
+                // Recorded only when true, so stored decisions for subscription
+                // rosters keep their earlier shape.
+                context: if priced_per_token {
+                    json!({"provider": provider, "account_classes": true, "priced_per_token": true})
+                } else {
+                    json!({"provider": provider, "account_classes": true})
+                },
             },
             skipped,
         )
