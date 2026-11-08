@@ -17,7 +17,6 @@
 mod account_quota;
 mod account_refusal_log;
 mod account_selection;
-mod available_models_text;
 mod background;
 #[cfg(test)]
 mod baseline_tests;
@@ -4267,7 +4266,6 @@ pub(crate) fn handles(method: &str) -> bool {
             | model_resolution::RESOLVE_MODEL_OP
             | model_resolution::MODEL_CAPABILITIES_OP
             | model_resolution::AGENT_MODEL_REQUIREMENTS_OP
-            | available_models_text::OP
             | ROUTE_MODEL_UPSERT_OP
             | ROUTE_LIST_INFERRED_OP
             | ROUTE_LIST_UNSCORED_OP
@@ -4361,11 +4359,6 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
         },
         ManagementOperation {
             name: model_resolution::AGENT_MODEL_REQUIREMENTS_OP.to_string(),
-            kind: ManagementOperationKind::Query,
-            description: None,
-        },
-        ManagementOperation {
-            name: available_models_text::OP.to_string(),
             kind: ManagementOperationKind::Query,
             description: None,
         },
@@ -14675,42 +14668,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_available_models_text_is_a_query_served_by_its_dispatch_arm() {
-        let rig = Rig::new("available-models-wire");
+    async fn removed_routing_available_models_text_is_unknown_method() {
+        let rig = Rig::new("removed-available-models-wire");
         let store = Arc::new(rig.open_store());
-        store
-            .upsert_fact(&fact("wireco", "model"), FactSource::Seed)
-            .unwrap();
-        let response = run_route_wire_request(
-            &store,
-            json!({
-                "method": available_models_text::OP,
-                "params": {
-                    "availableModels": ["wireco/model"],
-                    "subscriptionEntries": [],
-                    "providerAuthTypes": {}
-                }
-            }),
-        )
-        .await;
-        assert_eq!(response.header.ty, FrameType::Response);
-        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-        assert!(body["result"]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("wireco/model") && text.contains("← recommended")));
-
-        let routing_manifest = manifest(DEFAULT_MODULE_ID);
-        let operation = routing_manifest
-            .provides
+        for params in [
+            json!({"availableModels":["wireco/model"],"include":"all"}),
+            json!({}),
+            json!({"limit":"invalid"}),
+            serde_json::Value::Null,
+        ] {
+            let response = run_route_wire_request(
+                &store,
+                json!({"method":"routing.available_models_text","params":params}),
+            )
+            .await;
+            assert_eq!(response.header.ty, FrameType::Error, "{params}");
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(body["code"], "unknown_method", "{params}: {body}");
+        }
+        assert!(!handles("routing.available_models_text"));
+        assert!(served_operations()
             .iter()
-            .find_map(|role| match role {
+            .all(|operation| operation.name != "routing.available_models_text"));
+        assert!(manifest(DEFAULT_MODULE_ID).provides.iter().all(|role| {
+            match role {
                 ProviderRole::ManagementSurface { operations, .. } => operations
                     .iter()
-                    .find(|operation| operation.name == available_models_text::OP),
-                _ => None,
-            })
-            .expect("available models text operation is advertised");
-        assert_eq!(operation.kind, ManagementOperationKind::Query);
+                    .all(|operation| operation.name != "routing.available_models_text"),
+                _ => true,
+            }
+        }));
+    }
+
+    #[test]
+    fn census_gated_routing_operations_remain_registered() {
+        // Without a fleet-wide fourteen-day zero-call window and an empty
+        // caller census, these methods and their legacy shapes must stay.
+        let operations = served_operations();
+        for method in [
+            ROUTE_COOLDOWN_STATUS_OP,
+            ROUTE_MODEL_FACT_OP,
+            ROUTE_MODEL_FACTS_OP,
+            ROUTE_SET_DECISION_OUTCOME_OP,
+            ROUTE_RECORD_USAGE_OP,
+            ROUTE_RECORD_COOLDOWN_OP,
+            ROUTE_SELECT_OP,
+            ROUTE_SELECT_PANEL_OP,
+            ROUTE_EXPLAIN_OP,
+            account_selection::ACCOUNT_FOR_OP,
+            account_selection::ACCOUNT_OBSERVE_OP,
+            account_selection::ACCOUNT_STATUS_OP,
+            "route.pool_acquire",
+            "route.pool_renew",
+            "route.pool_release",
+            "route.pool_wall",
+        ] {
+            assert!(handles(method), "{method}");
+            assert!(operations.iter().any(|op| op.name == method), "{method}");
+        }
     }
 
     #[test]

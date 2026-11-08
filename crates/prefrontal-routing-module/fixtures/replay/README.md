@@ -49,6 +49,25 @@ for the bundled catalog are omitted; every non-neutral field is retained.
 Scratch directory names are replaced with `<replay>` / `<scratch>`. No reply
 member, identity, timestamp or non-neutral effect is masked.
 
+## Difference 10: routing's available-models text operation
+
+Routing no longer advertises or handles `routing.available_models_text`; requests
+now receive `unknown_method`. Core's operation with the same name is separate:
+core renders the text from `route.consumer_models` and Fusiform and keeps serving
+its existing callers. Rolling core back past that switch after routing's deletion
+is unsupported.
+
+The historical text request and golden remain intact. The core replay comparison
+changes only that step's reply and frame type for difference 10, retaining its
+state and all other steps. `available-models.golden.json` remains the pre-switch
+rendering oracle for the consumer-model inventory and core's renderer.
+
+No other method or legacy shape is removed. `route.cooldown_status` and
+`route.model_fact`, like the legacy shapes, remain until both an empty caller
+census and a fleet-wide fourteen-day zero-call window are established. The window
+starts no earlier than the latest counter deployment, switched-core deployment
+and last older-core exit; a local store's counts alone do not authorize deletion.
+
 ## Difference 14
 
 `core.golden.json` / `difference-14-core-A-task-B` sends core's request with
