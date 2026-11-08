@@ -2585,7 +2585,7 @@ async fn handle_model_facts(
                 epoch,
                 corr,
                 "store_error",
-                "[TODO(user): Explain why routing's engine speed samples could not be read.]",
+                "Routing couldn't read its engine speed samples just now.",
             )
             .await;
         }

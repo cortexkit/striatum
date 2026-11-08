@@ -250,12 +250,21 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
 }
 
 fn measurement_refusal(mut refusal: Refusal) -> Refusal {
-    refusal.message = "[TODO(user): Explain why the engine measurement was refused.]".into();
+    let message = match refusal.code.as_str() {
+        "engine_not_declared_by_caller" => "Only the module that declares this engine for this kind in its role description may report measurements for it, and the calling module doesn't. Nothing was recorded.",
+        "unknown_decision" => "The report names no engine decision routing made for this caller, engine and kind, so it can't count as that job's speed. Nothing was recorded.",
+        // A request-parsing refusal already names the field it rejected.
+        _ if !refusal.message.is_empty() => return refusal,
+        _ => "Routing couldn't record this engine measurement. Nothing was recorded.",
+    };
+    refusal.message = message.into();
     refusal
 }
 
 fn measurement_store_refusal(error: impl std::fmt::Display) -> Refusal {
-    measurement_refusal(store_refusal(error))
+    let mut refusal = store_refusal(error);
+    refusal.message = "Routing couldn't store this engine measurement just now. Nothing was recorded; send it again.".into();
+    refusal
 }
 
 fn authorize(caller: &Caller, kind: &wire::Kind, engine: &EngineIdentity) -> Result<(), Refusal> {
