@@ -294,6 +294,26 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
             let refusal = cortexkit_role_routing::errors::Refusal::unknown_decision();
             step["reply"] = json!({"code":refusal.code.as_str(),"message":refusal.message,"detail":refusal.detail});
         }
+        if file == "core" {
+            // Difference 10 removes only routing's text operation. Keep its
+            // historical request and state, and every other reply, unchanged.
+            let mut removed = 0;
+            for case in expected["cases"].as_array_mut().unwrap() {
+                for step in case["steps"].as_array_mut().unwrap() {
+                    if step["method"] == "routing.available_models_text" {
+                        assert_eq!(step["frame_type"], "Response");
+                        assert!(step["reply"]["result"]["text"].is_string());
+                        step["frame_type"] = json!("Error");
+                        step["reply"] = json!({
+                            "code":"unknown_method",
+                            "message":"unknown method 'routing.available_models_text'"
+                        });
+                        removed += 1;
+                    }
+                }
+            }
+            assert_eq!(removed, 1, "retain the historical text-operation probe");
+        }
         apply_report_outcome_difference(&mut expected);
         project_additive_shape_members(&mut observed);
         project_additive_shape_members(&mut expected);

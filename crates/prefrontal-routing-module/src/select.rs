@@ -1265,9 +1265,6 @@ pub(super) async fn handle_select_request(
     if envelope.method == model_resolution::AGENT_MODEL_REQUIREMENTS_OP {
         return model_resolution::handle_agent_model_requirements(frame, writer).await;
     }
-    if envelope.method == available_models_text::OP {
-        return available_models_text::handle(frame, writer, store, operator_config_path).await;
-    }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         let ladder_sources =
             winner_ladder::LadderSources::live(routing_config_path, operator_config_path);
