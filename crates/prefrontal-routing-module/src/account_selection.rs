@@ -3779,7 +3779,7 @@ fn empty_roster_refusal(
         };
         Some(OpReply::typed(
             "account_pool_exhausted",
-            "[TODO(user): Explain that every offered credential was excluded; inspect exclusions for recovery and retry timing.]",
+            "Routing found no usable account among the offered credentials. Each one is listed in exclusions with its reason and, where it has one, when it can be tried again.",
             json!({
                 "code": "account_pool_exhausted",
                 "retry_after_s": retry_after_s,
@@ -3892,7 +3892,7 @@ fn empty_roster_refusal(
                 .unwrap_or("probe_reserved");
             exclusions.push(json!({"account_id":row.account_id.as_deref().unwrap_or(&row.id),
                 "credential_id":row.id, "reason":code, "reset_at_ms":until,
-                "message":"[TODO(user): Explain that another selection reserved this credential's single probe; retry after its reservation expires.]"}));
+                "message":"Another selection holds this credential's one probe attempt for now. Retry after that hold expires, at most two minutes."}));
             continue;
         }
         if classes
@@ -3956,9 +3956,9 @@ fn empty_roster_refusal(
             exclusions.push(json!({"account_id":account, "credential_id":row.id,
                 "reason":refusal.code, "reset_at_ms":reset,
                 "message":if reset.is_some() {
-                    "[TODO(user): Explain that this credential is fenced until its quota reset or next single-probe window.]"
+                    "This credential is blocked until its quota resets or its next single probe window opens; reset_at_ms says when."
                 } else {
-                    "[TODO(user): Explain that this credential fence has no timed reset; an operator must clear it or its vault listing must change.]"
+                    "This credential is blocked with no timed reset: an operator must clear it, or its vault listing must change."
                 }}));
             continue;
         }
