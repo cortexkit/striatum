@@ -743,3 +743,43 @@ async fn failed_backstop_does_not_restart_minute_polling_while_attached() {
     assert_eq!(source.snapshots, 2);
     assert_eq!(used(&live), 10.0);
 }
+
+#[tokio::test]
+async fn an_unread_subject_is_acknowledged_and_never_blocks_quota_samples() {
+    let (_scratch, live) = fixture();
+    let bus = bus();
+    let sample = body("epoch-z", 1, 10);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        ..Default::default()
+    };
+    // The test cursor checks every ack follows a stored reading, so start from one.
+    live.store(&snapshot_body(&sample), false).unwrap();
+    let step = "ck.box_test.event.broca.step_finished.v1";
+    let _ = bus
+        .publish(
+            step,
+            "step-1",
+            ContentDigest::of_bytes(b"{}"),
+            Headers::default(),
+        )
+        .await
+        .unwrap();
+    publish(&bus, &mut source, &sample).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let mut state = SequenceState::default();
+    consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT)
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor.acks, 1,
+        "the step event is acknowledged, not redelivered"
+    );
+    assert!(state.skipped_subjects.contains(step));
+    consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT)
+        .await
+        .unwrap();
+    assert_eq!(cursor.deliveries, [1, 1], "each event is delivered once");
+    assert_eq!(cursor.acks, 2);
+    assert_eq!(used(&live), 10.0);
+}

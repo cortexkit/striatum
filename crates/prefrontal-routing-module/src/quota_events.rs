@@ -317,6 +317,8 @@ struct SequenceState {
     /// snapshot then stands in for everything they carried.
     owe_snapshot: bool,
     last_catch_up_attempt: Option<Instant>,
+    /// Subjects this consumer doesn't read, already logged once each.
+    skipped_subjects: HashSet<String>,
 }
 
 /// Insula keeps only its newest samples per account and none from before its
@@ -452,6 +454,22 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
         return Ok(());
     };
     let message = delivery.message;
+    if message.subject != subject {
+        // Only Insula's quota samples are read here. Another subject in this
+        // durable's filter will never become readable by redelivery, so it is
+        // acknowledged and skipped; NAKing it would redeliver it forever and fill
+        // the ack-pending window ahead of quota samples.
+        if state.skipped_subjects.insert(message.subject.clone()) {
+            eprintln!(
+                "[prefrontal-routing] quota consumer skipped unread event subject {}",
+                message.subject
+            );
+        }
+        return cursor
+            .ack()
+            .await
+            .map_err(|e| ConsumeError::Bus(e.to_string()));
+    }
     let far_behind = live
         .cache
         .lock()
@@ -479,9 +497,6 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
     }
     catch_up_snapshot(source, live, state).await;
     let result = async {
-        if message.subject != subject {
-            return Err("unexpected insula event subject".into());
-        }
         let bytes = match source.fetch(&message.id).await {
             Ok(bytes) => bytes,
             Err(error) if error.contains("event_not_found") => {
