@@ -95,7 +95,7 @@ impl Catalog {
                         catalog.engines.insert(module.to_owned(), declarations);
                     }
                     Err(error) => catalog.issues.push(format!(
-                        "[TODO(user): Invalid media engine declaration] {module}: {error}"
+                        "Module {module} declares media engines routing can't read, so routing ignores them: {error}"
                     )),
                 }
             }
