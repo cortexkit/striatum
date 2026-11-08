@@ -556,7 +556,7 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
     serde_json::to_value(answer).map_err(internal_unavailable)
 }
 
-/// The allocator's refusal in v1 shape. A hold and an exhausted pool are
+/// The allocator's refusal in v1 shape. A hold and an unavailable quota pool are
 /// timed by the wait the allocator states. Account-selection unavailability
 /// also preserves candidate exclusions and an optional short retry delay.
 /// Legacy codes the contract does not declare (`store_error`,
@@ -588,6 +588,17 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                 .and_then(Value::as_u64)
                 .or_else(wait_until),
         ),
+        "account_pool_reserve_limited" => {
+            let mut refusal = Refusal::new(RefusalCode::parse(code), message.clone());
+            if let Some(reset) = detail
+                .and_then(|detail| detail.get("reset_at_ms"))
+                .and_then(Value::as_u64)
+                .or_else(wait_until)
+            {
+                refusal.detail.insert("reset_at_ms".into(), json!(reset));
+            }
+            refusal
+        }
         "invalid_request" => Refusal::invalid_request("params", message.clone()),
         // Declared (0.5.2) and untimed: module-wide, use your own credential.
         "account_selection_disabled" => {
@@ -616,7 +627,10 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
         }
         other => Refusal::new(RefusalCode::parse(other), message.clone()),
     };
-    if code == "account_pool_exhausted" {
+    if matches!(
+        code,
+        "account_pool_exhausted" | "account_pool_reserve_limited"
+    ) {
         if let Some(detail) = detail.and_then(Value::as_object) {
             for key in [
                 "code",

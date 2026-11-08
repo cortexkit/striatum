@@ -1199,9 +1199,10 @@ impl ClassContext {
         )
     }
 
-    /// Inspect exhaustion with the allocator's own filters. Relaxing wait limits
-    /// reveals a known reset; removing reserve floors distinguishes exhaustion
-    /// from policy headroom. Eligibility and missing evidence remain refusals.
+    /// Inspect the requesting payment class with the allocator's own filters.
+    /// A new session has no account affinity and must leave the allocator's
+    /// minimum quota headroom intact. Those floors make an account unavailable
+    /// just as a confirmed wall does; model selection must not relax them.
     pub(crate) fn blocked_reset(
         &self,
         provider: &str,
@@ -1235,34 +1236,15 @@ impl ClassContext {
         }) {
             return None;
         }
-        let mut policy = self.config.allocator_policy(provider);
-        policy.max_hold_s = i64::MAX as u64 / 1000;
-        policy.reserve_five_hour = 0.0;
-        policy.reserve_seven_day = 0.0;
-        policy.reserve_scoped = 0.0;
-        policy.broca_floor_points = 0.0;
-        policy.soft_quota_remaining_percent = None;
-        policy.pool_floors.clear();
-        let reset = self.probe_with_policy(
-            provider,
+        let reset = pool_recovery_reset(
+            &blocked,
+            roster.roster.as_ref(),
+            self.fences.get(provider).map_or(&[], Vec::as_slice),
+            &self.config.allocator_policy(provider),
             model,
-            priced,
-            true,
-            Some(policy.max_hold_s),
-            "blocked-preflight",
-            policy,
+            self.now_ms,
         );
-        if let Some(hold) = reset.hold() {
-            return Some(Some(hold.reset_at_ms));
-        }
-        let exhausted = !reset.explanation.accounts.is_empty()
-            && reset.explanation.accounts.iter().all(|account| {
-                account.exclusions.iter().any(|reason| matches!(reason,
-                prefrontal_routing_core::accounts::ExclusionReason::ConfirmedFence { .. }
-                | prefrontal_routing_core::accounts::ExclusionReason::ScopeExhausted { .. }
-                | prefrontal_routing_core::accounts::ExclusionReason::BelowReserve { .. }))
-            });
-        exhausted.then_some(None)
+        Some(reset.map(|reset| fenced.values().copied().fold(reset, i64::min)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1376,8 +1358,8 @@ impl ClassContext {
         }
     }
 
-    /// Legacy selection needs request-local route walls because it does not run
-    /// allocator preflight. V1 must keep these fences at account preflight: a
+    /// Legacy selection needs request-local account walls because it does not run
+    /// allocator preflight. V1 must keep these walls at account preflight: a
     /// capacity wall would hide an adequate route and lose `accounts_blocked`
     /// and the reset that lets the caller wait.
     pub(crate) fn apply_legacy_route_fences(
@@ -1391,7 +1373,11 @@ impl ClassContext {
             if defer_pool_pin && self.targets.contains_key(&fact.provider_id) {
                 continue;
             }
-            if let Some(reset) = self.route_fence_reset(&fact.provider_id, &fact.model_id, priced) {
+            if let Some(reset) = self
+                .blocked_reset(&fact.provider_id, &fact.model_id, priced)
+                .flatten()
+                .or_else(|| self.route_fence_reset(&fact.provider_id, &fact.model_id, priced))
+            {
                 let state = snapshot
                     .by_capacity
                     .entry(prefrontal_routing_core::make_capacity_key(
@@ -1401,6 +1387,7 @@ impl ClassContext {
                     .or_default();
                 state.quota_exhausted_until =
                     Some(state.quota_exhausted_until.unwrap_or(0.0).max(reset as f64));
+                state.quota_pressure = Some(1.0);
             }
         }
     }
@@ -4007,6 +3994,95 @@ fn empty_roster_refusal(
     )
 }
 
+/// A pool recovers when its first eligible account clears every dated blocker.
+/// Read only the windows that actually excluded each account: an unrelated
+/// short-window reset must not shorten a weekly reserve hold.
+fn pool_recovery_reset(
+    decision: &Decision,
+    roster: Option<&Roster>,
+    fences: &[Fence],
+    policy: &AllocatorPolicy,
+    model: &str,
+    now: i64,
+) -> Option<i64> {
+    use prefrontal_routing_core::accounts::{ApplicableWindow, ExclusionReason};
+    let roster = roster?;
+    let family = policy.family_for_model(model);
+    let mut releases = Vec::new();
+    for note in &decision.explanation.accounts {
+        let account = roster
+            .accounts
+            .iter()
+            .find(|a| a.account_id == note.account_id)?;
+        let mut resets = Vec::new();
+        let window_reset = |window: ApplicableWindow| -> Option<i64> {
+            let quota = account.quota.as_ref()?;
+            let general = match window {
+                ApplicableWindow::FiveHour => GeneralWindow::FiveHour,
+                ApplicableWindow::SevenDay => GeneralWindow::SevenDay,
+                ApplicableWindow::Reported(minutes) => GeneralWindow::Reported(minutes),
+                ApplicableWindow::FamilyScope => {
+                    let ScopedList::Listed(windows) = &quota.scoped else {
+                        return None;
+                    };
+                    return windows
+                        .iter()
+                        .filter(|window| policy.family_for_scope(window) == Some(family))
+                        .map(|window| window.resets_at.at_ms())
+                        .collect::<Option<Vec<_>>>()?
+                        .into_iter()
+                        .max();
+                }
+            };
+            quota.window(general)?.resets_at.at_ms()
+        };
+        for reason in &note.exclusions {
+            match reason {
+                ExclusionReason::BelowReserve { windows } => {
+                    for window in windows {
+                        resets.push(window_reset(*window)?);
+                    }
+                }
+                ExclusionReason::BelowBrocaFloor { window, .. } => {
+                    resets.push(window_reset((*window).into())?);
+                }
+                ExclusionReason::ScopeExhausted { .. } => {
+                    resets.push(window_reset(ApplicableWindow::FamilyScope)?);
+                }
+                ExclusionReason::ConfirmedFence { pool } => {
+                    let matching: Vec<_> = fences
+                        .iter()
+                        .filter(|fence| {
+                            fence.account_id == account.account_id
+                                && fence.pool == *pool
+                                && fence.applies_to(
+                                    model,
+                                    family,
+                                    request_pool(None, &account.routing_provider, model).as_deref(),
+                                )
+                        })
+                        .collect();
+                    if matching.is_empty() {
+                        return None;
+                    }
+                    for fence in matching {
+                        resets.push(fence.reset.at_ms()?);
+                    }
+                }
+                // Missing evidence and permanent eligibility failures do not
+                // promise a recovery time.
+                _ => return None,
+            }
+        }
+        let release = resets.into_iter().max()?;
+        if release <= now {
+            return None;
+        }
+        releases.push(release);
+    }
+    releases.into_iter().min()
+}
+
 /// Check a cold worker launch without reserving an account or creating affinity.
 /// The runner still performs the usual atomic admission when it starts sending.
 #[cfg(test)]
@@ -4494,54 +4570,18 @@ fn serve(
                     "auth_required"
                 };
             }
-            let family = ctx.policy.family_for_model(&params.model);
-            let reset = state
-                .fences
-                .iter()
-                .filter(|fence| {
-                    fence.applies_to(&normalize(&params.model), family, request.pool.as_deref())
-                })
-                .filter(|fence| {
-                    roster
-                        .roster
-                        .iter()
-                        .flat_map(|roster| &roster.accounts)
-                        .any(|account| account.account_id == fence.account_id)
-                })
-                .filter_map(|fence| fence.reset.at_ms())
-                .chain(
-                    roster
-                        .roster
-                        .iter()
-                        .flat_map(|roster| &roster.accounts)
-                        .filter_map(|account| account.quota.as_ref())
-                        .flat_map(|quota| {
-                            let mut dates: Vec<_> = quota
-                                .required_windows()
-                                .into_iter()
-                                .filter_map(|window| quota.window(window))
-                                .filter(|window| window.used_percent >= 100.0)
-                                .filter_map(|window| window.resets_at.at_ms())
-                                .collect();
-                            if let ScopedList::Listed(windows) = &quota.scoped {
-                                dates.extend(
-                                    windows
-                                        .iter()
-                                        .filter(|window| {
-                                            ctx.policy.family_for_scope(window) == Some(family)
-                                        })
-                                        .filter(|window| window.used_percent >= 100.0)
-                                        .filter_map(|window| window.resets_at.at_ms()),
-                                );
-                            }
-                            dates
-                        }),
-                )
-                .filter(|reset| *reset > now)
-                .min();
-            // Only an exhausted pool is timed by the contract. Every other
-            // allocator refusal is untimed, so it carries no wait or reset.
-            let timed = code == "account_pool_exhausted";
+            let reset = pool_recovery_reset(
+                &decision,
+                state.roster.as_ref(),
+                &state.fences,
+                ctx.policy,
+                &params.model,
+                now,
+            );
+            let timed = matches!(
+                code,
+                "account_pool_exhausted" | "account_pool_reserve_limited"
+            );
             Ok(OpReply::typed(
                 code,
                 format!("no account admitted: {code}"),

@@ -856,6 +856,23 @@ async fn select_at_tier(
     let subscription_keys = candidates.subscription_keys;
     let rejections = candidates.rejected;
 
+    // V1 keeps account walls out of scoring so pinned and ladder requests can
+    // still inspect holds. Its ledger must nevertheless record the same timed
+    // account exclusions that removed routes from automatic selection.
+    let mut account_snapshot = snapshot.clone();
+    for fact in &facts {
+        let route = fact_to_route(fact);
+        if let Some(Some(reset)) = account_blocks.get(&route.route_key) {
+            let state = account_snapshot
+                .by_capacity
+                .entry(route.capacity_key)
+                .or_default();
+            state.quota_exhausted_until = Some(*reset as f64);
+            state.quota_pressure = Some(1.0);
+        }
+    }
+    priced.provenance = priced.provenance.with_account_snapshot(&account_snapshot);
+
     // Operator score targets allow fractions; keep them in the internal demand
     // rather than sending them through the integer-only request validator.
     let operator_demand =

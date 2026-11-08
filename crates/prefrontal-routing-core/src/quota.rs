@@ -950,6 +950,71 @@ mod tests {
     }
 
     #[test]
+    fn codex_weekly_primary_is_joined_and_one_nonexhausted_account_prevents_a_raw_wall() {
+        let facts = vec![fact("openai", "gpt-6-luna", 50.0)];
+        let now = ms("2026-11-08T19:30:00Z");
+        let entries: Vec<_> = [
+            ("a", 100.0, "2026-11-11T06:38:29Z"),
+            ("b", 100.0, "2026-11-13T11:40:07Z"),
+            ("c", 98.0, "2026-11-13T15:50:27Z"),
+        ]
+        .into_iter()
+        .map(|(account, used, reset)| {
+            usage(serde_json::json!({
+                "provider":"codex", "apiProvider":"openai", "account":account,
+                "source":"vault", "fetchedAt":"2026-11-08T19:30:00Z", "spend":[],
+                "savedResets":{"availableCount":2},
+                "usage":{"primary":{"usedPercent":used,"resetsAt":reset,"windowMinutes":10080}}
+            }))
+        })
+        .collect();
+        let mut snapshot = ModelRouteStateSnapshot {
+            now,
+            ..Default::default()
+        };
+        merge_quota_overlay_with(
+            &mut snapshot,
+            &entries,
+            &facts,
+            now,
+            &DEFAULT_PACE_CONFIG,
+            DEFAULT_HARD_BLOCK_THRESHOLD,
+            &model_pools(),
+        );
+        assert_eq!(
+            quota_capacity_keys(&entries[0], &facts),
+            vec!["openai/gpt-6-luna"]
+        );
+        let signal = &snapshot.by_capacity["openai/gpt-6-luna"];
+        assert!(signal.quota_pressure.unwrap() > 0.0);
+        // Raw usage alone cannot wall the 98% account. The consumer's allocator
+        // floors, applied by the module, decide whether it can actually serve.
+        assert_eq!(signal.quota_exhausted_until, None);
+        let mut entries = entries;
+        entries[2]
+            .usage
+            .as_mut()
+            .unwrap()
+            .primary
+            .as_mut()
+            .unwrap()
+            .used_percent = 100.0;
+        merge_quota_overlay_with(
+            &mut snapshot,
+            &entries,
+            &facts,
+            now,
+            &DEFAULT_PACE_CONFIG,
+            DEFAULT_HARD_BLOCK_THRESHOLD,
+            &model_pools(),
+        );
+        assert_eq!(
+            snapshot.by_capacity["openai/gpt-6-luna"].quota_exhausted_until,
+            Some(ms("2026-11-11T06:38:29Z"))
+        );
+    }
+
+    #[test]
     fn account_producer_deferral_preserves_operator_multiplier_and_one_fallback_selection() {
         assert!(!ACCOUNT_PRODUCER);
 
