@@ -425,6 +425,30 @@ fn project_additive_shape_members(value: &mut Value) {
             // Delivery identities are additive persistence, checked by the
             // tests for usage deduplication and crash recovery, not the pre-add snapshot.
             object.remove("routing_v1_report_delivery");
+            // Decision rows record quota signals after account eligibility, so a
+            // model the account allocator found unavailable for that request
+            // appears in the list as exhausted, and
+            // route.explain serves the stored snapshot. The codex availability
+            // tests check those signals; the recordings predate them.
+            if let Some(snapshot) = object
+                .get_mut("quotaSignalSnapshot")
+                .and_then(Value::as_object_mut)
+            {
+                snapshot.remove("signals");
+            }
+            if let Some(rows) = object
+                .get_mut("model_route_decisions")
+                .and_then(Value::as_array_mut)
+            {
+                for row in rows {
+                    if let Some(signal) = row
+                        .get_mut("quota_signal_json")
+                        .and_then(Value::as_object_mut)
+                    {
+                        signal.remove("signals");
+                    }
+                }
+            }
             if let Some(rows) = object
                 .get_mut("routing_v1_decision")
                 .and_then(Value::as_array_mut)

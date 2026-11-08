@@ -519,12 +519,8 @@ impl DecisionProvenance {
         let mut result = self.clone();
         if let Ok(mut signal) = serde_json::from_str::<serde_json::Value>(&result.quota_signal_json)
         {
-            // A summary recorded with no usable readings carries no signal list;
-            // adding an empty one would change how that decision reads.
-            if signal.get("signals").is_some() {
-                signal["signals"] = json!(quota_signals(snapshot));
-                result.quota_signal_json = signal.to_string();
-            }
+            signal["signals"] = json!(quota_signals(snapshot));
+            result.quota_signal_json = signal.to_string();
         }
         result
     }
