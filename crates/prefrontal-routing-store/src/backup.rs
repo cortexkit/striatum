@@ -74,6 +74,16 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
          summary is retained, so losing it resets those speeds to cold-start values",
     ),
     (
+        "routing_engine_eval",
+        "reference-set evaluations are the only retained engine accuracy evidence; empty, \
+         every engine ranks as unmeasured until its declaring provider evaluates it again",
+    ),
+    (
+        "routing_engine_speed",
+        "bounded job timing windows supply measured realtime eligibility; empty, routing \
+         falls back to declarations and may select an engine already measured too slow",
+    ),
+    (
         "routing_unscored_admissible_models",
         "routing-owned first-admission timestamp history; restoring it empty would make \
          previously observed ungraded models appear newly discovered",

@@ -410,7 +410,13 @@ fn project_additive_shape_members(value: &mut Value) {
                 .and_then(Value::as_array_mut)
             {
                 for row in rows {
-                    row.as_object_mut().unwrap().remove("selection_json");
+                    let row = row.as_object_mut().unwrap();
+                    row.remove("selection_json");
+                    // Older recordings predate engine report deduplication.
+                    // Omit only its neutral default, not a recorded report effect.
+                    if row.get("engine_reported") == Some(&json!(0)) {
+                        row.remove("engine_reported");
+                    }
                 }
             }
             if object.get("method").and_then(Value::as_str) == Some("role.describe") {
@@ -437,6 +443,8 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "select_panel",
                                 "consumer_models",
                                 "select_engine",
+                                "engine_reports",
+                                "engine_evals",
                             ][..],
                         ),
                         (
@@ -449,6 +457,8 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "route.select_panel",
                                 "route.consumer_models",
                                 "route.select_engine",
+                                "route.engine_report",
+                                "route.engine_eval",
                             ][..],
                         ),
                         // Classifier selection (routing 0.7.4) reads these.
@@ -474,10 +484,79 @@ fn project_additive_shape_members(value: &mut Value) {
                     result.remove("reset_at_ms");
                 }
             }
+            if object.get("method").and_then(Value::as_str) == Some("route.model_facts") {
+                if let Some(result) = object
+                    .get_mut("reply")
+                    .and_then(|reply| reply.get_mut("result"))
+                    .and_then(Value::as_object_mut)
+                {
+                    if result.get("engine_speed_samples") == Some(&json!([]))
+                        && result.get("engine_speed_sample_limit") == Some(&json!(20))
+                    {
+                        result.remove("engine_speed_samples");
+                        result.remove("engine_speed_sample_limit");
+                    }
+                }
+            }
             object.values_mut().for_each(project_additive_shape_members);
         }
         _ => {}
     }
+}
+
+#[test]
+fn additive_engine_projection_preserves_report_effects_and_existing_describe_members() {
+    let mut observed = json!({
+        "routing_v1_decision":[
+            {"decision_id":"old", "engine_reported":0},
+            {"decision_id":"reported", "engine_reported":1}
+        ],
+        "describe":{"method":"role.describe", "reply":{"result":{
+            "capabilities":["select", "engine_reports", "engine_evals"],
+            "ops":["role.describe", "route.engine_report", "route.engine_eval"],
+            "requirement_fields":[]
+        }}},
+        "unrelated":{"engine_reported":0}
+    });
+    project_additive_shape_members(&mut observed);
+    assert_eq!(
+        observed,
+        json!({
+            "routing_v1_decision":[
+                {"decision_id":"old"},
+                {"decision_id":"reported", "engine_reported":1}
+            ],
+            "describe":{"method":"role.describe", "reply":{"result":{
+                "capabilities":["select"], "ops":["role.describe"], "requirement_fields":[]
+            }}},
+            "unrelated":{"engine_reported":0}
+        })
+    );
+}
+
+#[test]
+fn additive_engine_inspection_projection_keeps_nonempty_or_changed_windows() {
+    let mut empty = json!({"method":"route.model_facts", "reply":{"result":{
+        "facts":[{"model_id":"kept"}],
+        "engine_speed_samples":[], "engine_speed_sample_limit":20
+    }}});
+    let mut changed_bound = empty.clone();
+    changed_bound["reply"]["result"]["engine_speed_sample_limit"] = json!(21);
+    let expected_changed_bound = changed_bound.clone();
+    let mut measured = empty.clone();
+    measured["reply"]["result"]["engine_speed_samples"] = json!([{"wall_ms":250}]);
+    let expected_measured = measured.clone();
+    for response in [&mut empty, &mut changed_bound, &mut measured] {
+        project_additive_shape_members(response);
+    }
+    assert_eq!(
+        empty,
+        json!({"method":"route.model_facts", "reply":{"result":{
+            "facts":[{"model_id":"kept"}]
+        }}})
+    );
+    assert_eq!(changed_bound, expected_changed_bound);
+    assert_eq!(measured, expected_measured);
 }
 
 fn first_difference(path: &str, actual: &Value, expected: &Value) -> String {
