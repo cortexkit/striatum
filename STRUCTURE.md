@@ -1,33 +1,33 @@
-# Structure (draft)
+# Structure
+
+A Rust workspace of three crates. This file is a map: search the code for a specific symbol.
 
 ```text
 crates/
-  prefrontal-routing-core/     pure model/account policy and domain types
-  prefrontal-routing-store/    SQLite persistence and numbered migrations
+  prefrontal-routing-core/     selection policy and domain types (no SQL, no wire)
+  prefrontal-routing-store/    SQLite store and numbered migrations
   prefrontal-routing-module/   ck-prefrontal-routing binary and wire handlers
 docs/specs/model-routing.md    routing policy specification
-test-vectors/route-*/          routing-produced account/catalog/head samples
-scripts/                      source checks and rust-test-gate.sh
-script/                       macOS deployment and signing gates
-.cargo/                       SQLite build setting and macOS test runner
-.config/nextest.toml           test timeouts and daemon concurrency limits
+test-vectors/route-*/          reply samples routing publishes for its consumers
+scripts/                       source checks and rust-test-gate.sh
+script/                        deploy and signing scripts
+.cargo/                        SQLite build flag and the macOS test-binary signer
+.config/nextest.toml           test timeouts and real-daemon test limits
 ```
 
-Start at `crates/prefrontal-routing-module/src/main.rs` for registration,
-configuration and serving. The crate manifests retain edition 2021, and the
-root manifest supplies their shared dependencies and build profiles.
+## Entry point
 
-Integration suites are folded into `tests/it/main.rs`; the model-router suite
-keeps its own process because it changes process-global state. Test scratch
-and daemon staging use the published `cortexkit-test-support` helpers. The
-source gates reject unreviewed standalone suites, unreachable production
-modules, raw scratch constructors and unsafe process-helper bypasses.
+`crates/prefrontal-routing-module/src/main.rs` registers the operations, loads settings and starts serving. It is very large; search it.
 
-`crates/prefrontal-routing-module/fixtures/IMPORTED.md` records the provenance of
-frozen consumer fixtures copied from the former workspace. Tests never need
-to read another prefrontal crate. Real-daemon integration tests are ignored by
-default and retain sibling-checkout resolution for subconscious and Insula;
-the standard standalone gate does not build those siblings.
+## Where to add new code
 
-[TODO(user): Review the navigation and testing conventions before treating
-these draft pages as contributor guidance.]
+- **Wire operation:** a handler in `prefrontal-routing-module` and its entry in the module manifest in `main.rs`.
+- **Policy change:** `prefrontal-routing-core`, with a test beside it.
+- **Migration:** the next free number in `crates/prefrontal-routing-store/migrations`, rehearsed on a copy of the live store before deploy.
+- **Integration test:** a file in the crate's shared `tests/it` binary with a `mod` line in its `main.rs`. The model-router suite keeps its own process because it changes process-wide state. `scripts/test-binary-fold.py` refuses other standalone test binaries.
+
+## Conventions
+
+- Tests take scratch paths from `cortexkit-test-support` and never touch live stores or `$HOME`.
+- Fixtures copied from other repositories record their source in `crates/prefrontal-routing-module/fixtures/IMPORTED.md`.
+- Real-daemon tests are ignored by default; they build sibling checkouts by relative path.
