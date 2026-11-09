@@ -6,8 +6,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 fn cases(kind: &str) -> Vec<Value> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../prefrontal-core-module/fixtures/routing-wire/states.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/routing-wire/states.json");
     let corpus: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let cases: Vec<_> = corpus["cases"]
         .as_array()

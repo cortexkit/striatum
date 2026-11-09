@@ -6819,7 +6819,7 @@ mod tests {
     }
 
     fn select_panel_wire_vectors() -> serde_json::Value {
-        serde_json::from_str(include_str!("../../../test-vectors/select-panel-wire.json"))
+        serde_json::from_str(include_str!("../fixtures/contracts/select-panel-wire.json"))
             .expect("select_panel wire vectors")
     }
 

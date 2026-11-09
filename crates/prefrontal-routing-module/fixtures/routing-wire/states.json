@@ -1,0 +1,5571 @@
+{
+  "base_commit": "5db47a66f03081be932da6c4eb0e289f0cd45c93",
+  "cases": [
+    {
+      "expected": "Failure { consecutive_failures: 3, cooldown_until: Some(601000), reason: Some(\"consecutive terminal send failures: 3; last error: confirmed_terminal_no_output\") }",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-provider",
+              "lastError": "confirmed_terminal_no_output",
+              "outcome": "error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "provider_backoff"
+    },
+    {
+      "expected": "Failure { consecutive_failures: 3, cooldown_until: Some(601000), reason: Some(\"consecutive terminal send failures: 3; last error: send_failed\") }",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-provider",
+              "lastError": "send_failed",
+              "outcome": "session_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "provider_backoff"
+    },
+    {
+      "expected": "None",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 0.0,
+          "cachedReadTokens": 0.0,
+          "completedMs": 5000.0,
+          "createdMs": 5001.0,
+          "inputTokens": 100.0,
+          "messageID": "broca-run:sample",
+          "modelID": "fake",
+          "outputTokens": 20.0,
+          "providerID": "fake",
+          "reasoningTokens": 10.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::broca_generation_routing_usage_does_not_turn_partial_timing_into_speed"
+      },
+      "kind": "model_speed_observation"
+    },
+    {
+      "expected": "None",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 0.0,
+          "cachedReadTokens": 0.0,
+          "completedMs": 5000.0,
+          "createdMs": 5001.0,
+          "inputTokens": 100.0,
+          "messageID": "broca-run:sample",
+          "modelID": "fake",
+          "outputTokens": 40.0,
+          "providerID": "fake",
+          "reasoningTokens": 20.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::broca_generation_routing_usage_does_not_turn_partial_timing_into_speed"
+      },
+      "kind": "model_speed_observation"
+    },
+    {
+      "expected": "None",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 5000.0,
+          "createdMs": 5001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:run-7",
+          "modelID": "claude-opus-5",
+          "outputTokens": 20.0,
+          "providerID": "anthropic",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "max",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::a_run_usage_names_the_tasks_model_agent_and_run"
+      },
+      "kind": "model_speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"live:gen:0\", route_key: \"openai/gpt-6.1-sol/xhigh\", provider_id: \"openai\", model_id: \"gpt-6.1-sol\", variant: Some(\"xhigh\"), service_tier: Some(\"standard\"), speed: None, output_tokens: 16835.0, reasoning_tokens: Some(11131.0), duration_ms: 580853.0, observed_at: 1000000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1000000.0,
+          "createdMs": 419147.0,
+          "inputTokens": null,
+          "messageID": "live:gen:0",
+          "modelID": "gpt-6.1-sol",
+          "outputTokens": 5704.0,
+          "providerID": "openai",
+          "reasoningTokens": 11131.0,
+          "service_tier": "standard",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": "xhigh",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::broca_generation_live_openai_entry_without_applied_tier_is_standard"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-NO6olEGs2ctY5zdWHNtEQ6:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 1.0, observed_at: 1000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1000.0,
+          "createdMs": 999.0,
+          "inputTokens": null,
+          "messageID": "run-sid-NO6olEGs2ctY5zdWHNtEQ6:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::broca_service_tier_tests::broca_service_tier_usage_routing_and_generation_samples"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-NO6olEGs2ctY5zdWHNtEQ6:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 1.0, observed_at: 1794155951274.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1794155951274.0,
+          "createdMs": 1794155951273.0,
+          "inputTokens": null,
+          "messageID": "run-sid-NO6olEGs2ctY5zdWHNtEQ6:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "manager_runtime::sidekick_lanes_runtime::turn_tests::finished_sidekick_run_reports_generation_duration_and_requested_tier"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-NO6olEGs2ctY5zdWHNtEQ6:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 1.0, observed_at: 1794155951527.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1794155951527.0,
+          "createdMs": 1794155951526.0,
+          "inputTokens": null,
+          "messageID": "run-sid-NO6olEGs2ctY5zdWHNtEQ6:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "manager_runtime::sidekick_lanes_runtime::turn_tests::finished_sidekick_run_reports_generation_duration_and_requested_tier"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-YpQKkZsTCcuTLGpyevvQw3:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 1.0, observed_at: 1000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1000.0,
+          "createdMs": 999.0,
+          "inputTokens": null,
+          "messageID": "run-sid-YpQKkZsTCcuTLGpyevvQw3:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::broca_service_tier_tests::broca_service_tier_usage_routing_and_generation_samples"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-YpQKkZsTCcuTLGpyevvQw3:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 1.0, observed_at: 1794155951360.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1794155951360.0,
+          "createdMs": 1794155951359.0,
+          "inputTokens": null,
+          "messageID": "run-sid-YpQKkZsTCcuTLGpyevvQw3:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "manager_runtime::sidekick_lanes_runtime::turn_tests::finished_sidekick_run_reports_generation_duration_and_requested_tier"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-YpQKkZsTCcuTLGpyevvQw3:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 1.0, observed_at: 1794155951612.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1794155951612.0,
+          "createdMs": 1794155951611.0,
+          "inputTokens": null,
+          "messageID": "run-sid-YpQKkZsTCcuTLGpyevvQw3:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "manager_runtime::sidekick_lanes_runtime::turn_tests::finished_sidekick_run_reports_generation_duration_and_requested_tier"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-YpQKkZsTCcuTLGpyevvQw3:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"standard\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 1.0, observed_at: 1000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1000.0,
+          "createdMs": 999.0,
+          "inputTokens": null,
+          "messageID": "run-sid-YpQKkZsTCcuTLGpyevvQw3:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "standard",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::broca_service_tier_tests::broca_service_tier_generation_without_tiers_is_standard"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-vMjk1qjsFkAVNdO8EveM2:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 2.0, observed_at: 1000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1000.0,
+          "createdMs": 998.0,
+          "inputTokens": null,
+          "messageID": "run-sid-vMjk1qjsFkAVNdO8EveM2:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::broca_service_tier_tests::broca_service_tier_usage_routing_and_generation_samples"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-vMjk1qjsFkAVNdO8EveM2:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 2.0, observed_at: 1794155951443.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1794155951443.0,
+          "createdMs": 1794155951441.0,
+          "inputTokens": null,
+          "messageID": "run-sid-vMjk1qjsFkAVNdO8EveM2:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "manager_runtime::sidekick_lanes_runtime::turn_tests::finished_sidekick_run_reports_generation_duration_and_requested_tier"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-vMjk1qjsFkAVNdO8EveM2:gen:0\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 2.0, observed_at: 1794155951699.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1794155951699.0,
+          "createdMs": 1794155951697.0,
+          "inputTokens": null,
+          "messageID": "run-sid-vMjk1qjsFkAVNdO8EveM2:gen:0",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "manager_runtime::sidekick_lanes_runtime::turn_tests::finished_sidekick_run_reports_generation_duration_and_requested_tier"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-vMjk1qjsFkAVNdO8EveM2:gen:1\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 2.0, observed_at: 1000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1000.0,
+          "createdMs": 998.0,
+          "inputTokens": null,
+          "messageID": "run-sid-vMjk1qjsFkAVNdO8EveM2:gen:1",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::broca_service_tier_tests::broca_service_tier_usage_routing_and_generation_samples"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-vMjk1qjsFkAVNdO8EveM2:gen:1\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 2.0, observed_at: 1794155951443.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1794155951443.0,
+          "createdMs": 1794155951441.0,
+          "inputTokens": null,
+          "messageID": "run-sid-vMjk1qjsFkAVNdO8EveM2:gen:1",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "manager_runtime::sidekick_lanes_runtime::turn_tests::finished_sidekick_run_reports_generation_duration_and_requested_tier"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(SpeedSampleObservation { id: \"run-sid-vMjk1qjsFkAVNdO8EveM2:gen:1\", route_key: \"openai/test-ultrafast\", provider_id: \"openai\", model_id: \"test-ultrafast\", variant: None, service_tier: Some(\"fast\"), speed: None, output_tokens: 1.0, reasoning_tokens: None, duration_ms: 2.0, observed_at: 1794155951699.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": null,
+          "cachedReadTokens": null,
+          "completedMs": 1794155951699.0,
+          "createdMs": 1794155951697.0,
+          "inputTokens": null,
+          "messageID": "run-sid-vMjk1qjsFkAVNdO8EveM2:gen:1",
+          "modelID": "test-ultrafast",
+          "outputTokens": 1.0,
+          "providerID": "openai",
+          "reasoningTokens": null,
+          "service_tier": "fast",
+          "speed_sample": true,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "manager_runtime::sidekick_lanes_runtime::turn_tests::finished_sidekick_run_reports_generation_duration_and_requested_tier"
+      },
+      "kind": "speed_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:fallback\", route_key: \"anthropic/claude-opus-4-8\", capacity_key: \"anthropic/claude-opus-4-8\", provider_id: \"anthropic\", input_tokens: Some(6.0), output_tokens: 31411.0, reasoning_tokens: None, cached_read_tokens: Some(40136.0), cache_write_tokens: Some(4.0), duration_ms: -1.0, workload_class: Some(\"ephemeral\"), account_key: None, observed_at: 5000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 4.0,
+          "cachedReadTokens": 40136.0,
+          "completedMs": 5000.0,
+          "createdMs": 5001.0,
+          "inputTokens": 6.0,
+          "messageID": "broca-run:fallback",
+          "modelID": "claude-opus-4-8",
+          "outputTokens": 31411.0,
+          "providerID": "anthropic",
+          "reasoningTokens": null,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::provider_fallback_routing_usage_keeps_unknown_reasoning"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:replay-athena\", route_key: \"openai/gpt-6/high\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: None, account_key: None, observed_at: 1800000000000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "athena",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1800000000000.0,
+          "createdMs": 1800000000001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:replay-athena",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "high",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::replay_core_usage_attribution"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:replay-gather\", route_key: \"openai/gpt-6/high\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: None, account_key: None, observed_at: 1800000000000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "gather",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1800000000000.0,
+          "createdMs": 1800000000001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:replay-gather",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "high",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::replay_core_usage_attribution"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:replay-lab\", route_key: \"openai/gpt-6/high\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: None, account_key: None, observed_at: 1800000000000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "lab",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1800000000000.0,
+          "createdMs": 1800000000001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:replay-lab",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "high",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::replay_core_usage_attribution"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:replay-mason\", route_key: \"openai/gpt-6/high\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: Some(\"ephemeral\"), account_key: None, observed_at: 1800000000000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1800000000000.0,
+          "createdMs": 1800000000001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:replay-mason",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "high",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::replay_core_usage_attribution"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:replay-oneshot\", route_key: \"openai/gpt-6/high\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: None, account_key: None, observed_at: 1800000000000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "oneshot",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1800000000000.0,
+          "createdMs": 1800000000001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:replay-oneshot",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "high",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::replay_core_usage_attribution"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:replay-sidekick-research\", route_key: \"openai/gpt-6/high\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: Some(\"gather\"), account_key: None, observed_at: 1800000000000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "sidekick-research",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1800000000000.0,
+          "createdMs": 1800000000001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:replay-sidekick-research",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "high",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::replay_core_usage_attribution"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:replay-spec\", route_key: \"openai/gpt-6/high\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: None, account_key: None, observed_at: 1800000000000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "spec",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1800000000000.0,
+          "createdMs": 1800000000001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:replay-spec",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "high",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::replay_core_usage_attribution"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:run-7\", route_key: \"anthropic/claude-opus-5/max\", capacity_key: \"anthropic/claude-opus-5\", provider_id: \"anthropic\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: Some(\"ephemeral\"), account_key: None, observed_at: 5000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 5000.0,
+          "createdMs": 5001.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:run-7",
+          "modelID": "claude-opus-5",
+          "outputTokens": 20.0,
+          "providerID": "anthropic",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": "max",
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::a_run_usage_names_the_tasks_model_agent_and_run"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:run\", route_key: \"openai/gpt-6\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: None, account_key: None, observed_at: 1.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "athena",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1.0,
+          "createdMs": 2.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:run",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::workload_classes_follow_routings_agent_mapping"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:run\", route_key: \"openai/gpt-6\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: None, account_key: None, observed_at: 1.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": null,
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1.0,
+          "createdMs": 2.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:run",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::workload_classes_follow_routings_agent_mapping"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:run\", route_key: \"openai/gpt-6\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: Some(\"ephemeral\"), account_key: None, observed_at: 1.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1.0,
+          "createdMs": 2.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:run",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::workload_classes_follow_routings_agent_mapping"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:run\", route_key: \"openai/gpt-6\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: Some(\"gather\"), account_key: None, observed_at: 1.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "sidekick-research",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1.0,
+          "createdMs": 2.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:run",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::workload_classes_follow_routings_agent_mapping"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:run\", route_key: \"openai/gpt-6\", capacity_key: \"openai/gpt-6\", provider_id: \"openai\", input_tokens: Some(300.0), output_tokens: 100.0, reasoning_tokens: Some(80.0), cached_read_tokens: Some(40.0), cache_write_tokens: Some(20.0), duration_ms: -1.0, workload_class: Some(\"hire\"), account_key: None, observed_at: 1.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "hire_ops",
+          "cacheWriteTokens": 20.0,
+          "cachedReadTokens": 40.0,
+          "completedMs": 1.0,
+          "createdMs": 2.0,
+          "inputTokens": 300.0,
+          "messageID": "broca-run:run",
+          "modelID": "gpt-6",
+          "outputTokens": 20.0,
+          "providerID": "openai",
+          "reasoningTokens": 80.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::workload_classes_follow_routings_agent_mapping"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:sample\", route_key: \"fake/fake\", capacity_key: \"fake/fake\", provider_id: \"fake\", input_tokens: Some(100.0), output_tokens: 30.0, reasoning_tokens: Some(10.0), cached_read_tokens: Some(0.0), cache_write_tokens: Some(0.0), duration_ms: -1.0, workload_class: Some(\"ephemeral\"), account_key: None, observed_at: 5000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 0.0,
+          "cachedReadTokens": 0.0,
+          "completedMs": 5000.0,
+          "createdMs": 5001.0,
+          "inputTokens": 100.0,
+          "messageID": "broca-run:sample",
+          "modelID": "fake",
+          "outputTokens": 20.0,
+          "providerID": "fake",
+          "reasoningTokens": 10.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::broca_generation_routing_usage_does_not_turn_partial_timing_into_speed"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Some(UsageObservation { id: \"broca-run:sample\", route_key: \"fake/fake\", capacity_key: \"fake/fake\", provider_id: \"fake\", input_tokens: Some(100.0), output_tokens: 60.0, reasoning_tokens: Some(20.0), cached_read_tokens: Some(0.0), cache_write_tokens: Some(0.0), duration_ms: -1.0, workload_class: Some(\"ephemeral\"), account_key: None, observed_at: 5000.0 })",
+      "input": {
+        "facts": {
+          "accountKey": null,
+          "agent": "mason",
+          "cacheWriteTokens": 0.0,
+          "cachedReadTokens": 0.0,
+          "completedMs": 5000.0,
+          "createdMs": 5001.0,
+          "inputTokens": 100.0,
+          "messageID": "broca-run:sample",
+          "modelID": "fake",
+          "outputTokens": 40.0,
+          "providerID": "fake",
+          "reasoningTokens": 20.0,
+          "toolElapsedMs": null,
+          "variant": null,
+          "workloadClass": null
+        },
+        "test": "llm_runner_consumer::routing_usage::tests::broca_generation_routing_usage_does_not_turn_partial_timing_into_speed"
+      },
+      "kind": "usage_observation"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "aggregator_assessment_reask",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "aggregator_chair_supply_correction_invalid",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "aggregator_chair_supply_reask",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "aggregator_emission_postcondition",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "aggregator_reply_invalid",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "aggregator_reply_schema",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "aggregator_reply_unparseable",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "campaign_plan_schema_rejected",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "classifier_output_invalid",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "discussion_repost",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "fold_over_budget",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "future_phase_contract",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "gather_output_invalid",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "member_reply_invalid",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "member_reply_schema",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "member_reply_unparseable",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "member_verdict_invalid_shape",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "member_verdict_not_normalizable",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "merge_output_unparseable",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "owner_replacement_protected",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "proposal_schema_rejected",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "replace_section_format",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "ruling_application_refused",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "ruling_fold_guard",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "ruling_move_guard",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "ruling_unrevised_sections",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "structured_output_validation_failed",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "synthesizer_output_invalid",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-contract",
+              "lastError": "synthesizer_output_unparseable",
+              "outcome": "contract_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "contract_backoff"
+    },
+    {
+      "expected": "Unchanged",
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-request-invalid",
+              "lastError": "Broca run run-sid-paused: provider error: class permanent; provider code request_invalid; provider subcode invalid_json_schema; HTTP 400; Broca said: 400: {\"error\":{\"message\":\"Invalid schema for response_format 'result': In context=(), 'required' is required to be supplied and to be an array including every key in properties. Missing 'reason'.\",\"type\":\"invalid_request_error\",\"param\":\"text.format.schema\",\"code\":\"invalid_json_schema\"}}",
+              "outcome": "session_error",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "request_invalid_backoff"
+    },
+    {
+      "expected": false,
+      "input": {
+        "requests": [
+          {
+            "method": "route.set_decision_outcome",
+            "params": {
+              "decisionID": "fixture-account-limit",
+              "lastError": "429: account limit",
+              "outcome": "interrupted",
+              "providerOutcome": null,
+              "retryAfterSecs": null
+            }
+          }
+        ]
+      },
+      "kind": "account_limit_backoff"
+    },
+    {
+      "expected": {
+        "affinity": [
+          [
+            "reserved:core",
+            "mason",
+            "live-affinity",
+            "D",
+            null
+          ]
+        ],
+        "credential_fence": [],
+        "pool_fence": [],
+        "route": [
+          [
+            "alibaba-token-plan/qwen3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-plus",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max-preview",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-fable-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-8",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-sonnet-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-opus-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-sonnet-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.1-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.5-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.7-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "kimi-for-coding/k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash:0731",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.2",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.7-code",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/mistral-large-3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/qwen3.5:397b",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4-mini",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "p/m",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-build-0.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ]
+        ],
+        "route_fence": []
+      },
+      "input": {
+        "body": {
+          "decision_id": "D",
+          "outcome": "cancelled"
+        },
+        "outcome": "cancelled"
+      },
+      "kind": "report_outcome"
+    },
+    {
+      "expected": {
+        "affinity": [
+          [
+            "reserved:core",
+            "mason",
+            "live-affinity",
+            "D",
+            null
+          ]
+        ],
+        "credential_fence": [],
+        "pool_fence": [],
+        "route": [
+          [
+            "alibaba-token-plan/qwen3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-plus",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max-preview",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-fable-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-8",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-sonnet-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-opus-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-sonnet-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.1-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.5-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.7-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "kimi-for-coding/k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash:0731",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.2",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.7-code",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/mistral-large-3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/qwen3.5:397b",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4-mini",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "p/m",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-build-0.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ]
+        ],
+        "route_fence": []
+      },
+      "input": {
+        "body": {
+          "decision_id": "D",
+          "outcome": "completed"
+        },
+        "outcome": "completed"
+      },
+      "kind": "report_outcome"
+    },
+    {
+      "expected": {
+        "affinity": [
+          [
+            "reserved:core",
+            "mason",
+            "live-affinity",
+            "D",
+            null
+          ]
+        ],
+        "credential_fence": [],
+        "pool_fence": [],
+        "route": [
+          [
+            "alibaba-token-plan/qwen3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-plus",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max-preview",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-fable-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-8",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-sonnet-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-opus-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-sonnet-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.1-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.5-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.7-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "kimi-for-coding/k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash:0731",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.2",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.7-code",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/mistral-large-3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/qwen3.5:397b",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4-mini",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "p/m",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-build-0.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ]
+        ],
+        "route_fence": []
+      },
+      "input": {
+        "body": {
+          "decision_id": "D",
+          "outcome": "contract_error"
+        },
+        "outcome": "contract_error"
+      },
+      "kind": "report_outcome"
+    },
+    {
+      "expected": {
+        "affinity": [
+          [
+            "reserved:core",
+            "mason",
+            "live-affinity",
+            "D",
+            null
+          ]
+        ],
+        "credential_fence": [],
+        "pool_fence": [],
+        "route": [
+          [
+            "alibaba-token-plan/qwen3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-plus",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max-preview",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-fable-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-8",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-sonnet-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-opus-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-sonnet-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.1-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.5-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.7-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "kimi-for-coding/k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash:0731",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.2",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.7-code",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/mistral-large-3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/qwen3.5:397b",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4-mini",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "p/m",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-build-0.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ]
+        ],
+        "route_fence": []
+      },
+      "input": {
+        "body": {
+          "decision_id": "D",
+          "outcome": "interrupted"
+        },
+        "outcome": "error"
+      },
+      "kind": "report_outcome"
+    },
+    {
+      "expected": {
+        "affinity": [
+          [
+            "reserved:core",
+            "mason",
+            "live-affinity",
+            "D",
+            null
+          ]
+        ],
+        "credential_fence": [],
+        "pool_fence": [],
+        "route": [
+          [
+            "alibaba-token-plan/qwen3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-plus",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max-preview",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-fable-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-8",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-sonnet-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-opus-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-sonnet-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.1-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.5-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.7-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "kimi-for-coding/k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash:0731",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.2",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.7-code",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/mistral-large-3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/qwen3.5:397b",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4-mini",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "p/m",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-build-0.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ]
+        ],
+        "route_fence": []
+      },
+      "input": {
+        "body": {
+          "decision_id": "D",
+          "outcome": "interrupted"
+        },
+        "outcome": "interrupted"
+      },
+      "kind": "report_outcome"
+    },
+    {
+      "expected": {
+        "affinity": [
+          [
+            "reserved:core",
+            "mason",
+            "live-affinity",
+            "D",
+            null
+          ]
+        ],
+        "credential_fence": [],
+        "pool_fence": [],
+        "route": [
+          [
+            "alibaba-token-plan/qwen3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-plus",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max-preview",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-fable-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-8",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-sonnet-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-opus-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-sonnet-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.1-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.5-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.7-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "kimi-for-coding/k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash:0731",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.2",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.7-code",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/mistral-large-3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/qwen3.5:397b",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4-mini",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "p/m",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-build-0.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ]
+        ],
+        "route_fence": []
+      },
+      "input": {
+        "body": {
+          "decision_id": "D",
+          "outcome": "interrupted"
+        },
+        "outcome": "quota_exhausted"
+      },
+      "kind": "report_outcome"
+    },
+    {
+      "expected": {
+        "affinity": [
+          [
+            "reserved:core",
+            "mason",
+            "live-affinity",
+            "D",
+            null
+          ]
+        ],
+        "credential_fence": [],
+        "pool_fence": [],
+        "route": [
+          [
+            "alibaba-token-plan/qwen3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-plus",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max-preview",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-fable-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-8",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-sonnet-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-opus-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-sonnet-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.1-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.5-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.7-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "kimi-for-coding/k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash:0731",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.2",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.7-code",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/mistral-large-3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/qwen3.5:397b",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4-mini",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "p/m",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-build-0.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ]
+        ],
+        "route_fence": []
+      },
+      "input": {
+        "body": {
+          "decision_id": "D",
+          "outcome": "launch_failed"
+        },
+        "outcome": "launch_failed"
+      },
+      "kind": "report_outcome"
+    },
+    {
+      "expected": {
+        "affinity": [
+          [
+            "reserved:core",
+            "mason",
+            "live-affinity",
+            "D",
+            null
+          ]
+        ],
+        "credential_fence": [],
+        "pool_fence": [],
+        "route": [
+          [
+            "alibaba-token-plan/qwen3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.7-plus",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "alibaba-token-plan/qwen3.8-max-preview",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-fable-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-4-8",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-opus-5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "anthropic/claude-sonnet-4-6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-opus-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-claude-sonnet-4-6-thinking",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.1-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.5-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.6-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "google/antigravity-gemini-3.7-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "kimi-for-coding/k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-flash:0731",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/deepseek-v4-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/glm-5.2",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k2.7-code",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/kimi-k3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m2.7",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/minimax-m3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/mistral-large-3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "ollama-cloud/qwen3.5:397b",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.4-mini",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-luna-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-sol-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "openai/gpt-5.6-terra-pro",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "p/m",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.3",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.5",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-4.6",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ],
+          [
+            "xai/grok-build-0.1",
+            null,
+            null,
+            0,
+            0,
+            0,
+            null,
+            null
+          ]
+        ],
+        "route_fence": []
+      },
+      "input": {
+        "body": {
+          "decision_id": "D",
+          "outcome": "session_error"
+        },
+        "outcome": "session_error"
+      },
+      "kind": "report_outcome"
+    },
+    {
+      "expected": {
+        "after": "anthropic/claude-opus-4-8",
+        "before": "xai/grok-4.7"
+      },
+      "input": {
+        "model": "grok-4.7",
+        "provider": "xai",
+        "requests": [
+          {
+            "method": "route.record_cooldown",
+            "params": {
+              "capacityKey": "xai/grok-4.7",
+              "cooldownUntil": 1794177198015.0,
+              "credentialId": null,
+              "incrementFailure": true,
+              "incrementQuotaError": true,
+              "lastError": "billing wall: xai is out of credit (Broca error class permanent; provider code billing_exhausted; HTTP 403; the provider said: 403: {\"code\":\"personal-team-blocked:spending-limit\",\"error\":\"You have run out of credits or need a Grok subscription...\"})",
+              "providerWide": true,
+              "quotaExhaustedUntil": 1794177198015.0,
+              "routeKey": "xai/grok-4.7",
+              "wallClass": "billing"
+            }
+          }
+        ]
+      },
+      "kind": "billing_wall"
+    },
+    {
+      "expected": {
+        "after": "openai/gpt-6.1-sol",
+        "before": "openai/gpt-6.1-sol"
+      },
+      "input": {
+        "model": "gpt-6.1-sol",
+        "provider": "openai",
+        "requests": []
+      },
+      "kind": "named_billing_wall"
+    },
+    {
+      "expected": {
+        "after": "xai/grok-4.7",
+        "before": "xai/grok-4.7"
+      },
+      "input": {
+        "model": "grok-4.7",
+        "provider": "xai",
+        "requests": []
+      },
+      "kind": "named_billing_wall"
+    },
+    {
+      "expected": {
+        "class_vector": true,
+        "rows": []
+      },
+      "input": {
+        "requests": []
+      },
+      "kind": "no_usage_mason"
+    },
+    {
+      "expected": {
+        "recorded": false,
+        "rows": [],
+        "usage_recorded": false
+      },
+      "input": {
+        "accountKey": null,
+        "agent": null,
+        "cacheWriteTokens": null,
+        "cachedReadTokens": null,
+        "completedMs": 1794155593216.0,
+        "createdMs": 1794155593016.0,
+        "inputTokens": null,
+        "messageID": "run-1:gen:1",
+        "modelID": "second",
+        "outputTokens": 40.0,
+        "providerID": "other",
+        "reasoningTokens": 20.0,
+        "service_tier": "fast",
+        "speed": "standard",
+        "speed_sample": true,
+        "toolElapsedMs": null,
+        "variant": null,
+        "workloadClass": null
+      },
+      "kind": "speed_usage"
+    },
+    {
+      "expected": {
+        "recorded": false,
+        "rows": [],
+        "usage_recorded": false
+      },
+      "input": {
+        "accountKey": null,
+        "agent": null,
+        "cacheWriteTokens": null,
+        "cachedReadTokens": null,
+        "completedMs": 1794155593216.0,
+        "createdMs": 1794155593116.0,
+        "inputTokens": null,
+        "messageID": "run-1:gen:0",
+        "modelID": "fake",
+        "outputTokens": 20.0,
+        "providerID": "fake",
+        "reasoningTokens": 10.0,
+        "service_tier": "fast",
+        "speed": "fast",
+        "speed_sample": true,
+        "toolElapsedMs": null,
+        "variant": null,
+        "workloadClass": null
+      },
+      "kind": "speed_usage"
+    },
+    {
+      "expected": {
+        "recorded": false,
+        "rows": [],
+        "usage_recorded": false
+      },
+      "input": {
+        "accountKey": null,
+        "agent": null,
+        "cacheWriteTokens": null,
+        "cachedReadTokens": null,
+        "completedMs": 1794155593229.0,
+        "createdMs": 1794155593029.0,
+        "inputTokens": null,
+        "messageID": "run-1:gen:1",
+        "modelID": "second",
+        "outputTokens": 40.0,
+        "providerID": "other",
+        "reasoningTokens": 20.0,
+        "service_tier": "fast",
+        "speed": "standard",
+        "speed_sample": true,
+        "toolElapsedMs": null,
+        "variant": null,
+        "workloadClass": null
+      },
+      "kind": "speed_usage"
+    },
+    {
+      "expected": {
+        "recorded": false,
+        "rows": [],
+        "usage_recorded": false
+      },
+      "input": {
+        "accountKey": null,
+        "agent": null,
+        "cacheWriteTokens": null,
+        "cachedReadTokens": null,
+        "completedMs": 1794155593229.0,
+        "createdMs": 1794155593129.0,
+        "inputTokens": null,
+        "messageID": "run-1:gen:0",
+        "modelID": "fake",
+        "outputTokens": 20.0,
+        "providerID": "fake",
+        "reasoningTokens": 10.0,
+        "service_tier": "fast",
+        "speed": "fast",
+        "speed_sample": true,
+        "toolElapsedMs": null,
+        "variant": null,
+        "workloadClass": null
+      },
+      "kind": "speed_usage"
+    },
+    {
+      "expected": {
+        "rows": []
+      },
+      "input": {
+        "requests": []
+      },
+      "kind": "no_usage_redelivery"
+    }
+  ],
+  "provenance": "Recorded from the base's routing-backed core tests; see s11-baseline-capture.patch in delivery evidence."
+}

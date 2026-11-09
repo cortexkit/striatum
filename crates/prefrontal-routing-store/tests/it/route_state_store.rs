@@ -754,7 +754,7 @@ fn ten_request_invalid_outcomes_leave_the_route_admissible_and_audited() {
         .update_route_state(ROUTE, ROUTE, &RouteStateUpdate::default())
         .unwrap();
     let wire: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../../../test-vectors/broca-request-invalid-v1/run_status.request_invalid_openai.json"
+        "../fixtures/run_status.request_invalid_openai.json"
     ))
     .unwrap();
     let error = &wire["error"];

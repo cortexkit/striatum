@@ -145,7 +145,7 @@ async fn respond(stream: &mut tokio::net::TcpStream, request: &Frame, ty: FrameT
 
 fn live_describe() -> Value {
     let reply: Value = serde_json::from_slice(include_bytes!(
-        "../../../../../test-vectors/broca-service-tiers-v1/role-describe-live.json"
+        "../../../fixtures/contracts/broca-service-tiers-v1/role-describe-live.json"
     ))
     .unwrap();
     reply["result"].clone()

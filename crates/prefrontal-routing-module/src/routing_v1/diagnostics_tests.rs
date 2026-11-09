@@ -14,7 +14,7 @@ const OP: &str = crate::diagnostics_findings::OP;
 
 fn assert_vector(name: &str, value: &Value) {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../test-vectors/diagnostics-findings-v1")
+        .join("fixtures/contracts/diagnostics-findings-v1")
         .join(name);
     let mut bytes = serde_json::to_vec_pretty(value).unwrap();
     bytes.push(b'\n');

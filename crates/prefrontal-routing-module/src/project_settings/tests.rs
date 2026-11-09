@@ -74,7 +74,7 @@ pub(crate) fn write(root: &Path, body: &str) {
 
 pub(crate) fn census(projects: &[PathBuf], workspace: Option<&Path>) -> Value {
     let vectors: Value = serde_json::from_str(include_str!(
-        "../../../../test-vectors/project-resolve-v1/enumerate.json"
+        "../../fixtures/contracts/project-resolve-v1/enumerate.json"
     ))
     .unwrap();
     let mut reply = vectors[0]["reply"].clone();
@@ -226,7 +226,7 @@ async fn unbound_or_unapproved_roots_never_supply_settings() {
 #[tokio::test]
 async fn served_resolve_project_id_vectors_cover_current_alias_and_gone() {
     let vectors: Value = serde_json::from_str(include_str!(
-        "../../../../test-vectors/project-resolve-v1/resolve-project-id.json"
+        "../../fixtures/contracts/project-resolve-v1/resolve-project-id.json"
     ))
     .unwrap();
     for case in vectors.as_array().unwrap() {
@@ -254,7 +254,7 @@ async fn served_resolve_project_id_vectors_cover_current_alias_and_gone() {
         assert_eq!(source.count("resolve_project_id"), 1);
     }
     let enumerate: Value = serde_json::from_str(include_str!(
-        "../../../../test-vectors/project-resolve-v1/enumerate.json"
+        "../../fixtures/contracts/project-resolve-v1/enumerate.json"
     ))
     .unwrap();
     assert_eq!(

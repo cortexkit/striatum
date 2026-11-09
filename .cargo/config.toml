@@ -1,0 +1,11 @@
+# Sign macOS test executables before launch, including nextest's test discovery.
+[target.aarch64-apple-darwin]
+runner = ".cargo/sign-test-binary.sh"
+
+[target.x86_64-apple-darwin]
+runner = ".cargo/sign-test-binary.sh"
+
+# SQLite's optional memory statistics serialize allocations through a global
+# mutex. Routing does not read those statistics or use SQLite heap limits.
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"

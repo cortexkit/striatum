@@ -1,0 +1,431 @@
+{
+  "anthropic/claude-opus-4-5": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 200000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 25000000000
+    }
+  },
+  "anthropic/claude-opus-4-6": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 25000000000
+    }
+  },
+  "anthropic/claude-opus-4-7": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 25000000000
+    }
+  },
+  "anthropic/claude-opus-4-8": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 25000000000
+    }
+  },
+  "anthropic/claude-sonnet-4-6": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 15000000000
+    }
+  },
+  "google/antigravity-claude-opus-4-6-thinking": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 25000000000
+    }
+  },
+  "google/antigravity-claude-sonnet-4-6-thinking": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 15000000000
+    }
+  },
+  "google/antigravity-gemini-3.1-pro": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1048576,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 12000000000
+    }
+  },
+  "google/antigravity-gemini-3.5-flash": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1048576,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 9000000000
+    }
+  },
+  "openai/gpt-5.4": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1050000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 15000000000
+    }
+  },
+  "openai/gpt-5.4-mini": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 400000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 4500000000
+    }
+  },
+  "openai/gpt-5.5": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1050000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 30000000000
+    }
+  },
+  "openai/gpt-5.6-luna": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1050000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 6000000000
+    }
+  },
+  "openai/gpt-5.6-luna-pro": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1050000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 6000000000
+    }
+  },
+  "openai/gpt-5.6-sol": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1050000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 30000000000
+    }
+  },
+  "openai/gpt-5.6-sol-pro": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1050000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 30000000000
+    }
+  },
+  "openai/gpt-5.6-terra": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1050000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 15000000000
+    }
+  },
+  "openai/gpt-5.6-terra-pro": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1050000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 15000000000
+    }
+  },
+  "opencode-go/deepseek-v4-flash": {
+    "capability.attachment": null,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 280000000
+    }
+  },
+  "opencode-go/deepseek-v4-pro": {
+    "capability.attachment": null,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 3480000000
+    }
+  },
+  "opencode-go/glm-5": {
+    "capability.attachment": null,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 202752,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 3200000000
+    }
+  },
+  "opencode-go/glm-5.1": {
+    "capability.attachment": null,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 202752,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 4400000000
+    }
+  },
+  "opencode-go/glm-5.2": {
+    "capability.attachment": null,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 4400000000
+    }
+  },
+  "opencode-go/kimi-k2.5": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 262144,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 3000000000
+    }
+  },
+  "opencode-go/kimi-k2.6": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 262144,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 4000000000
+    }
+  },
+  "opencode-go/minimax-m2.5": {
+    "capability.attachment": null,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 204800,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 1200000000
+    }
+  },
+  "opencode-go/minimax-m2.7": {
+    "capability.attachment": null,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 204800,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 1200000000
+    }
+  },
+  "opencode-go/minimax-m3": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 512000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 400000000
+    }
+  },
+  "opencode-go/qwen3.6-plus": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 3000000000
+    }
+  },
+  "opencode-go/qwen3.7-max": {
+    "capability.attachment": null,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 7500000000
+    }
+  },
+  "opencode-go/qwen3.7-plus": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 1600000000
+    }
+  },
+  "xai/grok-4.3": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 1000000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 2500000000
+    }
+  },
+  "xai/grok-build-0.1": {
+    "capability.attachment": true,
+    "capability.tool_call": true,
+    "existence": "present",
+    "limit.context": 256000,
+    "limit.output": null,
+    "rate.output": {
+      "currency": "USD",
+      "exponent": 9,
+      "state": "priced",
+      "units": 2000000000
+    }
+  }
+}

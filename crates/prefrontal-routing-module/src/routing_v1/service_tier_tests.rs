@@ -249,7 +249,7 @@ async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
     )
     .unwrap();
     let describe: Value = serde_json::from_slice(include_bytes!(
-        "../../../../test-vectors/broca-service-tiers-v1/role-describe-live.json"
+        "../../fixtures/contracts/broca-service-tiers-v1/role-describe-live.json"
     ))
     .unwrap();
     let mut cache = runners::DescribeCache::default();
@@ -305,7 +305,7 @@ async fn bound_fast_resume_survives_a_restart_catalog_gap_until_describe_expires
     )
     .unwrap();
     let describe: Value = serde_json::from_slice(include_bytes!(
-        "../../../../test-vectors/broca-service-tiers-v1/role-describe-live.json"
+        "../../fixtures/contracts/broca-service-tiers-v1/role-describe-live.json"
     ))
     .unwrap();
     let mut cache = runners::DescribeCache::default();
@@ -749,7 +749,7 @@ async fn account_service_tier_does_not_replace_a_pinned_account() {
 
 fn live_broca_credentials(credentials: &mut BrocaCredentials) {
     let bytes =
-        include_bytes!("../../../../test-vectors/broca-service-tiers-v1/role-describe-live.json");
+        include_bytes!("../../fixtures/contracts/broca-service-tiers-v1/role-describe-live.json");
     assert_eq!(bytes.len(), 2072);
     assert_eq!(
         format!("{:x}", Sha256::digest(bytes)),
@@ -1259,10 +1259,10 @@ async fn service_tier_absent_keeps_existing_answer_bytes_and_no_tier_decision() 
 #[test]
 fn broca_turn_system_runner_discovery_keeps_absent_service_tiers() {
     let before = include_bytes!(
-        "../../../../test-vectors/broca-turn-system-v1/before/role-describe.response.json"
+        "../../fixtures/contracts/broca-turn-system-v1/before/role-describe.response.json"
     );
     let after = include_bytes!(
-        "../../../../test-vectors/broca-turn-system-v1/after/role-describe.response.json"
+        "../../fixtures/contracts/broca-turn-system-v1/after/role-describe.response.json"
     );
     for bytes in [before.as_slice(), after.as_slice()] {
         let reply: Value = serde_json::from_slice(bytes).unwrap();

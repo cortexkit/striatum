@@ -1213,7 +1213,7 @@ mod tests {
         let reply = json!({"result": report(&evidence, 1_800_000_000_000, 60_000)});
         let mut bytes = serde_json::to_vec_pretty(&reply).unwrap();
         bytes.push(b'\n');
-        assert_eq!(bytes, include_bytes!("../../../test-vectors/diagnostics-findings-v1/reply-routing-unscored-admissible-model.json"));
+        assert_eq!(bytes, include_bytes!("../fixtures/contracts/diagnostics-findings-v1/reply-routing-unscored-admissible-model.json"));
     }
     use super::*;
 

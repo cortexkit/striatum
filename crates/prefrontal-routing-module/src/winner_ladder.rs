@@ -821,16 +821,14 @@ mod tests {
         }
     }
 
-    /// The health sentinel relays notices by matching this prefix; a rename on
-    /// either side would silently stop the relay.
+    /// Pin the consumer prefix captured from prefrontal/script/health-sentinel.ts
+    /// at 3de63a65ddde07b09128808f24d0f8a54da60072. Each repository checks its
+    /// side of the notice contract without reading the other's live checkout.
     #[test]
-    fn the_sentinel_relays_the_same_notice_prefix() {
-        let sentinel = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../script/health-sentinel.ts"
-        ))
-        .unwrap();
-        assert!(sentinel.contains(&format!("ROUTE_WINNER_NOTICE_PREFIX = \"{NOTICE_PREFIX}\"")));
+    fn notice_prefix_matches_captured_sentinel_contract() {
+        let prefix: String =
+            serde_json::from_str(include_str!("../fixtures/sentinel-notice-prefix.json")).unwrap();
+        assert_eq!(NOTICE_PREFIX, prefix);
     }
 
     #[test]

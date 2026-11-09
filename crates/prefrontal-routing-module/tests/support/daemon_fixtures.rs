@@ -97,7 +97,7 @@ impl FusiformCatalog {
         // Both daemon rigs read the same captured continuation page. Routing's
         // integration test compares every served row with its bundled seed facts.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../prefrontal-core-module/fixtures/routing-wire/catalog-seed.json");
+            .join("fixtures/routing-wire/catalog-seed.json");
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 

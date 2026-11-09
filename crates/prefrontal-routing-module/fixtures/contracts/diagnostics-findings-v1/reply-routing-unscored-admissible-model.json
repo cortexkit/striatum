@@ -1,0 +1,25 @@
+{
+  "result": {
+    "findings": [
+      {
+        "check": "unscored_admissible_model",
+        "count": 1,
+        "first_seen_ms": 1799999990000,
+        "hint": "ask the operator to grade synthetic-lab/ungraded-model in Fusiform",
+        "key": "synthetic-lab/ungraded-model",
+        "last_seen_ms": 1799999999000,
+        "model": "synthetic-lab/ungraded-model",
+        "samples": [
+          {
+            "first_seen_ms": 1799999990000,
+            "model": "synthetic-lab/ungraded-model"
+          }
+        ],
+        "severity": "info",
+        "summary": "synthetic-lab/ungraded-model was admissible without a Fusiform operator grade"
+      }
+    ],
+    "generated_at_ms": 1800000000000,
+    "window_ms": 60000
+  }
+}

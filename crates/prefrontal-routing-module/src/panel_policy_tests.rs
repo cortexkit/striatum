@@ -489,7 +489,7 @@ mod class_panel_policy {
     fn core_panel_replacement_fixtures_keep_recorded_seats_spares_and_policy() {
         use prefrontal_routing_core as routing;
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../prefrontal-core-module/fixtures/routing-wire/panels.json");
+            .join("fixtures/routing-wire/panels.json");
         let corpus: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         let cases = corpus["cases"].as_array().unwrap();
         assert!(!cases.is_empty());
