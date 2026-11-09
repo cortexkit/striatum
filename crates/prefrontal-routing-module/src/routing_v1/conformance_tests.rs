@@ -194,6 +194,16 @@ impl Harness {
         *self.broca_credentials.lock().unwrap() = Arc::new(Mutex::new(credentials));
     }
 
+    pub(super) fn observe_runner_describe(&self, module: &str, describe: &Value) {
+        let credentials = self.broca_credentials.lock().unwrap();
+        super::runners::DescribeCache::default().reply(
+            module,
+            Some(describe),
+            &mut credentials.lock().unwrap(),
+            crate::now_ms() as i64,
+        );
+    }
+
     /// Bind a new route as `principal`, scoped to `project_id` when given,
     /// with the control frame the daemon sends.
     pub(super) async fn bind(

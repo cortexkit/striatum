@@ -6,6 +6,20 @@ use serde_json::Value;
 
 use crate::broca_credentials::BrocaCredentials;
 
+/// Tier eligibility needs all three independently refreshed account views.
+/// An empty published answer is authoritative; an absent snapshot is not.
+pub(crate) fn unobserved_account_input(credentials: &BrocaCredentials) -> Option<&'static str> {
+    if credentials.listing_version().is_none() {
+        Some("[TODO(user): credential list not yet read after routing started]")
+    } else if !credentials.billing_catalog.is_loaded() {
+        Some("[TODO(user): model tiers not yet read after routing started]")
+    } else if credentials.plan_prices["prices"].as_array().is_none() {
+        Some("[TODO(user): plan prices not yet read after routing started]")
+    } else {
+        None
+    }
+}
+
 fn decimal(value: &Value) -> Option<f64> {
     let exponent = value["exponent"].as_u64()?;
     if exponent > 6 {

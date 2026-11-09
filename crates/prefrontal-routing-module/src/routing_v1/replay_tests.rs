@@ -965,6 +965,12 @@ fn install_client_catalog(harness: &Harness, client: &str) {
         })
         .collect();
     install_catalog(harness, &catalog);
+    // These replays exercise account/candidate contracts after discovery.
+    // Record that each runner answered without service-tier support, so a fresh
+    // fast request may fall back to standard instead of waiting for discovery.
+    for runner in &catalog.runners {
+        harness.observe_runner_describe(&runner.module, &json!({"capabilities":[]}));
+    }
     if client == "ckdesk" {
         super::conformance_tests::install_head_snapshot(harness);
     }

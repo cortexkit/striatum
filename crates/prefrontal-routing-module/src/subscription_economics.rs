@@ -397,6 +397,18 @@ fn build_with_credentials(
     out
 }
 
+pub(crate) async fn fetch_plan_prices(connection: &Path, project: &Path) -> Value {
+    if let Ok(mut fusi) =
+        QuotaConsumer::connect_module(connection, project, "fusiform", "tool_provider").await
+    {
+        fusi.query(json!({"name":"plan.prices", "arguments":{}}))
+            .await
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    }
+}
+
 pub(crate) async fn refresh(
     connection: &Path,
     project: &Path,
@@ -406,28 +418,32 @@ pub(crate) async fn refresh(
 ) {
     let now = crate::now_ms() as i64;
     let from = now - 24 * 3_600_000;
-    let mut report = Value::Null;
-    if let Ok(mut astro) =
-        QuotaConsumer::connect_module(connection, project, "astrocyte", "management_surface").await
-    {
-        report = astro
+    let report = async {
+        if let Ok(mut astro) =
+            QuotaConsumer::connect_module(connection, project, "astrocyte", "management_surface")
+                .await
+        {
+            astro
             .query(
                 json!({"method":"spend.multiplier.report", "params":{"from_ms":from,"to_ms":now}}),
             )
             .await
-            .unwrap_or(Value::Null);
-    }
-    let mut prices = Value::Null;
-    if let Ok(mut fusi) =
-        QuotaConsumer::connect_module(connection, project, "fusiform", "tool_provider").await
-    {
-        prices = fusi
-            .query(json!({"name":"plan.prices", "arguments":{}}))
-            .await
-            .unwrap_or(Value::Null);
-    }
-    let credential_ids = if let Ok(mut credentials) = credentials.lock() {
-        credentials.publish_plan_prices(&prices);
+            .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        }
+    };
+    // Admission needs plan prices even when Astro's spend report is slow.
+    // Publish them as soon as Fusiform answers, without waiting for Astro.
+    let prices = async {
+        let prices = fetch_plan_prices(connection, project).await;
+        if let Ok(mut credentials) = credentials.lock() {
+            credentials.publish_plan_prices(&prices);
+        }
+        prices
+    };
+    let (prices, report) = tokio::join!(prices, report);
+    let credential_ids = if let Ok(credentials) = credentials.lock() {
         credentials.api_key_credentials_by_provider(now as u64)
     } else {
         BTreeMap::new()

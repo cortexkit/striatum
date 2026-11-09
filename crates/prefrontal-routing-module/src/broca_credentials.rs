@@ -54,6 +54,8 @@ pub struct BrocaCredentials {
     pub(crate) catalog_snapshot: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
     pub(crate) catalog_wake: Arc<tokio::sync::Notify>,
     pub(crate) connection_file_path: Option<std::path::PathBuf>,
+    /// One on-demand account-input fetch shared by concurrent admissions.
+    pub(crate) admission_inputs: Arc<tokio::sync::Mutex<()>>,
     /// The providers with no catalog rows that resolved to a catalog provider
     /// at the last [`Self::refresh_serving_methods`], each with its catalog
     /// provider. Such a provider has no Fusiform plane of its own: its serving

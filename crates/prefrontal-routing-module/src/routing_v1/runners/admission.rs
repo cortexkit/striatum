@@ -42,9 +42,8 @@ pub(crate) async fn fetch_describe(
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
-/// A bound decision cannot step down its tier. After a restart, poll once on
-/// admission rather than treating the empty cache as evidence that the bound
-/// fast service tier is unsupported.
+/// Poll unknown tier views before admission. A cold cache cannot establish
+/// either that a bound tier is unavailable or that a fresh request must step down.
 pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: &Deps<'_>) {
     let Ok(request) = serde_json::from_slice::<Value>(body) else {
         return;
@@ -57,13 +56,17 @@ pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: 
         .as_str()
         .or_else(|| params["model_decision_id"].as_str())
         .and_then(|id| deps.store.decision_service_tier(id).ok().flatten());
-    let tier = bound.as_ref().map(|(tier, _)| tier.as_str());
-    if tier != Some("fast") {
+    let tier = bound
+        .as_ref()
+        .map(|(tier, _)| tier.as_str())
+        .or_else(|| params["service_tier"].as_str());
+    if !tier.is_some_and(|tier| tier != "standard") {
         return;
     }
     let Some(module) = accounts::admission_runner(caller, deps) else {
         return;
     };
+    refresh_account_inputs(deps.broca_credentials).await;
     let path = deps.broca_credentials.lock().ok().and_then(|credentials| {
         tier_view_unknown(&credentials, &module, crate::now_ms() as i64)
             .then(|| credentials.connection_file_path.clone())
@@ -91,4 +94,71 @@ pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: 
             crate::now_ms() as i64,
         );
     }
+}
+
+async fn refresh_account_inputs(credentials: &crate::SharedBrocaCredentials) {
+    let Some((gate, path)) = credentials.lock().ok().and_then(|credentials| {
+        crate::service_tiers::unobserved_account_input(&credentials)?;
+        Some((
+            credentials.admission_inputs.clone(),
+            credentials.connection_file_path.clone()?,
+        ))
+    }) else {
+        return;
+    };
+    if let Ok(guard) = gate.clone().try_lock_owned() {
+        let credentials = credentials.clone();
+        // The task owns the fetch so a waiting admission's deadline cannot
+        // cancel the load shared with another admission.
+        tokio::spawn(async move {
+            let _guard = guard;
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                let listing = async {
+                    use cortexkit_claustrum_client::CredentialResolver;
+                    let needed = credentials
+                        .lock()
+                        .is_ok_and(|credentials| credentials.listing_version().is_none());
+                    if needed {
+                        let resolver = cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
+                            path.clone(),
+                            std::env::current_dir().unwrap_or_else(|_| ".".into()),
+                            "prefrontal-routing",
+                        );
+                        if let Ok(listing) = resolver.list_scoped().await {
+                            if let Ok(mut credentials) = credentials.lock() {
+                                credentials.apply_listing(&listing, crate::now_ms());
+                            }
+                        }
+                    }
+                };
+                let plans = async {
+                    let needed = credentials.lock().is_ok_and(|credentials| {
+                        credentials.plan_prices["prices"].as_array().is_none()
+                    });
+                    if needed {
+                        let prices = crate::subscription_economics::fetch_plan_prices(
+                            &path,
+                            path.parent().unwrap_or(Path::new(".")),
+                        )
+                        .await;
+                        if prices["prices"].is_array() {
+                            if let Ok(mut credentials) = credentials.lock() {
+                                credentials.publish_plan_prices(&prices);
+                            }
+                        }
+                    }
+                };
+                tokio::join!(
+                    listing,
+                    plans,
+                    crate::broca_credentials::wait_for_billing_catalog(
+                        &credentials,
+                        Duration::from_secs(2),
+                    )
+                );
+            })
+            .await;
+        });
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), gate.lock()).await;
 }

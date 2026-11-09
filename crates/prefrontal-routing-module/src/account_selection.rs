@@ -3253,21 +3253,28 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         },
         None => None,
     };
-    if bound_tier.as_deref() == Some("fast")
-        && ctx.classes.as_ref().is_some_and(|classes| {
-            crate::routing_v1::runners::tier_view_unknown(
-                &classes.credentials,
-                &parsed.caller.runner,
-                ctx.now_ms,
-            )
+    let tier = bound_tier
+        .as_deref()
+        .or_else(|| parsed.service_tier.map(|tier| tier.as_str()));
+    let unobserved = tier.filter(|tier| *tier != "standard").and_then(|_| {
+        ctx.classes.as_ref().and_then(|classes| {
+            crate::service_tiers::unobserved_account_input(&classes.credentials).or_else(|| {
+                crate::routing_v1::runners::tier_view_unknown(
+                    &classes.credentials,
+                    &parsed.caller.runner,
+                    ctx.now_ms,
+                )
+                .then_some("[TODO(user): runner tiers not yet read after routing started]")
+            })
         })
-    {
+    });
+    if let Some(reason) = unobserved {
         return because(
-            "runner_tier_unobserved",
+            "service_tier_input_unobserved",
             OpReply::typed(
                 "account_selection_unavailable",
-                "Routing hasn't yet seen which service tiers this runner serves, because routing or the runner just restarted, so it can't confirm this decision's fast tier. Retry in a few seconds: the decision stays valid and never steps down to a lower tier.",
-                service_tier_refusal_detail(&parsed, "runner_service_tiers_unobserved", Some(3_000)),
+                "[TODO(user): Routing has just started and has not loaded the account or runner views needed to judge this service tier. Retry in a few seconds; a bound decision keeps its tier.]",
+                service_tier_refusal_detail(&parsed, reason, Some(3_000)),
             ),
         );
     }

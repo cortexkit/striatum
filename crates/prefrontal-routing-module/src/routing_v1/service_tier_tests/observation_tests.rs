@@ -9,6 +9,9 @@ use super::*;
 
 enum DescribeReply {
     Answer(Value),
+    Plans(Value),
+    PlansWithAstro(Value),
+    PlansStall,
     OpenRefused,
     DescribeRefused,
     Stall,
@@ -43,6 +46,10 @@ impl DescribePeer {
         }
         credentials.connection_file_path = Some(path);
         let task = tokio::spawn(async move {
+            if let DescribeReply::PlansWithAstro(prices) = &reply {
+                parallel_economics_peer(listener, key, daemon, prices.clone()).await;
+                return;
+            }
             let (mut stream, _) = listener.accept().await.unwrap();
             authenticate_server(&mut stream, &key, &daemon, "test", Duration::from_secs(5))
                 .await
@@ -50,7 +57,13 @@ impl DescribePeer {
             let open = read_frame(&mut stream).await.unwrap().unwrap();
             let body: Value = serde_json::from_slice(&open.body).unwrap();
             assert_eq!(body["op"], "route.open");
-            assert_eq!(body["target"]["kind"], "management_surface");
+            let target = match &reply {
+                DescribeReply::Plans(_) | DescribeReply::PlansStall => {
+                    json!({"kind":"tool_provider", "module_id":"fusiform"})
+                }
+                _ => json!({"kind":"management_surface", "module_id":"broca"}),
+            };
+            assert_eq!(body["target"], target);
             if matches!(reply, DescribeReply::OpenRefused) {
                 respond(
                     &mut stream,
@@ -74,13 +87,34 @@ impl DescribePeer {
             .await;
             let request = read_frame(&mut stream).await.unwrap().unwrap();
             assert_eq!(request.header.channel, 7);
+            let expected = match &reply {
+                DescribeReply::Plans(_) | DescribeReply::PlansStall => {
+                    json!({"name":"plan.prices", "arguments":{}})
+                }
+                _ => json!({"method":"role.describe", "params":{}}),
+            };
             assert_eq!(
                 serde_json::from_slice::<Value>(&request.body).unwrap(),
-                json!({
-                    "method":"role.describe","params":{}
-                })
+                expected
             );
             match reply {
+                DescribeReply::Plans(answer) => {
+                    // Keep the load in flight while both admissions reach it.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    respond(
+                        &mut stream,
+                        &request,
+                        FrameType::Response,
+                        json!({"result":answer}),
+                    )
+                    .await;
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                            .await
+                            .is_err(),
+                        "concurrent admissions opened duplicate plan-price connections"
+                    );
+                }
                 DescribeReply::Answer(answer) => {
                     respond(
                         &mut stream,
@@ -101,10 +135,10 @@ impl DescribePeer {
                     )
                     .await;
                 }
-                DescribeReply::Stall => {
+                DescribeReply::Stall | DescribeReply::PlansStall => {
                     let _ = read_frame(&mut stream).await;
                 }
-                DescribeReply::OpenRefused => unreachable!(),
+                DescribeReply::OpenRefused | DescribeReply::PlansWithAstro(_) => unreachable!(),
             }
         });
         Self {
@@ -141,6 +175,62 @@ async fn respond(stream: &mut tokio::net::TcpStream, request: &Frame, ty: FrameT
     )
     .unwrap();
     write_frame(stream, &frame).await.unwrap();
+}
+
+async fn parallel_economics_peer(
+    listener: tokio::net::TcpListener,
+    key: [u8; 32],
+    daemon: [u8; 16],
+    prices: Value,
+) {
+    let plans_queried = Arc::new(tokio::sync::Notify::new());
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let plans_queried = plans_queried.clone();
+        let prices = prices.clone();
+        tasks.spawn(async move {
+            authenticate_server(&mut stream, &key, &daemon, "test", Duration::from_secs(5))
+                .await
+                .unwrap();
+            let open = read_frame(&mut stream).await.unwrap().unwrap();
+            let body: Value = serde_json::from_slice(&open.body).unwrap();
+            assert_eq!(body["op"], "route.open");
+            respond(
+                &mut stream,
+                &open,
+                FrameType::Response,
+                json!({"route_channel":7,"route_epoch":3}),
+            )
+            .await;
+            let request = read_frame(&mut stream).await.unwrap().unwrap();
+            let query: Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["target"]["module_id"].as_str().unwrap() {
+                "fusiform" => {
+                    assert_eq!(query, json!({"name":"plan.prices","arguments":{}}));
+                    plans_queried.notify_one();
+                    prices
+                }
+                "astrocyte" => {
+                    assert_eq!(query["method"], "spend.multiplier.report");
+                    // A serial Astro-first refresh cannot get past this reply.
+                    plans_queried.notified().await;
+                    Value::Null
+                }
+                other => panic!("unexpected economics target: {other}"),
+            };
+            respond(
+                &mut stream,
+                &request,
+                FrameType::Response,
+                json!({"result":result}),
+            )
+            .await;
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
 }
 
 fn live_describe() -> Value {
@@ -190,29 +280,34 @@ async fn bound_request(harness: &Arc<Harness>, id: &str, legacy: bool) -> Value 
 async fn empty_view_fast_admission_describes_synchronously_after_routing_restart() {
     let _clock = crate::InjectedClock::set(NOW);
     for legacy in [false, true] {
-        let (harness, mut credentials) = legacy_broca_setup();
-        let request = bound_request(&harness, "cold-fast", legacy).await;
-        credentials.runner_service_tiers.clear();
-        credentials.runner_routed_accounts.clear();
-        credentials.runner_describe_observed.clear();
-        let peer =
-            DescribePeer::start(DescribeReply::Answer(live_describe()), &mut credentials).await;
-        harness.set_credentials(credentials);
-        let runner = harness.bind(reserved("broca"), None).await;
-        let admitted = runner.call("route.account_for", &request).await;
-        assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
-        assert_eq!(admitted.1["result"]["service_tier_chosen"], "fast");
-        assert!(admitted.1["result"]["account"]["credential_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("chatgpt:"));
-        peer.finish().await;
-        assert_eq!(runner.call("route.account_for", &request).await, admitted);
+        for bound in [false, true] {
+            let (harness, mut credentials) = legacy_broca_setup();
+            let mut request = bound_request(&harness, "cold-fast", legacy).await;
+            if !bound {
+                request.as_object_mut().unwrap().remove("decision_id");
+            }
+            credentials.runner_service_tiers.clear();
+            credentials.runner_routed_accounts.clear();
+            credentials.runner_describe_observed.clear();
+            let peer =
+                DescribePeer::start(DescribeReply::Answer(live_describe()), &mut credentials).await;
+            harness.set_credentials(credentials);
+            let runner = harness.bind(reserved("broca"), None).await;
+            let admitted = runner.call("route.account_for", &request).await;
+            assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+            assert_eq!(admitted.1["result"]["service_tier_chosen"], "fast");
+            assert!(admitted.1["result"]["account"]["credential_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("chatgpt:"));
+            peer.finish().await;
+            assert_eq!(runner.call("route.account_for", &request).await, admitted);
+        }
     }
 }
 
 #[tokio::test]
-async fn unknown_view_does_not_block_unbound_fast_or_bound_standard_admission() {
+async fn unknown_view_does_not_block_standard_admission() {
     let _clock = crate::InjectedClock::set(NOW);
     for legacy in [false, true] {
         for bound in [false, true] {
@@ -227,7 +322,7 @@ async fn unknown_view_does_not_block_unbound_fast_or_bound_standard_admission() 
                 assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
                 request["decision_id"] = selected.1["result"]["decision_id"].clone();
             }
-            request["service_tier"] = json!(if bound { "standard" } else { "fast" });
+            request["service_tier"] = json!("standard");
             credentials.runner_service_tiers.clear();
             credentials.runner_describe_observed.clear();
             harness.set_credentials(credentials);
@@ -243,48 +338,120 @@ async fn unknown_view_does_not_block_unbound_fast_or_bound_standard_admission() 
 async fn failed_describe_fast_admission_is_timed_transient_without_tier_downgrade() {
     let _clock = crate::InjectedClock::set(NOW);
     for legacy in [false, true] {
-        for failure in [
-            DescribeReply::OpenRefused,
-            DescribeReply::DescribeRefused,
-            DescribeReply::Stall,
-        ] {
-            let (harness, mut credentials) = legacy_broca_setup();
-            let request = bound_request(&harness, "unknown-fast", legacy).await;
-            credentials.runner_service_tiers.clear();
-            credentials.runner_describe_observed.clear();
-            let peer = DescribePeer::start(failure, &mut credentials).await;
-            harness.set_credentials(credentials);
-            let runner = harness.bind(reserved("broca"), None).await;
-            let refused = tokio::time::timeout(
-                Duration::from_secs(3),
-                runner.call("route.account_for", &request),
-            )
-            .await
-            .unwrap();
-            assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
-            assert_eq!(refused.1["code"], "account_selection_unavailable");
-            assert_eq!(
-                refused.1["detail"]["retry_after_ms"], 3_000,
-                "{}",
-                refused.1
-            );
-            assert_eq!(refused.1["detail"]["retry_after_s"], 3);
-            assert_candidate_detail(&refused.1, &request, "runner_service_tiers_unobserved");
-            assert!(!refused.1["message"]
-                .as_str()
-                .unwrap()
-                .contains("No account can serve"));
-            assert!(harness
-                .store()
-                .account_decisions("serve", 10)
-                .unwrap()
-                .is_empty());
-            assert!(harness
-                .store()
-                .v1_admission("reserved:broca", "unknown-fast")
-                .unwrap()
-                .is_none());
-            peer.finish().await;
+        for bound in [false, true] {
+            for failure in [
+                DescribeReply::OpenRefused,
+                DescribeReply::DescribeRefused,
+                DescribeReply::Stall,
+            ] {
+                let (harness, mut credentials) = legacy_broca_setup();
+                let mut request = bound_request(&harness, "unknown-fast", legacy).await;
+                if !bound {
+                    request.as_object_mut().unwrap().remove("decision_id");
+                }
+                credentials.runner_service_tiers.clear();
+                credentials.runner_describe_observed.clear();
+                let peer = DescribePeer::start(failure, &mut credentials).await;
+                harness.set_credentials(credentials);
+                let runner = harness.bind(reserved("broca"), None).await;
+                let refused = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    runner.call("route.account_for", &request),
+                )
+                .await
+                .unwrap();
+                assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+                assert_eq!(refused.1["code"], "account_selection_unavailable");
+                assert_eq!(
+                    refused.1["detail"]["retry_after_ms"], 3_000,
+                    "{}",
+                    refused.1
+                );
+                assert_eq!(refused.1["detail"]["retry_after_s"], 3);
+                assert_candidate_detail(
+                    &refused.1,
+                    &request,
+                    "[TODO(user): runner tiers not yet read after routing started]",
+                );
+                assert!(!refused.1["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("No account can serve"));
+                assert!(harness
+                    .store()
+                    .account_decisions("serve", 10)
+                    .unwrap()
+                    .is_empty());
+                assert!(harness
+                    .store()
+                    .v1_admission("reserved:broca", "unknown-fast")
+                    .unwrap()
+                    .is_none());
+                peer.finish().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn startup_account_tier_inputs_are_retryable_until_loaded() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [false, true] {
+        for bound in [true, false] {
+            for (input, reason) in [
+                (
+                    "plans",
+                    "[TODO(user): plan prices not yet read after routing started]",
+                ),
+                (
+                    "catalog",
+                    "[TODO(user): model tiers not yet read after routing started]",
+                ),
+                (
+                    "listing",
+                    "[TODO(user): credential list not yet read after routing started]",
+                ),
+            ] {
+                let (harness, mut credentials) = legacy_broca_setup();
+                let mut request = bound_request(&harness, "cold-account-inputs", legacy).await;
+                if !bound {
+                    request.as_object_mut().unwrap().remove("decision_id");
+                }
+                let loaded = credentials.clone();
+                match input {
+                    "plans" => credentials.plan_prices = Value::Null,
+                    "catalog" => credentials.billing_catalog = Default::default(),
+                    "listing" => {
+                        credentials = BrocaCredentials::default();
+                        credentials.runner_declarations = loaded.runner_declarations.clone();
+                        credentials.runner_service_tiers = loaded.runner_service_tiers.clone();
+                        credentials.billing_catalog = loaded.billing_catalog.clone();
+                        credentials.plan_prices = loaded.plan_prices.clone();
+                    }
+                    _ => unreachable!(),
+                }
+                harness.set_credentials(credentials);
+                let runner = harness.bind(reserved("broca"), None).await;
+                let refused = runner.call("route.account_for", &request).await;
+                assert_eq!(refused.0, FrameType::Error, "{input}: {}", refused.1);
+                assert_eq!(refused.1["code"], "account_selection_unavailable");
+                assert_eq!(
+                    refused.1["detail"]["retry_after_s"].as_u64(),
+                    Some(3),
+                    "{input}: {}",
+                    refused.1
+                );
+                assert_candidate_detail(&refused.1, &request, reason);
+                assert!(harness
+                    .store()
+                    .account_decisions("serve", 10)
+                    .unwrap()
+                    .is_empty());
+                harness.set_credentials(loaded);
+                let admitted = runner.call("route.account_for", &request).await;
+                assert_eq!(admitted.0, FrameType::Response, "{input}: {}", admitted.1);
+                assert_eq!(admitted.1["result"]["service_tier_chosen"], "fast");
+            }
         }
     }
 }
@@ -367,4 +534,96 @@ async fn current_positive_withdrawal_refuses_bound_fast_without_a_retry_or_step_
             .unwrap()
             .is_empty());
     }
+}
+
+#[tokio::test]
+async fn concurrent_bound_fast_admissions_share_the_on_demand_account_input_load() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [false, true] {
+        let (harness, mut credentials) = legacy_broca_setup();
+        let first = bound_request(&harness, "loading-first", legacy).await;
+        let mut second = first.clone();
+        second["admission_id"] = json!("loading-second");
+        let prices = credentials.plan_prices.clone();
+        credentials.plan_prices = Value::Null;
+        let reply = DescribeReply::Plans(prices);
+        // The peer accepts only one connection; a duplicate load cannot finish.
+        let peer = DescribePeer::start(reply, &mut credentials).await;
+        harness.set_credentials(credentials);
+        let runner = harness.bind(reserved("broca"), None).await;
+        let other = harness.bind(reserved("broca"), None).await;
+        let (first, second) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                runner.call("route.account_for", &first),
+                other.call("route.account_for", &second)
+            )
+        })
+        .await
+        .unwrap();
+        for admitted in [first, second] {
+            assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+            assert_eq!(admitted.1["result"]["service_tier_chosen"], "fast");
+        }
+        peer.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn stalled_on_demand_plan_prices_refuse_with_integer_retry_seconds() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [false, true] {
+        let (harness, mut credentials) = legacy_broca_setup();
+        let request = bound_request(&harness, "stalled-plans", legacy).await;
+        credentials.plan_prices = Value::Null;
+        let peer = DescribePeer::start(DescribeReply::PlansStall, &mut credentials).await;
+        harness.set_credentials(credentials);
+        let runner = harness.bind(reserved("broca"), None).await;
+        let refused = tokio::time::timeout(
+            Duration::from_secs(3),
+            runner.call("route.account_for", &request),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+        assert_eq!(refused.1["code"], "account_selection_unavailable");
+        assert_eq!(refused.1["detail"]["retry_after_s"].as_u64(), Some(3));
+        assert_candidate_detail(
+            &refused.1,
+            &request,
+            "[TODO(user): plan prices not yet read after routing started]",
+        );
+        peer.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn startup_plan_prices_do_not_wait_for_the_astro_spend_report() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (_, mut credentials) = legacy_broca_setup();
+    let prices = credentials.plan_prices.clone();
+    credentials.plan_prices = Value::Null;
+    let peer = DescribePeer::start(
+        DescribeReply::PlansWithAstro(prices.clone()),
+        &mut credentials,
+    )
+    .await;
+    let path = credentials.connection_file_path.clone().unwrap();
+    let credentials = Arc::new(std::sync::Mutex::new(credentials));
+    let quota = Arc::new(std::sync::Mutex::new(
+        crate::account_quota::AccountQuotaState::default(),
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::subscription_economics::refresh(
+            &path,
+            path.parent().unwrap(),
+            &quota,
+            None,
+            &credentials,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(credentials.lock().unwrap().plan_prices, prices);
+    peer.finish().await;
 }
