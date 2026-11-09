@@ -3264,7 +3264,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                     &parsed.caller.runner,
                     ctx.now_ms,
                 )
-                .then_some("[TODO(user): runner tiers not yet read after routing started]")
+                .then_some("routing just started and hasn't read the runner's service tiers yet")
             })
         })
     });
@@ -3273,7 +3273,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             "service_tier_input_unobserved",
             OpReply::typed(
                 "account_selection_unavailable",
-                "[TODO(user): Routing has just started and has not loaded the account or runner views needed to judge this service tier. Retry in a few seconds; a bound decision keeps its tier.]",
+                "Routing has just started and hasn't yet loaded what it needs to judge this service tier. Retry in 3 seconds; a bound decision keeps its tier.",
                 service_tier_refusal_detail(&parsed, reason, Some(3_000)),
             ),
         );

@@ -371,7 +371,7 @@ async fn failed_describe_fast_admission_is_timed_transient_without_tier_downgrad
                 assert_candidate_detail(
                     &refused.1,
                     &request,
-                    "[TODO(user): runner tiers not yet read after routing started]",
+                    "routing just started and hasn't read the runner's service tiers yet",
                 );
                 assert!(!refused.1["message"]
                     .as_str()
@@ -401,15 +401,15 @@ async fn startup_account_tier_inputs_are_retryable_until_loaded() {
             for (input, reason) in [
                 (
                     "plans",
-                    "[TODO(user): plan prices not yet read after routing started]",
+                    "routing just started and hasn't read plan prices yet",
                 ),
                 (
                     "catalog",
-                    "[TODO(user): model tiers not yet read after routing started]",
+                    "routing just started and hasn't read the models' service tiers yet",
                 ),
                 (
                     "listing",
-                    "[TODO(user): credential list not yet read after routing started]",
+                    "routing just started and hasn't read the credential list yet",
                 ),
             ] {
                 let (harness, mut credentials) = legacy_broca_setup();
@@ -590,7 +590,7 @@ async fn stalled_on_demand_plan_prices_refuse_with_integer_retry_seconds() {
         assert_candidate_detail(
             &refused.1,
             &request,
-            "[TODO(user): plan prices not yet read after routing started]",
+            "routing just started and hasn't read plan prices yet",
         );
         peer.finish().await;
     }
