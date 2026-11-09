@@ -420,14 +420,20 @@ async fn candidates(
     }
     let class = class(request)?;
     let panel_policy = crate::panel_policy::class_policy(config.panels(), class);
-    let groups = config.exclude_groups();
-    let group = if class == scoring::PanelClass::Lab {
-        &groups.lab
+    let class_consumer = if class == scoring::PanelClass::Lab {
+        "lab"
     } else {
-        &groups.athena
+        "athena"
     };
+    let group_consumer =
+        if crate::config_policy::consumer_matches(class_consumer, &request.consumer) {
+            request.consumer.as_str()
+        } else {
+            class_consumer
+        };
+    let group = config.consumer_exclusions(group_consumer);
     let mut operator_exclude =
-        crate::panel_policy::operator_exclusions(&facts, &config.operator_policy().exclude, group);
+        crate::panel_policy::operator_exclusions(&facts, &config.operator_policy().exclude, &group);
     operator_exclude.extend(
         facts
             .iter()

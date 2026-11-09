@@ -52,42 +52,7 @@ impl RoutingConfigFile {
             let Some(id) = crate::variant_policy::consumer_group(Some(consumer)) else {
                 continue;
             };
-            let mut exclusions = Vec::new();
-            for (key, rules) in &entities {
-                if rules.only_for.is_some() || rules.not_for.is_some() {
-                    let excluded =
-                        rules.only_for.as_ref().is_some_and(|names| {
-                            !names.iter().any(|name| consumer_matches(name, id))
-                        }) || rules
-                            .not_for
-                            .iter()
-                            .flatten()
-                            .any(|name| consumer_matches(name, id));
-                    let parent_excluded = key
-                        .split_once('/')
-                        .and_then(|(provider, _)| self.providers.get(provider))
-                        .is_some_and(|provider| {
-                            provider.rules.only_for.as_ref().is_some_and(|names| {
-                                !names.iter().any(|name| consumer_matches(name, id))
-                            }) || provider
-                                .rules
-                                .not_for
-                                .iter()
-                                .flatten()
-                                .any(|name| consumer_matches(name, id))
-                        });
-                    if !excluded && !parent_excluded {
-                        continue;
-                    }
-                    exclusions.push(if excluded {
-                        key.to_string()
-                    } else {
-                        format!("-{key}")
-                    });
-                }
-            }
-            exclusions
-                .sort_by_key(|key| (key.trim_start_matches('-').split('/').count(), key.clone()));
+            let exclusions = self.consumer_exclusions(id);
             exclusion_groups.insert(id.into(), serde_json::json!(exclusions));
         }
         for id in self.consumers.keys().filter(|id| !is_slot(id)) {
@@ -225,6 +190,21 @@ impl RoutingConfigFile {
 }
 
 impl LiveConfig {
+    /// Resolve entity restrictions from this snapshot for the full request name.
+    /// Unknown roots have no matching consumer group, just as undotted unknown names do.
+    pub fn consumer_exclusions(&self, consumer: &str) -> Vec<String> {
+        if crate::select_policy::Consumer::from_id(consumer).is_none() {
+            return Vec::new();
+        }
+        self.config.consumer_exclusions(consumer)
+    }
+
+    pub fn dotted_rule_refusal(&self, consumer: &str, route: &str) -> Option<String> {
+        self.config
+            .route_refusal_detail(consumer, route, false)
+            .and_then(|(detail, dotted)| dotted.then_some(detail))
+    }
+
     /// Contract slot names look up an operator-configured pin, not a caller's
     /// consumer defaults. The older slot-pin reads still use `slot_pin` and
     /// `config_policy::slot_consumer`'s reserved slot list.
@@ -258,6 +238,47 @@ impl LiveConfig {
 }
 
 impl RoutingConfigFile {
+    fn consumer_exclusions(&self, consumer: &str) -> Vec<String> {
+        let excluded = |rules: &EntityPolicy| {
+            rules
+                .only_for
+                .as_ref()
+                .is_some_and(|names| !names.iter().any(|name| consumer_matches(name, consumer)))
+                || rules
+                    .not_for
+                    .iter()
+                    .flatten()
+                    .any(|name| consumer_matches(name, consumer))
+        };
+        let entities = self
+            .providers
+            .iter()
+            .map(|(key, provider)| (key, &provider.rules))
+            .chain(
+                self.model_routing
+                    .models
+                    .iter()
+                    .map(|(key, model)| (key, &model.rules)),
+            );
+        let mut exclusions = Vec::new();
+        for (key, rules) in entities {
+            if rules.only_for.is_some() || rules.not_for.is_some() {
+                let entity_excluded = excluded(rules);
+                let parent_excluded = key
+                    .split_once('/')
+                    .and_then(|(provider, _)| self.providers.get(provider))
+                    .is_some_and(|provider| excluded(&provider.rules));
+                if entity_excluded {
+                    exclusions.push(key.clone());
+                } else if parent_excluded {
+                    exclusions.push(format!("-{key}"));
+                }
+            }
+        }
+        exclusions.sort_by_key(|key| (key.trim_start_matches('-').split('/').count(), key.clone()));
+        exclusions
+    }
+
     /// Why this config refuses `route` for `consumer`, naming the config rule
     /// that refuses it, or `None` when the route is allowed. Explicit pins
     /// bypass `pin_only` and `pin_only_for`, but never a provider/model
@@ -269,6 +290,18 @@ impl RoutingConfigFile {
         route: &str,
         pinned: bool,
     ) -> Option<String> {
+        self.route_refusal_detail(consumer, route, pinned)
+            .map(|(detail, _)| detail)
+    }
+
+    /// The flag marks a refusal caused by a dotted consumer pattern. Root-only
+    /// rules retain the existing rejection shape without an added detail.
+    fn route_refusal_detail(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+    ) -> Option<(String, bool)> {
         let provider = route.split('/').next().unwrap_or(route);
         let provider_rules = self.providers.get(provider).map(|policy| &policy.rules);
         let provider_source = |field: &str| format!("providers.{provider}.{field}");
@@ -308,24 +341,28 @@ impl RoutingConfigFile {
         }
         if let Some((source, names)) = only_for {
             if !names.iter().any(|name| consumer_matches(name, consumer)) {
-                return Some(format!("{source} {names:?} does not name {consumer:?}"));
+                return Some((
+                    format!("{source} {names:?} does not name {consumer:?}"),
+                    names.iter().any(|name| name.contains('.')),
+                ));
             }
         }
         if let Some((source, names)) = not_for {
             if let Some(name) = names.iter().find(|name| consumer_matches(name, consumer)) {
-                return Some(format!("{source} lists {name:?}"));
+                return Some((format!("{source} lists {name:?}"), name.contains('.')));
             }
         }
         if let Some((source, true)) = pin_only {
             if !pinned {
-                return Some(format!("{source} admits the route only when pinned"));
+                return Some((format!("{source} admits the route only when pinned"), false));
             }
         }
         if let Some((source, names)) = pin_only_for {
             if !pinned {
                 if let Some(name) = names.iter().find(|name| consumer_matches(name, consumer)) {
-                    return Some(format!(
-                        "{source} lists {name:?}, so it admits the route only when pinned"
+                    return Some((
+                        format!("{source} lists {name:?}, so it admits the route only when pinned"),
+                        name.contains('.'),
                     ));
                 }
             }
@@ -336,7 +373,12 @@ impl RoutingConfigFile {
                 .strip_prefix(&format!("{provider}/"))
                 .is_some_and(|tail| tail == model || tail.starts_with(&format!("{model}/")))
         });
-        (!served).then(|| format!("providers.{provider}.models {listed:?} does not list the model"))
+        (!served).then(|| {
+            (
+                format!("providers.{provider}.models {listed:?} does not list the model"),
+                false,
+            )
+        })
     }
 
     /// Refuse a config that pins a consumer to a route its own rules refuse

@@ -7,6 +7,85 @@ fn config(value: serde_json::Value) -> LiveConfig {
 }
 
 #[test]
+fn dotted_consumers_resolve_name_rules_without_reusing_root_exclusions() {
+    let config = config(json!({
+        "providers": {"p": {"not_for": ["athena"]}},
+        "models": {
+            "p/gather": {"not_for": [], "only_for": ["athena.gather"]},
+            "q/review": {"not_for": ["athena.gather"]},
+            "q/manual": {"pin_only": true},
+            "q/athena-manual": {"pin_only_for": ["athena"]}
+        }
+    }));
+    for consumer in ["athena.gather", "athena.gather.regather"] {
+        let exclusions = config.consumer_exclusions(consumer);
+        assert_eq!(exclusions, ["p", "-p/gather", "q/review"]);
+        assert!(config.route_allowed(consumer, "p/gather", false));
+        assert!(!config.route_allowed(consumer, "q/review", false));
+        for route in ["q/manual", "q/athena-manual"] {
+            assert!(!config.route_allowed(consumer, route, false));
+            assert!(config.route_allowed(consumer, route, true));
+        }
+        assert_eq!(config.exclude_groups().all, ["q/manual"]);
+        assert_eq!(
+            config.dotted_rule_refusal(consumer, "q/review").as_deref(),
+            Some("models[\"q/review\"].not_for lists \"athena.gather\"")
+        );
+    }
+    assert_eq!(config.consumer_exclusions("athena"), ["p", "p/gather"]);
+    assert!(!config.route_allowed("athena", "p/gather", false));
+    assert!(config.route_allowed("athena", "q/review", false));
+    for consumer in ["nosuch", "nosuch.gather"] {
+        assert!(config.consumer_exclusions(consumer).is_empty());
+        assert!(crate::select_policy::Consumer::from_id(consumer).is_none());
+        assert!(!config.route_allowed(consumer, "p/gather", false));
+        assert!(config.route_allowed(consumer, "q/review", false));
+    }
+    assert!(matches!(
+        crate::select_policy::Consumer::from_id("athena.gather"),
+        Some(crate::select_policy::Consumer::Athena)
+    ));
+}
+
+#[test]
+fn dotted_consumer_settings_keep_the_existing_operator_ancestor_walk() {
+    let config = config(json!({"consumers": {
+        "athena": {
+            "iq": 41, "eq": 52, "service_tier": "fast",
+            "variants": {"p/model": "high"}, "pin": {"model": "p/model"},
+            "projects": {"project": {"pin": "p/project"}}
+        },
+        "athena.gather": {"iq": 31}
+    }}));
+    for consumer in ["athena.gather", "athena.gather.regather"] {
+        let policy = config.consumer_policy(consumer, &ConsumerPolicy::default(), &BTreeMap::new());
+        assert_eq!(policy.iq, Some(31.0));
+        assert_eq!(policy.eq, Some(52.0));
+        assert_eq!(policy.ladder, Some(vec!["p/model".into()]));
+        assert_eq!(policy.variants.as_ref().unwrap()["p/model"], "high");
+        assert_eq!(config.project_pin("project", consumer), Some("p/project"));
+        assert_eq!(
+            config.service_tier(consumer, "p", "model"),
+            Some(cortexkit_role_routing::service_tier::ServiceTier::Fast)
+        );
+        let choice = crate::variant_policy::resolve(
+            config.variant_groups(),
+            &BTreeMap::new(),
+            None,
+            &crate::variant_policy::VariantRequest {
+                route_key: "p/model",
+                provider_id: "p",
+                model_id: "model",
+                explicit: None,
+                curated: Some("low"),
+                consumer: Some(consumer),
+            },
+        );
+        assert_eq!(choice.variant.as_deref(), Some("high"));
+    }
+}
+
+#[test]
 fn top_level_elo_overrides_is_refused_by_name() {
     for value in [json!(null), json!({}), json!({"p/model": 1400})] {
         let error = parse_config(&json!({"elo_overrides": value}).to_string()).unwrap_err();

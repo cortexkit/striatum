@@ -1,6 +1,6 @@
 //! Apply consumer exclusions and select pinned models without quality ranking.
 
-use crate::config_policy::{ExcludeGroups, SynthesizerPin};
+use crate::config_policy::SynthesizerPin;
 use prefrontal_routing_core::model_facts::ModelRequirements;
 use prefrontal_routing_core::model_router::{SelectModelRouteInput, SelectedModelRoute};
 use prefrontal_routing_core::provider_model_spec::ExclusionPolicy;
@@ -78,13 +78,14 @@ impl<'a> SelectionPass<'a> {
             })
             .cloned()
             .collect();
-        select_candidates(
+        let result = select_candidates(
             self.input(&allowed, self.snapshot.clone()),
             self.config,
             self.slots,
             self.consumer_exclude,
             self.rejections,
-        )
+        );
+        explain_dotted_exclusions(result, self.operator_config, self.consumer)
     }
 
     pub fn select<E>(
@@ -414,19 +415,6 @@ pub(crate) enum Consumer {
     Flow,
 }
 
-pub(crate) fn consumer_exclusions(groups: &ExcludeGroups, consumer: Option<Consumer>) -> &[String] {
-    match consumer {
-        Some(Consumer::Mason) => &groups.mason,
-        Some(Consumer::Sidekick) => &groups.sidekick,
-        Some(Consumer::Athena) => &groups.athena,
-        Some(Consumer::Lab) => &groups.lab,
-        Some(Consumer::Core) => &groups.core,
-        Some(Consumer::Codemode) => &groups.codemode,
-        Some(Consumer::Flow) => &groups.flow,
-        None => &[],
-    }
-}
-
 impl Consumer {
     /// Every request class, in declaration order.
     pub(crate) const ALL: [Consumer; 7] = [
@@ -439,12 +427,32 @@ impl Consumer {
         Consumer::Flow,
     ];
 
-    /// The request class a consumer id names, if it names one.
+    /// The request class named by a consumer's root, if it names one.
     pub(crate) fn from_id(id: &str) -> Option<Consumer> {
+        let root = id.split('.').next().unwrap_or(id);
         Self::ALL
             .into_iter()
-            .find(|consumer| crate::variant_policy::consumer_group(Some(*consumer)) == Some(id))
+            .find(|consumer| crate::variant_policy::consumer_group(Some(*consumer)) == Some(root))
     }
+}
+
+pub(crate) fn explain_dotted_exclusions(
+    mut result: Result<SelectedModelRoute, prefrontal_routing_core::model_router::NoRouteError>,
+    config: &crate::config_overrides::LiveConfig,
+    consumer: &str,
+) -> Result<SelectedModelRoute, prefrontal_routing_core::model_router::NoRouteError> {
+    let rejected = match &mut result {
+        Ok(selected) => &mut selected.rejected,
+        Err(error) => &mut error.rejected,
+    };
+    for rejection in rejected {
+        if rejection.reason == "excluded_by_operator" || rejection.reason == "not_available" {
+            if let Some(detail) = config.dotted_rule_refusal(consumer, &rejection.route_key) {
+                rejection.detail = Some(detail);
+            }
+        }
+    }
+    result
 }
 
 pub(crate) fn requires_metered(consumer: Option<Consumer>) -> bool {

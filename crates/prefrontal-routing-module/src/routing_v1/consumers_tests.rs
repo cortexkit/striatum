@@ -33,6 +33,122 @@ fn select(consumer: &str) -> Value {
 }
 
 #[tokio::test]
+async fn dotted_not_for_excludes_gather_but_keeps_plain_athena_and_records_the_full_name() {
+    let harness = harness();
+    harness.edit_config(|config| {
+        config["consumers"]["athena"] = json!({});
+        config["consumers"]["athena.gather"] = json!({});
+        config["consumers"]["athena.gather.regather"] = json!({});
+        config["models"]["example-provider/model-a"]["not_for"] = json!(["athena.gather"]);
+    });
+    let caller = harness.bind(reserved("prefrontal-core"), None).await;
+    for consumer in ["athena", "athena.gather", "athena.gather.regather"] {
+        let reply = caller
+            .call(
+                "route.select",
+                &json!({
+                    "consumer": consumer, "requirements": {"iq": 0}, "detail": true,
+                    "available_routes": ["example-provider/model-a", "example-provider/model-b"],
+                    "prefer": ["example-provider/model-a"]
+                }),
+            )
+            .await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        let result = &reply.1["result"];
+        assert_eq!(
+            result["route"]["model"],
+            if consumer == "athena" {
+                "model-a"
+            } else {
+                "model-b"
+            },
+            "{}",
+            reply.1
+        );
+        let id = result["decision_id"].as_str().unwrap();
+        assert_eq!(
+            harness.store().v1_decision(id).unwrap().unwrap().consumer,
+            consumer
+        );
+        if consumer != "athena" {
+            let rejected = result["detail"]["rejected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|rejected| rejected["routeKey"] == "example-provider/model-a")
+                .unwrap();
+            assert_eq!(rejected["reason"], "excluded_by_operator");
+            assert_eq!(
+                rejected["detail"],
+                "models[\"example-provider/model-a\"].not_for lists \"athena.gather\""
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn dotted_only_for_admits_gather_and_refuses_plain_athena() {
+    let harness = harness();
+    harness.edit_config(|config| {
+        config["consumers"]["athena"] = json!({});
+        config["consumers"]["athena.gather"] = json!({});
+        config["models"]["example-provider/model-a"]["only_for"] = json!(["athena.gather"]);
+    });
+    let caller = harness.bind(reserved("prefrontal-core"), None).await;
+    for consumer in ["athena", "athena.gather"] {
+        let reply = caller
+            .call(
+                "route.select",
+                &json!({
+                    "consumer": consumer, "requirements": {"iq": 0}, "detail": true,
+                    "available_routes": ["example-provider/model-a"]
+                }),
+            )
+            .await;
+        if consumer == "athena.gather" {
+            assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+            assert_eq!(reply.1["result"]["route"]["model"], "model-a");
+        } else {
+            assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+            assert_eq!(reply.1["code"], "no_route");
+            let rejected = reply.1["detail"]["rejected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|rejected| rejected["routeKey"] == "example-provider/model-a")
+                .unwrap();
+            assert_eq!(rejected["reason"], "excluded_by_operator");
+            assert_eq!(rejected["detail"],
+                "models[\"example-provider/model-a\"].only_for [\"athena.gather\"] does not name \"athena\"");
+        }
+    }
+}
+
+#[tokio::test]
+async fn dotted_unknown_root_keeps_unknown_consumer_selection_behavior() {
+    let harness = harness();
+    harness.edit_config(|config| {
+        config["consumers"]["nosuch"] = json!({});
+        config["consumers"]["nosuch.gather"] = json!({});
+        config["models"]["example-provider/model-a"]["not_for"] = json!(["athena"]);
+    });
+    let caller = harness.bind(reserved("prefrontal-core"), None).await;
+    for consumer in ["nosuch", "nosuch.gather"] {
+        let reply = caller
+            .call(
+                "route.select",
+                &json!({
+                    "consumer": consumer, "requirements": {"iq": 0},
+                    "available_routes": ["example-provider/model-a"]
+                }),
+            )
+            .await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(reply.1["result"]["route"]["model"], "model-a");
+    }
+}
+
+#[tokio::test]
 async fn consumer_models_checks_declaring_delegated_configured_and_foreign_owners() {
     let harness = harness();
     consumers::replace_catalog(&json!([entry(

@@ -911,7 +911,7 @@ async fn select_at_tier(
     // route-key exclusions in the one list every selection path reads.
     let mut exclude: Vec<String> = request.exclude.clone().unwrap_or_default();
     exclude.extend(request.exclude_providers.clone().unwrap_or_default());
-    let consumer_exclude = operator_config.exclude_groups().named_group(&consumer);
+    let consumer_exclude = operator_config.consumer_exclusions(&consumer);
     let slots = request.concurrency_slots.as_ref().map(|slots| {
         ConcurrencySlots::new(slots.iter().map(|slot| ConcurrencySlotState {
             key: slot.key.clone(),
@@ -1540,8 +1540,14 @@ impl<'a> Selection<'a> {
             }
         }
         let input = self.pass().input(&allowed, snapshot);
-        self.score_input(input, self.consumer_exclude, None)
-            .map_err(select_policy::describe_filter_refusal)
+        let result = self
+            .score_input(input, self.consumer_exclude, None)
+            .map_err(select_policy::describe_filter_refusal);
+        select_policy::explain_dotted_exclusions(
+            result,
+            self.sources.operator_config,
+            self.consumer,
+        )
     }
 
     fn score_input(

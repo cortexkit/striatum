@@ -1949,8 +1949,7 @@ pub(super) async fn handle_select_request(
     let mut policy_started = Instant::now();
     exclude.extend(head_refusals.route_keys.iter().cloned());
     let operator_exclude = operator_policy.exclude.clone();
-    let consumer_exclude =
-        select_policy::consumer_exclusions(operator_config.exclude_groups(), params.consumer);
+    let consumer_exclude = operator_config.consumer_exclusions(consumer_id);
     let requirements = resolved_request.requirements;
     let required_capabilities = resolved_request.required_capabilities;
     let target_agent = params.target_agent.clone();
@@ -1976,7 +1975,7 @@ pub(super) async fn handle_select_request(
         snapshot: &snapshot,
         exclude: &exclude,
         operator_exclude: &operator_exclude,
-        consumer_exclude,
+        consumer_exclude: &consumer_exclude,
         subscription_keys: &subscription_keys,
         priced_per_token,
         rejections: &mapped_availability.rejected,
