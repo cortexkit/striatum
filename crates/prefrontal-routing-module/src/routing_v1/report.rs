@@ -78,6 +78,7 @@ pub(super) fn report_at(
                 &decision,
                 request.credential_id.as_deref(),
                 deps,
+                crate::ACCOUNT_QUOTA.get(),
                 now,
             )
         })
@@ -352,6 +353,7 @@ fn prepare_usage(
     decision: &prefrontal_routing_store::V1Decision,
     reported_credential: Option<&str>,
     deps: &Deps<'_>,
+    accounts: Option<&crate::account_quota::SharedAccountQuota>,
     now: u64,
 ) -> Result<Option<prefrontal_routing_store::V1ReportUsage>, Refusal> {
     let Some(output) = usage.output_tokens else {
@@ -395,7 +397,11 @@ fn prepare_usage(
                 .as_ref()
                 .and_then(|identity| identity.credential_id.as_deref())
                 .or(reported_credential)?;
-            let credentials = deps.broca_credentials.lock().ok()?;
+            // Pricing also reads the store and account quota. Keep only owned
+            // credential data here, never a guard across those other locks.
+            let credentials = deps.broca_credentials.lock().ok()?.clone();
+            #[cfg(test)]
+            crate::account_quota::after_join_snapshot_for_test();
             let row = credentials
                 .listed_credentials()
                 .iter()
@@ -408,8 +414,7 @@ fn prepare_usage(
                 row.auth_method.as_deref()?,
                 &Default::default(),
             );
-            let credits = crate::ACCOUNT_QUOTA
-                .get()
+            let credits = accounts
                 .and_then(|state| state.lock().ok())
                 .and_then(|state| {
                     state
@@ -462,6 +467,128 @@ fn ledger_outcome(request: &ReportRequest, _now_ms: u64) -> RouteOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roster_refresh_and_tier_report_do_not_deadlock() {
+        use std::sync::{mpsc, Arc, Barrier, Mutex};
+        use std::time::Duration;
+
+        let scratch = cortexkit_test_support::ScratchDir::new("roster-tier-report-locks");
+        let store = Arc::new(
+            prefrontal_routing_store::SqliteRouteStateStore::open(
+                &prefrontal_routing_store::dev_descriptor(
+                    "roster-tier-report-locks",
+                    scratch.path().join("store.db").to_string_lossy(),
+                ),
+            )
+            .unwrap(),
+        );
+        let fact = crate::tests::fact("provider", "model");
+        store
+            .upsert_fact(&fact, prefrontal_routing_core::FactSource::Override)
+            .unwrap();
+        let mut credentials =
+            crate::broca_credentials::BrocaCredentials::api_test_credentials(&[fact]);
+        credentials.apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                view: "roster-tier-report-locks".into(),
+                credentials: vec![cortexkit_claustrum_client::ListedCredential {
+                    id: "credential".into(),
+                    account_id: Some("account".into()),
+                    provider_ids: vec!["provider".into()],
+                    auth_method: Some("apikey".into()),
+                    categories: vec!["llm-provider".into()],
+                    state: "active".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            1_700_000_000_000,
+        );
+        let credentials = Arc::new(Mutex::new(credentials));
+        let accounts = Arc::new(Mutex::new(
+            crate::account_quota::AccountQuotaState::default(),
+        ));
+        let config_path = scratch.path().join("routing.jsonc");
+        crate::test_config::write(&config_path, "{}").unwrap();
+
+        // Both production paths stop immediately after reading their first
+        // cache. Retaining both original guards forms the ABBA cycle regardless
+        // of which thread the scheduler runs first after the barrier.
+        let barrier = Arc::new(Barrier::new(2));
+        let (done, finished) = mpsc::channel();
+        let roster = {
+            let store = store.clone();
+            let credentials = credentials.clone();
+            let config_path = config_path.clone();
+            let accounts = accounts.clone();
+            let barrier = barrier.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                crate::account_quota::JOIN_SNAPSHOT_BARRIER
+                    .with(|slot| *slot.borrow_mut() = Some(barrier));
+                crate::account_quota::refresh_serving_methods(
+                    &accounts,
+                    &store,
+                    &credentials,
+                    &config_path,
+                );
+                done.send(()).unwrap();
+            })
+        };
+        let report = std::thread::spawn(move || {
+            crate::account_quota::JOIN_SNAPSHOT_BARRIER
+                .with(|slot| *slot.borrow_mut() = Some(barrier));
+            let quota_cache = Arc::new(Mutex::new(crate::QuotaCache::default()));
+            let deps = Deps {
+                quota_cache: &quota_cache,
+                store: &store,
+                routing_config_path: &config_path,
+                operator_config_path: &config_path,
+                broca_credentials: &credentials,
+            };
+            let decision = prefrontal_routing_store::V1Decision {
+                decision_id: "decision".into(),
+                principal: "owner".into(),
+                consumer: "mason".into(),
+                allowed_account_class: Default::default(),
+                project_id: None,
+                provider: "provider".into(),
+                model: "model".into(),
+                variant: None,
+                runner_module: "runner".into(),
+                affinity: None,
+                created_at_ms: 0,
+                expires_at_ms: i64::MAX,
+            };
+            let usage = serde_json::from_value(serde_json::json!({
+                "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+                "cached_input_tokens": 0, "cache_write_tokens": 0,
+                "service_tier_served": "standard"
+            }))
+            .unwrap();
+            let prepared = prepare_usage(
+                &usage,
+                &decision,
+                Some("credential"),
+                &deps,
+                Some(&accounts),
+                1_700_000_000_000,
+            )
+            .unwrap()
+            .expect("usage must reach the tier pricing branch");
+            assert_eq!(prepared.cost, Some(0.0));
+            done.send(()).unwrap();
+        });
+        // Do not join a deadlocked thread. Each worker owns only this fixture's
+        // caches, so a timeout fails this test without wedging other tests.
+        for _ in 0..2 {
+            finished.recv_timeout(Duration::from_secs(10))
+                .expect("deadlock: roster refresh and tier report did not finish after the snapshot barrier");
+        }
+        roster.join().unwrap();
+        report.join().unwrap();
+    }
 
     fn request(outcome: &str, reset_at_ms: Option<u64>) -> ReportRequest {
         let request = ReportRequest::new("d", Outcome::parse(outcome));

@@ -6,13 +6,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use prefrontal_routing_core::RouteStateStore;
 use subc_protocol::Frame;
 use subc_transport::read_frame;
 use tokio::io::AsyncRead;
 
 use crate::{
-    account_quota, config_overrides, fusiform_catalog, now_ms, quota_events, retention, routing_v1,
+    account_quota, config_overrides, fusiform_catalog, quota_events, retention, routing_v1,
     winner_ladder, BrocaCredentials, ModuleConfig, ModuleError, SharedBrocaCredentials,
     SharedCatalogHealth, SharedQuotaCache, SharedStore, ACCOUNT_QUOTA, DEFAULT_MODULE_ID,
 };
@@ -147,18 +146,12 @@ pub(super) fn start(
     );
     // Restore credential serving methods from cached account identities before
     // the first catalog poll; API-only providers wait for the non-secret listing.
-    if let (Ok(accounts), Ok(facts), Ok(mut credentials)) = (
-        account_state.lock(),
-        store.get_facts(),
-        broca_credentials.lock(),
-    ) {
-        credentials.refresh_serving_methods(
-            &accounts,
-            &facts,
-            now_ms() as i64,
-            &config_overrides::live_config(&config_overrides::config_path()).quota_model_pools(),
-        );
-    }
+    account_quota::refresh_serving_methods(
+        &account_state,
+        store,
+        &broca_credentials,
+        &config_overrides::config_path(),
+    );
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
         let roster_resolver: Arc<dyn cortexkit_claustrum_client::CredentialResolver> = Arc::new(
             cortexkit_claustrum_client::ClaustrumCredentialResolver::new(

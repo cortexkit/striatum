@@ -1764,6 +1764,46 @@ fn malformed_grant_is_logged_once_with_listing_credentials_and_count() {
     });
 }
 
+/// Join owned account and catalog snapshots into the credential cache. No account
+/// or store lock may be held when the credential cache is locked: tier reports
+/// read the same caches while the roster refresh is running.
+pub(crate) fn refresh_serving_methods(
+    state: &SharedAccountQuota,
+    store: &SqliteRouteStateStore,
+    broca_credentials: &crate::broca_credentials::SharedBrocaCredentials,
+    routing_config_path: &std::path::Path,
+) {
+    use prefrontal_routing_core::RouteStateStore as _;
+    let accounts = state.lock().ok().map(|guard| guard.clone());
+    #[cfg(test)]
+    after_join_snapshot_for_test();
+    if let (Some(accounts), Ok(facts)) = (accounts, store.get_facts()) {
+        // The join resolves providers missing their own catalog rows from the
+        // cached vault listing and catalog facts, then uses the listed login's
+        // authentication method to choose the billing plane.
+        let model_pools =
+            crate::config_overrides::live_config(routing_config_path).quota_model_pools();
+        if let Ok(mut credentials) = broca_credentials.lock() {
+            credentials.refresh_serving_methods(&accounts, &facts, now_ms(), &model_pools);
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static JOIN_SNAPSHOT_BARRIER: std::cell::RefCell<Option<Arc<std::sync::Barrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn after_join_snapshot_for_test() {
+    JOIN_SNAPSHOT_BARRIER.with(|barrier| {
+        if let Some(barrier) = barrier.borrow().as_ref() {
+            barrier.wait();
+        }
+    });
+}
+
 /// Refresh the vault roster and serving-method joins independently of quota delivery.
 /// Quota samples and fallback snapshots are written by the quota event consumer.
 pub async fn account_quota_loop(
@@ -1774,7 +1814,6 @@ pub async fn account_quota_loop(
     broca_credentials: crate::broca_credentials::SharedBrocaCredentials,
     routing_config_path: PathBuf,
 ) {
-    use prefrontal_routing_core::RouteStateStore as _;
     let project_root = std::env::temp_dir().join("prefrontal-routing-account-quota");
     let _ = std::fs::create_dir_all(&project_root);
     loop {
@@ -1837,15 +1876,7 @@ pub async fn account_quota_loop(
 
         // Account selection and pricing must agree on the serving login. Build
         // the method map after both roster and readings have been refreshed.
-        if let (Ok(guard), Ok(facts)) = (state.lock(), store.get_facts()) {
-            // Providers with no catalog rows resolve from this listing and these
-            // rows inside the refresh, so pricing follows the vault.
-            let model_pools =
-                crate::config_overrides::live_config(&routing_config_path).quota_model_pools();
-            if let Ok(mut credentials) = broca_credentials.lock() {
-                credentials.refresh_serving_methods(&guard, &facts, now_ms(), &model_pools);
-            }
-        }
+        refresh_serving_methods(&state, &store, &broca_credentials, &routing_config_path);
         crate::subscription_economics::refresh(
             &connection_file_path,
             &project_root,
