@@ -5225,7 +5225,11 @@ mod tests {
         let scoped = &snapshot.by_route["anthropic/opus/medium"];
         assert_eq!(scoped.cooldown_until, None);
         assert_eq!(scoped.quota_exhausted_until, None);
-        assert!(scoped.last_error.as_ref().unwrap().contains("57ce2cb7"));
+        assert!(scoped
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("00000000-0000-4000-8000-0000000000a1"));
         assert_eq!(
             snapshot.by_route["anthropic/billing"].quota_exhausted_until,
             Some(1791493229401.0)
